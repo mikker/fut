@@ -1,0 +1,21 @@
+[tools]
+rust = "1.95.0"
+zig = "0.16.0"
+
+[tasks.check]
+depends = ["fmt", "clippy", "test"]
+
+[tasks.fmt]
+run = "cargo fmt --check"
+
+[tasks.clippy]
+run = "cargo clippy --all-targets --all-features -- -D warnings"
+
+[tasks.test]
+run = "cargo test --all-targets --all-features"
+
+[tasks."test:unit"]
+run = "cargo test --lib --all-features"
+
+[tasks."test:e2e"]
+run = "cargo test --test e2e --all-features"
