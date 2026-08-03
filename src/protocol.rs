@@ -9,10 +9,10 @@ use std::path::PathBuf;
 
 use crate::{
     domain::{PaneId, ScreenSnapshot, SessionId, TabId, TerminalId, TerminalSize, WorkspaceId},
-    resources::{ResourceSnapshot, TargetSelector},
+    resources::{ResourceSnapshot, SessionSelector, TargetSelector},
 };
 
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 /// Enough for 50,000 individually styled JSON cells while remaining a firm
 /// pre-allocation bound for the length-delimited transport.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
@@ -41,7 +41,16 @@ pub enum AcknowledgedCommand {
     Input,
     Resize,
     CloseTarget,
+    RenameTarget,
     Shutdown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum RenameSelector {
+    Session(SessionSelector),
+    Workspace(WorkspaceId),
+    Tab(TabId),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -103,6 +112,10 @@ pub enum ClientMessage {
     ListResources,
     CloseTarget {
         selector: TargetSelector,
+    },
+    RenameTarget {
+        selector: RenameSelector,
+        name: String,
     },
     Ping,
     Shutdown,
@@ -411,7 +424,54 @@ mod tests {
             decode_payload::<ServerMessage>(&encode_payload(&switched).unwrap()).unwrap(),
             switched
         );
-        assert_eq!(PROTOCOL_VERSION, 5);
+        assert_eq!(PROTOCOL_VERSION, 6);
+    }
+
+    #[test]
+    fn rename_target_and_correlated_ack_round_trip_all_selectors_and_exact_names() {
+        let cases = [
+            (
+                RenameSelector::Session(SessionSelector::Name("project λ".into())),
+                "開発 λ",
+            ),
+            (
+                RenameSelector::Workspace(WorkspaceId::new()),
+                "  exact name  ",
+            ),
+            (RenameSelector::Tab(TabId::new()), "雪/タブ"),
+        ];
+
+        for (selector, name) in cases {
+            let request_id = Uuid::new_v4();
+            let request = Envelope {
+                request_id: Some(request_id),
+                message: ClientMessage::RenameTarget {
+                    selector,
+                    name: name.into(),
+                },
+            };
+            let decoded_request =
+                decode_payload::<Envelope<ClientMessage>>(&encode_payload(&request).unwrap())
+                    .unwrap();
+            assert_eq!(decoded_request, request);
+            assert!(matches!(
+                &decoded_request.message,
+                ClientMessage::RenameTarget { name: decoded, .. } if decoded == name
+            ));
+
+            let response = Envelope {
+                request_id: Some(request_id),
+                message: ServerMessage::CommandCompleted {
+                    command: AcknowledgedCommand::RenameTarget,
+                },
+            };
+            assert_eq!(
+                decode_payload::<Envelope<ServerMessage>>(&encode_payload(&response).unwrap())
+                    .unwrap(),
+                response
+            );
+            assert_eq!(response.request_id, request.request_id);
+        }
     }
 
     #[test]

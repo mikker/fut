@@ -151,16 +151,33 @@ pub enum ResourceEvent {
         name: String,
         project: Project,
     },
+    SessionRenamed {
+        id: SessionId,
+        old_name: String,
+        new_name: String,
+    },
     WorkspaceCreated {
         session_id: SessionId,
         id: WorkspaceId,
         name: String,
         root: PathBuf,
     },
+    WorkspaceRenamed {
+        session_id: SessionId,
+        id: WorkspaceId,
+        old_name: String,
+        new_name: String,
+    },
     TabCreated {
         workspace_id: WorkspaceId,
         id: TabId,
         name: String,
+    },
+    TabRenamed {
+        workspace_id: WorkspaceId,
+        id: TabId,
+        old_name: String,
+        new_name: String,
     },
     PaneCreated {
         tab_id: TabId,
@@ -516,6 +533,131 @@ impl ResourceTree {
                     closing: false,
                 },
             ],
+            vec![],
+        ))
+    }
+
+    pub fn rename_session(
+        &mut self,
+        session_id: SessionId,
+        new_name: String,
+    ) -> Result<Mutation, ResourceError> {
+        self.check_names([&new_name])?;
+        let session = self
+            .sessions
+            .get(&session_id)
+            .ok_or(ResourceError::NotFound("session"))?;
+        if session.closing {
+            return Err(ResourceError::Closing("session"));
+        }
+        if session.name == new_name {
+            return Ok(self.unchanged());
+        }
+        if self
+            .sessions
+            .values()
+            .any(|session| session.name == new_name)
+        {
+            return Err(ResourceError::Duplicate("session name"));
+        }
+
+        let old_name = std::mem::replace(
+            &mut self.sessions.get_mut(&session_id).unwrap().name,
+            new_name.clone(),
+        );
+        Ok(self.finish(
+            vec![ResourceEvent::SessionRenamed {
+                id: session_id,
+                old_name,
+                new_name,
+            }],
+            vec![],
+        ))
+    }
+
+    pub fn rename_workspace(
+        &mut self,
+        workspace_id: WorkspaceId,
+        new_name: String,
+    ) -> Result<Mutation, ResourceError> {
+        self.check_names([&new_name])?;
+        let workspace = self
+            .workspaces
+            .get(&workspace_id)
+            .ok_or(ResourceError::NotFound("workspace"))?;
+        let session_id = workspace.session_id;
+        if self.sessions[&session_id].closing {
+            return Err(ResourceError::Closing("session"));
+        }
+        if workspace.closing {
+            return Err(ResourceError::Closing("workspace"));
+        }
+        if workspace.name == new_name {
+            return Ok(self.unchanged());
+        }
+        if self.sessions[&session_id]
+            .workspaces
+            .iter()
+            .any(|id| *id != workspace_id && self.workspaces[id].name == new_name)
+        {
+            return Err(ResourceError::Duplicate("workspace name"));
+        }
+
+        let old_name = std::mem::replace(
+            &mut self.workspaces.get_mut(&workspace_id).unwrap().name,
+            new_name.clone(),
+        );
+        Ok(self.finish(
+            vec![ResourceEvent::WorkspaceRenamed {
+                session_id,
+                id: workspace_id,
+                old_name,
+                new_name,
+            }],
+            vec![],
+        ))
+    }
+
+    pub fn rename_tab(
+        &mut self,
+        tab_id: TabId,
+        new_name: String,
+    ) -> Result<Mutation, ResourceError> {
+        self.check_names([&new_name])?;
+        let tab = self
+            .tabs
+            .get(&tab_id)
+            .ok_or(ResourceError::NotFound("tab"))?;
+        let workspace_id = tab.workspace_id;
+        let workspace = &self.workspaces[&workspace_id];
+        if self.sessions[&workspace.session_id].closing {
+            return Err(ResourceError::Closing("session"));
+        }
+        if workspace.closing {
+            return Err(ResourceError::Closing("workspace"));
+        }
+        if tab.name == new_name {
+            return Ok(self.unchanged());
+        }
+        if workspace
+            .tabs
+            .iter()
+            .any(|id| *id != tab_id && self.tabs[id].name == new_name)
+        {
+            return Err(ResourceError::Duplicate("tab name"));
+        }
+
+        let old_name = std::mem::replace(
+            &mut self.tabs.get_mut(&tab_id).unwrap().name,
+            new_name.clone(),
+        );
+        Ok(self.finish(
+            vec![ResourceEvent::TabRenamed {
+                workspace_id,
+                id: tab_id,
+                old_name,
+                new_name,
+            }],
             vec![],
         ))
     }
@@ -1063,6 +1205,14 @@ impl ResourceTree {
             revision: self.revision,
             events,
             terminals_to_close,
+            multiplexer_empty: self.sessions.is_empty(),
+        }
+    }
+    fn unchanged(&self) -> Mutation {
+        Mutation {
+            revision: self.revision,
+            events: vec![],
+            terminals_to_close: vec![],
             multiplexer_empty: self.sessions.is_empty(),
         }
     }
@@ -2067,6 +2217,148 @@ mod tests {
             Err(ResourceError::Closing("session"))
         );
         assert_eq!(tree.snapshot(), before);
+        tree.validate().unwrap();
+    }
+
+    #[test]
+    fn renames_preserve_identity_order_and_emit_exact_events() {
+        let mut tree = ResourceTree::default();
+        let path = initial("Session", "/project");
+        let (session_id, workspace_id, tab_id) = (path.session_id, path.workspace_id, path.tab_id);
+        tree.create_session(path).unwrap();
+        let revision = tree.revision();
+
+        assert_eq!(
+            tree.rename_session(session_id, "session".into()).unwrap(),
+            Mutation {
+                revision: revision + 1,
+                events: vec![ResourceEvent::SessionRenamed {
+                    id: session_id,
+                    old_name: "Session".into(),
+                    new_name: "session".into(),
+                }],
+                terminals_to_close: vec![],
+                multiplexer_empty: false,
+            }
+        );
+        assert_eq!(
+            tree.resolve_session(SessionSelector::Name("Session".into())),
+            Err(ResourceError::NotFound("session"))
+        );
+        assert_eq!(
+            tree.resolve_session(SessionSelector::Name("session".into())),
+            Ok(session_id)
+        );
+        let workspace_rename = tree
+            .rename_workspace(workspace_id, "  Main  ".into())
+            .unwrap();
+        assert_eq!(workspace_rename.revision, revision + 2);
+        assert_eq!(
+            workspace_rename.events,
+            vec![ResourceEvent::WorkspaceRenamed {
+                session_id,
+                id: workspace_id,
+                old_name: "main".into(),
+                new_name: "  Main  ".into(),
+            }]
+        );
+        let tab_rename = tree.rename_tab(tab_id, "Shell".into()).unwrap();
+        assert_eq!(tab_rename.revision, revision + 3);
+        assert_eq!(
+            tab_rename.events,
+            vec![ResourceEvent::TabRenamed {
+                workspace_id,
+                id: tab_id,
+                old_name: "shell".into(),
+                new_name: "Shell".into(),
+            }]
+        );
+
+        let snapshot = tree.snapshot();
+        assert_eq!(snapshot.sessions[0].id, session_id);
+        assert_eq!(snapshot.sessions[0].workspaces[0].id, workspace_id);
+        assert_eq!(snapshot.sessions[0].workspaces[0].tabs[0].id, tab_id);
+        tree.validate().unwrap();
+    }
+
+    #[test]
+    fn exact_rename_is_a_true_no_op_even_when_a_pane_is_closing() {
+        let mut tree = ResourceTree::default();
+        let path = initial("session", "/project");
+        let (session_id, tab_id, pane_id) = (path.session_id, path.tab_id, path.pane_id);
+        tree.create_session(path).unwrap();
+        tree.close_pane(pane_id).unwrap();
+        let before = tree.snapshot();
+        let revision = tree.revision();
+
+        let mutation = tree.rename_tab(tab_id, "shell".into()).unwrap();
+        assert_eq!(mutation.revision, revision);
+        assert!(mutation.events.is_empty());
+        assert!(mutation.terminals_to_close.is_empty());
+        assert_eq!(tree.snapshot(), before);
+        assert_eq!(
+            tree.rename_session(session_id, "session".into())
+                .unwrap()
+                .revision,
+            revision
+        );
+        tree.validate().unwrap();
+    }
+
+    #[test]
+    fn rename_errors_are_scoped_atomic_and_reject_closing_ancestors() {
+        let mut tree = ResourceTree::default();
+        let first = initial("first", "/first");
+        let (session_id, workspace_id, tab_id) =
+            (first.session_id, first.workspace_id, first.tab_id);
+        tree.create_session(first).unwrap();
+        let second = initial("second", "/second");
+        let second_tab = second.tab_id;
+        tree.create_session(second).unwrap();
+        tree.add_tab(
+            workspace_id,
+            TabPath {
+                tab_id: TabId::new(),
+                tab_name: "peer".into(),
+                pane_id: PaneId::new(),
+                terminal_id: TerminalId::new(),
+            },
+        )
+        .unwrap();
+
+        for result in [
+            tree.rename_session(session_id, "second".into()),
+            tree.rename_tab(tab_id, "peer".into()),
+            tree.rename_workspace(WorkspaceId::new(), "name".into()),
+            tree.rename_tab(TabId::new(), "name".into()),
+            tree.rename_session(session_id, " \n ".into()),
+        ] {
+            assert!(result.is_err());
+        }
+        assert_eq!(tree.snapshot().sessions[0].name, "first");
+        assert_eq!(
+            tree.snapshot().sessions[0].workspaces[0].tabs[0].name,
+            "shell"
+        );
+
+        // Identical names in another parent are not duplicates.
+        tree.rename_tab(second_tab, "peer".into()).unwrap();
+        tree.close_workspace(workspace_id).unwrap();
+        let before = tree.snapshot();
+        assert_eq!(
+            tree.rename_workspace(workspace_id, "renamed".into()),
+            Err(ResourceError::Closing("workspace"))
+        );
+        assert_eq!(
+            tree.rename_tab(tab_id, "renamed".into()),
+            Err(ResourceError::Closing("workspace"))
+        );
+        assert_eq!(tree.snapshot(), before);
+        tree.close_session(tree.snapshot().sessions[1].id).unwrap();
+        assert_eq!(
+            tree.rename_tab(second_tab, "again".into()),
+            Err(ResourceError::Closing("session"))
+        );
         tree.validate().unwrap();
     }
 }

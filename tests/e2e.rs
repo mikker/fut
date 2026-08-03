@@ -14,8 +14,8 @@ use bytes::Bytes;
 use fut::{
     domain::{ScreenSnapshot, TerminalId, TerminalSize},
     protocol::{
-        ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, SelectedTarget, ServerMessage,
-        codec, decode_payload, encode_payload,
+        ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, RenameSelector, SelectedTarget,
+        ServerMessage, codec, decode_payload, encode_payload,
     },
     resources::{SessionSelector, TargetSelector},
 };
@@ -1861,6 +1861,226 @@ async fn unsupported_protocol_is_rejected_without_harming_daemon() {
         harness.control_command(ClientMessage::Ping).await,
         ServerMessage::Pong { .. }
     ));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn public_rename_preserves_a_live_process_and_rejects_invalid_changes_atomically() {
+    let harness = Harness::start(
+        "printf 'RENAME_READY\\r\\n'; while IFS= read -r line; do [ \"$line\" = routed ] && printf 'RENAME_ROUTED\\r\\n'; done",
+    ).await;
+    let initial = harness.resources().await;
+    let session_id = initial.sessions[0].id;
+    let workspace_id = initial.sessions[0].workspaces[0].id;
+    let tab_id = initial.sessions[0].workspaces[0].tabs[0].id;
+    let pane_id = initial.sessions[0].workspaces[0].tabs[0].panes[0].id;
+    let terminal_id = initial.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
+    let (mut attached, selected) =
+        attach_once(&harness, TargetSelector::Terminal(terminal_id)).await;
+    let child_pid = selected.child_pid;
+    assert_eq!(selected.terminal_id, terminal_id);
+    snapshot_containing(&mut attached, terminal_id, "RENAME_READY").await;
+
+    let sibling_cwd = harness.root.path().join("rename-sibling");
+    fs::create_dir(&sibling_cwd).unwrap();
+    let ServerMessage::LocationOpened { .. } = harness
+        .control_command(ClientMessage::OpenLocation {
+            name: Some("rename-sibling".into()),
+            cwd: sibling_cwd,
+            program: Some("/bin/sh".into()),
+            argv: vec!["-c".into(), "while IFS= read -r line; do :; done".into()],
+        })
+        .await
+    else {
+        panic!("failed to create rename sibling")
+    };
+    let before = harness.resources().await;
+
+    let run = |arguments: &[&str]| harness.cli().args(arguments).output().expect("run fut CLI");
+    for arguments in [
+        vec![
+            "rename".into(),
+            format!("session:{session_id}"),
+            "セッション 六".into(),
+        ],
+        vec![
+            "rename".into(),
+            format!("workspace:{workspace_id}"),
+            "作業 空間 λ".into(),
+        ],
+        vec![
+            "rename".into(),
+            format!("tab:{tab_id}"),
+            "タブ 雪 v6".into(),
+        ],
+    ] {
+        let borrowed = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+        let output = run(&borrowed);
+        assert!(
+            output.status.success(),
+            "rename failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "renamed=true"
+        );
+    }
+
+    let after = harness.resources().await;
+    assert_eq!(after.revision, before.revision + 3);
+    let mut expected = before.clone();
+    expected.revision += 3;
+    expected.sessions[0].name = "セッション 六".into();
+    expected.sessions[0].workspaces[0].name = "作業 空間 λ".into();
+    expected.sessions[0].workspaces[0].tabs[0].name = "タブ 雪 v6".into();
+    assert_eq!(
+        after, expected,
+        "rename changed identity, order, roots, or process structure"
+    );
+    assert!(process_alive(child_pid));
+
+    send(
+        &mut attached,
+        ClientMessage::Input {
+            bytes: b"routed\n".to_vec(),
+        },
+    )
+    .await;
+    snapshot_containing(&mut attached, terminal_id, "RENAME_ROUTED").await;
+    assert_eq!(
+        attach_error_once(
+            &harness,
+            TargetSelector::Session(SessionSelector::Name("cwd".into()))
+        )
+        .await,
+        "not_found"
+    );
+    assert_eq!(
+        attach_error_once(
+            &harness,
+            TargetSelector::Session(SessionSelector::Name("セッション 六".into()))
+        )
+        .await,
+        "already_attached"
+    );
+
+    let listed = run(&["list"]);
+    assert!(listed.status.success());
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    for label in ["セッション 六", "作業 空間 λ", "タブ 雪 v6"] {
+        assert!(
+            listed.contains(label),
+            "fresh list omitted {label:?}: {listed}"
+        );
+    }
+
+    let no_op_target = format!("tab:{tab_id}");
+    let no_op = run(&["rename", &no_op_target, "タブ 雪 v6"]);
+    assert!(
+        no_op.status.success(),
+        "same-name rename failed: {}",
+        String::from_utf8_lossy(&no_op.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&no_op.stdout).trim(),
+        "renamed=true"
+    );
+    assert_eq!(harness.resources().await, after);
+
+    let mut control = harness.connect().await.unwrap();
+    assert!(matches!(
+        hello(&mut control, ClientMode::Control, PROTOCOL_VERSION)
+            .await
+            .unwrap(),
+        ServerMessage::Welcome { .. }
+    ));
+    let request_id = Uuid::new_v4();
+    send_envelope(
+        &mut control,
+        Envelope {
+            request_id: Some(request_id),
+            message: ClientMessage::RenameTarget {
+                selector: RenameSelector::Tab(tab_id),
+                name: "タブ 雪 v6".into(),
+            },
+        },
+    )
+    .await;
+    assert_eq!(
+        receive_envelope(&mut control).await.unwrap(),
+        Envelope {
+            request_id: Some(request_id),
+            message: ServerMessage::CommandCompleted {
+                command: fut::protocol::AcknowledgedCommand::RenameTarget,
+            },
+        }
+    );
+    send(
+        &mut attached,
+        ClientMessage::RenameTarget {
+            selector: RenameSelector::Tab(tab_id),
+            name: "forbidden".into(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(receive_matching(&mut attached, |message| matches!(message, ServerMessage::Error { code, .. } if code == "control_only")).await,
+        ServerMessage::Error { ref code, .. } if code == "control_only")
+    );
+    assert_eq!(harness.resources().await, after);
+
+    let invalid = [
+        vec!["rename".into(), format!("pane:{pane_id}"), "no".into()],
+        vec![
+            "rename".into(),
+            format!("terminal:{terminal_id}"),
+            "no".into(),
+        ],
+        vec!["rename".into(), "bogus:target".into(), "no".into()],
+        vec![
+            "rename".into(),
+            format!("session:{}", Uuid::new_v4()),
+            "no".into(),
+        ],
+        vec![
+            "rename".into(),
+            format!("session:{session_id}"),
+            " \t ".into(),
+        ],
+        vec![
+            "rename".into(),
+            format!("session:{session_id}"),
+            "rename-sibling".into(),
+        ],
+    ];
+    for arguments in invalid {
+        let borrowed = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+        let output = run(&borrowed);
+        assert!(
+            !output.status.success(),
+            "invalid rename unexpectedly succeeded: {arguments:?}"
+        );
+        assert_eq!(
+            harness.resources().await,
+            after,
+            "invalid rename mutated resources: {arguments:?}"
+        );
+    }
+
+    harness.detach(&mut attached).await;
+    drop(attached);
+    let (mut renamed, resolved) = attach_once(
+        &harness,
+        TargetSelector::Session(SessionSelector::Name("セッション 六".into())),
+    )
+    .await;
+    assert_eq!(
+        (resolved.terminal_id, resolved.child_pid),
+        (terminal_id, child_pid)
+    );
+    harness.detach(&mut renamed).await;
+    drop(renamed);
     harness.shutdown().await;
 }
 

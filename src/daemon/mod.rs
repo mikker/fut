@@ -33,7 +33,8 @@ use crate::{
     project::{ProjectError, ProjectResolver, ResolvedLocation},
     protocol::{
         AcknowledgedCommand, ClientMessage, ClientMode, Envelope, OpenDisposition,
-        PROTOCOL_VERSION, SelectedTarget, ServerMessage, codec, decode_payload, encode_payload,
+        PROTOCOL_VERSION, RenameSelector, SelectedTarget, ServerMessage, codec, decode_payload,
+        encode_payload,
     },
     resources::{
         CheckoutDestination, InitialPath, ResourceError, ResourceTree, TabPath, TargetSelector,
@@ -249,6 +250,25 @@ impl SharedState {
             .collect::<Result<Vec<_>, _>>()?;
         scope.begin(&mut self.resources)?;
         Ok((scope, handles))
+    }
+
+    fn rename_target(&mut self, selector: RenameSelector, name: String) -> Result<(), DaemonError> {
+        if !self.accepting {
+            return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
+        }
+        match selector {
+            RenameSelector::Session(selector) => {
+                let session_id = self.resources.resolve_session(selector)?;
+                self.resources.rename_session(session_id, name)?;
+            }
+            RenameSelector::Workspace(id) => {
+                self.resources.rename_workspace(id, name)?;
+            }
+            RenameSelector::Tab(id) => {
+                self.resources.rename_tab(id, name)?;
+            }
+        }
+        Ok(())
     }
 
     fn begin_shutdown(&mut self) -> Vec<Arc<TerminalHandle>> {
@@ -769,7 +789,7 @@ async fn handle_connection(
                         return Ok(());
                     }
                     ClientMessage::Ping => send(&mut framed, envelope.request_id, ServerMessage::Pong { daemon_pid: std::process::id() }).await?,
-                    ClientMessage::OpenLocation { .. } | ClientMessage::CloseTarget { .. } | ClientMessage::Shutdown => send_error(&mut framed, envelope.request_id, "control_only", "command requires a control connection").await?,
+                    ClientMessage::OpenLocation { .. } | ClientMessage::CloseTarget { .. } | ClientMessage::RenameTarget { .. } | ClientMessage::Shutdown => send_error(&mut framed, envelope.request_id, "control_only", "command requires a control connection").await?,
                     ClientMessage::Hello { .. } => send_error(&mut framed, envelope.request_id, "already_hello", "hello was already received").await?,
                 }
             },
@@ -893,6 +913,24 @@ async fn control_loop(
                             envelope.request_id,
                             ServerMessage::CommandCompleted {
                                 command: AcknowledgedCommand::CloseTarget,
+                            },
+                        )
+                        .await?
+                    }
+                    Err(error) => {
+                        send_error(framed, envelope.request_id, error.code, &error.message).await?
+                    }
+                }
+            }
+            ClientMessage::RenameTarget { selector, name } => {
+                let result = shared.lock().await.rename_target(selector, name);
+                match result {
+                    Ok(()) => {
+                        send(
+                            framed,
+                            envelope.request_id,
+                            ServerMessage::CommandCompleted {
+                                command: AcknowledgedCommand::RenameTarget,
                             },
                         )
                         .await?

@@ -20,6 +20,7 @@ cargo run                 # open the current checkout, then attach its returned 
 cargo run -- new api --cwd ../api -- /bin/zsh
 cargo run -- new-tab workspace:<uuid> --name server --cwd services/api -- ./bin/server
 cargo run -- list
+cargo run -- rename tab:<uuid> "api server"
 cargo run -- attach api   # exact session name; typed workspace:/tab:/pane:/terminal: IDs also work
 cargo run -- ping
 cargo run -- close workspace:<uuid> # close only that workspace and its descendants
@@ -39,4 +40,8 @@ Bare `fut` and `fut attach` open the current checkout and attach the specific te
 
 `fut new-tab WORKSPACE [--name NAME] [--cwd PATH] [COMMAND...]` creates a tab in an existing workspace. Its working directory defaults to the workspace root, and a relative `--cwd` is resolved from that root. Commands are passed as arguments without shell evaluation.
 
-Session selectors accept `session:<uuid-or-exact-name>`, `id:<uuid>`, `name:<exact>`, bare UUIDs, and bare exact names. Names containing colons require `name:<exact>`. Other resources use explicit typed UUID selectors. A normal session/workspace selector must still resolve to exactly one open terminal. The minimal in-client global navigator switches directly between live panes. Pane splits and layouts, rename and move operations, fuzzy matching, project recipes, and agent activity are not implemented yet.
+Session selectors accept `session:<uuid-or-exact-name>`, `id:<uuid>`, `name:<exact>`, bare UUIDs, and bare exact names. Names containing colons require `name:<exact>`. Other resources use explicit typed UUID selectors. A normal session/workspace selector must still resolve to exactly one open terminal.
+
+`fut rename TARGET NAME` renames sessions, workspaces, and tabs only. Session targets accept the session selector forms above; workspace and tab targets require `workspace:<uuid>` and `tab:<uuid>`. Names are stored exactly as supplied and must be unique in their scope: sessions globally, workspaces within a session, and tabs within a workspace. Renaming to the exact current name is a no-op. The minimal in-client global navigator switches directly between live panes and shows renamed resources when opened after the rename; it does not provide inline editing.
+
+Pane naming and move, split, and layout operations are not implemented yet. Fuzzy matching, project recipes, and agent activity are also not implemented.

@@ -18,8 +18,8 @@ use crate::{
     },
     domain::WorkspaceId,
     protocol::{
-        AcknowledgedCommand, ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, ServerMessage,
-        codec, decode_payload, encode_payload,
+        AcknowledgedCommand, ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, RenameSelector,
+        ServerMessage, codec, decode_payload, encode_payload,
     },
     resources::{ResourceSnapshot, SessionSelector, TargetSelector},
 };
@@ -75,6 +75,13 @@ enum Command {
         /// Target selector (the same forms accepted by attach).
         #[arg(value_name = "TARGET")]
         target: Option<String>,
+    },
+    Rename {
+        /// Target: session:<uuid-or-name>, id:<uuid>, name:<exact>, workspace:<uuid>, tab:<uuid>, or session shorthand.
+        #[arg(value_name = "TARGET")]
+        target: String,
+        #[arg(value_name = "NAME")]
+        name: String,
     },
     Shutdown,
 }
@@ -211,6 +218,21 @@ pub async fn run() -> Result<()> {
                 AcknowledgedCommand::CloseTarget,
             )?;
             println!("closed=true");
+            Ok(())
+        }
+        Some(Command::Rename { target, name }) => {
+            response_ok(
+                control(
+                    &socket,
+                    ClientMessage::RenameTarget {
+                        selector: rename_selector(&target)?,
+                        name,
+                    },
+                )
+                .await?,
+                AcknowledgedCommand::RenameTarget,
+            )?;
+            println!("renamed=true");
             Ok(())
         }
         Some(Command::Shutdown) => {
@@ -360,6 +382,17 @@ fn selector(value: &str) -> Result<TargetSelector> {
         bail!("unknown target selector prefix; use name:<exact> for names containing colons");
     }
     Ok(TargetSelector::Session(session_selector_explicit(value)?))
+}
+
+fn rename_selector(value: &str) -> Result<RenameSelector> {
+    match selector(value)? {
+        TargetSelector::Session(selector) => Ok(RenameSelector::Session(selector)),
+        TargetSelector::Workspace(id) => Ok(RenameSelector::Workspace(id)),
+        TargetSelector::Tab(id) => Ok(RenameSelector::Tab(id)),
+        TargetSelector::Pane(_) | TargetSelector::Terminal(_) => {
+            bail!("rename target must be a session, workspace, or tab")
+        }
+    }
 }
 
 fn workspace_parent(value: &str) -> std::result::Result<WorkspaceId, String> {
@@ -582,5 +615,78 @@ mod tests {
             selector("name:has:colons").unwrap(),
             TargetSelector::Session(SessionSelector::Name("has:colons".into()))
         );
+    }
+
+    #[test]
+    fn parses_rename_selectors() {
+        let session = crate::domain::SessionId::new();
+        let workspace = crate::domain::WorkspaceId::new();
+        let tab = crate::domain::TabId::new();
+
+        for (target, expected) in [
+            (
+                format!("session:{session}"),
+                RenameSelector::Session(SessionSelector::Id(session)),
+            ),
+            (
+                format!("id:{session}"),
+                RenameSelector::Session(SessionSelector::Id(session)),
+            ),
+            (
+                "name:exact name".into(),
+                RenameSelector::Session(SessionSelector::Name("exact name".into())),
+            ),
+            (
+                "bare name".into(),
+                RenameSelector::Session(SessionSelector::Name("bare name".into())),
+            ),
+            (
+                format!("workspace:{workspace}"),
+                RenameSelector::Workspace(workspace),
+            ),
+            (format!("tab:{tab}"), RenameSelector::Tab(tab)),
+        ] {
+            assert_eq!(
+                rename_selector(&target).unwrap(),
+                expected,
+                "target {target:?}"
+            );
+        }
+
+        let pane = crate::domain::PaneId::new();
+        let terminal = crate::domain::TerminalId::new();
+        for target in [format!("pane:{pane}"), format!("terminal:{terminal}")] {
+            assert_eq!(
+                rename_selector(&target).unwrap_err().to_string(),
+                "rename target must be a session, workspace, or tab"
+            );
+        }
+        for malformed in [
+            "",
+            "session:",
+            "id:",
+            "id:not-a-uuid",
+            "name:",
+            "workspace:",
+            "workspace:not-a-uuid",
+            "tab:",
+            "tab:not-a-uuid",
+            "unknown:value",
+        ] {
+            assert!(
+                rename_selector(malformed).is_err(),
+                "accepted {malformed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_rename_command_name_as_one_argument() {
+        let cli = Cli::try_parse_from(["fut", "rename", "name:old", "new name"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Rename { target, name })
+                if target == "name:old" && name == "new name"
+        ));
     }
 }
