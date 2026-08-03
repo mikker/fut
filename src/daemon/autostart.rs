@@ -39,7 +39,7 @@ pub async fn ensure_daemon(socket: &Path, cwd: &Path) -> Result<()> {
         .arg("--socket")
         .arg(socket)
         .arg("daemon")
-        .arg("--foreground")
+        .arg("run")
         .arg("--cwd")
         .arg(cwd)
         .stdin(Stdio::null())

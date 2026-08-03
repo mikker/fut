@@ -20,6 +20,7 @@ use fut::{
     resources::{SessionSelector, TargetSelector},
 };
 use futures_util::{SinkExt, StreamExt};
+use serde_json::Value;
 use tempfile::TempDir;
 use tokio::{net::UnixStream, time};
 use tokio_util::codec::Framed;
@@ -419,9 +420,10 @@ fn spawn_daemon(
         .arg("--socket")
         .arg(socket)
         .arg("daemon")
-        .arg("--foreground")
+        .arg("run")
         .arg("--cwd")
         .arg(cwd)
+        .arg("--")
         .arg("/bin/sh")
         .arg("-c")
         .arg(script)
@@ -609,7 +611,7 @@ async fn current_location_open_recovers_from_last_terminal_exit_race() {
             "iteration {iteration}: {snapshot}"
         );
 
-        let shutdown = harness.cli().arg("shutdown").output().unwrap();
+        let shutdown = harness.cli().args(["daemon", "shutdown"]).output().unwrap();
         assert!(
             shutdown.status.success(),
             "{}",
@@ -627,9 +629,9 @@ async fn public_cli_lists_creates_and_closes_resources() {
     let marker = harness.root.path().join("second.started");
     let created = harness
         .cli()
-        .args(["new", "second", "--cwd"])
+        .args(["open"])
         .arg(&cwd)
-        .args(["/bin/sh", "-c"])
+        .args(["--name", "second", "--", "/bin/sh", "-c"])
         .arg(format!(
             "touch {}; while IFS= read -r line; do :; done",
             marker.display()
@@ -642,7 +644,7 @@ async fn public_cli_lists_creates_and_closes_resources() {
         String::from_utf8_lossy(&created.stderr)
     );
     let created = String::from_utf8(created.stdout).unwrap();
-    assert!(created.contains("disposition=session_created"));
+    assert!(created.contains("disposition=SessionCreated"));
     let workspace = created
         .split_whitespace()
         .find_map(|field| field.strip_prefix("workspace="))
@@ -664,7 +666,7 @@ async fn public_cli_lists_creates_and_closes_resources() {
 
     let closed = harness
         .cli()
-        .args(["close", &format!("workspace:{workspace}")])
+        .args(["workspace", "close", workspace])
         .output()
         .unwrap();
     assert!(
@@ -677,7 +679,7 @@ async fn public_cli_lists_creates_and_closes_resources() {
 }
 
 #[tokio::test]
-async fn public_new_tab_creates_an_isolated_ordered_tab_and_close_cascades() {
+async fn public_tab_new_is_isolated_and_public_tab_close_preserves_its_sibling() {
     let mut harness = Harness::start(
         "printf 'ORIGINAL_READY\\r\\n'; while IFS= read -r line; do [ \"$line\" = original ] && printf 'ORIGINAL_INPUT\\r\\n'; done",
     )
@@ -699,7 +701,7 @@ async fn public_new_tab_creates_an_isolated_ordered_tab_and_close_cascades() {
     let pwd_file = harness.root.path().join("new-tab.pwd");
     let output = harness
         .cli()
-        .args(["new-tab", &workspace_id.to_string(), "--name", "開発 λ", "--cwd", "relative-dir", "/bin/sh", "-c"])
+        .args(["tab", "new", &workspace_id.to_string(), "--name", "開発 λ", "--cwd", "relative-dir", "--", "/bin/sh", "-c"])
         .arg(format!(
             "touch {}; pwd > {}; printf 'NEW_READY\\r\\n'; while IFS= read -r line; do [ \"$line\" = new ] && printf 'NEW_INPUT\\r\\n'; done",
             marker.display(), pwd_file.display()
@@ -778,16 +780,17 @@ async fn public_new_tab_creates_an_isolated_ordered_tab_and_close_cascades() {
 
     harness.detach(&mut created).await;
     drop(created);
-    assert_eq!(
-        harness
-            .control_command(ClientMessage::CloseTarget {
-                selector: TargetSelector::Pane(pane_id)
-            })
-            .await,
-        ServerMessage::CommandCompleted {
-            command: fut::protocol::AcknowledgedCommand::CloseTarget
-        }
+    let close = harness
+        .cli()
+        .args(["tab", "close", &tab_id.to_string()])
+        .output()
+        .unwrap();
+    assert!(
+        close.status.success(),
+        "{}",
+        String::from_utf8_lossy(&close.stderr)
     );
+    assert_eq!(String::from_utf8_lossy(&close.stdout).trim(), "closed=true");
     wait_for(DEADLINE, || !process_alive(child_pid)).await;
     let closed = harness.resources().await;
     assert_eq!(closed.sessions[0].workspaces[0].tabs.len(), 1);
@@ -811,21 +814,23 @@ async fn public_new_tab_rejections_are_pre_spawn_and_atomic() {
             "valid",
             "missing-directory",
             "bad-cwd.marker",
-            "invalid_cwd",
+            "could not resolve",
         ),
         (&duplicate, ".", "duplicate.marker", "duplicate"),
-        (" \t ", ".", "blank.marker", "invalid_name"),
+        (" \t ", ".", "blank.marker", "must not be blank"),
     ] {
         let marker = harness.root.path().join(marker_name);
         let output = harness
             .cli()
             .args([
-                "new-tab",
+                "tab",
+                "new",
                 &workspace_id.to_string(),
                 "--name",
                 name,
                 "--cwd",
                 cwd,
+                "--",
                 "/bin/sh",
                 "-c",
             ])
@@ -843,7 +848,7 @@ async fn public_new_tab_rejections_are_pre_spawn_and_atomic() {
     }
 
     for parent in ["not-a-uuid", "tab:00000000-0000-0000-0000-000000000000"] {
-        let output = harness.cli().args(["new-tab", parent]).output().unwrap();
+        let output = harness.cli().args(["tab", "new", parent]).output().unwrap();
         assert!(
             !output.status.success(),
             "accepted malformed parent {parent:?}"
@@ -1039,24 +1044,487 @@ async fn immediate_exit_interactive_create_tab_never_loses_exit_or_old_attachmen
 }
 
 #[tokio::test]
-async fn public_cli_rejects_malformed_selectors_before_attachment() {
+async fn public_cli_rejects_removed_forms_and_malformed_raw_ids_locally() {
     let harness = Harness::start("while IFS= read -r line; do :; done").await;
-    for (selector, expected) in [
-        ("", "target must not be empty"),
-        ("workspace:not-a-uuid", "invalid workspace id"),
-        ("unknown:value", "unknown target selector prefix"),
-        ("session:", "session selector must not be empty"),
+    for arguments in [
+        vec!["new"],
+        vec!["new-tab"],
+        vec!["attach"],
+        vec!["rename"],
+        vec!["close"],
+        vec!["ping"],
+        vec!["shutdown"],
+        vec!["open", "--attach"],
+        vec!["tab", "new", "--attach"],
+        vec!["workspace", "attach", "workspace:not-a-uuid"],
+        vec!["tab", "close", "not-a-uuid"],
+        vec![
+            "pane",
+            "attach",
+            "pane:00000000-0000-0000-0000-000000000000",
+        ],
+        vec!["open", "/definitely/missing/fut-e2e-path"],
     ] {
-        let output = harness.cli().args(["attach", selector]).output().unwrap();
-        assert!(!output.status.success(), "accepted {selector:?}");
-        assert!(String::from_utf8_lossy(&output.stderr).contains(expected));
+        let output = harness.cli().args(&arguments).output().unwrap();
+        assert!(!output.status.success(), "accepted {arguments:?}");
+        assert!(!output.stderr.is_empty(), "no diagnostic for {arguments:?}");
     }
-    // Both documented legacy and typed session forms reach daemon selection.
-    for selector in ["missing", "name:missing"] {
-        let output = harness.cli().args(["attach", selector]).output().unwrap();
+
+    let resources = harness.resources().await;
+    let session = &resources.sessions[0];
+    let workspace = &session.workspaces[0];
+    let tab = &workspace.tabs[0];
+    let pane = &tab.panes[0];
+    for arguments in [
+        vec![
+            "session".into(),
+            "attach".into(),
+            format!("session:{}", session.id),
+        ],
+        vec![
+            "session".into(),
+            "close".into(),
+            format!("session:{}", session.id),
+        ],
+        vec![
+            "workspace".into(),
+            "attach".into(),
+            format!("workspace:{}", workspace.id),
+        ],
+        vec![
+            "workspace".into(),
+            "rename".into(),
+            format!("workspace:{}", workspace.id),
+            "x".into(),
+        ],
+        vec!["tab".into(), "close".into(), format!("tab:{}", tab.id)],
+        vec!["pane".into(), "attach".into(), format!("pane:{}", pane.id)],
+        vec![
+            "terminal".into(),
+            "attach".into(),
+            format!("terminal:{}", pane.terminal_id),
+        ],
+    ] {
+        let output = harness.cli().args(&arguments).output().unwrap();
+        assert!(
+            !output.status.success(),
+            "accepted removed selector syntax {arguments:?}"
+        );
+    }
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn public_noun_first_attach_accepts_names_and_raw_typed_ids() {
+    let harness =
+        Harness::start("printf 'ATTACH_READY\\r\\n'; while IFS= read -r line; do :; done").await;
+    let snapshot = harness.resources().await;
+    let session = &snapshot.sessions[0];
+    let workspace = &session.workspaces[0];
+    let tab = &workspace.tabs[0];
+    let pane = &tab.panes[0];
+
+    for arguments in [
+        vec!["session".into(), "attach".into(), session.name.clone()],
+        vec!["session".into(), "attach".into(), session.id.to_string()],
+        vec![
+            "workspace".into(),
+            "attach".into(),
+            workspace.id.to_string(),
+        ],
+        vec!["tab".into(), "attach".into(), tab.id.to_string()],
+        vec!["pane".into(), "attach".into(), pane.id.to_string()],
+        vec![
+            "terminal".into(),
+            "attach".into(),
+            pane.terminal_id.to_string(),
+        ],
+    ] {
+        let invocation = arguments
+            .iter()
+            .map(|argument| format!("'{}'", argument.replace('\'', "'\\''")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut command = Command::new("/usr/bin/script");
+        command
+            .env_clear()
+            .env("HOME", harness.root.path().join("home"))
+            .env("PATH", "/usr/bin:/bin")
+            .env("TMPDIR", harness.root.path().join("runtime"))
+            .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+            .env("TERM", "xterm-256color")
+            .args(["-q", "/dev/null", "/bin/sh", "-c"])
+            .arg(format!(
+                "stty rows 24 cols 80; exec '{}' --socket '{}' {invocation}",
+                env!("CARGO_BIN_EXE_fut"),
+                harness.socket.display()
+            ));
+        let mut client = PtyChild::spawn(command);
+        client.wait_for("ATTACH_READY").await;
+        client.send(b"\x02d");
+        client.wait_success().await;
+    }
+
+    let second_tab = harness
+        .cli()
+        .args(["tab", "new", &workspace.id.to_string()])
+        .output()
+        .unwrap();
+    assert!(second_tab.status.success());
+    let ambiguous = harness
+        .cli()
+        .args(["session", "attach", &session.id.to_string()])
+        .output()
+        .unwrap();
+    assert!(!ambiguous.status.success());
+    assert!(String::from_utf8_lossy(&ambiguous.stderr).contains("target_required"));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn public_json_commands_emit_compact_canonical_envelopes() {
+    let harness = Harness::start("while IFS= read -r line; do :; done").await;
+    let json = |output: std::process::Output, command: &str| {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(text.lines().count(), 1, "JSON was not compact: {text:?}");
+        let value: Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["command"], command);
+        value["result"].clone()
+    };
+    let json_error = |output: std::process::Output, code: &str| {
         assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("not_found"));
+        assert!(output.stdout.is_empty());
+        let text = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(
+            text.lines().count(),
+            1,
+            "JSON error was not compact: {text:?}"
+        );
+        let value: Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["error"]["code"], code);
+        assert!(value["error"]["message"].is_string());
+        value
+    };
+
+    json_error(
+        harness
+            .cli()
+            .args(["tab", "close", "not-a-uuid", "--json"])
+            .output()
+            .unwrap(),
+        "invalid_arguments",
+    );
+
+    let listed = json(
+        harness
+            .cli()
+            .args(["daemon", "--json", "ping"])
+            .output()
+            .unwrap(),
+        "daemon.ping",
+    );
+    assert!(listed["daemon_pid"].is_number());
+    let listed = json(
+        harness.cli().args(["list", "--json"]).output().unwrap(),
+        "list",
+    );
+    assert!(listed["sessions"].is_array());
+
+    let cwd = harness.root.path().join("json-open");
+    fs::create_dir(&cwd).unwrap();
+    let marker = harness.root.path().join("delimiter.marker");
+    let opened = json(
+        harness
+            .cli()
+            .args(["--json", "open"])
+            .arg(&cwd)
+            .args(["--name", "json-open", "--", "/bin/sh", "-c"])
+            .arg(format!(
+                "test x\"$1\" = xkept && touch {}; while IFS= read -r line; do :; done",
+                marker.display()
+            ))
+            .args(["fut-test", "kept"])
+            .output()
+            .unwrap(),
+        "open",
+    );
+    assert_eq!(opened["disposition"], "session_created");
+    let workspace_id = opened["selected"]["workspace_id"].as_str().unwrap();
+    assert!(opened["selected"]["session_id"].is_string());
+    wait_for(DEADLINE, || marker.exists()).await;
+
+    let child_json_marker = harness.root.path().join("child-json.marker");
+    let child_json_cwd = harness.root.path().join("child-json");
+    fs::create_dir(&child_json_cwd).unwrap();
+    let child_json = harness
+        .cli()
+        .args(["open"])
+        .arg(&child_json_cwd)
+        .args(["--", "/bin/sh", "-c"])
+        .arg(format!(
+            "test x\"$1\" = x--json && touch {}",
+            child_json_marker.display()
+        ))
+        .args(["fut-test", "--json"])
+        .output()
+        .unwrap();
+    assert!(child_json.status.success());
+    assert!(serde_json::from_slice::<Value>(&child_json.stdout).is_err());
+    wait_for(DEADLINE, || child_json_marker.exists()).await;
+
+    let created = json(
+        harness
+            .cli()
+            .args([
+                "--json",
+                "tab",
+                "new",
+                workspace_id,
+                "--name",
+                "json-tab",
+                "--",
+                "/bin/sh",
+                "-c",
+                "while IFS= read -r line; do :; done",
+            ])
+            .output()
+            .unwrap(),
+        "tab.new",
+    );
+    let tab_id = created["selected"]["tab_id"].as_str().unwrap();
+    assert!(created["selected"]["pane_id"].is_string());
+    assert!(created["selected"]["terminal_id"].is_string());
+    let renamed = json(
+        harness
+            .cli()
+            .args(["--json", "tab", "rename", tab_id, "renamed"])
+            .output()
+            .unwrap(),
+        "tab.rename",
+    );
+    assert_eq!(renamed["tab_id"], tab_id);
+    let closed = json(
+        harness
+            .cli()
+            .args(["--json", "tab", "close", tab_id])
+            .output()
+            .unwrap(),
+        "tab.close",
+    );
+    assert_eq!(closed["tab_id"], tab_id);
+
+    json_error(
+        harness
+            .cli()
+            .args([
+                "--json",
+                "session",
+                "attach",
+                opened["selected"]["session_id"].as_str().unwrap(),
+            ])
+            .output()
+            .unwrap(),
+        "invalid_arguments",
+    );
+    json_error(
+        harness.cli().args(["--json"]).output().unwrap(),
+        "invalid_arguments",
+    );
+
+    let missing_id = Uuid::new_v4().to_string();
+    json_error(
+        harness
+            .cli()
+            .args(["--json", "tab", "close", &missing_id])
+            .output()
+            .unwrap(),
+        "not_found",
+    );
+    let original_session = harness.resources().await.sessions[0].id.to_string();
+    json_error(
+        harness
+            .cli()
+            .args([
+                "--json",
+                "session",
+                "rename",
+                &original_session,
+                "json-open",
+            ])
+            .output()
+            .unwrap(),
+        "duplicate",
+    );
+
+    let missing_socket = harness.root.path().join("runtime/missing.sock");
+    json_error(
+        harness
+            .cli()
+            .args(["daemon", "ping", "--json", "--socket"])
+            .arg(missing_socket)
+            .output()
+            .unwrap(),
+        "command_failed",
+    );
+
+    let shutdown = json(
+        harness
+            .cli()
+            .args(["--json", "daemon", "shutdown"])
+            .output()
+            .unwrap(),
+        "daemon.shutdown",
+    );
+    assert_eq!(shutdown["shutdown"], true);
+    wait_for(DEADLINE, || !harness.socket.exists()).await;
+}
+
+#[tokio::test]
+async fn public_child_commands_require_the_delimiter_before_the_child_argv() {
+    let harness = Harness::start("while IFS= read -r line; do :; done").await;
+    let workspace_id = harness.resources().await.sessions[0].workspaces[0]
+        .id
+        .to_string();
+
+    for (arguments, marker_name) in [
+        (
+            vec!["open", ".", "/bin/sh", "-c", "touch"],
+            "open-no-delimiter",
+        ),
+        (
+            vec!["tab", "new", &workspace_id, "/bin/sh", "-c", "touch"],
+            "tab-no-delimiter",
+        ),
+        (
+            vec!["daemon", "run", "/bin/sh", "-c", "touch"],
+            "daemon-no-delimiter",
+        ),
+    ] {
+        let marker = harness.root.path().join(marker_name);
+        let mut arguments = arguments.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        *arguments.last_mut().unwrap() = format!("touch {}", marker.display());
+        let output = harness.cli().args(&arguments).output().unwrap();
+        assert!(
+            !output.status.success(),
+            "accepted child argv without --: {arguments:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "rejected child command executed: {arguments:?}"
+        );
     }
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn public_json_control_mutations_use_dotted_commands_and_raw_ids() {
+    let harness = Harness::start("while IFS= read -r line; do :; done").await;
+    let json = |arguments: &[&str], command: &str| {
+        let output = harness.cli().args(arguments).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        let value: Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["command"], command);
+        value["result"].clone()
+    };
+
+    let initial = harness.resources().await;
+    let session_id = initial.sessions[0].id.to_string();
+    let workspace_id = initial.sessions[0].workspaces[0].id.to_string();
+    let tab_id = initial.sessions[0].workspaces[0].tabs[0].id.to_string();
+    assert_eq!(
+        json(
+            &["session", "rename", &session_id, "json-session", "--json"],
+            "session.rename"
+        )["session_id"],
+        session_id
+    );
+    assert_eq!(
+        json(
+            &[
+                "workspace",
+                "rename",
+                &workspace_id,
+                "json-workspace",
+                "--json"
+            ],
+            "workspace.rename"
+        )["workspace_id"],
+        workspace_id
+    );
+    assert_eq!(
+        json(
+            &["tab", "rename", &tab_id, "json-tab", "--json"],
+            "tab.rename"
+        )["tab_id"],
+        tab_id
+    );
+
+    let created = json(&["tab", "new", &workspace_id, "--json"], "tab.new");
+    let pane_id = created["selected"]["pane_id"].as_str().unwrap();
+    assert_eq!(
+        json(&["pane", "close", pane_id, "--json"], "pane.close")["pane_id"],
+        pane_id
+    );
+
+    let created = json(&["tab", "new", &workspace_id, "--json"], "tab.new");
+    let close_tab_id = created["selected"]["tab_id"].as_str().unwrap();
+    assert_eq!(
+        json(&["tab", "close", close_tab_id, "--json"], "tab.close")["tab_id"],
+        close_tab_id
+    );
+
+    let workspace_dir = harness.root.path().join("json-workspace-close");
+    let session_dir = harness.root.path().join("json-session-close");
+    fs::create_dir(&workspace_dir).unwrap();
+    fs::create_dir(&session_dir).unwrap();
+    json(&["open", workspace_dir.to_str().unwrap(), "--json"], "open");
+    json(&["open", session_dir.to_str().unwrap(), "--json"], "open");
+    let resources = harness.resources().await;
+    let workspace_to_close = resources
+        .sessions
+        .iter()
+        .find(|session| session.name == "json-workspace-close")
+        .unwrap()
+        .workspaces[0]
+        .id
+        .to_string();
+    let session_to_close = resources
+        .sessions
+        .iter()
+        .find(|session| session.name == "json-session-close")
+        .unwrap()
+        .id
+        .to_string();
+    assert_eq!(
+        json(
+            &["workspace", "close", &workspace_to_close, "--json"],
+            "workspace.close"
+        )["workspace_id"],
+        workspace_to_close
+    );
+    assert_eq!(
+        json(
+            &["session", "close", &session_to_close, "--json"],
+            "session.close"
+        )["session_id"],
+        session_to_close
+    );
+
     harness.shutdown().await;
 }
 
@@ -1437,7 +1905,7 @@ async fn public_client_navigator_switches_live_pty_and_preserves_terminal_isolat
         .env("TERM", "xterm-256color")
         .args(["-q", "/dev/null", "/bin/sh", "-c"])
         .arg(format!(
-            "stty rows 24 cols 80; exec '{}' --socket '{}' attach terminal:{}",
+            "stty rows 24 cols 80; exec '{}' --socket '{}' terminal attach {}",
             env!("CARGO_BIN_EXE_fut"),
             harness.socket.display(),
             a.terminal_id
@@ -1503,7 +1971,7 @@ async fn public_client_ctrl_b_c_creates_routes_and_navigates_back() {
         .env("TERM", "xterm-256color")
         .args(["-q", "/dev/null", "/bin/sh", "-c"])
         .arg(format!(
-            "stty rows 24 cols 80; exec '{}' --socket '{}' attach terminal:{}",
+            "stty rows 24 cols 80; exec '{}' --socket '{}' terminal attach {}",
             env!("CARGO_BIN_EXE_fut"),
             harness.socket.display(),
             a.terminal_id
@@ -1899,18 +2367,21 @@ async fn public_rename_preserves_a_live_process_and_rejects_invalid_changes_atom
     let run = |arguments: &[&str]| harness.cli().args(arguments).output().expect("run fut CLI");
     for arguments in [
         vec![
+            "session".into(),
             "rename".into(),
-            format!("session:{session_id}"),
+            session_id.to_string(),
             "セッション 六".into(),
         ],
         vec![
+            "workspace".into(),
             "rename".into(),
-            format!("workspace:{workspace_id}"),
+            workspace_id.to_string(),
             "作業 空間 λ".into(),
         ],
         vec![
+            "tab".into(),
             "rename".into(),
-            format!("tab:{tab_id}"),
+            tab_id.to_string(),
             "タブ 雪 v6".into(),
         ],
     ] {
@@ -1975,8 +2446,8 @@ async fn public_rename_preserves_a_live_process_and_rejects_invalid_changes_atom
         );
     }
 
-    let no_op_target = format!("tab:{tab_id}");
-    let no_op = run(&["rename", &no_op_target, "タブ 雪 v6"]);
+    let no_op_target = tab_id.to_string();
+    let no_op = run(&["tab", "rename", &no_op_target, "タブ 雪 v6"]);
     assert!(
         no_op.status.success(),
         "same-name rename failed: {}",
@@ -2031,26 +2502,35 @@ async fn public_rename_preserves_a_live_process_and_rejects_invalid_changes_atom
     assert_eq!(harness.resources().await, after);
 
     let invalid = [
-        vec!["rename".into(), format!("pane:{pane_id}"), "no".into()],
         vec![
+            "pane".into(),
             "rename".into(),
-            format!("terminal:{terminal_id}"),
+            pane_id.to_string(),
+            "no".into(),
+        ],
+        vec![
+            "terminal".into(),
+            "rename".into(),
+            terminal_id.to_string(),
             "no".into(),
         ],
         vec!["rename".into(), "bogus:target".into(), "no".into()],
         vec![
+            "session".into(),
             "rename".into(),
-            format!("session:{}", Uuid::new_v4()),
+            Uuid::new_v4().to_string(),
             "no".into(),
         ],
         vec![
+            "session".into(),
             "rename".into(),
-            format!("session:{session_id}"),
+            session_id.to_string(),
             " \t ".into(),
         ],
         vec![
+            "session".into(),
             "rename".into(),
-            format!("session:{session_id}"),
+            session_id.to_string(),
             "rename-sibling".into(),
         ],
     ];

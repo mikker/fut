@@ -60,6 +60,12 @@ Fut should support:
 
 Focus and seen state belong to each attached client. Multiple clients may inspect the same live terminals without being forced to share sidebar state, dialogs, selection, or the same active workspace.
 
+### One typed, agent-oriented control surface
+
+Resource operations follow the hierarchy: noun first, then operation (`workspace rename`, `tab close`). Top-level `open` and `list` and the `daemon` lifecycle are intentional non-resource entry points. The protocol carries typed resource identities, and UIs use those types directly rather than constructing command-line selectors. The public CLI accepts raw opaque IDs for exact operations; mutations are ID-only, with exact session names allowed only as a convenience for session attach. A UUID-shaped session attach value is interpreted as an ID before considering names. Ancestor attachment through a session, workspace, or tab succeeds only when it identifies exactly one open terminal; pane and terminal IDs are exact, and ambiguous interactive navigation belongs in the navigator. It does not expose a `resource:<id>` selector language.
+
+Automation is a first-class client. Agents use versioned JSON responses and raw IDs, while human-readable output is not a contract and remains free to improve. JSON failures use the compact `{version:1,error:{code,message}}` envelope, preserving daemon codes and using `invalid_arguments` or `command_failed` for CLI-originated failures. UIs use the typed protocol rather than parsing CLI output. Manual use should not require memorizing UUIDs: dynamic daemon-backed completion will display resource names and hierarchy but insert the same raw ID used by automation. This completion is the next near-term missing control-surface item. Bare `fut` deliberately opens the current directory and then attaches to the returned terminal; control-only creation and resource attachment otherwise remain separate, with no claimed atomic combined CLI operation. This keeps one precise control model underneath distinct human and agent affordances.
+
 ### Agent awareness is ambient
 
 An agent remains a process in a terminal. Fut does not create a parallel Agent hierarchy or reserve a permanent agent dashboard.

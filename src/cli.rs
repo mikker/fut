@@ -1,9 +1,11 @@
-use std::{path::PathBuf, time::Duration};
+use std::{ffi::OsString, path::PathBuf, process::ExitCode, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
+use serde::Serialize;
+use serde_json::json;
 use tokio::net::UnixStream;
 use tokio_util::codec::Framed;
 use uuid::Uuid;
@@ -16,7 +18,7 @@ use crate::{
         path::socket_path,
         run_daemon,
     },
-    domain::WorkspaceId,
+    domain::{PaneId, SessionId, TabId, TerminalId, WorkspaceId},
     protocol::{
         AcknowledgedCommand, ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, RenameSelector,
         ServerMessage, codec, decode_payload, encode_payload,
@@ -31,83 +33,243 @@ use crate::{
     about = "A project-oriented terminal multiplexer"
 )]
 pub struct Cli {
+    /// Override the Unix socket used to contact the daemon.
     #[arg(long, global = true)]
     socket: Option<PathBuf>,
+    /// Emit versioned JSON for noninteractive commands only.
+    #[arg(long, global = true)]
+    json: bool,
+    /// Command to run; omit it to open the current directory and attach.
     #[command(subcommand)]
     command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    Attach {
-        /// Target: session:<uuid-or-name>, workspace:<uuid>, tab:<uuid>, pane:<uuid>, terminal:<uuid>, or legacy session shorthand.
-        #[arg(value_name = "TARGET")]
-        target: Option<String>,
-    },
-    New {
-        name: String,
-        #[arg(long)]
-        cwd: Option<PathBuf>,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        command: Vec<String>,
-    },
-    NewTab {
-        #[arg(value_name = "WORKSPACE", value_parser = workspace_parent)]
-        workspace_id: WorkspaceId,
+    /// Open a location through an existing daemon without attaching.
+    Open {
+        /// Directory to open; defaults to the current directory.
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+        /// Name for the new session or workspace created for this location.
         #[arg(long)]
         name: Option<String>,
-        #[arg(long)]
-        cwd: Option<PathBuf>,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        /// Child program and its direct argv, following `--`; defaults to the shell.
+        #[arg(last = true)]
         command: Vec<String>,
     },
+    /// Attach, rename, or close a session.
+    Session {
+        /// Session operation to perform.
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
+    /// Attach, rename, or close a workspace.
+    Workspace {
+        /// Workspace operation to perform.
+        #[command(subcommand)]
+        command: WorkspaceCommand,
+    },
+    /// Create, attach, rename, or close a tab.
+    Tab {
+        /// Tab operation to perform.
+        #[command(subcommand)]
+        command: TabCommand,
+    },
+    /// Attach or close a pane.
+    Pane {
+        /// Pane operation to perform.
+        #[command(subcommand)]
+        command: PaneCommand,
+    },
+    /// Attach to a terminal.
+    Terminal {
+        /// Terminal operation to perform.
+        #[command(subcommand)]
+        command: TerminalCommand,
+    },
+    /// List resources from the existing daemon.
     List,
+    /// Run or control the daemon.
     Daemon {
-        #[arg(long)]
-        foreground: bool,
-        #[arg(long)]
-        cwd: Option<PathBuf>,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        command: Vec<String>,
+        /// Daemon operation to perform.
+        #[command(subcommand)]
+        command: DaemonCommand,
     },
-    Ping,
-    Close {
-        /// Target selector (the same forms accepted by attach).
-        #[arg(value_name = "TARGET")]
-        target: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum SessionCommand {
+    /// Attach to a session that contains exactly one open terminal.
+    Attach {
+        /// Session UUID or name; a UUID-shaped value is always treated as an ID.
+        session: String,
     },
+    /// Rename a session by raw UUID on the existing daemon.
     Rename {
-        /// Target: session:<uuid-or-name>, id:<uuid>, name:<exact>, workspace:<uuid>, tab:<uuid>, or session shorthand.
-        #[arg(value_name = "TARGET")]
-        target: String,
-        #[arg(value_name = "NAME")]
+        /// Raw session UUID.
+        session_id: SessionId,
+        /// New session name.
         name: String,
     },
+    /// Close a session by raw UUID on the existing daemon.
+    Close {
+        /// Raw session UUID.
+        session_id: SessionId,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkspaceCommand {
+    /// Attach to a workspace on the existing daemon.
+    Attach {
+        /// Raw workspace UUID; the workspace must contain exactly one open terminal.
+        workspace_id: WorkspaceId,
+    },
+    /// Rename a workspace by raw UUID on the existing daemon.
+    Rename {
+        /// Raw workspace UUID.
+        workspace_id: WorkspaceId,
+        /// New workspace name.
+        name: String,
+    },
+    /// Close a workspace by raw UUID on the existing daemon.
+    Close {
+        /// Raw workspace UUID.
+        workspace_id: WorkspaceId,
+    },
+}
+
+#[derive(Subcommand)]
+enum TabCommand {
+    /// Create a tab through an existing daemon without attaching.
+    New {
+        /// Raw UUID of the workspace that will own the tab.
+        workspace_id: WorkspaceId,
+        /// Name for the new tab; defaults to shell, shell-2, and so on.
+        #[arg(long)]
+        name: Option<String>,
+        /// Working directory for the child; defaults to the workspace root.
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Child program and its direct argv, following `--`; defaults to the shell.
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+    /// Attach to a tab on the existing daemon.
+    Attach {
+        /// Raw tab UUID; the tab must contain exactly one open terminal.
+        tab_id: TabId,
+    },
+    /// Rename a tab by raw UUID on the existing daemon.
+    Rename {
+        /// Raw tab UUID.
+        tab_id: TabId,
+        /// New tab name.
+        name: String,
+    },
+    /// Close a tab by raw UUID on the existing daemon.
+    Close {
+        /// Raw tab UUID.
+        tab_id: TabId,
+    },
+}
+
+#[derive(Subcommand)]
+enum PaneCommand {
+    /// Attach to a pane on the existing daemon.
+    Attach {
+        /// Raw pane UUID identifying one terminal placement.
+        pane_id: PaneId,
+    },
+    /// Close a pane by raw UUID on the existing daemon.
+    Close {
+        /// Raw pane UUID.
+        pane_id: PaneId,
+    },
+}
+
+#[derive(Subcommand)]
+enum TerminalCommand {
+    /// Attach to a terminal on the existing daemon.
+    Attach {
+        /// Raw terminal UUID identifying one process-bearing terminal.
+        terminal_id: TerminalId,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonCommand {
+    /// Run the daemon in the foreground.
+    Run {
+        /// Initial child working directory; defaults to the current directory.
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Initial child program and its direct argv, following `--`; defaults to the shell.
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+    /// Check whether the existing daemon is responsive.
+    Ping,
+    /// Ask the existing daemon to shut down.
     Shutdown,
 }
 
-pub async fn run() -> Result<()> {
-    let cli = Cli::parse();
+pub async fn run() -> ExitCode {
+    run_from(std::env::args_os()).await
+}
+
+async fn run_from(args: impl IntoIterator<Item = OsString>) -> ExitCode {
+    let args = args.into_iter().collect::<Vec<_>>();
+    let json_requested = json_requested(&args);
+    let cli = match Cli::try_parse_from(&args) {
+        Ok(cli) => cli,
+        Err(error) if error.use_stderr() && json_requested => {
+            render_json_error("invalid_arguments", error.to_string());
+            return ExitCode::from(error.exit_code() as u8);
+        }
+        Err(error) => {
+            let code = error.exit_code();
+            let _ = error.print();
+            return ExitCode::from(code as u8);
+        }
+    };
+    let json_output = cli.json;
+    match execute(cli).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            if json_output {
+                let code = error
+                    .downcast_ref::<CliError>()
+                    .map_or("command_failed", |error| error.code.as_str());
+                render_json_error(code, format!("{error:#}"));
+            } else {
+                eprintln!("Error: {error:#}");
+            }
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn execute(cli: Cli) -> Result<()> {
     let socket = socket_path(cli.socket.as_deref())?;
+    reject_interactive_json(&cli)?;
     match cli.command {
-        None | Some(Command::Attach { target: None }) => {
+        None => {
             let cwd = std::env::current_dir().context("read current directory")?;
             open_and_attach(&socket, cwd).await
         }
-        Some(Command::Attach {
-            target: Some(target),
-        }) => client::attach(&socket, Some(selector(&target)?)).await,
-        Some(Command::New { name, cwd, command }) => {
-            let cwd = cwd.unwrap_or(std::env::current_dir()?);
-            let (program, argv) = command
-                .split_first()
-                .map_or((None, vec![]), |(program, argv)| {
-                    (Some(PathBuf::from(program)), argv.to_vec())
-                });
+        Some(Command::Open {
+            path,
+            name,
+            command,
+        }) => {
+            let cwd = path.unwrap_or(std::env::current_dir()?);
+            let (program, argv) = child_command(command);
             match control(
                 &socket,
                 ClientMessage::OpenLocation {
-                    name: Some(name),
+                    name,
                     cwd,
                     program,
                     argv,
@@ -118,38 +280,54 @@ pub async fn run() -> Result<()> {
                 ServerMessage::LocationOpened {
                     selected,
                     disposition,
-                } => {
-                    println!(
-                        "disposition={} session={} workspace={} tab={} pane={} terminal={} pid={}",
-                        match disposition {
-                            crate::protocol::OpenDisposition::Existing => "existing",
-                            crate::protocol::OpenDisposition::WorkspaceCreated =>
-                                "workspace_created",
-                            crate::protocol::OpenDisposition::SessionCreated => "session_created",
-                        },
+                } => output(
+                    cli.json,
+                    "open",
+                    json!({ "disposition": disposition, "selected": selected }),
+                    format!(
+                        "disposition={disposition:?} session={} workspace={} tab={} pane={} terminal={} pid={}",
                         selected.session_id,
                         selected.workspace_id,
                         selected.tab_id,
                         selected.pane_id,
                         selected.terminal_id,
                         selected.child_pid
-                    );
-                    Ok(())
-                }
+                    ),
+                ),
                 other => unexpected(other),
             }
         }
-        Some(Command::NewTab {
-            workspace_id,
-            name,
-            cwd,
-            command,
+        Some(Command::Session {
+            command: SessionCommand::Attach { session },
         }) => {
-            let (program, argv) = command
-                .split_first()
-                .map_or((None, vec![]), |(program, argv)| {
-                    (Some(PathBuf::from(program)), argv.to_vec())
-                });
+            client::attach(
+                &socket,
+                Some(TargetSelector::Session(session_selector(&session))),
+            )
+            .await
+        }
+        Some(Command::Workspace {
+            command: WorkspaceCommand::Attach { workspace_id },
+        }) => client::attach(&socket, Some(TargetSelector::Workspace(workspace_id))).await,
+        Some(Command::Tab {
+            command: TabCommand::Attach { tab_id },
+        }) => client::attach(&socket, Some(TargetSelector::Tab(tab_id))).await,
+        Some(Command::Pane {
+            command: PaneCommand::Attach { pane_id },
+        }) => client::attach(&socket, Some(TargetSelector::Pane(pane_id))).await,
+        Some(Command::Terminal {
+            command: TerminalCommand::Attach { terminal_id },
+        }) => client::attach(&socket, Some(TargetSelector::Terminal(terminal_id))).await,
+        Some(Command::Tab {
+            command:
+                TabCommand::New {
+                    workspace_id,
+                    name,
+                    cwd,
+                    command,
+                },
+        }) => {
+            let (program, argv) = child_command(command);
             match control(
                 &socket,
                 ClientMessage::CreateTab {
@@ -162,8 +340,11 @@ pub async fn run() -> Result<()> {
             )
             .await?
             {
-                ServerMessage::TabCreated { selected } => {
-                    println!(
+                ServerMessage::TabCreated { selected } => output(
+                    cli.json,
+                    "tab.new",
+                    json!({ "selected": selected }),
+                    format!(
                         "session={} workspace={} tab={} pane={} terminal={} pid={}",
                         selected.session_id,
                         selected.workspace_id,
@@ -171,27 +352,25 @@ pub async fn run() -> Result<()> {
                         selected.pane_id,
                         selected.terminal_id,
                         selected.child_pid
-                    );
-                    Ok(())
-                }
+                    ),
+                ),
                 other => unexpected(other),
             }
         }
         Some(Command::List) => match control(&socket, ClientMessage::ListResources).await? {
             ServerMessage::Resources { snapshot } => {
-                print_resources(&snapshot);
-                Ok(())
+                if cli.json {
+                    output(true, "list", &snapshot, String::new())
+                } else {
+                    print_resources(&snapshot);
+                    Ok(())
+                }
             }
             other => unexpected(other),
         },
         Some(Command::Daemon {
-            foreground,
-            cwd,
-            command,
+            command: DaemonCommand::Run { cwd, command },
         }) => {
-            if !foreground {
-                bail!("daemon currently requires --foreground");
-            }
             let cwd = cwd.unwrap_or(std::env::current_dir()?);
             let mut config = DaemonConfig::shell(socket, cwd);
             if let Some(program) = command.first() {
@@ -200,50 +379,216 @@ pub async fn run() -> Result<()> {
             }
             run_daemon(config).await
         }
-        Some(Command::Ping) => {
+        Some(Command::Daemon {
+            command: DaemonCommand::Ping,
+        }) => {
             let response = control(&socket, ClientMessage::Ping).await?;
             match response {
-                ServerMessage::Pong { daemon_pid } => println!("pong pid={daemon_pid}"),
+                ServerMessage::Pong { daemon_pid } => {
+                    return output(
+                        cli.json,
+                        "daemon.ping",
+                        json!({ "daemon_pid": daemon_pid }),
+                        format!("pong pid={daemon_pid}"),
+                    );
+                }
                 other => unexpected(other)?,
             }
             Ok(())
         }
-        Some(Command::Close { target }) => {
-            let selector = match target {
-                Some(value) => selector(&value)?,
-                None => TargetSelector::Session(only_session(&socket).await?),
-            };
-            response_ok(
-                control(&socket, ClientMessage::CloseTarget { selector }).await?,
-                AcknowledgedCommand::CloseTarget,
-            )?;
-            println!("closed=true");
-            Ok(())
-        }
-        Some(Command::Rename { target, name }) => {
-            response_ok(
-                control(
-                    &socket,
-                    ClientMessage::RenameTarget {
-                        selector: rename_selector(&target)?,
-                        name,
-                    },
-                )
-                .await?,
-                AcknowledgedCommand::RenameTarget,
-            )?;
-            println!("renamed=true");
-            Ok(())
-        }
-        Some(Command::Shutdown) => {
+        Some(Command::Daemon {
+            command: DaemonCommand::Shutdown,
+        }) => {
             response_ok(
                 control(&socket, ClientMessage::Shutdown).await?,
                 AcknowledgedCommand::Shutdown,
             )?;
-            println!("shutdown=true");
-            Ok(())
+            output(
+                cli.json,
+                "daemon.shutdown",
+                json!({ "shutdown": true }),
+                "shutdown=true",
+            )
+        }
+        Some(command) => run_mutation(&socket, cli.json, command).await,
+    }
+}
+
+fn child_command(command: Vec<String>) -> (Option<PathBuf>, Vec<String>) {
+    command
+        .split_first()
+        .map_or((None, vec![]), |(program, argv)| {
+            (Some(program.into()), argv.to_vec())
+        })
+}
+
+fn reject_interactive_json(cli: &Cli) -> Result<()> {
+    if !cli.json {
+        return Ok(());
+    }
+    let interactive = cli.command.is_none()
+        || matches!(
+            cli.command,
+            Some(Command::Session {
+                command: SessionCommand::Attach { .. }
+            }) | Some(Command::Workspace {
+                command: WorkspaceCommand::Attach { .. }
+            }) | Some(Command::Tab {
+                command: TabCommand::Attach { .. }
+            }) | Some(Command::Pane {
+                command: PaneCommand::Attach { .. }
+            }) | Some(Command::Terminal {
+                command: TerminalCommand::Attach { .. }
+            }) | Some(Command::Daemon {
+                command: DaemonCommand::Run { .. }
+            })
+        );
+    if interactive {
+        return Err(CliError::new(
+            "invalid_arguments",
+            "--json is not supported for interactive commands",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+async fn run_mutation(socket: &std::path::Path, json_output: bool, command: Command) -> Result<()> {
+    enum Mutation {
+        Close(TargetSelector),
+        Rename(RenameSelector, String),
+    }
+
+    let (mutation, command_name, result) = match command {
+        Command::Session {
+            command: SessionCommand::Rename { session_id, name },
+        } => (
+            Mutation::Rename(
+                RenameSelector::Session(SessionSelector::Id(session_id)),
+                name.clone(),
+            ),
+            "session.rename",
+            json!({"session_id": session_id, "name": name}),
+        ),
+        Command::Session {
+            command: SessionCommand::Close { session_id },
+        } => (
+            Mutation::Close(TargetSelector::Session(SessionSelector::Id(session_id))),
+            "session.close",
+            json!({"session_id": session_id}),
+        ),
+        Command::Workspace {
+            command: WorkspaceCommand::Rename { workspace_id, name },
+        } => (
+            Mutation::Rename(RenameSelector::Workspace(workspace_id), name.clone()),
+            "workspace.rename",
+            json!({"workspace_id": workspace_id, "name": name}),
+        ),
+        Command::Workspace {
+            command: WorkspaceCommand::Close { workspace_id },
+        } => (
+            Mutation::Close(TargetSelector::Workspace(workspace_id)),
+            "workspace.close",
+            json!({"workspace_id": workspace_id}),
+        ),
+        Command::Tab {
+            command: TabCommand::Rename { tab_id, name },
+        } => (
+            Mutation::Rename(RenameSelector::Tab(tab_id), name.clone()),
+            "tab.rename",
+            json!({"tab_id": tab_id, "name": name}),
+        ),
+        Command::Tab {
+            command: TabCommand::Close { tab_id },
+        } => (
+            Mutation::Close(TargetSelector::Tab(tab_id)),
+            "tab.close",
+            json!({"tab_id": tab_id}),
+        ),
+        Command::Pane {
+            command: PaneCommand::Close { pane_id },
+        } => (
+            Mutation::Close(TargetSelector::Pane(pane_id)),
+            "pane.close",
+            json!({"pane_id": pane_id}),
+        ),
+        _ => unreachable!("all non-mutation commands handled by run"),
+    };
+    match mutation {
+        Mutation::Rename(selector, name) => {
+            response_ok(
+                control(socket, ClientMessage::RenameTarget { selector, name }).await?,
+                AcknowledgedCommand::RenameTarget,
+            )?;
+            output(json_output, command_name, result, "renamed=true")
+        }
+        Mutation::Close(selector) => {
+            response_ok(
+                control(socket, ClientMessage::CloseTarget { selector }).await?,
+                AcknowledgedCommand::CloseTarget,
+            )?;
+            output(json_output, command_name, result, "closed=true")
         }
     }
+}
+
+fn output(
+    result_as_json: bool,
+    command: &str,
+    result: impl Serialize,
+    human: impl AsRef<str>,
+) -> Result<()> {
+    if result_as_json {
+        println!(
+            "{}",
+            serde_json::to_string(&json!({ "version": 1, "command": command, "result": result }))?
+        );
+    } else {
+        println!("{}", human.as_ref());
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct CliError {
+    code: String,
+    message: String,
+}
+
+impl CliError {
+    fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for CliError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CliError {}
+
+fn json_requested(args: &[OsString]) -> bool {
+    args.iter()
+        .skip(1)
+        .take_while(|argument| argument.as_os_str() != "--")
+        .any(|argument| argument.as_os_str() == "--json")
+}
+
+fn error_envelope(code: &str, message: impl Into<String>) -> serde_json::Value {
+    json!({ "version": 1, "error": { "code": code, "message": message.into() } })
+}
+
+fn render_json_error(code: &str, message: impl Into<String>) {
+    eprintln!(
+        "{}",
+        serde_json::to_string(&error_envelope(code, message))
+            .expect("the CLI error envelope is always serializable")
+    );
 }
 
 async fn open_and_attach(socket: &std::path::Path, cwd: PathBuf) -> Result<()> {
@@ -344,113 +689,11 @@ async fn control(socket: &std::path::Path, command: ClientMessage) -> Result<Ser
     .await
 }
 
-fn selector(value: &str) -> Result<TargetSelector> {
-    if value.is_empty() {
-        bail!("target must not be empty");
-    }
-    if let Some(id) = value.strip_prefix("workspace:") {
-        return id
-            .parse()
-            .map(TargetSelector::Workspace)
-            .context("invalid workspace id: expected a UUID");
-    }
-    if let Some(id) = value.strip_prefix("tab:") {
-        return id
-            .parse()
-            .map(TargetSelector::Tab)
-            .context("invalid tab id: expected a UUID");
-    }
-    if let Some(id) = value.strip_prefix("pane:") {
-        return id
-            .parse()
-            .map(TargetSelector::Pane)
-            .context("invalid pane id: expected a UUID");
-    }
-    if let Some(id) = value.strip_prefix("terminal:") {
-        return id
-            .parse()
-            .map(TargetSelector::Terminal)
-            .context("invalid terminal id: expected a UUID");
-    }
-    if let Some(session) = value.strip_prefix("session:") {
-        if session.is_empty() {
-            bail!("session selector must not be empty");
-        }
-        return Ok(TargetSelector::Session(session_selector(session)));
-    }
-    if value.contains(':') && !value.starts_with("id:") && !value.starts_with("name:") {
-        bail!("unknown target selector prefix; use name:<exact> for names containing colons");
-    }
-    Ok(TargetSelector::Session(session_selector_explicit(value)?))
-}
-
-fn rename_selector(value: &str) -> Result<RenameSelector> {
-    match selector(value)? {
-        TargetSelector::Session(selector) => Ok(RenameSelector::Session(selector)),
-        TargetSelector::Workspace(id) => Ok(RenameSelector::Workspace(id)),
-        TargetSelector::Tab(id) => Ok(RenameSelector::Tab(id)),
-        TargetSelector::Pane(_) | TargetSelector::Terminal(_) => {
-            bail!("rename target must be a session, workspace, or tab")
-        }
-    }
-}
-
-fn workspace_parent(value: &str) -> std::result::Result<WorkspaceId, String> {
-    let id = value.strip_prefix("workspace:").unwrap_or(value);
-    if value.contains(':') && id == value {
-        return Err("invalid workspace: expected a UUID or workspace:<uuid>".into());
-    }
-    id.parse()
-        .map_err(|_| "invalid workspace: expected a UUID or workspace:<uuid>".into())
-}
-
-fn session_selector_explicit(value: &str) -> Result<SessionSelector> {
-    if let Some(id) = value.strip_prefix("id:") {
-        if id.is_empty() {
-            bail!("id selector must not be empty");
-        }
-        return id
-            .parse()
-            .map(SessionSelector::Id)
-            .context("invalid id: session selector must contain a UUID");
-    }
-    if let Some(name) = value.strip_prefix("name:") {
-        if name.is_empty() {
-            bail!("name selector must not be empty");
-        }
-        return Ok(SessionSelector::Name(name.into()));
-    }
-    Ok(value
-        .parse()
-        .map(SessionSelector::Id)
-        .unwrap_or_else(|_| SessionSelector::Name(value.into())))
-}
-
 fn session_selector(value: &str) -> SessionSelector {
     value
         .parse()
         .map(SessionSelector::Id)
         .unwrap_or_else(|_| SessionSelector::Name(value.into()))
-}
-
-async fn only_session(socket: &std::path::Path) -> Result<SessionSelector> {
-    match control(socket, ClientMessage::ListResources).await? {
-        ServerMessage::Resources { snapshot } => {
-            let open = snapshot
-                .sessions
-                .iter()
-                .filter(|session| !session.closing)
-                .collect::<Vec<_>>();
-            if open.len() != 1 {
-                bail!(
-                    "session selector required when {} sessions are open",
-                    open.len()
-                );
-            }
-            Ok(SessionSelector::Id(open[0].id))
-        }
-        other => unexpected(other),
-    }
 }
 
 fn print_resources(snapshot: &ResourceSnapshot) {
@@ -518,7 +761,9 @@ fn response_ok(response: ServerMessage, expected: AcknowledgedCommand) -> Result
 
 fn unexpected<T>(message: ServerMessage) -> Result<T> {
     match message {
-        ServerMessage::Error { code, message } => bail!("daemon error ({code}): {message}"),
+        ServerMessage::Error { code, message } => {
+            Err(CliError::new(code, format!("daemon error: {message}")).into())
+        }
         other => bail!("unexpected daemon response: {other:?}"),
     }
 }
@@ -528,165 +773,173 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_new_tab_workspace_parent() {
-        let workspace_id = WorkspaceId::new();
-        for parent in [
-            workspace_id.to_string(),
-            format!("workspace:{workspace_id}"),
-        ] {
-            let cli = Cli::try_parse_from(["fut", "new-tab", &parent]).unwrap();
-            assert!(matches!(
-                cli.command,
-                Some(Command::NewTab {
-                    workspace_id: parsed,
-                    ..
-                }) if parsed == workspace_id
-            ));
-        }
+    fn detects_json_only_before_the_child_argv_delimiter() {
+        let args = |values: &[&str]| values.iter().map(OsString::from).collect::<Vec<_>>();
+        assert!(json_requested(&args(&["fut", "open", "--json"])));
+        assert!(json_requested(&args(&["fut", "open", "--json", "--", "x"])));
+        assert!(!json_requested(&args(&[
+            "fut", "open", "--", "x", "--json"
+        ])));
+        assert!(!json_requested(&args(&["fut", "--json=value", "list"])));
+    }
 
-        for parent in [
-            "not-a-uuid",
-            "workspace:not-a-uuid",
-            "tab:00000000-0000-0000-0000-000000000000",
-        ] {
-            let error = match Cli::try_parse_from(["fut", "new-tab", parent]) {
-                Ok(_) => panic!("accepted malformed workspace parent {parent:?}"),
+    #[test]
+    fn error_envelope_has_the_stable_shape() {
+        assert_eq!(
+            error_envelope("invalid_arguments", "bad input"),
+            json!({"version": 1, "error": {"code": "invalid_arguments", "message": "bad input"}})
+        );
+    }
+
+    #[test]
+    fn daemon_errors_remain_typed_through_anyhow() {
+        let error = unexpected::<()>(ServerMessage::Error {
+            code: "not_found".into(),
+            message: "missing session".into(),
+        })
+        .unwrap_err();
+        let cli_error = error.downcast_ref::<CliError>().unwrap();
+        assert_eq!(cli_error.code, "not_found");
+        assert_eq!(cli_error.to_string(), "daemon error: missing session");
+    }
+
+    #[test]
+    fn help_and_version_are_successful_clap_results() {
+        for args in [&["fut", "--help"][..], &["fut", "--json", "--version"][..]] {
+            let error = match Cli::try_parse_from(args) {
+                Ok(_) => panic!("help/version unexpectedly parsed as a command"),
                 Err(error) => error,
             };
-            assert!(
-                error
-                    .to_string()
-                    .contains("expected a UUID or workspace:<uuid>"),
-                "unexpected error for {parent:?}: {error}"
-            );
+            assert!(!error.use_stderr());
+            assert_eq!(error.exit_code(), 0);
         }
     }
 
     #[test]
-    fn parses_explicit_and_convenient_session_selectors() {
-        let id = crate::domain::SessionId::new();
+    fn parses_entire_command_tree() {
+        let session = SessionId::new().to_string();
+        let workspace = WorkspaceId::new().to_string();
+        let tab = TabId::new().to_string();
+        let pane = PaneId::new().to_string();
+        let terminal = TerminalId::new().to_string();
+        for args in [
+            vec!["fut", "open"],
+            vec!["fut", "list"],
+            vec!["fut", "session", "attach", "a name"],
+            vec!["fut", "session", "rename", &session, "new"],
+            vec!["fut", "session", "close", &session],
+            vec!["fut", "workspace", "attach", &workspace],
+            vec!["fut", "workspace", "rename", &workspace, "new"],
+            vec!["fut", "workspace", "close", &workspace],
+            vec!["fut", "tab", "new", &workspace],
+            vec!["fut", "tab", "attach", &tab],
+            vec!["fut", "tab", "rename", &tab, "new"],
+            vec!["fut", "tab", "close", &tab],
+            vec!["fut", "pane", "attach", &pane],
+            vec!["fut", "pane", "close", &pane],
+            vec!["fut", "terminal", "attach", &terminal],
+            vec!["fut", "daemon", "run"],
+            vec!["fut", "daemon", "ping"],
+            vec!["fut", "daemon", "shutdown"],
+        ] {
+            Cli::try_parse_from(args).unwrap();
+        }
+    }
+
+    #[test]
+    fn session_attach_interprets_only_raw_uuid_as_id() {
+        let id = SessionId::new();
+        assert_eq!(session_selector(&id.to_string()), SessionSelector::Id(id));
         assert_eq!(
-            selector(&format!("id:{id}")).unwrap(),
-            TargetSelector::Session(SessionSelector::Id(id))
+            session_selector("id:abc"),
+            SessionSelector::Name("id:abc".into())
         );
         assert_eq!(
-            selector(&id.to_string()).unwrap(),
-            TargetSelector::Session(SessionSelector::Id(id))
+            session_selector("name:abc"),
+            SessionSelector::Name("name:abc".into())
         );
-        assert_eq!(
-            selector(&format!("name:{id}")).unwrap(),
-            TargetSelector::Session(SessionSelector::Name(id.to_string()))
-        );
-        assert_eq!(
-            selector("name:雪 λ").unwrap(),
-            TargetSelector::Session(SessionSelector::Name("雪 λ".into()))
-        );
+    }
+
+    #[test]
+    fn child_commands_require_delimiter_and_preserve_flags() {
+        assert!(Cli::try_parse_from(["fut", "open", ".", "echo"]).is_err());
+        let cli = Cli::try_parse_from(["fut", "open", "--", "echo", "--flag"]).unwrap();
         assert!(
-            selector("id:not-a-uuid")
-                .unwrap_err()
-                .to_string()
-                .contains("invalid id")
+            matches!(cli.command, Some(Command::Open { command, .. }) if command == ["echo", "--flag"])
         );
-        let workspace = crate::domain::WorkspaceId::new();
-        assert_eq!(
-            selector(&format!("workspace:{workspace}")).unwrap(),
-            TargetSelector::Workspace(workspace)
-        );
-        assert!(
-            selector("terminal:not-a-uuid")
-                .unwrap_err()
-                .to_string()
-                .contains("invalid terminal id")
-        );
-        for malformed in [
-            "",
-            "id:",
-            "name:",
-            "session:",
-            "workspace:",
-            "tab:",
-            "pane:",
-            "terminal:",
-            "unknown:value",
-        ] {
-            assert!(selector(malformed).is_err(), "accepted {malformed:?}");
-        }
-        assert_eq!(
-            selector("name:has:colons").unwrap(),
-            TargetSelector::Session(SessionSelector::Name("has:colons".into()))
-        );
+        let workspace = WorkspaceId::new().to_string();
+        assert!(Cli::try_parse_from(["fut", "tab", "new", &workspace, "echo"]).is_err());
+        assert!(Cli::try_parse_from(["fut", "daemon", "run", "echo"]).is_err());
     }
 
     #[test]
-    fn parses_rename_selectors() {
-        let session = crate::domain::SessionId::new();
-        let workspace = crate::domain::WorkspaceId::new();
-        let tab = crate::domain::TabId::new();
-
-        for (target, expected) in [
-            (
-                format!("session:{session}"),
-                RenameSelector::Session(SessionSelector::Id(session)),
-            ),
-            (
-                format!("id:{session}"),
-                RenameSelector::Session(SessionSelector::Id(session)),
-            ),
-            (
-                "name:exact name".into(),
-                RenameSelector::Session(SessionSelector::Name("exact name".into())),
-            ),
-            (
-                "bare name".into(),
-                RenameSelector::Session(SessionSelector::Name("bare name".into())),
-            ),
-            (
-                format!("workspace:{workspace}"),
-                RenameSelector::Workspace(workspace),
-            ),
-            (format!("tab:{tab}"), RenameSelector::Tab(tab)),
+    fn rejects_legacy_forms_typed_prefixes_and_bad_mutation_ids() {
+        for args in [
+            ["fut", "new"],
+            ["fut", "new-tab"],
+            ["fut", "attach"],
+            ["fut", "rename"],
+            ["fut", "close"],
+            ["fut", "ping"],
+            ["fut", "shutdown"],
+            ["fut", "sess"],
         ] {
-            assert_eq!(
-                rename_selector(&target).unwrap(),
-                expected,
-                "target {target:?}"
-            );
+            assert!(Cli::try_parse_from(args).is_err());
         }
-
-        let pane = crate::domain::PaneId::new();
-        let terminal = crate::domain::TerminalId::new();
-        for target in [format!("pane:{pane}"), format!("terminal:{terminal}")] {
-            assert_eq!(
-                rename_selector(&target).unwrap_err().to_string(),
-                "rename target must be a session, workspace, or tab"
-            );
-        }
-        for malformed in [
-            "",
-            "session:",
-            "id:",
-            "id:not-a-uuid",
-            "name:",
-            "workspace:",
-            "workspace:not-a-uuid",
-            "tab:",
-            "tab:not-a-uuid",
-            "unknown:value",
-        ] {
-            assert!(
-                rename_selector(malformed).is_err(),
-                "accepted {malformed:?}"
-            );
-        }
+        assert!(Cli::try_parse_from(["fut", "session", "att"]).is_err());
+        assert!(Cli::try_parse_from(["fut", "workspace", "attach", "workspace:abc"]).is_err());
+        assert!(Cli::try_parse_from(["fut", "session", "rename", "a-name", "new"]).is_err());
     }
 
     #[test]
-    fn parses_rename_command_name_as_one_argument() {
-        let cli = Cli::try_parse_from(["fut", "rename", "name:old", "new name"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Command::Rename { target, name })
-                if target == "name:old" && name == "new name"
-        ));
+    fn rejects_json_for_interactive_commands() {
+        let terminal = TerminalId::new().to_string();
+        for args in [
+            vec!["fut", "--json"],
+            vec!["fut", "--json", "terminal", "attach", &terminal],
+            vec!["fut", "--json", "daemon", "run"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(reject_interactive_json(&cli).is_err());
+        }
+        let cli = Cli::try_parse_from(["fut", "--json", "list"]).unwrap();
+        assert!(reject_interactive_json(&cli).is_ok());
+    }
+
+    #[test]
+    fn rejects_removed_attach_flags() {
+        let workspace = WorkspaceId::new().to_string();
+        assert!(Cli::try_parse_from(["fut", "open", "--attach"]).is_err());
+        assert!(Cli::try_parse_from(["fut", "tab", "new", &workspace, "--attach"]).is_err());
+    }
+
+    #[test]
+    fn help_exposes_the_exact_noun_first_tree_and_command_contracts() {
+        use clap::CommandFactory;
+
+        let command = Cli::command();
+        let names: Vec<_> = command
+            .get_subcommands()
+            .map(clap::Command::get_name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "open",
+                "session",
+                "workspace",
+                "tab",
+                "pane",
+                "terminal",
+                "list",
+                "daemon"
+            ]
+        );
+
+        let mut help = Vec::new();
+        Cli::command().write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+        assert!(help.contains("versioned JSON for noninteractive commands only"));
+        assert!(help.contains("existing daemon without attaching"));
     }
 }

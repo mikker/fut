@@ -230,6 +230,7 @@ impl SharedState {
                 CloseScope::Session(self.resources.resolve_session(selector)?)
             }
             TargetSelector::Workspace(id) => CloseScope::Workspace(id),
+            TargetSelector::Tab(id) => CloseScope::Tab(id),
             other => CloseScope::Pane(self.resources.resolve_terminal_target(Some(other))?.pane_id),
         };
         let mut planned = self.resources.clone();
@@ -284,6 +285,7 @@ impl SharedState {
 enum CloseScope {
     Session(SessionId),
     Workspace(WorkspaceId),
+    Tab(TabId),
     Pane(PaneId),
 }
 
@@ -292,6 +294,7 @@ impl CloseScope {
         match self {
             Self::Session(id) => tree.close_session(id),
             Self::Workspace(id) => tree.close_workspace(id),
+            Self::Tab(id) => tree.close_tab(id),
             Self::Pane(id) => tree.close_pane(id),
         }
     }
@@ -300,6 +303,7 @@ impl CloseScope {
         match self {
             Self::Session(id) => tree.cancel_close_session(id),
             Self::Workspace(id) => tree.cancel_close_workspace(id),
+            Self::Tab(id) => tree.cancel_close_tab(id),
             Self::Pane(id) => tree.cancel_close_pane(id),
         }
     }

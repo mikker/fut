@@ -1,47 +1,78 @@
 # fut
 
-`fut` is a modern, agent-aware terminal multiplexer organized around projects and their worktrees.
+`fut` is an agent-oriented terminal multiplexer organized as sessions, workspaces, tabs, panes, and terminals. One daemon owns the live resource tree; clients and automation address resources by their raw IDs.
 
-The project is currently in its design and first-spike phase:
+The current Rust vertical slice supports multiple project sessions, explicitly opened Git worktrees as peer workspaces, multiple tabs, detach/reattach, rename and close operations, and semantic `libghostty-vt` terminal snapshots.
 
-- [VISION.md](VISION.md) describes the desired end state and architectural direction.
-- [CONTEXT.md](CONTEXT.md) defines the project's shared language.
-- [PLAN.md](PLAN.md) lays out the implementation sequence and exit criteria.
-
-## Current vertical slice
-
-The current Rust implementation proves one daemon-owned resource tree with multiple live project sessions. Git project identity is the canonical Git common directory, so explicitly opened linked worktrees join the existing session as peer workspaces. Non-Git directories use canonical directory identity. Workspaces can contain multiple tabs, with one pane and terminal per created tab. Terminals retain semantic `libghostty-vt` snapshots and survive detach/reattach.
+## Run it
 
 ```sh
 mise install
 mise run check
 
-cargo run                 # open the current checkout, then attach its returned terminal
-cargo run -- new api --cwd ../api -- /bin/zsh
-cargo run -- new-tab workspace:<uuid> --name server --cwd services/api -- ./bin/server
+cargo run                          # open the current directory and attach
+cargo run -- daemon run            # explicitly run the daemon
+cargo run -- open ../api           # control-only; daemon must already exist
+cargo run -- open ../api --name api -- /bin/zsh
 cargo run -- list
-cargo run -- rename tab:<uuid> "api server"
-cargo run -- attach api   # exact session name; typed workspace:/tab:/pane:/terminal: IDs also work
-cargo run -- ping
-cargo run -- close workspace:<uuid> # close only that workspace and its descendants
-cargo run -- shutdown     # stop the daemon
 ```
+
+`fut open [PATH] [--name NAME] [-- COMMAND...]` replaces the former `new` command. It is always control-only and requires an existing daemon. Bare `fut` is the convenience path that opens the current directory and then attaches to the returned terminal. Attaching to an existing resource is a separate `RESOURCE attach ID` operation; the CLI does not offer an atomic create-and-attach command. Child commands always follow `--`; they are passed as arguments without shell evaluation.
+
+## Control surface
+
+Resource operations are noun-first. Top-level `open` and `list`, plus the `daemon` lifecycle commands, are intentional non-resource entry points:
+
+```sh
+fut session attach SESSION
+fut session rename SESSION_ID NAME
+fut session close SESSION_ID
+
+fut workspace attach WORKSPACE_ID
+fut workspace rename WORKSPACE_ID NAME
+fut workspace close WORKSPACE_ID
+
+fut tab new WORKSPACE_ID [--name NAME] [--cwd PATH] [-- COMMAND...]
+fut tab attach TAB_ID
+fut tab rename TAB_ID NAME
+fut tab close TAB_ID
+
+fut pane attach PANE_ID
+fut pane close PANE_ID
+fut terminal attach TERMINAL_ID
+
+fut list
+fut daemon run [--cwd PATH] [-- COMMAND...]
+fut daemon ping
+fut daemon shutdown
+```
+
+Mutation commands accept raw IDs only. Attach commands also use raw IDs, except `session attach`, which additionally permits an exact session name as a convenience. A UUID-shaped session value always has ID precedence, even if it could be a session name. Attaching by session, workspace, or tab succeeds only when that ancestor identifies exactly one open terminal; otherwise use an exact pane or terminal ID, or choose through the navigator. Pane and terminal IDs identify their terminal exactly. There is no public `resource:<id>` or selector mini-language; the internal client/daemon protocol remains typed.
+
+`tab new` defaults its working directory to the workspace root; relative `--cwd` values resolve from that root. Names are unique in their scope. Worktrees are discovered only when explicitly opened.
+
+## Automation and interaction
+
+Global `--json` is available only for noninteractive control commands. Successful output has a versioned envelope and dotted command name:
+
+```json
+{"version":1,"command":"workspace.rename","result":{"workspace_id":"…","name":"api"}}
+```
+
+Human-readable output is not a machine contract. Agents should use `--json`, retain the raw IDs returned by Fut, and pass those IDs to later commands. The TUI uses typed protocol IDs directly and never constructs CLI selectors.
+
+Failures under `--json` are compact and versioned:
+
+```json
+{"version":1,"error":{"code":"not_found","message":"daemon error: resource not found"}}
+```
+
+Daemon error codes are preserved. CLI argument failures use `invalid_arguments`; failures without a more specific daemon code use `command_failed`.
+
+The intended manual UX is dynamic, daemon-backed shell completion that displays names and hierarchy while inserting raw IDs. That completion is not implemented yet; copy IDs from `fut list` for now.
 
 Inside the client, `Ctrl-b c` creates and switches to a default shell tab, `Ctrl-b g` opens the global navigator, `Ctrl-b d` detaches, and `Ctrl-b Ctrl-b` sends a literal `Ctrl-b`.
 
-The testing layers can also be run independently:
+Current limitations include one pane and terminal per created tab, no splits or layout mutations, no pane naming or move operation, basic input encoding, and full-grid JSON snapshots. Fuzzy navigation, project recipes, agent activity, and dynamic completion remain planned. Actual shell autocomplete is the next near-term missing control-surface item.
 
-```sh
-mise run test:unit
-mise run test:e2e
-```
-
-Bare `fut` and `fut attach` open the current checkout and attach the specific terminal returned by the daemon. `fut attach TARGET` is attach-only. `new` requires an already-running daemon. Its name overrides the session name for a new project or the workspace name for a new worktree; an existing workspace ignores it. Implicit resolver names are deterministically suffixed (`name-2`, `name-3`, …) on collision, while explicit duplicate names are errors. Worktrees are discovered only when explicitly opened; Fut does not eagerly enumerate them.
-
-`fut new-tab WORKSPACE [--name NAME] [--cwd PATH] [COMMAND...]` creates a tab in an existing workspace. Its working directory defaults to the workspace root, and a relative `--cwd` is resolved from that root. Commands are passed as arguments without shell evaluation.
-
-Session selectors accept `session:<uuid-or-exact-name>`, `id:<uuid>`, `name:<exact>`, bare UUIDs, and bare exact names. Names containing colons require `name:<exact>`. Other resources use explicit typed UUID selectors. A normal session/workspace selector must still resolve to exactly one open terminal.
-
-`fut rename TARGET NAME` renames sessions, workspaces, and tabs only. Session targets accept the session selector forms above; workspace and tab targets require `workspace:<uuid>` and `tab:<uuid>`. Names are stored exactly as supplied and must be unique in their scope: sessions globally, workspaces within a session, and tabs within a workspace. Renaming to the exact current name is a no-op. The minimal in-client global navigator switches directly between live panes and shows renamed resources when opened after the rename; it does not provide inline editing.
-
-Pane naming and move, split, and layout operations are not implemented yet. Fuzzy matching, project recipes, and agent activity are also not implemented.
+See [VISION.md](VISION.md) for the product direction, [CONTEXT.md](CONTEXT.md) for shared language, and [PLAN.md](PLAN.md) for implementation status and exit criteria.

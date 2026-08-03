@@ -195,6 +195,9 @@ pub enum ResourceEvent {
         pane_id: PaneId,
         terminal_id: TerminalId,
     },
+    TabCloseRequested {
+        tab_id: TabId,
+    },
     SessionCloseRequested {
         session_id: SessionId,
     },
@@ -204,6 +207,9 @@ pub enum ResourceEvent {
     PaneCloseCancelled {
         pane_id: PaneId,
         terminal_id: TerminalId,
+    },
+    TabCloseCancelled {
+        tab_id: TabId,
     },
     SessionCloseCancelled {
         session_id: SessionId,
@@ -917,6 +923,51 @@ impl ResourceTree {
             }],
             vec![],
         ))
+    }
+
+    pub fn close_tab(&mut self, tab_id: TabId) -> Result<Mutation, ResourceError> {
+        let tab = self
+            .tabs
+            .get(&tab_id)
+            .ok_or(ResourceError::NotFound("tab"))?;
+        let workspace = &self.workspaces[&tab.workspace_id];
+        if self.sessions[&workspace.session_id].closing {
+            return Err(ResourceError::Closing("session"));
+        }
+        if workspace.closing {
+            return Err(ResourceError::Closing("workspace"));
+        }
+        if tab.panes.iter().any(|id| self.panes[id].closing) {
+            return Err(ResourceError::Closing("pane"));
+        }
+        let panes = tab.panes.clone();
+        let terminals = panes.iter().map(|id| self.panes[id].terminal_id).collect();
+        for pane_id in panes {
+            self.panes.get_mut(&pane_id).unwrap().closing = true;
+        }
+        Ok(self.finish(vec![ResourceEvent::TabCloseRequested { tab_id }], terminals))
+    }
+
+    pub fn cancel_close_tab(&mut self, tab_id: TabId) -> Result<Mutation, ResourceError> {
+        let tab = self
+            .tabs
+            .get(&tab_id)
+            .ok_or(ResourceError::NotFound("tab"))?;
+        let workspace = &self.workspaces[&tab.workspace_id];
+        if self.sessions[&workspace.session_id].closing {
+            return Err(ResourceError::Closing("session"));
+        }
+        if workspace.closing {
+            return Err(ResourceError::Closing("workspace"));
+        }
+        if !tab.panes.iter().all(|id| self.panes[id].closing) {
+            return Err(ResourceError::NotFound("pending tab close"));
+        }
+        let panes = tab.panes.clone();
+        for pane_id in panes {
+            self.panes.get_mut(&pane_id).unwrap().closing = false;
+        }
+        Ok(self.finish(vec![ResourceEvent::TabCloseCancelled { tab_id }], vec![]))
     }
 
     pub fn close_session(&mut self, session_id: SessionId) -> Result<Mutation, ResourceError> {
@@ -2357,6 +2408,115 @@ mod tests {
         tree.close_session(tree.snapshot().sessions[1].id).unwrap();
         assert_eq!(
             tree.rename_tab(second_tab, "again".into()),
+            Err(ResourceError::Closing("session"))
+        );
+        tree.validate().unwrap();
+    }
+
+    #[test]
+    fn whole_tab_close_is_ordered_atomic_and_cascades_only_after_the_last_exit() {
+        let mut tree = ResourceTree::default();
+        let path = initial("session", "/project");
+        let (workspace_id, tab_id, first_pane, first_terminal) = (
+            path.workspace_id,
+            path.tab_id,
+            path.pane_id,
+            path.terminal_id,
+        );
+        tree.create_session(path).unwrap();
+        let second_pane = PaneId::new();
+        let second_terminal = TerminalId::new();
+        tree.add_pane(tab_id, second_pane, second_terminal).unwrap();
+        tree.add_tab(
+            workspace_id,
+            TabPath {
+                tab_id: TabId::new(),
+                tab_name: "peer".into(),
+                pane_id: PaneId::new(),
+                terminal_id: TerminalId::new(),
+            },
+        )
+        .unwrap();
+
+        let close = tree.close_tab(tab_id).unwrap();
+        assert_eq!(
+            close.terminals_to_close,
+            vec![first_terminal, second_terminal]
+        );
+        assert_eq!(
+            close.events,
+            vec![ResourceEvent::TabCloseRequested { tab_id }]
+        );
+        assert!(
+            tree.snapshot().sessions[0].workspaces[0].tabs[0]
+                .panes
+                .iter()
+                .all(|pane| pane.closing)
+        );
+        let before = tree.snapshot();
+        assert_eq!(tree.close_tab(tab_id), Err(ResourceError::Closing("pane")));
+        assert_eq!(tree.snapshot(), before);
+
+        let first_exit = tree.terminal_exited(first_terminal).unwrap();
+        assert_eq!(
+            first_exit.events,
+            vec![ResourceEvent::PaneClosed {
+                pane_id: first_pane,
+                terminal_id: first_terminal,
+                cause: CloseCause::Requested,
+            }]
+        );
+        let last_exit = tree.terminal_exited(second_terminal).unwrap();
+        assert_eq!(
+            last_exit.events,
+            vec![
+                ResourceEvent::PaneClosed {
+                    pane_id: second_pane,
+                    terminal_id: second_terminal,
+                    cause: CloseCause::Requested,
+                },
+                ResourceEvent::TabClosed { tab_id },
+            ]
+        );
+        tree.validate().unwrap();
+    }
+
+    #[test]
+    fn whole_tab_close_can_cancel_remaining_panes_and_respects_ancestors() {
+        let mut tree = ResourceTree::default();
+        let path = initial("session", "/project");
+        let (session_id, workspace_id, tab_id, first_terminal) = (
+            path.session_id,
+            path.workspace_id,
+            path.tab_id,
+            path.terminal_id,
+        );
+        tree.create_session(path).unwrap();
+        let pane_id = PaneId::new();
+        let terminal_id = TerminalId::new();
+        tree.add_pane(tab_id, pane_id, terminal_id).unwrap();
+        assert_eq!(
+            tree.cancel_close_tab(tab_id),
+            Err(ResourceError::NotFound("pending tab close"))
+        );
+        tree.close_tab(tab_id).unwrap();
+        tree.terminal_exited(first_terminal).unwrap();
+        let cancel = tree.cancel_close_tab(tab_id).unwrap();
+        assert_eq!(
+            cancel.events,
+            vec![ResourceEvent::TabCloseCancelled { tab_id }]
+        );
+        assert!(!tree.snapshot().sessions[0].workspaces[0].tabs[0].panes[0].closing);
+
+        tree.close_workspace(workspace_id).unwrap();
+        assert_eq!(
+            tree.cancel_close_tab(tab_id),
+            Err(ResourceError::Closing("workspace"))
+        );
+        tree.cancel_close_workspace(workspace_id).unwrap();
+        tree.close_session(session_id).unwrap();
+        assert_eq!(
+            tree.cancel_close_tab(tab_id),
             Err(ResourceError::Closing("session"))
         );
         tree.validate().unwrap();
