@@ -11,9 +11,8 @@ use uuid::Uuid;
 use crate::{
     client,
     daemon::{DaemonConfig, autostart::ensure_daemon, path::socket_path, run_daemon},
-    domain::TerminalSize,
     protocol::{
-        AcknowledgedCommand, ClientKind, ClientMessage, Envelope, PROTOCOL_VERSION, ServerMessage,
+        AcknowledgedCommand, ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, ServerMessage,
         codec, decode_payload, encode_payload,
     },
     resources::{ResourceSnapshot, SessionSelector},
@@ -166,21 +165,27 @@ async fn control(socket: &std::path::Path, command: ClientMessage) -> Result<Ser
         ClientMessage::Hello {
             version: PROTOCOL_VERSION,
             client_version: env!("CARGO_PKG_VERSION").into(),
-            kind: ClientKind::Control,
-            size: TerminalSize {
-                columns: 80,
-                rows: 24,
-            },
-            selector: None,
+            mode: ClientMode::Control,
         },
     )
     .await?;
-    match receive(&mut framed).await? {
+    match receive(
+        &mut framed,
+        Duration::from_secs(2),
+        "daemon handshake timed out",
+    )
+    .await?
+    {
         ServerMessage::Welcome { .. } => {}
         other => return unexpected(other),
     }
     send(&mut framed, command).await?;
-    receive(&mut framed).await
+    receive(
+        &mut framed,
+        Duration::from_secs(15),
+        "daemon response timed out",
+    )
+    .await
 }
 
 fn selector(value: &str) -> Result<SessionSelector> {
@@ -265,10 +270,12 @@ async fn send(
 
 async fn receive(
     framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    duration: Duration,
+    timeout_message: &'static str,
 ) -> Result<ServerMessage> {
-    let frame = tokio::time::timeout(Duration::from_secs(15), framed.next())
+    let frame = tokio::time::timeout(duration, framed.next())
         .await
-        .context("daemon response timed out")?
+        .context(timeout_message)?
         .context("daemon disconnected")??;
     Ok(decode_payload::<Envelope<ServerMessage>>(&frame)?.message)
 }

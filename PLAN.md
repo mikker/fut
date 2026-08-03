@@ -14,7 +14,7 @@ The Milestone 0–1 spike and the first daemon-integrated Milestone 2 slice are 
 - durable terminal lifecycle and confirmed child cleanup;
 - separate unit and process-level end-to-end test layers.
 
-This validates the first multi-session vertical slice but does not complete Milestone 2. Input encoding remains a basic client-side mapping and snapshots are full-grid JSON messages. Project identity currently uses canonical directories; Git common-dir/worktree discovery is deliberately next. Every connection selects one terminal at handshake, with no retargeting, navigator, direct switching, rename/move/split operations, or project recipes. A session disappears when its terminal exits; only the last session exit closes Fut and releases the socket.
+This validates the first multi-session vertical slice but does not complete Milestone 2. Input encoding remains a basic client-side mapping and snapshots are full-grid JSON messages. Sessions are currently directory-backed; Git common-dir/worktree identity is deliberately next. Only interactive connections select one terminal at handshake, with no retargeting, navigator, direct switching, rename/move/split operations, or project recipes. A session disappears when its terminal exits; only the last session exit closes Fut and releases the socket.
 
 ## Strategy
 

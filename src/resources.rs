@@ -4,7 +4,7 @@
 //! canonicalize them before inserting them here. This tree deliberately performs no I/O.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     path::PathBuf,
 };
 
@@ -12,8 +12,6 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::domain::{PaneId, SessionId, TabId, TerminalId, WorkspaceId};
-
-const FINALIZED_REQUESTED_TERMINALS_CAPACITY: usize = 1024;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum ProjectIdentity {
@@ -62,6 +60,15 @@ pub struct WorkspacePath {
 pub struct TabPath {
     pub tab_id: TabId,
     pub tab_name: String,
+    pub pane_id: PaneId,
+    pub terminal_id: TerminalId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResolvedTerminalPath {
+    pub session_id: SessionId,
+    pub workspace_id: WorkspaceId,
+    pub tab_id: TabId,
     pub pane_id: PaneId,
     pub terminal_id: TerminalId,
 }
@@ -145,7 +152,6 @@ pub enum ResourceEvent {
     },
     SessionCloseRequested {
         session_id: SessionId,
-        terminal_ids: Vec<TerminalId>,
     },
     PaneCloseCancelled {
         pane_id: PaneId,
@@ -161,15 +167,12 @@ pub enum ResourceEvent {
     },
     TabClosed {
         tab_id: TabId,
-        cause: CloseCause,
     },
     WorkspaceClosed {
         workspace_id: WorkspaceId,
-        cause: CloseCause,
     },
     SessionClosed {
         session_id: SessionId,
-        cause: CloseCause,
     },
 }
 
@@ -195,8 +198,8 @@ pub enum ResourceError {
     DifferentWorkspace,
     #[error("resource is closing: {0}")]
     Closing(&'static str),
-    #[error("terminal exit was already finalized after a requested close")]
-    AlreadyFinalized,
+    #[error("a session target must be selected")]
+    TargetRequired,
     #[error("resource tree invariant violated: {0}")]
     Invariant(String),
 }
@@ -237,7 +240,6 @@ pub struct ResourceTree {
     tabs: BTreeMap<TabId, Tab>,
     panes: BTreeMap<PaneId, Pane>,
     terminals: BTreeMap<TerminalId, PaneId>,
-    finalized_requested_terminals: VecDeque<TerminalId>,
 }
 
 impl ResourceTree {
@@ -257,6 +259,64 @@ impl ResourceTree {
                 .find(|id| self.sessions[id].name == name)
                 .ok_or(ResourceError::NotFound("session")),
         }
+    }
+
+    pub fn resolve_terminal_target(
+        &self,
+        selector: Option<SessionSelector>,
+    ) -> Result<ResolvedTerminalPath, ResourceError> {
+        let session_id = match selector {
+            Some(selector) => self.resolve_session(selector)?,
+            None => {
+                let mut open = self.session_order.iter().copied().filter(|id| {
+                    self.sessions
+                        .get(id)
+                        .is_some_and(|session| !session.closing)
+                });
+                let session_id = open.next().ok_or(ResourceError::TargetRequired)?;
+                if open.next().is_some() {
+                    return Err(ResourceError::TargetRequired);
+                }
+                session_id
+            }
+        };
+        let session = self
+            .sessions
+            .get(&session_id)
+            .ok_or(ResourceError::NotFound("session"))?;
+        if session.closing {
+            return Err(ResourceError::Closing("session"));
+        }
+        let workspace_id = *session
+            .workspaces
+            .first()
+            .ok_or_else(|| ResourceError::Invariant("session has no workspace".into()))?;
+        let workspace = self.workspaces.get(&workspace_id).ok_or_else(|| {
+            ResourceError::Invariant("session references missing workspace".into())
+        })?;
+        let tab_id = *workspace
+            .tabs
+            .first()
+            .ok_or_else(|| ResourceError::Invariant("workspace has no tab".into()))?;
+        let tab = self
+            .tabs
+            .get(&tab_id)
+            .ok_or_else(|| ResourceError::Invariant("workspace references missing tab".into()))?;
+        let pane_id = *tab
+            .panes
+            .first()
+            .ok_or_else(|| ResourceError::Invariant("tab has no pane".into()))?;
+        let pane = self
+            .panes
+            .get(&pane_id)
+            .ok_or_else(|| ResourceError::Invariant("tab references missing pane".into()))?;
+        Ok(ResolvedTerminalPath {
+            session_id,
+            workspace_id,
+            tab_id,
+            pane_id,
+            terminal_id: pane.terminal_id,
+        })
     }
 
     #[must_use]
@@ -550,7 +610,7 @@ impl ResourceTree {
             from: pane.tab_id,
             to: destination,
         }];
-        self.cascade_empty(pane.tab_id, CloseCause::Requested, &mut events);
+        self.cascade_empty(pane.tab_id, &mut events);
         Ok(self.finish(events, vec![]))
     }
 
@@ -613,10 +673,7 @@ impl ResourceTree {
             self.panes.get_mut(&pane_id).unwrap().closing = true;
         }
         Ok(self.finish(
-            vec![ResourceEvent::SessionCloseRequested {
-                session_id,
-                terminal_ids: terminals.clone(),
-            }],
+            vec![ResourceEvent::SessionCloseRequested { session_id }],
             terminals,
         ))
     }
@@ -646,11 +703,7 @@ impl ResourceTree {
 
     pub fn terminal_exited(&mut self, terminal_id: TerminalId) -> Result<Mutation, ResourceError> {
         let Some(&pane_id) = self.terminals.get(&terminal_id) else {
-            return if self.finalized_requested_terminals.contains(&terminal_id) {
-                Err(ResourceError::AlreadyFinalized)
-            } else {
-                Err(ResourceError::NotFound("terminal"))
-            };
+            return Err(ResourceError::NotFound("terminal"));
         };
         let requested = self.panes[&pane_id].closing;
         let cause = if requested {
@@ -659,15 +712,12 @@ impl ResourceTree {
             CloseCause::TerminalExited
         };
         let tab_id = self.remove_pane(pane_id);
-        if requested {
-            self.remember_finalized_requested_terminal(terminal_id);
-        }
         let mut events = vec![ResourceEvent::PaneClosed {
             pane_id,
             terminal_id,
             cause,
         }];
-        self.cascade_empty(tab_id, cause, &mut events);
+        self.cascade_empty(tab_id, &mut events);
         Ok(self.finish(events, vec![]))
     }
 
@@ -775,7 +825,7 @@ impl ResourceTree {
         pane.tab_id
     }
 
-    fn cascade_empty(&mut self, tab_id: TabId, cause: CloseCause, events: &mut Vec<ResourceEvent>) {
+    fn cascade_empty(&mut self, tab_id: TabId, events: &mut Vec<ResourceEvent>) {
         if !self.tabs[&tab_id].panes.is_empty() {
             return;
         }
@@ -785,7 +835,7 @@ impl ResourceTree {
             .unwrap()
             .tabs
             .retain(|id| *id != tab_id);
-        events.push(ResourceEvent::TabClosed { tab_id, cause });
+        events.push(ResourceEvent::TabClosed { tab_id });
         if !self.workspaces[&workspace_id].tabs.is_empty() {
             return;
         }
@@ -795,21 +845,16 @@ impl ResourceTree {
             .unwrap()
             .workspaces
             .retain(|id| *id != workspace_id);
-        events.push(ResourceEvent::WorkspaceClosed {
-            workspace_id,
-            cause,
-        });
+        events.push(ResourceEvent::WorkspaceClosed { workspace_id });
         if !self.sessions[&session_id].workspaces.is_empty() {
             return;
         }
         self.sessions.remove(&session_id);
         self.session_order.retain(|id| *id != session_id);
-        events.push(ResourceEvent::SessionClosed { session_id, cause });
+        events.push(ResourceEvent::SessionClosed { session_id });
     }
 
     fn insert_pane(&mut self, tab_id: TabId, pane_id: PaneId, terminal_id: TerminalId) {
-        self.finalized_requested_terminals
-            .retain(|finalized| *finalized != terminal_id);
         self.panes.insert(
             pane_id,
             Pane {
@@ -819,12 +864,6 @@ impl ResourceTree {
             },
         );
         self.terminals.insert(terminal_id, pane_id);
-    }
-    fn remember_finalized_requested_terminal(&mut self, terminal_id: TerminalId) {
-        if self.finalized_requested_terminals.len() == FINALIZED_REQUESTED_TERMINALS_CAPACITY {
-            self.finalized_requested_terminals.pop_front();
-        }
-        self.finalized_requested_terminals.push_back(terminal_id);
     }
     fn finish(
         &mut self,
@@ -988,6 +1027,109 @@ mod tests {
     }
 
     #[test]
+    fn terminal_target_requires_one_open_session_without_a_selector() {
+        let mut tree = ResourceTree::default();
+        assert_eq!(
+            tree.resolve_terminal_target(None),
+            Err(ResourceError::TargetRequired)
+        );
+
+        let first = initial("first", "/first");
+        let expected = ResolvedTerminalPath {
+            session_id: first.session_id,
+            workspace_id: first.workspace_id,
+            tab_id: first.tab_id,
+            pane_id: first.pane_id,
+            terminal_id: first.terminal_id,
+        };
+        tree.create_session(first).unwrap();
+        assert_eq!(tree.resolve_terminal_target(None), Ok(expected));
+
+        let second = initial("second", "/second");
+        let second_id = second.session_id;
+        tree.create_session(second).unwrap();
+        assert_eq!(
+            tree.resolve_terminal_target(None),
+            Err(ResourceError::TargetRequired)
+        );
+        tree.close_session(second_id).unwrap();
+        assert_eq!(tree.resolve_terminal_target(None), Ok(expected));
+    }
+
+    #[test]
+    fn terminal_target_uses_first_ordered_children_and_exact_explicit_selector() {
+        let mut tree = ResourceTree::default();
+        let first = initial("first", "/first");
+        let first_id = first.session_id;
+        let expected = ResolvedTerminalPath {
+            session_id: first.session_id,
+            workspace_id: first.workspace_id,
+            tab_id: first.tab_id,
+            pane_id: first.pane_id,
+            terminal_id: first.terminal_id,
+        };
+        tree.create_session(first).unwrap();
+        tree.create_session(initial("second", "/second")).unwrap();
+
+        assert_eq!(
+            tree.resolve_terminal_target(Some(SessionSelector::Id(first_id))),
+            Ok(expected)
+        );
+        assert_eq!(
+            tree.resolve_terminal_target(Some(SessionSelector::Name("first".into()))),
+            Ok(expected)
+        );
+        assert_eq!(
+            tree.resolve_terminal_target(Some(SessionSelector::Name("First".into()))),
+            Err(ResourceError::NotFound("session"))
+        );
+        assert_eq!(
+            tree.resolve_terminal_target(Some(SessionSelector::Id(SessionId::new()))),
+            Err(ResourceError::NotFound("session"))
+        );
+    }
+
+    #[test]
+    fn terminal_target_rejects_closing_sessions_implicitly_and_explicitly() {
+        let mut tree = ResourceTree::default();
+        let path = initial("closing", "/closing");
+        let session_id = path.session_id;
+        tree.create_session(path).unwrap();
+        tree.close_session(session_id).unwrap();
+
+        assert_eq!(
+            tree.resolve_terminal_target(None),
+            Err(ResourceError::TargetRequired)
+        );
+        assert_eq!(
+            tree.resolve_terminal_target(Some(SessionSelector::Id(session_id))),
+            Err(ResourceError::Closing("session"))
+        );
+        assert_eq!(
+            tree.resolve_terminal_target(Some(SessionSelector::Name("closing".into()))),
+            Err(ResourceError::Closing("session"))
+        );
+    }
+
+    #[test]
+    fn terminal_target_reports_broken_child_invariants() {
+        let mut tree = ResourceTree::default();
+        let path = initial("broken", "/broken");
+        let session_id = path.session_id;
+        tree.create_session(path).unwrap();
+        tree.sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .workspaces
+            .clear();
+
+        assert!(matches!(
+            tree.resolve_terminal_target(None),
+            Err(ResourceError::Invariant(_))
+        ));
+    }
+
+    #[test]
     fn roots_are_snapshotted_and_unique_across_peer_workspaces() {
         let mut tree = ResourceTree::default();
         let p = initial("s", "/project");
@@ -1029,7 +1171,7 @@ mod tests {
     }
 
     #[test]
-    fn requested_close_is_two_phase_and_late_exit_is_distinct_without_revision() {
+    fn requested_close_is_two_phase_and_duplicate_exit_is_not_found_without_revision() {
         let mut tree = ResourceTree::default();
         let p = initial("s", "/p");
         let pane = p.pane_id;
@@ -1056,7 +1198,7 @@ mod tests {
         let revision = tree.revision();
         assert_eq!(
             tree.terminal_exited(terminal),
-            Err(ResourceError::AlreadyFinalized)
+            Err(ResourceError::NotFound("terminal"))
         );
         assert_eq!(tree.revision(), revision);
         tree.validate().unwrap();
@@ -1074,6 +1216,10 @@ mod tests {
         let sid = tree.session_order[0];
         let request = tree.close_session(sid).unwrap();
         assert_eq!(request.terminals_to_close, vec![first, second]);
+        assert_eq!(
+            request.events,
+            vec![ResourceEvent::SessionCloseRequested { session_id: sid }]
+        );
         assert!(!request.multiplexer_empty);
         let one = tree.terminal_exited(first).unwrap();
         assert!(!one.multiplexer_empty);
@@ -1124,36 +1270,6 @@ mod tests {
         assert_eq!(tree.close_session(sid), Err(ResourceError::Closing("pane")));
         assert_eq!(tree.snapshot(), before);
         assert_eq!(tree.revision(), before.revision);
-        tree.validate().unwrap();
-    }
-
-    #[test]
-    fn requested_terminal_tombstones_are_bounded_and_recent() {
-        let mut tree = ResourceTree::default();
-        let mut finalized = Vec::new();
-
-        for i in 0..=FINALIZED_REQUESTED_TERMINALS_CAPACITY {
-            let p = initial(&format!("s{i}"), &format!("/{i}"));
-            let pane = p.pane_id;
-            let terminal = p.terminal_id;
-            tree.create_session(p).unwrap();
-            tree.close_pane(pane).unwrap();
-            tree.terminal_exited(terminal).unwrap();
-            finalized.push(terminal);
-        }
-
-        assert_eq!(
-            tree.terminal_exited(finalized[0]),
-            Err(ResourceError::NotFound("terminal"))
-        );
-        assert_eq!(
-            tree.terminal_exited(*finalized.last().unwrap()),
-            Err(ResourceError::AlreadyFinalized)
-        );
-        assert_eq!(
-            tree.finalized_requested_terminals.len(),
-            FINALIZED_REQUESTED_TERMINALS_CAPACITY
-        );
         tree.validate().unwrap();
     }
 

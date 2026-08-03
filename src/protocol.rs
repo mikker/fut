@@ -1,8 +1,5 @@
 //! Versioned messages and bounded JSON framing for the local Fut protocol.
 
-use std::io;
-
-use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio_util::codec::LengthDelimitedCodec;
@@ -27,10 +24,14 @@ pub struct Envelope<T> {
     pub message: T,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ClientKind {
-    Interactive,
+pub enum ClientMode {
+    Interactive {
+        size: TerminalSize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<SessionSelector>,
+    },
     Control,
 }
 
@@ -59,10 +60,7 @@ pub enum ClientMessage {
     Hello {
         version: u16,
         client_version: String,
-        kind: ClientKind,
-        size: TerminalSize,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        selector: Option<SessionSelector>,
+        mode: ClientMode,
     },
     Input {
         bytes: Vec<u8>,
@@ -126,16 +124,6 @@ pub enum ServerMessage {
     },
 }
 
-impl ClientMessage {
-    #[must_use]
-    pub fn protocol_is_compatible(&self) -> Option<bool> {
-        match self {
-            Self::Hello { version, .. } => Some(*version == PROTOCOL_VERSION),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum FrameError {
     #[error("frame payload is empty")]
@@ -144,10 +132,6 @@ pub enum FrameError {
     TooLarge { actual: usize, maximum: usize },
     #[error("invalid JSON payload: {0}")]
     InvalidJson(#[from] serde_json::Error),
-    #[error("frame is shorter than its four-byte header")]
-    MissingHeader,
-    #[error("frame declares {declared} bytes but contains {actual}")]
-    LengthMismatch { declared: usize, actual: usize },
 }
 
 pub fn codec() -> LengthDelimitedCodec {
@@ -173,29 +157,6 @@ pub fn decode_payload<T: DeserializeOwned>(payload: &[u8]) -> Result<T, FrameErr
     Ok(value)
 }
 
-pub fn encode_frame<T: Serialize>(value: &T) -> Result<Bytes, FrameError> {
-    let payload = encode_payload(value)?;
-    let mut frame = BytesMut::with_capacity(4 + payload.len());
-    frame.put_u32(payload.len() as u32);
-    frame.extend_from_slice(&payload);
-    Ok(frame.freeze())
-}
-
-pub fn decode_frame<T: DeserializeOwned>(frame: &[u8]) -> Result<T, FrameError> {
-    let header: [u8; 4] = frame
-        .get(..4)
-        .ok_or(FrameError::MissingHeader)?
-        .try_into()
-        .expect("slice length was checked");
-    let declared = u32::from_be_bytes(header) as usize;
-    validate_payload_len(declared)?;
-    let actual = frame.len() - 4;
-    if declared != actual {
-        return Err(FrameError::LengthMismatch { declared, actual });
-    }
-    decode_payload(&frame[4..])
-}
-
 fn validate_payload_len(length: usize) -> Result<(), FrameError> {
     match length {
         0 => Err(FrameError::Empty),
@@ -207,14 +168,10 @@ fn validate_payload_len(length: usize) -> Result<(), FrameError> {
     }
 }
 
-pub fn frame_io_error(error: FrameError) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, error)
-}
-
 #[cfg(test)]
 mod tests {
-    use bytes::BufMut;
-    use tokio_util::codec::Decoder;
+    use bytes::{BufMut, Bytes, BytesMut};
+    use tokio_util::codec::{Decoder, Encoder};
 
     use super::*;
     use crate::domain::{Cell, Cursor, MAX_VISIBLE_CELLS};
@@ -229,9 +186,9 @@ mod tests {
     #[test]
     fn envelope_round_trips_with_and_without_request_id() {
         for envelope in [ping(None), ping(Some(Uuid::new_v4()))] {
-            let frame = encode_frame(&envelope).unwrap();
+            let payload = encode_payload(&envelope).unwrap();
             assert_eq!(
-                decode_frame::<Envelope<ClientMessage>>(&frame).unwrap(),
+                decode_payload::<Envelope<ClientMessage>>(&payload).unwrap(),
                 envelope
             );
         }
@@ -257,27 +214,6 @@ mod tests {
         assert!(matches!(
             decode_payload::<ClientMessage>(&payload),
             Err(FrameError::InvalidJson(_))
-        ));
-    }
-
-    #[test]
-    fn frame_rejects_missing_mismatched_empty_and_oversized_lengths() {
-        assert!(matches!(
-            decode_frame::<ClientMessage>(&[0, 0]),
-            Err(FrameError::MissingHeader)
-        ));
-        assert!(matches!(
-            decode_frame::<ClientMessage>(&[0, 0, 0, 0]),
-            Err(FrameError::Empty)
-        ));
-        assert!(matches!(
-            decode_frame::<ClientMessage>(&[0, 0, 0, 2, b'{']),
-            Err(FrameError::LengthMismatch { .. })
-        ));
-        let oversized = ((MAX_FRAME_LEN + 1) as u32).to_be_bytes();
-        assert!(matches!(
-            decode_frame::<ClientMessage>(&oversized),
-            Err(FrameError::TooLarge { .. })
         ));
     }
 
@@ -350,34 +286,25 @@ mod tests {
     }
 
     #[test]
-    fn hello_version_compatibility_is_explicit() {
-        let hello = |version| ClientMessage::Hello {
-            version,
-            client_version: "0.1.0".into(),
-            kind: ClientKind::Interactive,
-            size: TerminalSize {
-                columns: 80,
-                rows: 24,
-            },
-            selector: None,
-        };
+    fn codec_encoder_and_payload_codec_round_trip() {
+        let envelope = ping(Some(Uuid::new_v4()));
+        let payload = encode_payload(&envelope).unwrap();
+        let mut wire = BytesMut::new();
+        codec().encode(Bytes::from(payload), &mut wire).unwrap();
+        let decoded = codec().decode(&mut wire).unwrap().unwrap();
+        assert_eq!(
+            decode_payload::<Envelope<ClientMessage>>(&decoded).unwrap(),
+            envelope
+        );
+    }
 
-        assert_eq!(hello(PROTOCOL_VERSION).protocol_is_compatible(), Some(true));
-        assert_eq!(
-            hello(PROTOCOL_VERSION + 1).protocol_is_compatible(),
-            Some(false)
-        );
-        assert_eq!(ClientMessage::Ping.protocol_is_compatible(), None);
-        assert_eq!(
-            ServerMessage::IncompatibleProtocol {
-                client: 2,
-                server: PROTOCOL_VERSION
-            },
-            ServerMessage::IncompatibleProtocol {
-                client: 2,
-                server: PROTOCOL_VERSION
-            }
-        );
+    #[test]
+    fn codec_waits_for_incomplete_headers_and_payloads() {
+        let mut short_header = BytesMut::from(&[0, 0][..]);
+        assert!(codec().decode(&mut short_header).unwrap().is_none());
+
+        let mut short_payload = BytesMut::from(&[0, 0, 0, 2, b'{'][..]);
+        assert!(codec().decode(&mut short_payload).unwrap().is_none());
     }
 
     #[test]
@@ -388,9 +315,9 @@ mod tests {
                 command: AcknowledgedCommand::Resize,
             },
         };
-        let frame = encode_frame(&envelope).unwrap();
+        let frame = encode_payload(&envelope).unwrap();
         assert_eq!(
-            decode_frame::<Envelope<ServerMessage>>(&frame).unwrap(),
+            decode_payload::<Envelope<ServerMessage>>(&frame).unwrap(),
             envelope
         );
     }

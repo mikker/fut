@@ -34,4 +34,4 @@ mise run test:unit
 mise run test:e2e
 ```
 
-`new` requires an already-running daemon in this slice. Project identity is the canonical working directory; Git common-directory/worktree discovery is next. Session selectors accept `id:<uuid>` and `name:<exact>`; bare UUIDs select IDs and other bare values select exact names. There is no in-client retargeting, navigator, direct switching, project recipe, or agent activity yet.
+`new` requires an already-running daemon in this slice. Sessions are currently backed by canonical working directories; Git common-directory/worktree identity is next. Session selectors accept `id:<uuid>` and `name:<exact>`; bare UUIDs select IDs and other bare values select exact names. Only interactive connections select a terminal. There is no in-client retargeting, navigator, direct switching, project recipe, or agent activity yet.

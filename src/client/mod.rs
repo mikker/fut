@@ -8,7 +8,7 @@ use anyhow::{Context, bail};
 use bytes::Bytes;
 use crossterm::{
     cursor::{Hide, Show},
-    event::{DisableMouseCapture, Event, EventStream},
+    event::{Event, EventStream},
     execute,
     terminal::{
         DisableLineWrap, EnableLineWrap, EnterAlternateScreen, LeaveAlternateScreen,
@@ -31,7 +31,7 @@ use tokio_util::codec::Framed;
 use crate::{
     domain::{CellStyle, ScreenSnapshot, TerminalId, TerminalSize},
     protocol::{
-        ClientKind, ClientMessage, Envelope, PROTOCOL_VERSION, ServerMessage, codec,
+        ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, ServerMessage, codec,
         decode_payload, encode_payload,
     },
     resources::SessionSelector,
@@ -50,14 +50,18 @@ pub async fn attach(socket_path: &Path, selector: Option<SessionSelector>) -> an
         ClientMessage::Hello {
             version: PROTOCOL_VERSION,
             client_version: env!("CARGO_PKG_VERSION").into(),
-            kind: ClientKind::Interactive,
-            size: TerminalSize { columns, rows },
-            selector,
+            mode: ClientMode::Interactive {
+                size: TerminalSize { columns, rows },
+                selector,
+            },
         },
     )
     .await?;
 
-    let terminal_id = match receive(&mut framed).await? {
+    let terminal_id = match time::timeout(Duration::from_secs(2), receive(&mut framed))
+        .await
+        .context("daemon handshake timed out")??
+    {
         ServerMessage::Welcome {
             version,
             selected: Some(selected),
@@ -254,7 +258,6 @@ struct TerminalGuard {
     alternate_screen: bool,
     cursor_hidden: bool,
     line_wrap_disabled: bool,
-    mouse_capture: bool,
 }
 
 impl TerminalGuard {
@@ -264,7 +267,6 @@ impl TerminalGuard {
             alternate_screen: false,
             cursor_hidden: false,
             line_wrap_disabled: false,
-            mouse_capture: false,
         };
         enable_raw_mode()?;
         guard.raw = true;
@@ -274,7 +276,6 @@ impl TerminalGuard {
         guard.cursor_hidden = true;
         execute!(io::stdout(), DisableLineWrap)?;
         guard.line_wrap_disabled = true;
-        // Mouse input is not translated in this spike, so it remains disabled.
         Ok(guard)
     }
 }
@@ -282,9 +283,6 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut stdout = io::stdout();
-        if self.mouse_capture {
-            let _ = execute!(stdout, DisableMouseCapture);
-        }
         if self.line_wrap_disabled {
             let _ = execute!(stdout, EnableLineWrap);
         }

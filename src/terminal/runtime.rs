@@ -82,20 +82,18 @@ impl TerminalHandle {
         }
 
         let (completion, completed) = oneshot::channel();
-        tokio::time::timeout(
+        let sent = tokio::time::timeout(
             Duration::from_secs(2),
             self.commands.send(RuntimeMessage::Close(completion)),
         )
         .await
-        .map_err(|_| CommandError::Busy)?
-        .map_err(|_| CommandError::Stopped)?;
-        match completed.await {
-            Ok(result) => result,
-            Err(_) if matches!(*self.lifecycle.borrow(), TerminalLifecycle::Exited { .. }) => {
-                Ok(())
-            }
-            Err(_) => Err(CommandError::Stopped),
-        }
+        .map_err(|_| CommandError::Busy)
+        .and_then(|result| result.map_err(|_| CommandError::Stopped));
+        let result = match sent {
+            Ok(()) => completed.await.unwrap_or(Err(CommandError::Stopped)),
+            Err(error) => Err(error),
+        };
+        self.normalize_close_result(result)
     }
 
     #[must_use]
@@ -125,6 +123,17 @@ impl TerminalHandle {
                 async_mpsc::error::TrySendError::Full(_) => CommandError::Busy,
                 async_mpsc::error::TrySendError::Closed(_) => CommandError::Stopped,
             })
+    }
+
+    fn normalize_close_result(&self, result: Result<(), CommandError>) -> Result<(), CommandError> {
+        match result {
+            Err(CommandError::Stopped)
+                if matches!(*self.lifecycle.borrow(), TerminalLifecycle::Exited { .. }) =>
+            {
+                Ok(())
+            }
+            result => result,
+        }
     }
 }
 
@@ -611,6 +620,31 @@ mod tests {
                 .unwrap()
                 .success()
         );
+        handle.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_racing_natural_exit_is_successful() {
+        for _ in 0..20 {
+            let handle = spawn_terminal(shell("exit 0", HashMap::new())).unwrap();
+            handle.close().await.unwrap();
+            assert!(matches!(
+                handle.lifecycle(),
+                TerminalLifecycle::Exited { .. }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_and_repeated_closes_are_successful() {
+        let handle = Arc::new(spawn_terminal(shell("sleep 60", HashMap::new())).unwrap());
+        let closes = (0..8).map(|_| {
+            let handle = Arc::clone(&handle);
+            tokio::spawn(async move { handle.close().await })
+        });
+        for close in closes {
+            close.await.unwrap().unwrap();
+        }
         handle.close().await.unwrap();
     }
 

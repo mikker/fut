@@ -12,12 +12,9 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::{net::UnixStream, time};
 use tokio_util::codec::Framed;
 
-use crate::{
-    domain::TerminalSize,
-    protocol::{
-        ClientKind, ClientMessage, Envelope, PROTOCOL_VERSION, ServerMessage, codec,
-        decode_payload, encode_payload,
-    },
+use crate::protocol::{
+    ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, ServerMessage, codec, decode_payload,
+    encode_payload,
 };
 
 use super::path::{prepare_runtime_dir, runtime_dir};
@@ -83,12 +80,7 @@ pub async fn protocol_ready(socket: &Path) -> bool {
                 message: ClientMessage::Hello {
                     version: PROTOCOL_VERSION,
                     client_version: env!("CARGO_PKG_VERSION").into(),
-                    kind: ClientKind::Control,
-                    size: TerminalSize {
-                        columns: 80,
-                        rows: 24,
-                    },
-                    selector: None,
+                    mode: ClientMode::Control,
                 },
             })?))
             .await?;
