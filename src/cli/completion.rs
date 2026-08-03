@@ -38,7 +38,15 @@ completer!(tab_close, TabClose);
 completer!(pane_new, PaneNew);
 completer!(pane_attach, PaneAttach);
 completer!(pane_close, PaneClose);
+completer!(pane_move_source, PaneMoveSource);
 completer!(terminal_attach, TerminalAttach);
+
+pub(super) fn pane_move_destination(_: &OsStr) -> Vec<CompletionCandidate> {
+    let Some(source) = pane_move_source_from_argv(std::env::args_os()) else {
+        return vec![];
+    };
+    dynamic_candidates(Operation::PaneMoveDestination(source))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Operation {
@@ -55,6 +63,8 @@ enum Operation {
     PaneNew,
     PaneAttach,
     PaneClose,
+    PaneMoveSource,
+    PaneMoveDestination(crate::domain::PaneId),
     TerminalAttach,
 }
 
@@ -94,14 +104,48 @@ fn fetch_snapshot() -> Option<ResourceSnapshot> {
     })
 }
 
-fn explicit_socket(
+fn completion_argv(
     args: impl IntoIterator<Item = impl Into<std::ffi::OsString>>,
-) -> Option<PathBuf> {
+) -> Option<Vec<std::ffi::OsString>> {
     let mut args = args.into_iter().map(Into::into);
     args.next()?;
     if args.next()?.as_os_str() != "--" {
         return None;
     }
+    Some(args.collect())
+}
+
+fn pane_move_source_from_argv(
+    args: impl IntoIterator<Item = impl Into<std::ffi::OsString>>,
+) -> Option<crate::domain::PaneId> {
+    let argv = completion_argv(args)?;
+    let mut args = argv.into_iter();
+    args.next()?;
+    let mut command = Vec::new();
+    while let Some(argument) = args.next() {
+        if argument == "--socket" {
+            args.next()?;
+        } else if argument == "--json"
+            || argument
+                .to_str()
+                .is_some_and(|value| value.starts_with("--socket="))
+        {
+            continue;
+        } else {
+            command.push(argument);
+        }
+    }
+    if command.first()?.as_os_str() != "pane" || command.get(1)?.as_os_str() != "move" {
+        return None;
+    }
+    command.get(2)?.to_str()?.parse().ok()
+}
+
+fn explicit_socket(
+    args: impl IntoIterator<Item = impl Into<std::ffi::OsString>>,
+) -> Option<PathBuf> {
+    let argv = completion_argv(args)?;
+    let mut args = argv.into_iter();
     args.next()?;
 
     while let Some(argument) = args.next() {
@@ -213,6 +257,21 @@ fn candidates(snapshot: &ResourceSnapshot, operation: Operation) -> Vec<Candidat
                 if matches!(operation, Operation::TabAttach) && tab_attachable
                     || matches!(operation, Operation::TabRename | Operation::PaneNew) && tab_live
                     || matches!(operation, Operation::TabClose) && tab_live && tab_panes_open
+                    || match operation {
+                        Operation::PaneMoveDestination(source) => {
+                            tab_live
+                                && tab.panes.iter().all(|pane| pane.id != source)
+                                && workspace.tabs.iter().any(|source_tab| {
+                                    source_tab.id != tab.id
+                                        && !source_tab.closing
+                                        && source_tab
+                                            .panes
+                                            .iter()
+                                            .any(|pane| pane.id == source && !pane.closing)
+                                })
+                        }
+                        _ => false,
+                    }
                 {
                     push(&mut result, tab.id.to_string(), tab_label.clone());
                 }
@@ -223,6 +282,15 @@ fn candidates(snapshot: &ResourceSnapshot, operation: Operation) -> Vec<Candidat
                     let pane_label = format!("{pane_hierarchy}{root_suffix}");
                     if matches!(operation, Operation::PaneAttach | Operation::PaneClose)
                         && pane_live
+                    {
+                        push(&mut result, pane.id.to_string(), pane_label.clone());
+                    }
+                    if matches!(operation, Operation::PaneMoveSource)
+                        && pane_live
+                        && workspace
+                            .tabs
+                            .iter()
+                            .any(|other| other.id != tab.id && !other.closing)
                     {
                         push(&mut result, pane.id.to_string(), pane_label.clone());
                     }
@@ -551,6 +619,100 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn pane_move_candidates_match_resource_tree_for_every_pane_and_tab_pair() {
+        for tree in representative_trees() {
+            let snapshot = tree.snapshot();
+            let panes: Vec<_> = snapshot
+                .sessions
+                .iter()
+                .flat_map(|session| &session.workspaces)
+                .flat_map(|workspace| &workspace.tabs)
+                .flat_map(|tab| &tab.panes)
+                .map(|pane| pane.id)
+                .collect();
+            let tabs: Vec<_> = snapshot
+                .sessions
+                .iter()
+                .flat_map(|session| &session.workspaces)
+                .flat_map(|workspace| &workspace.tabs)
+                .map(|tab| tab.id)
+                .collect();
+            let sources: Vec<_> = candidates(&snapshot, Operation::PaneMoveSource)
+                .into_iter()
+                .map(|candidate| candidate.value)
+                .collect();
+
+            for pane in panes {
+                let destinations: Vec<_> =
+                    candidates(&snapshot, Operation::PaneMoveDestination(pane))
+                        .into_iter()
+                        .map(|candidate| candidate.value)
+                        .collect();
+                let mut any = false;
+                for tab in &tabs {
+                    let source_tab = snapshot
+                        .sessions
+                        .iter()
+                        .flat_map(|session| &session.workspaces)
+                        .flat_map(|workspace| &workspace.tabs)
+                        .find(|candidate| {
+                            candidate.panes.iter().any(|candidate| candidate.id == pane)
+                        })
+                        .unwrap()
+                        .id;
+                    let accepted = *tab != source_tab && tree.clone().move_pane(pane, *tab).is_ok();
+                    any |= accepted;
+                    assert_eq!(
+                        destinations.contains(&tab.to_string()),
+                        accepted,
+                        "pane {pane} destination {tab}"
+                    );
+                }
+                assert_eq!(
+                    sources.contains(&pane.to_string()),
+                    any,
+                    "source pane {pane}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parses_move_source_from_completion_argv() {
+        let pane = PaneId::new();
+        let pane_string = pane.to_string();
+        assert_eq!(
+            pane_move_source_from_argv(
+                ["complete", "--", "fut", "pane", "move", &pane_string, "",]
+            ),
+            Some(pane)
+        );
+        assert_eq!(
+            pane_move_source_from_argv([
+                "complete",
+                "--",
+                "fut",
+                "pane",
+                "--socket",
+                "/tmp/fut.sock",
+                "--json",
+                "move",
+                &pane_string,
+                "",
+            ]),
+            Some(pane)
+        );
+        assert_eq!(
+            pane_move_source_from_argv(["complete", "--", "fut", "pane", "move", "bad", ""]),
+            None
+        );
+        assert_eq!(
+            pane_move_source_from_argv(["fut", "pane", "move", &pane_string]),
+            None
+        );
     }
 
     #[test]

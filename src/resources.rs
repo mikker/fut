@@ -250,8 +250,6 @@ pub enum ResourceError {
     Duplicate(&'static str),
     #[error("name must not be blank")]
     EmptyName,
-    #[error("source and destination tabs are the same")]
-    SameTab,
     #[error("panes may only move between tabs in the same workspace")]
     DifferentWorkspace,
     #[error("resource is closing: {0}")]
@@ -883,9 +881,6 @@ impl ResourceTree {
         if pane.closing {
             return Err(ResourceError::Closing("pane"));
         }
-        if pane.tab_id == destination {
-            return Err(ResourceError::SameTab);
-        }
         let source_workspace = source_tab.workspace_id;
         if source_workspace != destination_tab.workspace_id {
             return Err(ResourceError::DifferentWorkspace);
@@ -895,6 +890,9 @@ impl ResourceTree {
         }
         if self.workspaces[&source_workspace].closing {
             return Err(ResourceError::Closing("workspace"));
+        }
+        if pane.tab_id == destination {
+            return Ok(self.unchanged());
         }
         self.tabs
             .get_mut(&pane.tab_id)
@@ -1853,22 +1851,117 @@ mod tests {
     }
 
     #[test]
-    fn moves_preserve_ids_and_reject_other_workspaces_and_sessions() {
+    fn move_pane_preserves_order_ids_and_reverse_resolution() {
         let mut tree = ResourceTree::default();
-        let p = initial("a", "/a");
-        let pane = p.pane_id;
-        let terminal = p.terminal_id;
-        let wid = p.workspace_id;
-        tree.create_session(p).unwrap();
-        let same = TabPath {
-            tab_id: TabId::new(),
-            tab_name: "same".into(),
-            pane_id: PaneId::new(),
-            terminal_id: TerminalId::new(),
-        };
-        let same_id = same.tab_id;
-        tree.add_tab(wid, same).unwrap();
-        tree.move_pane(pane, same_id).unwrap();
+        let path = initial("a", "/a");
+        let (workspace, source, pane, terminal) = (
+            path.workspace_id,
+            path.tab_id,
+            path.pane_id,
+            path.terminal_id,
+        );
+        tree.create_session(path).unwrap();
+        let source_sibling = PaneId::new();
+        tree.add_pane(source, source_sibling, TerminalId::new())
+            .unwrap();
+        let destination = TabId::new();
+        let destination_sibling = PaneId::new();
+        tree.add_tab(
+            workspace,
+            TabPath {
+                tab_id: destination,
+                tab_name: "destination".into(),
+                pane_id: destination_sibling,
+                terminal_id: TerminalId::new(),
+            },
+        )
+        .unwrap();
+        let destination_tail = PaneId::new();
+        tree.add_pane(destination, destination_tail, TerminalId::new())
+            .unwrap();
+
+        let moved = tree.move_pane(pane, destination).unwrap();
+        assert_eq!(
+            moved.events,
+            vec![ResourceEvent::PaneMoved {
+                pane_id: pane,
+                terminal_id: terminal,
+                from: source,
+                to: destination,
+            }]
+        );
+        assert!(moved.terminals_to_close.is_empty());
+        assert_eq!(tree.tabs[&source].panes, vec![source_sibling]);
+        assert_eq!(
+            tree.tabs[&destination].panes,
+            vec![destination_sibling, destination_tail, pane]
+        );
+        assert_eq!(tree.panes[&pane].terminal_id, terminal);
+        assert_eq!(tree.terminals[&terminal], pane);
+        assert_eq!(
+            tree.resolve_terminal_target(Some(TargetSelector::Terminal(terminal)))
+                .unwrap()
+                .pane_id,
+            pane
+        );
+
+        let before = tree.snapshot();
+        let retry = tree.move_pane(pane, destination).unwrap();
+        assert_eq!(retry.revision, before.revision);
+        assert!(retry.events.is_empty());
+        assert!(retry.terminals_to_close.is_empty());
+        assert_eq!(tree.snapshot(), before);
+        tree.validate().unwrap();
+    }
+
+    #[test]
+    fn moving_last_pane_emits_pane_moved_then_tab_closed_without_closing_terminal() {
+        let mut tree = ResourceTree::default();
+        let path = initial("a", "/a");
+        let (workspace, source, pane, terminal) = (
+            path.workspace_id,
+            path.tab_id,
+            path.pane_id,
+            path.terminal_id,
+        );
+        tree.create_session(path).unwrap();
+        let destination = TabId::new();
+        tree.add_tab(
+            workspace,
+            TabPath {
+                tab_id: destination,
+                tab_name: "destination".into(),
+                pane_id: PaneId::new(),
+                terminal_id: TerminalId::new(),
+            },
+        )
+        .unwrap();
+
+        let moved = tree.move_pane(pane, destination).unwrap();
+        assert_eq!(
+            moved.events,
+            vec![
+                ResourceEvent::PaneMoved {
+                    pane_id: pane,
+                    terminal_id: terminal,
+                    from: source,
+                    to: destination,
+                },
+                ResourceEvent::TabClosed { tab_id: source },
+            ]
+        );
+        assert!(moved.terminals_to_close.is_empty());
+        assert!(!tree.tabs.contains_key(&source));
+        assert_eq!(tree.terminals[&terminal], pane);
+        tree.validate().unwrap();
+    }
+
+    #[test]
+    fn move_pane_rejects_other_workspaces_and_sessions_atomically() {
+        let mut tree = ResourceTree::default();
+        let path = initial("a", "/a");
+        let (session, pane) = (path.session_id, path.pane_id);
+        tree.create_session(path).unwrap();
         let peer = WorkspacePath {
             workspace_id: WorkspaceId::new(),
             workspace_name: "peer".into(),
@@ -1879,27 +1972,18 @@ mod tests {
             terminal_id: TerminalId::new(),
         };
         let peer_tab = peer.tab_id;
-        let sid = tree.session_order[0];
-        tree.add_workspace(sid, peer).unwrap();
-        let before = tree.snapshot();
-        let result = tree.move_pane(pane, peer_tab);
-        assert_eq!(result, Err(ResourceError::DifferentWorkspace));
-        assert_eq!(tree.snapshot(), before);
-        assert_valid(&tree, &result);
+        tree.add_workspace(session, peer).unwrap();
         let other = initial("b", "/b");
         let other_tab = other.tab_id;
         tree.create_session(other).unwrap();
-        let result = tree.move_pane(pane, other_tab);
-        assert_eq!(result, Err(ResourceError::DifferentWorkspace));
-        assert_valid(&tree, &result);
-        let snapshot = tree.snapshot();
-        let found = snapshot.sessions[0].workspaces[0]
-            .tabs
-            .iter()
-            .flat_map(|t| &t.panes)
-            .find(|p| p.id == pane)
-            .unwrap();
-        assert_eq!(found.terminal_id, terminal);
+
+        for destination in [peer_tab, other_tab] {
+            let before = tree.snapshot();
+            let result = tree.move_pane(pane, destination);
+            assert_eq!(result, Err(ResourceError::DifferentWorkspace));
+            assert_eq!(tree.snapshot(), before);
+            assert_valid(&tree, &result);
+        }
     }
 
     #[test]
@@ -2630,6 +2714,10 @@ mod tests {
         );
         assert_eq!(
             tree.move_pane(first_pane, destination),
+            Err(ResourceError::Closing("tab"))
+        );
+        assert_eq!(
+            tree.move_pane(first_pane, source),
             Err(ResourceError::Closing("tab"))
         );
         assert_eq!(

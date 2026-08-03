@@ -344,9 +344,22 @@ fn matches_request(pending: Option<Uuid>, response: Option<Uuid>) -> bool {
 }
 
 pub(super) fn flatten(snapshot: &ResourceSnapshot, current: &SelectedTarget) -> Vec<NavigatorRow> {
+    let current_ancestry = snapshot.sessions.iter().find_map(|session| {
+        session.workspaces.iter().find_map(|workspace| {
+            workspace.tabs.iter().find_map(|tab| {
+                tab.panes
+                    .iter()
+                    .find(|pane| pane.id == current.pane_id)
+                    .map(|_| (session.id, workspace.id, tab.id))
+            })
+        })
+    });
+    let (current_session_id, current_workspace_id, current_tab_id) =
+        current_ancestry.unwrap_or((current.session_id, current.workspace_id, current.tab_id));
+
     let mut rows = Vec::new();
     for session in &snapshot.sessions {
-        let session_current = session.id == current.session_id;
+        let session_current = session.id == current_session_id;
         let session_target =
             if session_current && pane_available_session(session, current.pane_id, false) {
                 Some(current.pane_id)
@@ -363,7 +376,7 @@ pub(super) fn flatten(snapshot: &ResourceSnapshot, current: &SelectedTarget) -> 
         });
         for workspace in &session.workspaces {
             let closing = session.closing || workspace.closing;
-            let workspace_current = session_current && workspace.id == current.workspace_id;
+            let workspace_current = session_current && workspace.id == current_workspace_id;
             let target = if workspace_current
                 && pane_available_workspace(workspace, current.pane_id, session.closing)
             {
@@ -380,7 +393,7 @@ pub(super) fn flatten(snapshot: &ResourceSnapshot, current: &SelectedTarget) -> 
                 destination: (!closing).then_some(target).flatten(),
             });
             for tab in &workspace.tabs {
-                let tab_current = workspace_current && tab.id == current.tab_id;
+                let tab_current = workspace_current && tab.id == current_tab_id;
                 let tab_closing = closing || tab.closing;
                 let target = if tab_current
                     && tab
@@ -583,6 +596,54 @@ mod tests {
             .unwrap();
         assert!(closing.closing);
         assert_eq!(closing.destination, None);
+    }
+
+    #[test]
+    fn flatten_uses_fresh_ancestry_after_current_pane_moves() {
+        let (mut snapshot, mut current, _) = fixture();
+        let old_tab_id = current.tab_id;
+        let destination_tab_id = TabId::new();
+        let moved_pane = snapshot.sessions[0].workspaces[0].tabs[0].panes.remove(0);
+        snapshot.sessions[0].workspaces[0].tabs.push(TabSnapshot {
+            id: destination_tab_id,
+            name: "destination".into(),
+            closing: false,
+            panes: vec![moved_pane],
+        });
+
+        // Simulate an attachment whose selected target has not observed the external move yet.
+        current.tab_id = old_tab_id;
+        let rows = flatten(&snapshot, &current);
+        let current_rows = rows.iter().filter(|row| row.current).collect::<Vec<_>>();
+
+        assert_eq!(current_rows.len(), 4);
+        assert!(
+            current_rows
+                .iter()
+                .any(|row| row.key == ResourceKey::Tab(destination_tab_id))
+        );
+        assert!(
+            current_rows
+                .iter()
+                .any(|row| row.key == ResourceKey::Pane(current.pane_id))
+        );
+        assert!(
+            !rows
+                .iter()
+                .find(|row| row.key == ResourceKey::Tab(old_tab_id))
+                .unwrap()
+                .current
+        );
+        for key in [
+            ResourceKey::Session(current.session_id),
+            ResourceKey::Workspace(current.workspace_id),
+            ResourceKey::Tab(destination_tab_id),
+        ] {
+            assert_eq!(
+                rows.iter().find(|row| row.key == key).unwrap().destination,
+                Some(current.pane_id)
+            );
+        }
     }
 
     #[test]

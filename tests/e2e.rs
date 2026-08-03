@@ -12,7 +12,7 @@ use std::{
 
 use bytes::Bytes;
 use fut::{
-    domain::{ScreenSnapshot, TerminalId, TerminalSize},
+    domain::{PaneId, ScreenSnapshot, TabId, TerminalId, TerminalSize},
     protocol::{
         ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, RenameSelector, SelectedTarget,
         ServerMessage, codec, decode_payload, encode_payload,
@@ -942,6 +942,258 @@ async fn public_pane_new_preserves_attachment_isolates_input_and_cascades_on_las
 }
 
 #[tokio::test]
+async fn public_pane_move_preserves_attachment_identity_order_and_cascades_empty_tab() {
+    let harness = Harness::start(
+        "printf 'MOVE_A_READY\r\n'; while IFS= read -r line; do [ \"$line\" = moved ] && printf 'MOVE_A_INPUT\r\n'; done",
+    )
+    .await;
+    let initial = harness.resources().await;
+    let workspace = &initial.sessions[0].workspaces[0];
+    let source_tab = workspace.tabs[0].id;
+    let pane_a = workspace.tabs[0].panes[0].id;
+    let terminal_a = workspace.tabs[0].panes[0].terminal_id;
+    let (mut attached_a, selected_a) = attach_once(&harness, TargetSelector::Pane(pane_a)).await;
+    snapshot_containing(&mut attached_a, terminal_a, "MOVE_A_READY").await;
+
+    let sibling_output = harness
+        .cli()
+        .args([
+            "--json",
+            "pane",
+            "new",
+            &source_tab.to_string(),
+            "--",
+            "/bin/sh",
+            "-c",
+            "while IFS= read -r line; do :; done",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        sibling_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sibling_output.stderr)
+    );
+    let sibling_json: Value = serde_json::from_slice(&sibling_output.stdout).unwrap();
+    let pane_c: PaneId = sibling_json["result"]["selected"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let terminal_c: TerminalId = sibling_json["result"]["selected"]["terminal_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let pid_c = sibling_json["result"]["selected"]["child_pid"]
+        .as_u64()
+        .unwrap() as u32;
+
+    let destination_output = harness
+        .cli()
+        .args([
+            "--json",
+            "tab",
+            "new",
+            &workspace.id.to_string(),
+            "--name",
+            "destination",
+            "--",
+            "/bin/sh",
+            "-c",
+            "while IFS= read -r line; do :; done",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        destination_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&destination_output.stderr)
+    );
+    let destination_json: Value = serde_json::from_slice(&destination_output.stdout).unwrap();
+    let destination_tab: TabId = destination_json["result"]["selected"]["tab_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let destination_pane: PaneId = destination_json["result"]["selected"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let destination_pid = destination_json["result"]["selected"]["child_pid"]
+        .as_u64()
+        .unwrap() as u32;
+
+    let rejected_request = Uuid::new_v4();
+    send_envelope(
+        &mut attached_a,
+        Envelope {
+            request_id: Some(rejected_request),
+            message: ClientMessage::MovePane {
+                pane_id: pane_a,
+                destination_tab_id: destination_tab,
+            },
+        },
+    )
+    .await;
+    loop {
+        let response = receive_envelope(&mut attached_a)
+            .await
+            .expect("interactive connection closed during rejected move");
+        if response.request_id == Some(rejected_request) {
+            assert!(matches!(
+                response.message,
+                ServerMessage::Error { ref code, .. } if code == "control_only"
+            ));
+            break;
+        }
+    }
+
+    let moved_output = harness
+        .cli()
+        .args([
+            "--json",
+            "pane",
+            "move",
+            &pane_a.to_string(),
+            &destination_tab.to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        moved_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&moved_output.stderr)
+    );
+    let moved_json: Value = serde_json::from_slice(&moved_output.stdout).unwrap();
+    assert_eq!(moved_json["version"], 1);
+    assert_eq!(moved_json["command"], "pane.move");
+    assert_eq!(
+        moved_json["result"]["source_tab_id"],
+        source_tab.to_string()
+    );
+    assert_eq!(moved_json["result"]["moved"], true);
+    assert_eq!(moved_json["result"]["source_tab_closed"], false);
+    assert_eq!(
+        moved_json["result"]["selected"]["tab_id"],
+        destination_tab.to_string()
+    );
+    assert_eq!(
+        moved_json["result"]["selected"]["pane_id"],
+        pane_a.to_string()
+    );
+    assert_eq!(
+        moved_json["result"]["selected"]["terminal_id"],
+        terminal_a.to_string()
+    );
+    assert_eq!(
+        moved_json["result"]["selected"]["child_pid"],
+        selected_a.child_pid
+    );
+
+    let moved = harness.resources().await;
+    let tabs = &moved.sessions[0].workspaces[0].tabs;
+    assert_eq!(tabs.len(), 2);
+    assert_eq!(tabs[0].id, source_tab);
+    assert_eq!(
+        tabs[0].panes.iter().map(|pane| pane.id).collect::<Vec<_>>(),
+        [pane_c]
+    );
+    assert_eq!(tabs[1].id, destination_tab);
+    assert_eq!(
+        tabs[1].panes.iter().map(|pane| pane.id).collect::<Vec<_>>(),
+        [destination_pane, pane_a]
+    );
+    assert!(process_alive(selected_a.child_pid));
+    assert!(process_alive(pid_c));
+    assert!(process_alive(destination_pid));
+    assert_eq!(
+        attach_error_once(&harness, TargetSelector::Terminal(terminal_a)).await,
+        "already_attached"
+    );
+
+    let refreshed = select_response(&mut attached_a, TargetSelector::Pane(pane_a)).await;
+    assert_eq!(refreshed.tab_id, destination_tab);
+    assert_eq!(refreshed.pane_id, pane_a);
+    assert_eq!(refreshed.terminal_id, terminal_a);
+    assert_eq!(refreshed.child_pid, selected_a.child_pid);
+    send(
+        &mut attached_a,
+        ClientMessage::Input {
+            bytes: b"moved\n".to_vec(),
+        },
+    )
+    .await;
+    snapshot_containing(&mut attached_a, terminal_a, "MOVE_A_INPUT").await;
+
+    let revision = moved.revision;
+    let retry = harness
+        .cli()
+        .args([
+            "--json",
+            "pane",
+            "move",
+            &pane_a.to_string(),
+            &destination_tab.to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(retry.status.success());
+    let retry_json: Value = serde_json::from_slice(&retry.stdout).unwrap();
+    assert_eq!(
+        retry_json["result"]["source_tab_id"],
+        destination_tab.to_string()
+    );
+    assert_eq!(retry_json["result"]["moved"], false);
+    assert_eq!(retry_json["result"]["source_tab_closed"], false);
+    assert_eq!(harness.resources().await.revision, revision);
+
+    let final_move = harness
+        .cli()
+        .args([
+            "--json",
+            "pane",
+            "move",
+            &pane_c.to_string(),
+            &destination_tab.to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(final_move.status.success());
+    let final_json: Value = serde_json::from_slice(&final_move.stdout).unwrap();
+    assert_eq!(
+        final_json["result"]["source_tab_id"],
+        source_tab.to_string()
+    );
+    assert_eq!(final_json["result"]["moved"], true);
+    assert_eq!(final_json["result"]["source_tab_closed"], true);
+    assert_eq!(
+        final_json["result"]["selected"]["terminal_id"],
+        terminal_c.to_string()
+    );
+    let after = harness.resources().await;
+    let original_session = after
+        .sessions
+        .iter()
+        .find(|session| session.id == initial.sessions[0].id)
+        .unwrap();
+    let tabs = &original_session.workspaces[0].tabs;
+    assert_eq!(tabs.len(), 1);
+    assert_eq!(tabs[0].id, destination_tab);
+    assert_eq!(
+        tabs[0].panes.iter().map(|pane| pane.id).collect::<Vec<_>>(),
+        [destination_pane, pane_a, pane_c]
+    );
+    assert!(process_alive(selected_a.child_pid));
+    assert!(process_alive(pid_c));
+
+    harness.detach(&mut attached_a).await;
+    drop(attached_a);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn closing_a_multi_pane_tab_preserves_and_routes_its_sibling_tab() {
     let mut harness = Harness::start("while IFS= read -r line; do :; done").await;
     let initial = harness.resources().await;
@@ -1626,6 +1878,8 @@ async fn public_cli_rejects_removed_forms_and_malformed_raw_ids_locally() {
         vec!["pane", "new", "--attach"],
         vec!["pane", "new", "not-a-uuid"],
         vec!["pane", "new", "tab:00000000-0000-0000-0000-000000000000"],
+        vec!["pane", "move", "not-a-uuid", "not-a-tab"],
+        vec!["pane", "move", "00000000-0000-0000-0000-000000000000"],
         vec!["workspace", "attach", "workspace:not-a-uuid"],
         vec!["tab", "close", "not-a-uuid"],
         vec![
@@ -1669,6 +1923,12 @@ async fn public_cli_rejects_removed_forms_and_malformed_raw_ids_locally() {
         ],
         vec!["tab".into(), "close".into(), format!("tab:{}", tab.id)],
         vec!["pane".into(), "attach".into(), format!("pane:{}", pane.id)],
+        vec![
+            "pane".into(),
+            "move".into(),
+            format!("pane:{}", pane.id),
+            tab.id.to_string(),
+        ],
         vec![
             "terminal".into(),
             "attach".into(),
@@ -3639,6 +3899,37 @@ async fn process_completion_covers_live_resource_operations_and_refresh() {
             .map(|tab| tab.id.to_string())
             .collect::<Vec<_>>()
     );
+    let first_tab = workspace.tabs[0].id;
+    let first_pane = workspace.tabs[0].panes[0].id;
+    let second_tab = workspace.tabs[1].id;
+    let second_tab_pane = workspace.tabs[1].panes[0].id;
+    let completion_revision = expanded.revision;
+    assert_eq!(
+        completion_values(&env.complete(&harness.socket, &["pane", "move", ""])),
+        [first_pane.to_string(), second_tab_pane.to_string()]
+    );
+    assert_eq!(
+        completion_values(&env.complete(
+            &harness.socket,
+            &["pane", "move", &first_pane.to_string(), ""],
+        )),
+        [second_tab.to_string()]
+    );
+    assert_eq!(
+        completion_values(&env.complete(
+            &harness.socket,
+            &["pane", "move", &second_tab_pane.to_string(), ""],
+        )),
+        [first_tab.to_string()]
+    );
+    assert!(
+        completion_values(&env.complete(
+            &harness.socket,
+            &["pane", "move", "00000000-0000-0000-0000-000000000000", "",],
+        ))
+        .is_empty()
+    );
+    assert_eq!(harness.resources().await.revision, completion_revision);
 
     let ambiguous_tab = workspace.tabs[0].id;
     let second_pane = harness

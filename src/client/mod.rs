@@ -152,6 +152,10 @@ async fn run(
                         // client has no pane-creation action until layouts exist.
                         bail!("unexpected pane creation response")
                     }
+                    ServerMessage::PaneMoved { .. } => {
+                        // Pane movement is currently a control-plane operation.
+                        bail!("unexpected pane movement response")
+                    }
                     ServerMessage::Snapshot { .. } | ServerMessage::Pong { .. } | ServerMessage::CommandCompleted { .. } | ServerMessage::LocationOpened { .. } => {}
                     ServerMessage::TerminalExited { terminal_id: id, exit_code } if id == selected.terminal_id => {
                         if let Some(code) = exit_code { bail!("terminal exited with status {code}") }

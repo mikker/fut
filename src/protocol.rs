@@ -12,7 +12,7 @@ use crate::{
     resources::{ResourceSnapshot, SessionSelector, TargetSelector},
 };
 
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 /// Enough for 50,000 individually styled JSON cells while remaining a firm
 /// pre-allocation bound for the length-delimited transport.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
@@ -118,6 +118,10 @@ pub enum ClientMessage {
         #[serde(default)]
         argv: Vec<String>,
     },
+    MovePane {
+        pane_id: PaneId,
+        destination_tab_id: TabId,
+    },
     ListResources,
     CloseTarget {
         selector: TargetSelector,
@@ -146,6 +150,12 @@ pub enum ServerMessage {
         selected: SelectedTarget,
     },
     PaneCreated {
+        selected: SelectedTarget,
+    },
+    PaneMoved {
+        source_tab_id: TabId,
+        moved: bool,
+        source_tab_closed: bool,
         selected: SelectedTarget,
     },
     TargetSelected {
@@ -436,7 +446,7 @@ mod tests {
             decode_payload::<ServerMessage>(&encode_payload(&switched).unwrap()).unwrap(),
             switched
         );
-        assert_eq!(PROTOCOL_VERSION, 7);
+        assert_eq!(PROTOCOL_VERSION, 8);
     }
 
     #[test]
@@ -516,6 +526,48 @@ mod tests {
                 },
             },
         };
+        assert_eq!(
+            decode_payload::<Envelope<ServerMessage>>(&encode_payload(&response).unwrap()).unwrap(),
+            response
+        );
+        assert_eq!(response.request_id, request.request_id);
+    }
+
+    #[test]
+    fn move_pane_and_correlated_response_round_trip() {
+        let request_id = Uuid::new_v4();
+        let pane_id = PaneId::new();
+        let source_tab_id = TabId::new();
+        let destination_tab_id = TabId::new();
+        let selected = SelectedTarget {
+            session_id: SessionId::new(),
+            workspace_id: WorkspaceId::new(),
+            tab_id: destination_tab_id,
+            pane_id,
+            terminal_id: TerminalId::new(),
+            child_pid: 42,
+        };
+        let request = Envelope {
+            request_id: Some(request_id),
+            message: ClientMessage::MovePane {
+                pane_id,
+                destination_tab_id,
+            },
+        };
+        let response = Envelope {
+            request_id: Some(request_id),
+            message: ServerMessage::PaneMoved {
+                source_tab_id,
+                moved: true,
+                source_tab_closed: true,
+                selected,
+            },
+        };
+
+        assert_eq!(
+            decode_payload::<Envelope<ClientMessage>>(&encode_payload(&request).unwrap()).unwrap(),
+            request
+        );
         assert_eq!(
             decode_payload::<Envelope<ServerMessage>>(&encode_payload(&response).unwrap()).unwrap(),
             response

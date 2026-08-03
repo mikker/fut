@@ -81,7 +81,7 @@ enum Command {
         #[command(subcommand)]
         command: TabCommand,
     },
-    /// Create, attach, or close a pane.
+    /// Create, attach, move, or close a pane.
     Pane {
         /// Pane operation to perform.
         #[command(subcommand)]
@@ -209,6 +209,15 @@ enum PaneCommand {
         /// Raw pane UUID identifying one terminal placement.
         #[arg(add = ArgValueCompleter::new(completion::pane_attach))]
         pane_id: PaneId,
+    },
+    /// Move a pane to another tab in the same workspace.
+    Move {
+        /// Raw UUID of the pane to move.
+        #[arg(add = ArgValueCompleter::new(completion::pane_move_source))]
+        pane_id: PaneId,
+        /// Raw UUID of the destination tab.
+        #[arg(add = ArgValueCompleter::new(completion::pane_move_destination))]
+        destination_tab_id: TabId,
     },
     /// Close a pane by raw UUID on the existing daemon.
     Close {
@@ -386,6 +395,47 @@ async fn execute(cli: Cli) -> Result<()> {
                 other => unexpected(other),
             }
         }
+        Some(Command::Pane {
+            command:
+                PaneCommand::Move {
+                    pane_id,
+                    destination_tab_id,
+                },
+        }) => match control(
+            &socket,
+            ClientMessage::MovePane {
+                pane_id,
+                destination_tab_id,
+            },
+        )
+        .await?
+        {
+            ServerMessage::PaneMoved {
+                source_tab_id,
+                moved,
+                source_tab_closed,
+                selected,
+            } => output(
+                cli.json,
+                "pane.move",
+                json!({
+                    "source_tab_id": source_tab_id,
+                    "moved": moved,
+                    "source_tab_closed": source_tab_closed,
+                    "selected": selected,
+                }),
+                format!(
+                    "source_tab_id={source_tab_id} moved={moved} source_tab_closed={source_tab_closed} session={} workspace={} tab={} pane={} terminal={} pid={}",
+                    selected.session_id,
+                    selected.workspace_id,
+                    selected.tab_id,
+                    selected.pane_id,
+                    selected.terminal_id,
+                    selected.child_pid
+                ),
+            ),
+            other => unexpected(other),
+        },
         Some(Command::Terminal {
             command: TerminalCommand::Attach { terminal_id },
         }) => client::attach(&socket, Some(TargetSelector::Terminal(terminal_id))).await,
@@ -913,6 +963,7 @@ mod tests {
             vec!["fut", "tab", "close", &tab],
             vec!["fut", "pane", "new", &tab],
             vec!["fut", "pane", "attach", &pane],
+            vec!["fut", "pane", "move", &pane, &tab],
             vec!["fut", "pane", "close", &pane],
             vec!["fut", "terminal", "attach", &terminal],
             vec!["fut", "daemon", "run"],
@@ -973,6 +1024,10 @@ mod tests {
         assert!(Cli::try_parse_from(["fut", "session", "att"]).is_err());
         assert!(Cli::try_parse_from(["fut", "workspace", "attach", "workspace:abc"]).is_err());
         assert!(Cli::try_parse_from(["fut", "session", "rename", "a-name", "new"]).is_err());
+        assert!(Cli::try_parse_from(["fut", "move-pane"]).is_err());
+        assert!(Cli::try_parse_from(["fut", "pane", "move", "bad", "also-bad"]).is_err());
+        let pane = PaneId::new().to_string();
+        assert!(Cli::try_parse_from(["fut", "pane", "move", &pane]).is_err());
     }
 
     #[test]
@@ -1030,5 +1085,15 @@ mod tests {
         let help = String::from_utf8(help).unwrap();
         assert!(help.contains("versioned JSON for noninteractive commands only"));
         assert!(help.contains("existing daemon without attaching"));
+
+        let command = Cli::command();
+        let pane = command.find_subcommand("pane").unwrap();
+        let movement = pane.find_subcommand("move").unwrap();
+        let positional_names: Vec<_> = movement
+            .get_arguments()
+            .map(clap::Arg::get_id)
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(positional_names, ["pane_id", "destination_tab_id"]);
     }
 }

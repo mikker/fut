@@ -115,6 +115,7 @@ impl From<ResourceError> for DaemonError {
             ResourceError::NotFound(_) => "not_found",
             ResourceError::Duplicate(_) => "duplicate",
             ResourceError::Closing(_) => "target_closing",
+            ResourceError::DifferentWorkspace => "different_workspace",
             ResourceError::TargetRequired | ResourceError::AmbiguousTarget => "target_required",
             ResourceError::EmptyName => "invalid_name",
             _ => "resource_error",
@@ -271,6 +272,55 @@ impl SharedState {
         Ok((scope, handles))
     }
 
+    fn move_pane(
+        &mut self,
+        pane_id: PaneId,
+        destination_tab_id: TabId,
+    ) -> Result<PaneMove, DaemonError> {
+        if !self.accepting {
+            return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
+        }
+        let source = self
+            .resources
+            .resolve_terminal_target(Some(TargetSelector::Pane(pane_id)))?;
+        let runtime = self
+            .runtimes
+            .get(&source.terminal_id)
+            .ok_or_else(|| DaemonError::new("not_found", "terminal runtime not found"))?;
+        if !matches!(
+            *runtime.handle.subscribe_lifecycle().borrow(),
+            TerminalLifecycle::Running
+        ) {
+            return Err(DaemonError::new(
+                "terminal_exited",
+                "terminal is not running",
+            ));
+        }
+        let source_tab_id = source.tab_id;
+        let moved = source_tab_id != destination_tab_id;
+        let mutation = self.resources.move_pane(pane_id, destination_tab_id)?;
+        let source_tab_closed = mutation.events.iter().any(|event| {
+            matches!(
+                event,
+                crate::resources::ResourceEvent::TabClosed { tab_id }
+                    if *tab_id == source_tab_id
+            )
+        });
+        let fresh = self
+            .resources
+            .resolve_terminal_target(Some(TargetSelector::Pane(pane_id)))?;
+        let runtime = self
+            .runtimes
+            .get(&fresh.terminal_id)
+            .expect("moving a pane preserves its runtime");
+        Ok(PaneMove {
+            source_tab_id,
+            moved,
+            source_tab_closed,
+            selected: selected_target(fresh, &runtime.handle),
+        })
+    }
+
     fn rename_target(&mut self, selector: RenameSelector, name: String) -> Result<(), DaemonError> {
         if !self.accepting {
             return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
@@ -328,6 +378,13 @@ impl CloseScope {
 }
 
 type Shared = Arc<Mutex<SharedState>>;
+
+struct PaneMove {
+    source_tab_id: TabId,
+    moved: bool,
+    source_tab_closed: bool,
+    selected: SelectedTarget,
+}
 
 struct LeasedTarget {
     selected: SelectedTarget,
@@ -746,16 +803,17 @@ async fn handle_connection(
                         }
                     }
                     ClientMessage::SelectTarget { selector } => {
-                        match resolves_to_current(&shared, &selector, attachment.target.selected.terminal_id).await {
-                            Ok(true) => {
-                                send(&mut framed, envelope.request_id, ServerMessage::TargetSelected { selected: attachment.target.selected.clone() }).await?;
+                        match resolve_current_target(&shared, &selector, attachment.target.selected.terminal_id).await {
+                            Ok(Some(selected)) => {
+                                attachment.target.selected = selected.clone();
+                                send(&mut framed, envelope.request_id, ServerMessage::TargetSelected { selected }).await?;
                                 continue;
                             }
                             Err(error) => {
                                 send_error(&mut framed, envelope.request_id, error.code, &error.message).await?;
                                 continue;
                             }
-                            Ok(false) => {}
+                            Ok(None) => {}
                         }
                         match switch_candidate(&shared, selector, client, size).await {
                             Ok(mut candidate) => {
@@ -836,7 +894,7 @@ async fn handle_connection(
                         return Ok(());
                     }
                     ClientMessage::Ping => send(&mut framed, envelope.request_id, ServerMessage::Pong { daemon_pid: std::process::id() }).await?,
-                    ClientMessage::OpenLocation { .. } | ClientMessage::CloseTarget { .. } | ClientMessage::RenameTarget { .. } | ClientMessage::Shutdown => send_error(&mut framed, envelope.request_id, "control_only", "command requires a control connection").await?,
+                    ClientMessage::OpenLocation { .. } | ClientMessage::MovePane { .. } | ClientMessage::CloseTarget { .. } | ClientMessage::RenameTarget { .. } | ClientMessage::Shutdown => send_error(&mut framed, envelope.request_id, "control_only", "command requires a control connection").await?,
                     ClientMessage::Hello { .. } => send_error(&mut framed, envelope.request_id, "already_hello", "hello was already received").await?,
                 }
             },
@@ -980,6 +1038,30 @@ async fn control_loop(
                     send_error(framed, envelope.request_id, error.code, &error.message).await?
                 }
             },
+            ClientMessage::MovePane {
+                pane_id,
+                destination_tab_id,
+            } => {
+                let result = shared.lock().await.move_pane(pane_id, destination_tab_id);
+                match result {
+                    Ok(moved) => {
+                        send(
+                            framed,
+                            envelope.request_id,
+                            ServerMessage::PaneMoved {
+                                source_tab_id: moved.source_tab_id,
+                                moved: moved.moved,
+                                source_tab_closed: moved.source_tab_closed,
+                                selected: moved.selected,
+                            },
+                        )
+                        .await?
+                    }
+                    Err(error) => {
+                        send_error(framed, envelope.request_id, error.code, &error.message).await?
+                    }
+                }
+            }
             ClientMessage::ListResources => {
                 let snapshot = shared.lock().await.resources.snapshot();
                 send(
@@ -1115,20 +1197,26 @@ async fn lease_target(
     })
 }
 
-async fn resolves_to_current(
+async fn resolve_current_target(
     shared: &Shared,
     selector: &TargetSelector,
     current: TerminalId,
-) -> Result<bool, DaemonError> {
+) -> Result<Option<SelectedTarget>, DaemonError> {
     let state = shared.lock().await;
     if !state.accepting {
         return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
     }
-    Ok(state
+    let path = state
         .resources
-        .resolve_terminal_target(Some(selector.clone()))?
-        .terminal_id
-        == current)
+        .resolve_terminal_target(Some(selector.clone()))?;
+    if path.terminal_id != current {
+        return Ok(None);
+    }
+    let runtime = state
+        .runtimes
+        .get(&path.terminal_id)
+        .ok_or_else(|| DaemonError::new("not_found", "terminal runtime not found"))?;
+    Ok(Some(selected_target(path, &runtime.handle)))
 }
 
 async fn switch_candidate(
@@ -1794,6 +1882,22 @@ mod tests {
         );
 
         terminal.close().await.unwrap();
+    }
+
+    #[test]
+    fn pane_move_errors_have_stable_codes() {
+        assert_eq!(
+            DaemonError::from(ResourceError::DifferentWorkspace).code,
+            "different_workspace"
+        );
+        assert_eq!(
+            DaemonError::from(ResourceError::NotFound("pane")).code,
+            "not_found"
+        );
+        assert_eq!(
+            DaemonError::from(ResourceError::Closing("tab")).code,
+            "target_closing"
+        );
     }
 
     #[test]
