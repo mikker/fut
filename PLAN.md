@@ -7,14 +7,14 @@ The Milestone 0–1 spike and the first daemon-integrated Milestone 2 slice are 
 - a Rust `fut` executable and pinned Rust/Zig toolchain;
 - one securely owned per-user daemon socket;
 - a pure ResourceTree used by the daemon, separate from its terminal runtime registry;
-- several one-workspace/one-tab/one-pane/one-terminal project sessions in one daemon;
+- several project sessions in one daemon, with explicitly opened linked Git worktrees as peer workspaces;
 - stable terminal identities and per-terminal attachment leases;
 - a narrow `libghostty-vt` adapter producing Fut-owned semantic snapshots;
 - a detachable Ratatui client with local view state;
 - durable terminal lifecycle and confirmed child cleanup;
 - separate unit and process-level end-to-end test layers.
 
-This validates the first multi-session vertical slice but does not complete Milestone 2. Input encoding remains a basic client-side mapping and snapshots are full-grid JSON messages. Sessions are currently directory-backed; Git common-dir/worktree identity is deliberately next. Only interactive connections select one terminal at handshake, with no retargeting, navigator, direct switching, rename/move/split operations, or project recipes. A session disappears when its terminal exits; only the last session exit closes Fut and releases the socket.
+This validates the first multi-session vertical slice but does not complete Milestone 2. Input encoding remains a basic client-side mapping and snapshots are full-grid JSON messages. Git checkouts use their canonical common directory as project identity and their top-level checkout as workspace root; non-Git directories use canonical directory identity. Worktrees are not eagerly discovered. Opening a linked checkout adds one peer workspace, while reopening it is side-effect free. Interactive connections select one terminal at handshake, with no retargeting, navigator, direct switching, rename/move/split operations, or project recipes. A workspace disappears when its last terminal exits, a session when its last workspace exits, and only the final session closes Fut and releases the socket.
 
 ## Strategy
 

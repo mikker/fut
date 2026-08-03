@@ -34,11 +34,11 @@ use crate::{
         ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, ServerMessage, codec,
         decode_payload, encode_payload,
     },
-    resources::SessionSelector,
+    resources::TargetSelector,
 };
 
 /// Attach an interactive full-screen client to an already-running daemon.
-pub async fn attach(socket_path: &Path, selector: Option<SessionSelector>) -> anyhow::Result<()> {
+pub async fn attach(socket_path: &Path, selector: Option<TargetSelector>) -> anyhow::Result<()> {
     let stream = UnixStream::connect(socket_path)
         .await
         .with_context(|| format!("connect to {}", socket_path.display()))?;
@@ -107,7 +107,7 @@ async fn run(
                     ServerMessage::Snapshot { terminal_id: id, screen } if id == terminal_id => {
                         snapshots.accept(screen);
                     }
-                    ServerMessage::Snapshot { .. } | ServerMessage::Pong { .. } | ServerMessage::CommandCompleted { .. } | ServerMessage::Resources { .. } | ServerMessage::SessionCreated { .. } => {}
+                    ServerMessage::Snapshot { .. } | ServerMessage::Pong { .. } | ServerMessage::CommandCompleted { .. } | ServerMessage::Resources { .. } | ServerMessage::LocationOpened { .. } => {}
                     ServerMessage::TerminalExited { terminal_id: id, exit_code } if id == terminal_id => {
                         if let Some(code) = exit_code { bail!("terminal exited with status {code}") }
                         break;

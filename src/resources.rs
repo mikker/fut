@@ -5,13 +5,23 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::domain::{PaneId, SessionId, TabId, TerminalId, WorkspaceId};
+
+fn disambiguate(suggested: &str, exists: impl Fn(&str) -> bool) -> String {
+    if !exists(suggested) {
+        return suggested.to_owned();
+    }
+    (2..)
+        .map(|suffix| format!("{suggested}-{suffix}"))
+        .find(|candidate| !exists(candidate))
+        .expect("an unbounded suffix must produce a unique name")
+}
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum ProjectIdentity {
@@ -29,6 +39,23 @@ pub struct Project {
 pub enum SessionSelector {
     Id(SessionId),
     Name(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum TargetSelector {
+    Session(SessionSelector),
+    Workspace(WorkspaceId),
+    Tab(TabId),
+    Pane(PaneId),
+    Terminal(TerminalId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CheckoutDestination {
+    Existing(WorkspaceId),
+    AddWorkspace { session_id: SessionId },
+    CreateSession,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -93,6 +120,7 @@ pub struct WorkspaceSnapshot {
     pub id: WorkspaceId,
     pub name: String,
     pub root: PathBuf,
+    pub closing: bool,
     pub tabs: Vec<TabSnapshot>,
 }
 
@@ -153,12 +181,18 @@ pub enum ResourceEvent {
     SessionCloseRequested {
         session_id: SessionId,
     },
+    WorkspaceCloseRequested {
+        workspace_id: WorkspaceId,
+    },
     PaneCloseCancelled {
         pane_id: PaneId,
         terminal_id: TerminalId,
     },
     SessionCloseCancelled {
         session_id: SessionId,
+    },
+    WorkspaceCloseCancelled {
+        workspace_id: WorkspaceId,
     },
     PaneClosed {
         pane_id: PaneId,
@@ -200,6 +234,8 @@ pub enum ResourceError {
     Closing(&'static str),
     #[error("a session target must be selected")]
     TargetRequired,
+    #[error("target is ambiguous")]
+    AmbiguousTarget,
     #[error("resource tree invariant violated: {0}")]
     Invariant(String),
 }
@@ -216,6 +252,7 @@ struct Workspace {
     session_id: SessionId,
     name: String,
     root: PathBuf,
+    closing: bool,
     tabs: Vec<TabId>,
 }
 #[derive(Clone, Debug)]
@@ -263,59 +300,98 @@ impl ResourceTree {
 
     pub fn resolve_terminal_target(
         &self,
-        selector: Option<SessionSelector>,
+        selector: Option<TargetSelector>,
     ) -> Result<ResolvedTerminalPath, ResourceError> {
-        let session_id = match selector {
-            Some(selector) => self.resolve_session(selector)?,
-            None => {
-                let mut open = self.session_order.iter().copied().filter(|id| {
-                    self.sessions
-                        .get(id)
-                        .is_some_and(|session| !session.closing)
-                });
-                let session_id = open.next().ok_or(ResourceError::TargetRequired)?;
-                if open.next().is_some() {
-                    return Err(ResourceError::TargetRequired);
-                }
-                session_id
+        let candidates = match selector {
+            None => self.open_paths()?,
+            Some(TargetSelector::Session(selector)) => {
+                let id = self.resolve_session(selector)?;
+                self.paths_for_session(id)?
+            }
+            Some(TargetSelector::Workspace(id)) => self.paths_for_workspace(id)?,
+            Some(TargetSelector::Tab(id)) => self.paths_for_tab(id)?,
+            Some(TargetSelector::Pane(id)) => vec![self.path_for_pane(id)?],
+            Some(TargetSelector::Terminal(id)) => {
+                let pane = *self
+                    .terminals
+                    .get(&id)
+                    .ok_or(ResourceError::NotFound("terminal"))?;
+                vec![self.path_for_pane(pane)?]
             }
         };
-        let session = self
-            .sessions
-            .get(&session_id)
-            .ok_or(ResourceError::NotFound("session"))?;
+        match candidates.as_slice() {
+            [path] => Ok(*path),
+            _ => Err(ResourceError::AmbiguousTarget),
+        }
+    }
+
+    /// Plans a checkout without reserving names, roots, or identifiers.
+    pub fn checkout_destination(
+        &self,
+        project: &Project,
+        root: &Path,
+    ) -> Result<CheckoutDestination, ResourceError> {
+        let matching_sessions: Vec<_> = self
+            .session_order
+            .iter()
+            .copied()
+            .filter(|id| self.sessions[id].project.identity == project.identity)
+            .collect();
+        if matching_sessions.len() > 1 {
+            return self.invalid("project identity belongs to multiple sessions");
+        }
+        let root_owner = self
+            .workspaces
+            .iter()
+            .find(|(_, workspace)| workspace.root == root);
+        let Some(&session_id) = matching_sessions.first() else {
+            return if root_owner.is_some() {
+                self.invalid("workspace root belongs to another project")
+            } else {
+                Ok(CheckoutDestination::CreateSession)
+            };
+        };
+        let session = &self.sessions[&session_id];
         if session.closing {
             return Err(ResourceError::Closing("session"));
         }
-        let workspace_id = *session
-            .workspaces
+        if let Some((&workspace_id, workspace)) = root_owner {
+            if workspace.session_id != session_id {
+                return self.invalid("workspace root belongs to another project");
+            }
+            if workspace.closing {
+                return Err(ResourceError::Closing("workspace"));
+            }
+            return Ok(CheckoutDestination::Existing(workspace_id));
+        }
+        Ok(CheckoutDestination::AddWorkspace { session_id })
+    }
+
+    /// The first terminal in insertion order, used only when opening a checkout.
+    pub fn initial_terminal_for_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<ResolvedTerminalPath, ResourceError> {
+        self.paths_for_workspace(workspace_id)?
             .first()
-            .ok_or_else(|| ResourceError::Invariant("session has no workspace".into()))?;
-        let workspace = self.workspaces.get(&workspace_id).ok_or_else(|| {
-            ResourceError::Invariant("session references missing workspace".into())
-        })?;
-        let tab_id = *workspace
-            .tabs
-            .first()
-            .ok_or_else(|| ResourceError::Invariant("workspace has no tab".into()))?;
-        let tab = self
-            .tabs
-            .get(&tab_id)
-            .ok_or_else(|| ResourceError::Invariant("workspace references missing tab".into()))?;
-        let pane_id = *tab
-            .panes
-            .first()
-            .ok_or_else(|| ResourceError::Invariant("tab has no pane".into()))?;
-        let pane = self
-            .panes
-            .get(&pane_id)
-            .ok_or_else(|| ResourceError::Invariant("tab references missing pane".into()))?;
-        Ok(ResolvedTerminalPath {
-            session_id,
-            workspace_id,
-            tab_id,
-            pane_id,
-            terminal_id: pane.terminal_id,
+            .copied()
+            .ok_or_else(|| ResourceError::Invariant("workspace has no terminal".into()))
+    }
+
+    pub fn available_session_name(&self, suggested: &str) -> String {
+        disambiguate(suggested, |name| {
+            self.sessions.values().any(|item| item.name == name)
+        })
+    }
+
+    pub fn available_workspace_name(&self, session_id: SessionId, suggested: &str) -> String {
+        disambiguate(suggested, |name| {
+            self.sessions.get(&session_id).is_some_and(|session| {
+                session
+                    .workspaces
+                    .iter()
+                    .any(|id| self.workspaces[id].name == name)
+            })
         })
     }
 
@@ -375,6 +451,7 @@ impl ResourceTree {
                 session_id: path.session_id,
                 name: path.workspace_name,
                 root: path.root,
+                closing: false,
                 tabs: vec![path.tab_id],
             },
         );
@@ -452,6 +529,7 @@ impl ResourceTree {
                 session_id,
                 name: path.workspace_name,
                 root: path.root,
+                closing: false,
                 tabs: vec![path.tab_id],
             },
         );
@@ -500,6 +578,9 @@ impl ResourceTree {
             .ok_or(ResourceError::NotFound("workspace"))?;
         if self.sessions[&workspace.session_id].closing {
             return Err(ResourceError::Closing("session"));
+        }
+        if workspace.closing {
+            return Err(ResourceError::Closing("workspace"));
         }
         if workspace
             .tabs
@@ -557,6 +638,9 @@ impl ResourceTree {
         if self.session_for_workspace(tab.workspace_id).closing {
             return Err(ResourceError::Closing("session"));
         }
+        if self.workspaces[&tab.workspace_id].closing {
+            return Err(ResourceError::Closing("workspace"));
+        }
         self.check_pane_ids(pane_id, terminal_id)?;
         self.tabs.get_mut(&tab_id).unwrap().panes.push(pane_id);
         self.insert_pane(tab_id, pane_id, terminal_id);
@@ -596,6 +680,9 @@ impl ResourceTree {
         }
         if self.session_for_workspace(source_workspace).closing {
             return Err(ResourceError::Closing("session"));
+        }
+        if self.workspaces[&source_workspace].closing {
+            return Err(ResourceError::Closing("workspace"));
         }
         self.tabs
             .get_mut(&pane.tab_id)
@@ -642,6 +729,10 @@ impl ResourceTree {
         if session.closing {
             return Err(ResourceError::Closing("session"));
         }
+        let workspace_id = self.tabs[&pane.tab_id].workspace_id;
+        if self.workspaces[&workspace_id].closing {
+            return Err(ResourceError::Closing("workspace"));
+        }
         if !pane.closing {
             return Err(ResourceError::NotFound("pending pane close"));
         }
@@ -669,6 +760,10 @@ impl ResourceTree {
         }
         let terminals: Vec<_> = panes.iter().map(|id| self.panes[id].terminal_id).collect();
         self.sessions.get_mut(&session_id).unwrap().closing = true;
+        let workspaces = self.sessions[&session_id].workspaces.clone();
+        for workspace_id in workspaces {
+            self.workspaces.get_mut(&workspace_id).unwrap().closing = true;
+        }
         for pane_id in panes {
             self.panes.get_mut(&pane_id).unwrap().closing = true;
         }
@@ -692,11 +787,69 @@ impl ResourceTree {
         }
         let panes = self.session_panes(session_id);
         self.sessions.get_mut(&session_id).unwrap().closing = false;
+        let workspaces = self.sessions[&session_id].workspaces.clone();
+        for workspace_id in workspaces {
+            self.workspaces.get_mut(&workspace_id).unwrap().closing = false;
+        }
         for pane_id in panes {
             self.panes.get_mut(&pane_id).unwrap().closing = false;
         }
         Ok(self.finish(
             vec![ResourceEvent::SessionCloseCancelled { session_id }],
+            vec![],
+        ))
+    }
+
+    pub fn close_workspace(
+        &mut self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Mutation, ResourceError> {
+        let workspace = self
+            .workspaces
+            .get(&workspace_id)
+            .ok_or(ResourceError::NotFound("workspace"))?;
+        if self.sessions[&workspace.session_id].closing {
+            return Err(ResourceError::Closing("session"));
+        }
+        if workspace.closing {
+            return Err(ResourceError::Closing("workspace"));
+        }
+        let panes = self.workspace_panes(workspace_id);
+        if panes.iter().any(|id| self.panes[id].closing) {
+            return Err(ResourceError::Closing("pane"));
+        }
+        let terminals = panes.iter().map(|id| self.panes[id].terminal_id).collect();
+        self.workspaces.get_mut(&workspace_id).unwrap().closing = true;
+        for pane in panes {
+            self.panes.get_mut(&pane).unwrap().closing = true;
+        }
+        Ok(self.finish(
+            vec![ResourceEvent::WorkspaceCloseRequested { workspace_id }],
+            terminals,
+        ))
+    }
+
+    pub fn cancel_close_workspace(
+        &mut self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Mutation, ResourceError> {
+        let workspace = self
+            .workspaces
+            .get(&workspace_id)
+            .ok_or(ResourceError::NotFound("workspace"))?;
+        if self.sessions[&workspace.session_id].closing {
+            return Err(ResourceError::Closing("session"));
+        }
+        if !workspace.closing {
+            return Err(ResourceError::NotFound("pending workspace close"));
+        }
+        let panes = self.workspace_panes(workspace_id);
+        self.workspaces.get_mut(&workspace_id).unwrap().closing = false;
+        for pane in panes {
+            self.panes.get_mut(&pane).unwrap().closing = false;
+        }
+        Ok(self.finish(
+            vec![ResourceEvent::WorkspaceCloseCancelled { workspace_id }],
             vec![],
         ))
     }
@@ -790,10 +943,14 @@ impl ResourceTree {
                             || !seen_panes.insert(*pid)
                             || self.terminals.get(&pane.terminal_id) != Some(pid)
                             || (session.closing && !pane.closing)
+                            || (workspace.closing && !pane.closing)
                         {
                             return self.invalid("pane fields, parent, or closing state");
                         }
                     }
+                }
+                if session.closing && !workspace.closing {
+                    return self.invalid("closing session has open workspace");
                 }
             }
         }
@@ -898,6 +1055,7 @@ impl ResourceTree {
             id,
             name: w.name.clone(),
             root: w.root.clone(),
+            closing: w.closing,
             tabs: w.tabs.iter().map(|id| self.tab_snapshot(*id)).collect(),
         }
     }
@@ -931,6 +1089,113 @@ impl ResourceTree {
             .flat_map(|t| &self.tabs[t].panes)
             .copied()
             .collect()
+    }
+    fn workspace_panes(&self, workspace_id: WorkspaceId) -> Vec<PaneId> {
+        self.workspaces[&workspace_id]
+            .tabs
+            .iter()
+            .flat_map(|tab| &self.tabs[tab].panes)
+            .copied()
+            .collect()
+    }
+    fn open_paths(&self) -> Result<Vec<ResolvedTerminalPath>, ResourceError> {
+        let mut paths = Vec::new();
+        for id in &self.session_order {
+            match self.paths_for_session(*id) {
+                Ok(found) => paths.extend(found),
+                Err(ResourceError::Closing(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(paths)
+    }
+    fn paths_for_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<ResolvedTerminalPath>, ResourceError> {
+        let session = self
+            .sessions
+            .get(&session_id)
+            .ok_or(ResourceError::NotFound("session"))?;
+        if session.closing {
+            return Err(ResourceError::Closing("session"));
+        }
+        if session.workspaces.is_empty() {
+            return self.invalid("session has no workspace");
+        }
+        let mut paths = Vec::new();
+        for workspace in &session.workspaces {
+            match self.paths_for_workspace(*workspace) {
+                Ok(found) => paths.extend(found),
+                Err(ResourceError::Closing("workspace")) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(paths)
+    }
+    fn paths_for_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Vec<ResolvedTerminalPath>, ResourceError> {
+        let workspace = self
+            .workspaces
+            .get(&workspace_id)
+            .ok_or(ResourceError::NotFound("workspace"))?;
+        if self.sessions[&workspace.session_id].closing {
+            return Err(ResourceError::Closing("session"));
+        }
+        if workspace.closing {
+            return Err(ResourceError::Closing("workspace"));
+        }
+        if workspace.tabs.is_empty() {
+            return self.invalid("workspace has no tab");
+        }
+        let mut paths = Vec::new();
+        for tab in &workspace.tabs {
+            paths.extend(self.paths_for_tab(*tab)?);
+        }
+        Ok(paths)
+    }
+    fn paths_for_tab(&self, tab_id: TabId) -> Result<Vec<ResolvedTerminalPath>, ResourceError> {
+        let tab = self
+            .tabs
+            .get(&tab_id)
+            .ok_or(ResourceError::NotFound("tab"))?;
+        let workspace = &self.workspaces[&tab.workspace_id];
+        if self.sessions[&workspace.session_id].closing {
+            return Err(ResourceError::Closing("session"));
+        }
+        if workspace.closing {
+            return Err(ResourceError::Closing("workspace"));
+        }
+        if tab.panes.is_empty() {
+            return self.invalid("tab has no pane");
+        }
+        tab.panes.iter().map(|id| self.path_for_pane(*id)).collect()
+    }
+    fn path_for_pane(&self, pane_id: PaneId) -> Result<ResolvedTerminalPath, ResourceError> {
+        let pane = self
+            .panes
+            .get(&pane_id)
+            .ok_or(ResourceError::NotFound("pane"))?;
+        if pane.closing {
+            return Err(ResourceError::Closing("pane"));
+        }
+        let tab = &self.tabs[&pane.tab_id];
+        let workspace = &self.workspaces[&tab.workspace_id];
+        if self.sessions[&workspace.session_id].closing {
+            return Err(ResourceError::Closing("session"));
+        }
+        if workspace.closing {
+            return Err(ResourceError::Closing("workspace"));
+        }
+        Ok(ResolvedTerminalPath {
+            session_id: workspace.session_id,
+            workspace_id: tab.workspace_id,
+            tab_id: pane.tab_id,
+            pane_id,
+            terminal_id: pane.terminal_id,
+        })
     }
     fn check_names<'a>(
         &self,
@@ -1030,8 +1295,8 @@ mod tests {
     fn terminal_target_requires_one_open_session_without_a_selector() {
         let mut tree = ResourceTree::default();
         assert_eq!(
-            tree.resolve_terminal_target(None),
-            Err(ResourceError::TargetRequired)
+            tree.resolve_terminal_target(None::<TargetSelector>),
+            Err(ResourceError::AmbiguousTarget)
         );
 
         let first = initial("first", "/first");
@@ -1043,17 +1308,23 @@ mod tests {
             terminal_id: first.terminal_id,
         };
         tree.create_session(first).unwrap();
-        assert_eq!(tree.resolve_terminal_target(None), Ok(expected));
+        assert_eq!(
+            tree.resolve_terminal_target(None::<TargetSelector>),
+            Ok(expected)
+        );
 
         let second = initial("second", "/second");
         let second_id = second.session_id;
         tree.create_session(second).unwrap();
         assert_eq!(
-            tree.resolve_terminal_target(None),
-            Err(ResourceError::TargetRequired)
+            tree.resolve_terminal_target(None::<TargetSelector>),
+            Err(ResourceError::AmbiguousTarget)
         );
         tree.close_session(second_id).unwrap();
-        assert_eq!(tree.resolve_terminal_target(None), Ok(expected));
+        assert_eq!(
+            tree.resolve_terminal_target(None::<TargetSelector>),
+            Ok(expected)
+        );
     }
 
     #[test]
@@ -1072,19 +1343,27 @@ mod tests {
         tree.create_session(initial("second", "/second")).unwrap();
 
         assert_eq!(
-            tree.resolve_terminal_target(Some(SessionSelector::Id(first_id))),
+            tree.resolve_terminal_target(Some(TargetSelector::Session(SessionSelector::Id(
+                first_id
+            )))),
             Ok(expected)
         );
         assert_eq!(
-            tree.resolve_terminal_target(Some(SessionSelector::Name("first".into()))),
+            tree.resolve_terminal_target(Some(TargetSelector::Session(SessionSelector::Name(
+                "first".into()
+            )))),
             Ok(expected)
         );
         assert_eq!(
-            tree.resolve_terminal_target(Some(SessionSelector::Name("First".into()))),
+            tree.resolve_terminal_target(Some(TargetSelector::Session(SessionSelector::Name(
+                "First".into()
+            )))),
             Err(ResourceError::NotFound("session"))
         );
         assert_eq!(
-            tree.resolve_terminal_target(Some(SessionSelector::Id(SessionId::new()))),
+            tree.resolve_terminal_target(Some(TargetSelector::Session(SessionSelector::Id(
+                SessionId::new()
+            )))),
             Err(ResourceError::NotFound("session"))
         );
     }
@@ -1098,15 +1377,19 @@ mod tests {
         tree.close_session(session_id).unwrap();
 
         assert_eq!(
-            tree.resolve_terminal_target(None),
-            Err(ResourceError::TargetRequired)
+            tree.resolve_terminal_target(None::<TargetSelector>),
+            Err(ResourceError::AmbiguousTarget)
         );
         assert_eq!(
-            tree.resolve_terminal_target(Some(SessionSelector::Id(session_id))),
+            tree.resolve_terminal_target(Some(TargetSelector::Session(SessionSelector::Id(
+                session_id
+            )))),
             Err(ResourceError::Closing("session"))
         );
         assert_eq!(
-            tree.resolve_terminal_target(Some(SessionSelector::Name("closing".into()))),
+            tree.resolve_terminal_target(Some(TargetSelector::Session(SessionSelector::Name(
+                "closing".into()
+            )))),
             Err(ResourceError::Closing("session"))
         );
     }
@@ -1124,7 +1407,7 @@ mod tests {
             .clear();
 
         assert!(matches!(
-            tree.resolve_terminal_target(None),
+            tree.resolve_terminal_target(None::<TargetSelector>),
             Err(ResourceError::Invariant(_))
         ));
     }
@@ -1437,5 +1720,185 @@ mod tests {
             tree.validate().unwrap();
         }
         assert!(tree.snapshot().sessions.is_empty());
+    }
+
+    #[test]
+    fn typed_targets_checkout_planning_and_workspace_close() {
+        let mut tree = ResourceTree::default();
+        let first = initial("s", "/p");
+        let project = first.project.clone();
+        let root = first.root.clone();
+        let sid = first.session_id;
+        let wid = first.workspace_id;
+        let tab = first.tab_id;
+        let pane = first.pane_id;
+        let terminal = first.terminal_id;
+        let expected = ResolvedTerminalPath {
+            session_id: sid,
+            workspace_id: wid,
+            tab_id: tab,
+            pane_id: pane,
+            terminal_id: terminal,
+        };
+        tree.create_session(first).unwrap();
+        for selector in [
+            TargetSelector::Session(SessionSelector::Id(sid)),
+            TargetSelector::Workspace(wid),
+            TargetSelector::Tab(tab),
+            TargetSelector::Pane(pane),
+            TargetSelector::Terminal(terminal),
+        ] {
+            assert_eq!(
+                tree.resolve_terminal_target(Some(selector.clone())),
+                Ok(expected)
+            );
+            assert_eq!(
+                serde_json::from_str::<TargetSelector>(&serde_json::to_string(&selector).unwrap())
+                    .unwrap(),
+                selector
+            );
+        }
+        let revision = tree.revision();
+        assert_eq!(
+            tree.checkout_destination(&project, &root).unwrap(),
+            CheckoutDestination::Existing(expected.workspace_id)
+        );
+        assert_eq!(
+            tree.checkout_destination(&project, Path::new("/p/peer"))
+                .unwrap(),
+            CheckoutDestination::AddWorkspace { session_id: sid }
+        );
+        assert_eq!(
+            tree.checkout_destination(
+                &Project {
+                    identity: ProjectIdentity::CanonicalDirectory("/other".into())
+                },
+                Path::new("/other/main")
+            )
+            .unwrap(),
+            CheckoutDestination::CreateSession
+        );
+        assert_eq!(tree.revision(), revision);
+
+        let peer = WorkspacePath {
+            workspace_id: WorkspaceId::new(),
+            workspace_name: "peer".into(),
+            root: "/p/peer".into(),
+            tab_id: TabId::new(),
+            tab_name: "shell".into(),
+            pane_id: PaneId::new(),
+            terminal_id: TerminalId::new(),
+        };
+        let peer_terminal = peer.terminal_id;
+        tree.add_workspace(sid, peer).unwrap();
+        assert_eq!(
+            tree.resolve_terminal_target(Some(TargetSelector::Session(SessionSelector::Id(sid)))),
+            Err(ResourceError::AmbiguousTarget)
+        );
+        assert_eq!(
+            tree.resolve_terminal_target(None::<TargetSelector>),
+            Err(ResourceError::AmbiguousTarget)
+        );
+        let request = tree.close_workspace(wid).unwrap();
+        assert_eq!(request.terminals_to_close, vec![terminal]);
+        assert!(tree.snapshot().sessions[0].workspaces[0].closing);
+        assert_eq!(
+            tree.resolve_terminal_target(Some(TargetSelector::Workspace(wid))),
+            Err(ResourceError::Closing("workspace"))
+        );
+        assert_eq!(
+            tree.resolve_terminal_target(None),
+            tree.resolve_terminal_target(Some(TargetSelector::Terminal(peer_terminal)))
+        );
+        assert_eq!(
+            tree.resolve_terminal_target(Some(TargetSelector::Session(SessionSelector::Id(sid)))),
+            tree.resolve_terminal_target(Some(TargetSelector::Terminal(peer_terminal)))
+        );
+        tree.cancel_close_workspace(wid).unwrap();
+        assert!(!tree.snapshot().sessions[0].workspaces[0].closing);
+        tree.close_workspace(wid).unwrap();
+        let exit = tree.terminal_exited(terminal).unwrap();
+        assert!(matches!(
+            exit.events.as_slice(),
+            [
+                ResourceEvent::PaneClosed {
+                    cause: CloseCause::Requested,
+                    ..
+                },
+                ResourceEvent::TabClosed { .. },
+                ResourceEvent::WorkspaceClosed { .. }
+            ]
+        ));
+        assert!(!exit.multiplexer_empty);
+        tree.validate().unwrap();
+        assert!(
+            tree.terminal_exited(peer_terminal)
+                .unwrap()
+                .multiplexer_empty
+        );
+        tree.validate().unwrap();
+    }
+
+    #[test]
+    fn existing_checkout_is_workspace_idempotent_with_multiple_terminals() {
+        let mut tree = ResourceTree::default();
+        let path = initial("project", "/project");
+        let project = path.project.clone();
+        let workspace_id = path.workspace_id;
+        let first_terminal = path.terminal_id;
+        tree.create_session(path).unwrap();
+        tree.add_tab(
+            workspace_id,
+            TabPath {
+                tab_id: TabId::new(),
+                tab_name: "second".into(),
+                pane_id: PaneId::new(),
+                terminal_id: TerminalId::new(),
+            },
+        )
+        .unwrap();
+        let revision = tree.revision();
+
+        assert_eq!(
+            tree.checkout_destination(&project, Path::new("/project/main")),
+            Ok(CheckoutDestination::Existing(workspace_id))
+        );
+        assert_eq!(
+            tree.initial_terminal_for_workspace(workspace_id)
+                .unwrap()
+                .terminal_id,
+            first_terminal
+        );
+        assert_eq!(tree.revision(), revision);
+        assert_eq!(
+            tree.resolve_terminal_target(Some(TargetSelector::Workspace(workspace_id))),
+            Err(ResourceError::AmbiguousTarget)
+        );
+    }
+
+    #[test]
+    fn implicit_display_names_are_deterministically_disambiguated() {
+        let mut tree = ResourceTree::default();
+        let first = initial("project", "/first");
+        let session_id = first.session_id;
+        tree.create_session(first).unwrap();
+        let second = initial("project-2", "/second");
+        tree.create_session(second).unwrap();
+        assert_eq!(tree.available_session_name("project"), "project-3");
+
+        tree.add_workspace(
+            session_id,
+            WorkspacePath {
+                workspace_id: WorkspaceId::new(),
+                workspace_name: "main-2".into(),
+                root: "/first/peer".into(),
+                tab_id: TabId::new(),
+                tab_name: "shell".into(),
+                pane_id: PaneId::new(),
+                terminal_id: TerminalId::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(tree.available_workspace_name(session_id, "main"), "main-3");
     }
 }

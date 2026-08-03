@@ -6,7 +6,7 @@ pub mod path;
 pub mod autostart;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io,
     os::{
@@ -30,12 +30,14 @@ use tokio_util::codec::Framed;
 
 use crate::{
     domain::{ClientId, PaneId, SessionId, TabId, TerminalId, TerminalSize, WorkspaceId},
+    project::{ProjectError, ProjectResolver, ResolvedLocation},
     protocol::{
-        AcknowledgedCommand, ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, SelectedTarget,
-        ServerMessage, codec, decode_payload, encode_payload,
+        AcknowledgedCommand, ClientMessage, ClientMode, Envelope, OpenDisposition,
+        PROTOCOL_VERSION, SelectedTarget, ServerMessage, codec, decode_payload, encode_payload,
     },
     resources::{
-        InitialPath, Project, ProjectIdentity, ResourceError, ResourceTree, SessionSelector,
+        CheckoutDestination, InitialPath, ResourceError, ResourceTree, TargetSelector,
+        WorkspacePath,
     },
     terminal::{
         CommandError, SpawnSpec, TerminalEvent, TerminalHandle, TerminalLifecycle, spawn_terminal,
@@ -82,6 +84,7 @@ struct RuntimeEntry {
 struct SharedState {
     resources: ResourceTree,
     runtimes: HashMap<TerminalId, RuntimeEntry>,
+    expected_finalizations: HashSet<TerminalId>,
     accepting: bool,
 }
 
@@ -111,9 +114,23 @@ impl From<ResourceError> for DaemonError {
             ResourceError::NotFound(_) => "not_found",
             ResourceError::Duplicate(_) => "duplicate",
             ResourceError::Closing(_) => "target_closing",
-            ResourceError::TargetRequired => "target_required",
+            ResourceError::TargetRequired | ResourceError::AmbiguousTarget => "target_required",
             ResourceError::EmptyName => "invalid_name",
             _ => "resource_error",
+        };
+        Self::new(code, error.to_string())
+    }
+}
+
+impl From<ProjectError> for DaemonError {
+    fn from(error: ProjectError) -> Self {
+        let code = match error {
+            ProjectError::Input { .. }
+            | ProjectError::NotDirectory(_)
+            | ProjectError::Canonicalize { .. }
+            | ProjectError::BareRepository(_) => "invalid_cwd",
+            ProjectError::GitNotFound(_) | ProjectError::GitSpawn(_) => "git_unavailable",
+            _ => "project_resolution",
         };
         Self::new(code, error.to_string())
     }
@@ -126,6 +143,25 @@ impl SharedState {
         terminal: Arc<TerminalHandle>,
     ) -> Result<(), DaemonError> {
         self.resources.create_session(path)?;
+        self.expected_finalizations.remove(&terminal.id());
+        self.runtimes.insert(
+            terminal.id(),
+            RuntimeEntry {
+                handle: terminal,
+                lease: AttachmentLease::default(),
+            },
+        );
+        Ok(())
+    }
+
+    fn register_workspace(
+        &mut self,
+        session_id: SessionId,
+        path: WorkspacePath,
+        terminal: Arc<TerminalHandle>,
+    ) -> Result<(), DaemonError> {
+        self.resources.add_workspace(session_id, path)?;
+        self.expected_finalizations.remove(&terminal.id());
         self.runtimes.insert(
             terminal.id(),
             RuntimeEntry {
@@ -137,6 +173,9 @@ impl SharedState {
     }
 
     fn finalize_terminal(&mut self, terminal_id: TerminalId) -> Result<bool, DaemonError> {
+        if self.expected_finalizations.remove(&terminal_id) {
+            return Ok(false);
+        }
         if !self.runtimes.contains_key(&terminal_id) {
             return Err(DaemonError::new(
                 "resource_error",
@@ -151,20 +190,36 @@ impl SharedState {
         Ok(mutation.multiplexer_empty)
     }
 
-    fn begin_session_close(
+    fn finalize_terminal_for_replacement(
         &mut self,
-        selector: SessionSelector,
-    ) -> Result<(SessionId, Vec<Arc<TerminalHandle>>), DaemonError> {
+        terminal_id: TerminalId,
+    ) -> Result<bool, DaemonError> {
+        let empty = self.finalize_terminal(terminal_id)?;
+        self.expected_finalizations.insert(terminal_id);
+        Ok(empty)
+    }
+
+    fn begin_target_close(
+        &mut self,
+        selector: TargetSelector,
+    ) -> Result<(CloseScope, Vec<Arc<TerminalHandle>>), DaemonError> {
         if !self.accepting {
             return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
         }
-        let session_id = self.resources.resolve_session(selector)?;
-        let terminals = self.resources.close_session(session_id)?.terminals_to_close;
+        let scope = match selector {
+            TargetSelector::Session(selector) => {
+                CloseScope::Session(self.resources.resolve_session(selector)?)
+            }
+            TargetSelector::Workspace(id) => CloseScope::Workspace(id),
+            other => CloseScope::Pane(self.resources.resolve_terminal_target(Some(other))?.pane_id),
+        };
+        let mut planned = self.resources.clone();
+        let terminals = scope.begin(&mut planned)?.terminals_to_close;
         let handles = terminals
-            .into_iter()
+            .iter()
             .map(|id| {
                 self.runtimes
-                    .get(&id)
+                    .get(id)
                     .map(|entry| Arc::clone(&entry.handle))
                     .ok_or_else(|| {
                         DaemonError::new(
@@ -173,14 +228,9 @@ impl SharedState {
                         )
                     })
             })
-            .collect::<Result<Vec<_>, _>>();
-        match handles {
-            Ok(handles) => Ok((session_id, handles)),
-            Err(error) => {
-                let _ = self.resources.cancel_close_session(session_id);
-                Err(error)
-            }
-        }
+            .collect::<Result<Vec<_>, _>>()?;
+        scope.begin(&mut self.resources)?;
+        Ok((scope, handles))
     }
 
     fn begin_shutdown(&mut self) -> Vec<Arc<TerminalHandle>> {
@@ -192,23 +242,58 @@ impl SharedState {
     }
 }
 
+#[derive(Clone, Copy)]
+enum CloseScope {
+    Session(SessionId),
+    Workspace(WorkspaceId),
+    Pane(PaneId),
+}
+
+impl CloseScope {
+    fn begin(self, tree: &mut ResourceTree) -> Result<crate::resources::Mutation, ResourceError> {
+        match self {
+            Self::Session(id) => tree.close_session(id),
+            Self::Workspace(id) => tree.close_workspace(id),
+            Self::Pane(id) => tree.close_pane(id),
+        }
+    }
+
+    fn cancel(self, tree: &mut ResourceTree) -> Result<crate::resources::Mutation, ResourceError> {
+        match self {
+            Self::Session(id) => tree.cancel_close_session(id),
+            Self::Workspace(id) => tree.cancel_close_workspace(id),
+            Self::Pane(id) => tree.cancel_close_pane(id),
+        }
+    }
+}
+
 type Shared = Arc<Mutex<SharedState>>;
 
 /// Bind Fut's sole socket and run while at least one session is alive.
 pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
+    let resolved = ProjectResolver::default()
+        .resolve(&config.spawn.cwd)
+        .await
+        .map_err(DaemonError::from)?;
     let socket = bind_socket(&config.socket_path).await?;
-    let cwd = fs::canonicalize(&config.spawn.cwd)
-        .with_context(|| format!("canonicalize {}", config.spawn.cwd.display()))?;
     let mut initial_spawn = config.spawn;
-    initial_spawn.cwd = cwd.clone();
+    initial_spawn.cwd = resolved.cwd.clone();
     let terminal = Arc::new(spawn_terminal(initial_spawn)?);
-    let initial = initial_path(default_session_name(&cwd), cwd, terminal.id());
+    let initial = initial_path(
+        &resolved,
+        resolved.suggested_session_name.clone(),
+        terminal.id(),
+    );
     let mut state = SharedState {
         resources: ResourceTree::default(),
         runtimes: HashMap::new(),
+        expected_finalizations: HashSet::new(),
         accepting: true,
     };
-    state.register_session(initial, Arc::clone(&terminal))?;
+    if let Err(error) = state.register_session(initial, Arc::clone(&terminal)) {
+        let _ = terminal.close().await;
+        return Err(error.into());
+    }
     let shared = Arc::new(Mutex::new(state));
     let (exited_tx, mut exited_rx) = mpsc::unbounded_channel();
     watch_terminal(terminal, exited_tx.clone());
@@ -269,23 +354,14 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     Ok(())
 }
 
-fn default_session_name(cwd: &Path) -> String {
-    cwd.file_name()
-        .filter(|name| !name.is_empty())
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "root".into())
-}
-
-fn initial_path(name: String, cwd: PathBuf, terminal_id: TerminalId) -> InitialPath {
+fn initial_path(resolved: &ResolvedLocation, name: String, terminal_id: TerminalId) -> InitialPath {
     InitialPath {
         session_id: SessionId::new(),
         session_name: name,
-        project: Project {
-            identity: ProjectIdentity::CanonicalDirectory(cwd.clone()),
-        },
+        project: resolved.project.clone(),
         workspace_id: WorkspaceId::new(),
-        workspace_name: "main".into(),
-        root: cwd,
+        workspace_name: resolved.suggested_workspace_name.clone(),
+        root: resolved.workspace_root.clone(),
         tab_id: TabId::new(),
         tab_name: "shell".into(),
         pane_id: PaneId::new(),
@@ -556,7 +632,7 @@ async fn handle_connection(
                         break;
                     }
                     ClientMessage::Ping => send(&mut framed, envelope.request_id, ServerMessage::Pong { daemon_pid: std::process::id() }).await?,
-                    ClientMessage::CreateSession { .. } | ClientMessage::ListResources | ClientMessage::CloseSession { .. } | ClientMessage::Shutdown => send_error(&mut framed, envelope.request_id, "control_only", "command requires a control connection").await?,
+                    ClientMessage::OpenLocation { .. } | ClientMessage::ListResources | ClientMessage::CloseTarget { .. } | ClientMessage::Shutdown => send_error(&mut framed, envelope.request_id, "control_only", "command requires a control connection").await?,
                     ClientMessage::Hello { .. } => send_error(&mut framed, envelope.request_id, "already_hello", "hello was already received").await?,
                 }
             },
@@ -614,17 +690,20 @@ async fn control_loop(
                 )
                 .await?
             }
-            ClientMessage::CreateSession {
+            ClientMessage::OpenLocation {
                 name,
                 cwd,
                 program,
                 argv,
-            } => match create_session(&shared, &exited, name, cwd, program, argv).await {
-                Ok(selected) => {
+            } => match open_location(&shared, &exited, name, cwd, program, argv).await {
+                Ok((selected, disposition)) => {
                     send(
                         framed,
                         envelope.request_id,
-                        ServerMessage::SessionCreated { selected },
+                        ServerMessage::LocationOpened {
+                            selected,
+                            disposition,
+                        },
                     )
                     .await?
                 }
@@ -641,14 +720,14 @@ async fn control_loop(
                 )
                 .await?;
             }
-            ClientMessage::CloseSession { selector } => {
-                match close_session(&shared, selector).await {
+            ClientMessage::CloseTarget { selector } => {
+                match close_target(&shared, selector).await {
                     Ok(()) => {
                         send(
                             framed,
                             envelope.request_id,
                             ServerMessage::CommandCompleted {
-                                command: AcknowledgedCommand::CloseSession,
+                                command: AcknowledgedCommand::CloseTarget,
                             },
                         )
                         .await?
@@ -659,15 +738,20 @@ async fn control_loop(
                 }
             }
             ClientMessage::Shutdown => {
-                send(
+                {
+                    let mut state = shared.lock().await;
+                    state.accepting = false;
+                }
+                let response = send(
                     framed,
                     envelope.request_id,
                     ServerMessage::CommandCompleted {
                         command: AcknowledgedCommand::Shutdown,
                     },
                 )
-                .await?;
+                .await;
                 let _ = shutdown.send(true);
+                response?;
                 break;
             }
             ClientMessage::Detach => {
@@ -699,7 +783,7 @@ async fn control_loop(
 
 async fn select_target(
     shared: &Shared,
-    selector: Option<SessionSelector>,
+    selector: Option<TargetSelector>,
     client: ClientId,
 ) -> Result<((SelectedTarget, Arc<TerminalHandle>), lease::LeaseGuard), DaemonError> {
     let state = shared.lock().await;
@@ -736,40 +820,111 @@ async fn select_target(
     ))
 }
 
-async fn create_session(
+async fn open_location(
     shared: &Shared,
     exited: &mpsc::UnboundedSender<TerminalId>,
-    name: String,
+    name: Option<String>,
     cwd: PathBuf,
     program: Option<PathBuf>,
     argv: Vec<String>,
-) -> Result<SelectedTarget, DaemonError> {
-    let cwd = fs::canonicalize(&cwd).map_err(|error| {
-        DaemonError::new(
-            "invalid_cwd",
-            format!("canonicalize {}: {error}", cwd.display()),
-        )
-    })?;
+) -> Result<(SelectedTarget, OpenDisposition), DaemonError> {
+    // Git and filesystem resolution can block, so it deliberately precedes the state lock.
+    let resolved = ProjectResolver::default().resolve(&cwd).await?;
     let program = program.unwrap_or_else(|| {
         std::env::var_os("SHELL")
             .map(PathBuf::from)
             .unwrap_or_else(|| "/bin/sh".into())
     });
-    let proposed = initial_path(name, cwd.clone(), TerminalId::new());
-    let (terminal, selected, insertion_error) = {
+    let (terminal, selected, disposition, insertion_error) = {
         let mut state = shared.lock().await;
         if !state.accepting {
             return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
         }
+        let mut destination = state
+            .resources
+            .checkout_destination(&resolved.project, &resolved.workspace_root)?;
+        if let CheckoutDestination::Existing(workspace_id) = destination {
+            let path = state
+                .resources
+                .initial_terminal_for_workspace(workspace_id)?;
+            let exited_terminal = state
+                .runtimes
+                .get(&path.terminal_id)
+                .ok_or_else(|| DaemonError::new("resource_error", "terminal runtime missing"))?
+                .handle
+                .subscribe_lifecycle()
+                .borrow()
+                .clone();
+            if matches!(exited_terminal, TerminalLifecycle::Exited { .. }) {
+                state.finalize_terminal_for_replacement(path.terminal_id)?;
+                // This accepted open replaces the now-empty checkout rather than
+                // turning a natural terminal exit into daemon shutdown.
+                state.accepting = true;
+                destination = state
+                    .resources
+                    .checkout_destination(&resolved.project, &resolved.workspace_root)?;
+                if let CheckoutDestination::Existing(workspace_id) = destination {
+                    let replacement = state
+                        .resources
+                        .initial_terminal_for_workspace(workspace_id)?;
+                    let runtime =
+                        state
+                            .runtimes
+                            .get(&replacement.terminal_id)
+                            .ok_or_else(|| {
+                                DaemonError::new("resource_error", "terminal runtime missing")
+                            })?;
+                    return Ok((
+                        selected_target(replacement, &runtime.handle),
+                        OpenDisposition::Existing,
+                    ));
+                }
+            } else {
+                let runtime = &state.runtimes[&path.terminal_id];
+                return Ok((
+                    selected_target(path, &runtime.handle),
+                    OpenDisposition::Existing,
+                ));
+            }
+        }
+        let session_name = name.clone().unwrap_or_else(|| {
+            state
+                .resources
+                .available_session_name(&resolved.suggested_session_name)
+        });
+        let workspace_name = match destination {
+            CheckoutDestination::AddWorkspace { session_id } => name.clone().unwrap_or_else(|| {
+                state
+                    .resources
+                    .available_workspace_name(session_id, &resolved.suggested_workspace_name)
+            }),
+            _ => resolved.suggested_workspace_name.clone(),
+        };
+        let proposed_session = initial_path(&resolved, session_name, TerminalId::new());
+        let proposed_workspace = WorkspacePath {
+            workspace_id: WorkspaceId::new(),
+            workspace_name,
+            root: resolved.workspace_root.clone(),
+            tab_id: TabId::new(),
+            tab_name: "shell".into(),
+            pane_id: PaneId::new(),
+            terminal_id: TerminalId::new(),
+        };
         let mut validated = state.resources.clone();
-        validated
-            .create_session(proposed.clone())
-            .map_err(DaemonError::from)?;
+        match destination {
+            CheckoutDestination::CreateSession => {
+                validated.create_session(proposed_session.clone())?;
+            }
+            CheckoutDestination::AddWorkspace { session_id } => {
+                validated.add_workspace(session_id, proposed_workspace.clone())?;
+            }
+            CheckoutDestination::Existing(_) => unreachable!(),
+        }
         let terminal = Arc::new(
             spawn_terminal(SpawnSpec {
                 program,
                 argv,
-                cwd: cwd.clone(),
+                cwd: resolved.cwd.clone(),
                 env: std::env::vars().collect(),
                 size: TerminalSize {
                     columns: 80,
@@ -778,36 +933,69 @@ async fn create_session(
             })
             .map_err(|error| DaemonError::new("spawn_failed", error.to_string()))?,
         );
-        let mut path = proposed;
-        path.terminal_id = terminal.id();
-        let selected = SelectedTarget {
-            session_id: path.session_id,
-            workspace_id: path.workspace_id,
-            tab_id: path.tab_id,
-            pane_id: path.pane_id,
-            terminal_id: path.terminal_id,
-            child_pid: terminal.child_pid(),
+        let (path, disposition, insertion) = match destination {
+            CheckoutDestination::CreateSession => {
+                let mut path = proposed_session;
+                path.terminal_id = terminal.id();
+                let selected = crate::resources::ResolvedTerminalPath {
+                    session_id: path.session_id,
+                    workspace_id: path.workspace_id,
+                    tab_id: path.tab_id,
+                    pane_id: path.pane_id,
+                    terminal_id: path.terminal_id,
+                };
+                let insertion = state.register_session(path, Arc::clone(&terminal));
+                (selected, OpenDisposition::SessionCreated, insertion)
+            }
+            CheckoutDestination::AddWorkspace { session_id } => {
+                let mut path = proposed_workspace;
+                path.terminal_id = terminal.id();
+                let selected = crate::resources::ResolvedTerminalPath {
+                    session_id,
+                    workspace_id: path.workspace_id,
+                    tab_id: path.tab_id,
+                    pane_id: path.pane_id,
+                    terminal_id: path.terminal_id,
+                };
+                let insertion = state.register_workspace(session_id, path, Arc::clone(&terminal));
+                (selected, OpenDisposition::WorkspaceCreated, insertion)
+            }
+            CheckoutDestination::Existing(_) => unreachable!(),
         };
-        let insertion = state.register_session(path, Arc::clone(&terminal));
-        (terminal, selected, insertion.err())
+        let selected = selected_target(path, &terminal);
+        (terminal, selected, disposition, insertion.err())
     };
     if let Some(error) = insertion_error {
         let _ = terminal.close().await;
         return Err(error);
     }
     watch_terminal(terminal, exited.clone());
-    Ok(selected)
+    Ok((selected, disposition))
 }
 
-async fn close_session(shared: &Shared, selector: SessionSelector) -> Result<(), DaemonError> {
-    let (session_id, handles) = {
+fn selected_target(
+    path: crate::resources::ResolvedTerminalPath,
+    terminal: &TerminalHandle,
+) -> SelectedTarget {
+    SelectedTarget {
+        session_id: path.session_id,
+        workspace_id: path.workspace_id,
+        tab_id: path.tab_id,
+        pane_id: path.pane_id,
+        terminal_id: path.terminal_id,
+        child_pid: terminal.child_pid(),
+    }
+}
+
+async fn close_target(shared: &Shared, selector: TargetSelector) -> Result<(), DaemonError> {
+    let (scope, handles) = {
         let mut state = shared.lock().await;
-        state.begin_session_close(selector)?
+        state.begin_target_close(selector)?
     };
     for handle in handles {
         if let Err(error) = handle.close().await {
             let mut state = shared.lock().await;
-            let _ = state.resources.cancel_close_session(session_id);
+            let _ = scope.cancel(&mut state.resources);
             return Err(DaemonError::command("close_failed", error));
         }
     }
@@ -881,13 +1069,24 @@ mod tests {
     use super::*;
 
     fn inconsistent_state() -> (SharedState, InitialPath) {
-        let path = initial_path("test".into(), "/".into(), TerminalId::new());
+        let resolved = ResolvedLocation {
+            cwd: "/".into(),
+            project: crate::resources::Project {
+                identity: crate::resources::ProjectIdentity::CanonicalDirectory("/".into()),
+            },
+            workspace_root: "/".into(),
+            suggested_session_name: "test".into(),
+            suggested_workspace_name: "root".into(),
+            workspace_kind: crate::project::WorkspaceKind::Directory,
+        };
+        let path = initial_path(&resolved, "test".into(), TerminalId::new());
         let mut resources = ResourceTree::default();
         resources.create_session(path.clone()).unwrap();
         (
             SharedState {
                 resources,
                 runtimes: HashMap::new(),
+                expected_finalizations: HashSet::new(),
                 accepting: true,
             },
             path,
@@ -898,7 +1097,9 @@ mod tests {
     fn missing_runtime_rolls_back_session_close_marker() {
         let (mut state, path) = inconsistent_state();
 
-        let Err(error) = state.begin_session_close(SessionSelector::Id(path.session_id)) else {
+        let Err(error) = state.begin_target_close(TargetSelector::Session(
+            crate::resources::SessionSelector::Id(path.session_id),
+        )) else {
             panic!("missing runtime should fail session close");
         };
 
@@ -914,6 +1115,63 @@ mod tests {
         assert!(state.finalize_terminal(path.terminal_id).is_err());
 
         assert_eq!(state.resources.snapshot(), before);
+    }
+
+    #[test]
+    fn expected_duplicate_is_consumed_exactly_once_without_mutation() {
+        let (mut state, path) = inconsistent_state();
+        state.expected_finalizations.insert(path.terminal_id);
+        let before = state.resources.snapshot();
+
+        assert!(!state.finalize_terminal(path.terminal_id).unwrap());
+        assert_eq!(state.resources.snapshot(), before);
+        assert!(state.finalize_terminal(path.terminal_id).is_err());
+        assert_eq!(state.resources.snapshot(), before);
+    }
+
+    #[test]
+    fn proactive_last_terminal_replacement_can_keep_accepting() {
+        let (mut state, path) = inconsistent_state();
+        let terminal = Arc::new(
+            spawn_terminal(SpawnSpec {
+                program: "/bin/sh".into(),
+                argv: vec!["-c".into(), "exit".into()],
+                cwd: "/".into(),
+                env: HashMap::new(),
+                size: TerminalSize {
+                    columns: 80,
+                    rows: 24,
+                },
+            })
+            .unwrap(),
+        );
+        let old_id = path.terminal_id;
+        state.runtimes.insert(
+            old_id,
+            RuntimeEntry {
+                handle: terminal,
+                lease: AttachmentLease::default(),
+            },
+        );
+
+        assert!(state.finalize_terminal_for_replacement(old_id).unwrap());
+        assert!(!state.accepting);
+        state.accepting = true;
+
+        assert!(state.accepting);
+        assert!(!state.finalize_terminal(old_id).unwrap());
+        assert!(state.accepting);
+    }
+
+    #[test]
+    fn shutdown_stops_acceptance_before_runtime_collection() {
+        let (mut state, _) = inconsistent_state();
+        assert!(state.accepting);
+
+        let handles = state.begin_shutdown();
+
+        assert!(!state.accepting);
+        assert!(handles.is_empty());
     }
 
     #[test]

@@ -10,18 +10,18 @@ The project is currently in its design and first-spike phase:
 
 ## Current vertical slice
 
-The current Rust implementation proves one daemon-owned resource tree with multiple live project sessions. Each session currently has one workspace, one tab, one pane, and one terminal. Terminals retain semantic `libghostty-vt` snapshots and survive detach/reattach.
+The current Rust implementation proves one daemon-owned resource tree with multiple live project sessions. Git project identity is the canonical Git common directory, so explicitly opened linked worktrees join the existing session as peer workspaces. Non-Git directories use canonical directory identity. Each newly opened workspace currently starts with one tab, pane, and terminal. Terminals retain semantic `libghostty-vt` snapshots and survive detach/reattach.
 
 ```sh
 mise install
 mise run check
 
-cargo run                 # start or find the daemon, then attach (unambiguous session only)
+cargo run                 # open the current checkout, then attach its returned terminal
 cargo run -- new api --cwd ../api -- /bin/zsh
 cargo run -- list
-cargo run -- attach api   # exact name; also id:<uuid>, name:<exact>, or bare UUID
+cargo run -- attach api   # exact session name; typed workspace:/tab:/pane:/terminal: IDs also work
 cargo run -- ping
-cargo run -- close api    # close and reap the complete session
+cargo run -- close workspace:<uuid> # close only that workspace and its descendants
 cargo run -- shutdown     # stop the daemon
 ```
 
@@ -34,4 +34,4 @@ mise run test:unit
 mise run test:e2e
 ```
 
-`new` requires an already-running daemon in this slice. Sessions are currently backed by canonical working directories; Git common-directory/worktree identity is next. Session selectors accept `id:<uuid>` and `name:<exact>`; bare UUIDs select IDs and other bare values select exact names. Only interactive connections select a terminal. There is no in-client retargeting, navigator, direct switching, project recipe, or agent activity yet.
+Bare `fut` and `fut attach` open the current checkout and attach the specific terminal returned by the daemon. `fut attach TARGET` is attach-only. `new` requires an already-running daemon. Its name overrides the session name for a new project or the workspace name for a new worktree; an existing workspace ignores it. Implicit resolver names are deterministically suffixed (`name-2`, `name-3`, …) on collision, while explicit duplicate names are errors. Worktrees are discovered only when explicitly opened; Fut does not eagerly enumerate them. Session selectors accept `session:<uuid-or-exact-name>`, `id:<uuid>`, `name:<exact>`, bare UUIDs, and bare exact names. Names containing colons require `name:<exact>`. Other resources use explicit typed UUID selectors. A normal session/workspace selector must still resolve to exactly one open terminal. There is no fuzzy matching, in-client retargeting, navigator, direct switching, project recipe, or agent activity yet.

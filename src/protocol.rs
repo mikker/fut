@@ -9,10 +9,10 @@ use std::path::PathBuf;
 
 use crate::{
     domain::{PaneId, ScreenSnapshot, SessionId, TabId, TerminalId, TerminalSize, WorkspaceId},
-    resources::{ResourceSnapshot, SessionSelector},
+    resources::{ResourceSnapshot, TargetSelector},
 };
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 /// Enough for 50,000 individually styled JSON cells while remaining a firm
 /// pre-allocation bound for the length-delimited transport.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
@@ -30,7 +30,7 @@ pub enum ClientMode {
     Interactive {
         size: TerminalSize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        selector: Option<SessionSelector>,
+        selector: Option<TargetSelector>,
     },
     Control,
 }
@@ -40,7 +40,7 @@ pub enum ClientMode {
 pub enum AcknowledgedCommand {
     Input,
     Resize,
-    CloseSession,
+    CloseTarget,
     Shutdown,
 }
 
@@ -52,6 +52,14 @@ pub struct SelectedTarget {
     pub pane_id: PaneId,
     pub terminal_id: TerminalId,
     pub child_pid: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenDisposition {
+    Existing,
+    WorkspaceCreated,
+    SessionCreated,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -69,8 +77,9 @@ pub enum ClientMessage {
         size: TerminalSize,
     },
     Detach,
-    CreateSession {
-        name: String,
+    OpenLocation {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
         cwd: PathBuf,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         program: Option<PathBuf>,
@@ -78,8 +87,8 @@ pub enum ClientMessage {
         argv: Vec<String>,
     },
     ListResources,
-    CloseSession {
-        selector: SessionSelector,
+    CloseTarget {
+        selector: TargetSelector,
     },
     Ping,
     Shutdown,
@@ -93,8 +102,9 @@ pub enum ServerMessage {
         server_version: String,
         selected: Option<SelectedTarget>,
     },
-    SessionCreated {
+    LocationOpened {
         selected: SelectedTarget,
+        disposition: OpenDisposition,
     },
     Resources {
         snapshot: ResourceSnapshot,
@@ -324,9 +334,10 @@ mod tests {
 
     #[test]
     fn selectors_resource_commands_and_snapshots_round_trip() {
-        let selector = SessionSelector::Name("project λ".into());
-        let message = ClientMessage::CreateSession {
-            name: "project λ".into(),
+        let selector =
+            TargetSelector::Session(crate::resources::SessionSelector::Name("project λ".into()));
+        let message = ClientMessage::OpenLocation {
+            name: Some("project λ".into()),
             cwd: PathBuf::from("/tmp/project"),
             program: Some(PathBuf::from("/bin/sh")),
             argv: vec!["-c".into(), "echo ok".into()],
@@ -334,7 +345,7 @@ mod tests {
         let encoded = encode_payload(&message).unwrap();
         assert_eq!(decode_payload::<ClientMessage>(&encoded).unwrap(), message);
 
-        let close = ClientMessage::CloseSession { selector };
+        let close = ClientMessage::CloseTarget { selector };
         assert_eq!(
             decode_payload::<ClientMessage>(&encode_payload(&close).unwrap()).unwrap(),
             close
@@ -349,5 +360,21 @@ mod tests {
             decode_payload::<ServerMessage>(&encode_payload(&resources).unwrap()).unwrap(),
             resources
         );
+        let opened = ServerMessage::LocationOpened {
+            selected: SelectedTarget {
+                session_id: SessionId::new(),
+                workspace_id: WorkspaceId::new(),
+                tab_id: TabId::new(),
+                pane_id: PaneId::new(),
+                terminal_id: TerminalId::new(),
+                child_pid: 42,
+            },
+            disposition: OpenDisposition::WorkspaceCreated,
+        };
+        assert_eq!(
+            decode_payload::<ServerMessage>(&encode_payload(&opened).unwrap()).unwrap(),
+            opened
+        );
+        assert_eq!(PROTOCOL_VERSION, 3);
     }
 }

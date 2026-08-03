@@ -2,6 +2,7 @@
 
 use std::{
     fs,
+    io::Write,
     os::unix::fs::PermissionsExt,
     path::PathBuf,
     process::{Child, Command, Stdio},
@@ -15,7 +16,7 @@ use fut::{
         ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, ServerMessage, codec,
         decode_payload, encode_payload,
     },
-    resources::SessionSelector,
+    resources::{SessionSelector, TargetSelector},
 };
 use futures_util::{SinkExt, StreamExt};
 use tempfile::TempDir;
@@ -41,6 +42,10 @@ struct Harness {
 
 impl Harness {
     async fn start(script: &str) -> Self {
+        Self::start_with(script, |_| {}).await
+    }
+
+    async fn start_with(script: &str, setup: impl FnOnce(&std::path::Path)) -> Self {
         let root = tempfile::Builder::new()
             .prefix("fut-e2e-")
             .tempdir()
@@ -53,6 +58,7 @@ impl Harness {
             .expect("secure existing runtime directory");
         fs::create_dir_all(&home).expect("create home directory");
         fs::create_dir_all(&cwd).expect("create working directory");
+        setup(root.path());
         let socket = runtime.join("fut.sock");
         let daemon = spawn_daemon(&root, &socket, &home, &runtime, &cwd, script);
 
@@ -137,27 +143,38 @@ impl Harness {
 
     async fn interactive_for(
         &mut self,
-        selector: Option<SessionSelector>,
+        selector: Option<TargetSelector>,
     ) -> (Connection, TerminalId, u32) {
-        let mut connection = self.connect().await.expect("connect interactive client");
-        let welcome = hello(
-            &mut connection,
-            interactive_mode(selector),
-            PROTOCOL_VERSION,
-        )
+        time::timeout(DEADLINE, async {
+            loop {
+                let mut connection = self.connect().await.expect("connect interactive client");
+                let welcome = hello(
+                    &mut connection,
+                    interactive_mode(selector.clone()),
+                    PROTOCOL_VERSION,
+                )
+                .await
+                .expect("receive interactive welcome");
+                match welcome {
+                    ServerMessage::Welcome {
+                        version,
+                        selected: Some(selected),
+                        ..
+                    } => {
+                        assert_eq!(version, PROTOCOL_VERSION);
+                        self.terminal_pid = Some(selected.child_pid);
+                        return (connection, selected.terminal_id, selected.child_pid);
+                    }
+                    ServerMessage::Error { ref code, .. } if code == "already_attached" => {
+                        drop(connection);
+                        time::sleep(POLL_INTERVAL).await;
+                    }
+                    other => panic!("expected welcome, received {other:?}: {}", self.logs()),
+                }
+            }
+        })
         .await
-        .expect("receive interactive welcome");
-        let ServerMessage::Welcome {
-            version,
-            selected: Some(selected),
-            ..
-        } = welcome
-        else {
-            panic!("expected welcome, received {welcome:?}: {}", self.logs());
-        };
-        assert_eq!(version, PROTOCOL_VERSION);
-        self.terminal_pid = Some(selected.child_pid);
-        (connection, selected.terminal_id, selected.child_pid)
+        .expect("attachment lease was not released before deadline")
     }
 
     async fn control_command(&self, message: ClientMessage) -> ServerMessage {
@@ -185,10 +202,12 @@ impl Harness {
 
     async fn close_session(&self, selector: SessionSelector) {
         assert_eq!(
-            self.control_command(ClientMessage::CloseSession { selector })
-                .await,
+            self.control_command(ClientMessage::CloseTarget {
+                selector: TargetSelector::Session(selector)
+            })
+            .await,
             ServerMessage::CommandCompleted {
-                command: fut::protocol::AcknowledgedCommand::CloseSession,
+                command: fut::protocol::AcknowledgedCommand::CloseTarget,
             }
         );
     }
@@ -226,6 +245,39 @@ impl Harness {
             read("daemon.stderr")
         )
     }
+
+    fn cli(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fut"));
+        command
+            .env_clear()
+            .env("HOME", self.root.path().join("home"))
+            .env("PATH", "/usr/bin:/bin")
+            .env("TMPDIR", self.root.path().join("runtime"))
+            .env("FUT_RUNTIME_DIR", self.root.path().join("runtime"))
+            .env("TERM", "xterm-256color")
+            .arg("--socket")
+            .arg(&self.socket);
+        command
+    }
+}
+
+fn git(cwd: &std::path::Path, arguments: &[&str]) {
+    let status = Command::new("git")
+        .args([
+            "-c",
+            "user.name=Fut Test",
+            "-c",
+            "user.email=fut@example.invalid",
+        ])
+        .args(arguments)
+        .current_dir(cwd)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", cwd)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .status()
+        .unwrap();
+    assert!(status.success());
 }
 
 fn spawn_daemon(
@@ -391,6 +443,156 @@ async fn natural_terminal_exit_stops_daemon_and_removes_socket() {
 }
 
 #[tokio::test]
+async fn current_location_open_recovers_from_last_terminal_exit_race() {
+    for iteration in 0..15 {
+        let mut harness =
+            Harness::start("while [ ! -e exit-now ]; do sleep 0.01; done; exit 0").await;
+        fs::write(harness.root.path().join("cwd/exit-now"), b"").unwrap();
+        // Deterministically exercise the disappeared-socket edge of the race;
+        // the same retry path handles a connected `shutting_down` response.
+        wait_for(DEADLINE, || harness.daemon.try_wait().unwrap().is_some()).await;
+
+        let mut open = Command::new("/usr/bin/script")
+            .env_clear()
+            .env("HOME", harness.root.path().join("home"))
+            .env("PATH", "/usr/bin:/bin")
+            .env("TMPDIR", harness.root.path().join("runtime"))
+            .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+            .env("TERM", "xterm-256color")
+            .current_dir(harness.root.path().join("cwd"))
+            .args(["-q", "/dev/null", "/bin/sh", "-c"])
+            .arg(format!(
+                "stty rows 24 cols 80; exec '{}' --socket '{}'",
+                env!("CARGO_BIN_EXE_fut"),
+                harness.socket.display()
+            ))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run targetless fut in a PTY");
+        // Wait for OpenLocation and the terminal-specific interactive welcome,
+        // then use the documented detach chord through the PTY.
+        time::sleep(Duration::from_millis(500)).await;
+        let _ = open.stdin.take().unwrap().write_all(b"\x02d");
+        let opened = time::timeout(
+            DEADLINE,
+            tokio::task::spawn_blocking(move || open.wait_with_output()),
+        )
+        .await
+        .expect("targetless CLI timed out")
+        .unwrap()
+        .unwrap();
+        assert!(
+            opened.status.success(),
+            "iteration {iteration}: stdout={} stderr={} logs={}",
+            String::from_utf8_lossy(&opened.stdout),
+            String::from_utf8_lossy(&opened.stderr),
+            harness.logs()
+        );
+
+        let output = harness.cli().arg("list").output().expect("run public list");
+        assert!(
+            output.status.success(),
+            "iteration {iteration}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let snapshot = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            snapshot.contains("terminal="),
+            "iteration {iteration}: {snapshot}"
+        );
+
+        let shutdown = harness.cli().arg("shutdown").output().unwrap();
+        assert!(
+            shutdown.status.success(),
+            "{}",
+            String::from_utf8_lossy(&shutdown.stderr)
+        );
+        wait_for(DEADLINE, || !harness.socket.exists()).await;
+    }
+}
+
+#[tokio::test]
+async fn public_cli_lists_creates_and_closes_resources() {
+    let harness = Harness::start("while IFS= read -r line; do :; done").await;
+    let cwd = harness.root.path().join("second");
+    fs::create_dir(&cwd).unwrap();
+    let marker = harness.root.path().join("second.started");
+    let created = harness
+        .cli()
+        .args(["new", "second", "--cwd"])
+        .arg(&cwd)
+        .args(["/bin/sh", "-c"])
+        .arg(format!(
+            "touch {}; while IFS= read -r line; do :; done",
+            marker.display()
+        ))
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let created = String::from_utf8(created.stdout).unwrap();
+    assert!(created.contains("disposition=session_created"));
+    let workspace = created
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("workspace="))
+        .unwrap();
+    let terminal_pid: u32 = created
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("pid="))
+        .unwrap()
+        .parse()
+        .unwrap();
+    wait_for(DEADLINE, || marker.exists()).await;
+
+    let listed = harness.cli().arg("list").output().unwrap();
+    assert!(listed.status.success());
+    let listed = String::from_utf8(listed.stdout).unwrap();
+    assert!(listed.contains(workspace));
+    assert!(listed.contains(cwd.to_str().unwrap()));
+    assert!(listed.contains("session "));
+
+    let closed = harness
+        .cli()
+        .args(["close", &format!("workspace:{workspace}")])
+        .output()
+        .unwrap();
+    assert!(
+        closed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&closed.stderr)
+    );
+    wait_for(DEADLINE, || !process_alive(terminal_pid)).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn public_cli_rejects_malformed_selectors_before_attachment() {
+    let harness = Harness::start("while IFS= read -r line; do :; done").await;
+    for (selector, expected) in [
+        ("", "target must not be empty"),
+        ("workspace:not-a-uuid", "invalid workspace id"),
+        ("unknown:value", "unknown target selector prefix"),
+        ("session:", "session selector must not be empty"),
+    ] {
+        let output = harness.cli().args(["attach", selector]).output().unwrap();
+        assert!(!output.status.success(), "accepted {selector:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains(expected));
+    }
+    // Both documented legacy and typed session forms reach daemon selection.
+    for selector in ["missing", "name:missing"] {
+        let output = harness.cli().args(["attach", selector]).output().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("not_found"));
+    }
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn two_project_sessions_coexist_select_and_close_independently() {
     let script_a = r#"
 printf 'A_READY\r\n'
@@ -401,14 +603,15 @@ done
     let mut harness = Harness::start(script_a).await;
     let cwd_b = harness.root.path().join("project-b");
     fs::create_dir(&cwd_b).unwrap();
-    let created = harness.control_command(ClientMessage::CreateSession {
-        name: "project-b".into(),
+    let created = harness.control_command(ClientMessage::OpenLocation {
+        name: Some("project-b".into()),
         cwd: cwd_b.clone(),
         program: Some("/bin/sh".into()),
         argv: vec!["-c".into(), "printf 'B_READY\\r\\n'; while IFS= read -r line; do case \"$line\" in b) printf 'B_INPUT\\r\\n' ;; esac; done".into()],
     }).await;
-    let ServerMessage::SessionCreated {
+    let ServerMessage::LocationOpened {
         selected: selected_b,
+        ..
     } = created
     else {
         panic!("unexpected create response: {created:?}")
@@ -429,10 +632,14 @@ done
     ));
 
     let (mut client_a, terminal_a, pid_a) = harness
-        .interactive_for(Some(SessionSelector::Name("cwd".into())))
+        .interactive_for(Some(TargetSelector::Session(SessionSelector::Name(
+            "cwd".into(),
+        ))))
         .await;
     let (mut client_b, terminal_b, pid_b) = harness
-        .interactive_for(Some(SessionSelector::Id(selected_b.session_id)))
+        .interactive_for(Some(TargetSelector::Session(SessionSelector::Id(
+            selected_b.session_id,
+        ))))
         .await;
     assert_ne!((terminal_a, pid_a), (terminal_b, pid_b));
     let a_ready = snapshot_containing(&mut client_a, terminal_a, "A_READY").await;
@@ -487,14 +694,153 @@ done
 }
 
 #[tokio::test]
-async fn rejected_session_creation_never_spawns_and_preserves_tree() {
+async fn linked_git_worktree_is_a_peer_workspace_and_reopens_idempotently() {
+    let main_script = r#"printf 'MAIN_READY\r\n'; while IFS= read -r line; do case "$line" in main) printf 'MAIN_INPUT\r\n';; esac; done"#;
+    let mut harness = Harness::start_with(main_script, |root| {
+        let main = root.join("cwd");
+        git(&main, &["init", "-b", "main"]);
+        fs::write(main.join("tracked"), "x").unwrap();
+        git(&main, &["add", "tracked"]);
+        git(&main, &["commit", "-m", "initial"]);
+        let linked = root.join("linked");
+        git(
+            &main,
+            &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
+        );
+        fs::create_dir(linked.join("nested")).unwrap();
+    })
+    .await;
+
+    let linked = harness.root.path().join("linked");
+    let opened = harness.control_command(ClientMessage::OpenLocation {
+        name: Some("linked".into()),
+        cwd: linked.join("nested"),
+        program: Some("/bin/sh".into()),
+        argv: vec!["-c".into(), "printf 'LINKED_READY\r\n'; while IFS= read -r line; do case \"$line\" in linked) printf 'LINKED_INPUT\r\n';; esac; done".into()],
+    }).await;
+    let ServerMessage::LocationOpened {
+        selected: linked_target,
+        disposition: fut::protocol::OpenDisposition::WorkspaceCreated,
+    } = opened
+    else {
+        panic!("unexpected linked open: {opened:?}")
+    };
+    let snapshot = harness.resources().await;
+    assert_eq!(snapshot.sessions.len(), 1);
+    assert_eq!(snapshot.sessions[0].workspaces.len(), 2);
+    assert!(matches!(
+        snapshot.sessions[0].project.identity,
+        fut::resources::ProjectIdentity::GitCommonDir(_)
+    ));
+    assert_eq!(
+        snapshot.sessions[0].workspaces[1].root,
+        linked.canonicalize().unwrap()
+    );
+    let main_workspace = snapshot.sessions[0].workspaces[0].id;
+    let main_pane = snapshot.sessions[0].workspaces[0].tabs[0].panes[0].id;
+    let main_terminal = snapshot.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
+    assert_ne!(main_workspace, linked_target.workspace_id);
+    assert_ne!(main_pane, linked_target.pane_id);
+    assert_ne!(main_terminal, linked_target.terminal_id);
+
+    let mut ambiguous = harness.connect().await.unwrap();
+    assert!(matches!(
+        hello(
+            &mut ambiguous,
+            interactive_mode(Some(TargetSelector::Session(SessionSelector::Id(
+                snapshot.sessions[0].id,
+            )))),
+            PROTOCOL_VERSION,
+        )
+        .await
+        .unwrap(),
+        ServerMessage::Error { ref code, .. } if code == "target_required"
+    ));
+
+    let marker = harness.root.path().join("must-not-run");
+    let revision = snapshot.revision;
+    let reopened = harness
+        .control_command(ClientMessage::OpenLocation {
+            name: Some("ignored".into()),
+            cwd: linked.clone(),
+            program: Some("/bin/sh".into()),
+            argv: vec!["-c".into(), format!("touch {}", marker.display())],
+        })
+        .await;
+    let ServerMessage::LocationOpened {
+        selected: same,
+        disposition: fut::protocol::OpenDisposition::Existing,
+    } = reopened
+    else {
+        panic!("unexpected reopen: {reopened:?}")
+    };
+    assert_eq!(same, linked_target);
+    assert_eq!(harness.resources().await.revision, revision);
+    assert!(!marker.exists());
+
+    let (mut main_client, _, main_pid) = harness
+        .interactive_for(Some(TargetSelector::Workspace(main_workspace)))
+        .await;
+    let (mut linked_client, _, linked_pid) = harness
+        .interactive_for(Some(TargetSelector::Terminal(linked_target.terminal_id)))
+        .await;
+    snapshot_containing(&mut main_client, main_terminal, "MAIN_READY").await;
+    snapshot_containing(
+        &mut linked_client,
+        linked_target.terminal_id,
+        "LINKED_READY",
+    )
+    .await;
+    send(
+        &mut linked_client,
+        ClientMessage::Input {
+            bytes: b"linked\n".to_vec(),
+        },
+    )
+    .await;
+    snapshot_containing(
+        &mut linked_client,
+        linked_target.terminal_id,
+        "LINKED_INPUT",
+    )
+    .await;
+    drop(linked_client);
+    assert_eq!(
+        harness
+            .control_command(ClientMessage::CloseTarget {
+                selector: TargetSelector::Workspace(linked_target.workspace_id)
+            })
+            .await,
+        ServerMessage::CommandCompleted {
+            command: fut::protocol::AcknowledgedCommand::CloseTarget
+        }
+    );
+    wait_for(DEADLINE, || !process_alive(linked_pid)).await;
+    assert!(process_alive(main_pid));
+    send(
+        &mut main_client,
+        ClientMessage::Input {
+            bytes: b"main\n".to_vec(),
+        },
+    )
+    .await;
+    snapshot_containing(&mut main_client, main_terminal, "MAIN_INPUT").await;
+    drop(main_client);
+    harness
+        .close_session(SessionSelector::Id(snapshot.sessions[0].id))
+        .await;
+    harness.wait_until_exited().await;
+}
+
+#[tokio::test]
+async fn existing_reopen_is_idempotent_and_invalid_name_never_spawns() {
     let harness = Harness::start("while IFS= read -r line; do :; done").await;
     let before = harness.resources().await;
     let pid_file = harness.root.path().join("duplicate.pid");
     let marker_file = harness.root.path().join("duplicate.marker");
     let response = harness
-        .control_command(ClientMessage::CreateSession {
-            name: "cwd".into(),
+        .control_command(ClientMessage::OpenLocation {
+            name: Some("cwd".into()),
             cwd: harness.root.path().join("cwd"),
             program: Some("/bin/sh".into()),
             argv: vec![
@@ -507,10 +853,16 @@ async fn rejected_session_creation_never_spawns_and_preserves_tree() {
             ],
         })
         .await;
-    assert!(matches!(response, ServerMessage::Error { ref code, .. } if code == "duplicate"));
+    assert!(matches!(
+        response,
+        ServerMessage::LocationOpened {
+            disposition: fut::protocol::OpenDisposition::Existing,
+            ..
+        }
+    ));
     let response = harness
-        .control_command(ClientMessage::CreateSession {
-            name: "different-name".into(),
+        .control_command(ClientMessage::OpenLocation {
+            name: Some("different-name".into()),
             cwd: harness.root.path().join("cwd"),
             program: Some("/bin/sh".into()),
             argv: vec![
@@ -519,7 +871,13 @@ async fn rejected_session_creation_never_spawns_and_preserves_tree() {
             ],
         })
         .await;
-    assert!(matches!(response, ServerMessage::Error { ref code, .. } if code == "duplicate"));
+    assert!(matches!(
+        response,
+        ServerMessage::LocationOpened {
+            disposition: fut::protocol::OpenDisposition::Existing,
+            ..
+        }
+    ));
     let after = harness.resources().await;
     assert_eq!(after, before);
     time::sleep(Duration::from_millis(100)).await;
@@ -530,10 +888,12 @@ async fn rejected_session_creation_never_spawns_and_preserves_tree() {
     );
 
     let blank_marker = harness.root.path().join("blank.marker");
+    let blank_cwd = harness.root.path().join("blank-project");
+    fs::create_dir(&blank_cwd).unwrap();
     let response = harness
-        .control_command(ClientMessage::CreateSession {
-            name: " \t ".into(),
-            cwd: harness.root.path().join("cwd"),
+        .control_command(ClientMessage::OpenLocation {
+            name: Some(" \t ".into()),
+            cwd: blank_cwd,
             program: Some("/bin/sh".into()),
             argv: vec!["-c".into(), format!("touch {}", blank_marker.display())],
         })
@@ -553,7 +913,7 @@ async fn terminal_attachment_lease_rejects_contention_and_releases_on_detach_and
 
     let mut contender = harness.connect().await.unwrap();
     assert!(matches!(
-        hello(&mut contender, interactive_mode(Some(SessionSelector::Name("cwd".into()))), PROTOCOL_VERSION).await.unwrap(),
+        hello(&mut contender, interactive_mode(Some(TargetSelector::Session(SessionSelector::Name("cwd".into())))), PROTOCOL_VERSION).await.unwrap(),
         ServerMessage::Error { ref code, .. } if code == "already_attached"
     ));
     harness.detach(&mut first).await;
@@ -627,7 +987,7 @@ async fn hello(
     receive(connection).await.ok_or("connection closed")
 }
 
-fn interactive_mode(selector: Option<SessionSelector>) -> ClientMode {
+fn interactive_mode(selector: Option<TargetSelector>) -> ClientMode {
     ClientMode::Interactive {
         size: SIZE,
         selector,
