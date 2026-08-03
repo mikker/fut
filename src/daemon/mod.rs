@@ -86,6 +86,7 @@ struct SharedState {
     resources: ResourceTree,
     runtimes: HashMap<TerminalId, RuntimeEntry>,
     expected_finalizations: HashSet<TerminalId>,
+    resource_changes: watch::Sender<u64>,
     accepting: bool,
 }
 
@@ -139,12 +140,18 @@ impl From<ProjectError> for DaemonError {
 }
 
 impl SharedState {
+    fn publish_resource_change(&self, revision: u64) {
+        if revision > *self.resource_changes.borrow() {
+            self.resource_changes.send_replace(revision);
+        }
+    }
+
     fn register_session(
         &mut self,
         path: InitialPath,
         terminal: Arc<TerminalHandle>,
     ) -> Result<(), DaemonError> {
-        self.resources.create_session(path)?;
+        let mutation = self.resources.create_session(path)?;
         self.expected_finalizations.remove(&terminal.id());
         self.runtimes.insert(
             terminal.id(),
@@ -153,6 +160,7 @@ impl SharedState {
                 lease: AttachmentLease::default(),
             },
         );
+        self.publish_resource_change(mutation.revision);
         Ok(())
     }
 
@@ -162,7 +170,7 @@ impl SharedState {
         path: WorkspacePath,
         terminal: Arc<TerminalHandle>,
     ) -> Result<(), DaemonError> {
-        self.resources.add_workspace(session_id, path)?;
+        let mutation = self.resources.add_workspace(session_id, path)?;
         self.expected_finalizations.remove(&terminal.id());
         self.runtimes.insert(
             terminal.id(),
@@ -171,6 +179,7 @@ impl SharedState {
                 lease: AttachmentLease::default(),
             },
         );
+        self.publish_resource_change(mutation.revision);
         Ok(())
     }
 
@@ -180,7 +189,7 @@ impl SharedState {
         path: TabPath,
         terminal: Arc<TerminalHandle>,
     ) -> Result<(), DaemonError> {
-        self.resources.add_tab(workspace_id, path)?;
+        let mutation = self.resources.add_tab(workspace_id, path)?;
         self.expected_finalizations.remove(&terminal.id());
         self.runtimes.insert(
             terminal.id(),
@@ -189,6 +198,7 @@ impl SharedState {
                 lease: AttachmentLease::default(),
             },
         );
+        self.publish_resource_change(mutation.revision);
         Ok(())
     }
 
@@ -198,7 +208,7 @@ impl SharedState {
         pane_id: PaneId,
         terminal: Arc<TerminalHandle>,
     ) -> Result<(), DaemonError> {
-        self.resources.add_pane(tab_id, pane_id, terminal.id())?;
+        let mutation = self.resources.add_pane(tab_id, pane_id, terminal.id())?;
         self.expected_finalizations.remove(&terminal.id());
         self.runtimes.insert(
             terminal.id(),
@@ -207,6 +217,7 @@ impl SharedState {
                 lease: AttachmentLease::default(),
             },
         );
+        self.publish_resource_change(mutation.revision);
         Ok(())
     }
 
@@ -222,6 +233,7 @@ impl SharedState {
         }
         let mutation = self.resources.terminal_exited(terminal_id)?;
         self.runtimes.remove(&terminal_id);
+        self.publish_resource_change(mutation.revision);
         if mutation.multiplexer_empty {
             self.accepting = false;
         }
@@ -268,8 +280,15 @@ impl SharedState {
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        scope.begin(&mut self.resources)?;
+        let mutation = scope.begin(&mut self.resources)?;
+        self.publish_resource_change(mutation.revision);
         Ok((scope, handles))
+    }
+
+    fn cancel_target_close(&mut self, scope: CloseScope) {
+        if let Ok(mutation) = scope.cancel(&mut self.resources) {
+            self.publish_resource_change(mutation.revision);
+        }
     }
 
     fn move_pane(
@@ -299,6 +318,7 @@ impl SharedState {
         let source_tab_id = source.tab_id;
         let moved = source_tab_id != destination_tab_id;
         let mutation = self.resources.move_pane(pane_id, destination_tab_id)?;
+        self.publish_resource_change(mutation.revision);
         let source_tab_closed = mutation.events.iter().any(|event| {
             matches!(
                 event,
@@ -325,18 +345,15 @@ impl SharedState {
         if !self.accepting {
             return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
         }
-        match selector {
+        let mutation = match selector {
             RenameSelector::Session(selector) => {
                 let session_id = self.resources.resolve_session(selector)?;
-                self.resources.rename_session(session_id, name)?;
+                self.resources.rename_session(session_id, name)?
             }
-            RenameSelector::Workspace(id) => {
-                self.resources.rename_workspace(id, name)?;
-            }
-            RenameSelector::Tab(id) => {
-                self.resources.rename_tab(id, name)?;
-            }
-        }
+            RenameSelector::Workspace(id) => self.resources.rename_workspace(id, name)?,
+            RenameSelector::Tab(id) => self.resources.rename_tab(id, name)?,
+        };
+        self.publish_resource_change(mutation.revision);
         Ok(())
     }
 
@@ -402,14 +419,17 @@ const ATTACHMENT_UPDATE_CAPACITY: usize = 8;
 enum AttachmentUpdate {
     Snapshot {
         terminal_id: TerminalId,
+        generation: u64,
         screen: crate::domain::ScreenSnapshot,
     },
     Error {
         terminal_id: TerminalId,
+        generation: u64,
         message: String,
     },
     Exited {
         terminal_id: TerminalId,
+        generation: u64,
         exit_code: Option<i32>,
     },
 }
@@ -417,40 +437,41 @@ enum AttachmentUpdate {
 struct Attachment {
     panes: Vec<ObservedTarget>,
     focused: LeasedTarget,
+    resource_revision: u64,
+    streamed_resource_revision: u64,
+    resource_changes: watch::Receiver<u64>,
     updates: mpsc::Receiver<AttachmentUpdate>,
     update_sender: mpsc::Sender<AttachmentUpdate>,
-    tasks: Vec<JoinHandle<()>>,
+    watchers: HashMap<TerminalId, (u64, JoinHandle<()>)>,
+    next_watcher_generation: u64,
 }
 
 impl Attachment {
-    fn new(panes: Vec<ObservedTarget>, focused: LeasedTarget) -> Self {
+    fn new(
+        panes: Vec<ObservedTarget>,
+        focused: LeasedTarget,
+        resource_revision: u64,
+        resource_changes: watch::Receiver<u64>,
+    ) -> Self {
         let (update_sender, updates) = mpsc::channel(ATTACHMENT_UPDATE_CAPACITY);
         let mut attachment = Self {
             panes,
             focused,
+            resource_revision,
+            streamed_resource_revision: resource_revision,
+            resource_changes,
             updates,
             update_sender,
-            tasks: Vec::new(),
+            watchers: HashMap::new(),
+            next_watcher_generation: 0,
         };
-        for pane in &attachment.panes {
-            attachment.tasks.push(watch_attachment(
-                Arc::clone(&pane.terminal),
-                attachment.update_sender.clone(),
-            ));
-        }
+        attachment.reconcile_watchers();
         attachment
-    }
-
-    fn single(target: LeasedTarget) -> Self {
-        let observed = ObservedTarget {
-            selected: target.selected.clone(),
-            terminal: Arc::clone(&target.terminal),
-        };
-        Self::new(vec![observed], target)
     }
 
     fn selected(&self) -> SelectedView {
         SelectedView {
+            resource_revision: self.resource_revision,
             focused: self.focused.selected.clone(),
             panes: self
                 .panes
@@ -462,13 +483,6 @@ impl Attachment {
 
     fn focused_terminal(&self) -> &Arc<TerminalHandle> {
         &self.focused.terminal
-    }
-
-    fn terminal(&self, terminal_id: TerminalId) -> Option<&Arc<TerminalHandle>> {
-        self.panes
-            .iter()
-            .find(|pane| pane.selected.terminal_id == terminal_id)
-            .map(|pane| &pane.terminal)
     }
 
     fn refresh_focus(&mut self, selected: SelectedTarget) -> bool {
@@ -487,29 +501,36 @@ impl Attachment {
         true
     }
 
-    fn add(&mut self, target: LeasedTarget) {
-        self.tasks.push(watch_attachment(
-            Arc::clone(&target.terminal),
-            self.update_sender.clone(),
-        ));
-        self.panes.push(ObservedTarget {
-            selected: target.selected.clone(),
-            terminal: Arc::clone(&target.terminal),
-        });
-        self.focused = target;
+    fn reconcile(
+        &mut self,
+        panes: Vec<ObservedTarget>,
+        focused: SelectedTarget,
+        resource_revision: u64,
+    ) -> bool {
+        let changed = self.focused.selected != focused
+            || self.panes.len() != panes.len()
+            || self
+                .panes
+                .iter()
+                .zip(&panes)
+                .any(|(current, next)| current.selected != next.selected);
+        self.focused.selected = focused;
+        self.replace_panes(panes, resource_revision);
+        changed
     }
 
-    fn replace_panes(&mut self, panes: Vec<ObservedTarget>) {
-        for task in self.tasks.drain(..) {
-            task.abort();
-        }
+    fn observe_revision(&mut self, resource_revision: u64) {
+        self.resource_revision = self.resource_revision.max(resource_revision);
+    }
+
+    fn observe_streamed_revision(&mut self, resource_revision: u64) {
+        self.streamed_resource_revision = self.streamed_resource_revision.max(resource_revision);
+    }
+
+    fn replace_panes(&mut self, panes: Vec<ObservedTarget>, resource_revision: u64) {
         self.panes = panes;
-        for pane in &self.panes {
-            self.tasks.push(watch_attachment(
-                Arc::clone(&pane.terminal),
-                self.update_sender.clone(),
-            ));
-        }
+        self.resource_revision = resource_revision;
+        self.reconcile_watchers();
     }
 
     fn remove(&mut self, terminal_id: TerminalId) -> bool {
@@ -520,9 +541,50 @@ impl Attachment {
         else {
             return false;
         };
-        self.tasks.remove(index).abort();
+        if let Some((_, task)) = self.watchers.remove(&terminal_id) {
+            task.abort();
+        }
         self.panes.remove(index);
         true
+    }
+
+    fn accepts(&self, terminal_id: TerminalId, generation: u64) -> bool {
+        self.watchers
+            .get(&terminal_id)
+            .is_some_and(|(current, _)| *current == generation)
+    }
+
+    fn reconcile_watchers(&mut self) {
+        let desired = self
+            .panes
+            .iter()
+            .map(|pane| pane.selected.terminal_id)
+            .collect::<HashSet<_>>();
+        let removed = self
+            .watchers
+            .keys()
+            .filter(|terminal_id| !desired.contains(terminal_id))
+            .copied()
+            .collect::<Vec<_>>();
+        for terminal_id in removed {
+            if let Some((_, task)) = self.watchers.remove(&terminal_id) {
+                task.abort();
+            }
+        }
+        for pane in &self.panes {
+            let terminal_id = pane.selected.terminal_id;
+            if self.watchers.contains_key(&terminal_id) {
+                continue;
+            }
+            self.next_watcher_generation += 1;
+            let generation = self.next_watcher_generation;
+            let task = watch_attachment(
+                Arc::clone(&pane.terminal),
+                generation,
+                self.update_sender.clone(),
+            );
+            self.watchers.insert(terminal_id, (generation, task));
+        }
     }
 
     fn replacement_panes(&self, terminal_id: TerminalId) -> Vec<PaneId> {
@@ -559,7 +621,7 @@ impl Attachment {
 
 impl Drop for Attachment {
     fn drop(&mut self) {
-        for task in &self.tasks {
+        for (_, task) in self.watchers.values() {
             task.abort();
         }
     }
@@ -567,6 +629,7 @@ impl Drop for Attachment {
 
 fn watch_attachment(
     terminal: Arc<TerminalHandle>,
+    generation: u64,
     updates: mpsc::Sender<AttachmentUpdate>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -579,6 +642,7 @@ fn watch_attachment(
         if updates
             .send(AttachmentUpdate::Snapshot {
                 terminal_id,
+                generation,
                 screen,
             })
             .await
@@ -598,6 +662,7 @@ fn watch_attachment(
                     if updates
                         .send(AttachmentUpdate::Snapshot {
                             terminal_id,
+                            generation,
                             screen,
                         })
                         .await
@@ -609,6 +674,7 @@ fn watch_attachment(
                 let _ = updates
                     .send(AttachmentUpdate::Exited {
                         terminal_id,
+                        generation,
                         exit_code,
                     })
                     .await;
@@ -619,7 +685,7 @@ fn watch_attachment(
                 changed = snapshots.changed() => {
                     if changed.is_err() { return; }
                     let screen = snapshots.borrow_and_update().clone();
-                    if updates.send(AttachmentUpdate::Snapshot { terminal_id, screen }).await.is_err() {
+                    if updates.send(AttachmentUpdate::Snapshot { terminal_id, generation, screen }).await.is_err() {
                         return;
                     }
                 }
@@ -629,6 +695,7 @@ fn watch_attachment(
                         if updates
                             .send(AttachmentUpdate::Error {
                                 terminal_id,
+                                generation,
                                 message,
                             })
                             .await
@@ -664,10 +731,12 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
         resolved.suggested_session_name.clone(),
         terminal.id(),
     );
+    let (resource_changes, _) = watch::channel(0);
     let mut state = SharedState {
         resources: ResourceTree::default(),
         runtimes: HashMap::new(),
         expected_finalizations: HashSet::new(),
+        resource_changes,
         accepting: true,
     };
     if let Err(error) = state.register_session(initial, Arc::clone(&terminal)) {
@@ -1002,7 +1071,7 @@ async fn handle_connection(
                             }
                         };
                         if selected.terminal_id == attachment.focused.selected.terminal_id {
-                            let panes = match observe_tab(
+                            let (panes, resource_revision) = match observe_tab(
                                 &shared,
                                 selected.tab_id,
                                 selected.terminal_id,
@@ -1014,7 +1083,7 @@ async fn handle_connection(
                                 }
                             };
                             attachment.refresh_focus(selected);
-                            attachment.replace_panes(panes);
+                            attachment.replace_panes(panes, resource_revision);
                             send(
                                 &mut framed,
                                 envelope.request_id,
@@ -1047,17 +1116,21 @@ async fn handle_connection(
                         match create_tab(&shared, &exited, request, CreationMode::Attached(client)).await {
                             Ok(CreatedTerminal::Attached(target)) => {
                                 let selected = target.selected.clone();
-                                let candidate = Attachment::single(target);
-                                if let Err(error) = candidate.all_running() {
-                                    send_error(&mut framed, envelope.request_id, error.code, &error.message).await?;
-                                } else {
-                                    send(&mut framed, envelope.request_id, ServerMessage::TabCreated { selected }).await?;
-                                    send(
+                                match focus_leased_attachment(&shared, &mut attachment, target).await {
+                                    Ok(()) => {
+                                        send(&mut framed, envelope.request_id, ServerMessage::TabCreated { selected }).await?;
+                                        send(
+                                            &mut framed,
+                                            envelope.request_id,
+                                            ServerMessage::TargetSelected { selected: attachment.selected() },
+                                        ).await?;
+                                    }
+                                    Err(error) => send_error(
                                         &mut framed,
                                         envelope.request_id,
-                                        ServerMessage::TargetSelected { selected: candidate.selected() },
-                                    ).await?;
-                                    attachment = candidate;
+                                        error.code,
+                                        &error.message,
+                                    ).await?,
                                 }
                             }
                             Ok(CreatedTerminal::Detached(_)) => unreachable!("attached creation returns a lease"),
@@ -1083,27 +1156,22 @@ async fn handle_connection(
                         };
                         match create_pane(&shared, &exited, request, CreationMode::Attached(client)).await {
                             Ok(CreatedTerminal::Attached(target)) => {
-                                let lifecycle = target
-                                    .terminal
-                                    .subscribe_lifecycle()
-                                    .borrow()
-                                    .clone();
-                                if let TerminalLifecycle::Exited { exit_code } = lifecycle {
-                                    send_error(
+                                let selected = target.selected.clone();
+                                match focus_leased_attachment(&shared, &mut attachment, target).await {
+                                    Ok(()) => {
+                                        send(&mut framed, envelope.request_id, ServerMessage::PaneCreated { selected }).await?;
+                                        send(
+                                            &mut framed,
+                                            envelope.request_id,
+                                            ServerMessage::TargetSelected { selected: attachment.selected() },
+                                        ).await?;
+                                    }
+                                    Err(error) => send_error(
                                         &mut framed,
                                         envelope.request_id,
-                                        "terminal_exited",
-                                        &format!("terminal already exited with status {exit_code:?}"),
-                                    ).await?;
-                                } else {
-                                    let selected = target.selected.clone();
-                                    attachment.add(target);
-                                    send(&mut framed, envelope.request_id, ServerMessage::PaneCreated { selected }).await?;
-                                    send(
-                                        &mut framed,
-                                        envelope.request_id,
-                                        ServerMessage::TargetSelected { selected: attachment.selected() },
-                                    ).await?;
+                                        error.code,
+                                        &error.message,
+                                    ).await?,
                                 }
                             }
                             Ok(CreatedTerminal::Detached(_)) => unreachable!("attached creation returns a lease"),
@@ -1124,19 +1192,40 @@ async fn handle_connection(
                     ClientMessage::Hello { .. } => send_error(&mut framed, envelope.request_id, "already_hello", "hello was already received").await?,
                 }
             },
+            changed = attachment.resource_changes.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                if let Some(reconciled) = reconcile_attachment(&shared, &mut attachment).await? {
+                    if reconciled.view_changed {
+                        send(
+                            &mut framed,
+                            None,
+                            ServerMessage::TargetSelected { selected: attachment.selected() },
+                        ).await?;
+                    }
+                    send(
+                        &mut framed,
+                        None,
+                        ServerMessage::ResourcesChanged {
+                            snapshot: reconciled.snapshot,
+                        },
+                    ).await?;
+                }
+            }
             update = attachment.updates.recv() => match update {
-                Some(AttachmentUpdate::Snapshot { terminal_id, screen }) => {
-                    if attachment.terminal(terminal_id).is_some() {
+                Some(AttachmentUpdate::Snapshot { terminal_id, generation, screen }) => {
+                    if attachment.accepts(terminal_id, generation) {
                         send(&mut framed, None, ServerMessage::Snapshot { terminal_id, screen }).await?;
                     }
                 }
-                Some(AttachmentUpdate::Error { terminal_id, message }) => {
-                    if attachment.terminal(terminal_id).is_some() {
+                Some(AttachmentUpdate::Error { terminal_id, generation, message }) => {
+                    if attachment.accepts(terminal_id, generation) {
                         send_error(&mut framed, None, "terminal", &message).await?;
                     }
                 }
-                Some(AttachmentUpdate::Exited { terminal_id, exit_code }) => {
-                    if attachment.terminal(terminal_id).is_none() {
+                Some(AttachmentUpdate::Exited { terminal_id, generation, exit_code }) => {
+                    if !attachment.accepts(terminal_id, generation) {
                         continue;
                     }
                     let focused = terminal_id == attachment.focused.selected.terminal_id;
@@ -1472,7 +1561,41 @@ async fn lease_view(
             terminal: Arc::clone(&runtime.handle),
         });
     }
-    Ok(Attachment::new(panes, focused_target))
+    Ok(Attachment::new(
+        panes,
+        focused_target,
+        state.resources.revision(),
+        state.resource_changes.subscribe(),
+    ))
+}
+
+async fn focus_leased_attachment(
+    shared: &Shared,
+    attachment: &mut Attachment,
+    mut focused: LeasedTarget,
+) -> Result<(), DaemonError> {
+    let state = shared.lock().await;
+    if !state.accepting {
+        return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
+    }
+    if let TerminalLifecycle::Exited { exit_code } =
+        focused.terminal.subscribe_lifecycle().borrow().clone()
+    {
+        return Err(DaemonError::new(
+            "terminal_exited",
+            format!("terminal already exited with status {exit_code:?}"),
+        ));
+    }
+    let path = state
+        .resources
+        .resolve_terminal_target(Some(TargetSelector::Terminal(focused.selected.terminal_id)))?;
+    let paths = state.resources.open_terminal_paths_for_tab(path.tab_id)?;
+    focused.selected = selected_target(path, &focused.terminal);
+    let panes = observed_targets(&state, paths, focused.selected.terminal_id)?;
+    let selected = focused.selected.clone();
+    attachment.focused = focused;
+    attachment.reconcile(panes, selected, state.resources.revision());
+    Ok(())
 }
 
 async fn resolve_target(
@@ -1505,12 +1628,23 @@ async fn observe_tab(
     shared: &Shared,
     tab_id: TabId,
     focused: TerminalId,
-) -> Result<Vec<ObservedTarget>, DaemonError> {
+) -> Result<(Vec<ObservedTarget>, u64), DaemonError> {
     let state = shared.lock().await;
     if !state.accepting {
         return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
     }
     let paths = state.resources.open_terminal_paths_for_tab(tab_id)?;
+    Ok((
+        observed_targets(&state, paths, focused)?,
+        state.resources.revision(),
+    ))
+}
+
+fn observed_targets(
+    state: &SharedState,
+    paths: Vec<crate::resources::ResolvedTerminalPath>,
+    focused: TerminalId,
+) -> Result<Vec<ObservedTarget>, DaemonError> {
     let mut panes = Vec::with_capacity(paths.len());
     for path in paths {
         let runtime = state
@@ -1531,6 +1665,66 @@ async fn observe_tab(
         });
     }
     Ok(panes)
+}
+
+struct ReconciledResources {
+    snapshot: crate::resources::ResourceSnapshot,
+    view_changed: bool,
+}
+
+async fn reconcile_attachment(
+    shared: &Shared,
+    attachment: &mut Attachment,
+) -> Result<Option<ReconciledResources>, DaemonError> {
+    let state = shared.lock().await;
+    let revision = state.resources.revision();
+    if revision <= attachment.streamed_resource_revision {
+        return Ok(None);
+    }
+    let snapshot = state.resources.snapshot();
+    let focused_id = attachment.focused.selected.terminal_id;
+    let focused_path = match state
+        .resources
+        .resolve_terminal_target(Some(TargetSelector::Terminal(focused_id)))
+    {
+        Ok(path) => path,
+        Err(ResourceError::Closing(_) | ResourceError::NotFound(_)) => {
+            attachment.observe_revision(revision);
+            attachment.observe_streamed_revision(revision);
+            return Ok(Some(ReconciledResources {
+                snapshot,
+                view_changed: false,
+            }));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if !matches!(
+        attachment
+            .focused
+            .terminal
+            .subscribe_lifecycle()
+            .borrow()
+            .clone(),
+        TerminalLifecycle::Running
+    ) {
+        attachment.observe_revision(revision);
+        attachment.observe_streamed_revision(revision);
+        return Ok(Some(ReconciledResources {
+            snapshot,
+            view_changed: false,
+        }));
+    }
+    let paths = state
+        .resources
+        .open_terminal_paths_for_tab(focused_path.tab_id)?;
+    let panes = observed_targets(&state, paths, focused_id)?;
+    let focused = selected_target(focused_path, &attachment.focused.terminal);
+    let view_changed = attachment.reconcile(panes, focused, revision);
+    attachment.observe_streamed_revision(revision);
+    Ok(Some(ReconciledResources {
+        snapshot,
+        view_changed,
+    }))
 }
 
 async fn switch_candidate(
@@ -1970,7 +2164,7 @@ async fn close_target(shared: &Shared, selector: TargetSelector) -> Result<(), D
     for handle in handles {
         if let Err(error) = handle.close().await {
             let mut state = shared.lock().await;
-            let _ = scope.cancel(&mut state.resources);
+            state.cancel_target_close(scope);
             return Err(DaemonError::command("close_failed", error));
         }
     }
@@ -2062,6 +2256,7 @@ mod tests {
                 resources,
                 runtimes: HashMap::new(),
                 expected_finalizations: HashSet::new(),
+                resource_changes: watch::channel(1).0,
                 accepting: true,
             },
             path,
@@ -2102,6 +2297,29 @@ mod tests {
         assert_eq!(state.resources.snapshot(), before);
         assert!(state.finalize_terminal(path.terminal_id).is_err());
         assert_eq!(state.resources.snapshot(), before);
+    }
+
+    #[test]
+    fn committed_resource_mutations_publish_once_and_no_ops_stay_silent() {
+        let (mut state, path) = inconsistent_state();
+        let mut changes = state.resource_changes.subscribe();
+
+        state
+            .rename_target(
+                RenameSelector::Session(crate::resources::SessionSelector::Id(path.session_id)),
+                "renamed".into(),
+            )
+            .unwrap();
+        assert!(changes.has_changed().unwrap());
+        assert_eq!(*changes.borrow_and_update(), state.resources.revision());
+
+        state
+            .rename_target(
+                RenameSelector::Session(crate::resources::SessionSelector::Id(path.session_id)),
+                "renamed".into(),
+            )
+            .unwrap();
+        assert!(!changes.has_changed().unwrap());
     }
 
     #[test]

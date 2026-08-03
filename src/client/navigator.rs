@@ -79,7 +79,9 @@ impl NavigatorState {
         snapshot: &ResourceSnapshot,
         current: &SelectedTarget,
     ) -> bool {
-        if !matches_request(self.list_request, request_id)
+        let requested = matches_request(self.list_request, request_id);
+        let streamed = request_id.is_none() && self.list_request.is_none();
+        if (!requested && !streamed)
             || self
                 .resource_revision
                 .is_some_and(|revision| snapshot.revision <= revision)
@@ -88,13 +90,16 @@ impl NavigatorState {
         }
         let old_key = self.rows.get(self.selected).map(|row| row.key);
         let old_index = self.selected;
+        let streamed_status = streamed.then(|| self.status.clone());
         self.rows = flatten(snapshot, current);
         self.resource_revision = Some(snapshot.revision);
-        self.list_request = None;
-        self.status = if self.rows.is_empty() {
-            NavigatorStatus::Empty
-        } else {
-            NavigatorStatus::Ready
+        if requested {
+            self.list_request = None;
+        }
+        self.status = match streamed_status {
+            Some(status @ (NavigatorStatus::Switching | NavigatorStatus::Error { .. })) => status,
+            _ if self.rows.is_empty() => NavigatorStatus::Empty,
+            _ => NavigatorStatus::Ready,
         };
         self.selected = old_key
             .and_then(|key| self.rows.iter().position(|row| row.key == key))
@@ -684,9 +689,9 @@ mod tests {
 
     #[test]
     fn only_some_matching_request_ids_complete_pending_operations() {
-        let (snapshot, current, _) = fixture();
+        let (mut snapshot, current, _) = fixture();
         let mut nav = NavigatorState::open(&current);
-        assert!(!nav.accept_resources(None, &snapshot, &current));
+        assert!(nav.accept_resources(None, &snapshot, &current));
         assert!(!nav.switch_selected(None));
         assert!(!nav.switch_error(None, "unsolicited".into()));
         assert!(!nav.list_error(None, "unsolicited".into()));
@@ -695,6 +700,7 @@ mod tests {
         nav.set_list_request(list);
         assert!(!nav.accept_resources(None, &snapshot, &current));
         assert!(!nav.accept_resources(Some(Uuid::new_v4()), &snapshot, &current));
+        snapshot.revision += 1;
         assert!(nav.accept_resources(Some(list), &snapshot, &current));
 
         let switch = Uuid::new_v4();

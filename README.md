@@ -2,7 +2,7 @@
 
 `fut` is an agent-oriented terminal multiplexer organized as sessions, workspaces, tabs, panes, and terminals. One daemon owns the live resource tree; clients and automation address resources by their raw IDs.
 
-The current Rust vertical slice supports multiple project sessions, explicitly opened Git worktrees as peer workspaces, multiple tabs and panes, detach/reattach, rename, move, and close operations, semantic `libghostty-vt` terminal snapshots, and simultaneous multi-pane rendering with client-local focus.
+The current Rust vertical slice supports multiple project sessions, explicitly opened Git worktrees as peer workspaces, multiple tabs and panes, detach/reattach, rename, move, and close operations, semantic `libghostty-vt` terminal snapshots, simultaneous multi-pane rendering with client-local focus, and live reconciliation after external resource changes.
 
 ## Run it
 
@@ -55,7 +55,7 @@ Mutation commands accept raw IDs only. Attach commands also use raw IDs, except 
 
 ## Automation and interaction
 
-The client/daemon protocol is version 9. If a rebuilt client finds a running daemon with a different protocol, it reports the mismatch instead of starting a competing daemon; run `fut daemon shutdown` to negotiate with and stop that daemon, then retry. Global `--json` is available only for noninteractive control commands. Successful output has a versioned envelope and dotted command name:
+The client/daemon protocol is version 10. If a rebuilt client finds a running daemon with a different protocol, it reports the mismatch instead of starting a competing daemon; run `fut daemon shutdown` to negotiate with and stop that daemon, then retry. Global `--json` is available only for noninteractive control commands. Successful output has a versioned envelope and dotted command name:
 
 ```json
 {"version":1,"command":"workspace.rename","result":{"workspace_id":"…","name":"api"}}
@@ -92,6 +92,6 @@ Inside the client, `Ctrl-b c` creates and switches to a default shell tab, `Ctrl
 
 Multi-pane tabs render as equal-width vertical columns in resource order. A one-cell neutral rail marks every visible pane; the focused rail is bold, background rails are dim, terminal colors are left untouched, and only the focused cursor is shown. If the host is too narrow to leave twelve content columns per pane, the client falls back to the focused pane at full size and restores the columns when space returns. The exclusive input and resize lease remains on the focused terminal only, so separate clients may focus different sibling terminals; background panes are observed read-only and clipped to their current grids until focused.
 
-Multi-pane lifecycle is supported: pane and terminal navigation is exact; pane placement can move between tabs in one workspace without disturbing its terminal; exiting or closing one pane preserves its siblings and ancestors; when the focused pane exits the client transfers focus to the next available sibling; the final pane cascades through empty ancestors; and closing a whole tab closes all descendant panes and terminals. The first layout is intentionally not the final split system: there is no persisted direction or ratio, accordion policy, zoom, pane title, or mouse focus. Pane membership is captured when a tab view is selected, so externally creating or moving panes into that tab requires reselecting or reattaching until streamed resource updates land. Pane naming, cross-workspace movement, richer input, fuzzy navigation, project recipes, and agent activity remain planned.
+Multi-pane lifecycle is supported: pane and terminal navigation is exact; pane placement can move between tabs in one workspace without disturbing its terminal; exiting or closing one pane preserves its siblings and ancestors; when the focused pane exits the client transfers focus to the next available sibling; the final pane cascades through empty ancestors; and closing a whole tab closes all descendant panes and terminals. Interactive clients receive revisioned resource snapshots and authoritative complete tab views. External pane creation, movement, closure, and process exit therefore update every affected client without reselecting: background membership changes preserve focus, while a moved focused pane follows its stable terminal into the destination tab. Two-phase close remains visible in the model: a background pane disappears when its close is requested, while a focused pane remains selected until its final snapshot and exit are delivered, then transfers to an available sibling; if none remains, the client exits and preserves a nonzero child status. The navigator refreshes from the same resource stream. The first layout is intentionally not the final split system: there is no persisted direction or ratio, accordion policy, zoom, pane title, or mouse focus. Pane naming, cross-workspace movement, richer input, fuzzy navigation, project recipes, and agent activity remain planned.
 
 See [VISION.md](VISION.md) for the product direction, [CONTEXT.md](CONTEXT.md) for shared language, and [PLAN.md](PLAN.md) for implementation status and exit criteria.

@@ -189,8 +189,16 @@ mod tests {
 
         let error = ensure_daemon(&socket, temporary.path()).await.unwrap_err();
 
-        assert!(error.to_string().contains("uses protocol 8"));
-        assert!(error.to_string().contains("requires protocol 9"));
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("uses protocol {}", PROTOCOL_VERSION - 1))
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("requires protocol {PROTOCOL_VERSION}"))
+        );
         assert!(!temporary.path().join("fut-daemon.log").exists());
         server.await.unwrap();
     }

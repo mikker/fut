@@ -12,7 +12,7 @@ use crate::{
     resources::{ResourceSnapshot, SessionSelector, TargetSelector},
 };
 
-pub const PROTOCOL_VERSION: u16 = 9;
+pub const PROTOCOL_VERSION: u16 = 10;
 /// Enough for 50,000 individually styled JSON cells while remaining a firm
 /// pre-allocation bound for the length-delimited transport.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
@@ -65,6 +65,8 @@ pub struct SelectedTarget {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SelectedView {
+    /// Resource-tree revision from which this complete view was derived.
+    pub resource_revision: u64,
     /// The one terminal receiving this client's input and resize commands.
     pub focused: SelectedTarget,
     /// Open panes in resource-tree order for simultaneous read-only rendering.
@@ -171,6 +173,9 @@ pub enum ServerMessage {
         selected: SelectedView,
     },
     Resources {
+        snapshot: ResourceSnapshot,
+    },
+    ResourcesChanged {
         snapshot: ResourceSnapshot,
     },
     Snapshot {
@@ -452,6 +457,7 @@ mod tests {
         };
         let switched = ServerMessage::TargetSelected {
             selected: SelectedView {
+                resource_revision: 9,
                 focused: selected.clone(),
                 panes: vec![selected],
             },
@@ -460,7 +466,7 @@ mod tests {
             decode_payload::<ServerMessage>(&encode_payload(&switched).unwrap()).unwrap(),
             switched
         );
-        assert_eq!(PROTOCOL_VERSION, 9);
+        assert_eq!(PROTOCOL_VERSION, 10);
     }
 
     #[test]
@@ -490,6 +496,7 @@ mod tests {
             version: PROTOCOL_VERSION,
             server_version: "test".into(),
             selected: Some(SelectedView {
+                resource_revision: 1,
                 focused: focused.clone(),
                 panes: vec![focused],
             }),
@@ -497,6 +504,23 @@ mod tests {
         assert_eq!(
             decode_payload::<ServerMessage>(&encode_payload(&welcome).unwrap()).unwrap(),
             welcome
+        );
+    }
+
+    #[test]
+    fn streamed_resource_snapshot_round_trips_as_an_unsolicited_message() {
+        let envelope = Envelope {
+            request_id: None,
+            message: ServerMessage::ResourcesChanged {
+                snapshot: ResourceSnapshot {
+                    revision: 12,
+                    sessions: vec![],
+                },
+            },
+        };
+        assert_eq!(
+            decode_payload::<Envelope<ServerMessage>>(&encode_payload(&envelope).unwrap()).unwrap(),
+            envelope
         );
     }
 

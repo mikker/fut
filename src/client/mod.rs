@@ -104,6 +104,7 @@ async fn run(
     let mut create_tab = CreateTabState::default();
     let mut focus = FocusState::default();
     let mut notice: Option<String> = None;
+    let mut pending_focused_exit: Option<Option<i32>> = None;
     let mut force_draw = false;
     let mut redraw = time::interval(Duration::from_millis(16));
     redraw.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -112,7 +113,12 @@ async fn run(
     loop {
         tokio::select! {
             frame = framed.next() => {
-                let Some(frame) = frame else { break };
+                let Some(frame) = frame else {
+                    if let Some(Some(code)) = pending_focused_exit {
+                        bail!("terminal exited with status {code}");
+                    }
+                    break;
+                };
                 let envelope: Envelope<ServerMessage> = decode_payload(&frame?)?;
                 let request_id = envelope.request_id;
                 match envelope.message {
@@ -129,11 +135,20 @@ async fn run(
                             force_draw |= nav.accept_resources(request_id, &snapshot, view.focused());
                         }
                     }
+                    ServerMessage::ResourcesChanged { snapshot } => {
+                        view.observe_resource_revision(snapshot.revision);
+                        if let Some(nav) = navigator.as_mut() {
+                            force_draw |= nav.accept_resources(None, &snapshot, view.focused());
+                        }
+                    }
                     ServerMessage::TargetSelected { selected: target } => {
+                        let old_terminal = view.focused().terminal_id;
+                        if !view.replace(target)? {
+                            continue;
+                        }
                         let navigator_selected = navigator.as_mut().is_some_and(|nav| nav.switch_selected(request_id));
                         focus.complete(request_id);
-                        let old_terminal = view.focused().terminal_id;
-                        view.replace(target)?;
+                        pending_focused_exit = None;
                         resize_view(framed, terminal.size()?.into(), &mut view).await?;
                         if navigator_selected && view.focused().terminal_id == old_terminal {
                             navigator = None;
@@ -166,11 +181,16 @@ async fn run(
                     }
                     ServerMessage::Pong { .. } | ServerMessage::CommandCompleted { .. } | ServerMessage::LocationOpened { .. } => {}
                     ServerMessage::TerminalExited { terminal_id, exit_code } => {
-                        view.remove(terminal_id);
-                        if view.is_empty() {
+                        if terminal_id == view.focused().terminal_id {
+                            if view.len() > 1 {
+                                pending_focused_exit = Some(exit_code);
+                                force_draw = true;
+                                continue;
+                            }
                             if let Some(code) = exit_code { bail!("terminal exited with status {code}") }
                             break;
                         }
+                        view.remove(terminal_id);
                         force_draw = true;
                     }
                     ServerMessage::Detached => break,
@@ -195,7 +215,7 @@ async fn run(
                     ServerMessage::Welcome { .. } => bail!("unexpected second welcome from daemon"),
                 }
             }
-            event = events.next(), if focus.request_id.is_none() => {
+            event = events.next(), if focus.request_id.is_none() && pending_focused_exit.is_none() => {
                 let Some(event) = event else { break };
                 match event? {
                     Event::Key(key) if navigator.is_some() => {
@@ -401,6 +421,7 @@ impl PaneState {
 
 struct ViewState {
     focused: TerminalId,
+    resource_revision: u64,
     panes: Vec<PaneState>,
 }
 
@@ -409,13 +430,17 @@ impl ViewState {
         let focused = selected.focused.terminal_id;
         let mut view = Self {
             focused,
+            resource_revision: 0,
             panes: Vec::new(),
         };
         view.replace(selected)?;
         Ok(view)
     }
 
-    fn replace(&mut self, selected: SelectedView) -> anyhow::Result<()> {
+    fn replace(&mut self, selected: SelectedView) -> anyhow::Result<bool> {
+        if selected.resource_revision < self.resource_revision {
+            return Ok(false);
+        }
         let previous_focus = self.focused;
         if selected.panes.is_empty() {
             bail!("daemon selected an empty pane view");
@@ -471,6 +496,7 @@ impl ViewState {
             })
             .collect();
         self.focused = focused;
+        self.resource_revision = selected.resource_revision;
         if previous_focus != focused
             && let Some(pane) = self
                 .panes
@@ -479,7 +505,11 @@ impl ViewState {
         {
             pane.last_size = None;
         }
-        Ok(())
+        Ok(true)
+    }
+
+    fn observe_resource_revision(&mut self, revision: u64) {
+        self.resource_revision = self.resource_revision.max(revision);
     }
 
     fn focused(&self) -> &SelectedTarget {
@@ -489,6 +519,10 @@ impl ViewState {
             .find(|pane| pane.target.terminal_id == self.focused)
             .expect("focused terminal belongs to the client view")
             .target
+    }
+
+    fn len(&self) -> usize {
+        self.panes.len()
     }
 
     fn accept(&mut self, terminal_id: TerminalId, screen: ScreenSnapshot) -> bool {
@@ -549,10 +583,6 @@ impl ViewState {
         {
             self.focused = pane.target.terminal_id;
         }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.panes.is_empty()
     }
 
     fn terminal_ids(&self) -> Vec<TerminalId> {
@@ -794,6 +824,7 @@ mod tests {
         let first = panes[0].terminal_id;
         let second = panes[1].terminal_id;
         let mut state = ViewState::new(SelectedView {
+            resource_revision: 1,
             focused: panes[0].clone(),
             panes: panes.clone(),
         })
@@ -810,6 +841,7 @@ mod tests {
 
         state
             .replace(SelectedView {
+                resource_revision: 1,
                 focused: panes[1].clone(),
                 panes,
             })
@@ -835,12 +867,55 @@ mod tests {
     }
 
     #[test]
+    fn resource_revisions_prevent_stale_views_from_restoring_membership() {
+        let panes = targets(3);
+        let mut state = ViewState::new(SelectedView {
+            resource_revision: 2,
+            focused: panes[0].clone(),
+            panes: panes[..2].to_vec(),
+        })
+        .unwrap();
+        state.observe_resource_revision(4);
+
+        assert!(
+            !state
+                .replace(SelectedView {
+                    resource_revision: 3,
+                    focused: panes[1].clone(),
+                    panes: panes[1..].to_vec(),
+                })
+                .unwrap()
+        );
+        assert_eq!(state.focused().terminal_id, panes[0].terminal_id);
+        assert_eq!(
+            state
+                .panes
+                .iter()
+                .map(|pane| pane.target.terminal_id)
+                .collect::<Vec<_>>(),
+            [panes[0].terminal_id, panes[1].terminal_id]
+        );
+
+        assert!(
+            state
+                .replace(SelectedView {
+                    resource_revision: 4,
+                    focused: panes[1].clone(),
+                    panes: panes[1..].to_vec(),
+                })
+                .unwrap()
+        );
+        assert_eq!(state.focused().terminal_id, panes[1].terminal_id);
+    }
+
+    #[test]
     fn view_rejects_inconsistent_focus_and_duplicate_identity() {
         let panes = targets(2);
         let mut inconsistent = panes[0].clone();
         inconsistent.child_pid += 100;
         assert!(
             ViewState::new(SelectedView {
+                resource_revision: 1,
                 focused: inconsistent,
                 panes: panes.clone(),
             })
@@ -851,6 +926,7 @@ mod tests {
         duplicate.pane_id = panes[0].pane_id;
         assert!(
             ViewState::new(SelectedView {
+                resource_revision: 1,
                 focused: panes[0].clone(),
                 panes: vec![panes[0].clone(), duplicate],
             })
@@ -864,6 +940,7 @@ mod tests {
         let first = panes[0].terminal_id;
         let second = panes[1].terminal_id;
         let mut state = ViewState::new(SelectedView {
+            resource_revision: 1,
             focused: panes[0].clone(),
             panes: panes.clone(),
         })
@@ -883,6 +960,7 @@ mod tests {
 
         state
             .replace(SelectedView {
+                resource_revision: 1,
                 focused: panes[1].clone(),
                 panes,
             })
@@ -924,6 +1002,7 @@ mod tests {
             .unwrap()
         };
         let mut state = ViewState::new(SelectedView {
+            resource_revision: 1,
             focused: panes[0].clone(),
             panes: panes.clone(),
         })
@@ -945,6 +1024,7 @@ mod tests {
 
         state
             .replace(SelectedView {
+                resource_revision: 1,
                 focused: panes[1].clone(),
                 panes,
             })
