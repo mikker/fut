@@ -81,6 +81,7 @@ pub(super) enum PrefixAction {
     Wait,
     Detach,
     Navigator,
+    CreateTab,
     Send(Vec<u8>),
 }
 
@@ -98,6 +99,7 @@ impl PrefixState {
             match bytes.as_slice() {
                 b"d" => PrefixAction::Detach,
                 b"g" => PrefixAction::Navigator,
+                b"c" => PrefixAction::CreateTab,
                 [2] => PrefixAction::Send(vec![2]),
                 _ => PrefixAction::Send([vec![2], bytes].concat()),
             }
@@ -155,6 +157,8 @@ mod tests {
         assert_eq!(prefix.feed(b"d".to_vec()), PrefixAction::Detach);
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
         assert_eq!(prefix.feed(b"g".to_vec()), PrefixAction::Navigator);
+        assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
+        assert_eq!(prefix.feed(b"c".to_vec()), PrefixAction::CreateTab);
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Send(vec![2]));
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);

@@ -106,6 +106,29 @@ impl PtyChild {
         .unwrap_or_else(|_| panic!("PTY output never contained {needle:?}: {:?}", self.text()));
     }
 
+    async fn wait_for_count(&mut self, needle: &str, count: usize) {
+        time::timeout(DEADLINE, async {
+            loop {
+                let text = self.text();
+                assert!(
+                    self.child.try_wait().unwrap().is_none(),
+                    "PTY child exited before {count} occurrences of {needle:?}; output={text:?}"
+                );
+                if text.matches(needle).count() >= count {
+                    return;
+                }
+                time::sleep(POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "PTY output never contained {count} occurrences of {needle:?}: {:?}",
+                self.text()
+            )
+        });
+    }
+
     async fn wait_success(&mut self) {
         let status = time::timeout(DEADLINE, async {
             loop {
@@ -654,6 +677,368 @@ async fn public_cli_lists_creates_and_closes_resources() {
 }
 
 #[tokio::test]
+async fn public_new_tab_creates_an_isolated_ordered_tab_and_close_cascades() {
+    let mut harness = Harness::start(
+        "printf 'ORIGINAL_READY\\r\\n'; while IFS= read -r line; do [ \"$line\" = original ] && printf 'ORIGINAL_INPUT\\r\\n'; done",
+    )
+    .await;
+    let before = harness.resources().await;
+    let session_id = before.sessions[0].id;
+    let workspace = &before.sessions[0].workspaces[0];
+    let workspace_id = workspace.id;
+    let original_tab = workspace.tabs[0].id;
+    let original_pane = workspace.tabs[0].panes[0].id;
+    let original_terminal = workspace.tabs[0].panes[0].terminal_id;
+    let (mut original, _, original_pid) = harness
+        .interactive_for(Some(TargetSelector::Terminal(original_terminal)))
+        .await;
+    snapshot_containing(&mut original, original_terminal, "ORIGINAL_READY").await;
+
+    fs::create_dir(harness.root.path().join("cwd/relative-dir")).unwrap();
+    let marker = harness.root.path().join("new-tab.started");
+    let pwd_file = harness.root.path().join("new-tab.pwd");
+    let output = harness
+        .cli()
+        .args(["new-tab", &workspace_id.to_string(), "--name", "開発 λ", "--cwd", "relative-dir", "/bin/sh", "-c"])
+        .arg(format!(
+            "touch {}; pwd > {}; printf 'NEW_READY\\r\\n'; while IFS= read -r line; do [ \"$line\" = new ] && printf 'NEW_INPUT\\r\\n'; done",
+            marker.display(), pwd_file.display()
+        ))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = String::from_utf8(output.stdout).unwrap();
+    let field = |name: &str| {
+        output
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("missing {name} in {output:?}"))
+    };
+    assert_eq!(field("session"), session_id.to_string());
+    assert_eq!(field("workspace"), workspace_id.to_string());
+    let tab_id = field("tab").parse().unwrap();
+    let pane_id = field("pane").parse().unwrap();
+    let terminal_id = field("terminal").parse().unwrap();
+    let child_pid: u32 = field("pid").parse().unwrap();
+    assert_ne!(tab_id, original_tab);
+    assert_ne!(pane_id, original_pane);
+    assert_ne!(terminal_id, original_terminal);
+    assert_ne!(child_pid, original_pid);
+    wait_for(DEADLINE, || marker.exists()).await;
+    wait_for(DEADLINE, || pwd_file.exists()).await;
+    assert_eq!(
+        fs::read_to_string(&pwd_file).unwrap().trim(),
+        harness
+            .root
+            .path()
+            .join("cwd/relative-dir")
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .unwrap()
+    );
+
+    let after = harness.resources().await;
+    let workspace = &after.sessions[0].workspaces[0];
+    assert_eq!(workspace.tabs.len(), 2);
+    assert_eq!(workspace.tabs[0].id, original_tab);
+    assert_eq!(workspace.tabs[1].id, tab_id);
+    assert_eq!(workspace.tabs[1].name, "開発 λ");
+    assert_eq!(workspace.tabs[1].panes[0].id, pane_id);
+    assert_eq!(workspace.tabs[1].panes[0].terminal_id, terminal_id);
+
+    let (mut created, _, _) = harness
+        .interactive_for(Some(TargetSelector::Terminal(terminal_id)))
+        .await;
+    let new_screen = snapshot_containing(&mut created, terminal_id, "NEW_READY").await;
+    assert!(!snapshot_text(&new_screen).contains("ORIGINAL_READY"));
+    send(
+        &mut created,
+        ClientMessage::Input {
+            bytes: b"new\n".to_vec(),
+        },
+    )
+    .await;
+    snapshot_containing(&mut created, terminal_id, "NEW_INPUT").await;
+    send(
+        &mut original,
+        ClientMessage::Input {
+            bytes: b"original\n".to_vec(),
+        },
+    )
+    .await;
+    let original_screen =
+        snapshot_containing(&mut original, original_terminal, "ORIGINAL_INPUT").await;
+    assert!(!snapshot_text(&original_screen).contains("NEW_INPUT"));
+    assert!(process_alive(original_pid));
+
+    harness.detach(&mut created).await;
+    drop(created);
+    assert_eq!(
+        harness
+            .control_command(ClientMessage::CloseTarget {
+                selector: TargetSelector::Pane(pane_id)
+            })
+            .await,
+        ServerMessage::CommandCompleted {
+            command: fut::protocol::AcknowledgedCommand::CloseTarget
+        }
+    );
+    wait_for(DEADLINE, || !process_alive(child_pid)).await;
+    let closed = harness.resources().await;
+    assert_eq!(closed.sessions[0].workspaces[0].tabs.len(), 1);
+    assert_eq!(closed.sessions[0].workspaces[0].tabs[0].id, original_tab);
+    assert!(process_alive(original_pid));
+    assert!(harness.daemon.try_wait().unwrap().is_none());
+    harness.detach(&mut original).await;
+    drop(original);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn public_new_tab_rejections_are_pre_spawn_and_atomic() {
+    let harness = Harness::start("while IFS= read -r line; do :; done").await;
+    let before = harness.resources().await;
+    let workspace_id = before.sessions[0].workspaces[0].id;
+    let duplicate = before.sessions[0].workspaces[0].tabs[0].name.clone();
+
+    for (name, cwd, marker_name, expected) in [
+        (
+            "valid",
+            "missing-directory",
+            "bad-cwd.marker",
+            "invalid_cwd",
+        ),
+        (&duplicate, ".", "duplicate.marker", "duplicate"),
+        (" \t ", ".", "blank.marker", "invalid_name"),
+    ] {
+        let marker = harness.root.path().join(marker_name);
+        let output = harness
+            .cli()
+            .args([
+                "new-tab",
+                &workspace_id.to_string(),
+                "--name",
+                name,
+                "--cwd",
+                cwd,
+                "/bin/sh",
+                "-c",
+            ])
+            .arg(format!("touch {}", marker.display()))
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "accepted rejected tab {name:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(harness.resources().await, before);
+        assert!(!marker.exists(), "rejected command for {name:?} ran");
+    }
+
+    for parent in ["not-a-uuid", "tab:00000000-0000-0000-0000-000000000000"] {
+        let output = harness.cli().args(["new-tab", parent]).output().unwrap();
+        assert!(
+            !output.status.success(),
+            "accepted malformed parent {parent:?}"
+        );
+        assert!(
+            !output.stderr.is_empty(),
+            "malformed parent had no parser diagnostic"
+        );
+        assert_eq!(harness.resources().await, before);
+    }
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn interactive_create_tab_correlates_ack_switches_atomically_and_routes_input() {
+    let mut harness = Harness::start(
+        "printf 'RAW_A_READY\\r\\n'; while IFS= read -r line; do [ \"$line\" = old ] && printf 'RAW_A_INPUT\\r\\n'; done",
+    )
+    .await;
+    let resources = harness.resources().await;
+    let workspace_id = resources.sessions[0].workspaces[0].id;
+    let (mut connection, old_terminal, old_pid) = harness.interactive().await;
+    snapshot_containing(&mut connection, old_terminal, "RAW_A_READY").await;
+
+    let request_id = Uuid::new_v4();
+    send_envelope(&mut connection, Envelope {
+        request_id: Some(request_id),
+        message: ClientMessage::CreateTab {
+            workspace_id,
+            name: Some("raw-v5".into()),
+            cwd: None,
+            program: Some("/bin/sh".into()),
+            argv: vec!["-c".into(), "printf 'RAW_B_READY\\r\\n'; while IFS= read -r line; do [ \"$line\" = new ] && printf 'RAW_B_INPUT\\r\\n'; done".into()],
+        },
+    }).await;
+    let created = loop {
+        let response = receive_envelope(&mut connection)
+            .await
+            .expect("create-tab response");
+        if response.request_id == Some(request_id) {
+            let ServerMessage::TabCreated { selected } = response.message else {
+                panic!("expected correlated TabCreated, got {:?}", response.message)
+            };
+            break selected;
+        }
+        match response.message {
+            ServerMessage::Snapshot { terminal_id, .. } => assert_eq!(terminal_id, old_terminal),
+            other => panic!("unexpected frame before TabCreated: {other:?}"),
+        }
+    };
+    assert_eq!(created.workspace_id, workspace_id);
+    assert_ne!(created.terminal_id, old_terminal);
+    let next = receive_envelope(&mut connection)
+        .await
+        .expect("initial new-tab snapshot");
+    assert_eq!(next.request_id, None);
+    match next.message {
+        ServerMessage::Snapshot { terminal_id, .. } => assert_eq!(terminal_id, created.terminal_id),
+        other => {
+            panic!("expected new terminal Snapshot immediately after TabCreated, got {other:?}")
+        }
+    }
+
+    assert_eq!(
+        attach_error_once(&harness, TargetSelector::Terminal(created.terminal_id)).await,
+        "already_attached"
+    );
+    let (mut old, selected_old) =
+        attach_once(&harness, TargetSelector::Terminal(old_terminal)).await;
+    assert_eq!(selected_old.child_pid, old_pid);
+    assert!(process_alive(old_pid));
+    send(
+        &mut connection,
+        ClientMessage::Input {
+            bytes: b"new\n".to_vec(),
+        },
+    )
+    .await;
+    let new_screen = snapshot_containing(&mut connection, created.terminal_id, "RAW_B_INPUT").await;
+    assert!(!snapshot_text(&new_screen).contains("RAW_A_INPUT"));
+    send(
+        &mut old,
+        ClientMessage::Input {
+            bytes: b"old\n".to_vec(),
+        },
+    )
+    .await;
+    snapshot_containing(&mut old, old_terminal, "RAW_A_INPUT").await;
+
+    harness.detach(&mut old).await;
+    harness.detach(&mut connection).await;
+    drop(old);
+    drop(connection);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn immediate_exit_interactive_create_tab_never_loses_exit_or_old_attachment() {
+    let mut harness = Harness::start(
+        "printf 'OLD_READY\\r\\n'; while IFS= read -r line; do printf 'OLD_%s\\r\\n' \"$line\"; done",
+    )
+    .await;
+    let workspace_id = harness.resources().await.sessions[0].workspaces[0].id;
+    let (mut connection, old_terminal, _) = harness.interactive().await;
+    snapshot_containing(&mut connection, old_terminal, "OLD_READY").await;
+
+    let request_id = Uuid::new_v4();
+    send_envelope(
+        &mut connection,
+        Envelope {
+            request_id: Some(request_id),
+            message: ClientMessage::CreateTab {
+                workspace_id,
+                name: Some("immediate-exit".into()),
+                cwd: None,
+                program: Some("/bin/sh".into()),
+                argv: vec!["-c".into(), "printf 'FINAL_SNAPSHOT\\r\\n'; exit 23".into()],
+            },
+        },
+    )
+    .await;
+
+    let response = time::timeout(DEADLINE, async {
+        loop {
+            let response = receive_envelope(&mut connection)
+                .await
+                .expect("connection ended before create-tab response");
+            if response.request_id == Some(request_id) {
+                break response.message;
+            }
+            assert!(matches!(
+                response.message,
+                ServerMessage::Snapshot { terminal_id, .. } if terminal_id == old_terminal
+            ));
+        }
+    })
+    .await
+    .expect("immediate-exit CreateTab hung");
+
+    match response {
+        ServerMessage::Error { code, .. } => {
+            assert_eq!(code, "terminal_exited");
+            send(
+                &mut connection,
+                ClientMessage::Input {
+                    bytes: b"STILL_USABLE\n".to_vec(),
+                },
+            )
+            .await;
+            snapshot_containing(&mut connection, old_terminal, "OLD_STILL_USABLE").await;
+            harness.detach(&mut connection).await;
+        }
+        ServerMessage::TabCreated { selected } => {
+            let terminal_id = selected.terminal_id;
+            let mut saw_final_snapshot = false;
+            loop {
+                let message = time::timeout(DEADLINE, receive(&mut connection))
+                    .await
+                    .expect("committed immediate-exit tab hung")
+                    .expect("connection ended before TerminalExited");
+                match message {
+                    ServerMessage::Snapshot {
+                        terminal_id: id,
+                        screen,
+                    } => {
+                        assert_eq!(id, terminal_id, "stale old snapshot after TabCreated");
+                        saw_final_snapshot |= snapshot_text(&screen).contains("FINAL_SNAPSHOT");
+                    }
+                    ServerMessage::TerminalExited {
+                        terminal_id: id,
+                        exit_code,
+                    } => {
+                        assert_eq!(id, terminal_id);
+                        assert_eq!(exit_code, Some(23));
+                        assert!(saw_final_snapshot, "TerminalExited preceded final snapshot");
+                        break;
+                    }
+                    other => panic!("unexpected frame after TabCreated: {other:?}"),
+                }
+            }
+            assert!(
+                time::timeout(DEADLINE, receive(&mut connection))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        other => panic!("expected terminal_exited or TabCreated, got {other:?}"),
+    }
+
+    drop(connection);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn public_cli_rejects_malformed_selectors_before_attachment() {
     let harness = Harness::start("while IFS= read -r line; do :; done").await;
     for (selector, expected) in [
@@ -1091,6 +1476,83 @@ async fn public_client_navigator_switches_live_pty_and_preserves_terminal_isolat
     assert!(!snapshot_text(&screen_b).contains("PUBLIC_A_READY"));
     harness.detach(&mut raw_b).await;
     drop(raw_b);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn public_client_ctrl_b_c_creates_routes_and_navigates_back() {
+    let harness = Harness::start(
+        "printf 'CTRL_C_A_READY\\r\\n'; while IFS= read -r line; do [ \"$line\" = a ] && printf 'CTRL_C_A_INPUT\\r\\n'; done",
+    )
+    .await;
+    let before = harness.resources().await;
+    let workspace = &before.sessions[0].workspaces[0];
+    let workspace_id = workspace.id;
+    let a_terminal = workspace.tabs[0].panes[0].terminal_id;
+    let (mut probe, a) = attach_once(&harness, TargetSelector::Terminal(a_terminal)).await;
+    harness.detach(&mut probe).await;
+    drop(probe);
+
+    let mut command = Command::new("/usr/bin/script");
+    command
+        .env_clear()
+        .env("HOME", harness.root.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", harness.root.path().join("runtime"))
+        .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+        .env("TERM", "xterm-256color")
+        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .arg(format!(
+            "stty rows 24 cols 80; exec '{}' --socket '{}' attach terminal:{}",
+            env!("CARGO_BIN_EXE_fut"),
+            harness.socket.display(),
+            a.terminal_id
+        ));
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("CTRL_C_A_READY").await;
+    client.send(b"\x02c");
+
+    let created = time::timeout(DEADLINE, async {
+        loop {
+            let snapshot = harness.resources().await;
+            let workspace = snapshot.sessions[0]
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+                .expect("original workspace remains present");
+            if workspace.tabs.len() == 2 {
+                break workspace.tabs[1].panes[0].terminal_id;
+            }
+            time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("Ctrl-b c did not create a second tab");
+
+    client.send(b"printf 'CTRL_C_NEW_INPUT\\r\\n'\n");
+    client.wait_for("CTRL_C_NEW_INPUT").await;
+    client.send(b"\x02g");
+    client.wait_for("fut · navigator").await;
+    client.send(b"gjjj\r");
+    client.wait_for_count("CTRL_C_A_READY", 2).await;
+    client.send(b"a\n");
+    client.wait_for("CTRL_C_A_INPUT").await;
+    client.send(b"\x02d");
+    client.wait_success().await;
+
+    assert!(process_alive(a.child_pid));
+    let (mut raw_a, selected_a) = attach_once(&harness, TargetSelector::Terminal(a_terminal)).await;
+    assert_eq!(selected_a.child_pid, a.child_pid);
+    assert!(process_alive(selected_a.child_pid));
+    snapshot_containing(&mut raw_a, a_terminal, "CTRL_C_A_INPUT").await;
+    harness.detach(&mut raw_a).await;
+    drop(raw_a);
+    let (mut raw_created, selected_created) =
+        attach_once(&harness, TargetSelector::Terminal(created)).await;
+    assert!(process_alive(selected_created.child_pid));
+    snapshot_containing(&mut raw_created, created, "CTRL_C_NEW_INPUT").await;
+    harness.detach(&mut raw_created).await;
+    drop(raw_created);
     harness.shutdown().await;
 }
 

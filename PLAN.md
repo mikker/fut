@@ -2,7 +2,7 @@
 
 ## Current status
 
-The Milestone 0–1 spike and the first daemon-integrated Milestone 2 slice are implemented. They establish:
+The Milestone 0–1 spike and the current daemon-integrated Milestone 2 slice are implemented. They establish:
 
 - a Rust `fut` executable and pinned Rust/Zig toolchain;
 - one securely owned per-user daemon socket;
@@ -11,10 +11,11 @@ The Milestone 0–1 spike and the first daemon-integrated Milestone 2 slice are 
 - stable terminal identities and per-terminal attachment leases;
 - a narrow `libghostty-vt` adapter producing Fut-owned semantic snapshots;
 - a detachable Ratatui client with local view state and a global pane navigator;
+- end-to-end tab creation, allowing multiple tabs in each workspace;
 - durable terminal lifecycle and confirmed child cleanup;
 - separate unit and process-level end-to-end test layers.
 
-This validates the first multi-session vertical slice but does not complete Milestone 2. Input encoding remains a basic client-side mapping and snapshots are full-grid JSON messages. Git checkouts use their canonical common directory as project identity and their top-level checkout as workspace root; non-Git directories use canonical directory identity. Worktrees are not eagerly discovered. Opening a linked checkout adds one peer workspace, while reopening it is side-effect free. Interactive connections can retarget through the global navigator; rename/move/split operations and project recipes are not implemented. A workspace disappears when its last terminal exits, a session when its last workspace exits, and only the final session closes Fut and releases the socket.
+This validates tab creation end-to-end but does not complete Milestone 2. Each created tab still contains exactly one pane and terminal; visible splits and other rename, move, and layout mutations are deferred. Input encoding remains a basic client-side mapping and snapshots are full-grid JSON messages. Git checkouts use their canonical common directory as project identity and their top-level checkout as workspace root; non-Git directories use canonical directory identity. Worktrees are not eagerly discovered. Opening a linked checkout adds one peer workspace, while reopening it is side-effect free. Interactive connections can retarget through the global navigator. A workspace disappears when its last terminal exits, a session when its last workspace exits, and only the final session closes Fut and releases the socket.
 
 ## Strategy
 

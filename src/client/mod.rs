@@ -100,6 +100,7 @@ async fn run(
     let mut snapshots = SnapshotState::default();
     snapshots.select(selected.terminal_id);
     let mut navigator: Option<NavigatorState> = None;
+    let mut create_tab = CreateTabState::default();
     let mut force_draw = false;
     let mut redraw = time::interval(Duration::from_millis(16));
     redraw.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -138,6 +139,14 @@ async fn run(
                         }
                         force_draw = true;
                     }
+                    ServerMessage::TabCreated { selected: target } => {
+                        if !create_tab.complete(request_id) {
+                            continue;
+                        }
+                        selected = target;
+                        snapshots.commit_selection(selected.terminal_id);
+                        force_draw = true;
+                    }
                     ServerMessage::Snapshot { .. } | ServerMessage::Pong { .. } | ServerMessage::CommandCompleted { .. } | ServerMessage::LocationOpened { .. } => {}
                     ServerMessage::TerminalExited { terminal_id: id, exit_code } if id == selected.terminal_id => {
                         if let Some(code) = exit_code { bail!("terminal exited with status {code}") }
@@ -146,6 +155,9 @@ async fn run(
                     ServerMessage::TerminalExited { .. } => {}
                     ServerMessage::Detached => break,
                     ServerMessage::Error { code, message } => {
+                        if create_tab.complete(request_id) {
+                            bail!("create tab failed: daemon error ({code}): {message}");
+                        }
                         let handled = navigator.as_mut().is_some_and(|nav| {
                             nav.switch_error(request_id, message.clone())
                                 || nav.list_error(request_id, message.clone())
@@ -194,6 +206,15 @@ async fn run(
                                 send_request(framed, Some(request), ClientMessage::ListResources).await?;
                                 force_draw = true;
                             }
+                            PrefixAction::CreateTab => if let Some(request) = create_tab.begin() {
+                                send_request(framed, Some(request), ClientMessage::CreateTab {
+                                    workspace_id: selected.workspace_id,
+                                    name: None,
+                                    cwd: None,
+                                    program: None,
+                                    argv: Vec::new(),
+                                }).await?;
+                            },
                             PrefixAction::Send(bytes) => send(framed, ClientMessage::Input { bytes }).await?,
                         }
                     },
@@ -255,6 +276,30 @@ async fn receive(
         .await
         .context("daemon disconnected during handshake")??;
     Ok(decode_payload::<Envelope<ServerMessage>>(&frame)?.message)
+}
+
+#[derive(Default)]
+struct CreateTabState {
+    request_id: Option<Uuid>,
+}
+
+impl CreateTabState {
+    fn begin(&mut self) -> Option<Uuid> {
+        if self.request_id.is_some() {
+            return None;
+        }
+        let request_id = Uuid::new_v4();
+        self.request_id = Some(request_id);
+        Some(request_id)
+    }
+
+    fn complete(&mut self, request_id: Option<Uuid>) -> bool {
+        if request_id.is_none() || request_id != self.request_id {
+            return false;
+        }
+        self.request_id = None;
+        true
+    }
 }
 
 #[derive(Default)]
@@ -399,6 +444,18 @@ impl Drop for TerminalGuard {
 mod tests {
     use super::*;
     use crate::domain::Rgb;
+
+    #[test]
+    fn create_tab_state_allows_one_request_and_only_completes_its_correlation() {
+        let mut state = CreateTabState::default();
+        let request = state.begin().expect("first request starts");
+        assert!(state.begin().is_none());
+        assert!(!state.complete(None));
+        assert!(!state.complete(Some(Uuid::new_v4())));
+        assert!(state.begin().is_none());
+        assert!(state.complete(Some(request)));
+        assert!(state.begin().is_some());
+    }
 
     #[test]
     fn stale_snapshots_are_rejected_and_newest_is_drawn_once() {

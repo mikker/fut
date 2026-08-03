@@ -36,7 +36,7 @@ use crate::{
         PROTOCOL_VERSION, SelectedTarget, ServerMessage, codec, decode_payload, encode_payload,
     },
     resources::{
-        CheckoutDestination, InitialPath, ResourceError, ResourceTree, TargetSelector,
+        CheckoutDestination, InitialPath, ResourceError, ResourceTree, TabPath, TargetSelector,
         WorkspacePath,
     },
     terminal::{
@@ -172,6 +172,24 @@ impl SharedState {
         Ok(())
     }
 
+    fn register_tab(
+        &mut self,
+        workspace_id: WorkspaceId,
+        path: TabPath,
+        terminal: Arc<TerminalHandle>,
+    ) -> Result<(), DaemonError> {
+        self.resources.add_tab(workspace_id, path)?;
+        self.expected_finalizations.remove(&terminal.id());
+        self.runtimes.insert(
+            terminal.id(),
+            RuntimeEntry {
+                handle: terminal,
+                lease: AttachmentLease::default(),
+            },
+        );
+        Ok(())
+    }
+
     fn finalize_terminal(&mut self, terminal_id: TerminalId) -> Result<bool, DaemonError> {
         if self.expected_finalizations.remove(&terminal_id) {
             return Ok(false);
@@ -292,6 +310,13 @@ impl Attachment {
             snapshots,
             events,
             lifecycle,
+        }
+    }
+
+    fn exit_code(&self) -> Option<Option<i32>> {
+        match *self.lifecycle.borrow() {
+            TerminalLifecycle::Running => None,
+            TerminalLifecycle::Exited { exit_code } => Some(exit_code),
         }
     }
 }
@@ -635,6 +660,34 @@ async fn handle_connection(
     .await?;
 
     loop {
+        // A watch receiver created after the terminal exits considers its current
+        // value already seen. Inspect that durable value before waiting so exit
+        // delivery never depends on changed() observing a transition.
+        if let Some(exit_code) = attachment.exit_code() {
+            if attachment.snapshots.has_changed().unwrap_or(false) {
+                let screen = attachment.snapshots.borrow_and_update().clone();
+                send(
+                    &mut framed,
+                    None,
+                    ServerMessage::Snapshot {
+                        terminal_id: attachment.target.selected.terminal_id,
+                        screen,
+                    },
+                )
+                .await?;
+            }
+            send(
+                &mut framed,
+                None,
+                ServerMessage::TerminalExited {
+                    terminal_id: attachment.target.selected.terminal_id,
+                    exit_code,
+                },
+            )
+            .await?;
+            break;
+        }
+
         tokio::select! {
             frame = framed.next() => {
                 let Some(frame) = frame else { break };
@@ -674,6 +727,38 @@ async fn handle_connection(
                             Err(error) => send_error(&mut framed, envelope.request_id, error.code, &error.message).await?,
                         }
                     }
+                    ClientMessage::CreateTab { workspace_id, name, cwd, program, argv } => {
+                        let request = CreateTabRequest {
+                            workspace_id,
+                            name,
+                            cwd,
+                            program,
+                            argv,
+                            size,
+                        };
+                        match create_tab(&shared, &exited, request, CreateTabMode::Attached(client)).await {
+                            Ok(CreatedTab::Attached(target)) => {
+                                let mut candidate = Attachment::new(target);
+                                if let Some(exit_code) = candidate.exit_code() {
+                                    send_error(
+                                        &mut framed,
+                                        envelope.request_id,
+                                        "terminal_exited",
+                                        &format!("terminal already exited with status {exit_code:?}"),
+                                    ).await?;
+                                } else {
+                                    let screen = candidate.snapshots.borrow_and_update().clone();
+                                    let terminal_id = candidate.target.selected.terminal_id;
+                                    let selected = candidate.target.selected.clone();
+                                    attachment = candidate;
+                                    send(&mut framed, envelope.request_id, ServerMessage::TabCreated { selected }).await?;
+                                    send(&mut framed, None, ServerMessage::Snapshot { terminal_id, screen }).await?;
+                                }
+                            }
+                            Ok(CreatedTab::Detached(_)) => unreachable!("attached creation returns a lease"),
+                            Err(error) => send_error(&mut framed, envelope.request_id, error.code, &error.message).await?,
+                        }
+                    }
                     ClientMessage::ListResources => {
                         let snapshot = shared.lock().await.resources.snapshot();
                         send(&mut framed, envelope.request_id, ServerMessage::Resources { snapshot }).await?;
@@ -704,18 +789,8 @@ async fn handle_connection(
             },
             changed = attachment.lifecycle.changed() => {
                 if changed.is_err() { break; }
-                let current_lifecycle = attachment.lifecycle.borrow().clone();
-                if let TerminalLifecycle::Exited { exit_code } = current_lifecycle {
-                    if attachment.snapshots.has_changed().unwrap_or(false) {
-                        let screen = attachment.snapshots.borrow_and_update().clone();
-                        send(&mut framed, None, ServerMessage::Snapshot {
-                            terminal_id: attachment.target.selected.terminal_id,
-                            screen,
-                        }).await?;
-                    }
-                    send(&mut framed, None, ServerMessage::TerminalExited { terminal_id: attachment.target.selected.terminal_id, exit_code }).await?;
-                    break;
-                }
+                // The durable state is handled at the top of the loop, after any
+                // queued final snapshot has had a chance to win this select.
             },
         }
     }
@@ -757,6 +832,45 @@ async fn control_loop(
                         },
                     )
                     .await?
+                }
+                Err(error) => {
+                    send_error(framed, envelope.request_id, error.code, &error.message).await?
+                }
+            },
+            ClientMessage::CreateTab {
+                workspace_id,
+                name,
+                cwd,
+                program,
+                argv,
+            } => match create_tab(
+                &shared,
+                &exited,
+                CreateTabRequest {
+                    workspace_id,
+                    name,
+                    cwd,
+                    program,
+                    argv,
+                    size: TerminalSize {
+                        columns: 80,
+                        rows: 24,
+                    },
+                },
+                CreateTabMode::Detached,
+            )
+            .await
+            {
+                Ok(CreatedTab::Detached(selected)) => {
+                    send(
+                        framed,
+                        envelope.request_id,
+                        ServerMessage::TabCreated { selected },
+                    )
+                    .await?
+                }
+                Ok(CreatedTab::Attached(_)) => {
+                    unreachable!("detached creation does not acquire a lease")
                 }
                 Err(error) => {
                     send_error(framed, envelope.request_id, error.code, &error.message).await?
@@ -1075,6 +1189,156 @@ async fn open_location(
     }
     watch_terminal(terminal, exited.clone());
     Ok((selected, disposition))
+}
+
+struct CreateTabRequest {
+    workspace_id: WorkspaceId,
+    name: Option<String>,
+    cwd: Option<PathBuf>,
+    program: Option<PathBuf>,
+    argv: Vec<String>,
+    size: TerminalSize,
+}
+
+enum CreateTabMode {
+    Detached,
+    Attached(ClientId),
+}
+
+enum CreatedTab {
+    Detached(SelectedTarget),
+    Attached(LeasedTarget),
+}
+
+async fn create_tab(
+    shared: &Shared,
+    exited: &mpsc::UnboundedSender<TerminalId>,
+    request: CreateTabRequest,
+    mode: CreateTabMode,
+) -> Result<CreatedTab, DaemonError> {
+    let CreateTabRequest {
+        workspace_id,
+        name,
+        cwd,
+        program,
+        argv,
+        size,
+    } = request;
+    let root = {
+        let state = shared.lock().await;
+        if !state.accepting {
+            return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
+        }
+        state.resources.workspace_root(workspace_id)?.to_path_buf()
+    };
+    let cwd = match cwd {
+        None => root,
+        Some(cwd) => {
+            let candidate = if cwd.is_absolute() {
+                cwd
+            } else {
+                root.join(cwd)
+            };
+            let canonical = tokio::fs::canonicalize(&candidate).await.map_err(|error| {
+                DaemonError::new(
+                    "invalid_cwd",
+                    format!("could not resolve {}: {error}", candidate.display()),
+                )
+            })?;
+            let metadata = tokio::fs::metadata(&canonical).await.map_err(|error| {
+                DaemonError::new(
+                    "invalid_cwd",
+                    format!("could not inspect {}: {error}", canonical.display()),
+                )
+            })?;
+            if !metadata.is_dir() {
+                return Err(DaemonError::new(
+                    "invalid_cwd",
+                    format!("not a directory: {}", canonical.display()),
+                ));
+            }
+            canonical
+        }
+    };
+    let program = program.unwrap_or_else(|| {
+        std::env::var_os("SHELL")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| "/bin/sh".into())
+    });
+
+    let (terminal, creation) = {
+        let mut state = shared.lock().await;
+        if !state.accepting {
+            return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
+        }
+        let tab_name = match name {
+            Some(name) => name,
+            None => state.resources.available_tab_name(workspace_id, "shell")?,
+        };
+        let proposed = TabPath {
+            tab_id: TabId::new(),
+            tab_name,
+            pane_id: PaneId::new(),
+            terminal_id: TerminalId::new(),
+        };
+        let session_id = state.resources.session_id_for_workspace(workspace_id)?;
+        let mut validated = state.resources.clone();
+        validated.add_tab(workspace_id, proposed.clone())?;
+
+        let terminal = Arc::new(
+            spawn_terminal(SpawnSpec {
+                program,
+                argv,
+                cwd,
+                env: std::env::vars().collect(),
+                size,
+            })
+            .map_err(|error| DaemonError::new("spawn_failed", error.to_string()))?,
+        );
+        let mut path = proposed;
+        path.terminal_id = terminal.id();
+        let resolved = crate::resources::ResolvedTerminalPath {
+            session_id,
+            workspace_id,
+            tab_id: path.tab_id,
+            pane_id: path.pane_id,
+            terminal_id: path.terminal_id,
+        };
+        let selected = selected_target(resolved, &terminal);
+        let insertion = state.register_tab(workspace_id, path, Arc::clone(&terminal));
+        let creation = match insertion {
+            Ok(()) => Ok(match mode {
+                CreateTabMode::Detached => CreatedTab::Detached(selected.clone()),
+                CreateTabMode::Attached(client) => {
+                    let runtime = state
+                        .runtimes
+                        .get(&terminal.id())
+                        .expect("new runtime inserted");
+                    let guard = runtime
+                        .lease
+                        .acquire(client)
+                        .expect("new terminal has an independent lease");
+                    let target = LeasedTarget {
+                        selected: selected.clone(),
+                        terminal: Arc::clone(&terminal),
+                        _lease: guard,
+                    };
+                    CreatedTab::Attached(target)
+                }
+            }),
+            Err(error) => Err(error),
+        };
+        (terminal, creation)
+    };
+    let created = match creation {
+        Ok(created) => created,
+        Err(error) => {
+            let _ = terminal.close().await;
+            return Err(error);
+        }
+    };
+    watch_terminal(terminal, exited.clone());
+    Ok(created)
 }
 
 fn selected_target(

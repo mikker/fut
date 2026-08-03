@@ -395,6 +395,37 @@ impl ResourceTree {
         })
     }
 
+    pub fn workspace_root(&self, workspace_id: WorkspaceId) -> Result<&Path, ResourceError> {
+        self.workspaces
+            .get(&workspace_id)
+            .map(|workspace| workspace.root.as_path())
+            .ok_or(ResourceError::NotFound("workspace"))
+    }
+
+    pub fn session_id_for_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<SessionId, ResourceError> {
+        self.workspaces
+            .get(&workspace_id)
+            .map(|workspace| workspace.session_id)
+            .ok_or(ResourceError::NotFound("workspace"))
+    }
+
+    pub fn available_tab_name(
+        &self,
+        workspace_id: WorkspaceId,
+        suggested: &str,
+    ) -> Result<String, ResourceError> {
+        let workspace = self
+            .workspaces
+            .get(&workspace_id)
+            .ok_or(ResourceError::NotFound("workspace"))?;
+        Ok(disambiguate(suggested, |name| {
+            workspace.tabs.iter().any(|id| self.tabs[id].name == name)
+        }))
+    }
+
     #[must_use]
     pub fn snapshot(&self) -> ResourceSnapshot {
         ResourceSnapshot {
@@ -1900,5 +1931,142 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tree.available_workspace_name(session_id, "main"), "main-3");
+    }
+
+    #[test]
+    fn workspace_root_and_available_tab_names_are_workspace_scoped() {
+        let mut tree = ResourceTree::default();
+        let first = initial("first", "/first");
+        let session_id = first.session_id;
+        let workspace_id = first.workspace_id;
+        let root = first.root.clone();
+        tree.create_session(first).unwrap();
+        tree.add_tab(
+            workspace_id,
+            TabPath {
+                tab_id: TabId::new(),
+                tab_name: "shell-2".into(),
+                pane_id: PaneId::new(),
+                terminal_id: TerminalId::new(),
+            },
+        )
+        .unwrap();
+        tree.create_session(initial("second", "/second")).unwrap();
+
+        assert_eq!(tree.workspace_root(workspace_id), Ok(root.as_path()));
+        assert_eq!(tree.session_id_for_workspace(workspace_id), Ok(session_id));
+        assert_eq!(
+            tree.available_tab_name(workspace_id, "shell"),
+            Ok("shell-3".into())
+        );
+        let missing = WorkspaceId::new();
+        assert_eq!(
+            tree.workspace_root(missing),
+            Err(ResourceError::NotFound("workspace"))
+        );
+        assert_eq!(
+            tree.session_id_for_workspace(missing),
+            Err(ResourceError::NotFound("workspace"))
+        );
+        assert_eq!(
+            tree.available_tab_name(missing, "tab"),
+            Err(ResourceError::NotFound("workspace"))
+        );
+    }
+
+    #[test]
+    fn add_tab_is_atomic_and_preserves_order_identity_and_closing_rules() {
+        let mut tree = ResourceTree::default();
+        let first = initial("session", "/project");
+        let session_id = first.session_id;
+        let workspace_id = first.workspace_id;
+        let first_tab = first.tab_id;
+        let added = TabPath {
+            tab_id: TabId::new(),
+            tab_name: "editor".into(),
+            pane_id: PaneId::new(),
+            terminal_id: TerminalId::new(),
+        };
+        let added_ids = (added.tab_id, added.pane_id, added.terminal_id);
+        tree.create_session(first).unwrap();
+
+        let mutation = tree.add_tab(workspace_id, added).unwrap();
+        assert_eq!(
+            mutation.events,
+            vec![
+                ResourceEvent::TabCreated {
+                    workspace_id,
+                    id: added_ids.0,
+                    name: "editor".into(),
+                },
+                ResourceEvent::PaneCreated {
+                    tab_id: added_ids.0,
+                    id: added_ids.1,
+                    terminal_id: added_ids.2,
+                    closing: false,
+                },
+            ]
+        );
+        let tabs = &tree.snapshot().sessions[0].workspaces[0].tabs;
+        assert_eq!(
+            tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+            vec![first_tab, added_ids.0]
+        );
+        assert_eq!(tabs[1].panes[0].id, added_ids.1);
+        assert_eq!(tabs[1].panes[0].terminal_id, added_ids.2);
+
+        for (workspace, path, expected) in [
+            (
+                WorkspaceId::new(),
+                TabPath {
+                    tab_id: TabId::new(),
+                    tab_name: "missing".into(),
+                    pane_id: PaneId::new(),
+                    terminal_id: TerminalId::new(),
+                },
+                ResourceError::NotFound("workspace"),
+            ),
+            (
+                workspace_id,
+                TabPath {
+                    tab_id: TabId::new(),
+                    tab_name: "editor".into(),
+                    pane_id: PaneId::new(),
+                    terminal_id: TerminalId::new(),
+                },
+                ResourceError::Duplicate("tab name"),
+            ),
+            (
+                workspace_id,
+                TabPath {
+                    tab_id: added_ids.0,
+                    tab_name: "other".into(),
+                    pane_id: PaneId::new(),
+                    terminal_id: TerminalId::new(),
+                },
+                ResourceError::Duplicate("tab id"),
+            ),
+        ] {
+            let before = tree.snapshot();
+            assert_eq!(tree.add_tab(workspace, path), Err(expected));
+            assert_eq!(tree.snapshot(), before);
+        }
+
+        tree.close_session(session_id).unwrap();
+        let before = tree.snapshot();
+        assert_eq!(
+            tree.add_tab(
+                workspace_id,
+                TabPath {
+                    tab_id: TabId::new(),
+                    tab_name: "closed".into(),
+                    pane_id: PaneId::new(),
+                    terminal_id: TerminalId::new()
+                }
+            ),
+            Err(ResourceError::Closing("session"))
+        );
+        assert_eq!(tree.snapshot(), before);
+        tree.validate().unwrap();
     }
 }

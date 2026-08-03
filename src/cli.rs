@@ -16,6 +16,7 @@ use crate::{
         path::socket_path,
         run_daemon,
     },
+    domain::WorkspaceId,
     protocol::{
         AcknowledgedCommand, ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, ServerMessage,
         codec, decode_payload, encode_payload,
@@ -45,6 +46,16 @@ enum Command {
     },
     New {
         name: String,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    NewTab {
+        #[arg(value_name = "WORKSPACE", value_parser = workspace_parent)]
+        workspace_id: WorkspaceId,
+        #[arg(long)]
+        name: Option<String>,
         #[arg(long)]
         cwd: Option<PathBuf>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -109,6 +120,44 @@ pub async fn run() -> Result<()> {
                                 "workspace_created",
                             crate::protocol::OpenDisposition::SessionCreated => "session_created",
                         },
+                        selected.session_id,
+                        selected.workspace_id,
+                        selected.tab_id,
+                        selected.pane_id,
+                        selected.terminal_id,
+                        selected.child_pid
+                    );
+                    Ok(())
+                }
+                other => unexpected(other),
+            }
+        }
+        Some(Command::NewTab {
+            workspace_id,
+            name,
+            cwd,
+            command,
+        }) => {
+            let (program, argv) = command
+                .split_first()
+                .map_or((None, vec![]), |(program, argv)| {
+                    (Some(PathBuf::from(program)), argv.to_vec())
+                });
+            match control(
+                &socket,
+                ClientMessage::CreateTab {
+                    workspace_id,
+                    name,
+                    cwd,
+                    program,
+                    argv,
+                },
+            )
+            .await?
+            {
+                ServerMessage::TabCreated { selected } => {
+                    println!(
+                        "session={} workspace={} tab={} pane={} terminal={} pid={}",
                         selected.session_id,
                         selected.workspace_id,
                         selected.tab_id,
@@ -313,6 +362,15 @@ fn selector(value: &str) -> Result<TargetSelector> {
     Ok(TargetSelector::Session(session_selector_explicit(value)?))
 }
 
+fn workspace_parent(value: &str) -> std::result::Result<WorkspaceId, String> {
+    let id = value.strip_prefix("workspace:").unwrap_or(value);
+    if value.contains(':') && id == value {
+        return Err("invalid workspace: expected a UUID or workspace:<uuid>".into());
+    }
+    id.parse()
+        .map_err(|_| "invalid workspace: expected a UUID or workspace:<uuid>".into())
+}
+
 fn session_selector_explicit(value: &str) -> Result<SessionSelector> {
     if let Some(id) = value.strip_prefix("id:") {
         if id.is_empty() {
@@ -435,6 +493,41 @@ fn unexpected<T>(message: ServerMessage) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_new_tab_workspace_parent() {
+        let workspace_id = WorkspaceId::new();
+        for parent in [
+            workspace_id.to_string(),
+            format!("workspace:{workspace_id}"),
+        ] {
+            let cli = Cli::try_parse_from(["fut", "new-tab", &parent]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Some(Command::NewTab {
+                    workspace_id: parsed,
+                    ..
+                }) if parsed == workspace_id
+            ));
+        }
+
+        for parent in [
+            "not-a-uuid",
+            "workspace:not-a-uuid",
+            "tab:00000000-0000-0000-0000-000000000000",
+        ] {
+            let error = match Cli::try_parse_from(["fut", "new-tab", parent]) {
+                Ok(_) => panic!("accepted malformed workspace parent {parent:?}"),
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("expected a UUID or workspace:<uuid>"),
+                "unexpected error for {parent:?}: {error}"
+            );
+        }
+    }
 
     #[test]
     fn parses_explicit_and_convenient_session_selectors() {
