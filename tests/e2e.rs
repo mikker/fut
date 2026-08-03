@@ -15,6 +15,7 @@ use fut::{
         ClientKind, ClientMessage, Envelope, PROTOCOL_VERSION, ServerMessage, codec,
         decode_payload, encode_payload,
     },
+    resources::SessionSelector,
 };
 use futures_util::{SinkExt, StreamExt};
 use tempfile::TempDir;
@@ -111,7 +112,7 @@ impl Harness {
                     self.logs()
                 );
                 if let Ok(mut connection) = self.connect().await
-                    && hello(&mut connection, ClientKind::Control, PROTOCOL_VERSION)
+                    && hello(&mut connection, ClientKind::Control, PROTOCOL_VERSION, None)
                         .await
                         .is_ok_and(|message| matches!(message, ServerMessage::Welcome { .. }))
                 {
@@ -131,28 +132,39 @@ impl Harness {
     }
 
     async fn interactive(&mut self) -> (Connection, TerminalId, u32) {
+        self.interactive_for(None).await
+    }
+
+    async fn interactive_for(
+        &mut self,
+        selector: Option<SessionSelector>,
+    ) -> (Connection, TerminalId, u32) {
         let mut connection = self.connect().await.expect("connect interactive client");
-        let welcome = hello(&mut connection, ClientKind::Interactive, PROTOCOL_VERSION)
-            .await
-            .expect("receive interactive welcome");
+        let welcome = hello(
+            &mut connection,
+            ClientKind::Interactive,
+            PROTOCOL_VERSION,
+            selector,
+        )
+        .await
+        .expect("receive interactive welcome");
         let ServerMessage::Welcome {
             version,
-            terminal_id,
-            child_pid,
+            selected: Some(selected),
             ..
         } = welcome
         else {
             panic!("expected welcome, received {welcome:?}: {}", self.logs());
         };
         assert_eq!(version, PROTOCOL_VERSION);
-        self.terminal_pid = Some(child_pid);
-        (connection, terminal_id, child_pid)
+        self.terminal_pid = Some(selected.child_pid);
+        (connection, selected.terminal_id, selected.child_pid)
     }
 
     async fn control_command(&self, message: ClientMessage) -> ServerMessage {
         let mut connection = self.connect().await.expect("connect control client");
         assert!(matches!(
-            hello(&mut connection, ClientKind::Control, PROTOCOL_VERSION)
+            hello(&mut connection, ClientKind::Control, PROTOCOL_VERSION, None)
                 .await
                 .expect("receive control welcome"),
             ServerMessage::Welcome { .. }
@@ -314,9 +326,13 @@ done
     drop(client_c);
 
     assert_eq!(
-        harness.control_command(ClientMessage::CloseTerminal).await,
+        harness
+            .control_command(ClientMessage::CloseSession {
+                selector: SessionSelector::Name("cwd".into())
+            })
+            .await,
         ServerMessage::CommandCompleted {
-            command: fut::protocol::AcknowledgedCommand::CloseTerminal,
+            command: fut::protocol::AcknowledgedCommand::CloseSession,
         }
     );
     wait_for(DEADLINE, || !process_alive(child_pid)).await;
@@ -334,9 +350,14 @@ done
 
 #[tokio::test]
 async fn natural_terminal_exit_stops_daemon_and_removes_socket() {
-    let mut harness = Harness::start("while [ ! -e exit-now ]; do sleep 0.02; done; exit 7").await;
+    let mut harness = Harness::start(
+        "while [ ! -e exit-now ]; do sleep 0.02; done; printf 'FINAL_OUTPUT\\r\\n'; exit 7",
+    )
+    .await;
     let (mut interactive, terminal_id, _) = harness.interactive().await;
     fs::write(harness.root.path().join("cwd/exit-now"), b"").expect("release child exit gate");
+    let final_snapshot = snapshot_containing(&mut interactive, terminal_id, "FINAL_OUTPUT").await;
+    assert!(snapshot_text(&final_snapshot).contains("FINAL_OUTPUT"));
     assert_eq!(
         receive_matching(&mut interactive, |message| matches!(
             message,
@@ -355,14 +376,246 @@ async fn natural_terminal_exit_stops_daemon_and_removes_socket() {
 }
 
 #[tokio::test]
+async fn two_project_sessions_coexist_select_and_close_independently() {
+    let script_a = r#"
+printf 'A_READY\r\n'
+while IFS= read -r line; do
+  case "$line" in a) printf 'A_INPUT\r\n' ;; esac
+done
+"#;
+    let mut harness = Harness::start(script_a).await;
+    let cwd_b = harness.root.path().join("project-b");
+    fs::create_dir(&cwd_b).unwrap();
+    let created = harness.control_command(ClientMessage::CreateSession {
+        name: "project-b".into(),
+        cwd: cwd_b.clone(),
+        program: Some("/bin/sh".into()),
+        argv: vec!["-c".into(), "printf 'B_READY\\r\\n'; while IFS= read -r line; do case \"$line\" in b) printf 'B_INPUT\\r\\n' ;; esac; done".into()],
+    }).await;
+    let ServerMessage::SessionCreated {
+        selected: selected_b,
+    } = created
+    else {
+        panic!("unexpected create response: {created:?}")
+    };
+
+    let ServerMessage::Resources { snapshot } =
+        harness.control_command(ClientMessage::ListResources).await
+    else {
+        panic!("expected resources")
+    };
+    assert_eq!(snapshot.sessions.len(), 2);
+    assert_ne!(snapshot.sessions[0].id, snapshot.sessions[1].id);
+    assert_ne!(
+        snapshot.sessions[0].workspaces[0].root,
+        snapshot.sessions[1].workspaces[0].root
+    );
+
+    let mut ambiguous = harness.connect().await.unwrap();
+    assert!(matches!(
+        hello(&mut ambiguous, ClientKind::Interactive, PROTOCOL_VERSION, None).await.unwrap(),
+        ServerMessage::Error { ref code, .. } if code == "target_required"
+    ));
+
+    let (mut client_a, terminal_a, pid_a) = harness
+        .interactive_for(Some(SessionSelector::Name("cwd".into())))
+        .await;
+    let (mut client_b, terminal_b, pid_b) = harness
+        .interactive_for(Some(SessionSelector::Id(selected_b.session_id)))
+        .await;
+    assert_ne!((terminal_a, pid_a), (terminal_b, pid_b));
+    let a_ready = snapshot_containing(&mut client_a, terminal_a, "A_READY").await;
+    let b_ready = snapshot_containing(&mut client_b, terminal_b, "B_READY").await;
+    assert!(!snapshot_text(&a_ready).contains("B_READY"));
+    assert!(!snapshot_text(&b_ready).contains("A_READY"));
+    send(
+        &mut client_a,
+        ClientMessage::Input {
+            bytes: b"a\n".to_vec(),
+        },
+    )
+    .await;
+    send(
+        &mut client_b,
+        ClientMessage::Input {
+            bytes: b"b\n".to_vec(),
+        },
+    )
+    .await;
+    assert!(
+        snapshot_text(&snapshot_containing(&mut client_a, terminal_a, "A_INPUT").await)
+            .contains("A_INPUT")
+    );
+    assert!(
+        snapshot_text(&snapshot_containing(&mut client_b, terminal_b, "B_INPUT").await)
+            .contains("B_INPUT")
+    );
+
+    drop(client_a);
+    assert!(process_alive(pid_b));
+    assert_eq!(
+        harness
+            .control_command(ClientMessage::CloseSession {
+                selector: SessionSelector::Name("cwd".into())
+            })
+            .await,
+        ServerMessage::CommandCompleted {
+            command: fut::protocol::AcknowledgedCommand::CloseSession
+        }
+    );
+    wait_for(DEADLINE, || !process_alive(pid_a)).await;
+    assert!(process_alive(pid_b));
+    assert!(matches!(
+        harness.control_command(ClientMessage::Ping).await,
+        ServerMessage::Pong { .. }
+    ));
+    let ServerMessage::Resources { snapshot } =
+        harness.control_command(ClientMessage::ListResources).await
+    else {
+        panic!("expected resources")
+    };
+    assert_eq!(snapshot.sessions.len(), 1);
+    assert_eq!(snapshot.sessions[0].id, selected_b.session_id);
+
+    send(&mut client_b, ClientMessage::Detach).await;
+    receive_matching(&mut client_b, |message| {
+        matches!(message, ServerMessage::Detached)
+    })
+    .await;
+    drop(client_b);
+    assert_eq!(
+        harness
+            .control_command(ClientMessage::CloseSession {
+                selector: SessionSelector::Id(selected_b.session_id)
+            })
+            .await,
+        ServerMessage::CommandCompleted {
+            command: fut::protocol::AcknowledgedCommand::CloseSession
+        }
+    );
+    wait_for(DEADLINE, || !process_alive(pid_b)).await;
+    harness.wait_until_exited().await;
+}
+
+#[tokio::test]
+async fn rejected_session_creation_never_spawns_and_preserves_tree() {
+    let harness = Harness::start("while IFS= read -r line; do :; done").await;
+    let ServerMessage::Resources { snapshot: before } =
+        harness.control_command(ClientMessage::ListResources).await
+    else {
+        panic!("expected resources")
+    };
+    let pid_file = harness.root.path().join("duplicate.pid");
+    let marker_file = harness.root.path().join("duplicate.marker");
+    let response = harness
+        .control_command(ClientMessage::CreateSession {
+            name: "cwd".into(),
+            cwd: harness.root.path().join("cwd"),
+            program: Some("/bin/sh".into()),
+            argv: vec![
+                "-c".into(),
+                format!(
+                    "echo $$ > {}; touch {}; sleep 60",
+                    pid_file.display(),
+                    marker_file.display()
+                ),
+            ],
+        })
+        .await;
+    assert!(matches!(response, ServerMessage::Error { ref code, .. } if code == "duplicate"));
+    let response = harness
+        .control_command(ClientMessage::CreateSession {
+            name: "different-name".into(),
+            cwd: harness.root.path().join("cwd"),
+            program: Some("/bin/sh".into()),
+            argv: vec![
+                "-c".into(),
+                format!("touch {}; sleep 60", marker_file.display()),
+            ],
+        })
+        .await;
+    assert!(matches!(response, ServerMessage::Error { ref code, .. } if code == "duplicate"));
+    let ServerMessage::Resources { snapshot: after } =
+        harness.control_command(ClientMessage::ListResources).await
+    else {
+        panic!("expected resources")
+    };
+    assert_eq!(after, before);
+    time::sleep(Duration::from_millis(100)).await;
+    assert!(!pid_file.exists(), "rejected command wrote its PID file");
+    assert!(
+        !marker_file.exists(),
+        "rejected command wrote its marker file"
+    );
+
+    let blank_marker = harness.root.path().join("blank.marker");
+    let response = harness
+        .control_command(ClientMessage::CreateSession {
+            name: " \t ".into(),
+            cwd: harness.root.path().join("cwd"),
+            program: Some("/bin/sh".into()),
+            argv: vec!["-c".into(), format!("touch {}", blank_marker.display())],
+        })
+        .await;
+    assert!(matches!(response, ServerMessage::Error { ref code, .. } if code == "invalid_name"));
+    time::sleep(Duration::from_millis(100)).await;
+    assert!(!blank_marker.exists(), "invalid-name command executed");
+    let ServerMessage::Resources {
+        snapshot: after_blank,
+    } = harness.control_command(ClientMessage::ListResources).await
+    else {
+        panic!("expected resources")
+    };
+    assert_eq!(after_blank, before);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn terminal_attachment_lease_rejects_contention_and_releases_on_detach_and_eof() {
+    let mut harness = Harness::start("while IFS= read -r line; do :; done").await;
+    let (mut first, terminal_id, child_pid) = harness.interactive().await;
+
+    let mut contender = harness.connect().await.unwrap();
+    assert!(matches!(
+        hello(&mut contender, ClientKind::Interactive, PROTOCOL_VERSION, Some(SessionSelector::Name("cwd".into()))).await.unwrap(),
+        ServerMessage::Error { ref code, .. } if code == "already_attached"
+    ));
+    send(&mut first, ClientMessage::Detach).await;
+    receive_matching(&mut first, |message| {
+        matches!(message, ServerMessage::Detached)
+    })
+    .await;
+    drop(first);
+
+    let (second, second_id, second_pid) = harness.interactive().await;
+    assert_eq!((second_id, second_pid), (terminal_id, child_pid));
+    drop(second);
+    time::sleep(POLL_INTERVAL).await;
+    let (mut third, third_id, third_pid) = harness.interactive().await;
+    assert_eq!((third_id, third_pid), (terminal_id, child_pid));
+    send(&mut third, ClientMessage::Detach).await;
+    receive_matching(&mut third, |message| {
+        matches!(message, ServerMessage::Detached)
+    })
+    .await;
+    drop(third);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn unsupported_protocol_is_rejected_without_harming_daemon() {
     let mut harness = Harness::start("while IFS= read -r line; do :; done").await;
     let mut incompatible = harness.connect().await.expect("connect mismatched client");
     let unsupported = PROTOCOL_VERSION + 1;
     assert_eq!(
-        hello(&mut incompatible, ClientKind::Interactive, unsupported)
-            .await
-            .expect("receive protocol rejection"),
+        hello(
+            &mut incompatible,
+            ClientKind::Interactive,
+            unsupported,
+            None
+        )
+        .await
+        .expect("receive protocol rejection"),
         ServerMessage::IncompatibleProtocol {
             client: unsupported,
             server: PROTOCOL_VERSION,
@@ -404,6 +657,7 @@ async fn hello(
     connection: &mut Connection,
     kind: ClientKind,
     version: u16,
+    selector: Option<SessionSelector>,
 ) -> Result<ServerMessage, &'static str> {
     send_envelope(
         connection,
@@ -414,6 +668,7 @@ async fn hello(
                 client_version: "fut-e2e".into(),
                 kind,
                 size: SIZE,
+                selector,
             },
         },
     )

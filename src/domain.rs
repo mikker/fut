@@ -16,7 +16,9 @@ pub const MAX_VISIBLE_CELLS: usize = 50_000;
 
 macro_rules! id_type {
     ($name:ident) => {
-        #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+        #[derive(
+            Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+        )]
         #[serde(transparent)]
         pub struct $name(Uuid);
 
@@ -38,11 +40,23 @@ macro_rules! id_type {
                 self.0.fmt(formatter)
             }
         }
+
+        impl std::str::FromStr for $name {
+            type Err = uuid::Error;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Uuid::parse_str(value).map(Self)
+            }
+        }
     };
 }
 
 id_type!(TerminalId);
 id_type!(ClientId);
+id_type!(SessionId);
+id_type!(WorkspaceId);
+id_type!(TabId);
+id_type!(PaneId);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TerminalSize {

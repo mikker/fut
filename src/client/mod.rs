@@ -34,10 +34,11 @@ use crate::{
         ClientKind, ClientMessage, Envelope, PROTOCOL_VERSION, ServerMessage, codec,
         decode_payload, encode_payload,
     },
+    resources::SessionSelector,
 };
 
 /// Attach an interactive full-screen client to an already-running daemon.
-pub async fn attach(socket_path: &Path) -> anyhow::Result<()> {
+pub async fn attach(socket_path: &Path, selector: Option<SessionSelector>) -> anyhow::Result<()> {
     let stream = UnixStream::connect(socket_path)
         .await
         .with_context(|| format!("connect to {}", socket_path.display()))?;
@@ -51,6 +52,7 @@ pub async fn attach(socket_path: &Path) -> anyhow::Result<()> {
             client_version: env!("CARGO_PKG_VERSION").into(),
             kind: ClientKind::Interactive,
             size: TerminalSize { columns, rows },
+            selector,
         },
     )
     .await?;
@@ -58,9 +60,10 @@ pub async fn attach(socket_path: &Path) -> anyhow::Result<()> {
     let terminal_id = match receive(&mut framed).await? {
         ServerMessage::Welcome {
             version,
-            terminal_id,
+            selected: Some(selected),
             ..
-        } if version == PROTOCOL_VERSION => terminal_id,
+        } if version == PROTOCOL_VERSION => selected.terminal_id,
+        ServerMessage::Welcome { selected: None, .. } => bail!("daemon did not select a terminal"),
         ServerMessage::Welcome { version, .. } => {
             bail!("daemon welcomed client with unsupported protocol version {version}")
         }
@@ -100,7 +103,7 @@ async fn run(
                     ServerMessage::Snapshot { terminal_id: id, screen } if id == terminal_id => {
                         snapshots.accept(screen);
                     }
-                    ServerMessage::Snapshot { .. } | ServerMessage::Pong { .. } | ServerMessage::CommandCompleted { .. } => {}
+                    ServerMessage::Snapshot { .. } | ServerMessage::Pong { .. } | ServerMessage::CommandCompleted { .. } | ServerMessage::Resources { .. } | ServerMessage::SessionCreated { .. } => {}
                     ServerMessage::TerminalExited { terminal_id: id, exit_code } if id == terminal_id => {
                         if let Some(code) = exit_code { bail!("terminal exited with status {code}") }
                         break;

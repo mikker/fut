@@ -8,17 +8,20 @@ The project is currently in its design and first-spike phase:
 - [CONTEXT.md](CONTEXT.md) defines the project's shared language.
 - [PLAN.md](PLAN.md) lays out the implementation sequence and exit criteria.
 
-## Initial spike
+## Current vertical slice
 
-The current Rust spike proves one daemon-owned PTY, semantic terminal snapshots through `libghostty-vt`, a local Ratatui client, and detach/reattach without losing the child process.
+The current Rust implementation proves one daemon-owned resource tree with multiple live project sessions. Each session currently has one workspace, one tab, one pane, and one terminal. Terminals retain semantic `libghostty-vt` snapshots and survive detach/reattach.
 
 ```sh
 mise install
 mise run check
 
-cargo run                 # start or find the daemon, then attach
+cargo run                 # start or find the daemon, then attach (unambiguous session only)
+cargo run -- new api --cwd ../api -- /bin/zsh
+cargo run -- list
+cargo run -- attach api   # exact name; also id:<uuid>, name:<exact>, or bare UUID
 cargo run -- ping
-cargo run -- close        # close the current terminal and, when empty, Fut
+cargo run -- close api    # close and reap the complete session
 cargo run -- shutdown     # stop the daemon
 ```
 
@@ -31,4 +34,4 @@ mise run test:unit
 mise run test:e2e
 ```
 
-The spike intentionally owns only one terminal. Sessions, workspaces, tabs, panes, project recipes, and agent activity begin in later milestones.
+`new` requires an already-running daemon in this slice. Project identity is the canonical working directory; Git common-directory/worktree discovery is next. Session selectors accept `id:<uuid>` and `name:<exact>`; bare UUIDs select IDs and other bare values select exact names. There is no in-client retargeting, navigator, direct switching, project recipe, or agent activity yet.

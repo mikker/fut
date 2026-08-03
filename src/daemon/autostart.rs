@@ -88,6 +88,7 @@ pub async fn protocol_ready(socket: &Path) -> bool {
                         columns: 80,
                         rows: 24,
                     },
+                    selector: None,
                 },
             })?))
             .await?;

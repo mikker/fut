@@ -8,9 +8,14 @@ use thiserror::Error;
 use tokio_util::codec::LengthDelimitedCodec;
 use uuid::Uuid;
 
-use crate::domain::{ScreenSnapshot, TerminalId, TerminalSize};
+use std::path::PathBuf;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+use crate::{
+    domain::{PaneId, ScreenSnapshot, SessionId, TabId, TerminalId, TerminalSize, WorkspaceId},
+    resources::{ResourceSnapshot, SessionSelector},
+};
+
+pub const PROTOCOL_VERSION: u16 = 2;
 /// Enough for 50,000 individually styled JSON cells while remaining a firm
 /// pre-allocation bound for the length-delimited transport.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
@@ -34,8 +39,18 @@ pub enum ClientKind {
 pub enum AcknowledgedCommand {
     Input,
     Resize,
-    CloseTerminal,
+    CloseSession,
     Shutdown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SelectedTarget {
+    pub session_id: SessionId,
+    pub workspace_id: WorkspaceId,
+    pub tab_id: TabId,
+    pub pane_id: PaneId,
+    pub terminal_id: TerminalId,
+    pub child_pid: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -46,6 +61,8 @@ pub enum ClientMessage {
         client_version: String,
         kind: ClientKind,
         size: TerminalSize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<SessionSelector>,
     },
     Input {
         bytes: Vec<u8>,
@@ -54,7 +71,18 @@ pub enum ClientMessage {
         size: TerminalSize,
     },
     Detach,
-    CloseTerminal,
+    CreateSession {
+        name: String,
+        cwd: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        program: Option<PathBuf>,
+        #[serde(default)]
+        argv: Vec<String>,
+    },
+    ListResources,
+    CloseSession {
+        selector: SessionSelector,
+    },
     Ping,
     Shutdown,
 }
@@ -65,8 +93,13 @@ pub enum ServerMessage {
     Welcome {
         version: u16,
         server_version: String,
-        terminal_id: TerminalId,
-        child_pid: u32,
+        selected: Option<SelectedTarget>,
+    },
+    SessionCreated {
+        selected: SelectedTarget,
+    },
+    Resources {
+        snapshot: ResourceSnapshot,
     },
     Snapshot {
         terminal_id: TerminalId,
@@ -326,6 +359,7 @@ mod tests {
                 columns: 80,
                 rows: 24,
             },
+            selector: None,
         };
 
         assert_eq!(hello(PROTOCOL_VERSION).protocol_is_compatible(), Some(true));
@@ -341,7 +375,7 @@ mod tests {
             },
             ServerMessage::IncompatibleProtocol {
                 client: 2,
-                server: 1
+                server: PROTOCOL_VERSION
             }
         );
     }
@@ -358,6 +392,35 @@ mod tests {
         assert_eq!(
             decode_frame::<Envelope<ServerMessage>>(&frame).unwrap(),
             envelope
+        );
+    }
+
+    #[test]
+    fn selectors_resource_commands_and_snapshots_round_trip() {
+        let selector = SessionSelector::Name("project λ".into());
+        let message = ClientMessage::CreateSession {
+            name: "project λ".into(),
+            cwd: PathBuf::from("/tmp/project"),
+            program: Some(PathBuf::from("/bin/sh")),
+            argv: vec!["-c".into(), "echo ok".into()],
+        };
+        let encoded = encode_payload(&message).unwrap();
+        assert_eq!(decode_payload::<ClientMessage>(&encoded).unwrap(), message);
+
+        let close = ClientMessage::CloseSession { selector };
+        assert_eq!(
+            decode_payload::<ClientMessage>(&encode_payload(&close).unwrap()).unwrap(),
+            close
+        );
+        let resources = ServerMessage::Resources {
+            snapshot: ResourceSnapshot {
+                revision: 9,
+                sessions: vec![],
+            },
+        };
+        assert_eq!(
+            decode_payload::<ServerMessage>(&encode_payload(&resources).unwrap()).unwrap(),
+            resources
         );
     }
 }

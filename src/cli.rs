@@ -16,6 +16,7 @@ use crate::{
         AcknowledgedCommand, ClientKind, ClientMessage, Envelope, PROTOCOL_VERSION, ServerMessage,
         codec, decode_payload, encode_payload,
     },
+    resources::{ResourceSnapshot, SessionSelector},
 };
 
 #[derive(Parser)]
@@ -33,7 +34,18 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    Attach,
+    Attach {
+        /// Session selector: id:<uuid>, name:<exact>, UUID, or exact name.
+        session: Option<String>,
+    },
+    New {
+        name: String,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    List,
     Daemon {
         #[arg(long)]
         foreground: bool,
@@ -43,7 +55,10 @@ enum Command {
         command: Vec<String>,
     },
     Ping,
-    Close,
+    Close {
+        /// Session selector: id:<uuid>, name:<exact>, UUID, or exact name.
+        session: Option<String>,
+    },
     Shutdown,
 }
 
@@ -51,11 +66,49 @@ pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     let socket = socket_path(cli.socket.as_deref())?;
     match cli.command {
-        None | Some(Command::Attach) => {
+        None | Some(Command::Attach { session: None }) => {
             let cwd = std::env::current_dir().context("read current directory")?;
             ensure_daemon(&socket, &cwd).await?;
-            client::attach(&socket).await
+            client::attach(&socket, None).await
         }
+        Some(Command::Attach {
+            session: Some(session),
+        }) => client::attach(&socket, Some(selector(&session)?)).await,
+        Some(Command::New { name, cwd, command }) => {
+            let cwd = cwd.unwrap_or(std::env::current_dir()?);
+            let (program, argv) = command
+                .split_first()
+                .map_or((None, vec![]), |(program, argv)| {
+                    (Some(PathBuf::from(program)), argv.to_vec())
+                });
+            match control(
+                &socket,
+                ClientMessage::CreateSession {
+                    name,
+                    cwd,
+                    program,
+                    argv,
+                },
+            )
+            .await?
+            {
+                ServerMessage::SessionCreated { selected } => {
+                    println!(
+                        "session={} terminal={} pid={}",
+                        selected.session_id, selected.terminal_id, selected.child_pid
+                    );
+                    Ok(())
+                }
+                other => unexpected(other),
+            }
+        }
+        Some(Command::List) => match control(&socket, ClientMessage::ListResources).await? {
+            ServerMessage::Resources { snapshot } => {
+                print_resources(&snapshot);
+                Ok(())
+            }
+            other => unexpected(other),
+        },
         Some(Command::Daemon {
             foreground,
             cwd,
@@ -80,10 +133,14 @@ pub async fn run() -> Result<()> {
             }
             Ok(())
         }
-        Some(Command::Close) => {
+        Some(Command::Close { session }) => {
+            let selector = match session {
+                Some(value) => selector(&value)?,
+                None => only_session(&socket).await?,
+            };
             response_ok(
-                control(&socket, ClientMessage::CloseTerminal).await?,
-                AcknowledgedCommand::CloseTerminal,
+                control(&socket, ClientMessage::CloseSession { selector }).await?,
+                AcknowledgedCommand::CloseSession,
             )?;
             println!("closed=true");
             Ok(())
@@ -114,6 +171,7 @@ async fn control(socket: &std::path::Path, command: ClientMessage) -> Result<Ser
                 columns: 80,
                 rows: 24,
             },
+            selector: None,
         },
     )
     .await?;
@@ -123,6 +181,73 @@ async fn control(socket: &std::path::Path, command: ClientMessage) -> Result<Ser
     }
     send(&mut framed, command).await?;
     receive(&mut framed).await
+}
+
+fn selector(value: &str) -> Result<SessionSelector> {
+    if let Some(id) = value.strip_prefix("id:") {
+        return id
+            .parse()
+            .map(SessionSelector::Id)
+            .context("invalid id: session selector must contain a UUID");
+    }
+    if let Some(name) = value.strip_prefix("name:") {
+        return Ok(SessionSelector::Name(name.into()));
+    }
+    Ok(value
+        .parse()
+        .map(SessionSelector::Id)
+        .unwrap_or_else(|_| SessionSelector::Name(value.into())))
+}
+
+async fn only_session(socket: &std::path::Path) -> Result<SessionSelector> {
+    match control(socket, ClientMessage::ListResources).await? {
+        ServerMessage::Resources { snapshot } => {
+            let open = snapshot
+                .sessions
+                .iter()
+                .filter(|session| !session.closing)
+                .collect::<Vec<_>>();
+            if open.len() != 1 {
+                bail!(
+                    "session selector required when {} sessions are open",
+                    open.len()
+                );
+            }
+            Ok(SessionSelector::Id(open[0].id))
+        }
+        other => unexpected(other),
+    }
+}
+
+fn print_resources(snapshot: &ResourceSnapshot) {
+    println!("revision={}", snapshot.revision);
+    for session in &snapshot.sessions {
+        println!(
+            "session {} {:?}{}",
+            session.id,
+            session.name,
+            if session.closing { " closing" } else { "" }
+        );
+        for workspace in &session.workspaces {
+            println!(
+                "  workspace {} {:?} {}",
+                workspace.id,
+                workspace.name,
+                workspace.root.display()
+            );
+            for tab in &workspace.tabs {
+                println!("    tab {} {:?}", tab.id, tab.name);
+                for pane in &tab.panes {
+                    println!(
+                        "      pane {} terminal={}{}",
+                        pane.id,
+                        pane.terminal_id,
+                        if pane.closing { " closing" } else { "" }
+                    );
+                }
+            }
+        }
+    }
 }
 
 async fn send(
@@ -141,7 +266,7 @@ async fn send(
 async fn receive(
     framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
 ) -> Result<ServerMessage> {
-    let frame = tokio::time::timeout(Duration::from_secs(2), framed.next())
+    let frame = tokio::time::timeout(Duration::from_secs(15), framed.next())
         .await
         .context("daemon response timed out")?
         .context("daemon disconnected")??;
@@ -159,5 +284,34 @@ fn unexpected<T>(message: ServerMessage) -> Result<T> {
     match message {
         ServerMessage::Error { code, message } => bail!("daemon error ({code}): {message}"),
         other => bail!("unexpected daemon response: {other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_explicit_and_convenient_session_selectors() {
+        let id = crate::domain::SessionId::new();
+        assert_eq!(
+            selector(&format!("id:{id}")).unwrap(),
+            SessionSelector::Id(id)
+        );
+        assert_eq!(selector(&id.to_string()).unwrap(), SessionSelector::Id(id));
+        assert_eq!(
+            selector(&format!("name:{id}")).unwrap(),
+            SessionSelector::Name(id.to_string())
+        );
+        assert_eq!(
+            selector("name:雪 λ").unwrap(),
+            SessionSelector::Name("雪 λ".into())
+        );
+        assert!(
+            selector("id:not-a-uuid")
+                .unwrap_err()
+                .to_string()
+                .contains("invalid id")
+        );
     }
 }

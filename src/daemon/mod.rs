@@ -22,17 +22,20 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use tokio::{
     net::{UnixListener, UnixStream},
-    sync::watch,
+    sync::{Mutex, mpsc, watch},
     task::JoinSet,
     time::{Duration, timeout},
 };
 use tokio_util::codec::Framed;
 
 use crate::{
-    domain::{ClientId, TerminalSize},
+    domain::{ClientId, PaneId, SessionId, TabId, TerminalId, TerminalSize, WorkspaceId},
     protocol::{
-        AcknowledgedCommand, ClientKind, ClientMessage, Envelope, PROTOCOL_VERSION, ServerMessage,
-        codec, decode_payload, encode_payload,
+        AcknowledgedCommand, ClientKind, ClientMessage, Envelope, PROTOCOL_VERSION, SelectedTarget,
+        ServerMessage, codec, decode_payload, encode_payload,
+    },
+    resources::{
+        InitialPath, Project, ProjectIdentity, ResourceError, ResourceTree, SessionSelector,
     },
     terminal::{
         CommandError, SpawnSpec, TerminalEvent, TerminalHandle, TerminalLifecycle, spawn_terminal,
@@ -71,20 +74,55 @@ impl DaemonConfig {
 
 const CONNECTION_GRACE_PERIOD: Duration = Duration::from_secs(1);
 
-/// Bind Fut's sole socket and run while its terminal is alive.
+struct RuntimeEntry {
+    handle: Arc<TerminalHandle>,
+    session_id: SessionId,
+    lease: AttachmentLease,
+}
+
+struct SharedState {
+    resources: ResourceTree,
+    runtimes: HashMap<TerminalId, RuntimeEntry>,
+    accepting: bool,
+}
+
+type Shared = Arc<Mutex<SharedState>>;
+
+/// Bind Fut's sole socket and run while at least one session is alive.
 pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     let socket = bind_socket(&config.socket_path).await?;
-    let terminal = Arc::new(spawn_terminal(config.spawn)?);
-    let lease = AttachmentLease::default();
+    let cwd = fs::canonicalize(&config.spawn.cwd)
+        .with_context(|| format!("canonicalize {}", config.spawn.cwd.display()))?;
+    let mut initial_spawn = config.spawn;
+    initial_spawn.cwd = cwd.clone();
+    let terminal = Arc::new(spawn_terminal(initial_spawn)?);
+    let initial = initial_path(default_session_name(&cwd), cwd, terminal.id());
+    let mut resources = ResourceTree::default();
+    resources.create_session(initial.clone())?;
+    let mut runtimes = HashMap::new();
+    runtimes.insert(
+        terminal.id(),
+        RuntimeEntry {
+            handle: Arc::clone(&terminal),
+            session_id: initial.session_id,
+            lease: AttachmentLease::default(),
+        },
+    );
+    let shared = Arc::new(Mutex::new(SharedState {
+        resources,
+        runtimes,
+        accepting: true,
+    }));
+    let (exited_tx, mut exited_rx) = mpsc::unbounded_channel();
+    watch_terminal(terminal, exited_tx.clone());
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-    let mut lifecycle = terminal.subscribe_lifecycle();
     let mut connections = JoinSet::new();
 
     loop {
         tokio::select! {
             biased;
-            changed = lifecycle.changed() => {
-                if changed.is_err() || matches!(*lifecycle.borrow(), TerminalLifecycle::Exited { .. }) {
+            Some(terminal_id) = exited_rx.recv() => {
+                if finalize_terminal(&shared, terminal_id).await {
                     break;
                 }
             }
@@ -95,11 +133,11 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
             }
             accepted = socket.listener.accept() => {
                 let (stream, _) = accepted.context("accept daemon client")?;
-                let terminal = Arc::clone(&terminal);
-                let lease = lease.clone();
+                let shared = Arc::clone(&shared);
+                let exited = exited_tx.clone();
                 let shutdown = shutdown_tx.clone();
                 connections.spawn(async move {
-                    if let Err(error) = handle_connection(stream, terminal, lease, shutdown).await {
+                    if let Err(error) = handle_connection(stream, shared, exited, shutdown).await {
                         tracing::debug!(%error, "client connection ended");
                     }
                 });
@@ -111,10 +149,22 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
             }
         }
     }
-    if let Err(error) = terminal.close().await
-        && !matches!(error, CommandError::Stopped)
-    {
-        return Err(error).context("close terminal during shutdown");
+    let handles = {
+        let mut state = shared.lock().await;
+        state.accepting = false;
+        state
+            .runtimes
+            .values()
+            .map(|entry| Arc::clone(&entry.handle))
+            .collect::<Vec<_>>()
+    };
+    for terminal in handles {
+        if let Err(error) = terminal.close().await
+            && !(matches!(error, CommandError::Stopped)
+                && matches!(terminal.lifecycle(), TerminalLifecycle::Exited { .. }))
+        {
+            return Err(error).context("close terminal during shutdown");
+        }
     }
 
     // Terminal exit is already durable. Give attached and command handlers time
@@ -125,6 +175,60 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     .await;
     connections.shutdown().await;
     Ok(())
+}
+
+fn default_session_name(cwd: &Path) -> String {
+    cwd.file_name()
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "root".into())
+}
+
+fn initial_path(name: String, cwd: PathBuf, terminal_id: TerminalId) -> InitialPath {
+    InitialPath {
+        session_id: SessionId::new(),
+        session_name: name,
+        project: Project {
+            identity: ProjectIdentity::CanonicalDirectory(cwd.clone()),
+        },
+        workspace_id: WorkspaceId::new(),
+        workspace_name: "main".into(),
+        root: cwd,
+        tab_id: TabId::new(),
+        tab_name: "shell".into(),
+        pane_id: PaneId::new(),
+        terminal_id,
+    }
+}
+
+fn watch_terminal(terminal: Arc<TerminalHandle>, exited: mpsc::UnboundedSender<TerminalId>) {
+    tokio::spawn(async move {
+        let mut lifecycle = terminal.subscribe_lifecycle();
+        while matches!(*lifecycle.borrow(), TerminalLifecycle::Running) {
+            if lifecycle.changed().await.is_err() {
+                return;
+            }
+        }
+        let _ = exited.send(terminal.id());
+    });
+}
+
+async fn finalize_terminal(shared: &Shared, terminal_id: TerminalId) -> bool {
+    let mut state = shared.lock().await;
+    if state.runtimes.remove(&terminal_id).is_none() {
+        return false;
+    }
+    match state.resources.terminal_exited(terminal_id) {
+        Ok(mutation) if mutation.multiplexer_empty => {
+            state.accepting = false;
+            true
+        }
+        Ok(_) => false,
+        Err(error) => {
+            tracing::error!(%error, %terminal_id, "finalize terminal resource");
+            false
+        }
+    }
 }
 
 async fn bind_socket(path: &Path) -> Result<OwnedSocket> {
@@ -236,8 +340,8 @@ impl Drop for OwnedSocket {
 
 async fn handle_connection(
     stream: UnixStream,
-    terminal: Arc<TerminalHandle>,
-    lease: AttachmentLease,
+    shared: Shared,
+    exited: mpsc::UnboundedSender<TerminalId>,
     shutdown: watch::Sender<bool>,
 ) -> Result<()> {
     let mut framed = Framed::new(stream, codec());
@@ -248,13 +352,14 @@ async fn handle_connection(
         return Ok(());
     };
     let first: Envelope<ClientMessage> = decode_payload(&frame?)?;
-    let (version, kind, size) = match first.message {
+    let (version, kind, size, selector) = match first.message {
         ClientMessage::Hello {
             version,
             kind,
             size,
+            selector,
             ..
-        } => (version, kind, size),
+        } => (version, kind, size, selector),
         _ => {
             send_error(
                 &mut framed,
@@ -290,28 +395,26 @@ async fn handle_connection(
     }
 
     let client = ClientId::new();
-    let mut lifecycle = terminal.subscribe_lifecycle();
-    let lease_guard = if kind == ClientKind::Interactive {
-        match lease.acquire(client) {
-            Some(guard) => Some(guard),
-            None => {
-                send_error(
-                    &mut framed,
-                    first.request_id,
-                    "already_attached",
-                    "another interactive client holds the attachment lease",
-                )
-                .await?;
+    let selected = if kind == ClientKind::Interactive {
+        match select_target(&shared, selector, client).await {
+            Ok(selected) => Some(selected),
+            Err((code, message)) => {
+                send_error(&mut framed, first.request_id, code, &message).await?;
                 return Ok(());
             }
         }
     } else {
         None
     };
-    let current_lifecycle = lifecycle.borrow().clone();
-    if kind == ClientKind::Interactive
-        && let TerminalLifecycle::Exited { exit_code } = current_lifecycle
-    {
+    let (target, mut lease_guard) = selected.unzip();
+    let terminal = target.as_ref().map(|(_, terminal)| Arc::clone(terminal));
+    let mut lifecycle = terminal
+        .as_ref()
+        .map(|terminal| terminal.subscribe_lifecycle());
+    let current_lifecycle = lifecycle
+        .as_ref()
+        .map(|lifecycle| lifecycle.borrow().clone());
+    if let Some(TerminalLifecycle::Exited { exit_code }) = current_lifecycle {
         send_error(
             &mut framed,
             first.request_id,
@@ -327,15 +430,16 @@ async fn handle_connection(
         ServerMessage::Welcome {
             version: PROTOCOL_VERSION,
             server_version: env!("CARGO_PKG_VERSION").into(),
-            terminal_id: terminal.id(),
-            child_pid: terminal.child_pid(),
+            selected: target.as_ref().map(|(selected, _)| selected.clone()),
         },
     )
     .await?;
 
     if kind == ClientKind::Control {
-        return control_loop(&mut framed, &terminal, shutdown).await;
+        return control_loop(&mut framed, shared, exited, shutdown).await;
     }
+    let terminal = terminal.expect("interactive connection selected a terminal");
+    let mut lifecycle = lifecycle.take().expect("interactive lifecycle exists");
     if let Err(error) = terminal.resize(size).await {
         send_command_error(&mut framed, None, error).await?;
     }
@@ -367,11 +471,12 @@ async fn handle_connection(
                         }
                     }
                     ClientMessage::Detach => {
+                        drop(lease_guard.take());
                         send(&mut framed, envelope.request_id, ServerMessage::Detached).await?;
                         break;
                     }
                     ClientMessage::Ping => send(&mut framed, envelope.request_id, ServerMessage::Pong { daemon_pid: std::process::id() }).await?,
-                    ClientMessage::CloseTerminal | ClientMessage::Shutdown => send_error(&mut framed, envelope.request_id, "control_only", "command requires a control connection").await?,
+                    ClientMessage::CreateSession { .. } | ClientMessage::ListResources | ClientMessage::CloseSession { .. } | ClientMessage::Shutdown => send_error(&mut framed, envelope.request_id, "control_only", "command requires a control connection").await?,
                     ClientMessage::Hello { .. } => send_error(&mut framed, envelope.request_id, "already_hello", "hello was already received").await?,
                 }
             },
@@ -393,6 +498,13 @@ async fn handle_connection(
                 if changed.is_err() { break; }
                 let current_lifecycle = lifecycle.borrow().clone();
                 if let TerminalLifecycle::Exited { exit_code } = current_lifecycle {
+                    if snapshots.has_changed().unwrap_or(false) {
+                        let screen = snapshots.borrow_and_update().clone();
+                        send(&mut framed, None, ServerMessage::Snapshot {
+                            terminal_id: terminal.id(),
+                            screen,
+                        }).await?;
+                    }
                     send(&mut framed, None, ServerMessage::TerminalExited { terminal_id: terminal.id(), exit_code }).await?;
                     break;
                 }
@@ -405,7 +517,8 @@ async fn handle_connection(
 
 async fn control_loop(
     framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
-    terminal: &TerminalHandle,
+    shared: Shared,
+    exited: mpsc::UnboundedSender<TerminalId>,
     shutdown: watch::Sender<bool>,
 ) -> Result<()> {
     while let Some(frame) = framed.next().await {
@@ -421,18 +534,48 @@ async fn control_loop(
                 )
                 .await?
             }
-            ClientMessage::CloseTerminal => {
-                let result = terminal.close().await;
-                let terminal_stopped = matches!(result, Ok(()) | Err(CommandError::Stopped));
-                command_response(
+            ClientMessage::CreateSession {
+                name,
+                cwd,
+                program,
+                argv,
+            } => match create_session(&shared, &exited, name, cwd, program, argv).await {
+                Ok(selected) => {
+                    send(
+                        framed,
+                        envelope.request_id,
+                        ServerMessage::SessionCreated { selected },
+                    )
+                    .await?
+                }
+                Err((code, message)) => {
+                    send_error(framed, envelope.request_id, code, &message).await?
+                }
+            },
+            ClientMessage::ListResources => {
+                let snapshot = shared.lock().await.resources.snapshot();
+                send(
                     framed,
                     envelope.request_id,
-                    AcknowledgedCommand::CloseTerminal,
-                    result,
+                    ServerMessage::Resources { snapshot },
                 )
                 .await?;
-                if terminal_stopped {
-                    break;
+            }
+            ClientMessage::CloseSession { selector } => {
+                match close_session(&shared, selector).await {
+                    Ok(()) => {
+                        send(
+                            framed,
+                            envelope.request_id,
+                            ServerMessage::CommandCompleted {
+                                command: AcknowledgedCommand::CloseSession,
+                            },
+                        )
+                        .await?
+                    }
+                    Err((code, message)) => {
+                        send_error(framed, envelope.request_id, code, &message).await?
+                    }
                 }
             }
             ClientMessage::Shutdown => {
@@ -472,6 +615,210 @@ async fn control_loop(
         }
     }
     Ok(())
+}
+
+async fn select_target(
+    shared: &Shared,
+    selector: Option<SessionSelector>,
+    client: ClientId,
+) -> Result<((SelectedTarget, Arc<TerminalHandle>), lease::LeaseGuard), (&'static str, String)> {
+    let state = shared.lock().await;
+    if !state.accepting {
+        return Err(("shutting_down", "daemon is shutting down".into()));
+    }
+    let snapshot = state.resources.snapshot();
+    let session_id = match selector {
+        Some(selector) => state
+            .resources
+            .resolve_session(selector)
+            .map_err(resource_error)?,
+        None => {
+            let open = snapshot
+                .sessions
+                .iter()
+                .filter(|session| !session.closing)
+                .collect::<Vec<_>>();
+            if open.len() != 1 {
+                return Err((
+                    "target_required",
+                    "select a session by full UUID or exact name".into(),
+                ));
+            }
+            open[0].id
+        }
+    };
+    let session = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.id == session_id)
+        .ok_or_else(|| ("not_found", "session not found".into()))?;
+    if session.closing {
+        return Err(("target_closing", "session is closing".into()));
+    }
+    let workspace = &session.workspaces[0];
+    let tab = &workspace.tabs[0];
+    let pane = &tab.panes[0];
+    let runtime = state
+        .runtimes
+        .get(&pane.terminal_id)
+        .ok_or_else(|| ("not_found", "terminal runtime not found".into()))?;
+    if runtime.session_id != session_id {
+        return Err((
+            "resource_error",
+            "terminal runtime belongs to another session".into(),
+        ));
+    }
+    let guard = runtime.lease.acquire(client).ok_or_else(|| {
+        (
+            "already_attached",
+            "another interactive client holds this terminal's attachment lease".into(),
+        )
+    })?;
+    Ok((
+        (
+            SelectedTarget {
+                session_id,
+                workspace_id: workspace.id,
+                tab_id: tab.id,
+                pane_id: pane.id,
+                terminal_id: pane.terminal_id,
+                child_pid: runtime.handle.child_pid(),
+            },
+            Arc::clone(&runtime.handle),
+        ),
+        guard,
+    ))
+}
+
+async fn create_session(
+    shared: &Shared,
+    exited: &mpsc::UnboundedSender<TerminalId>,
+    name: String,
+    cwd: PathBuf,
+    program: Option<PathBuf>,
+    argv: Vec<String>,
+) -> Result<SelectedTarget, (&'static str, String)> {
+    let cwd = fs::canonicalize(&cwd).map_err(|error| {
+        (
+            "invalid_cwd",
+            format!("canonicalize {}: {error}", cwd.display()),
+        )
+    })?;
+    let program = program.unwrap_or_else(|| {
+        std::env::var_os("SHELL")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| "/bin/sh".into())
+    });
+    let proposed = initial_path(name, cwd.clone(), TerminalId::new());
+    let (terminal, selected, insertion_error) = {
+        let mut state = shared.lock().await;
+        if !state.accepting {
+            return Err(("shutting_down", "daemon is shutting down".into()));
+        }
+        let mut validated = state.resources.clone();
+        validated
+            .create_session(proposed.clone())
+            .map_err(resource_error)?;
+        let terminal = Arc::new(
+            spawn_terminal(SpawnSpec {
+                program,
+                argv,
+                cwd: cwd.clone(),
+                env: std::env::vars().collect(),
+                size: TerminalSize {
+                    columns: 80,
+                    rows: 24,
+                },
+            })
+            .map_err(|error| ("spawn_failed", error.to_string()))?,
+        );
+        let mut path = proposed;
+        path.terminal_id = terminal.id();
+        let selected = SelectedTarget {
+            session_id: path.session_id,
+            workspace_id: path.workspace_id,
+            tab_id: path.tab_id,
+            pane_id: path.pane_id,
+            terminal_id: path.terminal_id,
+            child_pid: terminal.child_pid(),
+        };
+        let insertion = state
+            .resources
+            .create_session(path)
+            .map_err(resource_error)
+            .map(|_| {
+                state.runtimes.insert(
+                    terminal.id(),
+                    RuntimeEntry {
+                        handle: Arc::clone(&terminal),
+                        session_id: selected.session_id,
+                        lease: AttachmentLease::default(),
+                    },
+                );
+            });
+        (terminal, selected, insertion.err())
+    };
+    if let Some(error) = insertion_error {
+        let _ = terminal.close().await;
+        return Err(error);
+    }
+    watch_terminal(terminal, exited.clone());
+    Ok(selected)
+}
+
+async fn close_session(
+    shared: &Shared,
+    selector: SessionSelector,
+) -> Result<(), (&'static str, String)> {
+    let (session_id, handles) = {
+        let mut state = shared.lock().await;
+        if !state.accepting {
+            return Err(("shutting_down", "daemon is shutting down".into()));
+        }
+        let session_id = state
+            .resources
+            .resolve_session(selector)
+            .map_err(resource_error)?;
+        let terminals = state
+            .resources
+            .close_session(session_id)
+            .map_err(resource_error)?
+            .terminals_to_close;
+        let handles = terminals
+            .into_iter()
+            .filter_map(|id| {
+                state
+                    .runtimes
+                    .get(&id)
+                    .map(|entry| Arc::clone(&entry.handle))
+            })
+            .collect::<Vec<_>>();
+        (session_id, handles)
+    };
+    for handle in handles {
+        if let Err(error) = handle.close().await {
+            if matches!(error, CommandError::Stopped)
+                && matches!(handle.lifecycle(), TerminalLifecycle::Exited { .. })
+            {
+                continue;
+            }
+            let mut state = shared.lock().await;
+            let _ = state.resources.cancel_close_session(session_id);
+            return Err(("close_failed", error.to_string()));
+        }
+    }
+    Ok(())
+}
+
+fn resource_error(error: ResourceError) -> (&'static str, String) {
+    let code = match error {
+        ResourceError::NotFound(_) => "not_found",
+        ResourceError::Duplicate(_) => "duplicate",
+        ResourceError::Closing(_) => "target_closing",
+        ResourceError::EmptyName => "invalid_name",
+        _ => "resource_error",
+    };
+    (code, error.to_string())
 }
 
 async fn command_response(

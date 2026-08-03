@@ -2,17 +2,19 @@
 
 ## Current status
 
-The Milestone 0–1 spike is implemented. It establishes:
+The Milestone 0–1 spike and the first daemon-integrated Milestone 2 slice are implemented. They establish:
 
 - a Rust `fut` executable and pinned Rust/Zig toolchain;
 - one securely owned per-user daemon socket;
-- one daemon-owned PTY and stable terminal identity;
+- a pure ResourceTree used by the daemon, separate from its terminal runtime registry;
+- several one-workspace/one-tab/one-pane/one-terminal project sessions in one daemon;
+- stable terminal identities and per-terminal attachment leases;
 - a narrow `libghostty-vt` adapter producing Fut-owned semantic snapshots;
 - a detachable Ratatui client with local view state;
 - durable terminal lifecycle and confirmed child cleanup;
 - separate unit and process-level end-to-end test layers.
 
-This validates the vertical slice but does not make Milestone 1 production-complete. Input encoding is still a basic client-side mapping, snapshots are full-grid JSON messages, and the broader project resource tree has not begun. Because the spike's sole terminal is its sole live session, terminal exit closes Fut and releases the daemon socket.
+This validates the first multi-session vertical slice but does not complete Milestone 2. Input encoding remains a basic client-side mapping and snapshots are full-grid JSON messages. Project identity currently uses canonical directories; Git common-dir/worktree discovery is deliberately next. Every connection selects one terminal at handshake, with no retargeting, navigator, direct switching, rename/move/split operations, or project recipes. A session disappears when its terminal exits; only the last session exit closes Fut and releases the socket.
 
 ## Strategy
 

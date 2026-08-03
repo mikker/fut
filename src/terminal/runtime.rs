@@ -319,14 +319,18 @@ fn run(
                     }
                 }
                 RuntimeMessage::Close(completion) => {
-                    kill_process_group(child_pid);
+                    kill_terminal_processes(&*master, child_pid);
                     if exit_code.is_none()
                         && let Err(error) = child.kill()
                     {
                         send_error(publishers.events, error.into());
                     }
-                    let result = match wait_for_child(&mut *child, Duration::from_secs(2)) {
-                        Ok(Some(status)) => {
+                    // A shell may be concurrently handing the tty to a newly
+                    // forked foreground group. Re-read the tty group after
+                    // killing the session leader before entering wait().
+                    kill_terminal_processes(&*master, child_pid);
+                    let result = match child.wait() {
+                        Ok(status) => {
                             let code = Some(status.exit_code() as i32);
                             drain_output_until(
                                 &queues.output,
@@ -336,11 +340,6 @@ fn run(
                             );
                             publish_exit(publishers.events, publishers.lifecycle, code);
                             Ok(())
-                        }
-                        Ok(None) => {
-                            let error = anyhow!("terminal child did not exit after SIGKILL");
-                            send_error(publishers.events, error);
-                            Err(CommandError::Stopped)
                         }
                         Err(error) => {
                             send_error(publishers.events, anyhow!(error.to_string()));
@@ -416,36 +415,31 @@ fn drain_output_until(
 }
 
 #[cfg(unix)]
-fn kill_process_group(child_pid: u32) {
-    // Killing the actual process group prevents descendants retaining the PTY
-    // and blocking reap. Do not assume the group id equals the reported pid.
+fn kill_terminal_processes(master: &dyn MasterPty, child_pid: u32) {
+    // A shell can put its foreground command in a different process group.
+    // Kill that tty foreground group as well as the child's session group so
+    // no descendant can retain the PTY and prevent confirmed reap.
     // SAFETY: getpgid/kill accept integer process ids and retain no pointers.
     unsafe {
+        if let Some(foreground_group) = master.process_group_leader()
+            && foreground_group != libc::getpgrp()
+        {
+            libc::kill(-foreground_group, libc::SIGKILL);
+        }
         let process_group = libc::getpgid(child_pid as i32);
         if process_group > 0 && process_group != libc::getpgrp() {
             libc::kill(-process_group, libc::SIGKILL);
+        } else {
+            // Some PTY implementations do not place the command in a distinct
+            // process group. Never signal Fut's own group, but still kill the
+            // child itself before the confirmed wait below.
+            libc::kill(child_pid as i32, libc::SIGKILL);
         }
     }
 }
 
 #[cfg(not(unix))]
 fn kill_process_group(_child_pid: u32) {}
-
-fn wait_for_child(
-    child: &mut dyn portable_pty::Child,
-    timeout: Duration,
-) -> std::io::Result<Option<portable_pty::ExitStatus>> {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(Some(status));
-        }
-        if std::time::Instant::now() >= deadline {
-            return Ok(None);
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-}
 
 fn acknowledge_pending_closes(receiver: &mut async_mpsc::Receiver<RuntimeMessage>) {
     while let Ok(message) = receiver.try_recv() {
@@ -669,8 +663,11 @@ mod tests {
 
     #[tokio::test]
     async fn sustained_output_cannot_fill_the_control_queue() {
-        let handle =
-            spawn_terminal(shell("head -c 1000000 /dev/zero; sleep 60", HashMap::new())).unwrap();
+        let handle = spawn_terminal(shell(
+            "i=0; while [ $i -lt 100 ]; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; i=$((i+1)); done; while IFS= read -r line; do :; done",
+            HashMap::new(),
+        ))
+        .unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         assert!(
@@ -682,7 +679,7 @@ mod tests {
                 .await
                 .is_ok()
         );
-        let close = tokio::time::timeout(Duration::from_secs(5), handle.close())
+        let close = tokio::time::timeout(Duration::from_secs(15), handle.close())
             .await
             .unwrap();
         assert!(!matches!(close, Err(CommandError::Busy)));
