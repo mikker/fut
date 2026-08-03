@@ -31,6 +31,16 @@ Build Fut as a sequence of narrow vertical slices. The first slice must prove pr
 
 Each milestone should leave a runnable `fut` binary. New abstractions are earned by the next milestone rather than designed for every possible client or platform in advance.
 
+Milestone numbers group capabilities; they do not force implementation order. The current execution order is:
+
+1. finish Milestone 2's resource and placement semantics, beginning with pane movement;
+2. build Milestone 4's spatial UI and daily-driver behavior;
+3. prove Milestone 5's agent activity and attention model in a narrow Pi-backed spike;
+4. return to Milestone 3's trusted project definitions and workspace recipes;
+5. harden the resulting product through Milestone 6.
+
+UI work begins before Milestone 2 closes: simultaneous pane rendering, per-client focus, and minimal split geometry are the bridge from resource semantics into Milestone 4. Milestone 4 then treats visual quality as product work rather than a final polish pass. Terminal content should dominate a compact, responsive interface with unmistakable focus, a visible but unobtrusive hierarchy, restrained state color, and a small amount of character rather than ornamental panel chrome.
+
 ## Guardrails
 
 These constraints protect the foundational model during implementation:
@@ -131,9 +141,11 @@ Introduce the real product model before reproducing more tmux behavior.
 - Shell completion obtains live resources from the daemon, presents enough names and ancestry to distinguish them, and inserts the exact raw ID accepted by the selected command. (Met.)
 - Every noninteractive command has versioned JSON success and error output; command names are dotted and scripts never need to parse human output. (Met.)
 
-## Milestone 3: Project definitions and workspace recipes
+## Milestone 3: Project definitions and workspace recipes (deferred)
 
 Replace the external Tmuxinator/Herdr bootstrap layer with a native, trusted creation flow.
+
+This capability remains part of the intended product, but implementation follows the daily-driver UI and initial agent-status spike. Until then, explicit CLI creation remains the honest bootstrap path.
 
 ### Work
 
@@ -163,23 +175,26 @@ Replace the external Tmuxinator/Herdr bootstrap layer with a native, trusted cre
 - An untrusted repository cannot silently execute configuration.
 - The current `hdr` bootstrap responsibilities can move into Fut.
 
-## Milestone 4: Daily-driver terminal and navigation behavior
+## Milestone 4: Daily-driver terminal, navigation, and UI
 
-Reach the minimum tmux replacement level suggested by the current dotfiles.
+Reach the minimum tmux replacement level suggested by the current dotfiles, with an interface that feels purpose-built rather than inherited from tmux.
 
 ### Work
 
+- Establish a small theme and presentation-token system for hierarchy, focus, activity, attention, muted chrome, and terminal-safe contrast.
+- Render simultaneous panes with clear focus, responsive degradation in small terminals, pane zoom, and a focus-biased accordion layout.
+- Make project, workspace, tab, and pane context legible without surrounding the terminal in boxes or permanently consuming excessive space.
+- Evolve the global navigator into a fast fuzzy destination and action surface, with compact keybinding discovery where context requires it.
 - Prefix and prefix-free configurable bindings.
 - Vim-style directional pane navigation and cycling.
 - Last pane, tab, workspace, and session navigation.
 - Numbered access within the current scope.
 - Splits and new tabs inheriting the focused terminal's current directory.
-- Pane zoom, titles, tab names, and automatic numbering.
-- Focus-biased accordion layout.
+- Pane titles, tab names, and automatic numbering.
 - Scrollback, copy mode, selection, search, and clipboard integration.
 - Truecolor, undercurl, hyperlinks, bracketed paste, focus events, mouse support, and extended keyboard protocols.
 - Temporary action surfaces for commands such as git diff, URL opening, Hunk, and editor splits.
-- Keybinding discovery equivalent to the useful part of tmux which-key.
+- Dogfood the primary shell, editor, agent, split, navigator, tiny-terminal, loading, error, and empty states as one coherent visual system.
 
 ### Tests
 
@@ -194,9 +209,11 @@ Reach the minimum tmux replacement level suggested by the current dotfiles.
 - The UI remains useful with the project tree visible, compact, or hidden.
 - Focus-biased layout works as a first-class policy rather than a resize hook.
 
-## Milestone 5: Agent activity and attention
+## Milestone 5: Agent activity and attention spike
 
 Add agent awareness as metadata on the established resource tree.
+
+Start this milestone as a proof-of-concept against the now-usable UI: one explicit reporting protocol, one first-party Pi integration, inline rollups, and direct navigation to attention. Do not begin with process heuristics or a generic integration framework.
 
 ### Work
 
