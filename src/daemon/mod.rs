@@ -485,22 +485,6 @@ impl Attachment {
         &self.focused.terminal
     }
 
-    fn refresh_focus(&mut self, selected: SelectedTarget) -> bool {
-        if self.focused.selected.terminal_id != selected.terminal_id {
-            return false;
-        }
-        let Some(pane) = self
-            .panes
-            .iter_mut()
-            .find(|pane| pane.selected.terminal_id == selected.terminal_id)
-        else {
-            return false;
-        };
-        pane.selected = selected.clone();
-        self.focused.selected = selected;
-        true
-    }
-
     fn reconcile(
         &mut self,
         panes: Vec<ObservedTarget>,
@@ -1063,27 +1047,24 @@ async fn handle_connection(
                         }
                     }
                     ClientMessage::SelectTarget { selector } => {
-                        let selected = match resolve_target(&shared, &selector).await {
-                            Ok(selected) => selected,
+                        let selection = match observe_selection(
+                            &shared,
+                            &selector,
+                            attachment.focused.selected.terminal_id,
+                        ).await {
+                            Ok(selection) => selection,
                             Err(error) => {
                                 send_error(&mut framed, envelope.request_id, error.code, &error.message).await?;
                                 continue;
                             }
                         };
-                        if selected.terminal_id == attachment.focused.selected.terminal_id {
-                            let (panes, resource_revision) = match observe_tab(
-                                &shared,
-                                selected.tab_id,
-                                selected.terminal_id,
-                            ).await {
-                                Ok(panes) => panes,
-                                Err(error) => {
-                                    send_error(&mut framed, envelope.request_id, error.code, &error.message).await?;
-                                    continue;
-                                }
-                            };
-                            attachment.refresh_focus(selected);
-                            attachment.replace_panes(panes, resource_revision);
+                        if let TargetSelection::Focused {
+                            selected,
+                            panes,
+                            resource_revision,
+                        } = selection
+                        {
+                            attachment.reconcile(panes, selected, resource_revision);
                             send(
                                 &mut framed,
                                 envelope.request_id,
@@ -1093,13 +1074,12 @@ async fn handle_connection(
                         }
                         match switch_candidate(&shared, selector, client).await {
                             Ok(candidate) => {
-                                let selected = candidate.selected();
+                                attachment = candidate;
                                 send(
                                     &mut framed,
                                     envelope.request_id,
-                                    ServerMessage::TargetSelected { selected },
+                                    ServerMessage::TargetSelected { selected: attachment.selected() },
                                 ).await?;
-                                attachment = candidate;
                             }
                             Err(error) => send_error(&mut framed, envelope.request_id, error.code, &error.message).await?,
                         }
@@ -1598,10 +1578,20 @@ async fn focus_leased_attachment(
     Ok(())
 }
 
-async fn resolve_target(
+enum TargetSelection {
+    Focused {
+        selected: SelectedTarget,
+        panes: Vec<ObservedTarget>,
+        resource_revision: u64,
+    },
+    Different,
+}
+
+async fn observe_selection(
     shared: &Shared,
     selector: &TargetSelector,
-) -> Result<SelectedTarget, DaemonError> {
+    focused_terminal_id: TerminalId,
+) -> Result<TargetSelection, DaemonError> {
     let state = shared.lock().await;
     if !state.accepting {
         return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
@@ -1621,23 +1611,15 @@ async fn resolve_target(
             format!("terminal already exited with status {exit_code:?}"),
         ));
     }
-    Ok(selected_target(path, &runtime.handle))
-}
-
-async fn observe_tab(
-    shared: &Shared,
-    tab_id: TabId,
-    focused: TerminalId,
-) -> Result<(Vec<ObservedTarget>, u64), DaemonError> {
-    let state = shared.lock().await;
-    if !state.accepting {
-        return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
+    if path.terminal_id != focused_terminal_id {
+        return Ok(TargetSelection::Different);
     }
-    let paths = state.resources.open_terminal_paths_for_tab(tab_id)?;
-    Ok((
-        observed_targets(&state, paths, focused)?,
-        state.resources.revision(),
-    ))
+    let paths = state.resources.open_terminal_paths_for_tab(path.tab_id)?;
+    Ok(TargetSelection::Focused {
+        selected: selected_target(path, &runtime.handle),
+        panes: observed_targets(&state, paths, focused_terminal_id)?,
+        resource_revision: state.resources.revision(),
+    })
 }
 
 fn observed_targets(
@@ -2395,6 +2377,78 @@ mod tests {
         );
 
         terminal.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn focused_selection_observes_exact_target_and_complete_tab() {
+        let spawn = || {
+            Arc::new(
+                spawn_terminal(SpawnSpec {
+                    program: "/bin/sh".into(),
+                    argv: vec!["-c".into(), "sleep 10".into()],
+                    cwd: "/".into(),
+                    env: HashMap::new(),
+                    size: TerminalSize {
+                        columns: 80,
+                        rows: 24,
+                    },
+                })
+                .unwrap(),
+            )
+        };
+        let focused = spawn();
+        let sibling = spawn();
+        let resolved = ResolvedLocation {
+            cwd: "/".into(),
+            project: crate::resources::Project {
+                identity: crate::resources::ProjectIdentity::CanonicalDirectory("/".into()),
+            },
+            workspace_root: "/".into(),
+            suggested_session_name: "test".into(),
+            suggested_workspace_name: "root".into(),
+            workspace_kind: crate::project::WorkspaceKind::Directory,
+        };
+        let path = initial_path(&resolved, "test".into(), focused.id());
+        let sibling_pane_id = PaneId::new();
+        let (resource_changes, _) = watch::channel(0);
+        let mut state = SharedState {
+            resources: ResourceTree::default(),
+            runtimes: HashMap::new(),
+            expected_finalizations: HashSet::new(),
+            resource_changes,
+            accepting: true,
+        };
+        state
+            .register_session(path.clone(), Arc::clone(&focused))
+            .unwrap();
+        state
+            .register_pane(path.tab_id, sibling_pane_id, Arc::clone(&sibling))
+            .unwrap();
+        let shared = Arc::new(Mutex::new(state));
+
+        let TargetSelection::Focused {
+            selected,
+            panes,
+            resource_revision,
+        } = observe_selection(&shared, &TargetSelector::Pane(path.pane_id), focused.id())
+            .await
+            .unwrap()
+        else {
+            panic!("the focused terminal should be observed in place");
+        };
+
+        assert_eq!(selected.pane_id, path.pane_id);
+        assert_eq!(selected.terminal_id, focused.id());
+        assert_eq!(panes.len(), 2);
+        assert!(
+            panes
+                .iter()
+                .any(|pane| pane.selected.pane_id == sibling_pane_id)
+        );
+        assert_eq!(resource_revision, shared.lock().await.resources.revision());
+
+        focused.close().await.unwrap();
+        sibling.close().await.unwrap();
     }
 
     #[test]

@@ -136,18 +136,22 @@ async fn run(
                         }
                     }
                     ServerMessage::ResourcesChanged { snapshot } => {
-                        view.observe_resource_revision(snapshot.revision);
                         if let Some(nav) = navigator.as_mut() {
                             force_draw |= nav.accept_resources(None, &snapshot, view.focused());
                         }
                     }
                     ServerMessage::TargetSelected { selected: target } => {
                         let old_terminal = view.focused().terminal_id;
-                        if !view.replace(target)? {
-                            continue;
-                        }
                         let navigator_selected = navigator.as_mut().is_some_and(|nav| nav.switch_selected(request_id));
                         focus.complete(request_id);
+                        if !view.replace(target)? {
+                            if navigator_selected {
+                                navigator = None;
+                                view.invalidate_drawn();
+                                force_draw = true;
+                            }
+                            continue;
+                        }
                         pending_focused_exit = None;
                         resize_view(framed, terminal.size()?.into(), &mut view).await?;
                         if navigator_selected && view.focused().terminal_id == old_terminal {
@@ -421,7 +425,7 @@ impl PaneState {
 
 struct ViewState {
     focused: TerminalId,
-    resource_revision: u64,
+    selected_revision: u64,
     panes: Vec<PaneState>,
 }
 
@@ -430,7 +434,7 @@ impl ViewState {
         let focused = selected.focused.terminal_id;
         let mut view = Self {
             focused,
-            resource_revision: 0,
+            selected_revision: 0,
             panes: Vec::new(),
         };
         view.replace(selected)?;
@@ -438,7 +442,7 @@ impl ViewState {
     }
 
     fn replace(&mut self, selected: SelectedView) -> anyhow::Result<bool> {
-        if selected.resource_revision < self.resource_revision {
+        if selected.resource_revision < self.selected_revision {
             return Ok(false);
         }
         let previous_focus = self.focused;
@@ -496,7 +500,7 @@ impl ViewState {
             })
             .collect();
         self.focused = focused;
-        self.resource_revision = selected.resource_revision;
+        self.selected_revision = selected.resource_revision;
         if previous_focus != focused
             && let Some(pane) = self
                 .panes
@@ -506,10 +510,6 @@ impl ViewState {
             pane.last_size = None;
         }
         Ok(true)
-    }
-
-    fn observe_resource_revision(&mut self, revision: u64) {
-        self.resource_revision = self.resource_revision.max(revision);
     }
 
     fn focused(&self) -> &SelectedTarget {
@@ -867,7 +867,7 @@ mod tests {
     }
 
     #[test]
-    fn resource_revisions_prevent_stale_views_from_restoring_membership() {
+    fn selected_view_revisions_only_reject_older_selected_views() {
         let panes = targets(3);
         let mut state = ViewState::new(SelectedView {
             resource_revision: 2,
@@ -875,10 +875,9 @@ mod tests {
             panes: panes[..2].to_vec(),
         })
         .unwrap();
-        state.observe_resource_revision(4);
 
         assert!(
-            !state
+            state
                 .replace(SelectedView {
                     resource_revision: 3,
                     focused: panes[1].clone(),
@@ -886,22 +885,22 @@ mod tests {
                 })
                 .unwrap()
         );
-        assert_eq!(state.focused().terminal_id, panes[0].terminal_id);
+        assert_eq!(state.focused().terminal_id, panes[1].terminal_id);
         assert_eq!(
             state
                 .panes
                 .iter()
                 .map(|pane| pane.target.terminal_id)
                 .collect::<Vec<_>>(),
-            [panes[0].terminal_id, panes[1].terminal_id]
+            [panes[1].terminal_id, panes[2].terminal_id]
         );
 
         assert!(
-            state
+            !state
                 .replace(SelectedView {
-                    resource_revision: 4,
-                    focused: panes[1].clone(),
-                    panes: panes[1..].to_vec(),
+                    resource_revision: 2,
+                    focused: panes[0].clone(),
+                    panes: panes[..2].to_vec(),
                 })
                 .unwrap()
         );
@@ -945,18 +944,28 @@ mod tests {
             panes: panes.clone(),
         })
         .unwrap();
-        let area = Rect::new(0, 0, 27, 4);
+        let area = Rect::new(0, 0, 38, 4);
         assert_eq!(
             state.resize_requests(area),
             [(
                 first,
                 TerminalSize {
-                    columns: 13,
+                    columns: 24,
                     rows: 4
                 }
             )]
         );
         assert!(state.resize_requests(area).is_empty());
+        assert_eq!(
+            state.resize_requests(Rect::new(0, 0, 37, 4)),
+            [(
+                first,
+                TerminalSize {
+                    columns: 37,
+                    rows: 4
+                }
+            )]
+        );
 
         state
             .replace(SelectedView {
@@ -970,7 +979,7 @@ mod tests {
             [(
                 second,
                 TerminalSize {
-                    columns: 12,
+                    columns: 24,
                     rows: 4
                 }
             )]
@@ -1010,7 +1019,7 @@ mod tests {
         assert!(state.accept(first, snapshot("A", 13)));
         assert!(state.accept(second, snapshot("B", 12)));
 
-        let area = Rect::new(0, 0, 27, 2);
+        let area = Rect::new(0, 0, 38, 2);
         let mut buffer = Buffer::empty(area);
         assert_eq!(render_view(&state, area, &mut buffer), Some((1, 0)));
         assert_eq!(buffer[(0, 0)].symbol(), "┃");
@@ -1018,9 +1027,9 @@ mod tests {
         assert_eq!(buffer[(0, 0)].fg, Color::Reset);
         assert_eq!(buffer[(0, 0)].bg, Color::Reset);
         assert_eq!(buffer[(1, 0)].symbol(), "A");
-        assert_eq!(buffer[(14, 0)].symbol(), "│");
-        assert!(buffer[(14, 0)].modifier.contains(Modifier::DIM));
-        assert_eq!(buffer[(15, 0)].symbol(), "B");
+        assert_eq!(buffer[(25, 0)].symbol(), "│");
+        assert!(buffer[(25, 0)].modifier.contains(Modifier::DIM));
+        assert_eq!(buffer[(26, 0)].symbol(), "B");
 
         state
             .replace(SelectedView {
@@ -1030,9 +1039,9 @@ mod tests {
             })
             .unwrap();
         let mut moved = Buffer::empty(area);
-        assert_eq!(render_view(&state, area, &mut moved), Some((15, 0)));
+        assert_eq!(render_view(&state, area, &mut moved), Some((14, 0)));
         assert!(moved[(0, 0)].modifier.contains(Modifier::DIM));
-        assert!(moved[(14, 0)].modifier.contains(Modifier::BOLD));
+        assert!(moved[(13, 0)].modifier.contains(Modifier::BOLD));
 
         let tiny = Rect::new(0, 0, 20, 2);
         let mut tiny_buffer = Buffer::empty(tiny);

@@ -3455,6 +3455,74 @@ async fn public_client_renders_simultaneous_panes_and_cycles_focus() {
 }
 
 #[tokio::test]
+async fn public_client_accordion_resizes_focus_and_falls_back_narrowly() {
+    let harness = Harness::start(
+        "printf 'AAAAAAAA\\r\\n'; while IFS= read -r line; do if [ \"$line\" = size-a ]; then set -- $(stty size); printf 'A_SIZE_%s_%s\\r\\n' \"$1\" \"$2\"; fi; done",
+    )
+    .await;
+    let resources = harness.resources().await;
+    let tab_id = resources.sessions[0].workspaces[0].tabs[0].id;
+    let pane_a = resources.sessions[0].workspaces[0].tabs[0].panes[0].id;
+    let ServerMessage::PaneCreated { selected: pane_b } = harness
+        .control_command(ClientMessage::CreatePane {
+            tab_id,
+            cwd: None,
+            program: Some("/bin/sh".into()),
+            argv: vec![
+                "-c".into(),
+                "printf 'BBBBBBBB\\r\\n'; while IFS= read -r line; do if [ \"$line\" = size-b ]; then set -- $(stty size); printf 'B_SIZE_%s_%s\\r\\n' \"$1\" \"$2\"; fi; done".into(),
+            ],
+        })
+        .await
+    else {
+        panic!("failed to create accordion sibling")
+    };
+
+    let spawn_client = |columns: u16| {
+        let mut command = Command::new("/usr/bin/script");
+        command
+            .env_clear()
+            .env("HOME", harness.root.path().join("home"))
+            .env("PATH", "/usr/bin:/bin")
+            .env("TMPDIR", harness.root.path().join("runtime"))
+            .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+            .env("TERM", "xterm-256color")
+            .args(["-q", "/dev/null", "/bin/sh", "-c"])
+            .arg(format!(
+                "stty rows 24 cols {columns}; exec '{}' --socket '{}' pane attach {}",
+                env!("CARGO_BIN_EXE_fut"),
+                harness.socket.display(),
+                pane_a
+            ));
+        PtyChild::spawn(command)
+    };
+
+    let mut narrow = spawn_client(37);
+    narrow.wait_for("AAAAAAAA").await;
+    narrow.send(b"size-a\n");
+    narrow.wait_for("A_SIZE_24_37").await;
+    narrow.send(b"\x02l");
+    narrow.send(b"size-b\n");
+    narrow.wait_for("B_SIZE_24_37").await;
+    narrow.send(b"\x02d");
+    narrow.wait_success().await;
+
+    let mut accordion = spawn_client(38);
+    accordion.wait_for("AAAAAAAA").await;
+    accordion.wait_for("BBBBBBBB").await;
+    accordion.send(b"size-a\n");
+    accordion.wait_for("A_SIZE_24_24").await;
+    accordion.send(b"\x02l");
+    accordion.send(b"size-b\n");
+    accordion.wait_for("B_SIZE_24_24").await;
+    accordion.send(b"\x02d");
+    accordion.wait_success().await;
+
+    assert!(process_alive(pane_b.child_pid));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn public_client_transfers_focus_when_the_focused_pane_exits() {
     let harness = Harness::start(
         "printf 'EXIT_A_READY\r\n'; while IFS= read -r line; do [ \"$line\" = exit ] && exit 23; done",
