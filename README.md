@@ -55,7 +55,7 @@ Mutation commands accept raw IDs only. Attach commands also use raw IDs, except 
 
 ## Automation and interaction
 
-The client/daemon protocol is version 9. Global `--json` is available only for noninteractive control commands. Successful output has a versioned envelope and dotted command name:
+The client/daemon protocol is version 9. If a rebuilt client finds a running daemon with a different protocol, it reports the mismatch instead of starting a competing daemon; run `fut daemon shutdown` to negotiate with and stop that daemon, then retry. Global `--json` is available only for noninteractive control commands. Successful output has a versioned envelope and dotted command name:
 
 ```json
 {"version":1,"command":"workspace.rename","result":{"workspace_id":"…","name":"api"}}

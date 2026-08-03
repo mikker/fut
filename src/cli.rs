@@ -521,7 +521,7 @@ async fn execute(cli: Cli) -> Result<()> {
             command: DaemonCommand::Shutdown,
         }) => {
             response_ok(
-                control(&socket, ClientMessage::Shutdown).await?,
+                shutdown_control(&socket).await?,
                 AcknowledgedCommand::Shutdown,
             )?;
             output(
@@ -778,6 +778,41 @@ async fn wait_until_protocol_stops(socket: &std::path::Path) -> bool {
 }
 
 async fn control(socket: &std::path::Path, command: ClientMessage) -> Result<ServerMessage> {
+    match control_attempt(socket, command, PROTOCOL_VERSION).await? {
+        ControlAttempt::Response(response) => Ok(response),
+        ControlAttempt::Incompatible { server } => bail!(
+            "daemon at {} uses protocol {server}, but this Fut client requires protocol \
+             {PROTOCOL_VERSION}",
+            socket.display()
+        ),
+    }
+}
+
+async fn shutdown_control(socket: &std::path::Path) -> Result<ServerMessage> {
+    match control_attempt(socket, ClientMessage::Shutdown, PROTOCOL_VERSION).await? {
+        ControlAttempt::Response(response) => Ok(response),
+        ControlAttempt::Incompatible { server } => {
+            match control_attempt(socket, ClientMessage::Shutdown, server).await? {
+                ControlAttempt::Response(response) => Ok(response),
+                ControlAttempt::Incompatible { server: changed } => bail!(
+                    "daemon at {} changed protocol from {server} to {changed} during shutdown",
+                    socket.display()
+                ),
+            }
+        }
+    }
+}
+
+enum ControlAttempt {
+    Response(ServerMessage),
+    Incompatible { server: u16 },
+}
+
+async fn control_attempt(
+    socket: &std::path::Path,
+    command: ClientMessage,
+    version: u16,
+) -> Result<ControlAttempt> {
     let stream = UnixStream::connect(socket)
         .await
         .with_context(|| format!("connect to {}", socket.display()))?;
@@ -785,7 +820,7 @@ async fn control(socket: &std::path::Path, command: ClientMessage) -> Result<Ser
     send(
         &mut framed,
         ClientMessage::Hello {
-            version: PROTOCOL_VERSION,
+            version,
             client_version: env!("CARGO_PKG_VERSION").into(),
             mode: ClientMode::Control,
         },
@@ -798,16 +833,23 @@ async fn control(socket: &std::path::Path, command: ClientMessage) -> Result<Ser
     )
     .await?
     {
-        ServerMessage::Welcome { .. } => {}
+        ServerMessage::Welcome {
+            version: server, ..
+        } if server == version => {}
+        ServerMessage::IncompatibleProtocol { server, .. } => {
+            return Ok(ControlAttempt::Incompatible { server });
+        }
         other => return unexpected(other),
     }
     send(&mut framed, command).await?;
-    receive(
-        &mut framed,
-        Duration::from_secs(15),
-        "daemon response timed out",
-    )
-    .await
+    Ok(ControlAttempt::Response(
+        receive(
+            &mut framed,
+            Duration::from_secs(15),
+            "daemon response timed out",
+        )
+        .await?,
+    ))
 }
 
 fn session_selector(value: &str) -> SessionSelector {
@@ -927,6 +969,86 @@ mod tests {
         let cli_error = error.downcast_ref::<CliError>().unwrap();
         assert_eq!(cli_error.code, "not_found");
         assert_eq!(cli_error.to_string(), "daemon error: missing session");
+    }
+
+    #[tokio::test]
+    async fn shutdown_reconnects_with_the_running_daemon_protocol() {
+        let temporary = tempfile::tempdir().unwrap();
+        let socket = temporary.path().join("fut.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut framed = Framed::new(stream, codec());
+            let first = framed.next().await.unwrap().unwrap();
+            let first: Envelope<ClientMessage> = decode_payload(&first).unwrap();
+            assert!(matches!(
+                first.message,
+                ClientMessage::Hello {
+                    version: PROTOCOL_VERSION,
+                    ..
+                }
+            ));
+            framed
+                .send(Bytes::from(
+                    encode_payload(&Envelope {
+                        request_id: first.request_id,
+                        message: ServerMessage::IncompatibleProtocol {
+                            client: PROTOCOL_VERSION,
+                            server: 4,
+                        },
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            drop(framed);
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut framed = Framed::new(stream, codec());
+            let second = framed.next().await.unwrap().unwrap();
+            let second: Envelope<ClientMessage> = decode_payload(&second).unwrap();
+            assert!(matches!(
+                second.message,
+                ClientMessage::Hello { version: 4, .. }
+            ));
+            framed
+                .send(Bytes::from(
+                    encode_payload(&Envelope {
+                        request_id: second.request_id,
+                        message: ServerMessage::Welcome {
+                            version: 4,
+                            server_version: "old".into(),
+                            selected: None,
+                        },
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            let shutdown = framed.next().await.unwrap().unwrap();
+            let shutdown: Envelope<ClientMessage> = decode_payload(&shutdown).unwrap();
+            assert_eq!(shutdown.message, ClientMessage::Shutdown);
+            framed
+                .send(Bytes::from(
+                    encode_payload(&Envelope {
+                        request_id: shutdown.request_id,
+                        message: ServerMessage::CommandCompleted {
+                            command: AcknowledgedCommand::Shutdown,
+                        },
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        assert_eq!(
+            shutdown_control(&socket).await.unwrap(),
+            ServerMessage::CommandCompleted {
+                command: AcknowledgedCommand::Shutdown,
+            }
+        );
+        server.await.unwrap();
     }
 
     #[test]
