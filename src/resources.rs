@@ -128,6 +128,7 @@ pub struct WorkspaceSnapshot {
 pub struct TabSnapshot {
     pub id: TabId,
     pub name: String,
+    pub closing: bool,
     pub panes: Vec<PaneSnapshot>,
 }
 
@@ -282,6 +283,7 @@ struct Workspace {
 struct Tab {
     workspace_id: WorkspaceId,
     name: String,
+    closing: bool,
     panes: Vec<PaneId>,
 }
 #[derive(Clone, Copy, Debug)]
@@ -435,6 +437,24 @@ impl ResourceTree {
             .ok_or(ResourceError::NotFound("workspace"))
     }
 
+    pub fn workspace_id_for_tab(&self, tab_id: TabId) -> Result<WorkspaceId, ResourceError> {
+        let tab = self
+            .tabs
+            .get(&tab_id)
+            .ok_or(ResourceError::NotFound("tab"))?;
+        let workspace = &self.workspaces[&tab.workspace_id];
+        if self.sessions[&workspace.session_id].closing {
+            return Err(ResourceError::Closing("session"));
+        }
+        if workspace.closing {
+            return Err(ResourceError::Closing("workspace"));
+        }
+        if tab.closing {
+            return Err(ResourceError::Closing("tab"));
+        }
+        Ok(tab.workspace_id)
+    }
+
     pub fn available_tab_name(
         &self,
         workspace_id: WorkspaceId,
@@ -514,6 +534,7 @@ impl ResourceTree {
             Tab {
                 workspace_id: path.workspace_id,
                 name: path.tab_name,
+                closing: false,
                 panes: vec![path.pane_id],
             },
         );
@@ -645,6 +666,9 @@ impl ResourceTree {
         if tab.name == new_name {
             return Ok(self.unchanged());
         }
+        if tab.closing {
+            return Err(ResourceError::Closing("tab"));
+        }
         if workspace
             .tabs
             .iter()
@@ -717,6 +741,7 @@ impl ResourceTree {
             Tab {
                 workspace_id: path.workspace_id,
                 name: path.tab_name,
+                closing: false,
                 panes: vec![path.pane_id],
             },
         );
@@ -782,6 +807,7 @@ impl ResourceTree {
             Tab {
                 workspace_id,
                 name: path.tab_name,
+                closing: false,
                 panes: vec![path.pane_id],
             },
         );
@@ -820,6 +846,9 @@ impl ResourceTree {
         if self.workspaces[&tab.workspace_id].closing {
             return Err(ResourceError::Closing("workspace"));
         }
+        if tab.closing {
+            return Err(ResourceError::Closing("tab"));
+        }
         self.check_pane_ids(pane_id, terminal_id)?;
         self.tabs.get_mut(&tab_id).unwrap().panes.push(pane_id);
         self.insert_pane(tab_id, pane_id, terminal_id);
@@ -843,17 +872,21 @@ impl ResourceTree {
             .panes
             .get(&pane_id)
             .ok_or(ResourceError::NotFound("pane"))?;
+        let source_tab = &self.tabs[&pane.tab_id];
         let destination_tab = self
             .tabs
             .get(&destination)
             .ok_or(ResourceError::NotFound("tab"))?;
+        if source_tab.closing || destination_tab.closing {
+            return Err(ResourceError::Closing("tab"));
+        }
         if pane.closing {
             return Err(ResourceError::Closing("pane"));
         }
         if pane.tab_id == destination {
             return Err(ResourceError::SameTab);
         }
-        let source_workspace = self.tabs[&pane.tab_id].workspace_id;
+        let source_workspace = source_tab.workspace_id;
         if source_workspace != destination_tab.workspace_id {
             return Err(ResourceError::DifferentWorkspace);
         }
@@ -881,14 +914,25 @@ impl ResourceTree {
     }
 
     pub fn close_pane(&mut self, pane_id: PaneId) -> Result<Mutation, ResourceError> {
-        let pane = self
+        let pane = *self
             .panes
-            .get_mut(&pane_id)
+            .get(&pane_id)
             .ok_or(ResourceError::NotFound("pane"))?;
+        let tab = &self.tabs[&pane.tab_id];
+        let workspace = &self.workspaces[&tab.workspace_id];
+        if self.sessions[&workspace.session_id].closing {
+            return Err(ResourceError::Closing("session"));
+        }
+        if workspace.closing {
+            return Err(ResourceError::Closing("workspace"));
+        }
+        if tab.closing {
+            return Err(ResourceError::Closing("tab"));
+        }
         if pane.closing {
             return Err(ResourceError::Closing("pane"));
         }
-        pane.closing = true;
+        self.panes.get_mut(&pane_id).unwrap().closing = true;
         let terminal_id = pane.terminal_id;
         Ok(self.finish(
             vec![ResourceEvent::PaneCloseRequested {
@@ -911,6 +955,9 @@ impl ResourceTree {
         let workspace_id = self.tabs[&pane.tab_id].workspace_id;
         if self.workspaces[&workspace_id].closing {
             return Err(ResourceError::Closing("workspace"));
+        }
+        if self.tabs[&pane.tab_id].closing {
+            return Err(ResourceError::Closing("tab"));
         }
         if !pane.closing {
             return Err(ResourceError::NotFound("pending pane close"));
@@ -937,11 +984,15 @@ impl ResourceTree {
         if workspace.closing {
             return Err(ResourceError::Closing("workspace"));
         }
+        if tab.closing {
+            return Err(ResourceError::Closing("tab"));
+        }
         if tab.panes.iter().any(|id| self.panes[id].closing) {
             return Err(ResourceError::Closing("pane"));
         }
         let panes = tab.panes.clone();
         let terminals = panes.iter().map(|id| self.panes[id].terminal_id).collect();
+        self.tabs.get_mut(&tab_id).unwrap().closing = true;
         for pane_id in panes {
             self.panes.get_mut(&pane_id).unwrap().closing = true;
         }
@@ -960,10 +1011,11 @@ impl ResourceTree {
         if workspace.closing {
             return Err(ResourceError::Closing("workspace"));
         }
-        if !tab.panes.iter().all(|id| self.panes[id].closing) {
+        if !tab.closing {
             return Err(ResourceError::NotFound("pending tab close"));
         }
         let panes = tab.panes.clone();
+        self.tabs.get_mut(&tab_id).unwrap().closing = false;
         for pane_id in panes {
             self.panes.get_mut(&pane_id).unwrap().closing = false;
         }
@@ -1168,6 +1220,7 @@ impl ResourceTree {
                             || self.terminals.get(&pane.terminal_id) != Some(pid)
                             || (session.closing && !pane.closing)
                             || (workspace.closing && !pane.closing)
+                            || (tab.closing && !pane.closing)
                         {
                             return self.invalid("pane fields, parent, or closing state");
                         }
@@ -1296,6 +1349,7 @@ impl ResourceTree {
         TabSnapshot {
             id,
             name: t.name.clone(),
+            closing: t.closing,
             panes: t.panes.iter().map(|id| self.pane_snapshot(*id)).collect(),
         }
     }
@@ -1384,7 +1438,11 @@ impl ResourceTree {
         }
         let mut paths = Vec::new();
         for tab in &workspace.tabs {
-            paths.extend(self.paths_for_tab(*tab)?);
+            match self.paths_for_tab(*tab) {
+                Ok(found) => paths.extend(found),
+                Err(ResourceError::Closing("tab")) => {}
+                Err(error) => return Err(error),
+            }
         }
         Ok(paths)
     }
@@ -1399,6 +1457,9 @@ impl ResourceTree {
         }
         if workspace.closing {
             return Err(ResourceError::Closing("workspace"));
+        }
+        if tab.closing {
+            return Err(ResourceError::Closing("tab"));
         }
         if tab.panes.is_empty() {
             return self.invalid("tab has no pane");
@@ -1420,6 +1481,9 @@ impl ResourceTree {
         }
         if workspace.closing {
             return Err(ResourceError::Closing("workspace"));
+        }
+        if tab.closing {
+            return Err(ResourceError::Closing("tab"));
         }
         Ok(ResolvedTerminalPath {
             session_id: workspace.session_id,
@@ -2454,7 +2518,7 @@ mod tests {
                 .all(|pane| pane.closing)
         );
         let before = tree.snapshot();
-        assert_eq!(tree.close_tab(tab_id), Err(ResourceError::Closing("pane")));
+        assert_eq!(tree.close_tab(tab_id), Err(ResourceError::Closing("tab")));
         assert_eq!(tree.snapshot(), before);
 
         let first_exit = tree.terminal_exited(first_terminal).unwrap();
@@ -2506,7 +2570,9 @@ mod tests {
             cancel.events,
             vec![ResourceEvent::TabCloseCancelled { tab_id }]
         );
-        assert!(!tree.snapshot().sessions[0].workspaces[0].tabs[0].panes[0].closing);
+        let tab = &tree.snapshot().sessions[0].workspaces[0].tabs[0];
+        assert!(!tab.closing);
+        assert!(!tab.panes[0].closing);
 
         tree.close_workspace(workspace_id).unwrap();
         assert_eq!(
@@ -2520,5 +2586,94 @@ mod tests {
             Err(ResourceError::Closing("session"))
         );
         tree.validate().unwrap();
+    }
+
+    #[test]
+    fn explicit_tab_closing_controls_tab_operations_and_rolls_back_atomically() {
+        let mut tree = ResourceTree::default();
+        let path = initial("session", "/project");
+        let (workspace_id, source, first_pane) = (path.workspace_id, path.tab_id, path.pane_id);
+        tree.create_session(path).unwrap();
+        let second_pane = PaneId::new();
+        tree.add_pane(source, second_pane, TerminalId::new())
+            .unwrap();
+        let destination = TabId::new();
+        tree.add_tab(
+            workspace_id,
+            TabPath {
+                tab_id: destination,
+                tab_name: "destination".into(),
+                pane_id: PaneId::new(),
+                terminal_id: TerminalId::new(),
+            },
+        )
+        .unwrap();
+
+        tree.close_tab(source).unwrap();
+        let closed = tree.snapshot();
+        assert!(closed.sessions[0].workspaces[0].tabs[0].closing);
+        assert_eq!(
+            tree.workspace_id_for_tab(source),
+            Err(ResourceError::Closing("tab"))
+        );
+        assert_eq!(
+            tree.add_pane(source, PaneId::new(), TerminalId::new()),
+            Err(ResourceError::Closing("tab"))
+        );
+        assert_eq!(
+            tree.close_pane(first_pane),
+            Err(ResourceError::Closing("tab"))
+        );
+        assert_eq!(
+            tree.cancel_close_pane(first_pane),
+            Err(ResourceError::Closing("tab"))
+        );
+        assert_eq!(
+            tree.move_pane(first_pane, destination),
+            Err(ResourceError::Closing("tab"))
+        );
+        assert_eq!(
+            tree.rename_tab(source, "changed".into()),
+            Err(ResourceError::Closing("tab"))
+        );
+        let revision = tree.revision();
+        assert_eq!(
+            tree.rename_tab(source, "shell".into()).unwrap().revision,
+            revision
+        );
+        assert_eq!(tree.snapshot(), closed);
+
+        tree.cancel_close_tab(source).unwrap();
+        let tab = &tree.snapshot().sessions[0].workspaces[0].tabs[0];
+        assert!(!tab.closing && tab.panes.iter().all(|pane| !pane.closing));
+        tree.close_pane(first_pane).unwrap();
+        assert!(!tree.snapshot().sessions[0].workspaces[0].tabs[0].closing);
+        assert_eq!(
+            tree.cancel_close_tab(source),
+            Err(ResourceError::NotFound("pending tab close"))
+        );
+        tree.cancel_close_pane(first_pane).unwrap();
+
+        tree.close_tab(destination).unwrap();
+        assert_eq!(
+            tree.move_pane(first_pane, destination),
+            Err(ResourceError::Closing("tab"))
+        );
+        tree.cancel_close_tab(destination).unwrap();
+        tree.validate().unwrap();
+    }
+
+    #[test]
+    fn ancestor_close_does_not_mark_tabs_closing_and_validation_checks_one_way_invariant() {
+        let mut tree = ResourceTree::default();
+        let path = initial("session", "/project");
+        let (workspace_id, tab_id) = (path.workspace_id, path.tab_id);
+        tree.create_session(path).unwrap();
+        tree.close_workspace(workspace_id).unwrap();
+        assert!(!tree.snapshot().sessions[0].workspaces[0].tabs[0].closing);
+        tree.cancel_close_workspace(workspace_id).unwrap();
+
+        tree.tabs.get_mut(&tab_id).unwrap().closing = true;
+        assert!(matches!(tree.validate(), Err(ResourceError::Invariant(_))));
     }
 }

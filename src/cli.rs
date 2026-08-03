@@ -81,7 +81,7 @@ enum Command {
         #[command(subcommand)]
         command: TabCommand,
     },
-    /// Attach or close a pane.
+    /// Create, attach, or close a pane.
     Pane {
         /// Pane operation to perform.
         #[command(subcommand)]
@@ -192,6 +192,18 @@ enum TabCommand {
 
 #[derive(Subcommand)]
 enum PaneCommand {
+    /// Create a pane through an existing daemon without attaching.
+    New {
+        /// Raw UUID of the tab that will own the pane.
+        #[arg(add = ArgValueCompleter::new(completion::pane_new))]
+        tab_id: TabId,
+        /// Working directory for the child; defaults to the workspace root.
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        cwd: Option<PathBuf>,
+        /// Child program and its direct argv, following `--`; defaults to the shell.
+        #[arg(last = true, value_hint = ValueHint::CommandWithArguments)]
+        command: Vec<String>,
+    },
     /// Attach to a pane on the existing daemon.
     Attach {
         /// Raw pane UUID identifying one terminal placement.
@@ -337,6 +349,43 @@ async fn execute(cli: Cli) -> Result<()> {
         Some(Command::Pane {
             command: PaneCommand::Attach { pane_id },
         }) => client::attach(&socket, Some(TargetSelector::Pane(pane_id))).await,
+        Some(Command::Pane {
+            command:
+                PaneCommand::New {
+                    tab_id,
+                    cwd,
+                    command,
+                },
+        }) => {
+            let (program, argv) = child_command(command);
+            match control(
+                &socket,
+                ClientMessage::CreatePane {
+                    tab_id,
+                    cwd,
+                    program,
+                    argv,
+                },
+            )
+            .await?
+            {
+                ServerMessage::PaneCreated { selected } => output(
+                    cli.json,
+                    "pane.new",
+                    json!({ "selected": selected }),
+                    format!(
+                        "session={} workspace={} tab={} pane={} terminal={} pid={}",
+                        selected.session_id,
+                        selected.workspace_id,
+                        selected.tab_id,
+                        selected.pane_id,
+                        selected.terminal_id,
+                        selected.child_pid
+                    ),
+                ),
+                other => unexpected(other),
+            }
+        }
         Some(Command::Terminal {
             command: TerminalCommand::Attach { terminal_id },
         }) => client::attach(&socket, Some(TargetSelector::Terminal(terminal_id))).await,
@@ -735,7 +784,12 @@ fn print_resources(snapshot: &ResourceSnapshot) {
                 workspace.root.display()
             );
             for tab in &workspace.tabs {
-                println!("    tab {} {:?}", tab.id, tab.name);
+                println!(
+                    "    tab {} {:?}{}",
+                    tab.id,
+                    tab.name,
+                    if tab.closing { " closing" } else { "" }
+                );
                 for pane in &tab.panes {
                     println!(
                         "      pane {} terminal={}{}",
@@ -857,6 +911,7 @@ mod tests {
             vec!["fut", "tab", "attach", &tab],
             vec!["fut", "tab", "rename", &tab, "new"],
             vec!["fut", "tab", "close", &tab],
+            vec!["fut", "pane", "new", &tab],
             vec!["fut", "pane", "attach", &pane],
             vec!["fut", "pane", "close", &pane],
             vec!["fut", "terminal", "attach", &terminal],
@@ -891,6 +946,13 @@ mod tests {
         );
         let workspace = WorkspaceId::new().to_string();
         assert!(Cli::try_parse_from(["fut", "tab", "new", &workspace, "echo"]).is_err());
+        let tab = TabId::new().to_string();
+        assert!(Cli::try_parse_from(["fut", "pane", "new", &tab, "echo"]).is_err());
+        let cli =
+            Cli::try_parse_from(["fut", "pane", "new", &tab, "--", "echo", "--flag"]).unwrap();
+        assert!(
+            matches!(cli.command, Some(Command::Pane { command: PaneCommand::New { command, .. } }) if command == ["echo", "--flag"])
+        );
         assert!(Cli::try_parse_from(["fut", "daemon", "run", "echo"]).is_err());
     }
 
@@ -926,6 +988,9 @@ mod tests {
         }
         let cli = Cli::try_parse_from(["fut", "--json", "list"]).unwrap();
         assert!(reject_interactive_json(&cli).is_ok());
+        let tab = TabId::new().to_string();
+        let cli = Cli::try_parse_from(["fut", "--json", "pane", "new", &tab]).unwrap();
+        assert!(reject_interactive_json(&cli).is_ok());
     }
 
     #[test]
@@ -933,6 +998,8 @@ mod tests {
         let workspace = WorkspaceId::new().to_string();
         assert!(Cli::try_parse_from(["fut", "open", "--attach"]).is_err());
         assert!(Cli::try_parse_from(["fut", "tab", "new", &workspace, "--attach"]).is_err());
+        let tab = TabId::new().to_string();
+        assert!(Cli::try_parse_from(["fut", "pane", "new", &tab, "--attach"]).is_err());
     }
 
     #[test]

@@ -191,6 +191,24 @@ impl SharedState {
         Ok(())
     }
 
+    fn register_pane(
+        &mut self,
+        tab_id: TabId,
+        pane_id: PaneId,
+        terminal: Arc<TerminalHandle>,
+    ) -> Result<(), DaemonError> {
+        self.resources.add_pane(tab_id, pane_id, terminal.id())?;
+        self.expected_finalizations.remove(&terminal.id());
+        self.runtimes.insert(
+            terminal.id(),
+            RuntimeEntry {
+                handle: terminal,
+                lease: AttachmentLease::default(),
+            },
+        );
+        Ok(())
+    }
+
     fn finalize_terminal(&mut self, terminal_id: TerminalId) -> Result<bool, DaemonError> {
         if self.expected_finalizations.remove(&terminal_id) {
             return Ok(false);
@@ -760,8 +778,8 @@ async fn handle_connection(
                             argv,
                             size,
                         };
-                        match create_tab(&shared, &exited, request, CreateTabMode::Attached(client)).await {
-                            Ok(CreatedTab::Attached(target)) => {
+                        match create_tab(&shared, &exited, request, CreationMode::Attached(client)).await {
+                            Ok(CreatedTerminal::Attached(target)) => {
                                 let mut candidate = Attachment::new(target);
                                 if let Some(exit_code) = candidate.exit_code() {
                                     send_error(
@@ -779,7 +797,32 @@ async fn handle_connection(
                                     send(&mut framed, None, ServerMessage::Snapshot { terminal_id, screen }).await?;
                                 }
                             }
-                            Ok(CreatedTab::Detached(_)) => unreachable!("attached creation returns a lease"),
+                            Ok(CreatedTerminal::Detached(_)) => unreachable!("attached creation returns a lease"),
+                            Err(error) => send_error(&mut framed, envelope.request_id, error.code, &error.message).await?,
+                        }
+                    }
+                    ClientMessage::CreatePane { tab_id, cwd, program, argv } => {
+                        let request = CreatePaneRequest { tab_id, cwd, program, argv, size };
+                        match create_pane(&shared, &exited, request, CreationMode::Attached(client)).await {
+                            Ok(CreatedTerminal::Attached(target)) => {
+                                let mut candidate = Attachment::new(target);
+                                if let Some(exit_code) = candidate.exit_code() {
+                                    send_error(
+                                        &mut framed,
+                                        envelope.request_id,
+                                        "terminal_exited",
+                                        &format!("terminal already exited with status {exit_code:?}"),
+                                    ).await?;
+                                } else {
+                                    let screen = candidate.snapshots.borrow_and_update().clone();
+                                    let terminal_id = candidate.target.selected.terminal_id;
+                                    let selected = candidate.target.selected.clone();
+                                    attachment = candidate;
+                                    send(&mut framed, envelope.request_id, ServerMessage::PaneCreated { selected }).await?;
+                                    send(&mut framed, None, ServerMessage::Snapshot { terminal_id, screen }).await?;
+                                }
+                            }
+                            Ok(CreatedTerminal::Detached(_)) => unreachable!("attached creation returns a lease"),
                             Err(error) => send_error(&mut framed, envelope.request_id, error.code, &error.message).await?,
                         }
                     }
@@ -881,11 +924,11 @@ async fn control_loop(
                         rows: 24,
                     },
                 },
-                CreateTabMode::Detached,
+                CreationMode::Detached,
             )
             .await
             {
-                Ok(CreatedTab::Detached(selected)) => {
+                Ok(CreatedTerminal::Detached(selected)) => {
                     send(
                         framed,
                         envelope.request_id,
@@ -893,7 +936,44 @@ async fn control_loop(
                     )
                     .await?
                 }
-                Ok(CreatedTab::Attached(_)) => {
+                Ok(CreatedTerminal::Attached(_)) => {
+                    unreachable!("detached creation does not acquire a lease")
+                }
+                Err(error) => {
+                    send_error(framed, envelope.request_id, error.code, &error.message).await?
+                }
+            },
+            ClientMessage::CreatePane {
+                tab_id,
+                cwd,
+                program,
+                argv,
+            } => match create_pane(
+                &shared,
+                &exited,
+                CreatePaneRequest {
+                    tab_id,
+                    cwd,
+                    program,
+                    argv,
+                    size: TerminalSize {
+                        columns: 80,
+                        rows: 24,
+                    },
+                },
+                CreationMode::Detached,
+            )
+            .await
+            {
+                Ok(CreatedTerminal::Detached(selected)) => {
+                    send(
+                        framed,
+                        envelope.request_id,
+                        ServerMessage::PaneCreated { selected },
+                    )
+                    .await?
+                }
+                Ok(CreatedTerminal::Attached(_)) => {
                     unreachable!("detached creation does not acquire a lease")
                 }
                 Err(error) => {
@@ -1242,12 +1322,12 @@ struct CreateTabRequest {
     size: TerminalSize,
 }
 
-enum CreateTabMode {
+enum CreationMode {
     Detached,
     Attached(ClientId),
 }
 
-enum CreatedTab {
+enum CreatedTerminal {
     Detached(SelectedTarget),
     Attached(LeasedTarget),
 }
@@ -1256,8 +1336,8 @@ async fn create_tab(
     shared: &Shared,
     exited: &mpsc::UnboundedSender<TerminalId>,
     request: CreateTabRequest,
-    mode: CreateTabMode,
-) -> Result<CreatedTab, DaemonError> {
+    mode: CreationMode,
+) -> Result<CreatedTerminal, DaemonError> {
     let CreateTabRequest {
         workspace_id,
         name,
@@ -1273,35 +1353,7 @@ async fn create_tab(
         }
         state.resources.workspace_root(workspace_id)?.to_path_buf()
     };
-    let cwd = match cwd {
-        None => root,
-        Some(cwd) => {
-            let candidate = if cwd.is_absolute() {
-                cwd
-            } else {
-                root.join(cwd)
-            };
-            let canonical = tokio::fs::canonicalize(&candidate).await.map_err(|error| {
-                DaemonError::new(
-                    "invalid_cwd",
-                    format!("could not resolve {}: {error}", candidate.display()),
-                )
-            })?;
-            let metadata = tokio::fs::metadata(&canonical).await.map_err(|error| {
-                DaemonError::new(
-                    "invalid_cwd",
-                    format!("could not inspect {}: {error}", canonical.display()),
-                )
-            })?;
-            if !metadata.is_dir() {
-                return Err(DaemonError::new(
-                    "invalid_cwd",
-                    format!("not a directory: {}", canonical.display()),
-                ));
-            }
-            canonical
-        }
-    };
+    let cwd = resolve_spawn_cwd(&root, cwd).await?;
     let program = program.unwrap_or_else(|| {
         std::env::var_os("SHELL")
             .map(PathBuf::from)
@@ -1350,8 +1402,8 @@ async fn create_tab(
         let insertion = state.register_tab(workspace_id, path, Arc::clone(&terminal));
         let creation = match insertion {
             Ok(()) => Ok(match mode {
-                CreateTabMode::Detached => CreatedTab::Detached(selected.clone()),
-                CreateTabMode::Attached(client) => {
+                CreationMode::Detached => CreatedTerminal::Detached(selected),
+                CreationMode::Attached(client) => {
                     let runtime = state
                         .runtimes
                         .get(&terminal.id())
@@ -1361,11 +1413,11 @@ async fn create_tab(
                         .acquire(client)
                         .expect("new terminal has an independent lease");
                     let target = LeasedTarget {
-                        selected: selected.clone(),
+                        selected,
                         terminal: Arc::clone(&terminal),
                         _lease: guard,
                     };
-                    CreatedTab::Attached(target)
+                    CreatedTerminal::Attached(target)
                 }
             }),
             Err(error) => Err(error),
@@ -1381,6 +1433,136 @@ async fn create_tab(
     };
     watch_terminal(terminal, exited.clone());
     Ok(created)
+}
+
+struct CreatePaneRequest {
+    tab_id: TabId,
+    cwd: Option<PathBuf>,
+    program: Option<PathBuf>,
+    argv: Vec<String>,
+    size: TerminalSize,
+}
+
+async fn create_pane(
+    shared: &Shared,
+    exited: &mpsc::UnboundedSender<TerminalId>,
+    request: CreatePaneRequest,
+    mode: CreationMode,
+) -> Result<CreatedTerminal, DaemonError> {
+    let CreatePaneRequest {
+        tab_id,
+        cwd,
+        program,
+        argv,
+        size,
+    } = request;
+    let (workspace_id, session_id, root) = {
+        let state = shared.lock().await;
+        if !state.accepting {
+            return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
+        }
+        let workspace_id = state.resources.workspace_id_for_tab(tab_id)?;
+        let session_id = state.resources.session_id_for_workspace(workspace_id)?;
+        let root = state.resources.workspace_root(workspace_id)?.to_path_buf();
+        (workspace_id, session_id, root)
+    };
+    let cwd = resolve_spawn_cwd(&root, cwd).await?;
+    let program = program.unwrap_or_else(|| {
+        std::env::var_os("SHELL")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| "/bin/sh".into())
+    });
+
+    let (terminal, creation) = {
+        let mut state = shared.lock().await;
+        if !state.accepting {
+            return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
+        }
+        // Re-resolve the parent and validate a clone after the filesystem await,
+        // so a close or shutdown cannot race creation into a stale tab.
+        state.resources.workspace_id_for_tab(tab_id)?;
+        let pane_id = PaneId::new();
+        let mut validated = state.resources.clone();
+        validated.add_pane(tab_id, pane_id, TerminalId::new())?;
+
+        let terminal = Arc::new(
+            spawn_terminal(SpawnSpec {
+                program,
+                argv,
+                cwd,
+                env: std::env::vars().collect(),
+                size,
+            })
+            .map_err(|error| DaemonError::new("spawn_failed", error.to_string()))?,
+        );
+        let resolved = crate::resources::ResolvedTerminalPath {
+            session_id,
+            workspace_id,
+            tab_id,
+            pane_id,
+            terminal_id: terminal.id(),
+        };
+        let selected = selected_target(resolved, &terminal);
+        let insertion = state.register_pane(tab_id, pane_id, Arc::clone(&terminal));
+        let creation = match insertion {
+            Ok(()) => Ok(match mode {
+                CreationMode::Detached => CreatedTerminal::Detached(selected),
+                CreationMode::Attached(client) => {
+                    let runtime = state
+                        .runtimes
+                        .get(&terminal.id())
+                        .expect("new runtime inserted");
+                    let guard = runtime
+                        .lease
+                        .acquire(client)
+                        .expect("new terminal has an independent lease");
+                    CreatedTerminal::Attached(LeasedTarget {
+                        selected,
+                        terminal: Arc::clone(&terminal),
+                        _lease: guard,
+                    })
+                }
+            }),
+            Err(error) => Err(error),
+        };
+        (terminal, creation)
+    };
+    let created = match creation {
+        Ok(created) => created,
+        Err(error) => {
+            let _ = terminal.close().await;
+            return Err(error);
+        }
+    };
+    watch_terminal(terminal, exited.clone());
+    Ok(created)
+}
+
+async fn resolve_spawn_cwd(root: &Path, cwd: Option<PathBuf>) -> Result<PathBuf, DaemonError> {
+    let candidate = match cwd {
+        Some(cwd) if cwd.is_absolute() => cwd,
+        Some(cwd) => root.join(cwd),
+        None => root.to_path_buf(),
+    };
+    let canonical = tokio::fs::canonicalize(&candidate).await.map_err(|error| {
+        DaemonError::new(
+            "invalid_cwd",
+            format!("could not resolve {}: {error}", candidate.display()),
+        )
+    })?;
+    let metadata = tokio::fs::metadata(&canonical).await.map_err(|error| {
+        DaemonError::new(
+            "invalid_cwd",
+            format!("could not inspect {}: {error}", canonical.display()),
+        )
+    })?;
+    if !metadata.is_dir() {
+        return Err(DaemonError::new(
+            "invalid_cwd",
+            format!("not a directory: {}", canonical.display()),
+        ));
+    }
+    Ok(canonical)
 }
 
 fn selected_target(
@@ -1571,6 +1753,47 @@ mod tests {
         assert!(state.accepting);
         assert!(!state.finalize_terminal(old_id).unwrap());
         assert!(state.accepting);
+    }
+
+    #[tokio::test]
+    async fn registered_pane_has_independent_runtime_and_finalization() {
+        let (mut state, path) = inconsistent_state();
+        let terminal = Arc::new(
+            spawn_terminal(SpawnSpec {
+                program: "/bin/sh".into(),
+                argv: vec!["-c".into(), "sleep 10".into()],
+                cwd: "/".into(),
+                env: HashMap::new(),
+                size: TerminalSize {
+                    columns: 80,
+                    rows: 24,
+                },
+            })
+            .unwrap(),
+        );
+        let pane_id = PaneId::new();
+        let terminal_id = terminal.id();
+
+        state
+            .register_pane(path.tab_id, pane_id, Arc::clone(&terminal))
+            .unwrap();
+
+        let added = state
+            .resources
+            .resolve_terminal_target(Some(TargetSelector::Pane(pane_id)))
+            .unwrap();
+        assert_eq!(added.terminal_id, terminal_id);
+        assert!(state.runtimes.contains_key(&terminal_id));
+        assert!(!state.finalize_terminal(terminal_id).unwrap());
+        assert!(!state.runtimes.contains_key(&terminal_id));
+        assert!(
+            state
+                .resources
+                .resolve_terminal_target(Some(TargetSelector::Pane(pane_id)))
+                .is_err()
+        );
+
+        terminal.close().await.unwrap();
     }
 
     #[test]

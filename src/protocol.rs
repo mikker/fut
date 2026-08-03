@@ -12,7 +12,7 @@ use crate::{
     resources::{ResourceSnapshot, SessionSelector, TargetSelector},
 };
 
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 /// Enough for 50,000 individually styled JSON cells while remaining a firm
 /// pre-allocation bound for the length-delimited transport.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
@@ -109,6 +109,15 @@ pub enum ClientMessage {
         #[serde(default)]
         argv: Vec<String>,
     },
+    CreatePane {
+        tab_id: TabId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        program: Option<PathBuf>,
+        #[serde(default)]
+        argv: Vec<String>,
+    },
     ListResources,
     CloseTarget {
         selector: TargetSelector,
@@ -134,6 +143,9 @@ pub enum ServerMessage {
         disposition: OpenDisposition,
     },
     TabCreated {
+        selected: SelectedTarget,
+    },
+    PaneCreated {
         selected: SelectedTarget,
     },
     TargetSelected {
@@ -424,7 +436,7 @@ mod tests {
             decode_payload::<ServerMessage>(&encode_payload(&switched).unwrap()).unwrap(),
             switched
         );
-        assert_eq!(PROTOCOL_VERSION, 6);
+        assert_eq!(PROTOCOL_VERSION, 7);
     }
 
     #[test]
@@ -472,6 +484,43 @@ mod tests {
             );
             assert_eq!(response.request_id, request.request_id);
         }
+    }
+
+    #[test]
+    fn create_pane_and_correlated_response_round_trip_unicode_argv() {
+        let request_id = Uuid::new_v4();
+        let request = Envelope {
+            request_id: Some(request_id),
+            message: ClientMessage::CreatePane {
+                tab_id: TabId::new(),
+                cwd: Some(PathBuf::from("/tmp/雪 workspace")),
+                program: Some(PathBuf::from("/opt/工具/bin/シェル")),
+                argv: vec!["--題=λ".into(), "こんにちは 世界".into()],
+            },
+        };
+        assert_eq!(
+            decode_payload::<Envelope<ClientMessage>>(&encode_payload(&request).unwrap()).unwrap(),
+            request
+        );
+
+        let response = Envelope {
+            request_id: Some(request_id),
+            message: ServerMessage::PaneCreated {
+                selected: SelectedTarget {
+                    session_id: SessionId::new(),
+                    workspace_id: WorkspaceId::new(),
+                    tab_id: TabId::new(),
+                    pane_id: PaneId::new(),
+                    terminal_id: TerminalId::new(),
+                    child_pid: 4242,
+                },
+            },
+        };
+        assert_eq!(
+            decode_payload::<Envelope<ServerMessage>>(&encode_payload(&response).unwrap()).unwrap(),
+            response
+        );
+        assert_eq!(response.request_id, request.request_id);
     }
 
     #[test]

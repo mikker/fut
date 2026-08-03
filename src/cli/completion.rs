@@ -35,6 +35,7 @@ completer!(tab_new, TabNew);
 completer!(tab_attach, TabAttach);
 completer!(tab_rename, TabRename);
 completer!(tab_close, TabClose);
+completer!(pane_new, PaneNew);
 completer!(pane_attach, PaneAttach);
 completer!(pane_close, PaneClose);
 completer!(terminal_attach, TerminalAttach);
@@ -51,6 +52,7 @@ enum Operation {
     TabAttach,
     TabRename,
     TabClose,
+    PaneNew,
     PaneAttach,
     PaneClose,
     TerminalAttach,
@@ -139,11 +141,15 @@ fn candidates(snapshot: &ResourceSnapshot, operation: Operation) -> Vec<Candidat
             .iter()
             .filter(|workspace| !workspace.closing)
             .flat_map(|workspace| &workspace.tabs)
+            .filter(|tab| !tab.closing)
             .flat_map(|tab| &tab.panes);
-        let descendants_live = session
-            .workspaces
-            .iter()
-            .all(|workspace| !workspace.closing);
+        let descendants_live = session.workspaces.iter().all(|workspace| {
+            !workspace.closing
+                && workspace
+                    .tabs
+                    .iter()
+                    .all(|tab| !tab.closing && tab.panes.iter().all(|pane| !pane.closing))
+        });
         let session_attachable = session_live
             && live_workspace_panes.clone().count() == 1
             && live_workspace_panes.clone().all(|pane| !pane.closing);
@@ -164,12 +170,19 @@ fn candidates(snapshot: &ResourceSnapshot, operation: Operation) -> Vec<Candidat
 
         for workspace in &session.workspaces {
             let workspace_live = session_live && !workspace.closing;
-            let workspace_panes = workspace.tabs.iter().flat_map(|tab| &tab.panes);
+            let workspace_panes = workspace
+                .tabs
+                .iter()
+                .filter(|tab| !tab.closing)
+                .flat_map(|tab| &tab.panes);
             let workspace_attachable = workspace_live
                 && workspace_panes.clone().count() == 1
                 && workspace_panes.clone().all(|pane| !pane.closing);
-            let workspace_closable =
-                workspace_live && workspace_panes.clone().all(|pane| !pane.closing);
+            let workspace_closable = workspace_live
+                && workspace
+                    .tabs
+                    .iter()
+                    .all(|tab| !tab.closing && tab.panes.iter().all(|pane| !pane.closing));
             let hierarchy = format!(
                 "session {session_label} › workspace {}",
                 clean(&workspace.name)
@@ -190,22 +203,22 @@ fn candidates(snapshot: &ResourceSnapshot, operation: Operation) -> Vec<Candidat
             }
 
             for tab in &workspace.tabs {
+                let tab_live = workspace_live && !tab.closing;
                 let tab_panes_open = tab.panes.iter().all(|pane| !pane.closing);
-                let tab_attachable = workspace_live
-                    && tab.panes.len() == 1
-                    && tab.panes.iter().all(|pane| !pane.closing);
+                let tab_attachable =
+                    tab_live && tab.panes.len() == 1 && tab.panes.iter().all(|pane| !pane.closing);
                 let tab_hierarchy = format!("{hierarchy} › tab {}", clean(&tab.name));
                 let tab_label = format!("{tab_hierarchy}{root_suffix}");
 
                 if matches!(operation, Operation::TabAttach) && tab_attachable
-                    || matches!(operation, Operation::TabRename) && workspace_live
-                    || matches!(operation, Operation::TabClose) && workspace_live && tab_panes_open
+                    || matches!(operation, Operation::TabRename | Operation::PaneNew) && tab_live
+                    || matches!(operation, Operation::TabClose) && tab_live && tab_panes_open
                 {
                     push(&mut result, tab.id.to_string(), tab_label.clone());
                 }
 
                 for (index, pane) in tab.panes.iter().enumerate() {
-                    let pane_live = workspace_live && !pane.closing;
+                    let pane_live = tab_live && !pane.closing;
                     let pane_hierarchy = format!("{tab_hierarchy} › pane {}", index + 1);
                     let pane_label = format!("{pane_hierarchy}{root_suffix}");
                     if matches!(operation, Operation::PaneAttach | Operation::PaneClose)
@@ -313,11 +326,13 @@ mod tests {
                         TabSnapshot {
                             id: TabId::new(),
                             name: "One".into(),
+                            closing: false,
                             panes: vec![pane(false)],
                         },
                         TabSnapshot {
                             id: TabId::new(),
                             name: "Two".into(),
+                            closing: false,
                             panes: vec![pane(true)],
                         },
                     ],
@@ -359,6 +374,30 @@ mod tests {
             tree
         };
 
+        let mut closing_pane_with_live_sibling = ResourceTree::default();
+        let path = initial("sibling", "/sibling");
+        let tab_id = path.tab_id;
+        let closing_pane = path.pane_id;
+        closing_pane_with_live_sibling.create_session(path).unwrap();
+        closing_pane_with_live_sibling
+            .add_pane(tab_id, PaneId::new(), TerminalId::new())
+            .unwrap();
+        closing_pane_with_live_sibling
+            .close_pane(closing_pane)
+            .unwrap();
+
+        let mut closing_tab_with_live_sibling = ResourceTree::default();
+        let path = initial("tab-sibling", "/tab-sibling");
+        let workspace_id = path.workspace_id;
+        let closing_tab = path.tab_id;
+        closing_tab_with_live_sibling.create_session(path).unwrap();
+        closing_tab_with_live_sibling
+            .add_tab(workspace_id, tab("live-tab"))
+            .unwrap();
+        closing_tab_with_live_sibling
+            .close_tab(closing_tab)
+            .unwrap();
+
         let mut closing_workspace = ResourceTree::default();
         let path = initial("attach", "/attach-live");
         let session = path.session_id;
@@ -374,6 +413,8 @@ mod tests {
             pending(Operation::TabClose),
             pending(Operation::WorkspaceClose),
             pending(Operation::SessionClose),
+            closing_pane_with_live_sibling,
+            closing_tab_with_live_sibling,
             closing_workspace,
         ]
     }
@@ -423,6 +464,9 @@ mod tests {
                                 .rename_tab(tab.id, "completion-fresh-tab".into())
                                 .is_ok(),
                             Operation::TabClose => clone.close_tab(tab.id).is_ok(),
+                            Operation::PaneNew => clone
+                                .add_pane(tab.id, PaneId::new(), TerminalId::new())
+                                .is_ok(),
                             _ => false,
                         };
                     }
@@ -464,6 +508,7 @@ mod tests {
             Operation::TabAttach,
             Operation::TabRename,
             Operation::TabClose,
+            Operation::PaneNew,
             Operation::PaneAttach,
             Operation::PaneClose,
             Operation::TerminalAttach,
@@ -609,6 +654,7 @@ mod tests {
             Operation::TabAttach,
             Operation::TabRename,
             Operation::TabClose,
+            Operation::PaneNew,
             Operation::PaneAttach,
             Operation::PaneClose,
             Operation::TerminalAttach,

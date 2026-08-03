@@ -803,6 +803,228 @@ async fn public_tab_new_is_isolated_and_public_tab_close_preserves_its_sibling()
 }
 
 #[tokio::test]
+async fn public_pane_new_preserves_attachment_isolates_input_and_cascades_on_last_close() {
+    let mut harness = Harness::start(
+        "printf 'PANE_A_READY\\r\\n'; while IFS= read -r line; do [ \"$line\" = a ] && printf 'PANE_A_INPUT\\r\\n'; done",
+    )
+    .await;
+    let before = harness.resources().await;
+    let session = &before.sessions[0];
+    let workspace = &session.workspaces[0];
+    let tab = &workspace.tabs[0];
+    let pane_a = &tab.panes[0];
+    let (mut attached_a, selected_a) =
+        attach_once(&harness, TargetSelector::Terminal(pane_a.terminal_id)).await;
+    snapshot_containing(&mut attached_a, pane_a.terminal_id, "PANE_A_READY").await;
+
+    fs::create_dir(harness.root.path().join("cwd/pane-relative")).unwrap();
+    let pwd = harness.root.path().join("pane-b.pwd");
+    let output = harness
+        .cli()
+        .args(["pane", "new", &tab.id.to_string(), "--cwd", "pane-relative", "--", "/bin/sh", "-c"])
+        .arg(format!(
+            "pwd > {}; printf 'PANE_B_READY\\r\\n'; while IFS= read -r line; do [ \"$line\" = b ] && printf 'PANE_B_INPUT\\r\\n'; done",
+            pwd.display()
+        ))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    let field = |name: &str| {
+        text.split_whitespace()
+            .find_map(|field| field.strip_prefix(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("missing {name} in {text:?}"))
+    };
+    assert_eq!(field("session"), session.id.to_string());
+    assert_eq!(field("workspace"), workspace.id.to_string());
+    assert_eq!(field("tab"), tab.id.to_string());
+    let pane_b = field("pane").parse().unwrap();
+    let terminal_b = field("terminal").parse().unwrap();
+    let pid_b: u32 = field("pid").parse().unwrap();
+    assert_ne!(pane_b, pane_a.id);
+    assert_ne!(terminal_b, pane_a.terminal_id);
+    assert_ne!(pid_b, selected_a.child_pid);
+    wait_for(DEADLINE, || pwd.exists()).await;
+    assert_eq!(
+        fs::read_to_string(&pwd).unwrap().trim(),
+        harness
+            .root
+            .path()
+            .join("cwd/pane-relative")
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .unwrap()
+    );
+
+    let after = harness.resources().await;
+    let panes = &after.sessions[0].workspaces[0].tabs[0].panes;
+    assert_eq!(
+        panes.iter().map(|pane| pane.id).collect::<Vec<_>>(),
+        [pane_a.id, pane_b]
+    );
+    assert_eq!(
+        attach_error_once(&harness, TargetSelector::Terminal(pane_a.terminal_id)).await,
+        "already_attached"
+    );
+    for target in [
+        TargetSelector::Session(SessionSelector::Id(session.id)),
+        TargetSelector::Workspace(workspace.id),
+        TargetSelector::Tab(tab.id),
+    ] {
+        assert_eq!(attach_error_once(&harness, target).await, "target_required");
+    }
+
+    let (mut attached_b, selected_b) = attach_once(&harness, TargetSelector::Pane(pane_b)).await;
+    assert_eq!(selected_b.pane_id, pane_b);
+    assert_eq!(selected_b.terminal_id, terminal_b);
+    snapshot_containing(&mut attached_b, terminal_b, "PANE_B_READY").await;
+    send(
+        &mut attached_b,
+        ClientMessage::Input {
+            bytes: b"b\n".to_vec(),
+        },
+    )
+    .await;
+    let b_screen = snapshot_containing(&mut attached_b, terminal_b, "PANE_B_INPUT").await;
+    assert!(!snapshot_text(&b_screen).contains("PANE_A_INPUT"));
+    send(
+        &mut attached_a,
+        ClientMessage::Input {
+            bytes: b"a\n".to_vec(),
+        },
+    )
+    .await;
+    let a_screen = snapshot_containing(&mut attached_a, pane_a.terminal_id, "PANE_A_INPUT").await;
+    assert!(!snapshot_text(&a_screen).contains("PANE_B_INPUT"));
+
+    harness.detach(&mut attached_b).await;
+    drop(attached_b);
+    assert!(
+        harness
+            .cli()
+            .args(["pane", "close", &pane_b.to_string()])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    wait_for(DEADLINE, || !process_alive(pid_b)).await;
+    let surviving = resources_when(&harness, |snapshot| {
+        snapshot
+            .sessions
+            .first()
+            .and_then(|session| session.workspaces.first())
+            .and_then(|workspace| workspace.tabs.first())
+            .is_some_and(|tab| tab.panes.len() == 1)
+    })
+    .await;
+    assert_eq!(surviving.sessions[0].workspaces[0].tabs[0].panes.len(), 1);
+    assert!(process_alive(selected_a.child_pid));
+    assert!(harness.socket.exists());
+    harness.detach(&mut attached_a).await;
+    drop(attached_a);
+    assert!(
+        harness
+            .cli()
+            .args(["pane", "close", &pane_a.id.to_string()])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    wait_for(DEADLINE, || !process_alive(selected_a.child_pid)).await;
+    harness.wait_until_exited().await;
+}
+
+#[tokio::test]
+async fn closing_a_multi_pane_tab_preserves_and_routes_its_sibling_tab() {
+    let mut harness = Harness::start("while IFS= read -r line; do :; done").await;
+    let initial = harness.resources().await;
+    let workspace = &initial.sessions[0].workspaces[0];
+    let tab_a = workspace.tabs[0].id;
+    let terminal_a = workspace.tabs[0].panes[0].terminal_id;
+    let (mut original, selected_a) =
+        attach_once(&harness, TargetSelector::Terminal(terminal_a)).await;
+    let pid_a = selected_a.child_pid;
+    harness.detach(&mut original).await;
+    drop(original);
+    let pane_b = harness
+        .cli()
+        .args([
+            "pane",
+            "new",
+            &tab_a.to_string(),
+            "--",
+            "/bin/sh",
+            "-c",
+            "while IFS= read -r line; do :; done",
+        ])
+        .output()
+        .unwrap();
+    assert!(pane_b.status.success());
+    let pid_b: u32 = String::from_utf8(pane_b.stdout)
+        .unwrap()
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("pid="))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let tab_c = harness.cli().args(["tab", "new", &workspace.id.to_string(), "--", "/bin/sh", "-c", "printf 'C_READY\\r\\n'; while IFS= read -r line; do [ \"$line\" = c ] && printf 'C_INPUT\\r\\n'; done"]).output().unwrap();
+    assert!(tab_c.status.success());
+    let tab_c_text = String::from_utf8(tab_c.stdout).unwrap();
+    let terminal_c: TerminalId = tab_c_text
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("terminal="))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let pid_c: u32 = tab_c_text
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("pid="))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let (mut sibling, _) = attach_once(&harness, TargetSelector::Terminal(terminal_c)).await;
+    snapshot_containing(&mut sibling, terminal_c, "C_READY").await;
+
+    assert!(
+        harness
+            .cli()
+            .args(["tab", "close", &tab_a.to_string()])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    wait_for(DEADLINE, || !process_alive(pid_a) && !process_alive(pid_b)).await;
+    let after = resources_when(&harness, |snapshot| {
+        snapshot.sessions[0].workspaces[0].tabs.len() == 1
+            && snapshot.sessions[0].workspaces[0].tabs[0].id != tab_a
+    })
+    .await;
+    let tabs = &after.sessions[0].workspaces[0].tabs;
+    assert_eq!(tabs.len(), 1);
+    assert_ne!(tabs[0].id, tab_a);
+    assert!(process_alive(pid_c));
+    assert!(harness.daemon.try_wait().unwrap().is_none());
+    send(
+        &mut sibling,
+        ClientMessage::Input {
+            bytes: b"c\n".to_vec(),
+        },
+    )
+    .await;
+    snapshot_containing(&mut sibling, terminal_c, "C_INPUT").await;
+    harness.detach(&mut sibling).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn public_new_tab_rejections_are_pre_spawn_and_atomic() {
     let harness = Harness::start("while IFS= read -r line; do :; done").await;
     let before = harness.resources().await;
@@ -946,6 +1168,130 @@ async fn interactive_create_tab_correlates_ack_switches_atomically_and_routes_in
 }
 
 #[tokio::test]
+async fn interactive_create_pane_correlates_ack_switches_atomically_and_holds_lease() {
+    let mut harness = Harness::start(
+        "printf 'RAW_PANE_A_READY\\r\\n'; while IFS= read -r line; do [ \"$line\" = old ] && printf 'RAW_PANE_A_INPUT\\r\\n'; done",
+    )
+    .await;
+    let resources = harness.resources().await;
+    let tab_id = resources.sessions[0].workspaces[0].tabs[0].id;
+    let (mut connection, old_terminal, old_pid) = harness.interactive().await;
+    snapshot_containing(&mut connection, old_terminal, "RAW_PANE_A_READY").await;
+
+    let request_id = Uuid::new_v4();
+    send_envelope(
+        &mut connection,
+        Envelope {
+            request_id: Some(request_id),
+            message: ClientMessage::CreatePane {
+                tab_id,
+                cwd: None,
+                program: Some("/bin/sh".into()),
+                argv: vec![
+                    "-c".into(),
+                    "printf 'RAW_PANE_B_READY\\r\\n'; while IFS= read -r line; do [ \"$line\" = new ] && printf 'RAW_PANE_B_INPUT\\r\\n'; done".into(),
+                ],
+            },
+        },
+    )
+    .await;
+    let created = loop {
+        let response = receive_envelope(&mut connection)
+            .await
+            .expect("create-pane response");
+        if response.request_id == Some(request_id) {
+            let ServerMessage::PaneCreated { selected } = response.message else {
+                panic!(
+                    "expected correlated PaneCreated, got {:?}",
+                    response.message
+                )
+            };
+            break selected;
+        }
+        match response.message {
+            ServerMessage::Snapshot { terminal_id, .. } => assert_eq!(terminal_id, old_terminal),
+            other => panic!("unexpected frame before PaneCreated: {other:?}"),
+        }
+    };
+    assert_eq!(created.tab_id, tab_id);
+    assert_ne!(created.terminal_id, old_terminal);
+    let snapshot = receive_envelope(&mut connection)
+        .await
+        .expect("new pane snapshot");
+    assert_eq!(snapshot.request_id, None);
+    assert!(
+        matches!(snapshot.message, ServerMessage::Snapshot { terminal_id, .. } if terminal_id == created.terminal_id)
+    );
+    assert_eq!(
+        attach_error_once(&harness, TargetSelector::Terminal(created.terminal_id)).await,
+        "already_attached"
+    );
+
+    let (mut old, selected_old) =
+        attach_once(&harness, TargetSelector::Terminal(old_terminal)).await;
+    assert_eq!(selected_old.child_pid, old_pid);
+    send(
+        &mut connection,
+        ClientMessage::Input {
+            bytes: b"new\n".to_vec(),
+        },
+    )
+    .await;
+    snapshot_containing(&mut connection, created.terminal_id, "RAW_PANE_B_INPUT").await;
+    send(
+        &mut old,
+        ClientMessage::Input {
+            bytes: b"old\n".to_vec(),
+        },
+    )
+    .await;
+    snapshot_containing(&mut old, old_terminal, "RAW_PANE_A_INPUT").await;
+    harness.detach(&mut old).await;
+    harness.detach(&mut connection).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn public_pane_new_rejections_are_pre_spawn_and_atomic() {
+    let harness = Harness::start("while IFS= read -r line; do :; done").await;
+    let before = harness.resources().await;
+    let tab_id = before.sessions[0].workspaces[0].tabs[0].id;
+    let marker = harness.root.path().join("rejected-pane.marker");
+    let missing_tab = Uuid::new_v4().to_string();
+    for (parent, cwd, program, expected) in [
+        (missing_tab.as_str(), ".", "/bin/sh", "not found"),
+        (
+            &tab_id.to_string(),
+            "missing-directory",
+            "/bin/sh",
+            "could not resolve",
+        ),
+        (
+            &tab_id.to_string(),
+            ".",
+            "/definitely/missing/fut-pane-command",
+            "spawn",
+        ),
+    ] {
+        let output = harness
+            .cli()
+            .args(["pane", "new", parent, "--cwd", cwd, "--", program, "-c"])
+            .arg(format!("touch {}", marker.display()))
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "accepted rejected pane creation");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(harness.resources().await, before);
+        assert!(!marker.exists());
+    }
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn immediate_exit_interactive_create_tab_never_loses_exit_or_old_attachment() {
     let mut harness = Harness::start(
         "printf 'OLD_READY\\r\\n'; while IFS= read -r line; do printf 'OLD_%s\\r\\n' \"$line\"; done",
@@ -1044,6 +1390,227 @@ async fn immediate_exit_interactive_create_tab_never_loses_exit_or_old_attachmen
 }
 
 #[tokio::test]
+async fn immediate_exit_interactive_create_pane_preserves_its_original_sibling() {
+    let mut harness = Harness::start(
+        "printf 'PANE_A_READY\\r\\n'; while IFS= read -r line; do printf 'PANE_A_%s\\r\\n' \"$line\"; done",
+    )
+    .await;
+    let before = harness.resources().await;
+    let session_id = before.sessions[0].id;
+    let workspace_id = before.sessions[0].workspaces[0].id;
+    let tab_id = before.sessions[0].workspaces[0].tabs[0].id;
+    let pane_id = before.sessions[0].workspaces[0].tabs[0].panes[0].id;
+    let (mut connection, terminal_a, pid_a) = harness.interactive().await;
+    snapshot_containing(&mut connection, terminal_a, "PANE_A_READY").await;
+
+    let request_id = Uuid::new_v4();
+    send_envelope(
+        &mut connection,
+        Envelope {
+            request_id: Some(request_id),
+            message: ClientMessage::CreatePane {
+                tab_id,
+                cwd: None,
+                program: Some("/bin/sh".into()),
+                argv: vec!["-c".into(), "printf 'PANE_B_FINAL\\r\\n'; exit 23".into()],
+            },
+        },
+    )
+    .await;
+
+    let response = time::timeout(DEADLINE, async {
+        loop {
+            let response = receive_envelope(&mut connection)
+                .await
+                .expect("connection ended before create-pane response");
+            if response.request_id == Some(request_id) {
+                break response.message;
+            }
+            assert!(matches!(
+                response.message,
+                ServerMessage::Snapshot { terminal_id, .. } if terminal_id == terminal_a
+            ));
+        }
+    })
+    .await
+    .expect("immediate-exit CreatePane hung");
+
+    match response {
+        ServerMessage::Error { code, .. } => {
+            assert_eq!(code, "terminal_exited");
+            send(
+                &mut connection,
+                ClientMessage::Input {
+                    bytes: b"BEFORE_REATTACH\n".to_vec(),
+                },
+            )
+            .await;
+            snapshot_containing(&mut connection, terminal_a, "PANE_A_BEFORE_REATTACH").await;
+            harness.detach(&mut connection).await;
+        }
+        ServerMessage::PaneCreated { selected } => {
+            assert_eq!(selected.tab_id, tab_id);
+            let mut saw_final_snapshot = false;
+            loop {
+                let message = time::timeout(DEADLINE, receive(&mut connection))
+                    .await
+                    .expect("committed immediate-exit pane hung")
+                    .expect("connection ended before TerminalExited");
+                match message {
+                    ServerMessage::Snapshot {
+                        terminal_id,
+                        screen,
+                    } => {
+                        assert_eq!(terminal_id, selected.terminal_id);
+                        saw_final_snapshot |= snapshot_text(&screen).contains("PANE_B_FINAL");
+                    }
+                    ServerMessage::TerminalExited {
+                        terminal_id,
+                        exit_code,
+                    } => {
+                        assert_eq!(terminal_id, selected.terminal_id);
+                        assert_eq!(exit_code, Some(23));
+                        assert!(saw_final_snapshot, "TerminalExited preceded final snapshot");
+                        break;
+                    }
+                    other => panic!("unexpected frame after PaneCreated: {other:?}"),
+                }
+            }
+            assert!(
+                time::timeout(DEADLINE, receive(&mut connection))
+                    .await
+                    .expect("committed pane connection did not close")
+                    .is_none()
+            );
+        }
+        other => panic!("expected terminal_exited or PaneCreated, got {other:?}"),
+    }
+    drop(connection);
+
+    let after = resources_when(&harness, |snapshot| {
+        snapshot.sessions[0].workspaces[0].tabs[0].panes.len() == 1
+            && snapshot.sessions[0].workspaces[0].tabs[0].panes[0].id == pane_id
+    })
+    .await;
+    assert_eq!(after.sessions[0].id, session_id);
+    assert_eq!(after.sessions[0].workspaces[0].id, workspace_id);
+    assert_eq!(after.sessions[0].workspaces[0].tabs[0].id, tab_id);
+    assert_eq!(after.sessions[0].workspaces[0].tabs[0].panes.len(), 1);
+    assert_eq!(after.sessions[0].workspaces[0].tabs[0].panes[0].id, pane_id);
+    assert!(process_alive(pid_a));
+    assert!(harness.socket.exists());
+    assert!(harness.daemon.try_wait().unwrap().is_none());
+
+    let (mut original, selected) =
+        attach_once(&harness, TargetSelector::Terminal(terminal_a)).await;
+    assert_eq!(selected.child_pid, pid_a);
+    send(
+        &mut original,
+        ClientMessage::Input {
+            bytes: b"AFTER_EXIT\n".to_vec(),
+        },
+    )
+    .await;
+    snapshot_containing(&mut original, terminal_a, "PANE_A_AFTER_EXIT").await;
+    harness.detach(&mut original).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn naturally_exited_detached_sibling_pane_is_reaped_without_collateral_damage() {
+    let mut harness = Harness::start(
+        "printf 'NATURAL_A_READY\\r\\n'; while IFS= read -r line; do printf 'NATURAL_A_%s\\r\\n' \"$line\"; done",
+    )
+    .await;
+    let before = harness.resources().await;
+    let session_id = before.sessions[0].id;
+    let workspace_id = before.sessions[0].workspaces[0].id;
+    let tab_id = before.sessions[0].workspaces[0].tabs[0].id;
+    let terminal_a = before.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
+    let gate = harness.root.path().join("natural-pane-gate");
+    let output = harness
+        .cli()
+        .args(["pane", "new", &tab_id.to_string(), "--", "/bin/sh", "-c"])
+        .arg(format!(
+            "printf 'NATURAL_B_READY\\r\\n'; while [ ! -e {} ]; do sleep 0.02; done; printf 'NATURAL_B_FINAL\\r\\n'; exit 17",
+            gate.display()
+        ))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = String::from_utf8(output.stdout).unwrap();
+    let field = |name: &str| {
+        output
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("missing {name} in {output:?}"))
+    };
+    let pane_b = field("pane").parse().unwrap();
+    let terminal_b = field("terminal").parse().unwrap();
+    let pid_b: u32 = field("pid").parse().unwrap();
+
+    let (mut sibling, _) = attach_once(&harness, TargetSelector::Terminal(terminal_b)).await;
+    snapshot_containing(&mut sibling, terminal_b, "NATURAL_B_READY").await;
+    fs::write(&gate, "go").unwrap();
+    snapshot_containing(&mut sibling, terminal_b, "NATURAL_B_FINAL").await;
+    assert_eq!(
+        receive_matching(&mut sibling, |message| matches!(
+            message,
+            ServerMessage::TerminalExited { terminal_id, exit_code: Some(17) }
+                if *terminal_id == terminal_b
+        ))
+        .await,
+        ServerMessage::TerminalExited {
+            terminal_id: terminal_b,
+            exit_code: Some(17),
+        }
+    );
+    assert!(
+        time::timeout(DEADLINE, receive(&mut sibling))
+            .await
+            .expect("exited sibling connection did not close")
+            .is_none()
+    );
+    wait_for(DEADLINE, || !process_alive(pid_b)).await;
+
+    let after = resources_when(&harness, |snapshot| {
+        !snapshot.sessions[0].workspaces[0].tabs[0]
+            .panes
+            .iter()
+            .any(|pane| pane.id == pane_b)
+    })
+    .await;
+    assert_eq!(after.sessions[0].id, session_id);
+    assert_eq!(after.sessions[0].workspaces[0].id, workspace_id);
+    assert_eq!(after.sessions[0].workspaces[0].tabs[0].id, tab_id);
+    assert!(
+        !after.sessions[0].workspaces[0].tabs[0]
+            .panes
+            .iter()
+            .any(|pane| pane.id == pane_b)
+    );
+    assert!(harness.socket.exists());
+    assert!(harness.daemon.try_wait().unwrap().is_none());
+
+    let (mut original, _) = attach_once(&harness, TargetSelector::Terminal(terminal_a)).await;
+    snapshot_containing(&mut original, terminal_a, "NATURAL_A_READY").await;
+    send(
+        &mut original,
+        ClientMessage::Input {
+            bytes: b"ROUTES\n".to_vec(),
+        },
+    )
+    .await;
+    snapshot_containing(&mut original, terminal_a, "NATURAL_A_ROUTES").await;
+    harness.detach(&mut original).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn public_cli_rejects_removed_forms_and_malformed_raw_ids_locally() {
     let harness = Harness::start("while IFS= read -r line; do :; done").await;
     for arguments in [
@@ -1056,6 +1623,9 @@ async fn public_cli_rejects_removed_forms_and_malformed_raw_ids_locally() {
         vec!["shutdown"],
         vec!["open", "--attach"],
         vec!["tab", "new", "--attach"],
+        vec!["pane", "new", "--attach"],
+        vec!["pane", "new", "not-a-uuid"],
+        vec!["pane", "new", "tab:00000000-0000-0000-0000-000000000000"],
         vec!["workspace", "attach", "workspace:not-a-uuid"],
         vec!["tab", "close", "not-a-uuid"],
         vec![
@@ -1301,6 +1871,29 @@ async fn public_json_commands_emit_compact_canonical_envelopes() {
     let tab_id = created["selected"]["tab_id"].as_str().unwrap();
     assert!(created["selected"]["pane_id"].is_string());
     assert!(created["selected"]["terminal_id"].is_string());
+    let pane = json(
+        harness
+            .cli()
+            .args(["--json", "pane", "new", tab_id])
+            .output()
+            .unwrap(),
+        "pane.new",
+    );
+    assert_eq!(
+        pane["selected"]["session_id"],
+        created["selected"]["session_id"]
+    );
+    assert_eq!(
+        pane["selected"]["workspace_id"],
+        created["selected"]["workspace_id"]
+    );
+    assert_eq!(pane["selected"]["tab_id"], created["selected"]["tab_id"]);
+    assert_ne!(pane["selected"]["pane_id"], created["selected"]["pane_id"]);
+    assert_ne!(
+        pane["selected"]["terminal_id"],
+        created["selected"]["terminal_id"]
+    );
+    assert!(pane["selected"]["child_pid"].is_number());
     let renamed = json(
         harness
             .cli()
@@ -1389,9 +1982,9 @@ async fn public_json_commands_emit_compact_canonical_envelopes() {
 #[tokio::test]
 async fn public_child_commands_require_the_delimiter_before_the_child_argv() {
     let harness = Harness::start("while IFS= read -r line; do :; done").await;
-    let workspace_id = harness.resources().await.sessions[0].workspaces[0]
-        .id
-        .to_string();
+    let resources = harness.resources().await;
+    let workspace_id = resources.sessions[0].workspaces[0].id.to_string();
+    let tab_id = resources.sessions[0].workspaces[0].tabs[0].id.to_string();
 
     for (arguments, marker_name) in [
         (
@@ -1401,6 +1994,10 @@ async fn public_child_commands_require_the_delimiter_before_the_child_argv() {
         (
             vec!["tab", "new", &workspace_id, "/bin/sh", "-c", "touch"],
             "tab-no-delimiter",
+        ),
+        (
+            vec!["pane", "new", &tab_id, "/bin/sh", "-c", "touch"],
+            "pane-no-delimiter",
         ),
         (
             vec!["daemon", "run", "/bin/sh", "-c", "touch"],
@@ -2795,6 +3392,23 @@ async fn wait_for(timeout: Duration, mut condition: impl FnMut() -> bool) {
     .expect("condition did not become true before timeout");
 }
 
+async fn resources_when(
+    harness: &Harness,
+    condition: impl Fn(&fut::resources::ResourceSnapshot) -> bool,
+) -> fut::resources::ResourceSnapshot {
+    time::timeout(DEADLINE, async {
+        loop {
+            let snapshot = harness.resources().await;
+            if condition(&snapshot) {
+                return snapshot;
+            }
+            time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("resource condition did not become true before timeout")
+}
+
 fn process_alive(pid: u32) -> bool {
     // SAFETY: signal zero does not modify the target process.
     let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
@@ -2962,7 +3576,16 @@ async fn process_completion_covers_live_resource_operations_and_refresh() {
             tab.id.to_string(),
             tab_help.clone(),
         ),
-        (vec!["tab", "close", ""], tab.id.to_string(), tab_help),
+        (
+            vec!["tab", "close", ""],
+            tab.id.to_string(),
+            tab_help.clone(),
+        ),
+        (
+            vec!["pane", "new", ""],
+            tab.id.to_string(),
+            tab_help.clone(),
+        ),
         (
             vec!["pane", "attach", ""],
             pane.id.to_string(),
@@ -3015,6 +3638,22 @@ async fn process_completion_covers_live_resource_operations_and_refresh() {
             .iter()
             .map(|tab| tab.id.to_string())
             .collect::<Vec<_>>()
+    );
+
+    let ambiguous_tab = workspace.tabs[0].id;
+    let second_pane = harness
+        .cli()
+        .args(["pane", "new", &ambiguous_tab.to_string()])
+        .output()
+        .unwrap();
+    assert!(second_pane.status.success());
+    assert!(
+        !completion_values(&env.complete(&harness.socket, &["tab", "attach", ""]))
+            .contains(&ambiguous_tab.to_string())
+    );
+    assert!(
+        completion_values(&env.complete(&harness.socket, &["pane", "new", ""]))
+            .contains(&ambiguous_tab.to_string())
     );
 
     let stable_id = workspace.tabs[0].id;

@@ -347,11 +347,12 @@ pub(super) fn flatten(snapshot: &ResourceSnapshot, current: &SelectedTarget) -> 
     let mut rows = Vec::new();
     for session in &snapshot.sessions {
         let session_current = session.id == current.session_id;
-        let session_target = if session_current {
-            Some(current.pane_id)
-        } else {
-            first_pane_session(session, false)
-        };
+        let session_target =
+            if session_current && pane_available_session(session, current.pane_id, false) {
+                Some(current.pane_id)
+            } else {
+                first_pane_session(session, false)
+            };
         rows.push(NavigatorRow {
             key: ResourceKey::Session(session.id),
             depth: 0,
@@ -363,7 +364,9 @@ pub(super) fn flatten(snapshot: &ResourceSnapshot, current: &SelectedTarget) -> 
         for workspace in &session.workspaces {
             let closing = session.closing || workspace.closing;
             let workspace_current = session_current && workspace.id == current.workspace_id;
-            let target = if workspace_current {
+            let target = if workspace_current
+                && pane_available_workspace(workspace, current.pane_id, session.closing)
+            {
                 Some(current.pane_id)
             } else {
                 first_pane_workspace(workspace, closing)
@@ -378,12 +381,19 @@ pub(super) fn flatten(snapshot: &ResourceSnapshot, current: &SelectedTarget) -> 
             });
             for tab in &workspace.tabs {
                 let tab_current = workspace_current && tab.id == current.tab_id;
-                let target = if tab_current {
+                let tab_closing = closing || tab.closing;
+                let target = if tab_current
+                    && tab
+                        .panes
+                        .iter()
+                        .any(|pane| pane.id == current.pane_id && !pane.closing)
+                    && !tab_closing
+                {
                     Some(current.pane_id)
                 } else {
                     tab.panes
                         .iter()
-                        .find(|pane| !closing && !pane.closing)
+                        .find(|pane| !tab_closing && !pane.closing)
                         .map(|pane| pane.id)
                 };
                 rows.push(NavigatorRow {
@@ -391,11 +401,11 @@ pub(super) fn flatten(snapshot: &ResourceSnapshot, current: &SelectedTarget) -> 
                     depth: 2,
                     label: tab.name.clone(),
                     current: tab_current,
-                    closing,
-                    destination: (!closing).then_some(target).flatten(),
+                    closing: tab_closing,
+                    destination: (!tab_closing).then_some(target).flatten(),
                 });
                 for (index, pane) in tab.panes.iter().enumerate() {
-                    let pane_closing = closing || pane.closing;
+                    let pane_closing = tab_closing || pane.closing;
                     rows.push(NavigatorRow {
                         key: ResourceKey::Pane(pane.id),
                         depth: 3,
@@ -428,9 +438,39 @@ fn first_pane_workspace(
     workspace
         .tabs
         .iter()
+        .filter(|tab| !tab.closing)
         .flat_map(|tab| &tab.panes)
         .find(|pane| !inherited && !workspace.closing && !pane.closing)
         .map(|pane| pane.id)
+}
+
+fn pane_available_session(
+    session: &crate::resources::SessionSnapshot,
+    pane_id: PaneId,
+    inherited: bool,
+) -> bool {
+    !inherited
+        && !session.closing
+        && session
+            .workspaces
+            .iter()
+            .any(|workspace| pane_available_workspace(workspace, pane_id, session.closing))
+}
+
+fn pane_available_workspace(
+    workspace: &crate::resources::WorkspaceSnapshot,
+    pane_id: PaneId,
+    inherited: bool,
+) -> bool {
+    !inherited
+        && !workspace.closing
+        && workspace.tabs.iter().any(|tab| {
+            !tab.closing
+                && tab
+                    .panes
+                    .iter()
+                    .any(|pane| pane.id == pane_id && !pane.closing)
+        })
 }
 
 fn put(buffer: &mut Buffer, x: u16, y: u16, width: u16, text: &str, style: Style) {
@@ -477,6 +517,7 @@ mod tests {
                         tabs: vec![TabSnapshot {
                             id: tab_id,
                             name: "tab".into(),
+                            closing: false,
                             panes: vec![
                                 PaneSnapshot {
                                     id: current_pane,
@@ -542,6 +583,19 @@ mod tests {
             .unwrap();
         assert!(closing.closing);
         assert_eq!(closing.destination, None);
+    }
+
+    #[test]
+    fn closing_tab_disables_its_rows_and_ancestor_targets_avoid_it() {
+        let (mut snapshot, current, _) = fixture();
+        snapshot.sessions[0].workspaces[0].tabs[0].closing = true;
+
+        let rows = flatten(&snapshot, &current);
+
+        assert!(rows[2..].iter().all(|row| row.closing));
+        assert!(rows[2..].iter().all(|row| row.destination.is_none()));
+        assert_eq!(rows[0].destination, None);
+        assert_eq!(rows[1].destination, None);
     }
 
     #[test]

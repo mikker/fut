@@ -2,7 +2,7 @@
 
 `fut` is an agent-oriented terminal multiplexer organized as sessions, workspaces, tabs, panes, and terminals. One daemon owns the live resource tree; clients and automation address resources by their raw IDs.
 
-The current Rust vertical slice supports multiple project sessions, explicitly opened Git worktrees as peer workspaces, multiple tabs, detach/reattach, rename and close operations, and semantic `libghostty-vt` terminal snapshots.
+The current Rust vertical slice supports multiple project sessions, explicitly opened Git worktrees as peer workspaces, multiple tabs and panes, detach/reattach, rename and close operations, and semantic `libghostty-vt` terminal snapshots.
 
 ## Run it
 
@@ -37,6 +37,7 @@ fut tab attach TAB_ID
 fut tab rename TAB_ID NAME
 fut tab close TAB_ID
 
+fut pane new TAB_ID [--cwd PATH] [-- COMMAND...]
 fut pane attach PANE_ID
 fut pane close PANE_ID
 fut terminal attach TERMINAL_ID
@@ -47,13 +48,13 @@ fut daemon ping
 fut daemon shutdown
 ```
 
-Mutation commands accept raw IDs only. Attach commands also use raw IDs, except `session attach`, which additionally permits an exact session name as a convenience. A UUID-shaped session value always has ID precedence, even if it could be a session name. Attaching by session, workspace, or tab succeeds only when that ancestor identifies exactly one open terminal; otherwise use an exact pane or terminal ID, or choose through the navigator. Pane and terminal IDs identify their terminal exactly. There is no public `resource:<id>` or selector mini-language; the internal client/daemon protocol remains typed.
+Mutation commands accept raw IDs only. Attach commands also use raw IDs, except `session attach`, which additionally permits an exact session name as a convenience. A UUID-shaped session value always has ID precedence, even if it could be a session name. Attaching by session, workspace, or tab succeeds only when that ancestor identifies exactly one open terminal; multi-pane ancestors are ambiguous, so use an exact pane or terminal ID or choose through the navigator. Pane and terminal IDs identify their terminal exactly. There is no public `resource:<id>` or selector mini-language; the internal client/daemon protocol remains typed.
 
-`tab new` defaults its working directory to the workspace root; relative `--cwd` values resolve from that root. Names are unique in their scope. Worktrees are discovered only when explicitly opened.
+`open`, `tab new`, and `pane new` are control-only and do not attach. Their results include the complete selected ancestry (`session_id`, `workspace_id`, `tab_id`, `pane_id`, and `terminal_id`, plus the child PID); attachment remains a separate operation. `pane new` takes a raw tab ID and passes argv following a literal `--` directly, without shell evaluation. With no command it starts the default shell. Like `tab new`, its working directory defaults to the workspace root, and a relative `--cwd` resolves against that root. Names are unique in their scope. Worktrees are discovered only when explicitly opened.
 
 ## Automation and interaction
 
-Global `--json` is available only for noninteractive control commands. Successful output has a versioned envelope and dotted command name:
+The client/daemon protocol is version 7. Global `--json` is available only for noninteractive control commands. Successful output has a versioned envelope and dotted command name:
 
 ```json
 {"version":1,"command":"workspace.rename","result":{"workspace_id":"…","name":"api"}}
@@ -82,12 +83,12 @@ source <(COMPLETE=bash fut)
 COMPLETE=fish fut | source
 ```
 
-The generated integration completes the static command, option, and path grammar. At resource operands it reads the current daemon snapshot and inserts only the full raw ID. Zsh and fish also display Unicode names, full ancestry, workspace roots, and distinct numbered pane or terminal descriptions; Bash's completion protocol does not preserve those descriptions. `session attach` completion inserts IDs even though exact names remain valid when entered manually. Re-source the generated integration after upgrading Fut so it stays in step with the executable.
+The generated integration completes the static command, option, and path grammar. At resource operands it reads the current daemon snapshot and inserts only the full raw ID. This includes eligible tab IDs for `pane new`, shown with hierarchy and excluding closing tabs. Zsh and fish also display Unicode names, full ancestry, workspace roots, and distinct numbered pane or terminal descriptions; Bash's completion protocol does not preserve those descriptions. `session attach` completion inserts IDs even though exact names remain valid when entered manually. Re-source the generated integration after upgrading Fut so it stays in step with the executable.
 
 Completion never starts a daemon or mutates resources. It honors `--socket` and the normal socket environment precedence, omits closing and guaranteed-invalid targets, and uses a short bounded query. If the daemon is absent, stale, incompatible, or slow, completion fails silently while static suggestions remain available.
 
-Inside the client, `Ctrl-b c` creates and switches to a default shell tab, `Ctrl-b g` opens the global navigator, `Ctrl-b d` detaches, and `Ctrl-b Ctrl-b` sends a literal `Ctrl-b`.
+Inside the client, `Ctrl-b c` creates and switches to a default shell tab, `Ctrl-b g` opens the global navigator, `Ctrl-b d` detaches, and `Ctrl-b Ctrl-b` sends a literal `Ctrl-b`. Multi-pane tabs are currently rendered as a selected-only full grid; the navigator switches between sibling panes. `pane new` creates another pane in the resource tree, not a visible split.
 
-Current limitations include one pane and terminal per created tab, no splits or layout mutations, no pane naming or move operation, basic input encoding, and full-grid JSON snapshots. Fuzzy navigation, project recipes, and agent activity remain planned. Explicit pane creation and multi-pane tab lifecycle semantics are the next implementation slice.
+Multi-pane lifecycle is supported: pane and terminal navigation is exact; exiting or closing one pane preserves its siblings and ancestors; the final pane cascades through empty ancestors; and closing a whole tab closes all descendant panes and terminals. Current limitations include no simultaneous visible split, layout geometry, or split direction; no pane naming or movement; basic input encoding; and full-grid JSON snapshots. Fuzzy navigation, project recipes, and agent activity remain planned.
 
 See [VISION.md](VISION.md) for the product direction, [CONTEXT.md](CONTEXT.md) for shared language, and [PLAN.md](PLAN.md) for implementation status and exit criteria.
