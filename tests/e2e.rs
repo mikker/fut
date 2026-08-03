@@ -280,8 +280,12 @@ impl Harness {
                         ..
                     } => {
                         assert_eq!(version, PROTOCOL_VERSION);
-                        self.terminal_pid = Some(selected.child_pid);
-                        return (connection, selected.terminal_id, selected.child_pid);
+                        self.terminal_pid = Some(selected.focused.child_pid);
+                        return (
+                            connection,
+                            selected.focused.terminal_id,
+                            selected.focused.child_pid,
+                        );
                     }
                     ServerMessage::Error { ref code, .. } if code == "already_attached" => {
                         drop(connection);
@@ -1113,11 +1117,19 @@ async fn public_pane_move_preserves_attachment_identity_order_and_cascades_empty
         "already_attached"
     );
 
-    let refreshed = select_response(&mut attached_a, TargetSelector::Pane(pane_a)).await;
-    assert_eq!(refreshed.tab_id, destination_tab);
-    assert_eq!(refreshed.pane_id, pane_a);
-    assert_eq!(refreshed.terminal_id, terminal_a);
-    assert_eq!(refreshed.child_pid, selected_a.child_pid);
+    let refreshed = select_view_response(&mut attached_a, TargetSelector::Pane(pane_a)).await;
+    assert_eq!(refreshed.focused.tab_id, destination_tab);
+    assert_eq!(refreshed.focused.pane_id, pane_a);
+    assert_eq!(refreshed.focused.terminal_id, terminal_a);
+    assert_eq!(refreshed.focused.child_pid, selected_a.child_pid);
+    assert_eq!(
+        refreshed
+            .panes
+            .iter()
+            .map(|pane| pane.pane_id)
+            .collect::<Vec<_>>(),
+        [destination_pane, pane_a]
+    );
     send(
         &mut attached_a,
         ClientMessage::Input {
@@ -1377,14 +1389,17 @@ async fn interactive_create_tab_correlates_ack_switches_atomically_and_routes_in
     assert_ne!(created.terminal_id, old_terminal);
     let next = receive_envelope(&mut connection)
         .await
-        .expect("initial new-tab snapshot");
-    assert_eq!(next.request_id, None);
-    match next.message {
-        ServerMessage::Snapshot { terminal_id, .. } => assert_eq!(terminal_id, created.terminal_id),
-        other => {
-            panic!("expected new terminal Snapshot immediately after TabCreated, got {other:?}")
-        }
-    }
+        .expect("selected new-tab view");
+    assert_eq!(next.request_id, Some(request_id));
+    let ServerMessage::TargetSelected { selected } = next.message else {
+        panic!(
+            "expected TargetSelected after TabCreated, got {:?}",
+            next.message
+        )
+    };
+    assert_eq!(selected.focused, created);
+    assert_eq!(selected.panes.as_slice(), std::slice::from_ref(&created));
+    snapshot_containing(&mut connection, created.terminal_id, "RAW_B_READY").await;
 
     assert_eq!(
         attach_error_once(&harness, TargetSelector::Terminal(created.terminal_id)).await,
@@ -1467,13 +1482,21 @@ async fn interactive_create_pane_correlates_ack_switches_atomically_and_holds_le
     };
     assert_eq!(created.tab_id, tab_id);
     assert_ne!(created.terminal_id, old_terminal);
-    let snapshot = receive_envelope(&mut connection)
+    let selected = receive_envelope(&mut connection)
         .await
-        .expect("new pane snapshot");
-    assert_eq!(snapshot.request_id, None);
-    assert!(
-        matches!(snapshot.message, ServerMessage::Snapshot { terminal_id, .. } if terminal_id == created.terminal_id)
-    );
+        .expect("selected new-pane view");
+    assert_eq!(selected.request_id, Some(request_id));
+    let ServerMessage::TargetSelected { selected } = selected.message else {
+        panic!(
+            "expected TargetSelected after PaneCreated, got {:?}",
+            selected.message
+        )
+    };
+    assert_eq!(selected.focused, created);
+    assert_eq!(selected.panes.len(), 2);
+    assert_eq!(selected.panes[0].terminal_id, old_terminal);
+    assert_eq!(selected.panes[1], created);
+    snapshot_containing(&mut connection, created.terminal_id, "RAW_PANE_B_READY").await;
     assert_eq!(
         attach_error_once(&harness, TargetSelector::Terminal(created.terminal_id)).await,
         "already_attached"
@@ -1500,6 +1523,167 @@ async fn interactive_create_pane_correlates_ack_switches_atomically_and_holds_le
     snapshot_containing(&mut old, old_terminal, "RAW_PANE_A_INPUT").await;
     harness.detach(&mut old).await;
     harness.detach(&mut connection).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn interactive_tab_view_streams_all_panes_with_per_client_focus() {
+    let harness = Harness::start(
+        "printf 'VIEW_A_READY\r\n'; while IFS= read -r line; do [ \"$line\" = a ] && printf 'VIEW_A_INPUT\r\n'; done",
+    )
+    .await;
+    let initial = harness.resources().await;
+    let tab_id = initial.sessions[0].workspaces[0].tabs[0].id;
+    let pane_a = initial.sessions[0].workspaces[0].tabs[0].panes[0].id;
+    let terminal_a = initial.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
+    let ServerMessage::PaneCreated { selected: pane_b } = harness
+        .control_command(ClientMessage::CreatePane {
+            tab_id,
+            cwd: None,
+            program: Some("/bin/sh".into()),
+            argv: vec![
+                "-c".into(),
+                "printf 'VIEW_B_READY\r\n'; while IFS= read -r line; do [ \"$line\" = b ] && printf 'VIEW_B_INPUT\r\n'; done".into(),
+            ],
+        })
+        .await
+    else {
+        panic!("failed to create second view pane")
+    };
+
+    let mut first = harness.connect().await.unwrap();
+    let ServerMessage::Welcome {
+        selected: Some(first_view),
+        ..
+    } = hello(
+        &mut first,
+        interactive_mode(Some(TargetSelector::Pane(pane_a))),
+        PROTOCOL_VERSION,
+    )
+    .await
+    .unwrap()
+    else {
+        panic!("first view did not attach")
+    };
+    assert_eq!(first_view.focused.terminal_id, terminal_a);
+    assert_eq!(
+        first_view
+            .panes
+            .iter()
+            .map(|pane| pane.terminal_id)
+            .collect::<Vec<_>>(),
+        [terminal_a, pane_b.terminal_id]
+    );
+    snapshot_containing(&mut first, terminal_a, "VIEW_A_READY").await;
+    snapshot_containing(&mut first, pane_b.terminal_id, "VIEW_B_READY").await;
+
+    let ServerMessage::PaneCreated { selected: pane_c } = harness
+        .control_command(ClientMessage::CreatePane {
+            tab_id,
+            cwd: None,
+            program: Some("/bin/sh".into()),
+            argv: vec![
+                "-c".into(),
+                "printf 'VIEW_C_READY\r\n'; while IFS= read -r line; do :; done".into(),
+            ],
+        })
+        .await
+    else {
+        panic!("failed to create externally added view pane")
+    };
+    let refreshed = select_view_response(&mut first, TargetSelector::Pane(pane_a)).await;
+    assert_eq!(refreshed.focused.terminal_id, terminal_a);
+    assert_eq!(
+        refreshed
+            .panes
+            .iter()
+            .map(|pane| pane.terminal_id)
+            .collect::<Vec<_>>(),
+        [terminal_a, pane_b.terminal_id, pane_c.terminal_id]
+    );
+    snapshot_containing(&mut first, pane_c.terminal_id, "VIEW_C_READY").await;
+
+    send(
+        &mut first,
+        ClientMessage::Resize {
+            terminal_id: pane_b.terminal_id,
+            size: TerminalSize {
+                columns: 31,
+                rows: 9,
+            },
+        },
+    )
+    .await;
+    assert!(matches!(
+        receive_matching(&mut first, |message| matches!(
+            message,
+            ServerMessage::Error { code, .. } if code == "not_focused"
+        ))
+        .await,
+        ServerMessage::Error { ref code, .. } if code == "not_focused"
+    ));
+
+    let (mut second, selected_b) =
+        attach_once(&harness, TargetSelector::Terminal(pane_b.terminal_id)).await;
+    assert_eq!(selected_b, pane_b);
+    snapshot_containing(&mut second, pane_b.terminal_id, "VIEW_B_READY").await;
+    assert_eq!(
+        select_error(&mut first, TargetSelector::Terminal(pane_b.terminal_id)).await,
+        "already_attached"
+    );
+    send(
+        &mut first,
+        ClientMessage::Input {
+            bytes: b"a\n".to_vec(),
+        },
+    )
+    .await;
+    snapshot_containing(&mut first, terminal_a, "VIEW_A_INPUT").await;
+    send(
+        &mut second,
+        ClientMessage::Input {
+            bytes: b"b\n".to_vec(),
+        },
+    )
+    .await;
+    snapshot_containing(&mut second, pane_b.terminal_id, "VIEW_B_INPUT").await;
+
+    harness.detach(&mut second).await;
+    drop(second);
+    let selected = select_response(&mut first, TargetSelector::Terminal(pane_b.terminal_id)).await;
+    assert_eq!(selected, pane_b);
+    send(
+        &mut first,
+        ClientMessage::Resize {
+            terminal_id: pane_b.terminal_id,
+            size: TerminalSize {
+                columns: 31,
+                rows: 9,
+            },
+        },
+    )
+    .await;
+    receive_matching(&mut first, |message| {
+        matches!(
+            message,
+            ServerMessage::CommandCompleted {
+                command: fut::protocol::AcknowledgedCommand::Resize
+            }
+        )
+    })
+    .await;
+    let resized = receive_matching(&mut first, |message| {
+        matches!(
+            message,
+            ServerMessage::Snapshot { terminal_id, screen }
+                if *terminal_id == pane_b.terminal_id
+                    && screen.size == TerminalSize { columns: 31, rows: 9 }
+        )
+    })
+    .await;
+    assert!(matches!(resized, ServerMessage::Snapshot { .. }));
+
+    harness.detach(&mut first).await;
     harness.shutdown().await;
 }
 
@@ -1624,6 +1808,13 @@ async fn immediate_exit_interactive_create_tab_never_loses_exit_or_old_attachmen
                         assert!(saw_final_snapshot, "TerminalExited preceded final snapshot");
                         break;
                     }
+                    ServerMessage::TargetSelected { selected } => {
+                        assert_eq!(selected.focused.terminal_id, terminal_id);
+                        assert_eq!(
+                            selected.panes.as_slice(),
+                            std::slice::from_ref(&selected.focused)
+                        );
+                    }
                     other => panic!("unexpected frame after TabCreated: {other:?}"),
                 }
             }
@@ -1725,15 +1916,31 @@ async fn immediate_exit_interactive_create_pane_preserves_its_original_sibling()
                         assert!(saw_final_snapshot, "TerminalExited preceded final snapshot");
                         break;
                     }
+                    ServerMessage::TargetSelected { selected: view } => {
+                        assert_eq!(view.focused, selected);
+                        assert_eq!(view.panes.len(), 2);
+                    }
                     other => panic!("unexpected frame after PaneCreated: {other:?}"),
                 }
             }
-            assert!(
-                time::timeout(DEADLINE, receive(&mut connection))
-                    .await
-                    .expect("committed pane connection did not close")
-                    .is_none()
-            );
+            let transferred = receive_matching(&mut connection, |message| {
+                matches!(
+                    message,
+                    ServerMessage::TargetSelected { selected }
+                        if selected.focused.terminal_id == terminal_a
+                )
+            })
+            .await;
+            assert!(matches!(transferred, ServerMessage::TargetSelected { .. }));
+            send(
+                &mut connection,
+                ClientMessage::Input {
+                    bytes: b"TRANSFERRED\n".to_vec(),
+                },
+            )
+            .await;
+            snapshot_containing(&mut connection, terminal_a, "PANE_A_TRANSFERRED").await;
+            harness.detach(&mut connection).await;
         }
         other => panic!("expected terminal_exited or PaneCreated, got {other:?}"),
     }
@@ -1821,12 +2028,16 @@ async fn naturally_exited_detached_sibling_pane_is_reaped_without_collateral_dam
             exit_code: Some(17),
         }
     );
-    assert!(
-        time::timeout(DEADLINE, receive(&mut sibling))
-            .await
-            .expect("exited sibling connection did not close")
-            .is_none()
-    );
+    let transferred = receive_matching(&mut sibling, |message| {
+        matches!(
+            message,
+            ServerMessage::TargetSelected { selected }
+                if selected.focused.terminal_id == terminal_a
+        )
+    })
+    .await;
+    assert!(matches!(transferred, ServerMessage::TargetSelected { .. }));
+    harness.detach(&mut sibling).await;
     wait_for(DEADLINE, || !process_alive(pid_b)).await;
 
     let after = resources_when(&harness, |snapshot| {
@@ -2805,6 +3016,120 @@ async fn public_client_navigator_switches_live_pty_and_preserves_terminal_isolat
 }
 
 #[tokio::test]
+async fn public_client_renders_simultaneous_panes_and_cycles_focus() {
+    let harness = Harness::start(
+        "printf 'SPLIT_A_READY\r\n'; while IFS= read -r line; do [ \"$line\" = a ] && printf 'SPLIT_A_INPUT\r\n'; done",
+    )
+    .await;
+    let resources = harness.resources().await;
+    let tab_id = resources.sessions[0].workspaces[0].tabs[0].id;
+    let pane_a = resources.sessions[0].workspaces[0].tabs[0].panes[0].id;
+    let terminal_a = resources.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
+    let ServerMessage::PaneCreated { selected: pane_b } = harness
+        .control_command(ClientMessage::CreatePane {
+            tab_id,
+            cwd: None,
+            program: Some("/bin/sh".into()),
+            argv: vec![
+                "-c".into(),
+                "printf 'SPLIT_B_READY\r\n'; while IFS= read -r line; do [ \"$line\" = b ] && printf 'SPLIT_B_INPUT\r\n'; done".into(),
+            ],
+        })
+        .await
+    else {
+        panic!("failed to create public split pane")
+    };
+
+    let mut command = Command::new("/usr/bin/script");
+    command
+        .env_clear()
+        .env("HOME", harness.root.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", harness.root.path().join("runtime"))
+        .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+        .env("TERM", "xterm-256color")
+        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .arg(format!(
+            "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {}",
+            env!("CARGO_BIN_EXE_fut"),
+            harness.socket.display(),
+            pane_a
+        ));
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("SPLIT_A_READY").await;
+    client.wait_for("SPLIT_B_READY").await;
+    client.send(b"\x02l");
+    client.send(b"b\n");
+    client.wait_for("SPLIT_B_INPUT").await;
+    client.send(b"\x02h");
+    client.send(b"a\n");
+    client.wait_for("SPLIT_A_INPUT").await;
+    client.send(b"\x02d");
+    client.wait_success().await;
+
+    assert!(process_alive(pane_b.child_pid));
+    let (mut a, selected_a) = attach_once(&harness, TargetSelector::Terminal(terminal_a)).await;
+    assert_eq!(selected_a.terminal_id, terminal_a);
+    let a_screen = snapshot_containing(&mut a, terminal_a, "SPLIT_A_INPUT").await;
+    assert!(!snapshot_text(&a_screen).contains("SPLIT_B_INPUT"));
+    harness.detach(&mut a).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn public_client_transfers_focus_when_the_focused_pane_exits() {
+    let harness = Harness::start(
+        "printf 'EXIT_A_READY\r\n'; while IFS= read -r line; do [ \"$line\" = exit ] && exit 23; done",
+    )
+    .await;
+    let resources = harness.resources().await;
+    let tab_id = resources.sessions[0].workspaces[0].tabs[0].id;
+    let pane_a = resources.sessions[0].workspaces[0].tabs[0].panes[0].id;
+    let ServerMessage::PaneCreated { selected: pane_b } = harness
+        .control_command(ClientMessage::CreatePane {
+            tab_id,
+            cwd: None,
+            program: Some("/bin/sh".into()),
+            argv: vec![
+                "-c".into(),
+                "printf 'EXIT_B_READY\r\n'; while IFS= read -r line; do [ \"$line\" = b ] && printf 'EXIT_B_INPUT\r\n'; done".into(),
+            ],
+        })
+        .await
+    else {
+        panic!("failed to create focus replacement pane")
+    };
+
+    let mut command = Command::new("/usr/bin/script");
+    command
+        .env_clear()
+        .env("HOME", harness.root.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", harness.root.path().join("runtime"))
+        .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+        .env("TERM", "xterm-256color")
+        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .arg(format!(
+            "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {}",
+            env!("CARGO_BIN_EXE_fut"),
+            harness.socket.display(),
+            pane_a
+        ));
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("EXIT_A_READY").await;
+    client.wait_for("EXIT_B_READY").await;
+    client.send(b"exit\n");
+    client.wait_for_count("EXIT_B_READY", 2).await;
+    client.send(b"b\n");
+    client.wait_for("EXIT_B_INPUT").await;
+    client.send(b"\x02d");
+    client.wait_success().await;
+
+    assert!(process_alive(pane_b.child_pid));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn public_client_ctrl_b_c_creates_routes_and_navigates_back() {
     let harness = Harness::start(
         "printf 'CTRL_C_A_READY\\r\\n'; while IFS= read -r line; do [ \"$line\" = a ] && printf 'CTRL_C_A_INPUT\\r\\n'; done",
@@ -3146,7 +3471,7 @@ async fn missing_destination_and_post_switch_disconnects_preserve_exact_leases()
     })
     .await
     .expect("EOF did not release destination lease");
-    assert_eq!(selected, c);
+    assert_eq!(selected.focused, c);
     harness.detach(&mut after_eof).await;
     drop(after_eof);
     harness.shutdown().await;
@@ -3484,6 +3809,13 @@ async fn receive_envelope(connection: &mut Connection) -> Option<Envelope<Server
 }
 
 async fn select_response(connection: &mut Connection, selector: TargetSelector) -> SelectedTarget {
+    select_view_response(connection, selector).await.focused
+}
+
+async fn select_view_response(
+    connection: &mut Connection,
+    selector: TargetSelector,
+) -> fut::protocol::SelectedView {
     let request_id = Uuid::new_v4();
     send_envelope(
         connection,
@@ -3535,17 +3867,10 @@ async fn select_and_require_next_snapshot(
     expected: &SelectedTarget,
 ) {
     assert_eq!(select_response(connection, selector).await, *expected);
-    let next = receive_envelope(connection)
-        .await
-        .expect("missing destination snapshot");
-    match next.message {
-        ServerMessage::Snapshot { terminal_id, .. } => {
-            assert_eq!(terminal_id, expected.terminal_id)
-        }
-        other => {
-            panic!("expected destination Snapshot immediately after TargetSelected, got {other:?}")
-        }
-    }
+    receive_matching(connection, |message| {
+        matches!(message, ServerMessage::Snapshot { terminal_id, .. } if *terminal_id == expected.terminal_id)
+    })
+    .await;
 }
 
 async fn attach_once(harness: &Harness, selector: TargetSelector) -> (Connection, SelectedTarget) {
@@ -3563,7 +3888,7 @@ async fn attach_once(harness: &Harness, selector: TargetSelector) -> (Connection
     else {
         panic!("one-shot contender did not acquire lease")
     };
-    (connection, selected)
+    (connection, selected.focused)
 }
 
 async fn attach_error_once(harness: &Harness, selector: TargetSelector) -> String {

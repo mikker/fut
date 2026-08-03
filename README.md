@@ -2,7 +2,7 @@
 
 `fut` is an agent-oriented terminal multiplexer organized as sessions, workspaces, tabs, panes, and terminals. One daemon owns the live resource tree; clients and automation address resources by their raw IDs.
 
-The current Rust vertical slice supports multiple project sessions, explicitly opened Git worktrees as peer workspaces, multiple tabs and panes, detach/reattach, rename, move, and close operations, and semantic `libghostty-vt` terminal snapshots.
+The current Rust vertical slice supports multiple project sessions, explicitly opened Git worktrees as peer workspaces, multiple tabs and panes, detach/reattach, rename, move, and close operations, semantic `libghostty-vt` terminal snapshots, and simultaneous multi-pane rendering with client-local focus.
 
 ## Run it
 
@@ -55,7 +55,7 @@ Mutation commands accept raw IDs only. Attach commands also use raw IDs, except 
 
 ## Automation and interaction
 
-The client/daemon protocol is version 8. Global `--json` is available only for noninteractive control commands. Successful output has a versioned envelope and dotted command name:
+The client/daemon protocol is version 9. Global `--json` is available only for noninteractive control commands. Successful output has a versioned envelope and dotted command name:
 
 ```json
 {"version":1,"command":"workspace.rename","result":{"workspace_id":"…","name":"api"}}
@@ -88,8 +88,10 @@ The generated integration completes the static command, option, and path grammar
 
 Completion never starts a daemon or mutates resources. It honors `--socket` and the normal socket environment precedence, omits closing and guaranteed-invalid targets, and uses a short bounded query. If the daemon is absent, stale, incompatible, or slow, completion fails silently while static suggestions remain available.
 
-Inside the client, `Ctrl-b c` creates and switches to a default shell tab, `Ctrl-b g` opens the global navigator, `Ctrl-b d` detaches, and `Ctrl-b Ctrl-b` sends a literal `Ctrl-b`. Multi-pane tabs are currently rendered as a selected-only full grid; the navigator switches between sibling panes. `pane new` creates another pane in the resource tree, not a visible split.
+Inside the client, `Ctrl-b c` creates and switches to a default shell tab, `Ctrl-b g` opens the global navigator, `Ctrl-b d` detaches, and `Ctrl-b Ctrl-b` sends a literal `Ctrl-b`. In a multi-pane tab, `Ctrl-b l` or `Ctrl-b o` focuses the next pane, while `Ctrl-b h` or `Ctrl-b ;` focuses the previous pane. Focus changes are acknowledged by the daemon before later input is read.
 
-Multi-pane lifecycle is supported: pane and terminal navigation is exact; pane placement can move between tabs in one workspace without disturbing its terminal; exiting or closing one pane preserves its siblings and ancestors; the final pane cascades through empty ancestors; and closing a whole tab closes all descendant panes and terminals. Current limitations include no simultaneous visible split, layout geometry, or split direction; no pane naming or cross-workspace movement; basic input encoding; and full-grid JSON snapshots. Minimal split geometry and simultaneous pane rendering are next. Fuzzy navigation, project recipes, and agent activity remain planned.
+Multi-pane tabs render as equal-width vertical columns in resource order. A one-cell neutral rail marks every visible pane; the focused rail is bold, background rails are dim, terminal colors are left untouched, and only the focused cursor is shown. If the host is too narrow to leave twelve content columns per pane, the client falls back to the focused pane at full size and restores the columns when space returns. The exclusive input and resize lease remains on the focused terminal only, so separate clients may focus different sibling terminals; background panes are observed read-only and clipped to their current grids until focused.
+
+Multi-pane lifecycle is supported: pane and terminal navigation is exact; pane placement can move between tabs in one workspace without disturbing its terminal; exiting or closing one pane preserves its siblings and ancestors; when the focused pane exits the client transfers focus to the next available sibling; the final pane cascades through empty ancestors; and closing a whole tab closes all descendant panes and terminals. The first layout is intentionally not the final split system: there is no persisted direction or ratio, accordion policy, zoom, pane title, or mouse focus. Pane membership is captured when a tab view is selected, so externally creating or moving panes into that tab requires reselecting or reattaching until streamed resource updates land. Pane naming, cross-workspace movement, richer input, fuzzy navigation, project recipes, and agent activity remain planned.
 
 See [VISION.md](VISION.md) for the product direction, [CONTEXT.md](CONTEXT.md) for shared language, and [PLAN.md](PLAN.md) for implementation status and exit criteria.

@@ -401,6 +401,40 @@ impl ResourceTree {
             .ok_or_else(|| ResourceError::Invariant("workspace has no terminal".into()))
     }
 
+    pub fn open_terminal_paths_for_tab(
+        &self,
+        tab_id: TabId,
+    ) -> Result<Vec<ResolvedTerminalPath>, ResourceError> {
+        let tab = self
+            .tabs
+            .get(&tab_id)
+            .ok_or(ResourceError::NotFound("tab"))?;
+        let workspace = &self.workspaces[&tab.workspace_id];
+        if self.sessions[&workspace.session_id].closing {
+            return Err(ResourceError::Closing("session"));
+        }
+        if workspace.closing {
+            return Err(ResourceError::Closing("workspace"));
+        }
+        if tab.closing {
+            return Err(ResourceError::Closing("tab"));
+        }
+        Ok(tab
+            .panes
+            .iter()
+            .filter_map(|pane_id| {
+                let pane = &self.panes[pane_id];
+                (!pane.closing).then_some(ResolvedTerminalPath {
+                    session_id: workspace.session_id,
+                    workspace_id: tab.workspace_id,
+                    tab_id,
+                    pane_id: *pane_id,
+                    terminal_id: pane.terminal_id,
+                })
+            })
+            .collect())
+    }
+
     pub fn available_session_name(&self, suggested: &str) -> String {
         disambiguate(suggested, |name| {
             self.sessions.values().any(|item| item.name == name)
@@ -1618,6 +1652,32 @@ mod tests {
         assert_eq!(
             tree.resolve_terminal_target(None::<TargetSelector>),
             Ok(expected)
+        );
+    }
+
+    #[test]
+    fn open_terminal_paths_for_tab_preserves_order_and_omits_closing_panes() {
+        let mut tree = ResourceTree::default();
+        let path = initial("ordered", "/ordered");
+        let tab_id = path.tab_id;
+        let first_pane = path.pane_id;
+        let second_pane = PaneId::new();
+        let second_terminal = TerminalId::new();
+        tree.create_session(path).unwrap();
+        tree.add_pane(tab_id, second_pane, second_terminal).unwrap();
+
+        let paths = tree.open_terminal_paths_for_tab(tab_id).unwrap();
+        assert_eq!(
+            paths.iter().map(|path| path.pane_id).collect::<Vec<_>>(),
+            vec![first_pane, second_pane]
+        );
+
+        tree.close_pane(second_pane).unwrap();
+        assert_eq!(
+            tree.open_terminal_paths_for_tab(tab_id).unwrap(),
+            [tree
+                .resolve_terminal_target(Some(TargetSelector::Pane(first_pane)))
+                .unwrap()]
         );
     }
 

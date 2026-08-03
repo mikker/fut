@@ -82,6 +82,8 @@ pub(super) enum PrefixAction {
     Detach,
     Navigator,
     CreateTab,
+    FocusNext,
+    FocusPrevious,
     Send(Vec<u8>),
 }
 
@@ -100,6 +102,8 @@ impl PrefixState {
                 b"d" => PrefixAction::Detach,
                 b"g" => PrefixAction::Navigator,
                 b"c" => PrefixAction::CreateTab,
+                b"l" | b"o" => PrefixAction::FocusNext,
+                b"h" | b";" => PrefixAction::FocusPrevious,
                 [2] => PrefixAction::Send(vec![2]),
                 _ => PrefixAction::Send([vec![2], bytes].concat()),
             }
@@ -159,6 +163,14 @@ mod tests {
         assert_eq!(prefix.feed(b"g".to_vec()), PrefixAction::Navigator);
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
         assert_eq!(prefix.feed(b"c".to_vec()), PrefixAction::CreateTab);
+        assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
+        assert_eq!(prefix.feed(b"l".to_vec()), PrefixAction::FocusNext);
+        assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
+        assert_eq!(prefix.feed(b"o".to_vec()), PrefixAction::FocusNext);
+        assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
+        assert_eq!(prefix.feed(b"h".to_vec()), PrefixAction::FocusPrevious);
+        assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
+        assert_eq!(prefix.feed(b";".to_vec()), PrefixAction::FocusPrevious);
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Send(vec![2]));
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);

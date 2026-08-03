@@ -12,7 +12,7 @@ use crate::{
     resources::{ResourceSnapshot, SessionSelector, TargetSelector},
 };
 
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 9;
 /// Enough for 50,000 individually styled JSON cells while remaining a firm
 /// pre-allocation bound for the length-delimited transport.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
@@ -63,6 +63,14 @@ pub struct SelectedTarget {
     pub child_pid: u32,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SelectedView {
+    /// The one terminal receiving this client's input and resize commands.
+    pub focused: SelectedTarget,
+    /// Open panes in resource-tree order for simultaneous read-only rendering.
+    pub panes: Vec<SelectedTarget>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OpenDisposition {
@@ -83,6 +91,7 @@ pub enum ClientMessage {
         bytes: Vec<u8>,
     },
     Resize {
+        terminal_id: TerminalId,
         size: TerminalSize,
     },
     SelectTarget {
@@ -140,7 +149,7 @@ pub enum ServerMessage {
     Welcome {
         version: u16,
         server_version: String,
-        selected: Option<SelectedTarget>,
+        selected: Option<SelectedView>,
     },
     LocationOpened {
         selected: SelectedTarget,
@@ -159,7 +168,7 @@ pub enum ServerMessage {
         selected: SelectedTarget,
     },
     TargetSelected {
-        selected: SelectedTarget,
+        selected: SelectedView,
     },
     Resources {
         snapshot: ResourceSnapshot,
@@ -441,12 +450,54 @@ mod tests {
             ServerMessage::LocationOpened { selected, .. } => selected,
             _ => unreachable!(),
         };
-        let switched = ServerMessage::TargetSelected { selected };
+        let switched = ServerMessage::TargetSelected {
+            selected: SelectedView {
+                focused: selected.clone(),
+                panes: vec![selected],
+            },
+        };
         assert_eq!(
             decode_payload::<ServerMessage>(&encode_payload(&switched).unwrap()).unwrap(),
             switched
         );
-        assert_eq!(PROTOCOL_VERSION, 8);
+        assert_eq!(PROTOCOL_VERSION, 9);
+    }
+
+    #[test]
+    fn resize_and_selected_view_round_trip() {
+        let terminal_id = TerminalId::new();
+        let resize = ClientMessage::Resize {
+            terminal_id,
+            size: TerminalSize {
+                columns: 120,
+                rows: 40,
+            },
+        };
+        assert_eq!(
+            decode_payload::<ClientMessage>(&encode_payload(&resize).unwrap()).unwrap(),
+            resize
+        );
+
+        let focused = SelectedTarget {
+            session_id: SessionId::new(),
+            workspace_id: WorkspaceId::new(),
+            tab_id: TabId::new(),
+            pane_id: PaneId::new(),
+            terminal_id,
+            child_pid: 42,
+        };
+        let welcome = ServerMessage::Welcome {
+            version: PROTOCOL_VERSION,
+            server_version: "test".into(),
+            selected: Some(SelectedView {
+                focused: focused.clone(),
+                panes: vec![focused],
+            }),
+        };
+        assert_eq!(
+            decode_payload::<ServerMessage>(&encode_payload(&welcome).unwrap()).unwrap(),
+            welcome
+        );
     }
 
     #[test]

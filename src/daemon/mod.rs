@@ -22,8 +22,8 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use tokio::{
     net::{UnixListener, UnixStream},
-    sync::{Mutex, broadcast, mpsc, watch},
-    task::JoinSet,
+    sync::{Mutex, mpsc, watch},
+    task::{JoinHandle, JoinSet},
     time::{Duration, timeout},
 };
 use tokio_util::codec::Framed;
@@ -33,8 +33,8 @@ use crate::{
     project::{ProjectError, ProjectResolver, ResolvedLocation},
     protocol::{
         AcknowledgedCommand, ClientMessage, ClientMode, Envelope, OpenDisposition,
-        PROTOCOL_VERSION, RenameSelector, SelectedTarget, ServerMessage, codec, decode_payload,
-        encode_payload,
+        PROTOCOL_VERSION, RenameSelector, SelectedTarget, SelectedView, ServerMessage, codec,
+        decode_payload, encode_payload,
     },
     resources::{
         CheckoutDestination, InitialPath, ResourceError, ResourceTree, TabPath, TargetSelector,
@@ -392,32 +392,261 @@ struct LeasedTarget {
     _lease: lease::LeaseGuard,
 }
 
+struct ObservedTarget {
+    selected: SelectedTarget,
+    terminal: Arc<TerminalHandle>,
+}
+
+const ATTACHMENT_UPDATE_CAPACITY: usize = 8;
+
+enum AttachmentUpdate {
+    Snapshot {
+        terminal_id: TerminalId,
+        screen: crate::domain::ScreenSnapshot,
+    },
+    Error {
+        terminal_id: TerminalId,
+        message: String,
+    },
+    Exited {
+        terminal_id: TerminalId,
+        exit_code: Option<i32>,
+    },
+}
+
 struct Attachment {
-    target: LeasedTarget,
-    snapshots: watch::Receiver<crate::domain::ScreenSnapshot>,
-    events: broadcast::Receiver<TerminalEvent>,
-    lifecycle: watch::Receiver<TerminalLifecycle>,
+    panes: Vec<ObservedTarget>,
+    focused: LeasedTarget,
+    updates: mpsc::Receiver<AttachmentUpdate>,
+    update_sender: mpsc::Sender<AttachmentUpdate>,
+    tasks: Vec<JoinHandle<()>>,
 }
 
 impl Attachment {
-    fn new(target: LeasedTarget) -> Self {
-        let snapshots = target.terminal.subscribe_snapshots();
-        let events = target.terminal.subscribe_events();
-        let lifecycle = target.terminal.subscribe_lifecycle();
-        Self {
-            target,
-            snapshots,
-            events,
-            lifecycle,
+    fn new(panes: Vec<ObservedTarget>, focused: LeasedTarget) -> Self {
+        let (update_sender, updates) = mpsc::channel(ATTACHMENT_UPDATE_CAPACITY);
+        let mut attachment = Self {
+            panes,
+            focused,
+            updates,
+            update_sender,
+            tasks: Vec::new(),
+        };
+        for pane in &attachment.panes {
+            attachment.tasks.push(watch_attachment(
+                Arc::clone(&pane.terminal),
+                attachment.update_sender.clone(),
+            ));
+        }
+        attachment
+    }
+
+    fn single(target: LeasedTarget) -> Self {
+        let observed = ObservedTarget {
+            selected: target.selected.clone(),
+            terminal: Arc::clone(&target.terminal),
+        };
+        Self::new(vec![observed], target)
+    }
+
+    fn selected(&self) -> SelectedView {
+        SelectedView {
+            focused: self.focused.selected.clone(),
+            panes: self
+                .panes
+                .iter()
+                .map(|pane| pane.selected.clone())
+                .collect(),
         }
     }
 
-    fn exit_code(&self) -> Option<Option<i32>> {
-        match *self.lifecycle.borrow() {
-            TerminalLifecycle::Running => None,
-            TerminalLifecycle::Exited { exit_code } => Some(exit_code),
+    fn focused_terminal(&self) -> &Arc<TerminalHandle> {
+        &self.focused.terminal
+    }
+
+    fn terminal(&self, terminal_id: TerminalId) -> Option<&Arc<TerminalHandle>> {
+        self.panes
+            .iter()
+            .find(|pane| pane.selected.terminal_id == terminal_id)
+            .map(|pane| &pane.terminal)
+    }
+
+    fn refresh_focus(&mut self, selected: SelectedTarget) -> bool {
+        if self.focused.selected.terminal_id != selected.terminal_id {
+            return false;
+        }
+        let Some(pane) = self
+            .panes
+            .iter_mut()
+            .find(|pane| pane.selected.terminal_id == selected.terminal_id)
+        else {
+            return false;
+        };
+        pane.selected = selected.clone();
+        self.focused.selected = selected;
+        true
+    }
+
+    fn add(&mut self, target: LeasedTarget) {
+        self.tasks.push(watch_attachment(
+            Arc::clone(&target.terminal),
+            self.update_sender.clone(),
+        ));
+        self.panes.push(ObservedTarget {
+            selected: target.selected.clone(),
+            terminal: Arc::clone(&target.terminal),
+        });
+        self.focused = target;
+    }
+
+    fn replace_panes(&mut self, panes: Vec<ObservedTarget>) {
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
+        self.panes = panes;
+        for pane in &self.panes {
+            self.tasks.push(watch_attachment(
+                Arc::clone(&pane.terminal),
+                self.update_sender.clone(),
+            ));
         }
     }
+
+    fn remove(&mut self, terminal_id: TerminalId) -> bool {
+        let Some(index) = self
+            .panes
+            .iter()
+            .position(|pane| pane.selected.terminal_id == terminal_id)
+        else {
+            return false;
+        };
+        self.tasks.remove(index).abort();
+        self.panes.remove(index);
+        true
+    }
+
+    fn replacement_panes(&self, terminal_id: TerminalId) -> Vec<PaneId> {
+        let Some(index) = self
+            .panes
+            .iter()
+            .position(|pane| pane.selected.terminal_id == terminal_id)
+        else {
+            return Vec::new();
+        };
+        self.panes[index + 1..]
+            .iter()
+            .chain(self.panes[..index].iter().rev())
+            .map(|pane| pane.selected.pane_id)
+            .collect()
+    }
+
+    fn tab_id(&self) -> TabId {
+        self.focused.selected.tab_id
+    }
+
+    fn all_running(&self) -> Result<(), DaemonError> {
+        if let TerminalLifecycle::Exited { exit_code } =
+            self.focused.terminal.subscribe_lifecycle().borrow().clone()
+        {
+            return Err(DaemonError::new(
+                "terminal_exited",
+                format!("terminal already exited with status {exit_code:?}"),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Attachment {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+fn watch_attachment(
+    terminal: Arc<TerminalHandle>,
+    updates: mpsc::Sender<AttachmentUpdate>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let terminal_id = terminal.id();
+        let mut snapshots = terminal.subscribe_snapshots();
+        let mut events = terminal.subscribe_events();
+        let mut lifecycle = terminal.subscribe_lifecycle();
+
+        let screen = snapshots.borrow_and_update().clone();
+        if updates
+            .send(AttachmentUpdate::Snapshot {
+                terminal_id,
+                screen,
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        loop {
+            let exit_code = match lifecycle.borrow().clone() {
+                TerminalLifecycle::Running => None,
+                TerminalLifecycle::Exited { exit_code } => Some(exit_code),
+            };
+            if let Some(exit_code) = exit_code {
+                if snapshots.has_changed().unwrap_or(false) {
+                    let screen = snapshots.borrow_and_update().clone();
+                    if updates
+                        .send(AttachmentUpdate::Snapshot {
+                            terminal_id,
+                            screen,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                let _ = updates
+                    .send(AttachmentUpdate::Exited {
+                        terminal_id,
+                        exit_code,
+                    })
+                    .await;
+                return;
+            }
+
+            tokio::select! {
+                changed = snapshots.changed() => {
+                    if changed.is_err() { return; }
+                    let screen = snapshots.borrow_and_update().clone();
+                    if updates.send(AttachmentUpdate::Snapshot { terminal_id, screen }).await.is_err() {
+                        return;
+                    }
+                }
+                event = events.recv() => match event {
+                    Ok(TerminalEvent::TerminalExited { .. }) => {}
+                    Ok(TerminalEvent::Error { message }) => {
+                        if updates
+                            .send(AttachmentUpdate::Error {
+                                terminal_id,
+                                message,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                },
+                changed = lifecycle.changed() => {
+                    if changed.is_err() { return; }
+                    // Durable exit state is handled at the top, after any final snapshot.
+                }
+            }
+        }
+    })
 }
 
 /// Bind Fut's sole socket and run while at least one session is alive.
@@ -702,127 +931,106 @@ async fn handle_connection(
                 .await?;
                 return Ok(());
             }
-            let selected = match lease_target(&shared, selector, client).await {
-                Ok(selected) => selected,
+            let attachment = match lease_view(&shared, selector, client).await {
+                Ok(attachment) => attachment,
                 Err(error) => {
                     send_error(&mut framed, first.request_id, error.code, &error.message).await?;
                     return Ok(());
                 }
             };
-            (Some(selected), Some(size))
+            if let Err(error) = attachment.all_running() {
+                send_error(&mut framed, first.request_id, error.code, &error.message).await?;
+                return Ok(());
+            }
+            (Some(attachment), Some(size))
         }
         ClientMode::Control => (None, None),
     };
-    let current_lifecycle = leased
-        .as_ref()
-        .map(|target| target.terminal.subscribe_lifecycle().borrow().clone());
-    if let Some(TerminalLifecycle::Exited { exit_code }) = current_lifecycle {
-        send_error(
-            &mut framed,
-            first.request_id,
-            "terminal_exited",
-            &format!("terminal already exited with status {exit_code:?}"),
-        )
-        .await?;
-        return Ok(());
-    }
     send(
         &mut framed,
         first.request_id,
         ServerMessage::Welcome {
             version: PROTOCOL_VERSION,
             server_version: env!("CARGO_PKG_VERSION").into(),
-            selected: leased.as_ref().map(|target| target.selected.clone()),
+            selected: leased.as_ref().map(Attachment::selected),
         },
     )
     .await?;
 
-    let Some(requested_size) = interactive_size else {
+    let Some(spawn_size) = interactive_size else {
         return control_loop(&mut framed, shared, exited, shutdown).await;
     };
-    let target = leased.expect("interactive connection selected a terminal");
-    let mut attachment = Attachment::new(target);
-    let mut size = attachment.snapshots.borrow().size;
-    match attachment.target.terminal.resize(requested_size).await {
-        Ok(()) => size = requested_size,
-        Err(error) => send_command_error(&mut framed, None, error).await?,
-    }
-    let initial_screen = attachment.snapshots.borrow_and_update().clone();
-    send(
-        &mut framed,
-        None,
-        ServerMessage::Snapshot {
-            terminal_id: attachment.target.selected.terminal_id,
-            screen: initial_screen,
-        },
-    )
-    .await?;
+    let mut attachment = leased.expect("interactive connection selected a tab view");
 
     loop {
-        // A watch receiver created after the terminal exits considers its current
-        // value already seen. Inspect that durable value before waiting so exit
-        // delivery never depends on changed() observing a transition.
-        if let Some(exit_code) = attachment.exit_code() {
-            if attachment.snapshots.has_changed().unwrap_or(false) {
-                let screen = attachment.snapshots.borrow_and_update().clone();
-                send(
-                    &mut framed,
-                    None,
-                    ServerMessage::Snapshot {
-                        terminal_id: attachment.target.selected.terminal_id,
-                        screen,
-                    },
-                )
-                .await?;
-            }
-            send(
-                &mut framed,
-                None,
-                ServerMessage::TerminalExited {
-                    terminal_id: attachment.target.selected.terminal_id,
-                    exit_code,
-                },
-            )
-            .await?;
-            break;
-        }
-
         tokio::select! {
             frame = framed.next() => {
                 let Some(frame) = frame else { break };
                 let envelope: Envelope<ClientMessage> = decode_payload(&frame?)?;
                 match envelope.message {
-                    ClientMessage::Input { bytes } => command_response(&mut framed, envelope.request_id, AcknowledgedCommand::Input, attachment.target.terminal.input(bytes).await).await?,
-                    ClientMessage::Resize { size: requested } => {
-                        if let Err(error) = requested.validate() {
+                    ClientMessage::Input { bytes } => command_response(
+                        &mut framed,
+                        envelope.request_id,
+                        AcknowledgedCommand::Input,
+                        attachment.focused_terminal().input(bytes).await,
+                    ).await?,
+                    ClientMessage::Resize { terminal_id, size } => {
+                        if let Err(error) = size.validate() {
                             send_error(&mut framed, envelope.request_id, "invalid_size", &error.to_string()).await?;
+                        } else if terminal_id == attachment.focused.selected.terminal_id {
+                            command_response(
+                                &mut framed,
+                                envelope.request_id,
+                                AcknowledgedCommand::Resize,
+                                attachment.focused_terminal().resize(size).await,
+                            ).await?;
                         } else {
-                            let result = attachment.target.terminal.resize(requested).await;
-                            if result.is_ok() { size = requested; }
-                            command_response(&mut framed, envelope.request_id, AcknowledgedCommand::Resize, result).await?;
+                            send_error(
+                                &mut framed,
+                                envelope.request_id,
+                                "not_focused",
+                                "only the focused terminal may be resized",
+                            ).await?;
                         }
                     }
                     ClientMessage::SelectTarget { selector } => {
-                        match resolve_current_target(&shared, &selector, attachment.target.selected.terminal_id).await {
-                            Ok(Some(selected)) => {
-                                attachment.target.selected = selected.clone();
-                                send(&mut framed, envelope.request_id, ServerMessage::TargetSelected { selected }).await?;
-                                continue;
-                            }
+                        let selected = match resolve_target(&shared, &selector).await {
+                            Ok(selected) => selected,
                             Err(error) => {
                                 send_error(&mut framed, envelope.request_id, error.code, &error.message).await?;
                                 continue;
                             }
-                            Ok(None) => {}
+                        };
+                        if selected.terminal_id == attachment.focused.selected.terminal_id {
+                            let panes = match observe_tab(
+                                &shared,
+                                selected.tab_id,
+                                selected.terminal_id,
+                            ).await {
+                                Ok(panes) => panes,
+                                Err(error) => {
+                                    send_error(&mut framed, envelope.request_id, error.code, &error.message).await?;
+                                    continue;
+                                }
+                            };
+                            attachment.refresh_focus(selected);
+                            attachment.replace_panes(panes);
+                            send(
+                                &mut framed,
+                                envelope.request_id,
+                                ServerMessage::TargetSelected { selected: attachment.selected() },
+                            ).await?;
+                            continue;
                         }
-                        match switch_candidate(&shared, selector, client, size).await {
-                            Ok(mut candidate) => {
-                                let screen = candidate.snapshots.borrow_and_update().clone();
-                                let terminal_id = candidate.target.selected.terminal_id;
-                                let selected = candidate.target.selected.clone();
+                        match switch_candidate(&shared, selector, client).await {
+                            Ok(candidate) => {
+                                let selected = candidate.selected();
+                                send(
+                                    &mut framed,
+                                    envelope.request_id,
+                                    ServerMessage::TargetSelected { selected },
+                                ).await?;
                                 attachment = candidate;
-                                send(&mut framed, envelope.request_id, ServerMessage::TargetSelected { selected }).await?;
-                                send(&mut framed, None, ServerMessage::Snapshot { terminal_id, screen }).await?;
                             }
                             Err(error) => send_error(&mut framed, envelope.request_id, error.code, &error.message).await?,
                         }
@@ -834,25 +1042,22 @@ async fn handle_connection(
                             cwd,
                             program,
                             argv,
-                            size,
+                            size: spawn_size,
                         };
                         match create_tab(&shared, &exited, request, CreationMode::Attached(client)).await {
                             Ok(CreatedTerminal::Attached(target)) => {
-                                let mut candidate = Attachment::new(target);
-                                if let Some(exit_code) = candidate.exit_code() {
-                                    send_error(
+                                let selected = target.selected.clone();
+                                let candidate = Attachment::single(target);
+                                if let Err(error) = candidate.all_running() {
+                                    send_error(&mut framed, envelope.request_id, error.code, &error.message).await?;
+                                } else {
+                                    send(&mut framed, envelope.request_id, ServerMessage::TabCreated { selected }).await?;
+                                    send(
                                         &mut framed,
                                         envelope.request_id,
-                                        "terminal_exited",
-                                        &format!("terminal already exited with status {exit_code:?}"),
+                                        ServerMessage::TargetSelected { selected: candidate.selected() },
                                     ).await?;
-                                } else {
-                                    let screen = candidate.snapshots.borrow_and_update().clone();
-                                    let terminal_id = candidate.target.selected.terminal_id;
-                                    let selected = candidate.target.selected.clone();
                                     attachment = candidate;
-                                    send(&mut framed, envelope.request_id, ServerMessage::TabCreated { selected }).await?;
-                                    send(&mut framed, None, ServerMessage::Snapshot { terminal_id, screen }).await?;
                                 }
                             }
                             Ok(CreatedTerminal::Detached(_)) => unreachable!("attached creation returns a lease"),
@@ -860,11 +1065,30 @@ async fn handle_connection(
                         }
                     }
                     ClientMessage::CreatePane { tab_id, cwd, program, argv } => {
-                        let request = CreatePaneRequest { tab_id, cwd, program, argv, size };
+                        if tab_id != attachment.tab_id() {
+                            send_error(
+                                &mut framed,
+                                envelope.request_id,
+                                "different_tab",
+                                "interactive pane creation requires the currently selected tab",
+                            ).await?;
+                            continue;
+                        }
+                        let request = CreatePaneRequest {
+                            tab_id,
+                            cwd,
+                            program,
+                            argv,
+                            size: spawn_size,
+                        };
                         match create_pane(&shared, &exited, request, CreationMode::Attached(client)).await {
                             Ok(CreatedTerminal::Attached(target)) => {
-                                let mut candidate = Attachment::new(target);
-                                if let Some(exit_code) = candidate.exit_code() {
+                                let lifecycle = target
+                                    .terminal
+                                    .subscribe_lifecycle()
+                                    .borrow()
+                                    .clone();
+                                if let TerminalLifecycle::Exited { exit_code } = lifecycle {
                                     send_error(
                                         &mut framed,
                                         envelope.request_id,
@@ -872,12 +1096,14 @@ async fn handle_connection(
                                         &format!("terminal already exited with status {exit_code:?}"),
                                     ).await?;
                                 } else {
-                                    let screen = candidate.snapshots.borrow_and_update().clone();
-                                    let terminal_id = candidate.target.selected.terminal_id;
-                                    let selected = candidate.target.selected.clone();
-                                    attachment = candidate;
+                                    let selected = target.selected.clone();
+                                    attachment.add(target);
                                     send(&mut framed, envelope.request_id, ServerMessage::PaneCreated { selected }).await?;
-                                    send(&mut framed, None, ServerMessage::Snapshot { terminal_id, screen }).await?;
+                                    send(
+                                        &mut framed,
+                                        envelope.request_id,
+                                        ServerMessage::TargetSelected { selected: attachment.selected() },
+                                    ).await?;
                                 }
                             }
                             Ok(CreatedTerminal::Detached(_)) => unreachable!("attached creation returns a lease"),
@@ -898,24 +1124,60 @@ async fn handle_connection(
                     ClientMessage::Hello { .. } => send_error(&mut framed, envelope.request_id, "already_hello", "hello was already received").await?,
                 }
             },
-            changed = attachment.snapshots.changed() => {
-                if changed.is_err() { break; }
-                let screen = attachment.snapshots.borrow_and_update().clone();
-                send(&mut framed, None, ServerMessage::Snapshot {
-                    terminal_id: attachment.target.selected.terminal_id,
-                    screen,
-                }).await?;
-            },
-            event = attachment.events.recv() => match event {
-                Ok(TerminalEvent::TerminalExited { .. }) => {},
-                Ok(TerminalEvent::Error { message }) => send_error(&mut framed, None, "terminal", &message).await?,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            },
-            changed = attachment.lifecycle.changed() => {
-                if changed.is_err() { break; }
-                // The durable state is handled at the top of the loop, after any
-                // queued final snapshot has had a chance to win this select.
+            update = attachment.updates.recv() => match update {
+                Some(AttachmentUpdate::Snapshot { terminal_id, screen }) => {
+                    if attachment.terminal(terminal_id).is_some() {
+                        send(&mut framed, None, ServerMessage::Snapshot { terminal_id, screen }).await?;
+                    }
+                }
+                Some(AttachmentUpdate::Error { terminal_id, message }) => {
+                    if attachment.terminal(terminal_id).is_some() {
+                        send_error(&mut framed, None, "terminal", &message).await?;
+                    }
+                }
+                Some(AttachmentUpdate::Exited { terminal_id, exit_code }) => {
+                    if attachment.terminal(terminal_id).is_none() {
+                        continue;
+                    }
+                    let focused = terminal_id == attachment.focused.selected.terminal_id;
+                    let replacements = if focused {
+                        attachment.replacement_panes(terminal_id)
+                    } else {
+                        Vec::new()
+                    };
+                    send(
+                        &mut framed,
+                        None,
+                        ServerMessage::TerminalExited { terminal_id, exit_code },
+                    ).await?;
+                    if focused {
+                        let mut replacement = None;
+                        for pane_id in replacements {
+                            if let Ok(candidate) = lease_view(
+                                &shared,
+                                Some(TargetSelector::Pane(pane_id)),
+                                client,
+                            ).await
+                                && candidate.all_running().is_ok()
+                            {
+                                replacement = Some(candidate);
+                                break;
+                            }
+                        }
+                        let Some(replacement) = replacement else {
+                            break;
+                        };
+                        attachment = replacement;
+                    } else {
+                        attachment.remove(terminal_id);
+                    }
+                    send(
+                        &mut framed,
+                        None,
+                        ServerMessage::TargetSelected { selected: attachment.selected() },
+                    ).await?;
+                }
+                None => break,
             },
         }
     }
@@ -1152,22 +1414,81 @@ async fn control_loop(
     Ok(())
 }
 
-async fn lease_target(
+async fn lease_view(
     shared: &Shared,
     selector: Option<TargetSelector>,
     client: ClientId,
-) -> Result<LeasedTarget, DaemonError> {
+) -> Result<Attachment, DaemonError> {
     let state = shared.lock().await;
     if !state.accepting {
         return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
     }
-    let target = state
+    let focused = state.resources.resolve_terminal_target(selector)?;
+    let paths = state
         .resources
-        .resolve_terminal_target(selector)
-        .map_err(DaemonError::from)?;
+        .open_terminal_paths_for_tab(focused.tab_id)?;
+    let focused_runtime = state
+        .runtimes
+        .get(&focused.terminal_id)
+        .ok_or_else(|| DaemonError::new("not_found", "terminal runtime not found"))?;
+    if let TerminalLifecycle::Exited { exit_code } = focused_runtime
+        .handle
+        .subscribe_lifecycle()
+        .borrow()
+        .clone()
+    {
+        return Err(DaemonError::new(
+            "terminal_exited",
+            format!("terminal already exited with status {exit_code:?}"),
+        ));
+    }
+    let guard = focused_runtime.lease.acquire(client).ok_or_else(|| {
+        DaemonError::new(
+            "already_attached",
+            "another interactive client holds this terminal's attachment lease",
+        )
+    })?;
+    let focused_target = LeasedTarget {
+        selected: selected_target(focused, &focused_runtime.handle),
+        terminal: Arc::clone(&focused_runtime.handle),
+        _lease: guard,
+    };
+    let mut panes = Vec::with_capacity(paths.len());
+    for path in paths {
+        let runtime = state
+            .runtimes
+            .get(&path.terminal_id)
+            .ok_or_else(|| DaemonError::new("not_found", "terminal runtime not found"))?;
+        if path.terminal_id != focused.terminal_id
+            && matches!(
+                runtime.handle.subscribe_lifecycle().borrow().clone(),
+                TerminalLifecycle::Exited { .. }
+            )
+        {
+            continue;
+        }
+        panes.push(ObservedTarget {
+            selected: selected_target(path, &runtime.handle),
+            terminal: Arc::clone(&runtime.handle),
+        });
+    }
+    Ok(Attachment::new(panes, focused_target))
+}
+
+async fn resolve_target(
+    shared: &Shared,
+    selector: &TargetSelector,
+) -> Result<SelectedTarget, DaemonError> {
+    let state = shared.lock().await;
+    if !state.accepting {
+        return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
+    }
+    let path = state
+        .resources
+        .resolve_terminal_target(Some(selector.clone()))?;
     let runtime = state
         .runtimes
-        .get(&target.terminal_id)
+        .get(&path.terminal_id)
         .ok_or_else(|| DaemonError::new("not_found", "terminal runtime not found"))?;
     if let TerminalLifecycle::Exited { exit_code } =
         runtime.handle.subscribe_lifecycle().borrow().clone()
@@ -1177,74 +1498,48 @@ async fn lease_target(
             format!("terminal already exited with status {exit_code:?}"),
         ));
     }
-    let guard = runtime.lease.acquire(client).ok_or_else(|| {
-        DaemonError::new(
-            "already_attached",
-            "another interactive client holds this terminal's attachment lease",
-        )
-    })?;
-    Ok(LeasedTarget {
-        selected: SelectedTarget {
-            session_id: target.session_id,
-            workspace_id: target.workspace_id,
-            tab_id: target.tab_id,
-            pane_id: target.pane_id,
-            terminal_id: target.terminal_id,
-            child_pid: runtime.handle.child_pid(),
-        },
-        terminal: Arc::clone(&runtime.handle),
-        _lease: guard,
-    })
+    Ok(selected_target(path, &runtime.handle))
 }
 
-async fn resolve_current_target(
+async fn observe_tab(
     shared: &Shared,
-    selector: &TargetSelector,
-    current: TerminalId,
-) -> Result<Option<SelectedTarget>, DaemonError> {
+    tab_id: TabId,
+    focused: TerminalId,
+) -> Result<Vec<ObservedTarget>, DaemonError> {
     let state = shared.lock().await;
     if !state.accepting {
         return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
     }
-    let path = state
-        .resources
-        .resolve_terminal_target(Some(selector.clone()))?;
-    if path.terminal_id != current {
-        return Ok(None);
+    let paths = state.resources.open_terminal_paths_for_tab(tab_id)?;
+    let mut panes = Vec::with_capacity(paths.len());
+    for path in paths {
+        let runtime = state
+            .runtimes
+            .get(&path.terminal_id)
+            .ok_or_else(|| DaemonError::new("not_found", "terminal runtime not found"))?;
+        if path.terminal_id != focused
+            && matches!(
+                runtime.handle.subscribe_lifecycle().borrow().clone(),
+                TerminalLifecycle::Exited { .. }
+            )
+        {
+            continue;
+        }
+        panes.push(ObservedTarget {
+            selected: selected_target(path, &runtime.handle),
+            terminal: Arc::clone(&runtime.handle),
+        });
     }
-    let runtime = state
-        .runtimes
-        .get(&path.terminal_id)
-        .ok_or_else(|| DaemonError::new("not_found", "terminal runtime not found"))?;
-    Ok(Some(selected_target(path, &runtime.handle)))
+    Ok(panes)
 }
 
 async fn switch_candidate(
     shared: &Shared,
     selector: TargetSelector,
     client: ClientId,
-    size: TerminalSize,
 ) -> Result<Attachment, DaemonError> {
-    let target = lease_target(shared, Some(selector), client).await?;
-    let attachment = Attachment::new(target);
-    if let TerminalLifecycle::Exited { exit_code } = attachment.lifecycle.borrow().clone() {
-        return Err(DaemonError::new(
-            "terminal_exited",
-            format!("terminal already exited with status {exit_code:?}"),
-        ));
-    }
-    attachment
-        .target
-        .terminal
-        .resize(size)
-        .await
-        .map_err(|error| DaemonError::command("resize_failed", error))?;
-    if let TerminalLifecycle::Exited { exit_code } = attachment.lifecycle.borrow().clone() {
-        return Err(DaemonError::new(
-            "terminal_exited",
-            format!("terminal exited with status {exit_code:?}"),
-        ));
-    }
+    let attachment = lease_view(shared, Some(selector), client).await?;
+    attachment.all_running()?;
     Ok(attachment)
 }
 
