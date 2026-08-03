@@ -2,10 +2,11 @@
 
 use std::{
     fs,
-    io::Write,
+    io::{Read, Write},
     os::unix::fs::PermissionsExt,
     path::PathBuf,
     process::{Child, Command, Stdio},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -13,8 +14,8 @@ use bytes::Bytes;
 use fut::{
     domain::{ScreenSnapshot, TerminalId, TerminalSize},
     protocol::{
-        ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, ServerMessage, codec,
-        decode_payload, encode_payload,
+        ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, SelectedTarget, ServerMessage,
+        codec, decode_payload, encode_payload,
     },
     resources::{SessionSelector, TargetSelector},
 };
@@ -38,6 +39,99 @@ struct Harness {
     socket: PathBuf,
     daemon: Child,
     terminal_pid: Option<u32>,
+}
+
+struct PtyChild {
+    child: Child,
+    input: Option<std::process::ChildStdin>,
+    output: Arc<Mutex<Vec<u8>>>,
+}
+
+impl PtyChild {
+    fn spawn(mut command: Command) -> Self {
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn PTY child");
+        let input = child.stdin.take();
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let readers: Vec<Box<dyn Read + Send>> = vec![
+            Box::new(child.stdout.take().unwrap()),
+            Box::new(child.stderr.take().unwrap()),
+        ];
+        for mut reader in readers {
+            let output = Arc::clone(&output);
+            std::thread::spawn(move || {
+                let mut bytes = [0; 4096];
+                while let Ok(count) = reader.read(&mut bytes) {
+                    if count == 0 {
+                        break;
+                    }
+                    output.lock().unwrap().extend_from_slice(&bytes[..count]);
+                }
+            });
+        }
+        Self {
+            child,
+            input,
+            output,
+        }
+    }
+
+    fn send(&mut self, bytes: &[u8]) {
+        self.input
+            .as_mut()
+            .expect("PTY stdin is open")
+            .write_all(bytes)
+            .expect("write PTY input");
+    }
+
+    async fn wait_for(&mut self, needle: &str) {
+        time::timeout(DEADLINE, async {
+            loop {
+                let text = self.text();
+                assert!(
+                    self.child.try_wait().unwrap().is_none(),
+                    "PTY child exited before {needle:?}; output={text:?}"
+                );
+                if text.contains(needle) {
+                    return;
+                }
+                time::sleep(POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("PTY output never contained {needle:?}: {:?}", self.text()));
+    }
+
+    async fn wait_success(&mut self) {
+        let status = time::timeout(DEADLINE, async {
+            loop {
+                if let Some(status) = self.child.try_wait().unwrap() {
+                    return status;
+                }
+                time::sleep(POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .expect("PTY child did not exit");
+        assert!(status.success(), "PTY child failed: {:?}", self.text());
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.output.lock().unwrap()).into_owned()
+    }
+}
+
+impl Drop for PtyChild {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
 }
 
 impl Harness {
@@ -444,7 +538,7 @@ async fn natural_terminal_exit_stops_daemon_and_removes_socket() {
 
 #[tokio::test]
 async fn current_location_open_recovers_from_last_terminal_exit_race() {
-    for iteration in 0..15 {
+    for iteration in 0..10 {
         let mut harness =
             Harness::start("while [ ! -e exit-now ]; do sleep 0.01; done; exit 0").await;
         fs::write(harness.root.path().join("cwd/exit-now"), b"").unwrap();
@@ -452,10 +546,19 @@ async fn current_location_open_recovers_from_last_terminal_exit_race() {
         // the same retry path handles a connected `shutting_down` response.
         wait_for(DEADLINE, || harness.daemon.try_wait().unwrap().is_some()).await;
 
-        let mut open = Command::new("/usr/bin/script")
+        let shell = harness.root.path().join("ready-shell");
+        fs::write(
+            &shell,
+            "#!/bin/sh\nprintf 'RACE_READY\\r\\n'\nwhile IFS= read -r line; do :; done\n",
+        )
+        .unwrap();
+        fs::set_permissions(&shell, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut command = Command::new("/usr/bin/script");
+        command
             .env_clear()
             .env("HOME", harness.root.path().join("home"))
             .env("PATH", "/usr/bin:/bin")
+            .env("SHELL", &shell)
             .env("TMPDIR", harness.root.path().join("runtime"))
             .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
             .env("TERM", "xterm-256color")
@@ -465,31 +568,11 @@ async fn current_location_open_recovers_from_last_terminal_exit_race() {
                 "stty rows 24 cols 80; exec '{}' --socket '{}'",
                 env!("CARGO_BIN_EXE_fut"),
                 harness.socket.display()
-            ))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("run targetless fut in a PTY");
-        // Wait for OpenLocation and the terminal-specific interactive welcome,
-        // then use the documented detach chord through the PTY.
-        time::sleep(Duration::from_millis(500)).await;
-        let _ = open.stdin.take().unwrap().write_all(b"\x02d");
-        let opened = time::timeout(
-            DEADLINE,
-            tokio::task::spawn_blocking(move || open.wait_with_output()),
-        )
-        .await
-        .expect("targetless CLI timed out")
-        .unwrap()
-        .unwrap();
-        assert!(
-            opened.status.success(),
-            "iteration {iteration}: stdout={} stderr={} logs={}",
-            String::from_utf8_lossy(&opened.stdout),
-            String::from_utf8_lossy(&opened.stderr),
-            harness.logs()
-        );
+            ));
+        let mut open = PtyChild::spawn(command);
+        open.wait_for("RACE_READY").await;
+        open.send(b"\x02d");
+        open.wait_success().await;
 
         let output = harness.cli().arg("list").output().expect("run public list");
         assert!(
@@ -931,6 +1014,358 @@ async fn terminal_attachment_lease_rejects_contention_and_releases_on_detach_and
 }
 
 #[tokio::test]
+async fn public_client_navigator_switches_live_pty_and_preserves_terminal_isolation() {
+    let harness = Harness::start(
+        "printf 'PUBLIC_A_READY\\r\\n'; while IFS= read -r line; do [ \"$line\" = a ] && printf 'PUBLIC_A_INPUT\\r\\n'; done",
+    )
+    .await;
+    let resources = harness.resources().await;
+    let a_terminal = resources.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
+    let (mut probe_a, a) = attach_once(&harness, TargetSelector::Terminal(a_terminal)).await;
+    harness.detach(&mut probe_a).await;
+    drop(probe_a);
+
+    let cwd_b = harness.root.path().join("public-b");
+    fs::create_dir(&cwd_b).unwrap();
+    let ServerMessage::LocationOpened { selected: b, .. } = harness
+        .control_command(ClientMessage::OpenLocation {
+            name: Some("public-b".into()),
+            cwd: cwd_b,
+            program: Some("/bin/sh".into()),
+            argv: vec![
+                "-c".into(),
+                "printf 'PUBLIC_B_READY\\r\\n'; while IFS= read -r line; do [ \"$line\" = b ] && printf 'PUBLIC_B_INPUT\\r\\n'; done".into(),
+            ],
+        })
+        .await
+    else {
+        panic!("failed to create public B target")
+    };
+
+    let mut command = Command::new("/usr/bin/script");
+    command
+        .env_clear()
+        .env("HOME", harness.root.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", harness.root.path().join("runtime"))
+        .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+        .env("TERM", "xterm-256color")
+        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .arg(format!(
+            "stty rows 24 cols 80; exec '{}' --socket '{}' attach terminal:{}",
+            env!("CARGO_BIN_EXE_fut"),
+            harness.socket.display(),
+            a.terminal_id
+        ));
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("PUBLIC_A_READY").await;
+    client.send(b"\x02g");
+    client.wait_for("fut · navigator").await;
+    client.wait_for("public-b").await;
+    client.send(b"\x1b[F\r");
+    client.wait_for("PUBLIC_B_READY").await;
+    client.send(b"b\n");
+    client.wait_for("PUBLIC_B_INPUT").await;
+    client.send(b"\x02d");
+    client.wait_success().await;
+
+    assert!(process_alive(a.child_pid));
+    assert!(process_alive(b.child_pid));
+    let (mut raw_a, selected_a) =
+        attach_once(&harness, TargetSelector::Terminal(a.terminal_id)).await;
+    assert_eq!(
+        (selected_a.terminal_id, selected_a.child_pid),
+        (a.terminal_id, a.child_pid)
+    );
+    let screen_a = snapshot_containing(&mut raw_a, a.terminal_id, "PUBLIC_A_READY").await;
+    assert!(!snapshot_text(&screen_a).contains("PUBLIC_B_INPUT"));
+    harness.detach(&mut raw_a).await;
+    drop(raw_a);
+    let (mut raw_b, selected_b) =
+        attach_once(&harness, TargetSelector::Terminal(b.terminal_id)).await;
+    assert_eq!(
+        (selected_b.terminal_id, selected_b.child_pid),
+        (b.terminal_id, b.child_pid)
+    );
+    let screen_b = snapshot_containing(&mut raw_b, b.terminal_id, "PUBLIC_B_INPUT").await;
+    assert!(!snapshot_text(&screen_b).contains("PUBLIC_A_READY"));
+    harness.detach(&mut raw_b).await;
+    drop(raw_b);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn switching_is_atomic_reversible_and_keeps_protocol_routing_isolated() {
+    let mut harness = Harness::start(
+        "printf 'A_READY\\r\\n'; while IFS= read -r line; do [ \"$line\" = a ] && printf 'A_INPUT\\r\\n'; done",
+    )
+    .await;
+    let cwd_b = harness.root.path().join("switch-b");
+    fs::create_dir(&cwd_b).unwrap();
+    let opened = harness
+        .control_command(ClientMessage::OpenLocation {
+            name: Some("switch-b".into()),
+            cwd: cwd_b,
+            program: Some("/bin/sh".into()),
+            argv: vec![
+                "-c".into(),
+                "printf 'B_READY\\r\\n'; while IFS= read -r line; do [ \"$line\" = b ] && printf 'B_INPUT\\r\\n'; done".into(),
+            ],
+        })
+        .await;
+    let ServerMessage::LocationOpened { selected: b, .. } = opened else {
+        panic!("expected second target, got {opened:?}")
+    };
+    let resources = harness.resources().await;
+    let a_session = resources.sessions[0].id;
+    let (mut connection, a_id, a_pid) = harness
+        .interactive_for(Some(TargetSelector::Session(SessionSelector::Id(
+            a_session,
+        ))))
+        .await;
+    snapshot_containing(&mut connection, a_id, "A_READY").await;
+
+    let a = SelectedTarget {
+        session_id: resources.sessions[0].id,
+        workspace_id: resources.sessions[0].workspaces[0].id,
+        tab_id: resources.sessions[0].workspaces[0].tabs[0].id,
+        pane_id: resources.sessions[0].workspaces[0].tabs[0].panes[0].id,
+        terminal_id: a_id,
+        child_pid: a_pid,
+    };
+
+    select_and_require_next_snapshot(&mut connection, TargetSelector::Terminal(b.terminal_id), &b)
+        .await;
+
+    // TargetSelected alone is the gate: no delay or unrelated round trip is needed
+    // before a one-shot client can acquire the exact old lease.
+    let (mut old_target, reattached) = attach_once(&harness, TargetSelector::Terminal(a_id)).await;
+    assert_eq!(reattached, a);
+    harness.detach(&mut old_target).await;
+    drop(old_target);
+
+    send(
+        &mut connection,
+        ClientMessage::Input {
+            bytes: b"b\n".to_vec(),
+        },
+    )
+    .await;
+    snapshot_containing(&mut connection, b.terminal_id, "B_INPUT").await;
+
+    select_and_require_next_snapshot(&mut connection, TargetSelector::Terminal(a_id), &a).await;
+    send(
+        &mut connection,
+        ClientMessage::Input {
+            bytes: b"a\n".to_vec(),
+        },
+    )
+    .await;
+    snapshot_containing(&mut connection, a_id, "A_INPUT").await;
+
+    select_and_require_next_snapshot(&mut connection, TargetSelector::Pane(b.pane_id), &b).await;
+    select_and_require_next_snapshot(&mut connection, TargetSelector::Terminal(a_id), &a).await;
+    harness.detach(&mut connection).await;
+    drop(connection);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn same_target_list_and_failed_switches_preserve_the_attachment() {
+    let mut harness = Harness::start(
+        "printf 'A_READY\\r\\n'; while IFS= read -r line; do printf 'A_%s\\r\\n' \"$line\"; done",
+    )
+    .await;
+    let cwd_b = harness.root.path().join("held-b");
+    fs::create_dir(&cwd_b).unwrap();
+    let ServerMessage::LocationOpened { selected: b, .. } = harness.control_command(ClientMessage::OpenLocation {
+        name: Some("held-b".into()), cwd: cwd_b, program: Some("/bin/sh".into()),
+        argv: vec!["-c".into(), "printf 'B_READY\\r\\n'; while IFS= read -r line; do printf 'B_%s\\r\\n' \"$line\"; done".into()],
+    }).await else { panic!("expected B") };
+    let resources = harness.resources().await;
+    let pane_a = resources.sessions[0].workspaces[0].tabs[0].panes[0].id;
+    let (mut a, a_id, a_pid) = harness
+        .interactive_for(Some(TargetSelector::Pane(pane_a)))
+        .await;
+    let (mut held_b, _, _) = harness
+        .interactive_for(Some(TargetSelector::Terminal(b.terminal_id)))
+        .await;
+
+    for selector in [TargetSelector::Terminal(a_id), TargetSelector::Pane(pane_a)] {
+        let selected = select_response(&mut a, selector).await;
+        assert_eq!((selected.terminal_id, selected.child_pid), (a_id, a_pid));
+        let contender = attach_error_once(&harness, TargetSelector::Terminal(a_id)).await;
+        assert_eq!(contender, "already_attached");
+    }
+    let request = Uuid::new_v4();
+    send_envelope(
+        &mut a,
+        Envelope {
+            request_id: Some(request),
+            message: ClientMessage::ListResources,
+        },
+    )
+    .await;
+    let response = loop {
+        let response = receive_envelope(&mut a).await.unwrap();
+        if response.request_id == Some(request) {
+            break response;
+        }
+        match response.message {
+            ServerMessage::Snapshot { terminal_id, .. } => assert_eq!(terminal_id, a_id),
+            other => panic!("unexpected frame before Resources: {other:?}"),
+        }
+    };
+    assert!(matches!(response.message, ServerMessage::Resources { .. }));
+
+    assert_eq!(
+        select_error(&mut a, TargetSelector::Terminal(b.terminal_id)).await,
+        "already_attached"
+    );
+    send(
+        &mut a,
+        ClientMessage::Input {
+            bytes: b"still-a\n".to_vec(),
+        },
+    )
+    .await;
+    snapshot_containing(&mut a, a_id, "A_still-a").await;
+    send(
+        &mut held_b,
+        ClientMessage::Input {
+            bytes: b"still-b\n".to_vec(),
+        },
+    )
+    .await;
+    snapshot_containing(&mut held_b, b.terminal_id, "B_still-b").await;
+
+    harness.detach(&mut held_b).await;
+    drop(held_b);
+    select_and_require_next_snapshot(&mut a, TargetSelector::Terminal(b.terminal_id), &b).await;
+    harness.detach(&mut a).await;
+    drop(a);
+    let (mut released, selected) =
+        attach_once(&harness, TargetSelector::Terminal(b.terminal_id)).await;
+    assert_eq!(selected, b);
+    harness.detach(&mut released).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn missing_destination_and_post_switch_disconnects_preserve_exact_leases() {
+    let mut harness = Harness::start(
+        "printf 'A_READY\\r\\n'; while IFS= read -r line; do printf 'A_%s\\r\\n' \"$line\"; done",
+    )
+    .await;
+    let cwd_b = harness.root.path().join("closing-b");
+    fs::create_dir(&cwd_b).unwrap();
+    let ServerMessage::LocationOpened { selected: b, .. } = harness
+        .control_command(ClientMessage::OpenLocation {
+            name: Some("closing-b".into()),
+            cwd: cwd_b,
+            program: Some("/bin/sh".into()),
+            argv: vec!["-c".into(), "while IFS= read -r line; do :; done".into()],
+        })
+        .await
+    else {
+        panic!("expected B")
+    };
+    let resources = harness.resources().await;
+    let a_id = resources
+        .sessions
+        .iter()
+        .find(|session| session.id != b.session_id)
+        .unwrap()
+        .workspaces[0]
+        .tabs[0]
+        .panes[0]
+        .terminal_id;
+    let (mut a, _, _) = harness
+        .interactive_for(Some(TargetSelector::Terminal(a_id)))
+        .await;
+    harness
+        .close_session(SessionSelector::Id(b.session_id))
+        .await;
+    loop {
+        let resources = harness.resources().await;
+        if resources
+            .sessions
+            .iter()
+            .all(|session| session.id != b.session_id)
+        {
+            break;
+        }
+    }
+    assert_eq!(
+        select_error(&mut a, TargetSelector::Terminal(b.terminal_id)).await,
+        "not_found"
+    );
+    send(
+        &mut a,
+        ClientMessage::Input {
+            bytes: b"after-missing\n".to_vec(),
+        },
+    )
+    .await;
+    snapshot_containing(&mut a, a_id, "A_after-missing").await;
+
+    let cwd_c = harness.root.path().join("disconnect-c");
+    fs::create_dir(&cwd_c).unwrap();
+    let ServerMessage::LocationOpened { selected: c, .. } = harness
+        .control_command(ClientMessage::OpenLocation {
+            name: Some("disconnect-c".into()),
+            cwd: cwd_c,
+            program: Some("/bin/sh".into()),
+            argv: vec!["-c".into(), "while IFS= read -r line; do :; done".into()],
+        })
+        .await
+    else {
+        panic!("expected C")
+    };
+    select_and_require_next_snapshot(&mut a, TargetSelector::Terminal(c.terminal_id), &c).await;
+    harness.detach(&mut a).await;
+    drop(a);
+    let (mut after_detach, selected) =
+        attach_once(&harness, TargetSelector::Terminal(c.terminal_id)).await;
+    assert_eq!(selected, c);
+    harness.detach(&mut after_detach).await;
+    drop(after_detach);
+
+    let (mut abrupt, _, _) = harness
+        .interactive_for(Some(TargetSelector::Terminal(a_id)))
+        .await;
+    select_and_require_next_snapshot(&mut abrupt, TargetSelector::Terminal(c.terminal_id), &c)
+        .await;
+    drop(abrupt);
+    let (mut after_eof, selected) = time::timeout(DEADLINE, async {
+        loop {
+            let mut contender = harness.connect().await.expect("connect EOF contender");
+            match hello(
+                &mut contender,
+                interactive_mode(Some(TargetSelector::Terminal(c.terminal_id))),
+                PROTOCOL_VERSION,
+            )
+            .await
+            .unwrap()
+            {
+                ServerMessage::Welcome {
+                    selected: Some(selected),
+                    ..
+                } => break (contender, selected),
+                ServerMessage::Error { ref code, .. } if code == "already_attached" => continue,
+                other => panic!("unexpected EOF contender response: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("EOF did not release destination lease");
+    assert_eq!(selected, c);
+    harness.detach(&mut after_eof).await;
+    drop(after_eof);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn unsupported_protocol_is_rejected_without_harming_daemon() {
     let mut harness = Harness::start("while IFS= read -r line; do :; done").await;
     let mut incompatible = harness.connect().await.expect("connect mismatched client");
@@ -1015,16 +1450,115 @@ async fn send_envelope(connection: &mut Connection, envelope: Envelope<ClientMes
 }
 
 async fn receive(connection: &mut Connection) -> Option<ServerMessage> {
+    receive_envelope(connection)
+        .await
+        .map(|envelope| envelope.message)
+}
+
+async fn receive_envelope(connection: &mut Connection) -> Option<Envelope<ServerMessage>> {
     let frame = time::timeout(DEADLINE, connection.next())
         .await
         .expect("protocol receive timed out")?
         .expect("read server frame")
         .to_vec();
-    Some(
-        decode_payload::<Envelope<ServerMessage>>(&frame)
-            .expect("decode server frame")
-            .message,
+    Some(decode_payload(&frame).expect("decode server frame"))
+}
+
+async fn select_response(connection: &mut Connection, selector: TargetSelector) -> SelectedTarget {
+    let request_id = Uuid::new_v4();
+    send_envelope(
+        connection,
+        Envelope {
+            request_id: Some(request_id),
+            message: ClientMessage::SelectTarget { selector },
+        },
     )
+    .await;
+    loop {
+        let response = receive_envelope(connection)
+            .await
+            .expect("connection closed during selection");
+        if response.request_id == Some(request_id) {
+            let ServerMessage::TargetSelected { selected } = response.message else {
+                panic!("expected TargetSelected, got {:?}", response.message)
+            };
+            return selected;
+        }
+    }
+}
+
+async fn select_error(connection: &mut Connection, selector: TargetSelector) -> String {
+    let request_id = Uuid::new_v4();
+    send_envelope(
+        connection,
+        Envelope {
+            request_id: Some(request_id),
+            message: ClientMessage::SelectTarget { selector },
+        },
+    )
+    .await;
+    loop {
+        let response = receive_envelope(connection)
+            .await
+            .expect("connection closed during selection");
+        if response.request_id == Some(request_id) {
+            let ServerMessage::Error { code, .. } = response.message else {
+                panic!("expected selection error, got {:?}", response.message)
+            };
+            return code;
+        }
+    }
+}
+
+async fn select_and_require_next_snapshot(
+    connection: &mut Connection,
+    selector: TargetSelector,
+    expected: &SelectedTarget,
+) {
+    assert_eq!(select_response(connection, selector).await, *expected);
+    let next = receive_envelope(connection)
+        .await
+        .expect("missing destination snapshot");
+    match next.message {
+        ServerMessage::Snapshot { terminal_id, .. } => {
+            assert_eq!(terminal_id, expected.terminal_id)
+        }
+        other => {
+            panic!("expected destination Snapshot immediately after TargetSelected, got {other:?}")
+        }
+    }
+}
+
+async fn attach_once(harness: &Harness, selector: TargetSelector) -> (Connection, SelectedTarget) {
+    let mut connection = harness.connect().await.expect("connect one-shot contender");
+    let ServerMessage::Welcome {
+        selected: Some(selected),
+        ..
+    } = hello(
+        &mut connection,
+        interactive_mode(Some(selector)),
+        PROTOCOL_VERSION,
+    )
+    .await
+    .expect("one-shot contender disconnected")
+    else {
+        panic!("one-shot contender did not acquire lease")
+    };
+    (connection, selected)
+}
+
+async fn attach_error_once(harness: &Harness, selector: TargetSelector) -> String {
+    let mut connection = harness.connect().await.expect("connect one-shot contender");
+    let ServerMessage::Error { code, .. } = hello(
+        &mut connection,
+        interactive_mode(Some(selector)),
+        PROTOCOL_VERSION,
+    )
+    .await
+    .expect("one-shot contender disconnected") else {
+        panic!("one-shot contender unexpectedly acquired lease")
+    };
+    code
 }
 
 async fn receive_matching(

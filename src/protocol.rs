@@ -12,7 +12,7 @@ use crate::{
     resources::{ResourceSnapshot, TargetSelector},
 };
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 /// Enough for 50,000 individually styled JSON cells while remaining a firm
 /// pre-allocation bound for the length-delimited transport.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
@@ -76,6 +76,9 @@ pub enum ClientMessage {
     Resize {
         size: TerminalSize,
     },
+    SelectTarget {
+        selector: TargetSelector,
+    },
     Detach,
     OpenLocation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -105,6 +108,9 @@ pub enum ServerMessage {
     LocationOpened {
         selected: SelectedTarget,
         disposition: OpenDisposition,
+    },
+    TargetSelected {
+        selected: SelectedTarget,
     },
     Resources {
         snapshot: ResourceSnapshot,
@@ -345,6 +351,13 @@ mod tests {
         let encoded = encode_payload(&message).unwrap();
         assert_eq!(decode_payload::<ClientMessage>(&encoded).unwrap(), message);
 
+        let select = ClientMessage::SelectTarget {
+            selector: selector.clone(),
+        };
+        assert_eq!(
+            decode_payload::<ClientMessage>(&encode_payload(&select).unwrap()).unwrap(),
+            select
+        );
         let close = ClientMessage::CloseTarget { selector };
         assert_eq!(
             decode_payload::<ClientMessage>(&encode_payload(&close).unwrap()).unwrap(),
@@ -375,6 +388,15 @@ mod tests {
             decode_payload::<ServerMessage>(&encode_payload(&opened).unwrap()).unwrap(),
             opened
         );
-        assert_eq!(PROTOCOL_VERSION, 3);
+        let selected = match opened {
+            ServerMessage::LocationOpened { selected, .. } => selected,
+            _ => unreachable!(),
+        };
+        let switched = ServerMessage::TargetSelected { selected };
+        assert_eq!(
+            decode_payload::<ServerMessage>(&encode_payload(&switched).unwrap()).unwrap(),
+            switched
+        );
+        assert_eq!(PROTOCOL_VERSION, 4);
     }
 }

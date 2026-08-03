@@ -80,6 +80,7 @@ pub(super) struct PrefixState {
 pub(super) enum PrefixAction {
     Wait,
     Detach,
+    Navigator,
     Send(Vec<u8>),
 }
 
@@ -96,6 +97,7 @@ impl PrefixState {
             self.waiting = false;
             match bytes.as_slice() {
                 b"d" => PrefixAction::Detach,
+                b"g" => PrefixAction::Navigator,
                 [2] => PrefixAction::Send(vec![2]),
                 _ => PrefixAction::Send([vec![2], bytes].concat()),
             }
@@ -151,6 +153,8 @@ mod tests {
         let mut prefix = PrefixState::default();
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
         assert_eq!(prefix.feed(b"d".to_vec()), PrefixAction::Detach);
+        assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
+        assert_eq!(prefix.feed(b"g".to_vec()), PrefixAction::Navigator);
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Send(vec![2]));
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);

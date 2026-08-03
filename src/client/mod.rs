@@ -1,6 +1,7 @@
 //! Interactive terminal client for a running Fut daemon.
 
 mod input;
+mod navigator;
 
 use std::{io, path::Path, time::Duration};
 
@@ -17,6 +18,7 @@ use crossterm::{
 };
 use futures_util::{SinkExt, StreamExt};
 use input::{PrefixAction, PrefixState, encode_key};
+use navigator::{NavigatorAction, NavigatorState};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -27,6 +29,7 @@ use ratatui::{
 };
 use tokio::{net::UnixStream, time};
 use tokio_util::codec::Framed;
+use uuid::Uuid;
 
 use crate::{
     domain::{CellStyle, ScreenSnapshot, TerminalId, TerminalSize},
@@ -58,7 +61,7 @@ pub async fn attach(socket_path: &Path, selector: Option<TargetSelector>) -> any
     )
     .await?;
 
-    let terminal_id = match time::timeout(Duration::from_secs(2), receive(&mut framed))
+    let selected = match time::timeout(Duration::from_secs(2), receive(&mut framed))
         .await
         .context("daemon handshake timed out")??
     {
@@ -66,7 +69,7 @@ pub async fn attach(socket_path: &Path, selector: Option<TargetSelector>) -> any
             version,
             selected: Some(selected),
             ..
-        } if version == PROTOCOL_VERSION => selected.terminal_id,
+        } if version == PROTOCOL_VERSION => selected,
         ServerMessage::Welcome { selected: None, .. } => bail!("daemon did not select a terminal"),
         ServerMessage::Welcome { version, .. } => {
             bail!("daemon welcomed client with unsupported protocol version {version}")
@@ -81,7 +84,7 @@ pub async fn attach(socket_path: &Path, selector: Option<TargetSelector>) -> any
     // Host terminal state is changed only after a successful handshake.
     let guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let result = run(&mut terminal, &mut framed, terminal_id).await;
+    let result = run(&mut terminal, &mut framed, selected).await;
     drop(terminal);
     drop(guard);
     result
@@ -90,11 +93,14 @@ pub async fn attach(socket_path: &Path, selector: Option<TargetSelector>) -> any
 async fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
-    terminal_id: TerminalId,
+    mut selected: crate::protocol::SelectedTarget,
 ) -> anyhow::Result<()> {
     let mut events = EventStream::new();
     let mut prefix = PrefixState::default();
     let mut snapshots = SnapshotState::default();
+    snapshots.select(selected.terminal_id);
+    let mut navigator: Option<NavigatorState> = None;
+    let mut force_draw = false;
     let mut redraw = time::interval(Duration::from_millis(16));
     redraw.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
@@ -103,17 +109,51 @@ async fn run(
             frame = framed.next() => {
                 let Some(frame) = frame else { break };
                 let envelope: Envelope<ServerMessage> = decode_payload(&frame?)?;
+                let request_id = envelope.request_id;
                 match envelope.message {
-                    ServerMessage::Snapshot { terminal_id: id, screen } if id == terminal_id => {
-                        snapshots.accept(screen);
+                    ServerMessage::Snapshot { terminal_id: id, screen } if id == selected.terminal_id => {
+                        if snapshots.accept(id, screen) && navigator.as_ref().is_some_and(|nav| nav.switch_request.is_none() && matches!(nav.status, navigator::NavigatorStatus::Switching)) {
+                            navigator = None;
+                        }
                     }
-                    ServerMessage::Snapshot { .. } | ServerMessage::Pong { .. } | ServerMessage::CommandCompleted { .. } | ServerMessage::Resources { .. } | ServerMessage::LocationOpened { .. } => {}
-                    ServerMessage::TerminalExited { terminal_id: id, exit_code } if id == terminal_id => {
+                    ServerMessage::Resources { snapshot } => {
+                        if let Some(nav) = navigator.as_mut() {
+                            force_draw |= nav.accept_resources(request_id, &snapshot, &selected);
+                        }
+                    }
+                    ServerMessage::TargetSelected { selected: target } => {
+                        if !navigator.as_mut().is_some_and(|nav| nav.switch_selected(request_id)) {
+                            continue;
+                        }
+                        let old_terminal = selected.terminal_id;
+                        selected = target;
+                        if selected.terminal_id == old_terminal {
+                            navigator = None;
+                            snapshots.invalidate_drawn();
+                        } else {
+                            snapshots.commit_selection(selected.terminal_id);
+                            if let Some(nav) = navigator.as_mut() {
+                                nav.status = navigator::NavigatorStatus::Switching;
+                            }
+                        }
+                        force_draw = true;
+                    }
+                    ServerMessage::Snapshot { .. } | ServerMessage::Pong { .. } | ServerMessage::CommandCompleted { .. } | ServerMessage::LocationOpened { .. } => {}
+                    ServerMessage::TerminalExited { terminal_id: id, exit_code } if id == selected.terminal_id => {
                         if let Some(code) = exit_code { bail!("terminal exited with status {code}") }
                         break;
                     }
-                    ServerMessage::TerminalExited { .. } | ServerMessage::Detached => break,
-                    ServerMessage::Error { code, message } => bail!("daemon error ({code}): {message}"),
+                    ServerMessage::TerminalExited { .. } => {}
+                    ServerMessage::Detached => break,
+                    ServerMessage::Error { code, message } => {
+                        let handled = navigator.as_mut().is_some_and(|nav| {
+                            nav.switch_error(request_id, message.clone())
+                                || nav.list_error(request_id, message.clone())
+                        });
+                        if handled {
+                            force_draw = true;
+                        } else { bail!("daemon error ({code}): {message}") }
+                    }
                     ServerMessage::IncompatibleProtocol { client, server } => {
                         bail!("protocol became incompatible: client {client}, server {server}")
                     }
@@ -123,28 +163,55 @@ async fn run(
             event = events.next() => {
                 let Some(event) = event else { break };
                 match event? {
+                    Event::Key(key) if navigator.is_some() => {
+                        let visible = terminal.size()?.height.saturating_sub(2) as usize;
+                        match navigator.as_mut().expect("navigator exists").key(key, visible) {
+                            NavigatorAction::Stay => force_draw = true,
+                            NavigatorAction::Close => {
+                                navigator = None;
+                                snapshots.invalidate_drawn();
+                                force_draw = true;
+                            }
+                            NavigatorAction::Select(selector) => {
+                                let request = Uuid::new_v4();
+                                navigator.as_mut().expect("navigator exists").begin_switch(request);
+                                send_request(framed, Some(request), ClientMessage::SelectTarget { selector }).await?;
+                                force_draw = true;
+                            }
+                        }
+                    }
                     Event::Key(key) => if let Some(bytes) = encode_key(key) {
                         match prefix.feed(bytes) {
                             PrefixAction::Wait => {}
                             PrefixAction::Detach => {
                                 send(framed, ClientMessage::Detach).await?;
                             }
+                            PrefixAction::Navigator => {
+                                let request = Uuid::new_v4();
+                                let mut state = NavigatorState::open(&selected);
+                                state.set_list_request(request);
+                                navigator = Some(state);
+                                send_request(framed, Some(request), ClientMessage::ListResources).await?;
+                                force_draw = true;
+                            }
                             PrefixAction::Send(bytes) => send(framed, ClientMessage::Input { bytes }).await?,
                         }
                     },
-                    Event::Paste(text) => send(framed, ClientMessage::Input { bytes: text.into_bytes() }).await?,
+                    Event::Paste(text) if navigator.is_none() => send(framed, ClientMessage::Input { bytes: text.into_bytes() }).await?,
                     Event::Resize(columns, rows) if columns > 0 && rows > 0 => {
                         send(framed, ClientMessage::Resize { size: TerminalSize { columns, rows } }).await?;
                     }
                     _ => {}
                 }
             }
-            _ = redraw.tick(), if snapshots.needs_draw() => {
-                let screen = snapshots.pending.as_ref().expect("draw requires a pending snapshot");
+            _ = redraw.tick(), if force_draw || snapshots.needs_draw() => {
+                let screen = snapshots.pending.as_ref();
                 terminal.draw(|frame| {
                     let area = frame.area();
-                    frame.render_widget(Screen(screen), area);
-                    if screen.cursor.visible
+                    if let Some(screen) = screen { frame.render_widget(Screen(screen), area); }
+                    if let Some(nav) = navigator.as_mut() {
+                        nav.render(area, frame.buffer_mut());
+                    } else if let Some(screen) = screen && screen.cursor.visible
                         && screen.cursor.column < area.width
                         && screen.cursor.row < area.height
                     {
@@ -152,6 +219,7 @@ async fn run(
                     }
                 })?;
                 snapshots.mark_drawn();
+                force_draw = false;
             }
         }
     }
@@ -162,9 +230,17 @@ async fn send(
     framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     message: ClientMessage,
 ) -> anyhow::Result<()> {
+    send_request(framed, None, message).await
+}
+
+async fn send_request(
+    framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    request_id: Option<Uuid>,
+    message: ClientMessage,
+) -> anyhow::Result<()> {
     framed
         .send(Bytes::from(encode_payload(&Envelope {
-            request_id: None,
+            request_id,
             message,
         })?))
         .await?;
@@ -183,13 +259,30 @@ async fn receive(
 
 #[derive(Default)]
 struct SnapshotState {
+    terminal_id: Option<TerminalId>,
     newest_revision: Option<u64>,
     drawn_revision: Option<u64>,
     pending: Option<ScreenSnapshot>,
 }
 
 impl SnapshotState {
-    fn accept(&mut self, screen: ScreenSnapshot) -> bool {
+    fn select(&mut self, terminal_id: TerminalId) {
+        if self.terminal_id != Some(terminal_id) {
+            self.commit_selection(terminal_id);
+        }
+    }
+
+    fn commit_selection(&mut self, terminal_id: TerminalId) {
+        self.terminal_id = Some(terminal_id);
+        self.newest_revision = None;
+        self.drawn_revision = None;
+        self.pending = None;
+    }
+
+    fn accept(&mut self, terminal_id: TerminalId, screen: ScreenSnapshot) -> bool {
+        if self.terminal_id != Some(terminal_id) {
+            return false;
+        }
         if self
             .newest_revision
             .is_some_and(|revision| screen.revision <= revision)
@@ -207,6 +300,10 @@ impl SnapshotState {
 
     fn mark_drawn(&mut self) {
         self.drawn_revision = self.newest_revision;
+    }
+
+    fn invalidate_drawn(&mut self) {
+        self.drawn_revision = None;
     }
 }
 
@@ -322,13 +419,29 @@ mod tests {
             .unwrap()
         };
         let mut state = SnapshotState::default();
-        assert!(state.accept(snapshot(2)));
-        assert!(!state.accept(snapshot(1)));
-        assert!(!state.accept(snapshot(2)));
+        let terminal = TerminalId::new();
+        state.select(terminal);
+        assert!(state.accept(terminal, snapshot(2)));
+        assert!(!state.accept(terminal, snapshot(1)));
+        assert!(!state.accept(terminal, snapshot(2)));
         assert!(state.needs_draw());
         state.mark_drawn();
         assert!(!state.needs_draw());
-        assert!(state.accept(snapshot(3)));
+        assert!(state.accept(terminal, snapshot(3)));
+        state.mark_drawn();
+        state.select(terminal);
+        assert_eq!(
+            state.pending.as_ref().map(|screen| screen.revision),
+            Some(3)
+        );
+        assert!(!state.needs_draw());
+        state.invalidate_drawn();
+        assert!(state.needs_draw());
+        let other = TerminalId::new();
+        state.select(other);
+        assert!(state.pending.is_none());
+        assert!(state.accept(other, snapshot(1)));
+        assert!(!state.accept(terminal, snapshot(100)));
     }
 
     #[test]
