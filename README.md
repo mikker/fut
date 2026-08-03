@@ -69,10 +69,25 @@ Failures under `--json` are compact and versioned:
 
 Daemon error codes are preserved. CLI argument failures use `invalid_arguments`; failures without a more specific daemon code use `command_failed`.
 
-The intended manual UX is dynamic, daemon-backed shell completion that displays names and hierarchy while inserting raw IDs. That completion is not implemented yet; copy IDs from `fut list` for now.
+Enable shell completion from your shell startup file:
+
+```sh
+# zsh
+source <(COMPLETE=zsh fut)
+
+# bash
+source <(COMPLETE=bash fut)
+
+# fish
+COMPLETE=fish fut | source
+```
+
+The generated integration completes the static command, option, and path grammar. At resource operands it reads the current daemon snapshot and inserts only the full raw ID. Zsh and fish also display Unicode names, full ancestry, workspace roots, and distinct numbered pane or terminal descriptions; Bash's completion protocol does not preserve those descriptions. `session attach` completion inserts IDs even though exact names remain valid when entered manually. Re-source the generated integration after upgrading Fut so it stays in step with the executable.
+
+Completion never starts a daemon or mutates resources. It honors `--socket` and the normal socket environment precedence, omits closing and guaranteed-invalid targets, and uses a short bounded query. If the daemon is absent, stale, incompatible, or slow, completion fails silently while static suggestions remain available.
 
 Inside the client, `Ctrl-b c` creates and switches to a default shell tab, `Ctrl-b g` opens the global navigator, `Ctrl-b d` detaches, and `Ctrl-b Ctrl-b` sends a literal `Ctrl-b`.
 
-Current limitations include one pane and terminal per created tab, no splits or layout mutations, no pane naming or move operation, basic input encoding, and full-grid JSON snapshots. Fuzzy navigation, project recipes, agent activity, and dynamic completion remain planned. Actual shell autocomplete is the next near-term missing control-surface item.
+Current limitations include one pane and terminal per created tab, no splits or layout mutations, no pane naming or move operation, basic input encoding, and full-grid JSON snapshots. Fuzzy navigation, project recipes, and agent activity remain planned. Explicit pane creation and multi-pane tab lifecycle semantics are the next implementation slice.
 
 See [VISION.md](VISION.md) for the product direction, [CONTEXT.md](CONTEXT.md) for shared language, and [PLAN.md](PLAN.md) for implementation status and exit criteria.

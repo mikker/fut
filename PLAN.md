@@ -16,13 +16,14 @@ The Milestone 0–1 spike and the current daemon-integrated Milestone 2 slice ar
 - a noun-first CLI with raw-ID resource operations, control-only `open`, and explicit interactive attach commands;
 - a versioned JSON success envelope for noninteractive control commands, using dotted command names;
 - compact, versioned JSON error envelopes that preserve daemon codes and classify CLI failures;
+- daemon-backed dynamic shell completion that shows live hierarchy while inserting raw IDs;
 - proper tab closure through `tab close`, including normal descendant and upward lifecycle cleanup;
 - durable terminal lifecycle and confirmed child cleanup;
 - separate unit and process-level end-to-end test layers.
 
 The public grammar is now `open`, `session`, `workspace`, `tab`, `pane`, `terminal`, `list`, and `daemon`. Noun-first applies to resource operations; top-level `open` and `list` and the `daemon` lifecycle are intentional non-resource entry points. Resource mutations take raw IDs only; attach operations do too, except that `session attach` permits an exact name. UUID-shaped session attach values have ID precedence. Session, workspace, and tab attachment succeeds only when the ancestor identifies exactly one open terminal; pane and terminal IDs are exact, and the navigator handles interactive selection. The public CLI has no typed-prefix or selector mini-language. Child commands require `--`. Bare `fut` opens the current directory and then attaches to its returned terminal. `fut open` and `fut tab new` are control-only, resource attachment is separate, and the CLI makes no atomic create-and-attach guarantee. The TUI consumes typed protocol IDs directly rather than constructing CLI arguments.
 
-This validates tab creation, proper tab close, and session, workspace, and tab rename end-to-end but does not complete Milestone 2. Successful `--json` responses use a `version: 1` envelope and dotted command name. Failures use `{version:1,error:{code,message}}`: daemon codes are preserved, argument errors use `invalid_arguments`, and otherwise untyped command failures use `command_failed`. Human output is deliberately not a machine contract; agents retain raw IDs and use `--json`, while UIs use the typed protocol. Structured errors are complete. Actual daemon-backed shell autocomplete is the next near-term missing item. Each created tab still contains exactly one pane and terminal. Pane rename is absent because panes are currently unnamed; visible splits, move, and layout mutations are also deferred. Input encoding remains a basic client-side mapping and snapshots are full-grid JSON messages. Git checkouts use their canonical common directory as project identity and their top-level checkout as workspace root; non-Git directories use canonical directory identity. Worktrees are not eagerly discovered. Opening a linked checkout adds one peer workspace, while reopening it is side-effect free. Interactive connections can retarget through the global navigator. A workspace disappears when its last terminal exits, a session when its last workspace exits, and only the final session closes Fut and releases the socket.
+This validates tab creation, proper tab close, session, workspace, and tab rename, structured control output, and live completion end-to-end but does not complete Milestone 2. Successful `--json` responses use a `version: 1` envelope and dotted command name. Failures use `{version:1,error:{code,message}}`: daemon codes are preserved, argument errors use `invalid_arguments`, and otherwise untyped command failures use `command_failed`. Human output is deliberately not a machine contract; agents retain raw IDs and use `--json`, while UIs use the typed protocol. Shell completion covers the static grammar and reads live resources without autostarting or mutating the daemon; it displays names, ancestry, roots, and pane-versus-terminal context while inserting raw IDs. Each created tab still contains exactly one pane and terminal. Explicit pane creation and multi-pane lifecycle semantics are the next slice. Pane rename is absent because panes are currently unnamed; visible splits, move, and layout mutations are also deferred. Input encoding remains a basic client-side mapping and snapshots are full-grid JSON messages. Git checkouts use their canonical common directory as project identity and their top-level checkout as workspace root; non-Git directories use canonical directory identity. Worktrees are not eagerly discovered. Opening a linked checkout adds one peer workspace, while reopening it is side-effect free. Interactive connections can retarget through the global navigator. A workspace disappears when its last terminal exits, a session when its last workspace exits, and only the final session closes Fut and releases the socket.
 
 ## Strategy
 
@@ -110,7 +111,7 @@ Introduce the real product model before reproducing more tmux behavior.
 - Define resource snapshots and typed incremental events.
 - Provide a JSON control API alongside the interactive protocol.
 - Keep the public CLI noun-first and ID-oriented while preserving typed resource selectors inside the protocol.
-- Add dynamic, daemon-backed shell completion that shows resource names and hierarchy but inserts raw IDs.
+- Add dynamic, daemon-backed shell completion that shows resource names and hierarchy but inserts raw IDs. (Implemented.)
 - Return structured, versioned JSON errors for every noninteractive `--json` failure. (Implemented.)
 - Add the global navigator over the complete resource tree.
 
@@ -127,7 +128,7 @@ Introduce the real product model before reproducing more tmux behavior.
 - A client can jump directly from any pane to any other pane.
 - Detachment preserves the tree; closing the final terminal removes its session.
 - No server-global active resource is required to render or control a client.
-- Shell completion obtains live resources from the daemon, presents enough names and ancestry to distinguish them, and inserts the exact raw ID accepted by the selected command.
+- Shell completion obtains live resources from the daemon, presents enough names and ancestry to distinguish them, and inserts the exact raw ID accepted by the selected command. (Met.)
 - Every noninteractive command has versioned JSON success and error output; command names are dotted and scripts never need to parse human output. (Met.)
 
 ## Milestone 3: Project definitions and workspace recipes

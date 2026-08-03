@@ -3,11 +3,11 @@
 use std::{
     fs,
     io::{Read, Write},
-    os::unix::fs::PermissionsExt,
+    os::unix::{fs::PermissionsExt, net::UnixListener},
     path::PathBuf,
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
-    time::Duration,
+    sync::{Arc, Mutex, mpsc},
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -2799,4 +2799,347 @@ fn process_alive(pid: u32) -> bool {
     // SAFETY: signal zero does not modify the target process.
     let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
     result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+struct CompletionEnv(TempDir);
+
+impl CompletionEnv {
+    fn new() -> Self {
+        let root = tempfile::Builder::new()
+            .prefix("fut-completion-e2e-")
+            .tempdir()
+            .unwrap();
+        fs::create_dir(root.path().join("home")).unwrap();
+        Self(root)
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fut"));
+        command
+            .env_clear()
+            .env("HOME", self.0.path().join("home"))
+            .env("PATH", "/usr/bin:/bin")
+            .env("TMPDIR", self.0.path())
+            .env("FUT_RUNTIME_DIR", self.0.path().join("runtime"))
+            .env("TERM", "xterm-256color")
+            .env("COMPLETE", "zsh");
+        command
+    }
+
+    fn complete(&self, socket: &std::path::Path, words: &[&str]) -> std::process::Output {
+        self.complete_at(socket, words, words.len() + 2)
+    }
+
+    fn complete_at(
+        &self,
+        socket: &std::path::Path,
+        words: &[&str],
+        index: usize,
+    ) -> std::process::Output {
+        self.command()
+            .env("FUT_SOCKET", self.0.path().join("missing-env.sock"))
+            .env("_CLAP_COMPLETE_INDEX", index.to_string())
+            .args(["--", "fut", "--socket"])
+            .arg(socket)
+            .args(words)
+            .output()
+            .unwrap()
+    }
+}
+
+fn zsh_dynamic(output: &std::process::Output) -> Vec<(String, String)> {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    String::from_utf8(output.stdout.clone())
+        .unwrap()
+        .lines()
+        .filter_map(|line| {
+            let (value, help) = line.split_once(':')?;
+            Uuid::parse_str(value).ok()?;
+            Some((value.into(), help.into()))
+        })
+        .collect()
+}
+
+fn completion_values(output: &std::process::Output) -> Vec<String> {
+    zsh_dynamic(output)
+        .into_iter()
+        .map(|candidate| candidate.0)
+        .collect()
+}
+
+fn completion_help(output: &std::process::Output, id: impl ToString) -> String {
+    let id = id.to_string();
+    zsh_dynamic(output)
+        .into_iter()
+        .find_map(|(value, help)| (value == id).then_some(help))
+        .unwrap_or_else(|| panic!("missing completion {id}"))
+}
+
+#[test]
+fn zsh_completion_registration_is_compact_and_side_effect_free() {
+    let env = CompletionEnv::new();
+    let before = fs::read_dir(env.0.path()).unwrap().count();
+    let output = env.command().output().unwrap();
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let script = String::from_utf8(output.stdout).unwrap();
+    assert!(script.starts_with("#compdef fut\n"));
+    assert!(script.contains("COMPLETE=\"zsh\""));
+    assert!(script.contains("_CLAP_COMPLETE_INDEX"));
+    assert!(script.len() < 4_096);
+    assert_eq!(fs::read_dir(env.0.path()).unwrap().count(), before);
+    assert!(!env.0.path().join("runtime").exists());
+}
+
+#[tokio::test]
+async fn process_completion_covers_live_resource_operations_and_refresh() {
+    let harness = Harness::start("while IFS= read -r line; do :; done").await;
+    let env = CompletionEnv::new();
+    let snapshot = harness.resources().await;
+    let session = &snapshot.sessions[0];
+    let workspace = &session.workspaces[0];
+    let tab = &workspace.tabs[0];
+    let pane = &tab.panes[0];
+    let root = workspace.root.to_string_lossy();
+    let session_help = format!("session {}", session.name);
+    let workspace_help = format!("{session_help} › workspace {} — {root}", workspace.name);
+    let tab_help = format!(
+        "{session_help} › workspace {} › tab {} — {root}",
+        workspace.name, tab.name
+    );
+    let pane_help = format!(
+        "{session_help} › workspace {} › tab {} › pane 1 — {root}",
+        workspace.name, tab.name
+    );
+    let cases = [
+        (
+            vec!["session", "attach", ""],
+            session.id.to_string(),
+            session_help.clone(),
+        ),
+        (
+            vec!["session", "rename", ""],
+            session.id.to_string(),
+            session_help.clone(),
+        ),
+        (
+            vec!["session", "close", ""],
+            session.id.to_string(),
+            session_help.clone(),
+        ),
+        (
+            vec!["workspace", "attach", ""],
+            workspace.id.to_string(),
+            workspace_help.clone(),
+        ),
+        (
+            vec!["workspace", "rename", ""],
+            workspace.id.to_string(),
+            workspace_help.clone(),
+        ),
+        (
+            vec!["workspace", "close", ""],
+            workspace.id.to_string(),
+            workspace_help.clone(),
+        ),
+        (
+            vec!["tab", "new", ""],
+            workspace.id.to_string(),
+            workspace_help,
+        ),
+        (
+            vec!["tab", "attach", ""],
+            tab.id.to_string(),
+            tab_help.clone(),
+        ),
+        (
+            vec!["tab", "rename", ""],
+            tab.id.to_string(),
+            tab_help.clone(),
+        ),
+        (vec!["tab", "close", ""], tab.id.to_string(), tab_help),
+        (
+            vec!["pane", "attach", ""],
+            pane.id.to_string(),
+            pane_help.clone(),
+        ),
+        (
+            vec!["pane", "close", ""],
+            pane.id.to_string(),
+            pane_help.clone(),
+        ),
+        (
+            vec!["terminal", "attach", ""],
+            pane.terminal_id.to_string(),
+            format!(
+                "{session_help} › workspace {} › tab {} › pane 1 › terminal process — {root}",
+                workspace.name, tab.name
+            ),
+        ),
+    ];
+    for (words, id, help) in cases {
+        let output = env.complete(&harness.socket, &words);
+        assert_eq!(
+            completion_values(&output),
+            std::slice::from_ref(&id),
+            "{words:?}"
+        );
+        assert_eq!(completion_help(&output, &id), help, "{words:?}");
+        assert!(!id.contains(':'));
+    }
+
+    let created = harness
+        .cli()
+        .args(["tab", "new", &workspace.id.to_string(), "--name", "second"])
+        .output()
+        .unwrap();
+    assert!(created.status.success());
+    let expanded = harness.resources().await;
+    let workspace = &expanded.sessions[0].workspaces[0];
+    assert_eq!(workspace.tabs.len(), 2);
+    assert!(
+        completion_values(&env.complete(&harness.socket, &["session", "attach", ""])).is_empty()
+    );
+    assert!(
+        completion_values(&env.complete(&harness.socket, &["workspace", "attach", ""])).is_empty()
+    );
+    assert_eq!(
+        completion_values(&env.complete(&harness.socket, &["tab", "attach", ""])),
+        workspace
+            .tabs
+            .iter()
+            .map(|tab| tab.id.to_string())
+            .collect::<Vec<_>>()
+    );
+
+    let stable_id = workspace.tabs[0].id;
+    assert!(
+        harness
+            .cli()
+            .args(["tab", "rename", &stable_id.to_string(), "fresh-name"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let refreshed = env.complete(&harness.socket, &["tab", "rename", ""]);
+    assert!(completion_help(&refreshed, stable_id).contains("tab fresh-name"));
+    assert!(completion_values(&refreshed).contains(&stable_id.to_string()));
+
+    #[cfg(target_os = "macos")]
+    {
+        let registration = env.command().output().unwrap();
+        assert!(registration.status.success());
+        let registration_path = env.0.path().join("_fut");
+        fs::write(&registration_path, registration.stdout).unwrap();
+        let smoke_path = env.0.path().join("completion-smoke.zsh");
+        fs::write(
+            &smoke_path,
+            r#"autoload -Uz compinit
+compinit -D
+source "$COMPLETION_SCRIPT"
+function _describe() {
+  local array_name="${@[-1]}"
+  print -rl -- "${(@P)array_name}"
+}
+words=(fut --socket "$FUT_TEST_SOCKET" tab rename '')
+CURRENT=${#words}
+_clap_dynamic_completer_fut
+"#,
+        )
+        .unwrap();
+        let smoke = Command::new("/bin/zsh")
+            .args(["-f", smoke_path.to_str().unwrap()])
+            .env_clear()
+            .env("HOME", env.0.path().join("home"))
+            .env("PATH", "/usr/bin:/bin")
+            .env("TMPDIR", env.0.path())
+            .env("FUT_RUNTIME_DIR", env.0.path().join("missing-runtime"))
+            .env("COMPLETION_SCRIPT", registration_path)
+            .env("FUT_TEST_SOCKET", &harness.socket)
+            .output()
+            .unwrap();
+        assert!(
+            smoke.status.success(),
+            "{}",
+            String::from_utf8_lossy(&smoke.stderr)
+        );
+        let smoke = String::from_utf8(smoke.stdout).unwrap();
+        assert!(smoke.contains(&stable_id.to_string()));
+        assert!(smoke.contains("tab fresh-name"));
+    }
+
+    let missing = env.0.path().join("child.sock");
+    let words = [
+        "tab",
+        "new",
+        "",
+        "--",
+        "--socket",
+        missing.to_str().unwrap(),
+    ];
+    assert_eq!(
+        completion_values(&env.complete_at(&harness.socket, &words, 5)),
+        [workspace.id.to_string()]
+    );
+    harness.shutdown().await;
+}
+
+#[test]
+fn unavailable_completion_sockets_are_fast_silent_and_non_destructive() {
+    for kind in ["missing", "stale", "stalled"] {
+        let env = CompletionEnv::new();
+        let runtime = env.0.path().join("runtime");
+        fs::create_dir(&runtime).unwrap();
+        let socket = runtime.join(format!("{kind}.sock"));
+        let (mut release, mut thread) = (None, None);
+        if kind == "stale" {
+            drop(UnixListener::bind(&socket).unwrap());
+        } else if kind == "stalled" {
+            let listener = UnixListener::bind(&socket).unwrap();
+            let (accepted_tx, accepted_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            thread = Some(std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                accepted_tx.send(()).unwrap();
+                let _stream = stream;
+                let _ = release_rx.recv();
+            }));
+            release = Some((release_tx, accepted_rx));
+        }
+        let existed = socket.exists();
+        let start = Instant::now();
+        let output = env.complete(&socket, &["session", "attach", "--"]);
+        if let Some((_, accepted)) = &release {
+            accepted.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "{kind} completion hung"
+        );
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        assert!(completion_values(&output).is_empty());
+        assert!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .contains("--socket:")
+        );
+        assert_eq!(socket.exists(), existed);
+        if let Some((release, _)) = release {
+            release.send(()).unwrap();
+        }
+        if let Some(thread) = thread.take() {
+            thread.join().unwrap();
+        }
+        assert_eq!(
+            fs::read_dir(&runtime).unwrap().count(),
+            usize::from(existed)
+        );
+    }
 }

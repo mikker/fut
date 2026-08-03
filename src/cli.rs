@@ -2,13 +2,17 @@ use std::{ffi::OsString, path::PathBuf, process::ExitCode, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueHint};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::json;
 use tokio::net::UnixStream;
 use tokio_util::codec::Framed;
 use uuid::Uuid;
+
+mod completion;
+
+use clap_complete::engine::ArgValueCompleter;
 
 use crate::{
     client,
@@ -30,11 +34,12 @@ use crate::{
 #[command(
     name = "fut",
     version,
-    about = "A project-oriented terminal multiplexer"
+    about = "A project-oriented terminal multiplexer",
+    after_help = "Enable shell completion with, for example: source <(COMPLETE=zsh fut)"
 )]
 pub struct Cli {
     /// Override the Unix socket used to contact the daemon.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, value_hint = ValueHint::FilePath)]
     socket: Option<PathBuf>,
     /// Emit versioned JSON for noninteractive commands only.
     #[arg(long, global = true)]
@@ -49,13 +54,13 @@ enum Command {
     /// Open a location through an existing daemon without attaching.
     Open {
         /// Directory to open; defaults to the current directory.
-        #[arg(value_name = "PATH")]
+        #[arg(value_name = "PATH", value_hint = ValueHint::DirPath)]
         path: Option<PathBuf>,
         /// Name for the new session or workspace created for this location.
         #[arg(long)]
         name: Option<String>,
         /// Child program and its direct argv, following `--`; defaults to the shell.
-        #[arg(last = true)]
+        #[arg(last = true, value_hint = ValueHint::CommandWithArguments)]
         command: Vec<String>,
     },
     /// Attach, rename, or close a session.
@@ -103,11 +108,13 @@ enum SessionCommand {
     /// Attach to a session that contains exactly one open terminal.
     Attach {
         /// Session UUID or name; a UUID-shaped value is always treated as an ID.
+        #[arg(add = ArgValueCompleter::new(completion::session_attach))]
         session: String,
     },
     /// Rename a session by raw UUID on the existing daemon.
     Rename {
         /// Raw session UUID.
+        #[arg(add = ArgValueCompleter::new(completion::session_rename))]
         session_id: SessionId,
         /// New session name.
         name: String,
@@ -115,6 +122,7 @@ enum SessionCommand {
     /// Close a session by raw UUID on the existing daemon.
     Close {
         /// Raw session UUID.
+        #[arg(add = ArgValueCompleter::new(completion::session_close))]
         session_id: SessionId,
     },
 }
@@ -124,11 +132,13 @@ enum WorkspaceCommand {
     /// Attach to a workspace on the existing daemon.
     Attach {
         /// Raw workspace UUID; the workspace must contain exactly one open terminal.
+        #[arg(add = ArgValueCompleter::new(completion::workspace_attach))]
         workspace_id: WorkspaceId,
     },
     /// Rename a workspace by raw UUID on the existing daemon.
     Rename {
         /// Raw workspace UUID.
+        #[arg(add = ArgValueCompleter::new(completion::workspace_rename))]
         workspace_id: WorkspaceId,
         /// New workspace name.
         name: String,
@@ -136,6 +146,7 @@ enum WorkspaceCommand {
     /// Close a workspace by raw UUID on the existing daemon.
     Close {
         /// Raw workspace UUID.
+        #[arg(add = ArgValueCompleter::new(completion::workspace_close))]
         workspace_id: WorkspaceId,
     },
 }
@@ -145,25 +156,28 @@ enum TabCommand {
     /// Create a tab through an existing daemon without attaching.
     New {
         /// Raw UUID of the workspace that will own the tab.
+        #[arg(add = ArgValueCompleter::new(completion::tab_new))]
         workspace_id: WorkspaceId,
         /// Name for the new tab; defaults to shell, shell-2, and so on.
         #[arg(long)]
         name: Option<String>,
         /// Working directory for the child; defaults to the workspace root.
-        #[arg(long)]
+        #[arg(long, value_hint = ValueHint::DirPath)]
         cwd: Option<PathBuf>,
         /// Child program and its direct argv, following `--`; defaults to the shell.
-        #[arg(last = true)]
+        #[arg(last = true, value_hint = ValueHint::CommandWithArguments)]
         command: Vec<String>,
     },
     /// Attach to a tab on the existing daemon.
     Attach {
         /// Raw tab UUID; the tab must contain exactly one open terminal.
+        #[arg(add = ArgValueCompleter::new(completion::tab_attach))]
         tab_id: TabId,
     },
     /// Rename a tab by raw UUID on the existing daemon.
     Rename {
         /// Raw tab UUID.
+        #[arg(add = ArgValueCompleter::new(completion::tab_rename))]
         tab_id: TabId,
         /// New tab name.
         name: String,
@@ -171,6 +185,7 @@ enum TabCommand {
     /// Close a tab by raw UUID on the existing daemon.
     Close {
         /// Raw tab UUID.
+        #[arg(add = ArgValueCompleter::new(completion::tab_close))]
         tab_id: TabId,
     },
 }
@@ -180,11 +195,13 @@ enum PaneCommand {
     /// Attach to a pane on the existing daemon.
     Attach {
         /// Raw pane UUID identifying one terminal placement.
+        #[arg(add = ArgValueCompleter::new(completion::pane_attach))]
         pane_id: PaneId,
     },
     /// Close a pane by raw UUID on the existing daemon.
     Close {
         /// Raw pane UUID.
+        #[arg(add = ArgValueCompleter::new(completion::pane_close))]
         pane_id: PaneId,
     },
 }
@@ -194,6 +211,7 @@ enum TerminalCommand {
     /// Attach to a terminal on the existing daemon.
     Attach {
         /// Raw terminal UUID identifying one process-bearing terminal.
+        #[arg(add = ArgValueCompleter::new(completion::terminal_attach))]
         terminal_id: TerminalId,
     },
 }
@@ -203,16 +221,20 @@ enum DaemonCommand {
     /// Run the daemon in the foreground.
     Run {
         /// Initial child working directory; defaults to the current directory.
-        #[arg(long)]
+        #[arg(long, value_hint = ValueHint::DirPath)]
         cwd: Option<PathBuf>,
         /// Initial child program and its direct argv, following `--`; defaults to the shell.
-        #[arg(last = true)]
+        #[arg(last = true, value_hint = ValueHint::CommandWithArguments)]
         command: Vec<String>,
     },
     /// Check whether the existing daemon is responsive.
     Ping,
     /// Ask the existing daemon to shut down.
     Shutdown,
+}
+
+pub fn complete() {
+    completion::complete_env();
 }
 
 pub async fn run() -> ExitCode {
