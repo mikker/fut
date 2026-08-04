@@ -56,7 +56,25 @@ The stable, process-bearing resource behind a pane. A terminal owns the pseudote
 
 ### Layout
 
-The arrangement and sizing policy for panes in a tab. A split tree is the default layout shape. A focus-biased or accordion layout gives the focused pane a useful working width while leaving its siblings visible.
+The arrangement of panes in a tab. In the target model being implemented next, every tab owns an authored split tree as shared runtime state. Clients evaluate that tree against their own viewport, minimum sizes, and selected presentation policy. The current implementation still renders its ordered pane collection as an accordion and has not persisted the tree yet.
+
+### Split tree
+
+The planned shared runtime topology of a tab. Leaf nodes reference pane placements; branch nodes split left/right or top/bottom and store a ratio. `Ctrl-b |` splits the focused pane to the right and `Ctrl-b _` splits it downward. Closing or moving a pane removes its leaf and collapses any branch left with one child.
+
+The split tree belongs to the tab rather than to one client, but computed rectangles never do. Resource order and split-tree leaf order must agree so navigation, automation, fallback, and rendering do not acquire competing notions of pane order.
+
+### Layout policy
+
+A client-owned choice for presenting a tab's panes. Once authored trees land, the default policy renders the split tree. An accordion policy may temporarily present the same ordered pane leaves as a focus-biased horizontal accordion without rewriting shared split topology.
+
+### Accordion
+
+An alternate layout policy that gives the focused pane more width while keeping siblings visible when space permits. It is not a substitute for authored split direction, and `pane_min_width` is only a responsive constraint—not a layout model.
+
+### Zoom
+
+A temporary client-owned overlay that gives the focused pane the complete terminal area available to the tab. Zoom does not modify the authored split tree or another client's presentation.
 
 ### Client
 
