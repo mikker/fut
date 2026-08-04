@@ -1182,6 +1182,115 @@ impl ResourceTree {
         Ok(self.finish(events, vec![]))
     }
 
+    pub fn fallback_terminal_ids(
+        &self,
+        terminal_id: TerminalId,
+    ) -> Result<Vec<TerminalId>, ResourceError> {
+        let pane_id = *self
+            .terminals
+            .get(&terminal_id)
+            .ok_or(ResourceError::NotFound("terminal"))?;
+        let tab_id = self.panes[&pane_id].tab_id;
+        let workspace_id = self.tabs[&tab_id].workspace_id;
+        let session_id = self.workspaces[&workspace_id].session_id;
+        let tab = &self.tabs[&tab_id];
+        let pane_index = tab
+            .panes
+            .iter()
+            .position(|candidate| *candidate == pane_id)
+            .ok_or_else(|| ResourceError::Invariant("pane missing from tab".into()))?;
+        let mut fallback = tab.panes[..pane_index]
+            .iter()
+            .rev()
+            .chain(tab.panes[pane_index + 1..].iter())
+            .filter_map(|pane_id| {
+                let pane = &self.panes[pane_id];
+                (!pane.closing).then_some(pane.terminal_id)
+            })
+            .collect::<Vec<_>>();
+
+        let workspace = &self.workspaces[&workspace_id];
+        let tab_index = workspace
+            .tabs
+            .iter()
+            .position(|candidate| *candidate == tab_id)
+            .ok_or_else(|| ResourceError::Invariant("tab missing from workspace".into()))?;
+        for tab_id in workspace.tabs[..tab_index]
+            .iter()
+            .rev()
+            .chain(workspace.tabs[tab_index + 1..].iter())
+        {
+            let tab = &self.tabs[tab_id];
+            if !tab.closing {
+                fallback.extend(tab.panes.iter().filter_map(|pane_id| {
+                    let pane = &self.panes[pane_id];
+                    (!pane.closing).then_some(pane.terminal_id)
+                }));
+            }
+        }
+
+        let session = &self.sessions[&session_id];
+        let workspace_index = session
+            .workspaces
+            .iter()
+            .position(|candidate| *candidate == workspace_id)
+            .ok_or_else(|| ResourceError::Invariant("workspace missing from session".into()))?;
+        for workspace_id in session.workspaces[..workspace_index]
+            .iter()
+            .rev()
+            .chain(session.workspaces[workspace_index + 1..].iter())
+        {
+            let workspace = &self.workspaces[workspace_id];
+            if workspace.closing {
+                continue;
+            }
+            for tab_id in &workspace.tabs {
+                let tab = &self.tabs[tab_id];
+                if tab.closing {
+                    continue;
+                }
+                for pane_id in &tab.panes {
+                    let pane = &self.panes[pane_id];
+                    if !pane.closing {
+                        fallback.push(pane.terminal_id);
+                    }
+                }
+            }
+        }
+        Ok(fallback)
+    }
+
+    pub fn open_terminal_ids_for_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<TerminalId>, ResourceError> {
+        let session = self
+            .sessions
+            .get(&session_id)
+            .ok_or(ResourceError::NotFound("session"))?;
+        if session.closing {
+            return Ok(Vec::new());
+        }
+        let mut terminals = Vec::new();
+        for workspace_id in &session.workspaces {
+            let workspace = &self.workspaces[workspace_id];
+            if workspace.closing {
+                continue;
+            }
+            for tab_id in &workspace.tabs {
+                let tab = &self.tabs[tab_id];
+                if tab.closing {
+                    continue;
+                }
+                terminals.extend(tab.panes.iter().filter_map(|pane_id| {
+                    let pane = &self.panes[pane_id];
+                    (!pane.closing).then_some(pane.terminal_id)
+                }));
+            }
+        }
+        Ok(terminals)
+    }
+
     pub fn validate(&self) -> Result<(), ResourceError> {
         if self.session_order.len() != self.sessions.len()
             || self
@@ -1678,6 +1787,83 @@ mod tests {
             [tree
                 .resolve_terminal_target(Some(TargetSelector::Pane(first_pane)))
                 .unwrap()]
+        );
+    }
+
+    #[test]
+    fn fallback_terminals_prefer_the_current_collection_and_never_cross_sessions() {
+        let mut tree = ResourceTree::default();
+        let first = initial("first", "/first");
+        let session_id = first.session_id;
+        let workspace_id = first.workspace_id;
+        let tab_id = first.tab_id;
+        let terminal_a = first.terminal_id;
+        let pane_b = PaneId::new();
+        let terminal_b = TerminalId::new();
+        tree.create_session(first).unwrap();
+        tree.add_pane(tab_id, pane_b, terminal_b).unwrap();
+
+        let terminal_c = TerminalId::new();
+        tree.add_tab(
+            workspace_id,
+            TabPath {
+                tab_id: TabId::new(),
+                tab_name: "second".into(),
+                pane_id: PaneId::new(),
+                terminal_id: terminal_c,
+            },
+        )
+        .unwrap();
+        let terminal_d = TerminalId::new();
+        tree.add_workspace(
+            session_id,
+            WorkspacePath {
+                workspace_id: WorkspaceId::new(),
+                workspace_name: "peer".into(),
+                root: "/first/peer".into(),
+                tab_id: TabId::new(),
+                tab_name: "shell".into(),
+                pane_id: PaneId::new(),
+                terminal_id: terminal_d,
+            },
+        )
+        .unwrap();
+        let other = initial("other", "/other");
+        let other_terminal = other.terminal_id;
+        tree.create_session(other).unwrap();
+
+        assert_eq!(
+            tree.open_terminal_ids_for_session(session_id).unwrap(),
+            vec![terminal_a, terminal_b, terminal_c, terminal_d]
+        );
+
+        assert_eq!(
+            tree.fallback_terminal_ids(terminal_c).unwrap(),
+            vec![terminal_a, terminal_b, terminal_d]
+        );
+        assert_eq!(
+            tree.fallback_terminal_ids(terminal_a).unwrap(),
+            vec![terminal_b, terminal_c, terminal_d]
+        );
+        assert_eq!(
+            tree.fallback_terminal_ids(terminal_b).unwrap(),
+            vec![terminal_a, terminal_c, terminal_d]
+        );
+        assert!(
+            !tree
+                .fallback_terminal_ids(terminal_c)
+                .unwrap()
+                .contains(&other_terminal)
+        );
+
+        tree.close_pane(pane_b).unwrap();
+        assert_eq!(
+            tree.open_terminal_ids_for_session(session_id).unwrap(),
+            vec![terminal_a, terminal_c, terminal_d]
+        );
+        assert_eq!(
+            tree.fallback_terminal_ids(terminal_c).unwrap(),
+            vec![terminal_a, terminal_d]
         );
     }
 

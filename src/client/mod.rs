@@ -260,13 +260,9 @@ async fn run(
                     ServerMessage::Pong { .. } | ServerMessage::CommandCompleted { .. } | ServerMessage::LocationOpened { .. } => {}
                     ServerMessage::TerminalExited { terminal_id, exit_code } => {
                         if terminal_id == view.focused().terminal_id {
-                            if view.len() > 1 {
-                                pending_focused_exit = Some(exit_code);
-                                force_draw = true;
-                                continue;
-                            }
-                            if let Some(code) = exit_code { bail!("terminal exited with status {code}") }
-                            break;
+                            pending_focused_exit = Some(exit_code);
+                            force_draw = true;
+                            continue;
                         }
                         view.remove(terminal_id);
                         force_draw = true;
@@ -858,10 +854,6 @@ impl ViewState {
             .find(|pane| pane.target.terminal_id == self.focused)
             .expect("focused terminal belongs to the client view")
             .target
-    }
-
-    fn len(&self) -> usize {
-        self.panes.len()
     }
 
     fn accept(&mut self, terminal_id: TerminalId, screen: ScreenSnapshot) -> bool {

@@ -437,6 +437,7 @@ enum AttachmentUpdate {
 struct Attachment {
     panes: Vec<ObservedTarget>,
     focused: LeasedTarget,
+    fallback_terminal_ids: Vec<TerminalId>,
     resource_revision: u64,
     streamed_resource_revision: u64,
     resource_changes: watch::Receiver<u64>,
@@ -450,6 +451,7 @@ impl Attachment {
     fn new(
         panes: Vec<ObservedTarget>,
         focused: LeasedTarget,
+        fallback_terminal_ids: Vec<TerminalId>,
         resource_revision: u64,
         resource_changes: watch::Receiver<u64>,
     ) -> Self {
@@ -457,6 +459,7 @@ impl Attachment {
         let mut attachment = Self {
             panes,
             focused,
+            fallback_terminal_ids,
             resource_revision,
             streamed_resource_revision: resource_revision,
             resource_changes,
@@ -489,6 +492,7 @@ impl Attachment {
         &mut self,
         panes: Vec<ObservedTarget>,
         focused: SelectedTarget,
+        fallback_terminal_ids: Vec<TerminalId>,
         resource_revision: u64,
     ) -> bool {
         let changed = self.focused.selected != focused
@@ -499,6 +503,7 @@ impl Attachment {
                 .zip(&panes)
                 .any(|(current, next)| current.selected != next.selected);
         self.focused.selected = focused;
+        self.fallback_terminal_ids = fallback_terminal_ids;
         self.replace_panes(panes, resource_revision);
         changed
     }
@@ -569,21 +574,6 @@ impl Attachment {
             );
             self.watchers.insert(terminal_id, (generation, task));
         }
-    }
-
-    fn replacement_panes(&self, terminal_id: TerminalId) -> Vec<PaneId> {
-        let Some(index) = self
-            .panes
-            .iter()
-            .position(|pane| pane.selected.terminal_id == terminal_id)
-        else {
-            return Vec::new();
-        };
-        self.panes[index + 1..]
-            .iter()
-            .chain(self.panes[..index].iter().rev())
-            .map(|pane| pane.selected.pane_id)
-            .collect()
     }
 
     fn tab_id(&self) -> TabId {
@@ -1061,10 +1051,16 @@ async fn handle_connection(
                         if let TargetSelection::Focused {
                             selected,
                             panes,
+                            fallback_terminal_ids,
                             resource_revision,
                         } = selection
                         {
-                            attachment.reconcile(panes, selected, resource_revision);
+                            attachment.reconcile(
+                                panes,
+                                selected,
+                                fallback_terminal_ids,
+                                resource_revision,
+                            );
                             send(
                                 &mut framed,
                                 envelope.request_id,
@@ -1210,7 +1206,7 @@ async fn handle_connection(
                     }
                     let focused = terminal_id == attachment.focused.selected.terminal_id;
                     let replacements = if focused {
-                        attachment.replacement_panes(terminal_id)
+                        exit_replacement_ids(&shared, &attachment, terminal_id).await
                     } else {
                         Vec::new()
                     };
@@ -1221,10 +1217,10 @@ async fn handle_connection(
                     ).await?;
                     if focused {
                         let mut replacement = None;
-                        for pane_id in replacements {
+                        for terminal_id in replacements {
                             if let Ok(candidate) = lease_view(
                                 &shared,
-                                Some(TargetSelector::Pane(pane_id)),
+                                Some(TargetSelector::Terminal(terminal_id)),
                                 client,
                             ).await
                                 && candidate.all_running().is_ok()
@@ -1496,6 +1492,7 @@ async fn lease_view(
     let paths = state
         .resources
         .open_terminal_paths_for_tab(focused.tab_id)?;
+    let fallback_terminal_ids = state.resources.fallback_terminal_ids(focused.terminal_id)?;
     let focused_runtime = state
         .runtimes
         .get(&focused.terminal_id)
@@ -1544,6 +1541,7 @@ async fn lease_view(
     Ok(Attachment::new(
         panes,
         focused_target,
+        fallback_terminal_ids,
         state.resources.revision(),
         state.resource_changes.subscribe(),
     ))
@@ -1570,11 +1568,17 @@ async fn focus_leased_attachment(
         .resources
         .resolve_terminal_target(Some(TargetSelector::Terminal(focused.selected.terminal_id)))?;
     let paths = state.resources.open_terminal_paths_for_tab(path.tab_id)?;
+    let fallback_terminal_ids = state.resources.fallback_terminal_ids(path.terminal_id)?;
     focused.selected = selected_target(path, &focused.terminal);
     let panes = observed_targets(&state, paths, focused.selected.terminal_id)?;
     let selected = focused.selected.clone();
     attachment.focused = focused;
-    attachment.reconcile(panes, selected, state.resources.revision());
+    attachment.reconcile(
+        panes,
+        selected,
+        fallback_terminal_ids,
+        state.resources.revision(),
+    );
     Ok(())
 }
 
@@ -1582,6 +1586,7 @@ enum TargetSelection {
     Focused {
         selected: SelectedTarget,
         panes: Vec<ObservedTarget>,
+        fallback_terminal_ids: Vec<TerminalId>,
         resource_revision: u64,
     },
     Different,
@@ -1615,9 +1620,11 @@ async fn observe_selection(
         return Ok(TargetSelection::Different);
     }
     let paths = state.resources.open_terminal_paths_for_tab(path.tab_id)?;
+    let fallback_terminal_ids = state.resources.fallback_terminal_ids(path.terminal_id)?;
     Ok(TargetSelection::Focused {
         selected: selected_target(path, &runtime.handle),
         panes: observed_targets(&state, paths, focused_terminal_id)?,
+        fallback_terminal_ids,
         resource_revision: state.resources.revision(),
     })
 }
@@ -1699,9 +1706,10 @@ async fn reconcile_attachment(
     let paths = state
         .resources
         .open_terminal_paths_for_tab(focused_path.tab_id)?;
+    let fallback_terminal_ids = state.resources.fallback_terminal_ids(focused_id)?;
     let panes = observed_targets(&state, paths, focused_id)?;
     let focused = selected_target(focused_path, &attachment.focused.terminal);
-    let view_changed = attachment.reconcile(panes, focused, revision);
+    let view_changed = attachment.reconcile(panes, focused, fallback_terminal_ids, revision);
     attachment.observe_streamed_revision(revision);
     Ok(Some(ReconciledResources {
         snapshot,
@@ -1717,6 +1725,28 @@ async fn switch_candidate(
     let attachment = lease_view(shared, Some(selector), client).await?;
     attachment.all_running()?;
     Ok(attachment)
+}
+
+async fn exit_replacement_ids(
+    shared: &Shared,
+    attachment: &Attachment,
+    exiting: TerminalId,
+) -> Vec<TerminalId> {
+    let mut replacements = attachment.fallback_terminal_ids.clone();
+    let mut seen = replacements.iter().copied().collect::<HashSet<_>>();
+    seen.insert(exiting);
+    let state = shared.lock().await;
+    if let Ok(current) = state
+        .resources
+        .open_terminal_ids_for_session(attachment.focused.selected.session_id)
+    {
+        replacements.extend(
+            current
+                .into_iter()
+                .filter(|terminal_id| seen.insert(*terminal_id)),
+        );
+    }
+    replacements
 }
 
 async fn open_location(
@@ -2421,14 +2451,29 @@ mod tests {
         state
             .register_session(path.clone(), Arc::clone(&focused))
             .unwrap();
-        state
+        let shared = Arc::new(Mutex::new(state));
+        let stale_attachment = lease_view(
+            &shared,
+            Some(TargetSelector::Pane(path.pane_id)),
+            ClientId::new(),
+        )
+        .await
+        .unwrap();
+        shared
+            .lock()
+            .await
             .register_pane(path.tab_id, sibling_pane_id, Arc::clone(&sibling))
             .unwrap();
-        let shared = Arc::new(Mutex::new(state));
+        assert_eq!(
+            exit_replacement_ids(&shared, &stale_attachment, focused.id()).await,
+            vec![sibling.id()]
+        );
+        drop(stale_attachment);
 
         let TargetSelection::Focused {
             selected,
             panes,
+            fallback_terminal_ids,
             resource_revision,
         } = observe_selection(&shared, &TargetSelector::Pane(path.pane_id), focused.id())
             .await
@@ -2440,6 +2485,7 @@ mod tests {
         assert_eq!(selected.pane_id, path.pane_id);
         assert_eq!(selected.terminal_id, focused.id());
         assert_eq!(panes.len(), 2);
+        assert_eq!(fallback_terminal_ids, vec![sibling.id()]);
         assert!(
             panes
                 .iter()

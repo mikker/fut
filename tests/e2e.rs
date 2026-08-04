@@ -2169,12 +2169,19 @@ async fn immediate_exit_interactive_create_tab_never_loses_exit_or_old_attachmen
                     other => panic!("unexpected frame after TabCreated: {other:?}"),
                 }
             }
-            assert!(
-                time::timeout(DEADLINE, receive(&mut connection))
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
+            receive_matching(&mut connection, |message| {
+                matches!(message, ServerMessage::TargetSelected { selected } if selected.focused.terminal_id == old_terminal)
+            })
+            .await;
+            send(
+                &mut connection,
+                ClientMessage::Input {
+                    bytes: b"FELL_BACK\n".to_vec(),
+                },
+            )
+            .await;
+            snapshot_containing(&mut connection, old_terminal, "OLD_FELL_BACK").await;
+            harness.detach(&mut connection).await;
         }
         other => panic!("expected terminal_exited or TabCreated, got {other:?}"),
     }
@@ -4400,6 +4407,215 @@ async fn unsupported_protocol_is_rejected_without_harming_daemon() {
         harness.control_command(ClientMessage::Ping).await,
         ServerMessage::Pong { .. }
     ));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn focused_exit_falls_back_through_previous_tabs_in_the_same_session() {
+    let harness = Harness::start(
+        "printf 'FALLBACK_A_READY\r\n'; while IFS= read -r line; do [ \"$line\" = a ] && printf 'FALLBACK_A_INPUT\r\n'; done",
+    )
+    .await;
+    let initial = harness.resources().await;
+    let workspace_id = initial.sessions[0].workspaces[0].id;
+    let terminal_a = initial.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
+    let ServerMessage::TabCreated { selected: tab_b } = harness
+        .control_command(ClientMessage::CreateTab {
+            workspace_id,
+            name: Some("second".into()),
+            cwd: None,
+            program: Some("/bin/sh".into()),
+            argv: vec![
+                "-c".into(),
+                "printf 'FALLBACK_B_READY\\r\\n'; while IFS= read -r line; do [ \"$line\" = b ] && printf 'FALLBACK_B_INPUT\\r\\n'; done".into(),
+            ],
+        })
+        .await
+    else {
+        panic!("failed to create second fallback tab")
+    };
+    let ServerMessage::TabCreated { selected: tab_c } = harness
+        .control_command(ClientMessage::CreateTab {
+            workspace_id,
+            name: Some("third".into()),
+            cwd: None,
+            program: Some("/bin/sh".into()),
+            argv: vec![
+                "-c".into(),
+                "printf 'FALLBACK_C_READY\\r\\n'; while IFS= read -r line; do :; done".into(),
+            ],
+        })
+        .await
+    else {
+        panic!("failed to create third fallback tab")
+    };
+
+    let (mut attached, _) =
+        attach_once(&harness, TargetSelector::Terminal(tab_c.terminal_id)).await;
+    snapshot_containing(&mut attached, tab_c.terminal_id, "FALLBACK_C_READY").await;
+    send(&mut attached, ClientMessage::Input { bytes: vec![0x04] }).await;
+    receive_matching(&mut attached, |message| {
+        matches!(message, ServerMessage::TerminalExited { terminal_id, .. } if *terminal_id == tab_c.terminal_id)
+    })
+    .await;
+    let ServerMessage::TargetSelected { selected } = receive_matching(&mut attached, |message| {
+        matches!(message, ServerMessage::TargetSelected { selected } if selected.focused.terminal_id == tab_b.terminal_id)
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(selected.focused.tab_id, tab_b.tab_id);
+    send(
+        &mut attached,
+        ClientMessage::Input {
+            bytes: b"b\n".to_vec(),
+        },
+    )
+    .await;
+    snapshot_containing(&mut attached, tab_b.terminal_id, "FALLBACK_B_INPUT").await;
+
+    send(&mut attached, ClientMessage::Input { bytes: vec![0x04] }).await;
+    receive_matching(&mut attached, |message| {
+        matches!(message, ServerMessage::TerminalExited { terminal_id, .. } if *terminal_id == tab_b.terminal_id)
+    })
+    .await;
+    receive_matching(&mut attached, |message| {
+        matches!(message, ServerMessage::TargetSelected { selected } if selected.focused.terminal_id == terminal_a)
+    })
+    .await;
+    send(
+        &mut attached,
+        ClientMessage::Input {
+            bytes: b"a\n".to_vec(),
+        },
+    )
+    .await;
+    snapshot_containing(&mut attached, terminal_a, "FALLBACK_A_INPUT").await;
+
+    harness.detach(&mut attached).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn public_ctrl_d_closes_a_tab_and_returns_to_its_predecessor() {
+    let harness = Harness::start(
+        "printf 'PREDECESSOR_TERMINAL_ACTIVE\r\n'; while IFS= read -r line; do [ \"$line\" = a ] && printf 'PREDECESSOR_INPUT_ROUTED\r\n'; done",
+    )
+    .await;
+    let resources = harness.resources().await;
+    let workspace_id = resources.sessions[0].workspaces[0].id;
+    let terminal_a = resources.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
+    let ServerMessage::TabCreated { selected: tab_b } = harness
+        .control_command(ClientMessage::CreateTab {
+            workspace_id,
+            name: Some("temporary".into()),
+            cwd: None,
+            program: Some("/bin/sh".into()),
+            argv: vec![
+                "-c".into(),
+                "printf 'CTRL_D_B_READY\\r\\n'; while IFS= read -r line; do :; done".into(),
+            ],
+        })
+        .await
+    else {
+        panic!("failed to create Ctrl-D tab")
+    };
+
+    let mut command = Command::new("/usr/bin/script");
+    command
+        .env_clear()
+        .env("HOME", harness.root.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", harness.root.path().join("runtime"))
+        .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+        .env("TERM", "xterm-256color")
+        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .arg(format!(
+            "stty rows 24 cols 80; exec '{}' --socket '{}' terminal attach {}",
+            env!("CARGO_BIN_EXE_fut"),
+            harness.socket.display(),
+            tab_b.terminal_id
+        ));
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("CTRL_D_B_READY").await;
+    client.send(&[0x04]);
+    client.wait_for("PREDECESSOR_TERMINAL_ACTIVE").await;
+    client.send(b"a\n");
+    client.wait_for("PREDECESSOR_INPUT_ROUTED").await;
+    client.send(b"\x02d");
+    client.wait_success().await;
+
+    let remaining = harness.resources().await;
+    assert_eq!(remaining.sessions[0].workspaces[0].tabs.len(), 1);
+    assert_eq!(
+        remaining.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id,
+        terminal_a
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn last_terminal_exit_detaches_instead_of_crossing_sessions() {
+    let mut harness = Harness::start("while IFS= read -r line; do :; done").await;
+    let first = harness.resources().await;
+    let first_session = first.sessions[0].id;
+    let second_cwd = harness.root.path().join("other-session");
+    fs::create_dir(&second_cwd).unwrap();
+    let ServerMessage::LocationOpened {
+        selected: second, ..
+    } = harness
+        .control_command(ClientMessage::OpenLocation {
+            name: Some("other".into()),
+            cwd: second_cwd,
+            program: Some("/bin/sh".into()),
+            argv: vec![
+                "-c".into(),
+                "printf 'OTHER_SESSION_READY\\r\\n'; while IFS= read -r line; do :; done".into(),
+            ],
+        })
+        .await
+    else {
+        panic!("failed to create second session")
+    };
+    let sessions = harness.resources().await;
+    assert_eq!(sessions.sessions.len(), 2);
+    let second_session = sessions
+        .sessions
+        .iter()
+        .find(|session| session.id != first_session)
+        .unwrap()
+        .id;
+
+    let (mut attached, _) =
+        attach_once(&harness, TargetSelector::Terminal(second.terminal_id)).await;
+    snapshot_containing(&mut attached, second.terminal_id, "OTHER_SESSION_READY").await;
+    send(&mut attached, ClientMessage::Input { bytes: vec![0x04] }).await;
+    receive_matching(&mut attached, |message| {
+        matches!(message, ServerMessage::TerminalExited { terminal_id, .. } if *terminal_id == second.terminal_id)
+    })
+    .await;
+    time::timeout(DEADLINE, async {
+        while let Some(frame) = attached.next().await {
+            let envelope: Envelope<ServerMessage> = decode_payload(&frame.unwrap()).unwrap();
+            assert!(
+                !matches!(envelope.message, ServerMessage::TargetSelected { .. }),
+                "client crossed into another session after its session closed"
+            );
+        }
+    })
+    .await
+    .expect("client did not detach after its last terminal exited");
+
+    let remaining = resources_when(&harness, |snapshot| snapshot.sessions.len() == 1).await;
+    assert_eq!(remaining.sessions[0].id, first_session);
+    assert!(
+        !remaining
+            .sessions
+            .iter()
+            .any(|session| session.id == second_session)
+    );
+    assert!(harness.daemon.try_wait().unwrap().is_none());
     harness.shutdown().await;
 }
 
