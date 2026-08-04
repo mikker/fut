@@ -164,6 +164,18 @@ impl Harness {
     }
 
     async fn start_with(script: &str, setup: impl FnOnce(&std::path::Path)) -> Self {
+        Self::start_configured(script, setup, None).await
+    }
+
+    async fn start_with_shell(script: &str, shell: &std::path::Path) -> Self {
+        Self::start_configured(script, |_| {}, Some(shell)).await
+    }
+
+    async fn start_configured(
+        script: &str,
+        setup: impl FnOnce(&std::path::Path),
+        shell: Option<&std::path::Path>,
+    ) -> Self {
         let root = tempfile::Builder::new()
             .prefix("fut-e2e-")
             .tempdir()
@@ -178,7 +190,7 @@ impl Harness {
         fs::create_dir_all(&cwd).expect("create working directory");
         setup(root.path());
         let socket = runtime.join("fut.sock");
-        let daemon = spawn_daemon(&root, &socket, &home, &runtime, &cwd, script);
+        let daemon = spawn_daemon(&root, &socket, &home, &runtime, &cwd, script, shell);
 
         let mut harness = Self {
             root,
@@ -205,6 +217,7 @@ impl Harness {
             &self.root.path().join("runtime"),
             &self.root.path().join("cwd"),
             script,
+            None,
         );
         self.wait_until_ready().await;
     }
@@ -409,12 +422,14 @@ fn spawn_daemon(
     runtime: &PathBuf,
     cwd: &PathBuf,
     script: &str,
+    shell: Option<&std::path::Path>,
 ) -> Child {
     let stdout =
         fs::File::create(root.path().join("daemon.stdout")).expect("create daemon stdout capture");
     let stderr =
         fs::File::create(root.path().join("daemon.stderr")).expect("create daemon stderr capture");
-    Command::new(env!("CARGO_BIN_EXE_fut"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_fut"));
+    command
         .env_clear()
         .env("HOME", home)
         .env("PATH", "/usr/bin:/bin")
@@ -433,9 +448,11 @@ fn spawn_daemon(
         .arg(script)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .spawn()
-        .expect("start real fut daemon binary")
+        .stderr(Stdio::from(stderr));
+    if let Some(shell) = shell {
+        command.env("SHELL", shell);
+    }
+    command.spawn().expect("start real fut daemon binary")
 }
 
 impl Drop for Harness {
@@ -3801,6 +3818,113 @@ done
     assert!(process_alive(linked_pid));
     harness.shutdown().await;
     wait_for(DEADLINE, || !process_alive(linked_pid)).await;
+}
+
+#[tokio::test]
+async fn public_command_bar_filters_labels_actions_and_matches_direct_dispatch() {
+    let harness = Harness::start(
+        "printf 'COMMAND_ALPHA_READY\\r\\n'; while IFS= read -r line; do case \"$line\" in alpha) printf 'COMMAND_ALPHA_ACK\\r\\n';; *) printf 'COMMAND_ALPHA_UNEXPECTED_%s\\r\\n' \"$line\";; esac; done",
+    )
+    .await;
+    let snapshot = harness.resources().await;
+    let tab_id = snapshot.sessions[0].workspaces[0].tabs[0].id;
+    let pane_a = snapshot.sessions[0].workspaces[0].tabs[0].panes[0].id;
+    let ServerMessage::PaneCreated { selected: pane_b } = harness
+        .control_command(ClientMessage::CreatePane {
+            tab_id,
+            cwd: None,
+            program: Some("/bin/sh".into()),
+            argv: vec![
+                "-c".into(),
+                "printf 'COMMAND_ZETA_READY\\r\\n'; while IFS= read -r line; do case \"$line\" in zeta) printf 'COMMAND_ZETA_ACK\\r\\n';; *) printf 'COMMAND_ZETA_UNEXPECTED_%s\\r\\n' \"$line\";; esac; done".into(),
+            ],
+        })
+        .await
+    else {
+        panic!("failed to create command-bar sibling")
+    };
+
+    let mut command = Command::new("/usr/bin/script");
+    command
+        .env_clear()
+        .env("HOME", harness.root.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", harness.root.path().join("runtime"))
+        .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+        .env("TERM", "xterm-256color")
+        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .arg(format!(
+            "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {pane_a}",
+            env!("CARGO_BIN_EXE_fut"),
+            harness.socket.display(),
+        ));
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("COMMAND_ALPHA_READY").await;
+    client.wait_for("COMMAND_ZETA_READY").await;
+
+    client.send(b"\x02k");
+    client.wait_for("Open global navigator").await;
+    client.wait_for("Ctrl-b g").await;
+    client.send(b"\x1b[200~frobnicate\nzeta\x1b[201~");
+    client.wait_for("No matching commands").await;
+    client.send(b"\x15next pane\rzeta\n");
+    client.wait_for("COMMAND_ZETA_ACK").await;
+
+    client.send(b"\x02halpha\n");
+    client.wait_for("COMMAND_ALPHA_ACK").await;
+    assert!(
+        !client.text().contains("UNEXPECTED"),
+        "command query leaked to a terminal: {:?}",
+        client.text()
+    );
+    client.send(b"\x02d");
+    client.wait_success().await;
+    assert!(client.text().contains("\x1b[?2004h"));
+    assert!(client.text().contains("\x1b[?2004l"));
+
+    assert!(process_alive(pane_b.child_pid));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn command_bar_create_failure_releases_input_to_the_original_terminal() {
+    let harness = Harness::start_with_shell(
+        "printf 'CREATE_FAILURE_READY\\r\\n'; while IFS= read -r line; do [ \"$line\" = after ] && printf 'CREATE_FAILURE_RECOVERED\\r\\n'; done",
+        std::path::Path::new("/definitely/missing/fut-shell"),
+    )
+    .await;
+    let snapshot = harness.resources().await;
+    let pane = snapshot.sessions[0].workspaces[0].tabs[0].panes[0].id;
+
+    let mut command = Command::new("/usr/bin/script");
+    command
+        .env_clear()
+        .env("HOME", harness.root.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", harness.root.path().join("runtime"))
+        .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+        .env("TERM", "xterm-256color")
+        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .arg(format!(
+            "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {pane}",
+            env!("CARGO_BIN_EXE_fut"),
+            harness.socket.display(),
+        ));
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("CREATE_FAILURE_READY").await;
+    client.send(b"\x02kcreate tab\r");
+    client.wait_for("create tab failed").await;
+    client.send(b"after\n");
+    client.wait_for("CREATE_FAILURE_RECOVERED").await;
+    assert_eq!(
+        harness.resources().await.sessions[0].workspaces[0]
+            .tabs
+            .len(),
+        1
+    );
+    client.send(b"\x02d");
+    client.wait_success().await;
+    harness.shutdown().await;
 }
 
 #[tokio::test]

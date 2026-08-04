@@ -1,5 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use super::actions::{ClientAction, action_for_suffix};
+
 pub(super) fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return None;
@@ -79,12 +81,7 @@ pub(super) struct PrefixState {
 #[derive(Debug, Eq, PartialEq)]
 pub(super) enum PrefixAction {
     Wait,
-    Detach,
-    Navigator,
-    WorkspaceSidebar,
-    CreateTab,
-    FocusNext,
-    FocusPrevious,
+    Dispatch(ClientAction),
     Send(Vec<u8>),
 }
 
@@ -99,15 +96,12 @@ impl PrefixState {
             }
         } else {
             self.waiting = false;
-            match bytes.as_slice() {
-                b"d" => PrefixAction::Detach,
-                b"g" => PrefixAction::Navigator,
-                b"w" => PrefixAction::WorkspaceSidebar,
-                b"c" => PrefixAction::CreateTab,
-                b"l" | b"o" => PrefixAction::FocusNext,
-                b"h" | b";" => PrefixAction::FocusPrevious,
-                [2] => PrefixAction::Send(vec![2]),
-                _ => PrefixAction::Send([vec![2], bytes].concat()),
+            if bytes == [2] {
+                PrefixAction::Send(vec![2])
+            } else if let Some(action) = action_for_suffix(&bytes) {
+                PrefixAction::Dispatch(action)
+            } else {
+                PrefixAction::Send([vec![2], bytes].concat())
             }
         }
     }
@@ -160,21 +154,50 @@ mod tests {
     fn prefix_detaches_escapes_itself_and_preserves_other_sequences() {
         let mut prefix = PrefixState::default();
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
-        assert_eq!(prefix.feed(b"d".to_vec()), PrefixAction::Detach);
+        assert_eq!(
+            prefix.feed(b"d".to_vec()),
+            PrefixAction::Dispatch(ClientAction::Detach)
+        );
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
-        assert_eq!(prefix.feed(b"g".to_vec()), PrefixAction::Navigator);
+        assert_eq!(
+            prefix.feed(b"g".to_vec()),
+            PrefixAction::Dispatch(ClientAction::OpenNavigator)
+        );
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
-        assert_eq!(prefix.feed(b"w".to_vec()), PrefixAction::WorkspaceSidebar);
+        assert_eq!(
+            prefix.feed(b"w".to_vec()),
+            PrefixAction::Dispatch(ClientAction::OpenWorkspaceSidebar)
+        );
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
-        assert_eq!(prefix.feed(b"c".to_vec()), PrefixAction::CreateTab);
+        assert_eq!(
+            prefix.feed(b"c".to_vec()),
+            PrefixAction::Dispatch(ClientAction::CreateTab)
+        );
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
-        assert_eq!(prefix.feed(b"l".to_vec()), PrefixAction::FocusNext);
+        assert_eq!(
+            prefix.feed(b"l".to_vec()),
+            PrefixAction::Dispatch(ClientAction::FocusNextPane)
+        );
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
-        assert_eq!(prefix.feed(b"o".to_vec()), PrefixAction::FocusNext);
+        assert_eq!(
+            prefix.feed(b"o".to_vec()),
+            PrefixAction::Dispatch(ClientAction::FocusNextPane)
+        );
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
-        assert_eq!(prefix.feed(b"h".to_vec()), PrefixAction::FocusPrevious);
+        assert_eq!(
+            prefix.feed(b"h".to_vec()),
+            PrefixAction::Dispatch(ClientAction::FocusPreviousPane)
+        );
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
-        assert_eq!(prefix.feed(b";".to_vec()), PrefixAction::FocusPrevious);
+        assert_eq!(
+            prefix.feed(b";".to_vec()),
+            PrefixAction::Dispatch(ClientAction::FocusPreviousPane)
+        );
+        assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
+        assert_eq!(
+            prefix.feed(b"k".to_vec()),
+            PrefixAction::Dispatch(ClientAction::OpenCommandBar)
+        );
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Send(vec![2]));
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);

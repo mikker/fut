@@ -1,6 +1,8 @@
 //! Interactive terminal client for a running Fut daemon.
 
+mod actions;
 mod chrome;
+mod command_bar;
 mod config;
 mod input;
 mod layout;
@@ -9,13 +11,15 @@ mod sidebar;
 
 use std::{io, path::Path, time::Duration};
 
+use actions::ClientAction;
 use anyhow::{Context, bail};
 use bytes::Bytes;
 use chrome::{ResourceState, client_layout, render_tab_bar};
+use command_bar::{CommandBarAction, CommandBarState};
 use config::UiConfig;
 use crossterm::{
     cursor::{Hide, Show},
-    event::{Event, EventStream},
+    event::{DisableBracketedPaste, EnableBracketedPaste, Event, EventStream},
     execute,
     terminal::{
         DisableLineWrap, EnableLineWrap, EnterAlternateScreen, LeaveAlternateScreen,
@@ -50,6 +54,12 @@ use crate::{
     },
     resources::TargetSelector,
 };
+
+enum ClientSurface {
+    Navigator(NavigatorState),
+    WorkspaceSidebar(WorkspaceSidebarState),
+    CommandBar(CommandBarState),
+}
 
 /// Attach an interactive full-screen client to an already-running daemon.
 pub async fn attach(socket_path: &Path, selector: Option<TargetSelector>) -> anyhow::Result<()> {
@@ -123,8 +133,7 @@ async fn run(
     let mut prefix = PrefixState::default();
     let mut view = ViewState::new(selected)?;
     let mut resources = ResourceState::default();
-    let mut navigator: Option<NavigatorState> = None;
-    let mut workspace_sidebar: Option<WorkspaceSidebarState> = None;
+    let mut surface: Option<ClientSurface> = None;
     let mut workspace_history = WorkspaceHistory::default();
     workspace_history.record(view.focused());
     let mut create_tab = CreateTabState::default();
@@ -152,61 +161,54 @@ async fn run(
                     ServerMessage::Snapshot { terminal_id, screen } => {
                         if view.accept(terminal_id, screen)
                             && terminal_id == view.focused().terminal_id
-                            && navigator.as_ref().is_some_and(|nav| nav.switch_request.is_none() && matches!(nav.status, navigator::NavigatorStatus::Switching))
+                            && matches!(
+                                surface.as_ref(),
+                                Some(ClientSurface::Navigator(nav))
+                                    if nav.switch_request.is_none()
+                                        && matches!(nav.status, navigator::NavigatorStatus::Switching)
+                            )
                         {
-                            navigator = None;
+                            surface = None;
                         }
                     }
                     ServerMessage::Resources { snapshot } => {
                         if resources.accept(snapshot) {
-                            if let Some(nav) = navigator.as_mut() {
-                                nav.accept_resources(
-                                    resources.snapshot().expect("accepted resources exist"),
-                                    view.focused(),
-                                );
-                            }
-                            if let Some(sidebar) = workspace_sidebar.as_mut() {
-                                sidebar.accept_resources(
-                                    resources.snapshot().expect("accepted resources exist"),
-                                    view.focused(),
-                                    &workspace_history,
-                                );
-                            }
+                            refresh_surface_resources(
+                                &mut surface,
+                                resources.snapshot().expect("accepted resources exist"),
+                                view.focused(),
+                                &workspace_history,
+                            );
                             force_draw = true;
                         }
                     }
                     ServerMessage::ResourcesChanged { snapshot } => {
                         if resources.accept(snapshot) {
-                            if let Some(nav) = navigator.as_mut() {
-                                nav.accept_resources(
-                                    resources.snapshot().expect("accepted resources exist"),
-                                    view.focused(),
-                                );
-                            }
-                            if let Some(sidebar) = workspace_sidebar.as_mut() {
-                                sidebar.accept_resources(
-                                    resources.snapshot().expect("accepted resources exist"),
-                                    view.focused(),
-                                    &workspace_history,
-                                );
-                            }
+                            refresh_surface_resources(
+                                &mut surface,
+                                resources.snapshot().expect("accepted resources exist"),
+                                view.focused(),
+                                &workspace_history,
+                            );
                             force_draw = true;
                         }
                     }
                     ServerMessage::TargetSelected { selected: target } => {
                         let old_terminal = view.focused().terminal_id;
-                        let navigator_selected = navigator.as_mut().is_some_and(|nav| nav.switch_selected(request_id));
+                        let navigator_selected = match surface.as_mut() {
+                            Some(ClientSurface::Navigator(nav)) => nav.switch_selected(request_id),
+                            _ => false,
+                        };
                         let workspace_selected =
                             matches!(focus.complete(request_id), Some(FocusOrigin::Workspace));
+                        let create_selected = create_tab.selected(request_id, &target.focused);
                         if !view.replace(target)? {
-                            if navigator_selected {
-                                navigator = None;
+                            if navigator_selected || workspace_selected {
+                                surface = None;
                                 view.invalidate_drawn();
                                 force_draw = true;
                             }
-                            if workspace_selected {
-                                workspace_sidebar = None;
-                                view.invalidate_drawn();
+                            if create_selected {
                                 force_draw = true;
                             }
                             continue;
@@ -214,27 +216,30 @@ async fn run(
                         workspace_history.record(view.focused());
                         pending_focused_exit = None;
                         resize_view(framed, terminal.size()?.into(), &mut view, ui).await?;
-                        if let Some(sidebar) = workspace_sidebar.as_mut()
+                        if let Some(ClientSurface::WorkspaceSidebar(sidebar)) = surface.as_mut()
                             && let Some(snapshot) = resources.snapshot()
                         {
                             sidebar.accept_resources(snapshot, view.focused(), &workspace_history);
                         }
                         if navigator_selected && view.focused().terminal_id == old_terminal {
-                            navigator = None;
+                            surface = None;
                             view.invalidate_drawn();
                         } else if navigator_selected
-                            && let Some(nav) = navigator.as_mut()
+                            && let Some(ClientSurface::Navigator(nav)) = surface.as_mut()
                         {
                             nav.status = navigator::NavigatorStatus::Switching;
                         }
                         if workspace_selected {
-                            workspace_sidebar = None;
+                            surface = None;
+                            view.invalidate_drawn();
+                        }
+                        if create_selected {
                             view.invalidate_drawn();
                         }
                         force_draw = true;
                     }
                     ServerMessage::TabCreated { selected: target } => {
-                        if !create_tab.complete(request_id) {
+                        if !create_tab.created(request_id, target.terminal_id) {
                             continue;
                         }
                         if target.terminal_id == view.focused().terminal_id {
@@ -268,18 +273,23 @@ async fn run(
                     }
                     ServerMessage::Detached => break,
                     ServerMessage::Error { code, message } => {
-                        if create_tab.complete(request_id) {
-                            bail!("create tab failed: daemon error ({code}): {message}");
+                        if create_tab.fail(request_id) {
+                            notice = Some(format!("create tab failed · {message}"));
+                            force_draw = true;
+                            continue;
                         }
-                        let handled = navigator.as_mut().is_some_and(|nav| {
-                            nav.switch_error(request_id, message.clone())
-                        });
+                        let handled = match surface.as_mut() {
+                            Some(ClientSurface::Navigator(nav)) => {
+                                nav.switch_error(request_id, message.clone())
+                            }
+                            _ => false,
+                        };
                         if handled {
                             force_draw = true;
                         } else {
                             match focus.complete(request_id) {
                                 Some(FocusOrigin::Workspace) => {
-                                    if let Some(sidebar) = workspace_sidebar.as_mut() {
+                                    if let Some(ClientSurface::WorkspaceSidebar(sidebar)) = surface.as_mut() {
                                         sidebar.switch_error(message);
                                         force_draw = true;
                                     } else {
@@ -300,46 +310,53 @@ async fn run(
                     ServerMessage::Welcome { .. } => bail!("unexpected second welcome from daemon"),
                 }
             }
-            event = events.next(), if focus.request_id.is_none() && pending_focused_exit.is_none() => {
+            event = events.next(), if accepts_client_input(&focus, &create_tab, &pending_focused_exit) => {
                 let Some(event) = event else { break };
                 match event? {
-                    Event::Key(key) if navigator.is_some() => {
+                    Event::Key(key) if matches!(surface.as_ref(), Some(ClientSurface::Navigator(_))) => {
                         notice = None;
                         let visible = terminal.size()?.height.saturating_sub(2) as usize;
-                        match navigator.as_mut().expect("navigator exists").key(key, visible) {
+                        let action = match surface.as_mut().expect("navigator exists") {
+                            ClientSurface::Navigator(nav) => nav.key(key, visible),
+                            _ => unreachable!("surface guard ensures navigator"),
+                        };
+                        match action {
                             NavigatorAction::Stay => force_draw = true,
                             NavigatorAction::Close => {
-                                navigator = None;
+                                surface = None;
                                 view.invalidate_drawn();
                                 force_draw = true;
                             }
                             NavigatorAction::Select(selector) => {
                                 let request = Uuid::new_v4();
-                                navigator.as_mut().expect("navigator exists").begin_switch(request);
+                                match surface.as_mut().expect("navigator exists") {
+                                    ClientSurface::Navigator(nav) => nav.begin_switch(request),
+                                    _ => unreachable!("surface guard ensures navigator"),
+                                }
                                 send_request(framed, Some(request), ClientMessage::SelectTarget { selector }).await?;
                                 force_draw = true;
                             }
                         }
                     }
-                    Event::Key(key) if workspace_sidebar.is_some() => {
+                    Event::Key(key) if matches!(surface.as_ref(), Some(ClientSurface::WorkspaceSidebar(_))) => {
                         notice = None;
-                        match workspace_sidebar
-                            .as_mut()
-                            .expect("workspace sidebar exists")
-                            .key(key)
-                        {
+                        let action = match surface.as_mut().expect("workspace sidebar exists") {
+                            ClientSurface::WorkspaceSidebar(sidebar) => sidebar.key(key),
+                            _ => unreachable!("surface guard ensures workspace sidebar"),
+                        };
+                        match action {
                             WorkspaceSidebarAction::Stay => force_draw = true,
                             WorkspaceSidebarAction::Close => {
-                                workspace_sidebar = None;
+                                surface = None;
                                 view.invalidate_drawn();
                                 force_draw = true;
                             }
                             WorkspaceSidebarAction::Select(terminal_id) => {
                                 if let Some(request) = focus.begin(FocusOrigin::Workspace) {
-                                    workspace_sidebar
-                                        .as_mut()
-                                        .expect("workspace sidebar exists")
-                                        .begin_switch();
+                                    match surface.as_mut().expect("workspace sidebar exists") {
+                                        ClientSurface::WorkspaceSidebar(sidebar) => sidebar.begin_switch(),
+                                        _ => unreachable!("surface guard ensures workspace sidebar"),
+                                    }
                                     send_request(
                                         framed,
                                         Some(request),
@@ -353,66 +370,63 @@ async fn run(
                             }
                         }
                     }
-                    Event::Key(key) => if let Some(bytes) = encode_key(key) {
+                    Event::Key(key) if matches!(surface.as_ref(), Some(ClientSurface::CommandBar(_))) => {
+                        notice = None;
+                        let action = match surface.as_mut().expect("command bar exists") {
+                            ClientSurface::CommandBar(command_bar) => command_bar.key(key),
+                            _ => unreachable!("surface guard ensures command bar"),
+                        };
+                        match action {
+                            CommandBarAction::Stay => force_draw = true,
+                            CommandBarAction::Close => {
+                                surface = None;
+                                view.invalidate_drawn();
+                                force_draw = true;
+                            }
+                            CommandBarAction::Dispatch(action) => {
+                                surface = None;
+                                view.invalidate_drawn();
+                                notice = dispatch_client_action(
+                                    action,
+                                    framed,
+                                    &view,
+                                    &resources,
+                                    &mut surface,
+                                    &workspace_history,
+                                    &mut create_tab,
+                                    &mut focus,
+                                ).await?;
+                                force_draw = true;
+                            }
+                        }
+                    }
+                    Event::Paste(text) if matches!(surface.as_ref(), Some(ClientSurface::CommandBar(_))) => {
+                        if let Some(ClientSurface::CommandBar(command_bar)) = surface.as_mut() {
+                            command_bar.paste(&text);
+                            force_draw = true;
+                        }
+                    }
+                    Event::Key(key) if surface.is_none() => if let Some(bytes) = encode_key(key) {
                         notice = None;
                         match prefix.feed(bytes) {
                             PrefixAction::Wait => {}
-                            PrefixAction::Detach => {
-                                send(framed, ClientMessage::Detach).await?;
-                            }
-                            PrefixAction::Navigator => {
-                                let mut state = NavigatorState::open(view.focused());
-                                if let Some(snapshot) = resources.snapshot() {
-                                    state.accept_resources(snapshot, view.focused());
-                                }
-                                navigator = Some(state);
+                            PrefixAction::Dispatch(action) => {
+                                notice = dispatch_client_action(
+                                    action,
+                                    framed,
+                                    &view,
+                                    &resources,
+                                    &mut surface,
+                                    &workspace_history,
+                                    &mut create_tab,
+                                    &mut focus,
+                                ).await?;
                                 force_draw = true;
-                            }
-                            PrefixAction::WorkspaceSidebar => {
-                                if let Some(snapshot) = resources.snapshot() {
-                                    workspace_sidebar = WorkspaceSidebarState::open(
-                                        snapshot,
-                                        view.focused(),
-                                        &workspace_history,
-                                    );
-                                    if workspace_sidebar.is_some() {
-                                        force_draw = true;
-                                    } else {
-                                        notice = Some("no workspace available".into());
-                                        force_draw = true;
-                                    }
-                                } else {
-                                    notice = Some("workspaces are still loading".into());
-                                    force_draw = true;
-                                }
-                            }
-                            PrefixAction::CreateTab => if let Some(request) = create_tab.begin() {
-                                send_request(framed, Some(request), ClientMessage::CreateTab {
-                                    workspace_id: view.focused().workspace_id,
-                                    name: None,
-                                    cwd: None,
-                                    program: None,
-                                    argv: Vec::new(),
-                                }).await?;
-                            },
-                            action @ (PrefixAction::FocusNext | PrefixAction::FocusPrevious) => {
-                                let forward = matches!(action, PrefixAction::FocusNext);
-                                if let Some(target) = view.cycle(forward)
-                                    && let Some(request) = focus.begin(FocusOrigin::Pane)
-                                {
-                                    send_request(
-                                        framed,
-                                        Some(request),
-                                        ClientMessage::SelectTarget {
-                                            selector: TargetSelector::Pane(target.pane_id),
-                                        },
-                                    ).await?;
-                                }
                             }
                             PrefixAction::Send(bytes) => send(framed, ClientMessage::Input { bytes }).await?,
                         }
                     },
-                    Event::Paste(text) if navigator.is_none() && workspace_sidebar.is_none() => send(framed, ClientMessage::Input { bytes: text.into_bytes() }).await?,
+                    Event::Paste(text) if surface.is_none() => send(framed, ClientMessage::Input { bytes: text.into_bytes() }).await?,
                     Event::Resize(columns, rows) if columns > 0 && rows > 0 => {
                         resize_view(framed, Rect::new(0, 0, columns, rows), &mut view, ui).await?;
                         force_draw = true;
@@ -433,7 +447,7 @@ async fn run(
                             frame.buffer_mut(),
                         );
                     }
-                    if let Some(sidebar) = workspace_sidebar.as_ref() {
+                    if let Some(ClientSurface::WorkspaceSidebar(sidebar)) = surface.as_ref() {
                         if let Some(sidebar_area) =
                             layout.workspace_sidebar.map(|sidebar| sidebar.area())
                         {
@@ -455,9 +469,16 @@ async fn run(
                             frame.buffer_mut(),
                         );
                     }
-                    if let Some(nav) = navigator.as_mut() {
-                        nav.render(area, frame.buffer_mut());
-                    } else if workspace_sidebar.is_none()
+                    match surface.as_mut() {
+                        Some(ClientSurface::Navigator(nav)) => {
+                            nav.render(area, frame.buffer_mut());
+                        }
+                        Some(ClientSurface::CommandBar(command_bar)) => {
+                            command_bar.render(layout.terminal, frame.buffer_mut());
+                        }
+                        Some(ClientSurface::WorkspaceSidebar(_)) | None => {}
+                    }
+                    if surface.is_none()
                         && notice.is_none()
                         && let Some((column, row)) = cursor
                     {
@@ -473,6 +494,103 @@ async fn run(
         }
     }
     Ok(())
+}
+
+fn refresh_surface_resources(
+    surface: &mut Option<ClientSurface>,
+    snapshot: &crate::resources::ResourceSnapshot,
+    focused: &SelectedTarget,
+    workspace_history: &WorkspaceHistory,
+) {
+    match surface.as_mut() {
+        Some(ClientSurface::Navigator(nav)) => {
+            nav.accept_resources(snapshot, focused);
+        }
+        Some(ClientSurface::WorkspaceSidebar(sidebar)) => {
+            sidebar.accept_resources(snapshot, focused, workspace_history);
+        }
+        Some(ClientSurface::CommandBar(_)) | None => {}
+    }
+}
+
+fn accepts_client_input(
+    focus: &FocusState,
+    create_tab: &CreateTabState,
+    pending_focused_exit: &Option<Option<i32>>,
+) -> bool {
+    focus.request_id.is_none() && !create_tab.blocks_input() && pending_focused_exit.is_none()
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the dispatcher explicitly borrows the small client states it coordinates"
+)]
+async fn dispatch_client_action(
+    action: ClientAction,
+    framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    view: &ViewState,
+    resources: &ResourceState,
+    surface: &mut Option<ClientSurface>,
+    workspace_history: &WorkspaceHistory,
+    create_tab: &mut CreateTabState,
+    focus: &mut FocusState,
+) -> anyhow::Result<Option<String>> {
+    match action {
+        ClientAction::OpenCommandBar => {
+            *surface = Some(ClientSurface::CommandBar(CommandBarState::open()));
+        }
+        ClientAction::OpenNavigator => {
+            let mut navigator = NavigatorState::open(view.focused());
+            if let Some(snapshot) = resources.snapshot() {
+                navigator.accept_resources(snapshot, view.focused());
+            }
+            *surface = Some(ClientSurface::Navigator(navigator));
+        }
+        ClientAction::OpenWorkspaceSidebar => {
+            let Some(snapshot) = resources.snapshot() else {
+                return Ok(Some("workspaces are still loading".into()));
+            };
+            let Some(sidebar) =
+                WorkspaceSidebarState::open(snapshot, view.focused(), workspace_history)
+            else {
+                return Ok(Some("no workspace available".into()));
+            };
+            *surface = Some(ClientSurface::WorkspaceSidebar(sidebar));
+        }
+        ClientAction::CreateTab => {
+            if let Some(request) = create_tab.begin() {
+                send_request(
+                    framed,
+                    Some(request),
+                    ClientMessage::CreateTab {
+                        workspace_id: view.focused().workspace_id,
+                        name: None,
+                        cwd: None,
+                        program: None,
+                        argv: Vec::new(),
+                    },
+                )
+                .await?;
+            }
+        }
+        ClientAction::FocusNextPane | ClientAction::FocusPreviousPane => {
+            let forward = action == ClientAction::FocusNextPane;
+            if let Some(target) = view.cycle(forward)
+                && let Some(request) = focus.begin(FocusOrigin::Pane)
+            {
+                send_request(
+                    framed,
+                    Some(request),
+                    ClientMessage::SelectTarget {
+                        selector: TargetSelector::Pane(target.pane_id),
+                    },
+                )
+                .await?;
+            }
+        }
+        ClientAction::Detach => send(framed, ClientMessage::Detach).await?,
+    }
+    Ok(None)
 }
 
 async fn send(
@@ -507,26 +625,76 @@ async fn receive(
 }
 
 #[derive(Default)]
-struct CreateTabState {
-    request_id: Option<Uuid>,
+enum CreateTabState {
+    #[default]
+    Idle,
+    AwaitingCreated {
+        request_id: Uuid,
+    },
+    AwaitingSelected {
+        request_id: Uuid,
+        terminal_id: TerminalId,
+    },
 }
 
 impl CreateTabState {
     fn begin(&mut self) -> Option<Uuid> {
-        if self.request_id.is_some() {
+        if !matches!(self, Self::Idle) {
             return None;
         }
         let request_id = Uuid::new_v4();
-        self.request_id = Some(request_id);
+        *self = Self::AwaitingCreated { request_id };
         Some(request_id)
     }
 
-    fn complete(&mut self, request_id: Option<Uuid>) -> bool {
-        if request_id.is_none() || request_id != self.request_id {
+    fn created(&mut self, request_id: Option<Uuid>, terminal_id: TerminalId) -> bool {
+        let Self::AwaitingCreated {
+            request_id: expected,
+        } = self
+        else {
+            return false;
+        };
+        if request_id != Some(*expected) {
             return false;
         }
-        self.request_id = None;
+        *self = Self::AwaitingSelected {
+            request_id: *expected,
+            terminal_id,
+        };
         true
+    }
+
+    fn selected(&mut self, request_id: Option<Uuid>, selected: &SelectedTarget) -> bool {
+        let Self::AwaitingSelected {
+            request_id: expected,
+            terminal_id,
+        } = self
+        else {
+            return false;
+        };
+        if request_id != Some(*expected) || *terminal_id != selected.terminal_id {
+            return false;
+        }
+        *self = Self::Idle;
+        true
+    }
+
+    fn fail(&mut self, request_id: Option<Uuid>) -> bool {
+        let expected = match self {
+            Self::Idle => return false,
+            Self::AwaitingCreated { request_id } | Self::AwaitingSelected { request_id, .. } => {
+                *request_id
+            }
+        };
+        if request_id != Some(expected) {
+            return false;
+        }
+        *self = Self::Idle;
+        true
+    }
+
+    fn blocks_input(&self) -> bool {
+        !matches!(self, Self::Idle)
     }
 }
 
@@ -900,6 +1068,7 @@ fn style(source: CellStyle) -> Style {
 struct TerminalGuard {
     raw: bool,
     alternate_screen: bool,
+    bracketed_paste: bool,
     cursor_hidden: bool,
     line_wrap_disabled: bool,
 }
@@ -909,6 +1078,7 @@ impl TerminalGuard {
         let mut guard = Self {
             raw: false,
             alternate_screen: false,
+            bracketed_paste: false,
             cursor_hidden: false,
             line_wrap_disabled: false,
         };
@@ -916,6 +1086,8 @@ impl TerminalGuard {
         guard.raw = true;
         execute!(io::stdout(), EnterAlternateScreen)?;
         guard.alternate_screen = true;
+        execute!(io::stdout(), EnableBracketedPaste)?;
+        guard.bracketed_paste = true;
         execute!(io::stdout(), Hide)?;
         guard.cursor_hidden = true;
         execute!(io::stdout(), DisableLineWrap)?;
@@ -927,6 +1099,9 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut stdout = io::stdout();
+        if self.bracketed_paste {
+            let _ = execute!(stdout, DisableBracketedPaste);
+        }
         if self.line_wrap_disabled {
             let _ = execute!(stdout, EnableLineWrap);
         }
@@ -964,15 +1139,33 @@ mod tests {
     }
 
     #[test]
-    fn create_tab_state_allows_one_request_and_only_completes_its_correlation() {
+    fn create_tab_state_blocks_input_through_correlated_ack_and_selection() {
         let mut state = CreateTabState::default();
+        let focus = FocusState::default();
+        let no_exit = None;
         let request = state.begin().expect("first request starts");
         assert!(state.begin().is_none());
-        assert!(!state.complete(None));
-        assert!(!state.complete(Some(Uuid::new_v4())));
+        assert!(state.blocks_input());
+        assert!(!accepts_client_input(&focus, &state, &no_exit));
+        let target = targets(1).remove(0);
+        assert!(!state.created(None, target.terminal_id));
+        assert!(!state.created(Some(Uuid::new_v4()), target.terminal_id));
+        assert!(state.created(Some(request), target.terminal_id));
+        assert!(state.blocks_input());
+        assert!(!accepts_client_input(&focus, &state, &no_exit));
+        assert!(!state.selected(Some(Uuid::new_v4()), &target));
         assert!(state.begin().is_none());
-        assert!(state.complete(Some(request)));
+        assert!(state.selected(Some(request), &target));
+        assert!(!state.blocks_input());
+        assert!(accepts_client_input(&focus, &state, &no_exit));
         assert!(state.begin().is_some());
+
+        let mut failed = CreateTabState::default();
+        let request = failed.begin().unwrap();
+        assert!(!failed.fail(Some(Uuid::new_v4())));
+        assert!(failed.fail(Some(request)));
+        assert!(!failed.blocks_input());
+        assert!(accepts_client_input(&focus, &failed, &no_exit));
     }
 
     #[test]
