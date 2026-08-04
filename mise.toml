@@ -20,6 +20,14 @@ run = "cargo test --lib --all-features"
 [tasks."test:e2e"]
 run = "cargo test --test e2e --all-features"
 
+[tasks.journey]
+description = "Run the isolated keyboard-driven daily-driver journey"
+run = "cargo test --test e2e --all-features isolated_daily_driver_journey -- --nocapture --test-threads=1"
+
+[tasks."journey:chaos"]
+description = "Run a reproducible isolated keyboard chaos journey"
+run = "cargo test --test e2e --all-features isolated_keyboard_chaos_journey -- --nocapture --test-threads=1"
+
 [tasks.demo]
 description = "Build and attach to a disposable multi-workspace Fut demo"
 run = "bash scripts/demo"

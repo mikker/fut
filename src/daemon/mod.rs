@@ -2444,6 +2444,13 @@ async fn command_response(
     command: AcknowledgedCommand,
     result: Result<(), CommandError>,
 ) -> Result<()> {
+    if is_uncorrelated_transition_error(request_id, &result) {
+        // Interactive input and resize messages are intentionally uncorrelated.
+        // Their terminal can exit after the client sends them but before this
+        // loop reconciles its attachment. Drop that transition input rather
+        // than turning a normal focused-exit fallback into a fatal client error.
+        return Ok(());
+    }
     if let Err(error) = result {
         send_command_error(framed, request_id, error).await?;
     } else if request_id.is_some() {
@@ -2455,6 +2462,13 @@ async fn command_response(
         .await?;
     }
     Ok(())
+}
+
+fn is_uncorrelated_transition_error(
+    request_id: Option<uuid::Uuid>,
+    result: &Result<(), CommandError>,
+) -> bool {
+    request_id.is_none() && matches!(result, Err(CommandError::Stopped))
 }
 
 async fn send_command_error(
@@ -2503,6 +2517,22 @@ async fn send(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stopped_transition_input_is_silent_only_when_uncorrelated() {
+        assert!(is_uncorrelated_transition_error(
+            None,
+            &Err(CommandError::Stopped)
+        ));
+        assert!(!is_uncorrelated_transition_error(
+            Some(uuid::Uuid::new_v4()),
+            &Err(CommandError::Stopped)
+        ));
+        assert!(!is_uncorrelated_transition_error(
+            None,
+            &Err(CommandError::Busy)
+        ));
+    }
 
     fn inconsistent_state() -> (SharedState, InitialPath) {
         let resolved = ResolvedLocation {

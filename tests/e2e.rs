@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use std::{
+    collections::HashMap,
     fs,
     io::{Read, Write},
     os::unix::{fs::PermissionsExt, net::UnixListener},
@@ -32,6 +33,21 @@ const SIZE: TerminalSize = TerminalSize {
     columns: 80,
     rows: 24,
 };
+
+struct ChaosRng(u64);
+
+impl ChaosRng {
+    fn new(seed: u64) -> Self {
+        Self(seed.max(1))
+    }
+
+    fn index(&mut self, upper: usize) -> usize {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 as usize) % upper
+    }
+}
 
 type Connection = Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>;
 
@@ -82,11 +98,14 @@ impl PtyChild {
     }
 
     fn send(&mut self, bytes: &[u8]) {
-        self.input
+        if let Err(error) = self
+            .input
             .as_mut()
             .expect("PTY stdin is open")
             .write_all(bytes)
-            .expect("write PTY input");
+        {
+            panic!("write PTY input: {error}; output={:?}", self.text());
+        }
     }
 
     async fn wait_for(&mut self, needle: &str) {
@@ -3714,6 +3733,378 @@ async fn public_tab_navigation_and_right_down_splits_share_the_command_catalog()
 }
 
 #[tokio::test]
+async fn isolated_daily_driver_journey() {
+    let harness = Harness::start(
+        "printf 'JOURNEY_MAIN_READY\r\n'; while IFS= read -r line; do case \"$line\" in main) printf 'JOURNEY_MAIN_INPUT\r\n';; fallback) printf 'JOURNEY_EXIT_FALLBACK\r\n';; reattach) printf 'JOURNEY_REATTACHED_INPUT\r\n';; esac; done",
+    )
+    .await;
+    let resources = harness.resources().await;
+    let workspace_id = resources.sessions[0].workspaces[0].id;
+    let original_pane = resources.sessions[0].workspaces[0].tabs[0].panes[0].id;
+    let ServerMessage::TabCreated { selected: second } = harness
+        .control_command(ClientMessage::CreateTab {
+            workspace_id,
+            name: Some("journey-second".into()),
+            cwd: None,
+            program: Some("/bin/sh".into()),
+            argv: vec![
+                "-c".into(),
+                "printf 'TAB2_READY_729\r\n'; while IFS= read -r line; do case \"$line\" in second) printf 'TAB2_INPUT_729\r\n';; exit-now) exit;; esac; done"
+                    .into(),
+            ],
+        })
+        .await
+    else {
+        panic!("failed to create journey tab")
+    };
+
+    let spawn_client = |pane: PaneId, columns: u16| {
+        let mut command = Command::new("/usr/bin/script");
+        command
+            .env_clear()
+            .env("HOME", harness.root.path().join("home"))
+            .env("PATH", "/usr/bin:/bin")
+            .env("TMPDIR", harness.root.path().join("runtime"))
+            .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+            .env("TERM", "xterm-256color")
+            .args(["-q", "/dev/null", "/bin/sh", "-c"])
+            .arg(format!(
+                "stty rows 30 cols {columns}; exec '{}' --socket '{}' pane attach {pane}",
+                env!("CARGO_BIN_EXE_fut"),
+                harness.socket.display()
+            ));
+        PtyChild::spawn(command)
+    };
+
+    let mut client = spawn_client(original_pane, 100);
+    client.wait_for("JOURNEY_MAIN_READY").await;
+    client.send(b"main\n");
+    client.wait_for("JOURNEY_MAIN_INPUT").await;
+
+    client.send(b"\x02|");
+    client.send(b"printf 'JOURNEY_RIGHT_SPLIT\\r\\n'\n");
+    client.wait_for("JOURNEY_RIGHT_SPLIT").await;
+    client.send(b"\x02k");
+    client.send(b"split pane down\r");
+    client.send(b"printf 'JOURNEY_DOWN_SPLIT\\r\\n'\n");
+    client.wait_for("JOURNEY_DOWN_SPLIT").await;
+
+    let split_resources = resources_when(&harness, |snapshot| {
+        snapshot.sessions[0].workspaces[0].tabs[0].panes.len() == 3
+    })
+    .await;
+    let split_tab = &split_resources.sessions[0].workspaces[0].tabs[0];
+    assert_eq!(
+        split_tab.layout.leaf_ids(),
+        split_tab
+            .panes
+            .iter()
+            .map(|pane| pane.id)
+            .collect::<Vec<_>>()
+    );
+
+    client.send(b"\x02z");
+    client.wait_for("zoom ").await;
+    client.send(b"printf 'JOURNEY_ZOOMED\\r\\n'\n");
+    client.wait_for("JOURNEY_ZOOMED").await;
+    client.send(b"\x02z");
+
+    client.send(b"\x02n");
+    client.wait_for("TAB2_READY_729").await;
+    client.send(b"second\n");
+    client.wait_for("TAB2_INPUT_729").await;
+    client.send(b"\x02p");
+    client.send(b"printf 'JOURNEY_BACK_ON_MAIN\\r\\n'\n");
+    client.wait_for("JOURNEY_BACK_ON_MAIN").await;
+    client.send(b"\x02n");
+    client.send(b"exit-now\n");
+
+    let remaining = resources_when(&harness, |snapshot| {
+        snapshot.sessions[0].workspaces[0].tabs.len() == 1
+    })
+    .await;
+    assert_eq!(remaining.sessions[0].workspaces[0].tabs[0].panes.len(), 3);
+    client.send(b"fallback\n");
+    client.wait_for("JOURNEY_EXIT_FALLBACK").await;
+    assert!(!process_alive(second.child_pid));
+
+    client.send(b"\x02d");
+    client.wait_success().await;
+    let reattach_pane = remaining.sessions[0].workspaces[0].tabs[0].panes[0].id;
+    let mut reattached = spawn_client(reattach_pane, 60);
+    reattached.wait_for("JOURNEY_MAIN_READY").await;
+    reattached.send(b"reattach\n");
+    reattached.wait_for("JOURNEY_REATTACHED_INPUT").await;
+    reattached.send(b"\x02d");
+    reattached.wait_success().await;
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn isolated_keyboard_chaos_journey() {
+    let seed = std::env::var("FUT_CHAOS_SEED")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0x0f07_ca05);
+    let steps = std::env::var("FUT_CHAOS_STEPS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(40usize);
+    assert!(
+        (1..=2_000).contains(&steps),
+        "FUT_CHAOS_STEPS must be 1..=2000"
+    );
+
+    let harness = Harness::start("exec /bin/sh").await;
+    let initial = harness.resources().await;
+    let workspace_id = initial.sessions[0].workspaces[0].id;
+    let mut current_tab = initial.sessions[0].workspaces[0].tabs[0].id;
+    let mut current_pane = initial.sessions[0].workspaces[0].tabs[0].panes[0].id;
+    let mut rng = ChaosRng::new(seed);
+    let mut pane_processes = HashMap::new();
+    let mut tab_history = HashMap::from([(current_tab, current_pane)]);
+
+    let spawn_client = |pane: PaneId, columns: u16| {
+        let mut command = Command::new("/usr/bin/script");
+        command
+            .env_clear()
+            .env("HOME", harness.root.path().join("home"))
+            .env("PATH", "/usr/bin:/bin")
+            .env("TMPDIR", harness.root.path().join("runtime"))
+            .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+            .env("TERM", "xterm-256color")
+            .args(["-q", "/dev/null", "/bin/sh", "-c"])
+            .arg(format!(
+                "stty rows 30 cols {columns}; exec '{}' --socket '{}' pane attach {pane}",
+                env!("CARGO_BIN_EXE_fut"),
+                harness.socket.display()
+            ));
+        PtyChild::spawn(command)
+    };
+
+    let mut client = spawn_client(current_pane, 100);
+    client.wait_for("sh-3.2$").await;
+    pane_processes.insert(
+        current_pane,
+        chaos_identify_pane(&mut client, harness.root.path(), 0, seed).await,
+    );
+
+    for step in 1..=steps {
+        let before = harness.resources().await;
+        let workspace = before.sessions[0]
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .expect("chaos workspace remains open");
+        let tab = workspace
+            .tabs
+            .iter()
+            .find(|tab| tab.id == current_tab)
+            .expect("current chaos tab remains open");
+        let pane_index = tab
+            .panes
+            .iter()
+            .position(|pane| pane.id == current_pane)
+            .expect("current chaos pane remains open");
+        let mut action = rng.index(10);
+        if matches!(action, 0 | 1) && tab.panes.len() >= 6 {
+            action = 2 + rng.index(3);
+        }
+        if action == 7 && workspace.tabs.len() >= 4 {
+            action = 5 + rng.index(2);
+        }
+        if action == 8 && tab.panes.len() == 1 {
+            action = 2 + rng.index(3);
+        }
+        if matches!(action, 5 | 6) && workspace.tabs.len() == 1 {
+            action = 7;
+        }
+
+        let action_name = match action {
+            0 => {
+                client.send(b"\x02|");
+                let snapshot = resources_when(&harness, |snapshot| {
+                    snapshot.sessions[0].workspaces[0]
+                        .tabs
+                        .iter()
+                        .find(|tab| tab.id == current_tab)
+                        .is_some_and(|tab| {
+                            tab.panes.len()
+                                == before.sessions[0].workspaces[0]
+                                    .tabs
+                                    .iter()
+                                    .find(|tab| tab.id == current_tab)
+                                    .unwrap()
+                                    .panes
+                                    .len()
+                                    + 1
+                        })
+                })
+                .await;
+                let tab = snapshot.sessions[0].workspaces[0]
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.id == current_tab)
+                    .unwrap();
+                current_pane = tab.panes[pane_index + 1].id;
+                pane_processes.insert(
+                    current_pane,
+                    chaos_identify_pane(&mut client, harness.root.path(), step, seed).await,
+                );
+                "split-right"
+            }
+            1 => {
+                client.send(b"\x02k");
+                client.send(b"split pane down\r");
+                let pane_count = tab.panes.len() + 1;
+                let snapshot = resources_when(&harness, |snapshot| {
+                    snapshot.sessions[0].workspaces[0]
+                        .tabs
+                        .iter()
+                        .find(|tab| tab.id == current_tab)
+                        .is_some_and(|tab| tab.panes.len() == pane_count)
+                })
+                .await;
+                let tab = snapshot.sessions[0].workspaces[0]
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.id == current_tab)
+                    .unwrap();
+                current_pane = tab.panes[pane_index + 1].id;
+                pane_processes.insert(
+                    current_pane,
+                    chaos_identify_pane(&mut client, harness.root.path(), step, seed).await,
+                );
+                "launcher-split-down"
+            }
+            2 => {
+                client.send(b"\x02l");
+                current_pane = tab.panes[(pane_index + 1) % tab.panes.len()].id;
+                "focus-next"
+            }
+            3 => {
+                client.send(b"\x02h");
+                current_pane = tab.panes[(pane_index + tab.panes.len() - 1) % tab.panes.len()].id;
+                "focus-previous"
+            }
+            4 => {
+                client.send(b"\x02z");
+                "toggle-zoom"
+            }
+            5 | 6 => {
+                let tab_index = workspace
+                    .tabs
+                    .iter()
+                    .position(|tab| tab.id == current_tab)
+                    .unwrap();
+                let next_index = if action == 5 {
+                    (tab_index + 1) % workspace.tabs.len()
+                } else {
+                    (tab_index + workspace.tabs.len() - 1) % workspace.tabs.len()
+                };
+                client.send(if action == 5 { b"\x02n" } else { b"\x02p" });
+                current_tab = workspace.tabs[next_index].id;
+                current_pane = tab_history
+                    .get(&current_tab)
+                    .copied()
+                    .filter(|pane_id| {
+                        workspace.tabs[next_index]
+                            .panes
+                            .iter()
+                            .any(|pane| pane.id == *pane_id)
+                    })
+                    .unwrap_or(workspace.tabs[next_index].panes[0].id);
+                if action == 5 {
+                    "tab-next"
+                } else {
+                    "tab-previous"
+                }
+            }
+            7 => {
+                client.send(b"\x02c");
+                let tab_count = workspace.tabs.len() + 1;
+                let snapshot = resources_when(&harness, |snapshot| {
+                    snapshot.sessions[0].workspaces[0].tabs.len() == tab_count
+                })
+                .await;
+                let tab = snapshot.sessions[0].workspaces[0].tabs.last().unwrap();
+                current_tab = tab.id;
+                current_pane = tab.panes[0].id;
+                pane_processes.insert(
+                    current_pane,
+                    chaos_identify_pane(&mut client, harness.root.path(), step, seed).await,
+                );
+                "create-tab"
+            }
+            8 => {
+                client.send(b"exit\n");
+                let pane_count = tab.panes.len() - 1;
+                let snapshot = resources_when(&harness, |snapshot| {
+                    snapshot.sessions[0].workspaces[0]
+                        .tabs
+                        .iter()
+                        .find(|tab| tab.id == current_tab)
+                        .is_some_and(|tab| tab.panes.len() == pane_count)
+                })
+                .await;
+                let tab = snapshot.sessions[0].workspaces[0]
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.id == current_tab)
+                    .unwrap();
+                current_pane = tab.panes[pane_index.saturating_sub(1)].id;
+                "exit-pane"
+            }
+            9 => {
+                client.send(b"\x02d");
+                client.wait_success().await;
+                let pane = &workspace.tabs[rng.index(workspace.tabs.len())].panes;
+                current_pane = pane[rng.index(pane.len())].id;
+                current_tab = workspace
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.panes.iter().any(|pane| pane.id == current_pane))
+                    .unwrap()
+                    .id;
+                client = spawn_client(current_pane, 48 + rng.index(73) as u16);
+                tab_history.clear();
+                tab_history.insert(current_tab, current_pane);
+                "detach-reattach"
+            }
+            _ => unreachable!(),
+        };
+
+        eprintln!("chaos seed={seed} step={step}/{steps} action={action_name}");
+        tab_history.insert(current_tab, current_pane);
+        chaos_probe_pane(
+            &mut client,
+            harness.root.path(),
+            step,
+            pane_processes.get(&current_pane).unwrap(),
+            seed,
+        )
+        .await;
+        let snapshot = harness.resources().await;
+        let tab = snapshot.sessions[0].workspaces[0]
+            .tabs
+            .iter()
+            .find(|tab| tab.id == current_tab)
+            .expect("focused tab exists after chaos action");
+        assert!(tab.panes.iter().any(|pane| pane.id == current_pane));
+        assert_eq!(
+            tab.layout.leaf_ids(),
+            tab.panes.iter().map(|pane| pane.id).collect::<Vec<_>>(),
+            "layout mismatch after seed={seed} step={step} action={action_name}"
+        );
+    }
+
+    client.send(b"\x02d");
+    client.wait_success().await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn public_tab_bar_tracks_live_tabs_resizes_content_and_honors_global_position() {
     let harness = Harness::start(
         "printf 'TAB_BAR_READY\\r\\n'; while IFS= read -r line; do case \"$line\" in top-probe) set -- $(stty size); printf 'TOP_SIZE_%s_%s\\r\\n' \"$1\" \"$2\";; bottom-probe) set -- $(stty size); printf 'BOTTOM_SIZE_%s_%s\\r\\n' \"$1\" \"$2\";; esac; done",
@@ -5260,6 +5651,58 @@ async fn wait_for(timeout: Duration, mut condition: impl FnMut() -> bool) {
     })
     .await
     .expect("condition did not become true before timeout");
+}
+
+async fn chaos_identify_pane(
+    client: &mut PtyChild,
+    root: &std::path::Path,
+    step: usize,
+    seed: u64,
+) -> String {
+    let marker = root.join("cwd").join(format!("a{step}"));
+    let command = format!("echo $$>a{step}\n");
+    time::sleep(Duration::from_millis(100)).await;
+    time::timeout(DEADLINE, async {
+        loop {
+            if marker.exists() {
+                break;
+            }
+            client.send(command.as_bytes());
+            time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("chaos identification timed out: seed={seed} step={step}"));
+    fs::read_to_string(marker).unwrap()
+}
+
+async fn chaos_probe_pane(
+    client: &mut PtyChild,
+    root: &std::path::Path,
+    step: usize,
+    process: &str,
+    seed: u64,
+) {
+    let marker = root.join("cwd").join(format!("p{step}"));
+    let command = format!("echo $$>p{step}\n");
+    time::sleep(Duration::from_millis(100)).await;
+    time::timeout(DEADLINE, async {
+        loop {
+            if marker.exists() {
+                break;
+            }
+            client.send(command.as_bytes());
+            time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("chaos probe timed out: seed={seed} step={step}"));
+    assert_eq!(
+        fs::read_to_string(marker).unwrap(),
+        process,
+        "chaos input reached the wrong pane: seed={seed} step={step}; output={:?}",
+        client.text()
+    );
 }
 
 async fn resources_when(
