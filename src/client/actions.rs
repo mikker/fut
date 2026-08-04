@@ -6,6 +6,7 @@ pub(super) enum ClientAction {
     CreateTab,
     FocusNextPane,
     FocusPreviousPane,
+    TogglePaneZoom,
     Detach,
 }
 
@@ -22,7 +23,7 @@ pub(super) struct DirectBinding {
     pub action: ClientAction,
 }
 
-pub(super) const COMMANDS: [ActionDefinition; 6] = [
+pub(super) const COMMANDS: [ActionDefinition; 7] = [
     ActionDefinition {
         action: ClientAction::OpenNavigator,
         title: "Open global navigator",
@@ -49,13 +50,18 @@ pub(super) const COMMANDS: [ActionDefinition; 6] = [
         keywords: "focus previous pane back backward cycle",
     },
     ActionDefinition {
+        action: ClientAction::TogglePaneZoom,
+        title: "Toggle pane zoom",
+        keywords: "pane zoom maximize restore fullscreen",
+    },
+    ActionDefinition {
         action: ClientAction::Detach,
         title: "Detach client",
         keywords: "detach disconnect leave client",
     },
 ];
 
-pub(super) const DIRECT_BINDINGS: [DirectBinding; 9] = [
+pub(super) const DIRECT_BINDINGS: [DirectBinding; 10] = [
     DirectBinding {
         suffix: b"k",
         action: ClientAction::OpenCommandBar,
@@ -87,6 +93,10 @@ pub(super) const DIRECT_BINDINGS: [DirectBinding; 9] = [
     DirectBinding {
         suffix: b";",
         action: ClientAction::FocusPreviousPane,
+    },
+    DirectBinding {
+        suffix: b"z",
+        action: ClientAction::TogglePaneZoom,
     },
     DirectBinding {
         suffix: b"d",
@@ -140,5 +150,7 @@ mod tests {
             }
         }
         assert!(definition(ClientAction::OpenCommandBar).is_none());
+        assert_eq!(action_for_suffix(b"z"), Some(ClientAction::TogglePaneZoom));
+        assert_eq!(binding_label(ClientAction::TogglePaneZoom), "Ctrl-b z");
     }
 }

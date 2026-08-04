@@ -3547,6 +3547,73 @@ async fn public_client_accordion_resizes_focus_and_falls_back_narrowly() {
 }
 
 #[tokio::test]
+async fn public_pane_zoom_toggles_full_width_and_matches_command_dispatch() {
+    let harness = Harness::start(
+        "printf 'ZOOM_A_READY\r\n'; while IFS= read -r line; do set -- $(stty size); case \"$line\" in before) printf 'BEFORE_%s_%s\r\n' \"$1\" \"$2\";; zoomed) printf 'ZOOMED_%s_%s\r\n' \"$1\" \"$2\";; restored) printf 'RESTORED_%s_%s\r\n' \"$1\" \"$2\";; command) printf 'COMMAND_ZOOM_%s_%s\r\n' \"$1\" \"$2\";; esac; done",
+    )
+    .await;
+    let resources = harness.resources().await;
+    let tab_id = resources.sessions[0].workspaces[0].tabs[0].id;
+    let pane_a = resources.sessions[0].workspaces[0].tabs[0].panes[0].id;
+    let ServerMessage::PaneCreated { selected: pane_b } = harness
+        .control_command(ClientMessage::CreatePane {
+            tab_id,
+            cwd: None,
+            program: Some("/bin/sh".into()),
+            argv: vec![
+                "-c".into(),
+                "printf 'ZOOM_B_READY\\r\\n'; while IFS= read -r line; do :; done".into(),
+            ],
+        })
+        .await
+    else {
+        panic!("failed to create zoom sibling")
+    };
+
+    let mut command = Command::new("/usr/bin/script");
+    command
+        .env_clear()
+        .env("HOME", harness.root.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", harness.root.path().join("runtime"))
+        .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+        .env("TERM", "xterm-256color")
+        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .arg(format!(
+            "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {}",
+            env!("CARGO_BIN_EXE_fut"),
+            harness.socket.display(),
+            pane_a
+        ));
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("ZOOM_A_READY").await;
+    client.wait_for("ZOOM_B_READY").await;
+    client.send(b"before\n");
+    client.wait_for("BEFORE_23_52").await;
+
+    client.send(b"\x02z");
+    client.wait_for("zoom ").await;
+    client.send(b"zoomed\n");
+    client.wait_for("ZOOMED_23_80").await;
+
+    client.send(b"\x02z");
+    client.send(b"restored\n");
+    client.wait_for("RESTORED_23_52").await;
+
+    client.send(b"\x02k");
+    client.send(b"pane zoom");
+    client.send(b"\r");
+    client.send(b"command\n");
+    client.wait_for("COMMAND_ZOOM_23_80").await;
+    client.send(b"\x02z");
+    client.send(b"\x02d");
+    client.wait_success().await;
+
+    assert!(process_alive(pane_b.child_pid));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn public_tab_bar_tracks_live_tabs_resizes_content_and_honors_global_position() {
     let harness = Harness::start(
         "printf 'TAB_BAR_READY\\r\\n'; while IFS= read -r line; do case \"$line\" in top-probe) set -- $(stty size); printf 'TOP_SIZE_%s_%s\\r\\n' \"$1\" \"$2\";; bottom-probe) set -- $(stty size); printf 'BOTTOM_SIZE_%s_%s\\r\\n' \"$1\" \"$2\";; esac; done",

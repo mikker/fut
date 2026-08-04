@@ -385,12 +385,14 @@ async fn run(
                                 notice = dispatch_client_action(
                                     action,
                                     framed,
-                                    &view,
+                                    &mut view,
                                     &resources,
                                     &mut surface,
                                     &workspace_history,
                                     &mut create_tab,
                                     &mut focus,
+                                    terminal.size()?.into(),
+                                    ui,
                                 ).await?;
                                 force_draw = true;
                             }
@@ -410,12 +412,14 @@ async fn run(
                                 notice = dispatch_client_action(
                                     action,
                                     framed,
-                                    &view,
+                                    &mut view,
                                     &resources,
                                     &mut surface,
                                     &workspace_history,
                                     &mut create_tab,
                                     &mut focus,
+                                    terminal.size()?.into(),
+                                    ui,
                                 ).await?;
                                 force_draw = true;
                             }
@@ -439,6 +443,7 @@ async fn run(
                         render_tab_bar(
                             resources.snapshot(),
                             view.focused(),
+                            view.is_zoomed(),
                             tab_bar,
                             frame.buffer_mut(),
                         );
@@ -524,12 +529,14 @@ fn accepts_client_input(
 async fn dispatch_client_action(
     action: ClientAction,
     framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
-    view: &ViewState,
+    view: &mut ViewState,
     resources: &ResourceState,
     surface: &mut Option<ClientSurface>,
     workspace_history: &WorkspaceHistory,
     create_tab: &mut CreateTabState,
     focus: &mut FocusState,
+    host: Rect,
+    ui: UiConfig,
 ) -> anyhow::Result<Option<String>> {
     match action {
         ClientAction::OpenCommandBar => {
@@ -583,6 +590,12 @@ async fn dispatch_client_action(
                 )
                 .await?;
             }
+        }
+        ClientAction::TogglePaneZoom => {
+            let Some(_) = view.toggle_zoom() else {
+                return Ok(Some("pane zoom needs more than one pane".into()));
+            };
+            resize_view(framed, host, view, ui).await?;
         }
         ClientAction::Detach => send(framed, ClientMessage::Detach).await?,
     }
@@ -762,6 +775,7 @@ struct ViewState {
     focused: TerminalId,
     selected_revision: u64,
     panes: Vec<PaneState>,
+    zoomed: bool,
 }
 
 impl ViewState {
@@ -771,6 +785,7 @@ impl ViewState {
             focused,
             selected_revision: 0,
             panes: Vec::new(),
+            zoomed: false,
         };
         view.replace(selected)?;
         Ok(view)
@@ -781,6 +796,11 @@ impl ViewState {
             return Ok(false);
         }
         let previous_focus = self.focused;
+        let previous_tab = self
+            .panes
+            .iter()
+            .find(|pane| pane.target.terminal_id == self.focused)
+            .map(|pane| pane.target.tab_id);
         if selected.panes.is_empty() {
             bail!("daemon selected an empty pane view");
         }
@@ -836,6 +856,11 @@ impl ViewState {
             .collect();
         self.focused = focused;
         self.selected_revision = selected.resource_revision;
+        if previous_tab.is_some_and(|tab_id| tab_id != selected.focused.tab_id)
+            || self.panes.len() < 2
+        {
+            self.zoomed = false;
+        }
         if previous_focus != focused
             && let Some(pane) = self
                 .panes
@@ -854,6 +879,19 @@ impl ViewState {
             .find(|pane| pane.target.terminal_id == self.focused)
             .expect("focused terminal belongs to the client view")
             .target
+    }
+
+    fn is_zoomed(&self) -> bool {
+        self.zoomed
+    }
+
+    fn toggle_zoom(&mut self) -> Option<bool> {
+        if self.panes.len() < 2 {
+            return None;
+        }
+        self.zoomed = !self.zoomed;
+        self.invalidate_drawn();
+        Some(self.zoomed)
     }
 
     fn accept(&mut self, terminal_id: TerminalId, screen: ScreenSnapshot) -> bool {
@@ -909,6 +947,9 @@ impl ViewState {
             return;
         };
         self.panes.remove(index);
+        if self.panes.len() < 2 {
+            self.zoomed = false;
+        }
         if self.focused == terminal_id
             && let Some(pane) = self.panes.get(index).or_else(|| self.panes.last())
         {
@@ -924,7 +965,7 @@ impl ViewState {
     }
 
     fn resize_requests(&mut self, area: Rect) -> Vec<(TerminalId, TerminalSize)> {
-        let layouts = pane_layouts(area, &self.terminal_ids(), self.focused);
+        let layouts = pane_layouts(area, &self.terminal_ids(), self.focused, self.zoomed);
         let Some(pane) = self
             .panes
             .iter_mut()
@@ -962,7 +1003,7 @@ async fn resize_view(
 }
 
 fn render_view(view: &ViewState, area: Rect, buffer: &mut Buffer) -> Option<(u16, u16)> {
-    let layouts = pane_layouts(area, &view.terminal_ids(), view.focused);
+    let layouts = pane_layouts(area, &view.terminal_ids(), view.focused, view.zoomed);
     let mut cursor = None;
     for pane in &view.panes {
         let Some(PaneLayout { rail, content }) = layouts.get(&pane.target.terminal_id) else {
@@ -1356,6 +1397,82 @@ mod tests {
                 }
             )]
         );
+    }
+
+    #[test]
+    fn pane_zoom_is_explicit_tracks_focus_and_resets_across_tabs() {
+        let panes = targets(2);
+        let first = panes[0].terminal_id;
+        let second = panes[1].terminal_id;
+        let area = Rect::new(0, 0, 38, 4);
+        let mut state = ViewState::new(SelectedView {
+            resource_revision: 1,
+            focused: panes[0].clone(),
+            panes: panes.clone(),
+        })
+        .unwrap();
+
+        assert!(!state.is_zoomed());
+        assert_eq!(state.resize_requests(area)[0].1.columns, 24);
+        assert_eq!(state.toggle_zoom(), Some(true));
+        assert!(state.is_zoomed());
+        assert_eq!(
+            state.resize_requests(area),
+            [(
+                first,
+                TerminalSize {
+                    columns: 38,
+                    rows: 4,
+                },
+            )]
+        );
+
+        state
+            .replace(SelectedView {
+                resource_revision: 1,
+                focused: panes[1].clone(),
+                panes: panes.clone(),
+            })
+            .unwrap();
+        assert!(state.is_zoomed());
+        assert_eq!(
+            state
+                .panes
+                .iter()
+                .find(|pane| pane.target.terminal_id == second)
+                .unwrap()
+                .last_size,
+            None
+        );
+        assert_eq!(
+            state.resize_requests(area)[0],
+            (
+                second,
+                TerminalSize {
+                    columns: 38,
+                    rows: 4
+                }
+            )
+        );
+
+        let other_tab = targets(2);
+        state
+            .replace(SelectedView {
+                resource_revision: 2,
+                focused: other_tab[0].clone(),
+                panes: other_tab,
+            })
+            .unwrap();
+        assert!(!state.is_zoomed());
+
+        state
+            .replace(SelectedView {
+                resource_revision: 3,
+                focused: panes[0].clone(),
+                panes: vec![panes[0].clone()],
+            })
+            .unwrap();
+        assert_eq!(state.toggle_zoom(), None);
     }
 
     #[test]

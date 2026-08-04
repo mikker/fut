@@ -18,15 +18,17 @@ pub(super) fn pane_layouts(
     host: Rect,
     terminals: &[TerminalId],
     focused: TerminalId,
+    zoomed: bool,
 ) -> BTreeMap<TerminalId, PaneLayout> {
     if host.width == 0 || host.height == 0 || terminals.is_empty() || !terminals.contains(&focused)
     {
         return BTreeMap::new();
     }
 
-    if terminals.len() == 1 {
+    if terminals.len() == 1 || zoomed {
+        let terminal = if zoomed { focused } else { terminals[0] };
         return BTreeMap::from([(
-            terminals[0],
+            terminal,
             PaneLayout {
                 rail: None,
                 content: host,
@@ -104,10 +106,10 @@ mod tests {
     #[test]
     fn invalid_inputs_have_no_layouts() {
         let ids = terminals(2);
-        assert!(pane_layouts(Rect::new(2, 3, 80, 24), &[], TerminalId::new()).is_empty());
-        assert!(pane_layouts(Rect::new(2, 3, 0, 24), &ids, ids[0]).is_empty());
-        assert!(pane_layouts(Rect::new(2, 3, 80, 0), &ids, ids[0]).is_empty());
-        assert!(pane_layouts(Rect::new(2, 3, 80, 24), &ids, TerminalId::new()).is_empty());
+        assert!(pane_layouts(Rect::new(2, 3, 80, 24), &[], TerminalId::new(), false).is_empty());
+        assert!(pane_layouts(Rect::new(2, 3, 0, 24), &ids, ids[0], false).is_empty());
+        assert!(pane_layouts(Rect::new(2, 3, 80, 0), &ids, ids[0], false).is_empty());
+        assert!(pane_layouts(Rect::new(2, 3, 80, 24), &ids, TerminalId::new(), false).is_empty());
     }
 
     #[test]
@@ -115,7 +117,7 @@ mod tests {
         let ids = terminals(1);
         let host = Rect::new(4, 7, 19, 11);
         assert_eq!(
-            pane_layouts(host, &ids, ids[0])[&ids[0]],
+            pane_layouts(host, &ids, ids[0], false)[&ids[0]],
             PaneLayout {
                 rail: None,
                 content: host
@@ -130,12 +132,12 @@ mod tests {
 
         for &focused in &ids {
             let below = Rect::new(3, 5, threshold - 1, 7);
-            let layouts = pane_layouts(below, &ids, focused);
+            let layouts = pane_layouts(below, &ids, focused, false);
             assert_eq!(layouts.len(), 1);
             assert_eq!(layouts[&focused].content, below);
             assert_eq!(layouts[&focused].rail, None);
 
-            let layouts = pane_layouts(Rect::new(3, 5, threshold, 7), &ids, focused);
+            let layouts = pane_layouts(Rect::new(3, 5, threshold, 7), &ids, focused, false);
             assert_eq!(layouts.len(), ids.len());
             for id in &ids {
                 assert_eq!(
@@ -154,21 +156,21 @@ mod tests {
 
         assert_eq!(
             widths(
-                &pane_layouts(Rect::new(0, 0, threshold + 3, 1), &ids, focused),
+                &pane_layouts(Rect::new(0, 0, threshold + 3, 1), &ids, focused, false,),
                 &ids
             ),
             [13, 26, 12]
         );
         assert_eq!(
             widths(
-                &pane_layouts(Rect::new(0, 0, threshold + 4, 1), &ids, focused),
+                &pane_layouts(Rect::new(0, 0, threshold + 4, 1), &ids, focused, false,),
                 &ids
             ),
             [13, 26, 13]
         );
         assert_eq!(
             widths(
-                &pane_layouts(Rect::new(0, 0, threshold + 8, 1), &ids, focused),
+                &pane_layouts(Rect::new(0, 0, threshold + 8, 1), &ids, focused, false,),
                 &ids
             ),
             [14, 28, 14]
@@ -179,7 +181,7 @@ mod tests {
     fn rails_precede_content_and_input_order_controls_columns() {
         let ids = terminals(3);
         let ordered = [ids[2], ids[0], ids[1]];
-        let layouts = pane_layouts(Rect::new(10, 6, 51, 4), &ordered, ids[0]);
+        let layouts = pane_layouts(Rect::new(10, 6, 51, 4), &ordered, ids[0], false);
 
         assert_eq!(layouts[&ids[2]].rail, Some(Rect::new(10, 6, 1, 4)));
         assert_eq!(layouts[&ids[2]].content, Rect::new(11, 6, 12, 4));
@@ -194,7 +196,7 @@ mod tests {
         let ids = terminals(5);
         for width in 1..=5 {
             let host = Rect::new(9, 2, width, 3);
-            let layouts = pane_layouts(host, &ids, ids[3]);
+            let layouts = pane_layouts(host, &ids, ids[3], false);
             assert_eq!(layouts.len(), 1);
             assert_eq!(
                 layouts[&ids[3]],
@@ -213,7 +215,7 @@ mod tests {
             for focus_index in 0..count {
                 for width in 1..=300_u16 {
                     let host = Rect::new(7, 11, width, 3);
-                    let layouts = pane_layouts(host, &ids, ids[focus_index]);
+                    let layouts = pane_layouts(host, &ids, ids[focus_index], false);
                     if layouts.len() == 1 {
                         assert_eq!(layouts[&ids[focus_index]].content, host);
                         assert_eq!(layouts[&ids[focus_index]].rail, None);
@@ -242,6 +244,25 @@ mod tests {
                     assert_eq!(x, host.x + host.width);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn explicit_zoom_gives_only_the_focus_the_full_host() {
+        let ids = terminals(3);
+        let host = Rect::new(7, 9, 80, 24);
+
+        for &focused in &ids {
+            assert_eq!(
+                pane_layouts(host, &ids, focused, true),
+                BTreeMap::from([(
+                    focused,
+                    PaneLayout {
+                        rail: None,
+                        content: host,
+                    },
+                )])
+            );
         }
     }
 }

@@ -16,6 +16,7 @@ use super::config::{TabBarPosition, UiConfig, WorkspaceSidebarPosition};
 
 pub(super) const WORKSPACE_SIDEBAR_WIDTH: u16 = 24;
 const MIN_DOCKED_TERMINAL_WIDTH: u16 = 96;
+const ZOOM_STATUS: &str = "zoom ";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ClientLayout {
@@ -188,6 +189,7 @@ impl From<&TabSnapshot> for TabItem {
 pub(super) fn render_tab_bar(
     snapshot: Option<&ResourceSnapshot>,
     focused: &SelectedTarget,
+    zoomed: bool,
     area: Rect,
     buffer: &mut Buffer,
 ) {
@@ -195,21 +197,38 @@ pub(super) fn render_tab_bar(
         return;
     }
     clear_row(area, buffer);
+    let width = usize::from(area.width);
+    let zoom_width = if zoomed {
+        width.min(UnicodeWidthStr::width(ZOOM_STATUS))
+    } else {
+        0
+    };
+    let tab_width = width.saturating_sub(zoom_width);
     let Some(model) = snapshot.and_then(|snapshot| TabBarModel::from_snapshot(snapshot, focused))
     else {
-        let fallback = active_only("tab", false, usize::from(area.width));
+        let fallback = active_only("tab", false, tab_width);
         buffer.set_line(
             area.x,
             area.y,
             &Line::styled(fallback, active_style()),
-            area.width,
+            u16::try_from(tab_width).expect("tab width fits u16"),
         );
+        render_zoom_status(zoom_width, area, buffer);
         return;
     };
 
-    let width = usize::from(area.width);
-    let (line, complete) = visible_tabs(&model, width);
-    buffer.set_line(area.x, area.y, &line, area.width);
+    let (line, complete) = visible_tabs(&model, tab_width);
+    buffer.set_line(
+        area.x,
+        area.y,
+        &line,
+        u16::try_from(tab_width).expect("tab width fits u16"),
+    );
+
+    if zoom_width > 0 {
+        render_zoom_status(zoom_width, area, buffer);
+        return;
+    }
 
     const BRAND: &str = "fut ";
     let brand_width = UnicodeWidthStr::width(BRAND);
@@ -221,6 +240,18 @@ pub(super) fn render_tab_bar(
             muted_style(),
         );
     }
+}
+
+fn render_zoom_status(width: usize, area: Rect, buffer: &mut Buffer) {
+    if width == 0 {
+        return;
+    }
+    buffer.set_string(
+        area.x + area.width - u16::try_from(width).expect("zoom width fits u16"),
+        area.y,
+        &ZOOM_STATUS[..width],
+        active_style(),
+    );
 }
 
 fn visible_tabs(model: &TabBarModel, width: usize) -> (Line<'static>, bool) {
@@ -429,7 +460,7 @@ mod tests {
         let (snapshot, focused) = fixture(names, active);
         let area = Rect::new(0, 0, width, 1);
         let mut buffer = Buffer::empty(area);
-        render_tab_bar(Some(&snapshot), &focused, area, &mut buffer);
+        render_tab_bar(Some(&snapshot), &focused, false, area, &mut buffer);
         let text = (0..width)
             .map(|column| buffer[(column, 0)].symbol())
             .collect::<String>();
@@ -546,7 +577,7 @@ mod tests {
         snapshot.sessions[0].workspaces[0].tabs[1].closing = true;
         let area = Rect::new(0, 0, 40, 1);
         let mut buffer = Buffer::empty(area);
-        render_tab_bar(Some(&snapshot), &focused, area, &mut buffer);
+        render_tab_bar(Some(&snapshot), &focused, false, area, &mut buffer);
         let text = (0..area.width)
             .map(|column| buffer[(column, 0)].symbol())
             .collect::<String>();
@@ -555,7 +586,42 @@ mod tests {
         let mut missing = focused.clone();
         missing.workspace_id = WorkspaceId::new();
         let mut fallback = Buffer::empty(area);
-        render_tab_bar(Some(&snapshot), &missing, area, &mut fallback);
+        render_tab_bar(Some(&snapshot), &missing, false, area, &mut fallback);
         assert_eq!(fallback[(1, 0)].symbol(), "●");
+    }
+
+    #[test]
+    fn zoom_status_is_persistent_bold_and_preserves_the_active_tab() {
+        let (snapshot, focused) = fixture(&["shell", "editor", "tests"], 1);
+        let area = Rect::new(3, 4, 24, 1);
+        let mut buffer = Buffer::empty(area);
+        render_tab_bar(Some(&snapshot), &focused, true, area, &mut buffer);
+        let text = (area.x..area.x + area.width)
+            .map(|column| buffer[(column, area.y)].symbol())
+            .collect::<String>();
+
+        assert!(text.contains("●"));
+        assert!(text.contains("editor"));
+        assert!(text.ends_with("zoom "));
+        assert!(
+            buffer[(area.x + area.width - 5, area.y)]
+                .modifier
+                .contains(Modifier::BOLD)
+        );
+
+        for width in 1..=6 {
+            let area = Rect::new(0, 0, width, 1);
+            let mut buffer = Buffer::empty(area);
+            render_tab_bar(Some(&snapshot), &focused, true, area, &mut buffer);
+            let text = (0..width)
+                .map(|column| buffer[(column, 0)].symbol())
+                .collect::<String>();
+            let status_width = usize::from(width).min(ZOOM_STATUS.len());
+            assert!(text.ends_with(&ZOOM_STATUS[..status_width]));
+            assert!(buffer[(0, 0)].modifier.contains(Modifier::BOLD));
+            if width == 6 {
+                assert!(text.contains('●'));
+            }
+        }
     }
 }
