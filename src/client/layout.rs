@@ -3,6 +3,10 @@ use std::collections::BTreeMap;
 use ratatui::layout::Rect;
 
 use crate::domain::TerminalId;
+use crate::{
+    domain::PaneId,
+    splits::{SplitAxis, SplitTree},
+};
 
 const FOCUSED_MIN_WIDTH: u32 = 24;
 const BACKGROUND_MIN_WIDTH: u32 = 12;
@@ -12,6 +16,119 @@ const RAIL_WIDTH: u32 = 1;
 pub(super) struct PaneLayout {
     pub(super) rail: Option<Rect>,
     pub(super) content: Rect,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct AuthoredLayout {
+    pub(super) panes: BTreeMap<PaneId, Rect>,
+    pub(super) dividers: Vec<Rect>,
+}
+
+pub(super) fn authored_layout(
+    host: Rect,
+    tree: &SplitTree,
+    focused: PaneId,
+    zoomed: bool,
+) -> AuthoredLayout {
+    if host.width == 0 || host.height == 0 || !tree.leaf_ids().contains(&focused) {
+        return AuthoredLayout {
+            panes: BTreeMap::new(),
+            dividers: Vec::new(),
+        };
+    }
+    if zoomed {
+        return AuthoredLayout {
+            panes: BTreeMap::from([(focused, host)]),
+            dividers: Vec::new(),
+        };
+    }
+    let minimum = split_minimum(tree, focused);
+    if host.width < minimum.0 || host.height < minimum.1 {
+        return AuthoredLayout {
+            panes: BTreeMap::from([(focused, host)]),
+            dividers: Vec::new(),
+        };
+    }
+    let mut layout = AuthoredLayout {
+        panes: BTreeMap::new(),
+        dividers: Vec::new(),
+    };
+    place_split(tree, focused, host, &mut layout);
+    layout
+}
+
+fn split_minimum(tree: &SplitTree, focused: PaneId) -> (u16, u16) {
+    match tree {
+        SplitTree::Leaf { pane_id } => (if *pane_id == focused { 24 } else { 12 }, 3),
+        SplitTree::Branch {
+            axis,
+            first,
+            second,
+            ..
+        } => {
+            let first = split_minimum(first, focused);
+            let second = split_minimum(second, focused);
+            match axis {
+                SplitAxis::Horizontal => (
+                    first.0.saturating_add(1).saturating_add(second.0),
+                    first.1.max(second.1),
+                ),
+                SplitAxis::Vertical => (
+                    first.0.max(second.0),
+                    first.1.saturating_add(1).saturating_add(second.1),
+                ),
+            }
+        }
+    }
+}
+
+fn place_split(tree: &SplitTree, focused: PaneId, area: Rect, layout: &mut AuthoredLayout) {
+    match tree {
+        SplitTree::Leaf { pane_id } => {
+            layout.panes.insert(*pane_id, area);
+        }
+        SplitTree::Branch {
+            axis,
+            first_basis_points,
+            first,
+            second,
+        } => {
+            let first_min = split_minimum(first, focused);
+            let second_min = split_minimum(second, focused);
+            match axis {
+                SplitAxis::Horizontal => {
+                    let available = area.width - 1;
+                    let proposed = u16::try_from(
+                        u32::from(available) * u32::from(*first_basis_points) / 10_000,
+                    )
+                    .unwrap_or(available);
+                    let first_width = proposed.clamp(first_min.0, available - second_min.0);
+                    let first_area = Rect::new(area.x, area.y, first_width, area.height);
+                    let divider = Rect::new(area.x + first_width, area.y, 1, area.height);
+                    let second_area =
+                        Rect::new(divider.x + 1, area.y, available - first_width, area.height);
+                    layout.dividers.push(divider);
+                    place_split(first, focused, first_area, layout);
+                    place_split(second, focused, second_area, layout);
+                }
+                SplitAxis::Vertical => {
+                    let available = area.height - 1;
+                    let proposed = u16::try_from(
+                        u32::from(available) * u32::from(*first_basis_points) / 10_000,
+                    )
+                    .unwrap_or(available);
+                    let first_height = proposed.clamp(first_min.1, available - second_min.1);
+                    let first_area = Rect::new(area.x, area.y, area.width, first_height);
+                    let divider = Rect::new(area.x, area.y + first_height, area.width, 1);
+                    let second_area =
+                        Rect::new(area.x, divider.y + 1, area.width, available - first_height);
+                    layout.dividers.push(divider);
+                    place_split(first, focused, first_area, layout);
+                    place_split(second, focused, second_area, layout);
+                }
+            }
+        }
+    }
 }
 
 pub(super) fn pane_layouts(
@@ -264,5 +381,28 @@ mod tests {
                 )])
             );
         }
+    }
+
+    #[test]
+    fn authored_splits_honor_axes_ratios_and_focused_minimum_fallback() {
+        let a = PaneId::new();
+        let b = PaneId::new();
+        let mut horizontal = SplitTree::leaf(a);
+        assert!(horizontal.split(a, crate::splits::SplitDirection::Right, b));
+        let layout = authored_layout(Rect::new(0, 0, 80, 23), &horizontal, a, false);
+        assert_eq!(layout.panes[&a], Rect::new(0, 0, 39, 23));
+        assert_eq!(layout.dividers, [Rect::new(39, 0, 1, 23)]);
+        assert_eq!(layout.panes[&b], Rect::new(40, 0, 40, 23));
+
+        let mut vertical = SplitTree::leaf(a);
+        assert!(vertical.split(a, crate::splits::SplitDirection::Down, b));
+        let layout = authored_layout(Rect::new(2, 3, 80, 23), &vertical, a, false);
+        assert_eq!(layout.panes[&a], Rect::new(2, 3, 80, 11));
+        assert_eq!(layout.dividers, [Rect::new(2, 14, 80, 1)]);
+        assert_eq!(layout.panes[&b], Rect::new(2, 15, 80, 11));
+
+        let narrow = authored_layout(Rect::new(4, 5, 36, 6), &horizontal, a, false);
+        assert_eq!(narrow.panes, BTreeMap::from([(a, Rect::new(4, 5, 36, 6))]));
+        assert!(narrow.dividers.is_empty());
     }
 }

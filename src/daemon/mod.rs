@@ -40,6 +40,7 @@ use crate::{
         CheckoutDestination, InitialPath, ResourceError, ResourceTree, TabPath, TargetSelector,
         WorkspacePath,
     },
+    splits::{SplitDirection, SplitTree},
     terminal::{
         CommandError, SpawnSpec, TerminalEvent, TerminalHandle, TerminalLifecycle, spawn_terminal,
     },
@@ -209,6 +210,28 @@ impl SharedState {
         terminal: Arc<TerminalHandle>,
     ) -> Result<(), DaemonError> {
         let mutation = self.resources.add_pane(tab_id, pane_id, terminal.id())?;
+        self.expected_finalizations.remove(&terminal.id());
+        self.runtimes.insert(
+            terminal.id(),
+            RuntimeEntry {
+                handle: terminal,
+                lease: AttachmentLease::default(),
+            },
+        );
+        self.publish_resource_change(mutation.revision);
+        Ok(())
+    }
+
+    fn register_split_pane(
+        &mut self,
+        anchor: PaneId,
+        direction: SplitDirection,
+        pane_id: PaneId,
+        terminal: Arc<TerminalHandle>,
+    ) -> Result<(), DaemonError> {
+        let mutation = self
+            .resources
+            .split_pane(anchor, direction, pane_id, terminal.id())?;
         self.expected_finalizations.remove(&terminal.id());
         self.runtimes.insert(
             terminal.id(),
@@ -437,6 +460,7 @@ enum AttachmentUpdate {
 struct Attachment {
     panes: Vec<ObservedTarget>,
     focused: LeasedTarget,
+    layout: SplitTree,
     fallback_terminal_ids: Vec<TerminalId>,
     resource_revision: u64,
     streamed_resource_revision: u64,
@@ -451,6 +475,7 @@ impl Attachment {
     fn new(
         panes: Vec<ObservedTarget>,
         focused: LeasedTarget,
+        layout: SplitTree,
         fallback_terminal_ids: Vec<TerminalId>,
         resource_revision: u64,
         resource_changes: watch::Receiver<u64>,
@@ -459,6 +484,7 @@ impl Attachment {
         let mut attachment = Self {
             panes,
             focused,
+            layout,
             fallback_terminal_ids,
             resource_revision,
             streamed_resource_revision: resource_revision,
@@ -481,6 +507,7 @@ impl Attachment {
                 .iter()
                 .map(|pane| pane.selected.clone())
                 .collect(),
+            layout: self.layout.clone(),
         }
     }
 
@@ -492,10 +519,12 @@ impl Attachment {
         &mut self,
         panes: Vec<ObservedTarget>,
         focused: SelectedTarget,
+        layout: SplitTree,
         fallback_terminal_ids: Vec<TerminalId>,
         resource_revision: u64,
     ) -> bool {
         let changed = self.focused.selected != focused
+            || self.layout != layout
             || self.panes.len() != panes.len()
             || self
                 .panes
@@ -503,6 +532,7 @@ impl Attachment {
                 .zip(&panes)
                 .any(|(current, next)| current.selected != next.selected);
         self.focused.selected = focused;
+        self.layout = layout;
         self.fallback_terminal_ids = fallback_terminal_ids;
         self.replace_panes(panes, resource_revision);
         changed
@@ -530,10 +560,14 @@ impl Attachment {
         else {
             return false;
         };
+        let pane_id = self.panes[index].selected.pane_id;
         if let Some((_, task)) = self.watchers.remove(&terminal_id) {
             task.abort();
         }
         self.panes.remove(index);
+        if let Some(layout) = self.layout.clone().without(pane_id) {
+            self.layout = layout;
+        }
         true
     }
 
@@ -1051,6 +1085,7 @@ async fn handle_connection(
                         if let TargetSelection::Focused {
                             selected,
                             panes,
+                            layout,
                             fallback_terminal_ids,
                             resource_revision,
                         } = selection
@@ -1058,6 +1093,7 @@ async fn handle_connection(
                             attachment.reconcile(
                                 panes,
                                 selected,
+                                layout,
                                 fallback_terminal_ids,
                                 resource_revision,
                             );
@@ -1124,7 +1160,7 @@ async fn handle_connection(
                             continue;
                         }
                         let request = CreatePaneRequest {
-                            tab_id,
+                            target: PaneCreationTarget::Append(tab_id),
                             cwd,
                             program,
                             argv,
@@ -1151,6 +1187,42 @@ async fn handle_connection(
                                 }
                             }
                             Ok(CreatedTerminal::Detached(_)) => unreachable!("attached creation returns a lease"),
+                            Err(error) => send_error(&mut framed, envelope.request_id, error.code, &error.message).await?,
+                        }
+                    }
+                    ClientMessage::SplitPane { pane_id, direction, cwd, program, argv } => {
+                        if pane_id != attachment.focused.selected.pane_id {
+                            send_error(
+                                &mut framed,
+                                envelope.request_id,
+                                "not_focused",
+                                "interactive splitting requires the focused pane",
+                            ).await?;
+                            continue;
+                        }
+                        let request = CreatePaneRequest {
+                            target: PaneCreationTarget::Split { anchor: pane_id, direction },
+                            cwd,
+                            program,
+                            argv,
+                            size: spawn_size,
+                        };
+                        match create_pane(&shared, &exited, request, CreationMode::Attached(client)).await {
+                            Ok(CreatedTerminal::Attached(target)) => {
+                                let selected = target.selected.clone();
+                                match focus_leased_attachment(&shared, &mut attachment, target).await {
+                                    Ok(()) => {
+                                        send(&mut framed, envelope.request_id, ServerMessage::PaneCreated { selected }).await?;
+                                        send(
+                                            &mut framed,
+                                            envelope.request_id,
+                                            ServerMessage::TargetSelected { selected: attachment.selected() },
+                                        ).await?;
+                                    }
+                                    Err(error) => send_error(&mut framed, envelope.request_id, error.code, &error.message).await?,
+                                }
+                            }
+                            Ok(CreatedTerminal::Detached(_)) => unreachable!("attached split returns a lease"),
                             Err(error) => send_error(&mut framed, envelope.request_id, error.code, &error.message).await?,
                         }
                     }
@@ -1240,6 +1312,12 @@ async fn handle_connection(
                         &mut framed,
                         None,
                         ServerMessage::TargetSelected { selected: attachment.selected() },
+                    ).await?;
+                    let snapshot = shared.lock().await.resources.snapshot();
+                    send(
+                        &mut framed,
+                        None,
+                        ServerMessage::ResourcesChanged { snapshot },
                     ).await?;
                 }
                 None => break,
@@ -1337,7 +1415,7 @@ async fn control_loop(
                 &shared,
                 &exited,
                 CreatePaneRequest {
-                    tab_id,
+                    target: PaneCreationTarget::Append(tab_id),
                     cwd,
                     program,
                     argv,
@@ -1360,6 +1438,48 @@ async fn control_loop(
                 }
                 Ok(CreatedTerminal::Attached(_)) => {
                     unreachable!("detached creation does not acquire a lease")
+                }
+                Err(error) => {
+                    send_error(framed, envelope.request_id, error.code, &error.message).await?
+                }
+            },
+            ClientMessage::SplitPane {
+                pane_id,
+                direction,
+                cwd,
+                program,
+                argv,
+            } => match create_pane(
+                &shared,
+                &exited,
+                CreatePaneRequest {
+                    target: PaneCreationTarget::Split {
+                        anchor: pane_id,
+                        direction,
+                    },
+                    cwd,
+                    program,
+                    argv,
+                    size: TerminalSize {
+                        columns: 80,
+                        rows: 24,
+                    },
+                },
+                CreationMode::Detached,
+            )
+            .await
+            {
+                Ok(created) => {
+                    let selected = match created {
+                        CreatedTerminal::Detached(selected) => selected,
+                        CreatedTerminal::Attached(_) => unreachable!("control split is detached"),
+                    };
+                    send(
+                        framed,
+                        envelope.request_id,
+                        ServerMessage::PaneCreated { selected },
+                    )
+                    .await?
                 }
                 Err(error) => {
                     send_error(framed, envelope.request_id, error.code, &error.message).await?
@@ -1492,6 +1612,7 @@ async fn lease_view(
     let paths = state
         .resources
         .open_terminal_paths_for_tab(focused.tab_id)?;
+    let layout = state.resources.open_layout_for_tab(focused.tab_id)?;
     let fallback_terminal_ids = state.resources.fallback_terminal_ids(focused.terminal_id)?;
     let focused_runtime = state
         .runtimes
@@ -1538,9 +1659,11 @@ async fn lease_view(
             terminal: Arc::clone(&runtime.handle),
         });
     }
+    let layout = retain_observed_layout(layout, &panes)?;
     Ok(Attachment::new(
         panes,
         focused_target,
+        layout,
         fallback_terminal_ids,
         state.resources.revision(),
         state.resource_changes.subscribe(),
@@ -1568,14 +1691,17 @@ async fn focus_leased_attachment(
         .resources
         .resolve_terminal_target(Some(TargetSelector::Terminal(focused.selected.terminal_id)))?;
     let paths = state.resources.open_terminal_paths_for_tab(path.tab_id)?;
+    let layout = state.resources.open_layout_for_tab(path.tab_id)?;
     let fallback_terminal_ids = state.resources.fallback_terminal_ids(path.terminal_id)?;
     focused.selected = selected_target(path, &focused.terminal);
     let panes = observed_targets(&state, paths, focused.selected.terminal_id)?;
+    let layout = retain_observed_layout(layout, &panes)?;
     let selected = focused.selected.clone();
     attachment.focused = focused;
     attachment.reconcile(
         panes,
         selected,
+        layout,
         fallback_terminal_ids,
         state.resources.revision(),
     );
@@ -1586,6 +1712,7 @@ enum TargetSelection {
     Focused {
         selected: SelectedTarget,
         panes: Vec<ObservedTarget>,
+        layout: SplitTree,
         fallback_terminal_ids: Vec<TerminalId>,
         resource_revision: u64,
     },
@@ -1620,10 +1747,14 @@ async fn observe_selection(
         return Ok(TargetSelection::Different);
     }
     let paths = state.resources.open_terminal_paths_for_tab(path.tab_id)?;
+    let layout = state.resources.open_layout_for_tab(path.tab_id)?;
     let fallback_terminal_ids = state.resources.fallback_terminal_ids(path.terminal_id)?;
+    let panes = observed_targets(&state, paths, focused_terminal_id)?;
+    let layout = retain_observed_layout(layout, &panes)?;
     Ok(TargetSelection::Focused {
         selected: selected_target(path, &runtime.handle),
-        panes: observed_targets(&state, paths, focused_terminal_id)?,
+        panes,
+        layout,
         fallback_terminal_ids,
         resource_revision: state.resources.revision(),
     })
@@ -1654,6 +1785,31 @@ fn observed_targets(
         });
     }
     Ok(panes)
+}
+
+fn retain_observed_layout(
+    layout: SplitTree,
+    panes: &[ObservedTarget],
+) -> Result<SplitTree, DaemonError> {
+    let pane_ids = panes
+        .iter()
+        .map(|pane| pane.selected.pane_id)
+        .collect::<HashSet<_>>();
+    let layout = layout
+        .retained(|pane_id| pane_ids.contains(&pane_id))
+        .ok_or_else(|| DaemonError::new("resource_error", "selected layout has no pane"))?;
+    if layout.leaf_ids()
+        != panes
+            .iter()
+            .map(|pane| pane.selected.pane_id)
+            .collect::<Vec<_>>()
+    {
+        return Err(DaemonError::new(
+            "resource_error",
+            "selected layout order does not match observed panes",
+        ));
+    }
+    Ok(layout)
 }
 
 struct ReconciledResources {
@@ -1706,10 +1862,13 @@ async fn reconcile_attachment(
     let paths = state
         .resources
         .open_terminal_paths_for_tab(focused_path.tab_id)?;
+    let layout = state.resources.open_layout_for_tab(focused_path.tab_id)?;
     let fallback_terminal_ids = state.resources.fallback_terminal_ids(focused_id)?;
     let panes = observed_targets(&state, paths, focused_id)?;
+    let layout = retain_observed_layout(layout, &panes)?;
     let focused = selected_target(focused_path, &attachment.focused.terminal);
-    let view_changed = attachment.reconcile(panes, focused, fallback_terminal_ids, revision);
+    let view_changed =
+        attachment.reconcile(panes, focused, layout, fallback_terminal_ids, revision);
     attachment.observe_streamed_revision(revision);
     Ok(Some(ReconciledResources {
         snapshot,
@@ -2025,11 +2184,20 @@ async fn create_tab(
 }
 
 struct CreatePaneRequest {
-    tab_id: TabId,
+    target: PaneCreationTarget,
     cwd: Option<PathBuf>,
     program: Option<PathBuf>,
     argv: Vec<String>,
     size: TerminalSize,
+}
+
+#[derive(Clone, Copy)]
+enum PaneCreationTarget {
+    Append(TabId),
+    Split {
+        anchor: PaneId,
+        direction: SplitDirection,
+    },
 }
 
 async fn create_pane(
@@ -2039,23 +2207,55 @@ async fn create_pane(
     mode: CreationMode,
 ) -> Result<CreatedTerminal, DaemonError> {
     let CreatePaneRequest {
-        tab_id,
+        target,
         cwd,
         program,
         argv,
         size,
     } = request;
-    let (workspace_id, session_id, root) = {
+    let (workspace_id, session_id, root, inherited_cwd) = {
         let state = shared.lock().await;
         if !state.accepting {
             return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
         }
+        let tab_id = match target {
+            PaneCreationTarget::Append(tab_id) => tab_id,
+            PaneCreationTarget::Split { anchor, .. } => {
+                state
+                    .resources
+                    .resolve_terminal_target(Some(TargetSelector::Pane(anchor)))?
+                    .tab_id
+            }
+        };
         let workspace_id = state.resources.workspace_id_for_tab(tab_id)?;
         let session_id = state.resources.session_id_for_workspace(workspace_id)?;
         let root = state.resources.workspace_root(workspace_id)?.to_path_buf();
-        (workspace_id, session_id, root)
+        let inherited_cwd = match target {
+            PaneCreationTarget::Append(_) => None,
+            PaneCreationTarget::Split { anchor, .. } => {
+                let terminal_id = state
+                    .resources
+                    .resolve_terminal_target(Some(TargetSelector::Pane(anchor)))?
+                    .terminal_id;
+                let runtime = state
+                    .runtimes
+                    .get(&terminal_id)
+                    .ok_or_else(|| DaemonError::new("not_found", "terminal runtime not found"))?;
+                Some((
+                    runtime.handle.child_pid(),
+                    runtime.handle.spawn_cwd().to_path_buf(),
+                ))
+            }
+        };
+        (workspace_id, session_id, root, inherited_cwd)
     };
-    let cwd = resolve_spawn_cwd(&root, cwd).await?;
+    let cwd = match (cwd, inherited_cwd) {
+        (Some(cwd), _) => resolve_spawn_cwd(&root, Some(cwd)).await?,
+        (None, Some((pid, fallback))) => {
+            resolve_spawn_cwd(&root, process_cwd(pid).await.or(Some(fallback))).await?
+        }
+        (None, None) => resolve_spawn_cwd(&root, None).await?,
+    };
     let program = program.unwrap_or_else(|| {
         std::env::var_os("SHELL")
             .map(PathBuf::from)
@@ -2069,10 +2269,26 @@ async fn create_pane(
         }
         // Re-resolve the parent and validate a clone after the filesystem await,
         // so a close or shutdown cannot race creation into a stale tab.
+        let tab_id = match target {
+            PaneCreationTarget::Append(tab_id) => tab_id,
+            PaneCreationTarget::Split { anchor, .. } => {
+                state
+                    .resources
+                    .resolve_terminal_target(Some(TargetSelector::Pane(anchor)))?
+                    .tab_id
+            }
+        };
         state.resources.workspace_id_for_tab(tab_id)?;
         let pane_id = PaneId::new();
         let mut validated = state.resources.clone();
-        validated.add_pane(tab_id, pane_id, TerminalId::new())?;
+        match target {
+            PaneCreationTarget::Append(_) => {
+                validated.add_pane(tab_id, pane_id, TerminalId::new())?;
+            }
+            PaneCreationTarget::Split { anchor, direction } => {
+                validated.split_pane(anchor, direction, pane_id, TerminalId::new())?;
+            }
+        }
 
         let terminal = Arc::new(
             spawn_terminal(SpawnSpec {
@@ -2092,7 +2308,14 @@ async fn create_pane(
             terminal_id: terminal.id(),
         };
         let selected = selected_target(resolved, &terminal);
-        let insertion = state.register_pane(tab_id, pane_id, Arc::clone(&terminal));
+        let insertion = match target {
+            PaneCreationTarget::Append(_) => {
+                state.register_pane(tab_id, pane_id, Arc::clone(&terminal))
+            }
+            PaneCreationTarget::Split { anchor, direction } => {
+                state.register_split_pane(anchor, direction, pane_id, Arc::clone(&terminal))
+            }
+        };
         let creation = match insertion {
             Ok(()) => Ok(match mode {
                 CreationMode::Detached => CreatedTerminal::Detached(selected),
@@ -2152,6 +2375,38 @@ async fn resolve_spawn_cwd(root: &Path, cwd: Option<PathBuf>) -> Result<PathBuf,
         ));
     }
     Ok(canonical)
+}
+
+async fn process_cwd(pid: u32) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = timeout(
+            Duration::from_millis(500),
+            tokio::process::Command::new("/usr/sbin/lsof")
+                .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+                .output(),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8(output.stdout)
+            .ok()?
+            .lines()
+            .find_map(|line| line.strip_prefix('n'))
+            .map(PathBuf::from)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        tokio::fs::read_link(format!("/proc/{pid}/cwd")).await.ok()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 fn selected_target(
@@ -2473,6 +2728,7 @@ mod tests {
         let TargetSelection::Focused {
             selected,
             panes,
+            layout: _,
             fallback_terminal_ids,
             resource_revision,
         } = observe_selection(&shared, &TargetSelector::Pane(path.pane_id), focused.id())
@@ -2493,8 +2749,17 @@ mod tests {
         );
         assert_eq!(resource_revision, shared.lock().await.resources.revision());
 
-        focused.close().await.unwrap();
         sibling.close().await.unwrap();
+        let TargetSelection::Focused { panes, layout, .. } =
+            observe_selection(&shared, &TargetSelector::Pane(path.pane_id), focused.id())
+                .await
+                .unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(panes.len(), 1);
+        assert_eq!(layout, SplitTree::leaf(path.pane_id));
+        focused.close().await.unwrap();
     }
 
     #[test]

@@ -11,7 +11,10 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::domain::{PaneId, SessionId, TabId, TerminalId, WorkspaceId};
+use crate::{
+    domain::{PaneId, SessionId, TabId, TerminalId, WorkspaceId},
+    splits::{SplitDirection, SplitTree},
+};
 
 fn disambiguate(suggested: &str, exists: impl Fn(&str) -> bool) -> String {
     if !exists(suggested) {
@@ -129,6 +132,7 @@ pub struct TabSnapshot {
     pub id: TabId,
     pub name: String,
     pub closing: bool,
+    pub layout: SplitTree,
     pub panes: Vec<PaneSnapshot>,
 }
 
@@ -283,6 +287,7 @@ struct Tab {
     name: String,
     closing: bool,
     panes: Vec<PaneId>,
+    layout: SplitTree,
 }
 #[derive(Clone, Copy, Debug)]
 struct Pane {
@@ -435,6 +440,16 @@ impl ResourceTree {
             .collect())
     }
 
+    pub fn open_layout_for_tab(&self, tab_id: TabId) -> Result<SplitTree, ResourceError> {
+        let tab = self
+            .tabs
+            .get(&tab_id)
+            .ok_or(ResourceError::NotFound("tab"))?;
+        tab.layout
+            .retained(|pane_id| self.panes.get(&pane_id).is_some_and(|pane| !pane.closing))
+            .ok_or_else(|| ResourceError::Invariant("tab has no open pane layout".into()))
+    }
+
     pub fn available_session_name(&self, suggested: &str) -> String {
         disambiguate(suggested, |name| {
             self.sessions.values().any(|item| item.name == name)
@@ -568,6 +583,7 @@ impl ResourceTree {
                 name: path.tab_name,
                 closing: false,
                 panes: vec![path.pane_id],
+                layout: SplitTree::leaf(path.pane_id),
             },
         );
         self.insert_pane(path.tab_id, path.pane_id, path.terminal_id);
@@ -775,6 +791,7 @@ impl ResourceTree {
                 name: path.tab_name,
                 closing: false,
                 panes: vec![path.pane_id],
+                layout: SplitTree::leaf(path.pane_id),
             },
         );
         self.insert_pane(path.tab_id, path.pane_id, path.terminal_id);
@@ -841,6 +858,7 @@ impl ResourceTree {
                 name: path.tab_name,
                 closing: false,
                 panes: vec![path.pane_id],
+                layout: SplitTree::leaf(path.pane_id),
             },
         );
         self.insert_pane(path.tab_id, path.pane_id, path.terminal_id);
@@ -882,7 +900,56 @@ impl ResourceTree {
             return Err(ResourceError::Closing("tab"));
         }
         self.check_pane_ids(pane_id, terminal_id)?;
-        self.tabs.get_mut(&tab_id).unwrap().panes.push(pane_id);
+        let anchor = tab.panes.last().copied().expect("live tab has a pane");
+        let tab = self.tabs.get_mut(&tab_id).unwrap();
+        assert!(tab.layout.split(anchor, SplitDirection::Right, pane_id));
+        tab.panes.push(pane_id);
+        self.insert_pane(tab_id, pane_id, terminal_id);
+        Ok(self.finish(
+            vec![ResourceEvent::PaneCreated {
+                tab_id,
+                id: pane_id,
+                terminal_id,
+                closing: false,
+            }],
+            vec![],
+        ))
+    }
+
+    pub fn split_pane(
+        &mut self,
+        anchor: PaneId,
+        direction: SplitDirection,
+        pane_id: PaneId,
+        terminal_id: TerminalId,
+    ) -> Result<Mutation, ResourceError> {
+        let anchor_pane = *self
+            .panes
+            .get(&anchor)
+            .ok_or(ResourceError::NotFound("pane"))?;
+        if anchor_pane.closing {
+            return Err(ResourceError::Closing("pane"));
+        }
+        let tab_id = anchor_pane.tab_id;
+        let tab = &self.tabs[&tab_id];
+        if self.session_for_workspace(tab.workspace_id).closing {
+            return Err(ResourceError::Closing("session"));
+        }
+        if self.workspaces[&tab.workspace_id].closing {
+            return Err(ResourceError::Closing("workspace"));
+        }
+        if tab.closing {
+            return Err(ResourceError::Closing("tab"));
+        }
+        self.check_pane_ids(pane_id, terminal_id)?;
+        let index = tab
+            .panes
+            .iter()
+            .position(|candidate| *candidate == anchor)
+            .expect("anchor pane belongs to its tab");
+        let tab = self.tabs.get_mut(&tab_id).unwrap();
+        assert!(tab.layout.split(anchor, direction, pane_id));
+        tab.panes.insert(index + 1, pane_id);
         self.insert_pane(tab_id, pane_id, terminal_id);
         Ok(self.finish(
             vec![ResourceEvent::PaneCreated {
@@ -928,12 +995,24 @@ impl ResourceTree {
         if pane.tab_id == destination {
             return Ok(self.unchanged());
         }
-        self.tabs
-            .get_mut(&pane.tab_id)
-            .unwrap()
+        let source = self.tabs.get_mut(&pane.tab_id).unwrap();
+        source.panes.retain(|id| *id != pane_id);
+        source.layout = source
+            .layout
+            .clone()
+            .without(pane_id)
+            .unwrap_or_else(|| SplitTree::leaf(pane_id));
+        let destination_tab = self.tabs.get_mut(&destination).unwrap();
+        let anchor = *destination_tab
             .panes
-            .retain(|id| *id != pane_id);
-        self.tabs.get_mut(&destination).unwrap().panes.push(pane_id);
+            .last()
+            .expect("destination tab has a pane");
+        assert!(
+            destination_tab
+                .layout
+                .split(anchor, SplitDirection::Right, pane_id)
+        );
+        destination_tab.panes.push(pane_id);
         self.panes.get_mut(&pane_id).unwrap().tab_id = destination;
         let mut events = vec![ResourceEvent::PaneMoved {
             pane_id,
@@ -1346,6 +1425,8 @@ impl ResourceTree {
                     if tab.workspace_id != *wid
                         || tab.name.trim().is_empty()
                         || tab.panes.is_empty()
+                        || !tab.layout.validate()
+                        || tab.layout.leaf_ids() != tab.panes
                         || !tab_names.insert(&tab.name)
                         || !seen_tabs.insert(*tid)
                         || !unique(&tab.panes)
@@ -1397,6 +1478,10 @@ impl ResourceTree {
             .unwrap()
             .panes
             .retain(|id| *id != pane_id);
+        let tab = self.tabs.get_mut(&pane.tab_id).unwrap();
+        if let Some(layout) = tab.layout.clone().without(pane_id) {
+            tab.layout = layout;
+        }
         pane.tab_id
     }
 
@@ -1491,6 +1576,7 @@ impl ResourceTree {
             id,
             name: t.name.clone(),
             closing: t.closing,
+            layout: t.layout.clone(),
             panes: t.panes.iter().map(|id| self.pane_snapshot(*id)).collect(),
         }
     }
@@ -1788,6 +1874,36 @@ mod tests {
                 .resolve_terminal_target(Some(TargetSelector::Pane(first_pane)))
                 .unwrap()]
         );
+    }
+
+    #[test]
+    fn authored_split_inserts_after_anchor_and_collapses_on_exit() {
+        let mut tree = ResourceTree::default();
+        let first = initial("split", "/split");
+        let pane_a = first.pane_id;
+        let pane_b = PaneId::new();
+        let terminal_b = TerminalId::new();
+        tree.create_session(first).unwrap();
+
+        tree.split_pane(pane_a, SplitDirection::Down, pane_b, terminal_b)
+            .unwrap();
+        let tab = &tree.snapshot().sessions[0].workspaces[0].tabs[0];
+        assert_eq!(
+            tab.panes.iter().map(|pane| pane.id).collect::<Vec<_>>(),
+            [pane_a, pane_b]
+        );
+        assert!(matches!(
+            tab.layout,
+            SplitTree::Branch {
+                axis: crate::splits::SplitAxis::Vertical,
+                ..
+            }
+        ));
+
+        tree.terminal_exited(terminal_b).unwrap();
+        let tab = &tree.snapshot().sessions[0].workspaces[0].tabs[0];
+        assert_eq!(tab.layout, SplitTree::leaf(pane_a));
+        tree.validate().unwrap();
     }
 
     #[test]

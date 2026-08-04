@@ -412,15 +412,19 @@ mod tests {
         let workspace_id = WorkspaceId::new();
         let tabs = names
             .iter()
-            .map(|name| TabSnapshot {
-                id: TabId::new(),
-                name: (*name).into(),
-                closing: false,
-                panes: vec![PaneSnapshot {
-                    id: PaneId::new(),
-                    terminal_id: TerminalId::new(),
+            .map(|name| {
+                let pane_id = PaneId::new();
+                TabSnapshot {
+                    id: TabId::new(),
+                    name: (*name).into(),
                     closing: false,
-                }],
+                    layout: crate::splits::SplitTree::leaf(pane_id),
+                    panes: vec![PaneSnapshot {
+                        id: pane_id,
+                        terminal_id: TerminalId::new(),
+                        closing: false,
+                    }],
+                }
             })
             .collect::<Vec<_>>();
         let selected_tab = &tabs[active];
@@ -489,6 +493,7 @@ mod tests {
         let bottom_right = UiConfig {
             tab_bar_position: TabBarPosition::Bottom,
             workspace_sidebar_position: WorkspaceSidebarPosition::Right,
+            pane_layout: crate::client::config::PaneLayoutPolicy::Splits,
         };
         assert_eq!(
             client_layout(Rect::new(3, 4, 120, 24), bottom_right),

@@ -10,9 +10,10 @@ use std::path::PathBuf;
 use crate::{
     domain::{PaneId, ScreenSnapshot, SessionId, TabId, TerminalId, TerminalSize, WorkspaceId},
     resources::{ResourceSnapshot, SessionSelector, TargetSelector},
+    splits::{SplitDirection, SplitTree},
 };
 
-pub const PROTOCOL_VERSION: u16 = 10;
+pub const PROTOCOL_VERSION: u16 = 11;
 /// Enough for 50,000 individually styled JSON cells while remaining a firm
 /// pre-allocation bound for the length-delimited transport.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
@@ -71,6 +72,8 @@ pub struct SelectedView {
     pub focused: SelectedTarget,
     /// Open panes in resource-tree order for simultaneous read-only rendering.
     pub panes: Vec<SelectedTarget>,
+    /// Open authored topology covering `panes` in the same leaf order.
+    pub layout: SplitTree,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -122,6 +125,16 @@ pub enum ClientMessage {
     },
     CreatePane {
         tab_id: TabId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        program: Option<PathBuf>,
+        #[serde(default)]
+        argv: Vec<String>,
+    },
+    SplitPane {
+        pane_id: PaneId,
+        direction: SplitDirection,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<PathBuf>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -459,6 +472,7 @@ mod tests {
             selected: SelectedView {
                 resource_revision: 9,
                 focused: selected.clone(),
+                layout: SplitTree::leaf(selected.pane_id),
                 panes: vec![selected],
             },
         };
@@ -466,7 +480,7 @@ mod tests {
             decode_payload::<ServerMessage>(&encode_payload(&switched).unwrap()).unwrap(),
             switched
         );
-        assert_eq!(PROTOCOL_VERSION, 10);
+        assert_eq!(PROTOCOL_VERSION, 11);
     }
 
     #[test]
@@ -498,6 +512,7 @@ mod tests {
             selected: Some(SelectedView {
                 resource_revision: 1,
                 focused: focused.clone(),
+                layout: SplitTree::leaf(focused.pane_id),
                 panes: vec![focused],
             }),
         };
@@ -606,6 +621,23 @@ mod tests {
             response
         );
         assert_eq!(response.request_id, request.request_id);
+    }
+
+    #[test]
+    fn split_pane_direction_round_trips() {
+        for direction in [SplitDirection::Right, SplitDirection::Down] {
+            let message = ClientMessage::SplitPane {
+                pane_id: PaneId::new(),
+                direction,
+                cwd: None,
+                program: None,
+                argv: Vec::new(),
+            };
+            assert_eq!(
+                decode_payload::<ClientMessage>(&encode_payload(&message).unwrap()).unwrap(),
+                message
+            );
+        }
     }
 
     #[test]

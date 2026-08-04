@@ -8,7 +8,7 @@ use ratatui::{
 };
 
 use crate::{
-    domain::{TerminalId, WorkspaceId},
+    domain::{TabId, TerminalId, WorkspaceId},
     protocol::SelectedTarget,
     resources::{ResourceSnapshot, WorkspaceSnapshot},
 };
@@ -21,12 +21,65 @@ use super::{
 #[derive(Default)]
 pub(super) struct WorkspaceHistory {
     terminals: HashMap<WorkspaceId, TerminalId>,
+    tabs: HashMap<TabId, TerminalId>,
 }
 
 impl WorkspaceHistory {
     pub fn record(&mut self, target: &SelectedTarget) {
         self.terminals
             .insert(target.workspace_id, target.terminal_id);
+        self.tabs.insert(target.tab_id, target.terminal_id);
+    }
+
+    pub fn adjacent_tab(
+        &self,
+        snapshot: &ResourceSnapshot,
+        focused: &SelectedTarget,
+        forward: bool,
+    ) -> Option<TerminalId> {
+        let workspace = snapshot
+            .sessions
+            .iter()
+            .flat_map(|session| &session.workspaces)
+            .find(|workspace| workspace.id == focused.workspace_id)?;
+        if workspace.tabs.len() < 2 {
+            return None;
+        }
+        let current = workspace
+            .tabs
+            .iter()
+            .position(|tab| tab.id == focused.tab_id)?;
+        for offset in 1..workspace.tabs.len() {
+            let index = if forward {
+                (current + offset) % workspace.tabs.len()
+            } else {
+                (current + workspace.tabs.len() - offset) % workspace.tabs.len()
+            };
+            let tab = &workspace.tabs[index];
+            if tab.closing {
+                continue;
+            }
+            let available = |terminal_id| {
+                tab.panes
+                    .iter()
+                    .any(|pane| !pane.closing && pane.terminal_id == terminal_id)
+            };
+            if let Some(terminal_id) = self
+                .tabs
+                .get(&tab.id)
+                .copied()
+                .filter(|terminal_id| available(*terminal_id))
+                .or_else(|| {
+                    tab.panes
+                        .iter()
+                        .find(|pane| !pane.closing)
+                        .map(|pane| pane.terminal_id)
+                })
+            {
+                return Some(terminal_id);
+            }
+        }
+        None
     }
 }
 
@@ -544,21 +597,25 @@ mod tests {
         let workspaces = names
             .iter()
             .enumerate()
-            .map(|(index, name)| WorkspaceSnapshot {
-                id: WorkspaceId::new(),
-                name: (*name).into(),
-                root: PathBuf::from(format!("/project/{index}")),
-                closing: false,
-                tabs: vec![TabSnapshot {
-                    id: TabId::new(),
-                    name: "shell".into(),
+            .map(|(index, name)| {
+                let pane_id = PaneId::new();
+                WorkspaceSnapshot {
+                    id: WorkspaceId::new(),
+                    name: (*name).into(),
+                    root: PathBuf::from(format!("/project/{index}")),
                     closing: false,
-                    panes: vec![PaneSnapshot {
-                        id: PaneId::new(),
-                        terminal_id: TerminalId::new(),
+                    tabs: vec![TabSnapshot {
+                        id: TabId::new(),
+                        name: "shell".into(),
                         closing: false,
+                        layout: crate::splits::SplitTree::leaf(pane_id),
+                        panes: vec![PaneSnapshot {
+                            id: pane_id,
+                            terminal_id: TerminalId::new(),
+                            closing: false,
+                        }],
                     }],
-                }],
+                }
             })
             .collect::<Vec<_>>();
         let workspace = &workspaces[current];
@@ -628,6 +685,7 @@ mod tests {
             id: TabId::new(),
             name: "remembered".into(),
             closing: false,
+            layout: crate::splits::SplitTree::leaf(remembered.id),
             panes: vec![remembered],
         });
         let mut history = WorkspaceHistory::default();

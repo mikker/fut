@@ -3484,6 +3484,13 @@ async fn public_client_accordion_resizes_focus_and_falls_back_narrowly() {
         "printf 'AAAAAAAA\\r\\n'; while IFS= read -r line; do if [ \"$line\" = size-a ]; then set -- $(stty size); printf 'A_SIZE_%s_%s\\r\\n' \"$1\" \"$2\"; fi; done",
     )
     .await;
+    let config_dir = harness.root.path().join("home/.config/fut");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        "[ui]\npane_layout = \"accordion\"\n",
+    )
+    .unwrap();
     let resources = harness.resources().await;
     let tab_id = resources.sessions[0].workspaces[0].tabs[0].id;
     let pane_a = resources.sessions[0].workspaces[0].tabs[0].panes[0].id;
@@ -3589,7 +3596,7 @@ async fn public_pane_zoom_toggles_full_width_and_matches_command_dispatch() {
     client.wait_for("ZOOM_A_READY").await;
     client.wait_for("ZOOM_B_READY").await;
     client.send(b"before\n");
-    client.wait_for("BEFORE_23_52").await;
+    client.wait_for("BEFORE_23_39").await;
 
     client.send(b"\x02z");
     client.wait_for("zoom ").await;
@@ -3598,7 +3605,7 @@ async fn public_pane_zoom_toggles_full_width_and_matches_command_dispatch() {
 
     client.send(b"\x02z");
     client.send(b"restored\n");
-    client.wait_for("RESTORED_23_52").await;
+    client.wait_for("RESTORED_23_39").await;
 
     client.send(b"\x02k");
     client.send(b"pane zoom");
@@ -3610,6 +3617,99 @@ async fn public_pane_zoom_toggles_full_width_and_matches_command_dispatch() {
     client.wait_success().await;
 
     assert!(process_alive(pane_b.child_pid));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn public_tab_navigation_and_right_down_splits_share_the_command_catalog() {
+    let split_cwd = tempfile::tempdir().unwrap();
+    let script = format!(
+        "printf 'ACTION_A_READY\\r\\n'; while IFS= read -r line; do case \"$line\" in back) printf 'ACTION_A_BACK\\r\\n';; cd-now) cd '{}'; printf 'ACTION_A_CHANGED_DIR\\r\\n';; esac; done",
+        split_cwd.path().display()
+    );
+    let harness = Harness::start(&script).await;
+    let resources = harness.resources().await;
+    let workspace_id = resources.sessions[0].workspaces[0].id;
+    let pane_a = resources.sessions[0].workspaces[0].tabs[0].panes[0].id;
+    let ServerMessage::TabCreated { selected: tab_b } = harness
+        .control_command(ClientMessage::CreateTab {
+            workspace_id,
+            name: Some("second".into()),
+            cwd: None,
+            program: Some("/bin/sh".into()),
+            argv: vec![
+                "-c".into(),
+                "printf 'ACTION_TAB_B_READY\\r\\n'; while IFS= read -r line; do :; done".into(),
+            ],
+        })
+        .await
+    else {
+        panic!("failed to create tab-navigation target")
+    };
+
+    let mut command = Command::new("/usr/bin/script");
+    command
+        .env_clear()
+        .env("HOME", harness.root.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", harness.root.path().join("runtime"))
+        .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+        .env("TERM", "xterm-256color")
+        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .arg(format!(
+            "stty rows 30 cols 100; exec '{}' --socket '{}' pane attach {}",
+            env!("CARGO_BIN_EXE_fut"),
+            harness.socket.display(),
+            pane_a
+        ));
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("ACTION_A_READY").await;
+    client.send(b"\x02n");
+    client.wait_for("TAB_B_READY").await;
+    client.send(b"\x02p");
+    client.send(b"back\n");
+    client.wait_for("ACTION_A_BACK").await;
+    client.send(b"cd-now\n");
+    client.wait_for("ACTION_A_CHANGED_DIR").await;
+
+    client.send(b"\x02|");
+    client.send(b": > right-split-marker\n");
+    wait_for(DEADLINE, || {
+        split_cwd.path().join("right-split-marker").exists()
+    })
+    .await;
+
+    client.send(b"\x02k");
+    client.send(b"split pane down\r");
+    client.send(b": > down-split-marker\n");
+    wait_for(DEADLINE, || {
+        split_cwd.path().join("down-split-marker").exists()
+    })
+    .await;
+
+    let snapshot = resources_when(&harness, |snapshot| {
+        snapshot.sessions[0].workspaces[0].tabs[0].panes.len() == 3
+    })
+    .await;
+    let layout = &snapshot.sessions[0].workspaces[0].tabs[0].layout;
+    assert!(matches!(
+        layout,
+        fut::splits::SplitTree::Branch {
+            axis: fut::splits::SplitAxis::Horizontal,
+            second,
+            ..
+        } if matches!(
+            second.as_ref(),
+            fut::splits::SplitTree::Branch {
+                axis: fut::splits::SplitAxis::Vertical,
+                ..
+            }
+        )
+    ));
+
+    client.send(b"\x02d");
+    client.wait_success().await;
+    assert!(process_alive(tab_b.child_pid));
     harness.shutdown().await;
 }
 
@@ -4042,7 +4142,7 @@ async fn malformed_ui_config_prevents_bare_fut_from_starting_or_opening_resource
 #[tokio::test]
 async fn public_client_transfers_focus_when_the_focused_pane_exits() {
     let harness = Harness::start(
-        "printf 'EXIT_A_READY\r\n'; while IFS= read -r line; do [ \"$line\" = exit ] && exit 23; done",
+        "printf 'PRIMARY_EXIT_TARGET\r\n'; while IFS= read -r line; do [ \"$line\" = exit ] && exit 23; done",
     )
     .await;
     let resources = harness.resources().await;
@@ -4055,7 +4155,7 @@ async fn public_client_transfers_focus_when_the_focused_pane_exits() {
             program: Some("/bin/sh".into()),
             argv: vec![
                 "-c".into(),
-                "printf 'EXIT_B_READY\r\n'; while IFS= read -r line; do [ \"$line\" = b ] && printf 'EXIT_B_INPUT\r\n'; done".into(),
+                "printf 'SURVIVOR_PANE_READY\r\n'; while IFS= read -r line; do [ \"$line\" = b ] && printf 'EXIT_B_INPUT\r\n'; done".into(),
             ],
         })
         .await
@@ -4079,10 +4179,10 @@ async fn public_client_transfers_focus_when_the_focused_pane_exits() {
             pane_a
         ));
     let mut client = PtyChild::spawn(command);
-    client.wait_for("EXIT_A_READY").await;
-    client.wait_for("EXIT_B_READY").await;
+    client.wait_for("PRIMARY_EXIT_TARGET").await;
+    client.wait_for("SURVIVOR_PANE_READY").await;
     client.send(b"exit\n");
-    client.wait_for_count("EXIT_B_READY", 2).await;
+    client.wait_for_count("SURVIVOR_PANE_READY", 2).await;
     client.send(b"b\n");
     client.wait_for("EXIT_B_INPUT").await;
     client.send(b"\x02d");
@@ -4533,6 +4633,19 @@ async fn focused_exit_falls_back_through_previous_tabs_in_the_same_session() {
         unreachable!()
     };
     assert_eq!(selected.focused.tab_id, tab_b.tab_id);
+    let ServerMessage::ResourcesChanged { snapshot } = receive_matching(&mut attached, |message| {
+        matches!(message, ServerMessage::ResourcesChanged { snapshot } if snapshot.sessions[0].workspaces[0].tabs.iter().all(|tab| tab.id != tab_c.tab_id))
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    assert!(
+        snapshot.sessions[0].workspaces[0]
+            .tabs
+            .iter()
+            .all(|tab| tab.id != tab_c.tab_id)
+    );
     send(
         &mut attached,
         ClientMessage::Input {

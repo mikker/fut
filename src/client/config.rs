@@ -22,10 +22,19 @@ pub(super) enum WorkspaceSidebarPosition {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum PaneLayoutPolicy {
+    #[default]
+    Splits,
+    Accordion,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct UiConfig {
     pub(super) tab_bar_position: TabBarPosition,
     pub(super) workspace_sidebar_position: WorkspaceSidebarPosition,
+    pub(super) pane_layout: PaneLayoutPolicy,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -131,7 +140,7 @@ mod tests {
         let path = temporary.path().join("config.toml");
         fs::write(
             &path,
-            "[ui]\ntab_bar_position = \"bottom\"\nworkspace_sidebar_position = \"right\"\n",
+            "[ui]\ntab_bar_position = \"bottom\"\nworkspace_sidebar_position = \"right\"\npane_layout = \"accordion\"\n",
         )
         .unwrap();
 
@@ -140,6 +149,7 @@ mod tests {
             UiConfig {
                 tab_bar_position: TabBarPosition::Bottom,
                 workspace_sidebar_position: WorkspaceSidebarPosition::Right,
+                pane_layout: PaneLayoutPolicy::Accordion,
             }
         );
     }

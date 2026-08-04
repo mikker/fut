@@ -479,6 +479,12 @@ mod tests {
         let workspace_id = WorkspaceId::new();
         let tab_id = TabId::new();
         let current_terminal = TerminalId::new();
+        let mut layout = crate::splits::SplitTree::leaf(current_pane);
+        assert!(layout.split(
+            current_pane,
+            crate::splits::SplitDirection::Right,
+            other_pane,
+        ));
         (
             ResourceSnapshot {
                 revision: 1,
@@ -498,6 +504,7 @@ mod tests {
                             id: tab_id,
                             name: "tab".into(),
                             closing: false,
+                            layout,
                             panes: vec![
                                 PaneSnapshot {
                                     id: current_pane,
@@ -575,6 +582,7 @@ mod tests {
             id: destination_tab_id,
             name: "destination".into(),
             closing: false,
+            layout: crate::splits::SplitTree::leaf(moved_pane.id),
             panes: vec![moved_pane],
         });
 

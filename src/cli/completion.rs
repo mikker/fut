@@ -376,6 +376,8 @@ mod tests {
             terminal_id: TerminalId::new(),
             closing,
         };
+        let first_pane = pane(false);
+        let second_pane = pane(true);
         ResourceSnapshot {
             revision: 1,
             sessions: vec![SessionSnapshot {
@@ -395,13 +397,15 @@ mod tests {
                             id: TabId::new(),
                             name: "One".into(),
                             closing: false,
-                            panes: vec![pane(false)],
+                            layout: crate::splits::SplitTree::leaf(first_pane.id),
+                            panes: vec![first_pane],
                         },
                         TabSnapshot {
                             id: TabId::new(),
                             name: "Two".into(),
                             closing: false,
-                            panes: vec![pane(true)],
+                            layout: crate::splits::SplitTree::leaf(second_pane.id),
+                            panes: vec![second_pane],
                         },
                     ],
                 }],

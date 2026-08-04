@@ -16,7 +16,7 @@ use anyhow::{Context, bail};
 use bytes::Bytes;
 use chrome::{ResourceState, client_layout, render_tab_bar};
 use command_bar::{CommandBarAction, CommandBarState};
-use config::UiConfig;
+use config::{PaneLayoutPolicy, UiConfig};
 use crossterm::{
     cursor::{Hide, Show},
     event::{DisableBracketedPaste, EnableBracketedPaste, Event, EventStream},
@@ -28,7 +28,7 @@ use crossterm::{
 };
 use futures_util::{SinkExt, StreamExt};
 use input::{PrefixAction, PrefixState, encode_key};
-use layout::{PaneLayout, pane_layouts};
+use layout::{PaneLayout, authored_layout, pane_layouts};
 use navigator::{NavigatorAction, NavigatorState};
 use ratatui::{
     Terminal,
@@ -53,6 +53,7 @@ use crate::{
         ServerMessage, codec, decode_payload, encode_payload,
     },
     resources::TargetSelector,
+    splits::SplitTree,
 };
 
 enum ClientSurface {
@@ -137,6 +138,7 @@ async fn run(
     let mut workspace_history = WorkspaceHistory::default();
     workspace_history.record(view.focused());
     let mut create_tab = CreateTabState::default();
+    let mut split_pane = CreateTabState::default();
     let mut focus = FocusState::default();
     let mut notice: Option<String> = None;
     let mut pending_focused_exit: Option<Option<i32>> = None;
@@ -199,16 +201,18 @@ async fn run(
                             Some(ClientSurface::Navigator(nav)) => nav.switch_selected(request_id),
                             _ => false,
                         };
-                        let workspace_selected =
-                            matches!(focus.complete(request_id), Some(FocusOrigin::Workspace));
+                        let focus_origin = focus.complete(request_id);
+                        let workspace_selected = matches!(focus_origin, Some(FocusOrigin::Workspace));
+                        let tab_selected = matches!(focus_origin, Some(FocusOrigin::Tab));
                         let create_selected = create_tab.selected(request_id, &target.focused);
+                        let split_selected = split_pane.selected(request_id, &target.focused);
                         if !view.replace(target)? {
-                            if navigator_selected || workspace_selected {
+                            if navigator_selected || workspace_selected || tab_selected {
                                 surface = None;
                                 view.invalidate_drawn();
                                 force_draw = true;
                             }
-                            if create_selected {
+                            if create_selected || split_selected {
                                 force_draw = true;
                             }
                             continue;
@@ -233,7 +237,10 @@ async fn run(
                             surface = None;
                             view.invalidate_drawn();
                         }
-                        if create_selected {
+                        if tab_selected {
+                            view.invalidate_drawn();
+                        }
+                        if create_selected || split_selected {
                             view.invalidate_drawn();
                         }
                         force_draw = true;
@@ -247,11 +254,11 @@ async fn run(
                         }
                         force_draw = true;
                     }
-                    ServerMessage::PaneCreated { .. } => {
-                        // Raw protocol clients may create panes. The TUI keeps pane
-                        // creation control-only until split direction and CWD
-                        // inheritance are designed together.
-                        bail!("unexpected pane creation response")
+                    ServerMessage::PaneCreated { selected: target } => {
+                        if !split_pane.created(request_id, target.terminal_id) {
+                            continue;
+                        }
+                        force_draw = true;
                     }
                     ServerMessage::PaneMoved { .. } => {
                         // Pane movement is currently a control-plane operation.
@@ -271,6 +278,11 @@ async fn run(
                     ServerMessage::Error { code, message } => {
                         if create_tab.fail(request_id) {
                             notice = Some(format!("create tab failed · {message}"));
+                            force_draw = true;
+                            continue;
+                        }
+                        if split_pane.fail(request_id) {
+                            notice = Some(format!("split failed · {message}"));
                             force_draw = true;
                             continue;
                         }
@@ -296,6 +308,10 @@ async fn run(
                                     notice = Some(format!("pane unavailable · {message}"));
                                     force_draw = true;
                                 }
+                                Some(FocusOrigin::Tab) => {
+                                    notice = Some(format!("tab unavailable · {message}"));
+                                    force_draw = true;
+                                }
                                 None => bail!("daemon error ({code}): {message}"),
                             }
                         }
@@ -306,7 +322,7 @@ async fn run(
                     ServerMessage::Welcome { .. } => bail!("unexpected second welcome from daemon"),
                 }
             }
-            event = events.next(), if accepts_client_input(&focus, &create_tab, &pending_focused_exit) => {
+            event = events.next(), if accepts_client_input(&focus, &create_tab, &split_pane, &pending_focused_exit) => {
                 let Some(event) = event else { break };
                 match event? {
                     Event::Key(key) if matches!(surface.as_ref(), Some(ClientSurface::Navigator(_))) => {
@@ -390,6 +406,7 @@ async fn run(
                                     &mut surface,
                                     &workspace_history,
                                     &mut create_tab,
+                                    &mut split_pane,
                                     &mut focus,
                                     terminal.size()?.into(),
                                     ui,
@@ -417,6 +434,7 @@ async fn run(
                                     &mut surface,
                                     &workspace_history,
                                     &mut create_tab,
+                                    &mut split_pane,
                                     &mut focus,
                                     terminal.size()?.into(),
                                     ui,
@@ -438,7 +456,12 @@ async fn run(
                 terminal.draw(|frame| {
                     let area = frame.area();
                     let layout = client_layout(area, ui);
-                    let cursor = render_view(&view, layout.terminal, frame.buffer_mut());
+                    let cursor = render_view(
+                        &view,
+                        layout.terminal,
+                        ui.pane_layout,
+                        frame.buffer_mut(),
+                    );
                     if let Some(tab_bar) = layout.tab_bar {
                         render_tab_bar(
                             resources.snapshot(),
@@ -517,9 +540,13 @@ fn refresh_surface_resources(
 fn accepts_client_input(
     focus: &FocusState,
     create_tab: &CreateTabState,
+    split_pane: &CreateTabState,
     pending_focused_exit: &Option<Option<i32>>,
 ) -> bool {
-    focus.request_id.is_none() && !create_tab.blocks_input() && pending_focused_exit.is_none()
+    focus.request_id.is_none()
+        && !create_tab.blocks_input()
+        && !split_pane.blocks_input()
+        && pending_focused_exit.is_none()
 }
 
 #[allow(
@@ -534,6 +561,7 @@ async fn dispatch_client_action(
     surface: &mut Option<ClientSurface>,
     workspace_history: &WorkspaceHistory,
     create_tab: &mut CreateTabState,
+    split_pane: &mut CreateTabState,
     focus: &mut FocusState,
     host: Rect,
     ui: UiConfig,
@@ -568,6 +596,45 @@ async fn dispatch_client_action(
                     ClientMessage::CreateTab {
                         workspace_id: view.focused().workspace_id,
                         name: None,
+                        cwd: None,
+                        program: None,
+                        argv: Vec::new(),
+                    },
+                )
+                .await?;
+            }
+        }
+        ClientAction::FocusNextTab | ClientAction::FocusPreviousTab => {
+            let Some(snapshot) = resources.snapshot() else {
+                return Ok(Some("tabs are still loading".into()));
+            };
+            let forward = action == ClientAction::FocusNextTab;
+            if let Some(terminal_id) =
+                workspace_history.adjacent_tab(snapshot, view.focused(), forward)
+                && let Some(request) = focus.begin(FocusOrigin::Tab)
+            {
+                send_request(
+                    framed,
+                    Some(request),
+                    ClientMessage::SelectTarget {
+                        selector: TargetSelector::Terminal(terminal_id),
+                    },
+                )
+                .await?;
+            }
+        }
+        ClientAction::SplitPaneRight | ClientAction::SplitPaneDown => {
+            if let Some(request) = split_pane.begin() {
+                send_request(
+                    framed,
+                    Some(request),
+                    ClientMessage::SplitPane {
+                        pane_id: view.focused().pane_id,
+                        direction: if action == ClientAction::SplitPaneRight {
+                            crate::splits::SplitDirection::Right
+                        } else {
+                            crate::splits::SplitDirection::Down
+                        },
                         cwd: None,
                         program: None,
                         argv: Vec::new(),
@@ -716,6 +783,7 @@ struct FocusState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FocusOrigin {
     Pane,
+    Tab,
     Workspace,
 }
 
@@ -775,6 +843,7 @@ struct ViewState {
     focused: TerminalId,
     selected_revision: u64,
     panes: Vec<PaneState>,
+    layout: SplitTree,
     zoomed: bool,
 }
 
@@ -785,6 +854,7 @@ impl ViewState {
             focused,
             selected_revision: 0,
             panes: Vec::new(),
+            layout: selected.layout.clone(),
             zoomed: false,
         };
         view.replace(selected)?;
@@ -836,6 +906,15 @@ impl ViewState {
                 bail!("daemon pane view contains a duplicate pane or terminal");
             }
         }
+        if selected.layout.leaf_ids()
+            != selected
+                .panes
+                .iter()
+                .map(|pane| pane.pane_id)
+                .collect::<Vec<_>>()
+        {
+            bail!("daemon pane layout does not match its pane order");
+        }
 
         let mut old = std::mem::take(&mut self.panes);
         self.panes = selected
@@ -855,6 +934,7 @@ impl ViewState {
             })
             .collect();
         self.focused = focused;
+        self.layout = selected.layout;
         self.selected_revision = selected.resource_revision;
         if previous_tab.is_some_and(|tab_id| tab_id != selected.focused.tab_id)
             || self.panes.len() < 2
@@ -946,7 +1026,11 @@ impl ViewState {
         else {
             return;
         };
+        let pane_id = self.panes[index].target.pane_id;
         self.panes.remove(index);
+        if let Some(layout) = self.layout.clone().without(pane_id) {
+            self.layout = layout;
+        }
         if self.panes.len() < 2 {
             self.zoomed = false;
         }
@@ -964,8 +1048,51 @@ impl ViewState {
             .collect()
     }
 
-    fn resize_requests(&mut self, area: Rect) -> Vec<(TerminalId, TerminalSize)> {
-        let layouts = pane_layouts(area, &self.terminal_ids(), self.focused, self.zoomed);
+    fn pane_layouts(
+        &self,
+        area: Rect,
+        policy: PaneLayoutPolicy,
+    ) -> (
+        std::collections::BTreeMap<TerminalId, PaneLayout>,
+        Vec<Rect>,
+    ) {
+        match policy {
+            PaneLayoutPolicy::Accordion => (
+                pane_layouts(area, &self.terminal_ids(), self.focused, self.zoomed),
+                Vec::new(),
+            ),
+            PaneLayoutPolicy::Splits => {
+                let authored =
+                    authored_layout(area, &self.layout, self.focused().pane_id, self.zoomed);
+                let panes = authored
+                    .panes
+                    .into_iter()
+                    .filter_map(|(pane_id, content)| {
+                        self.panes
+                            .iter()
+                            .find(|pane| pane.target.pane_id == pane_id)
+                            .map(|pane| {
+                                (
+                                    pane.target.terminal_id,
+                                    PaneLayout {
+                                        rail: None,
+                                        content,
+                                    },
+                                )
+                            })
+                    })
+                    .collect();
+                (panes, authored.dividers)
+            }
+        }
+    }
+
+    fn resize_requests(
+        &mut self,
+        area: Rect,
+        policy: PaneLayoutPolicy,
+    ) -> Vec<(TerminalId, TerminalSize)> {
+        let layouts = self.pane_layouts(area, policy).0;
         let Some(pane) = self
             .panes
             .iter_mut()
@@ -996,14 +1123,30 @@ async fn resize_view(
     ui: UiConfig,
 ) -> anyhow::Result<()> {
     let terminal = client_layout(area, ui).terminal;
-    for (terminal_id, size) in view.resize_requests(terminal) {
+    for (terminal_id, size) in view.resize_requests(terminal, ui.pane_layout) {
         send(framed, ClientMessage::Resize { terminal_id, size }).await?;
     }
     Ok(())
 }
 
-fn render_view(view: &ViewState, area: Rect, buffer: &mut Buffer) -> Option<(u16, u16)> {
-    let layouts = pane_layouts(area, &view.terminal_ids(), view.focused, view.zoomed);
+fn render_view(
+    view: &ViewState,
+    area: Rect,
+    policy: PaneLayoutPolicy,
+    buffer: &mut Buffer,
+) -> Option<(u16, u16)> {
+    let (layouts, dividers) = view.pane_layouts(area, policy);
+    for divider in dividers {
+        let symbol = if divider.width == 1 { "│" } else { "─" };
+        for row in divider.y..divider.y + divider.height {
+            for column in divider.x..divider.x + divider.width {
+                if let Some(cell) = buffer.cell_mut((column, row)) {
+                    cell.set_symbol(symbol)
+                        .set_style(Style::default().add_modifier(Modifier::DIM));
+                }
+            }
+        }
+    }
     let mut cursor = None;
     for pane in &view.panes {
         let Some(PaneLayout { rail, content }) = layouts.get(&pane.target.terminal_id) else {
@@ -1171,26 +1314,48 @@ mod tests {
             .collect()
     }
 
+    fn selected_view(
+        resource_revision: u64,
+        focused: SelectedTarget,
+        panes: Vec<SelectedTarget>,
+    ) -> SelectedView {
+        let mut layout = SplitTree::leaf(panes[0].pane_id);
+        for pair in panes.windows(2) {
+            assert!(layout.split(
+                pair[0].pane_id,
+                crate::splits::SplitDirection::Right,
+                pair[1].pane_id,
+            ));
+        }
+        SelectedView {
+            resource_revision,
+            focused,
+            panes,
+            layout,
+        }
+    }
+
     #[test]
     fn create_tab_state_blocks_input_through_correlated_ack_and_selection() {
         let mut state = CreateTabState::default();
+        let split = CreateTabState::default();
         let focus = FocusState::default();
         let no_exit = None;
         let request = state.begin().expect("first request starts");
         assert!(state.begin().is_none());
         assert!(state.blocks_input());
-        assert!(!accepts_client_input(&focus, &state, &no_exit));
+        assert!(!accepts_client_input(&focus, &state, &split, &no_exit));
         let target = targets(1).remove(0);
         assert!(!state.created(None, target.terminal_id));
         assert!(!state.created(Some(Uuid::new_v4()), target.terminal_id));
         assert!(state.created(Some(request), target.terminal_id));
         assert!(state.blocks_input());
-        assert!(!accepts_client_input(&focus, &state, &no_exit));
+        assert!(!accepts_client_input(&focus, &state, &split, &no_exit));
         assert!(!state.selected(Some(Uuid::new_v4()), &target));
         assert!(state.begin().is_none());
         assert!(state.selected(Some(request), &target));
         assert!(!state.blocks_input());
-        assert!(accepts_client_input(&focus, &state, &no_exit));
+        assert!(accepts_client_input(&focus, &state, &split, &no_exit));
         assert!(state.begin().is_some());
 
         let mut failed = CreateTabState::default();
@@ -1198,7 +1363,7 @@ mod tests {
         assert!(!failed.fail(Some(Uuid::new_v4())));
         assert!(failed.fail(Some(request)));
         assert!(!failed.blocks_input());
-        assert!(accepts_client_input(&focus, &failed, &no_exit));
+        assert!(accepts_client_input(&focus, &failed, &split, &no_exit));
     }
 
     #[test]
@@ -1236,12 +1401,7 @@ mod tests {
         let panes = targets(2);
         let first = panes[0].terminal_id;
         let second = panes[1].terminal_id;
-        let mut state = ViewState::new(SelectedView {
-            resource_revision: 1,
-            focused: panes[0].clone(),
-            panes: panes.clone(),
-        })
-        .unwrap();
+        let mut state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
         assert!(state.accept(first, snapshot(2)));
         assert!(state.accept(second, snapshot(1)));
         assert!(!state.accept(first, snapshot(1)));
@@ -1253,11 +1413,7 @@ mod tests {
         state.mark_drawn();
 
         state
-            .replace(SelectedView {
-                resource_revision: 1,
-                focused: panes[1].clone(),
-                panes,
-            })
+            .replace(selected_view(1, panes[1].clone(), panes))
             .unwrap();
         assert_eq!(state.focused().terminal_id, second);
         assert_eq!(
@@ -1282,20 +1438,12 @@ mod tests {
     #[test]
     fn selected_view_revisions_only_reject_older_selected_views() {
         let panes = targets(3);
-        let mut state = ViewState::new(SelectedView {
-            resource_revision: 2,
-            focused: panes[0].clone(),
-            panes: panes[..2].to_vec(),
-        })
-        .unwrap();
+        let mut state =
+            ViewState::new(selected_view(2, panes[0].clone(), panes[..2].to_vec())).unwrap();
 
         assert!(
             state
-                .replace(SelectedView {
-                    resource_revision: 3,
-                    focused: panes[1].clone(),
-                    panes: panes[1..].to_vec(),
-                })
+                .replace(selected_view(3, panes[1].clone(), panes[1..].to_vec()))
                 .unwrap()
         );
         assert_eq!(state.focused().terminal_id, panes[1].terminal_id);
@@ -1310,11 +1458,7 @@ mod tests {
 
         assert!(
             !state
-                .replace(SelectedView {
-                    resource_revision: 2,
-                    focused: panes[0].clone(),
-                    panes: panes[..2].to_vec(),
-                })
+                .replace(selected_view(2, panes[0].clone(), panes[..2].to_vec()))
                 .unwrap()
         );
         assert_eq!(state.focused().terminal_id, panes[1].terminal_id);
@@ -1325,23 +1469,16 @@ mod tests {
         let panes = targets(2);
         let mut inconsistent = panes[0].clone();
         inconsistent.child_pid += 100;
-        assert!(
-            ViewState::new(SelectedView {
-                resource_revision: 1,
-                focused: inconsistent,
-                panes: panes.clone(),
-            })
-            .is_err()
-        );
+        assert!(ViewState::new(selected_view(1, inconsistent, panes.clone())).is_err());
 
         let mut duplicate = panes[1].clone();
         duplicate.pane_id = panes[0].pane_id;
         assert!(
-            ViewState::new(SelectedView {
-                resource_revision: 1,
-                focused: panes[0].clone(),
-                panes: vec![panes[0].clone(), duplicate],
-            })
+            ViewState::new(selected_view(
+                1,
+                panes[0].clone(),
+                vec![panes[0].clone(), duplicate],
+            ))
             .is_err()
         );
     }
@@ -1351,15 +1488,10 @@ mod tests {
         let panes = targets(2);
         let first = panes[0].terminal_id;
         let second = panes[1].terminal_id;
-        let mut state = ViewState::new(SelectedView {
-            resource_revision: 1,
-            focused: panes[0].clone(),
-            panes: panes.clone(),
-        })
-        .unwrap();
+        let mut state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
         let area = Rect::new(0, 0, 38, 4);
         assert_eq!(
-            state.resize_requests(area),
+            state.resize_requests(area, PaneLayoutPolicy::Accordion),
             [(
                 first,
                 TerminalSize {
@@ -1368,9 +1500,13 @@ mod tests {
                 }
             )]
         );
-        assert!(state.resize_requests(area).is_empty());
+        assert!(
+            state
+                .resize_requests(area, PaneLayoutPolicy::Accordion)
+                .is_empty()
+        );
         assert_eq!(
-            state.resize_requests(Rect::new(0, 0, 37, 4)),
+            state.resize_requests(Rect::new(0, 0, 37, 4), PaneLayoutPolicy::Accordion),
             [(
                 first,
                 TerminalSize {
@@ -1381,14 +1517,10 @@ mod tests {
         );
 
         state
-            .replace(SelectedView {
-                resource_revision: 1,
-                focused: panes[1].clone(),
-                panes,
-            })
+            .replace(selected_view(1, panes[1].clone(), panes))
             .unwrap();
         assert_eq!(
-            state.resize_requests(area),
+            state.resize_requests(area, PaneLayoutPolicy::Accordion),
             [(
                 second,
                 TerminalSize {
@@ -1405,19 +1537,19 @@ mod tests {
         let first = panes[0].terminal_id;
         let second = panes[1].terminal_id;
         let area = Rect::new(0, 0, 38, 4);
-        let mut state = ViewState::new(SelectedView {
-            resource_revision: 1,
-            focused: panes[0].clone(),
-            panes: panes.clone(),
-        })
-        .unwrap();
+        let mut state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
 
         assert!(!state.is_zoomed());
-        assert_eq!(state.resize_requests(area)[0].1.columns, 24);
+        assert_eq!(
+            state.resize_requests(area, PaneLayoutPolicy::Accordion)[0]
+                .1
+                .columns,
+            24
+        );
         assert_eq!(state.toggle_zoom(), Some(true));
         assert!(state.is_zoomed());
         assert_eq!(
-            state.resize_requests(area),
+            state.resize_requests(area, PaneLayoutPolicy::Accordion),
             [(
                 first,
                 TerminalSize {
@@ -1428,11 +1560,7 @@ mod tests {
         );
 
         state
-            .replace(SelectedView {
-                resource_revision: 1,
-                focused: panes[1].clone(),
-                panes: panes.clone(),
-            })
+            .replace(selected_view(1, panes[1].clone(), panes.clone()))
             .unwrap();
         assert!(state.is_zoomed());
         assert_eq!(
@@ -1445,7 +1573,7 @@ mod tests {
             None
         );
         assert_eq!(
-            state.resize_requests(area)[0],
+            state.resize_requests(area, PaneLayoutPolicy::Accordion)[0],
             (
                 second,
                 TerminalSize {
@@ -1457,20 +1585,12 @@ mod tests {
 
         let other_tab = targets(2);
         state
-            .replace(SelectedView {
-                resource_revision: 2,
-                focused: other_tab[0].clone(),
-                panes: other_tab,
-            })
+            .replace(selected_view(2, other_tab[0].clone(), other_tab))
             .unwrap();
         assert!(!state.is_zoomed());
 
         state
-            .replace(SelectedView {
-                resource_revision: 3,
-                focused: panes[0].clone(),
-                panes: vec![panes[0].clone()],
-            })
+            .replace(selected_view(3, panes[0].clone(), vec![panes[0].clone()]))
             .unwrap();
         assert_eq!(state.toggle_zoom(), None);
     }
@@ -1499,18 +1619,16 @@ mod tests {
             )
             .unwrap()
         };
-        let mut state = ViewState::new(SelectedView {
-            resource_revision: 1,
-            focused: panes[0].clone(),
-            panes: panes.clone(),
-        })
-        .unwrap();
+        let mut state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
         assert!(state.accept(first, snapshot("A", 13)));
         assert!(state.accept(second, snapshot("B", 12)));
 
         let area = Rect::new(0, 0, 38, 2);
         let mut buffer = Buffer::empty(area);
-        assert_eq!(render_view(&state, area, &mut buffer), Some((1, 0)));
+        assert_eq!(
+            render_view(&state, area, PaneLayoutPolicy::Accordion, &mut buffer),
+            Some((1, 0))
+        );
         assert_eq!(buffer[(0, 0)].symbol(), "┃");
         assert!(buffer[(0, 0)].modifier.contains(Modifier::BOLD));
         assert_eq!(buffer[(0, 0)].fg, Color::Reset);
@@ -1521,20 +1639,22 @@ mod tests {
         assert_eq!(buffer[(26, 0)].symbol(), "B");
 
         state
-            .replace(SelectedView {
-                resource_revision: 1,
-                focused: panes[1].clone(),
-                panes,
-            })
+            .replace(selected_view(1, panes[1].clone(), panes))
             .unwrap();
         let mut moved = Buffer::empty(area);
-        assert_eq!(render_view(&state, area, &mut moved), Some((14, 0)));
+        assert_eq!(
+            render_view(&state, area, PaneLayoutPolicy::Accordion, &mut moved),
+            Some((14, 0))
+        );
         assert!(moved[(0, 0)].modifier.contains(Modifier::DIM));
         assert!(moved[(13, 0)].modifier.contains(Modifier::BOLD));
 
         let tiny = Rect::new(0, 0, 20, 2);
         let mut tiny_buffer = Buffer::empty(tiny);
-        assert_eq!(render_view(&state, tiny, &mut tiny_buffer), Some((0, 0)));
+        assert_eq!(
+            render_view(&state, tiny, PaneLayoutPolicy::Accordion, &mut tiny_buffer,),
+            Some((0, 0))
+        );
         assert_eq!(tiny_buffer[(0, 0)].symbol(), "B");
         assert!((0..tiny.width).all(|column| tiny_buffer[(column, 0)].symbol() != "┃"));
     }

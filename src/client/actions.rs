@@ -4,6 +4,10 @@ pub(super) enum ClientAction {
     OpenNavigator,
     OpenWorkspaceSidebar,
     CreateTab,
+    FocusNextTab,
+    FocusPreviousTab,
+    SplitPaneRight,
+    SplitPaneDown,
     FocusNextPane,
     FocusPreviousPane,
     TogglePaneZoom,
@@ -23,7 +27,23 @@ pub(super) struct DirectBinding {
     pub action: ClientAction,
 }
 
-pub(super) const COMMANDS: [ActionDefinition; 7] = [
+#[cfg(test)]
+const ALL_ACTIONS: [ClientAction; 12] = [
+    ClientAction::OpenCommandBar,
+    ClientAction::OpenNavigator,
+    ClientAction::OpenWorkspaceSidebar,
+    ClientAction::CreateTab,
+    ClientAction::FocusNextTab,
+    ClientAction::FocusPreviousTab,
+    ClientAction::SplitPaneRight,
+    ClientAction::SplitPaneDown,
+    ClientAction::FocusNextPane,
+    ClientAction::FocusPreviousPane,
+    ClientAction::TogglePaneZoom,
+    ClientAction::Detach,
+];
+
+pub(super) const COMMANDS: [ActionDefinition; 11] = [
     ActionDefinition {
         action: ClientAction::OpenNavigator,
         title: "Open global navigator",
@@ -38,6 +58,26 @@ pub(super) const COMMANDS: [ActionDefinition; 7] = [
         action: ClientAction::CreateTab,
         title: "Create tab",
         keywords: "create new tab shell",
+    },
+    ActionDefinition {
+        action: ClientAction::FocusNextTab,
+        title: "Switch to next tab",
+        keywords: "tab next forward cycle switch",
+    },
+    ActionDefinition {
+        action: ClientAction::FocusPreviousTab,
+        title: "Switch to previous tab",
+        keywords: "tab previous back backward cycle switch",
+    },
+    ActionDefinition {
+        action: ClientAction::SplitPaneRight,
+        title: "Split pane right",
+        keywords: "pane split right horizontal create",
+    },
+    ActionDefinition {
+        action: ClientAction::SplitPaneDown,
+        title: "Split pane down",
+        keywords: "pane split down vertical create",
     },
     ActionDefinition {
         action: ClientAction::FocusNextPane,
@@ -61,7 +101,7 @@ pub(super) const COMMANDS: [ActionDefinition; 7] = [
     },
 ];
 
-pub(super) const DIRECT_BINDINGS: [DirectBinding; 10] = [
+pub(super) const DIRECT_BINDINGS: [DirectBinding; 14] = [
     DirectBinding {
         suffix: b"k",
         action: ClientAction::OpenCommandBar,
@@ -77,6 +117,22 @@ pub(super) const DIRECT_BINDINGS: [DirectBinding; 10] = [
     DirectBinding {
         suffix: b"c",
         action: ClientAction::CreateTab,
+    },
+    DirectBinding {
+        suffix: b"n",
+        action: ClientAction::FocusNextTab,
+    },
+    DirectBinding {
+        suffix: b"p",
+        action: ClientAction::FocusPreviousTab,
+    },
+    DirectBinding {
+        suffix: b"|",
+        action: ClientAction::SplitPaneRight,
+    },
+    DirectBinding {
+        suffix: b"_",
+        action: ClientAction::SplitPaneDown,
     },
     DirectBinding {
         suffix: b"l",
@@ -133,6 +189,8 @@ pub(super) fn action_for_suffix(suffix: &[u8]) -> Option<ClientAction> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     #[test]
@@ -150,6 +208,37 @@ mod tests {
             }
         }
         assert!(definition(ClientAction::OpenCommandBar).is_none());
+        for action in ALL_ACTIONS {
+            if action != ClientAction::OpenCommandBar {
+                assert!(
+                    definition(action).is_some(),
+                    "{action:?} is absent from launcher"
+                );
+            }
+        }
+        for binding in DIRECT_BINDINGS {
+            if binding.action != ClientAction::OpenCommandBar {
+                assert!(definition(binding.action).is_some());
+            }
+        }
+        assert_eq!(
+            DIRECT_BINDINGS
+                .iter()
+                .map(|binding| binding.suffix)
+                .collect::<HashSet<_>>()
+                .len(),
+            DIRECT_BINDINGS.len(),
+            "direct binding suffixes must be unique"
+        );
+        assert_eq!(
+            COMMANDS
+                .iter()
+                .map(|command| command.action)
+                .collect::<HashSet<_>>()
+                .len(),
+            COMMANDS.len(),
+            "launcher actions must be unique"
+        );
         assert_eq!(action_for_suffix(b"z"), Some(ClientAction::TogglePaneZoom));
         assert_eq!(binding_label(ClientAction::TogglePaneZoom), "Ctrl-b z");
     }

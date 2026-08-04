@@ -51,6 +51,7 @@ pub enum CommandError {
 pub struct TerminalHandle {
     id: TerminalId,
     child_pid: u32,
+    spawn_cwd: PathBuf,
     commands: async_mpsc::Sender<RuntimeMessage>,
     snapshots: watch::Sender<ScreenSnapshot>,
     events: broadcast::Sender<TerminalEvent>,
@@ -66,6 +67,11 @@ impl TerminalHandle {
     #[must_use]
     pub fn child_pid(&self) -> u32 {
         self.child_pid
+    }
+
+    #[must_use]
+    pub fn spawn_cwd(&self) -> &std::path::Path {
+        &self.spawn_cwd
     }
 
     pub async fn input(&self, bytes: Vec<u8>) -> Result<(), CommandError> {
@@ -165,6 +171,7 @@ struct RuntimePublishers<'a> {
 
 pub fn spawn_terminal(spec: SpawnSpec) -> Result<TerminalHandle> {
     spec.size.validate()?;
+    let spawn_cwd = spec.cwd.clone();
     let pair = native_pty_system().openpty(pty_size(spec.size))?;
     let mut command = CommandBuilder::new(&spec.program);
     command.args(&spec.argv);
@@ -275,6 +282,7 @@ pub fn spawn_terminal(spec: SpawnSpec) -> Result<TerminalHandle> {
     Ok(TerminalHandle {
         id,
         child_pid,
+        spawn_cwd,
         commands,
         snapshots,
         events,

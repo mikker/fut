@@ -56,17 +56,17 @@ The stable, process-bearing resource behind a pane. A terminal owns the pseudote
 
 ### Layout
 
-The arrangement of panes in a tab. In the target model being implemented next, every tab owns an authored split tree as shared runtime state. Clients evaluate that tree against their own viewport, minimum sizes, and selected presentation policy. The current implementation still renders its ordered pane collection as an accordion and has not persisted the tree yet.
+The arrangement of panes in a tab. Every tab owns an authored split tree as shared runtime state. Clients evaluate that tree against their own viewport, minimum sizes, and selected presentation policy.
 
 ### Split tree
 
-The planned shared runtime topology of a tab. Leaf nodes reference pane placements; branch nodes split left/right or top/bottom and store a ratio. `Ctrl-b |` splits the focused pane to the right and `Ctrl-b _` splits it downward. Closing or moving a pane removes its leaf and collapses any branch left with one child.
+The shared runtime topology of a tab. Leaf nodes reference pane placements; branch nodes split left/right or top/bottom and store a ratio. `Ctrl-b |` splits the focused pane to the right and `Ctrl-b _` splits it downward. Closing or moving a pane removes its leaf and collapses any branch left with one child.
 
 The split tree belongs to the tab rather than to one client, but computed rectangles never do. Resource order and split-tree leaf order must agree so navigation, automation, fallback, and rendering do not acquire competing notions of pane order.
 
 ### Layout policy
 
-A client-owned choice for presenting a tab's panes. Once authored trees land, the default policy renders the split tree. An accordion policy may temporarily present the same ordered pane leaves as a focus-biased horizontal accordion without rewriting shared split topology.
+A client-owned choice for presenting a tab's panes. The default policy renders the split tree. An accordion policy may temporarily present the same ordered pane leaves as a focus-biased horizontal accordion without rewriting shared split topology.
 
 ### Accordion
 
