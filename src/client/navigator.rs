@@ -35,7 +35,7 @@ pub(super) enum NavigatorStatus {
     Loading,
     Ready,
     Empty,
-    Error { message: String, can_retry: bool },
+    Error { message: String },
     Switching,
 }
 
@@ -45,7 +45,6 @@ pub(super) struct NavigatorState {
     pub scroll: usize,
     pub status: NavigatorStatus,
     pub resource_revision: Option<u64>,
-    pub list_request: Option<Uuid>,
     pub switch_request: Option<Uuid>,
 }
 
@@ -63,41 +62,28 @@ impl NavigatorState {
             scroll: 0,
             status: NavigatorStatus::Loading,
             resource_revision: None,
-            list_request: None,
             switch_request: None,
         }
     }
 
-    pub fn set_list_request(&mut self, id: Uuid) {
-        self.list_request = Some(id);
-        self.status = NavigatorStatus::Loading;
-    }
-
     pub fn accept_resources(
         &mut self,
-        request_id: Option<Uuid>,
         snapshot: &ResourceSnapshot,
         current: &SelectedTarget,
     ) -> bool {
-        let requested = matches_request(self.list_request, request_id);
-        let streamed = request_id.is_none() && self.list_request.is_none();
-        if (!requested && !streamed)
-            || self
-                .resource_revision
-                .is_some_and(|revision| snapshot.revision <= revision)
+        if self
+            .resource_revision
+            .is_some_and(|revision| snapshot.revision <= revision)
         {
             return false;
         }
         let old_key = self.rows.get(self.selected).map(|row| row.key);
         let old_index = self.selected;
-        let streamed_status = streamed.then(|| self.status.clone());
+        let previous_status = self.status.clone();
         self.rows = flatten(snapshot, current);
         self.resource_revision = Some(snapshot.revision);
-        if requested {
-            self.list_request = None;
-        }
-        self.status = match streamed_status {
-            Some(status @ (NavigatorStatus::Switching | NavigatorStatus::Error { .. })) => status,
+        self.status = match previous_status {
+            status @ (NavigatorStatus::Switching | NavigatorStatus::Error { .. }) => status,
             _ if self.rows.is_empty() => NavigatorStatus::Empty,
             _ => NavigatorStatus::Ready,
         };
@@ -150,11 +136,7 @@ impl NavigatorState {
             (KeyCode::Enter, _)
                 if matches!(
                     self.status,
-                    NavigatorStatus::Ready
-                        | NavigatorStatus::Error {
-                            can_retry: true,
-                            ..
-                        }
+                    NavigatorStatus::Ready | NavigatorStatus::Error { .. }
                 ) =>
             {
                 if let Some(row) = self.rows.get(self.selected)
@@ -180,22 +162,7 @@ impl NavigatorState {
             return false;
         }
         self.switch_request = None;
-        self.status = NavigatorStatus::Error {
-            message,
-            can_retry: true,
-        };
-        true
-    }
-
-    pub fn list_error(&mut self, request: Option<Uuid>, message: String) -> bool {
-        if !matches_request(self.list_request, request) {
-            return false;
-        }
-        self.list_request = None;
-        self.status = NavigatorStatus::Error {
-            message,
-            can_retry: false,
-        };
+        self.status = NavigatorStatus::Error { message };
         true
     }
 
@@ -248,14 +215,9 @@ impl NavigatorState {
                 NavigatorStatus::Loading => "Loading…".to_owned(),
                 NavigatorStatus::Empty => "No resources".to_owned(),
                 NavigatorStatus::Switching => "Switching…".to_owned(),
-                NavigatorStatus::Error {
-                    message,
-                    can_retry: true,
-                } => format!("Error: {message}  enter retry  esc cancel"),
-                NavigatorStatus::Error {
-                    message,
-                    can_retry: false,
-                } => format!("Error: {message}  esc cancel"),
+                NavigatorStatus::Error { message } => {
+                    format!("Error: {message}  enter retry  esc cancel")
+                }
                 NavigatorStatus::Ready => match self.rows.get(self.selected) {
                     Some(row) if row.closing => "Closing…  ↑↓/jk move  esc cancel".to_owned(),
                     _ => "↑↓/jk move  enter switch  esc cancel".to_owned(),
@@ -665,13 +627,11 @@ mod tests {
     }
 
     #[test]
-    fn navigation_clamps_pages_and_matching_requests_preserve_selection() {
+    fn navigation_clamps_pages_and_snapshot_refreshes_preserve_selection() {
         let (mut snapshot, current, _) = fixture();
-        let request = Uuid::new_v4();
         let mut nav = NavigatorState::open(&current);
-        nav.set_list_request(request);
-        assert!(!nav.accept_resources(Some(Uuid::new_v4()), &snapshot, &current));
-        assert!(nav.accept_resources(Some(request), &snapshot, &current));
+        assert!(nav.accept_resources(&snapshot, &current));
+        assert!(!nav.accept_resources(&snapshot, &current));
         assert_eq!(nav.selected, 3);
         nav.key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE), 2);
         assert_eq!(nav.selected, 4);
@@ -681,27 +641,17 @@ mod tests {
         assert_eq!(nav.selected, 2);
         let selected_key = nav.rows[nav.selected].key;
         snapshot.revision += 1;
-        let refresh = Uuid::new_v4();
-        nav.set_list_request(refresh);
-        assert!(nav.accept_resources(Some(refresh), &snapshot, &current));
+        assert!(nav.accept_resources(&snapshot, &current));
         assert_eq!(nav.rows[nav.selected].key, selected_key);
     }
 
     #[test]
-    fn only_some_matching_request_ids_complete_pending_operations() {
-        let (mut snapshot, current, _) = fixture();
+    fn only_matching_request_ids_complete_pending_switches() {
+        let (snapshot, current, _) = fixture();
         let mut nav = NavigatorState::open(&current);
-        assert!(nav.accept_resources(None, &snapshot, &current));
+        assert!(nav.accept_resources(&snapshot, &current));
         assert!(!nav.switch_selected(None));
         assert!(!nav.switch_error(None, "unsolicited".into()));
-        assert!(!nav.list_error(None, "unsolicited".into()));
-
-        let list = Uuid::new_v4();
-        nav.set_list_request(list);
-        assert!(!nav.accept_resources(None, &snapshot, &current));
-        assert!(!nav.accept_resources(Some(Uuid::new_v4()), &snapshot, &current));
-        snapshot.revision += 1;
-        assert!(nav.accept_resources(Some(list), &snapshot, &current));
 
         let switch = Uuid::new_v4();
         nav.begin_switch(switch);
@@ -711,32 +661,15 @@ mod tests {
         assert!(nav.switch_error(Some(switch), "busy".into()));
         assert!(matches!(
             nav.status,
-            NavigatorStatus::Error {
-                ref message,
-                can_retry: true
-            } if message == "busy"
+            NavigatorStatus::Error { ref message } if message == "busy"
         ));
-
-        let mut loading = NavigatorState::open(&current);
-        let request = Uuid::new_v4();
-        loading.set_list_request(request);
-        assert!(loading.list_error(Some(request), "unavailable".into()));
-        assert!(matches!(
-            loading.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 3),
-            NavigatorAction::Stay
-        ));
-        let (rendered, _) = rendered(&mut loading, 50, 5);
-        assert!(rendered.contains("Error: unavailable  esc cancel"));
-        assert!(!rendered.contains("enter retry"));
     }
 
     #[test]
     fn switching_keeps_rows_and_disables_actions_while_error_allows_retry() {
         let (snapshot, current, _) = fixture();
-        let list = Uuid::new_v4();
         let mut nav = NavigatorState::open(&current);
-        nav.set_list_request(list);
-        nav.accept_resources(Some(list), &snapshot, &current);
+        nav.accept_resources(&snapshot, &current);
         let selected = nav.selected;
         let rows = nav.rows.clone();
         let switch = Uuid::new_v4();
@@ -776,10 +709,8 @@ mod tests {
     #[test]
     fn render_keeps_hierarchy_visible_and_puts_progress_or_error_in_footer() {
         let (snapshot, current, _) = fixture();
-        let list = Uuid::new_v4();
         let mut nav = NavigatorState::open(&current);
-        nav.set_list_request(list);
-        nav.accept_resources(Some(list), &snapshot, &current);
+        nav.accept_resources(&snapshot, &current);
         nav.selected = 0;
         let (ready, buffer) = rendered(&mut nav, 50, 7);
         assert!(ready.contains("fut · navigator"));
@@ -808,10 +739,8 @@ mod tests {
     #[test]
     fn three_lines_reserve_only_one_line_for_chrome() {
         let (snapshot, current, _) = fixture();
-        let list = Uuid::new_v4();
         let mut nav = NavigatorState::open(&current);
-        nav.set_list_request(list);
-        nav.accept_resources(Some(list), &snapshot, &current);
+        nav.accept_resources(&snapshot, &current);
         let (text, _) = rendered(&mut nav, 40, 3);
         assert!(!text.contains("fut · navigator"));
         assert_eq!(text.lines().filter(|line| line.contains("move")).count(), 1);
@@ -826,9 +755,7 @@ mod tests {
             nav.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 3),
             NavigatorAction::Stay
         ));
-        let request = Uuid::new_v4();
-        nav.set_list_request(request);
-        nav.accept_resources(Some(request), &snapshot, &current);
+        nav.accept_resources(&snapshot, &current);
         nav.selected = 4;
         assert!(matches!(
             nav.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 3),
@@ -844,10 +771,8 @@ mod tests {
     fn rendering_tiny_and_narrow_unicode_buffers_never_panics_and_keeps_selection_visible() {
         let (snapshot, current, _) = fixture();
         for (width, height) in [(1, 1), (2, 2), (5, 3), (12, 4)] {
-            let request = Uuid::new_v4();
             let mut nav = NavigatorState::open(&current);
-            nav.set_list_request(request);
-            nav.accept_resources(Some(request), &snapshot, &current);
+            nav.accept_resources(&snapshot, &current);
             nav.selected = nav.rows.len() - 1;
             let area = Rect::new(0, 0, width, height);
             let mut buffer = Buffer::empty(area);

@@ -3500,10 +3500,10 @@ async fn public_client_accordion_resizes_focus_and_falls_back_narrowly() {
     let mut narrow = spawn_client(37);
     narrow.wait_for("AAAAAAAA").await;
     narrow.send(b"size-a\n");
-    narrow.wait_for("A_SIZE_24_37").await;
+    narrow.wait_for("A_SIZE_23_37").await;
     narrow.send(b"\x02l");
     narrow.send(b"size-b\n");
-    narrow.wait_for("B_SIZE_24_37").await;
+    narrow.wait_for("B_SIZE_23_37").await;
     narrow.send(b"\x02d");
     narrow.wait_success().await;
 
@@ -3511,15 +3511,177 @@ async fn public_client_accordion_resizes_focus_and_falls_back_narrowly() {
     accordion.wait_for("AAAAAAAA").await;
     accordion.wait_for("BBBBBBBB").await;
     accordion.send(b"size-a\n");
-    accordion.wait_for("A_SIZE_24_24").await;
+    accordion.wait_for("A_SIZE_23_24").await;
     accordion.send(b"\x02l");
     accordion.send(b"size-b\n");
-    accordion.wait_for("B_SIZE_24_24").await;
+    accordion.wait_for("B_SIZE_23_24").await;
     accordion.send(b"\x02d");
     accordion.wait_success().await;
 
     assert!(process_alive(pane_b.child_pid));
     harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn public_tab_bar_tracks_live_tabs_resizes_content_and_honors_global_position() {
+    let harness = Harness::start(
+        "printf 'TAB_BAR_READY\\r\\n'; while IFS= read -r line; do case \"$line\" in top-probe) set -- $(stty size); printf 'TOP_SIZE_%s_%s\\r\\n' \"$1\" \"$2\";; bottom-probe) set -- $(stty size); printf 'BOTTOM_SIZE_%s_%s\\r\\n' \"$1\" \"$2\";; esac; done",
+    )
+    .await;
+    let resources = harness.resources().await;
+    let workspace_id = resources.sessions[0].workspaces[0].id;
+    let current_tab = resources.sessions[0].workspaces[0].tabs[0].id;
+    let current_pane = resources.sessions[0].workspaces[0].tabs[0].panes[0].id;
+    let ServerMessage::TabCreated { selected: sibling } = harness
+        .control_command(ClientMessage::CreateTab {
+            workspace_id,
+            name: Some("tests".into()),
+            cwd: None,
+            program: Some("/bin/sh".into()),
+            argv: vec!["-c".into(), "while :; do sleep 1; done".into()],
+        })
+        .await
+    else {
+        panic!("failed to create tab-bar sibling")
+    };
+
+    let spawn_client = || {
+        let mut command = Command::new("/usr/bin/script");
+        command
+            .env_clear()
+            .env("HOME", harness.root.path().join("home"))
+            .env("PATH", "/usr/bin:/bin")
+            .env("TMPDIR", harness.root.path().join("runtime"))
+            .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+            .env("TERM", "xterm-256color")
+            .args(["-q", "/dev/null", "/bin/sh", "-c"])
+            .arg(format!(
+                "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {}",
+                env!("CARGO_BIN_EXE_fut"),
+                harness.socket.display(),
+                current_pane
+            ));
+        PtyChild::spawn(command)
+    };
+
+    let mut top = spawn_client();
+    top.wait_for("TAB_BAR_READY").await;
+    top.wait_for("tests").await;
+    top.send(b"top-probe\n");
+    top.wait_for("TOP_SIZE_23_80").await;
+
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::RenameTarget {
+                selector: RenameSelector::Tab(sibling.tab_id),
+                name: "checks".into(),
+            })
+            .await,
+        ServerMessage::CommandCompleted { .. }
+    ));
+    top.wait_for("checks").await;
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::RenameTarget {
+                selector: RenameSelector::Tab(current_tab),
+                name: "work".into(),
+            })
+            .await,
+        ServerMessage::CommandCompleted { .. }
+    ));
+    top.wait_for("work").await;
+    top.send(b"\x02d");
+    top.wait_success().await;
+
+    let config_directory = harness.root.path().join("home/.config/fut");
+    fs::create_dir_all(&config_directory).unwrap();
+    fs::write(
+        config_directory.join("config.toml"),
+        "[ui]\ntab_bar_position = \"bottom\"\nworkspace_sidebar_position = \"right\"\n",
+    )
+    .unwrap();
+
+    let mut bottom = spawn_client();
+    bottom.wait_for("work").await;
+    bottom.wait_for("checks").await;
+    bottom.wait_for("\x1b[24;1H").await;
+    let bar_positioned_on_last_row = bottom.text().split("\x1b[24;1H").any(|suffix| {
+        let nearby = &suffix[..suffix.len().min(200)];
+        nearby.contains("work") || nearby.contains("checks")
+    });
+    assert!(
+        bar_positioned_on_last_row,
+        "bottom bar labels were not rendered on row 24: {:?}",
+        bottom.text()
+    );
+    bottom.send(b"bottom-probe\n");
+    bottom.wait_for("BOTTOM_SIZE_23_80").await;
+    bottom.send(b"\x02d");
+    bottom.wait_success().await;
+
+    fs::write(
+        config_directory.join("config.toml"),
+        "[ui]\ntab_bar_position = \"sideways\"\n",
+    )
+    .unwrap();
+    let invalid = harness
+        .cli()
+        .args(["pane", "attach", &current_pane.to_string()])
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    assert!(
+        String::from_utf8_lossy(&invalid.stderr).contains("parse Fut config"),
+        "{}",
+        String::from_utf8_lossy(&invalid.stderr)
+    );
+    let control = harness.cli().arg("list").output().unwrap();
+    assert!(
+        control.status.success(),
+        "UI config affected a control command: {}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+
+    assert!(process_alive(sibling.child_pid));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn malformed_ui_config_prevents_bare_fut_from_starting_or_opening_resources() {
+    let root = tempfile::Builder::new()
+        .prefix("fut-e2e-config-")
+        .tempdir()
+        .unwrap();
+    let home = root.path().join("home");
+    let runtime = root.path().join("runtime");
+    let cwd = root.path().join("cwd");
+    fs::create_dir_all(home.join(".config/fut")).unwrap();
+    fs::create_dir_all(&runtime).unwrap();
+    fs::create_dir_all(&cwd).unwrap();
+    fs::write(
+        home.join(".config/fut/config.toml"),
+        "[ui]\ntab_bar_position = \"sideways\"\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_fut"))
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", &runtime)
+        .env("FUT_RUNTIME_DIR", &runtime)
+        .current_dir(&cwd)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("parse Fut config"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!runtime.join("fut.sock").exists());
+    assert!(fs::read_dir(&cwd).unwrap().next().is_none());
 }
 
 #[tokio::test]

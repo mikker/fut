@@ -713,8 +713,14 @@ fn render_json_error(code: &str, message: impl Into<String>) {
 }
 
 async fn open_and_attach(socket: &std::path::Path, cwd: PathBuf) -> Result<()> {
+    let ui = client::load_ui_config()?;
     let selected = open_current_location(socket, &cwd).await?;
-    client::attach(socket, Some(TargetSelector::Terminal(selected.terminal_id))).await
+    client::attach_with_ui(
+        socket,
+        Some(TargetSelector::Terminal(selected.terminal_id)),
+        ui,
+    )
+    .await
 }
 
 /// Idempotently opens `cwd`, surviving the old daemon's last-terminal shutdown.

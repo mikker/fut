@@ -1,5 +1,7 @@
 //! Interactive terminal client for a running Fut daemon.
 
+mod chrome;
+mod config;
 mod input;
 mod layout;
 mod navigator;
@@ -8,6 +10,8 @@ use std::{io, path::Path, time::Duration};
 
 use anyhow::{Context, bail};
 use bytes::Bytes;
+use chrome::{ResourceState, client_layout, render_tab_bar};
+use config::UiConfig;
 use crossterm::{
     cursor::{Hide, Show},
     event::{Event, EventStream},
@@ -44,6 +48,18 @@ use crate::{
 
 /// Attach an interactive full-screen client to an already-running daemon.
 pub async fn attach(socket_path: &Path, selector: Option<TargetSelector>) -> anyhow::Result<()> {
+    attach_with_ui(socket_path, selector, load_ui_config()?).await
+}
+
+pub(crate) fn load_ui_config() -> anyhow::Result<UiConfig> {
+    config::load()
+}
+
+pub(crate) async fn attach_with_ui(
+    socket_path: &Path,
+    selector: Option<TargetSelector>,
+    ui: UiConfig,
+) -> anyhow::Result<()> {
     let stream = UnixStream::connect(socket_path)
         .await
         .with_context(|| format!("connect to {}", socket_path.display()))?;
@@ -86,7 +102,7 @@ pub async fn attach(socket_path: &Path, selector: Option<TargetSelector>) -> any
     // Host terminal state is changed only after a successful handshake.
     let guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let result = run(&mut terminal, &mut framed, selected).await;
+    let result = run(&mut terminal, &mut framed, selected, ui).await;
     drop(terminal);
     drop(guard);
     result
@@ -96,10 +112,12 @@ async fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     selected: SelectedView,
+    ui: UiConfig,
 ) -> anyhow::Result<()> {
     let mut events = EventStream::new();
     let mut prefix = PrefixState::default();
     let mut view = ViewState::new(selected)?;
+    let mut resources = ResourceState::default();
     let mut navigator: Option<NavigatorState> = None;
     let mut create_tab = CreateTabState::default();
     let mut focus = FocusState::default();
@@ -108,7 +126,14 @@ async fn run(
     let mut force_draw = false;
     let mut redraw = time::interval(Duration::from_millis(16));
     redraw.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-    resize_view(framed, terminal.size()?.into(), &mut view).await?;
+    send_request(framed, Some(Uuid::new_v4()), ClientMessage::ListResources).await?;
+    resize_view(
+        framed,
+        terminal.size()?.into(),
+        &mut view,
+        ui.tab_bar_position,
+    )
+    .await?;
 
     loop {
         tokio::select! {
@@ -131,13 +156,25 @@ async fn run(
                         }
                     }
                     ServerMessage::Resources { snapshot } => {
-                        if let Some(nav) = navigator.as_mut() {
-                            force_draw |= nav.accept_resources(request_id, &snapshot, view.focused());
+                        if resources.accept(snapshot) {
+                            if let Some(nav) = navigator.as_mut() {
+                                nav.accept_resources(
+                                    resources.snapshot().expect("accepted resources exist"),
+                                    view.focused(),
+                                );
+                            }
+                            force_draw = true;
                         }
                     }
                     ServerMessage::ResourcesChanged { snapshot } => {
-                        if let Some(nav) = navigator.as_mut() {
-                            force_draw |= nav.accept_resources(None, &snapshot, view.focused());
+                        if resources.accept(snapshot) {
+                            if let Some(nav) = navigator.as_mut() {
+                                nav.accept_resources(
+                                    resources.snapshot().expect("accepted resources exist"),
+                                    view.focused(),
+                                );
+                            }
+                            force_draw = true;
                         }
                     }
                     ServerMessage::TargetSelected { selected: target } => {
@@ -153,7 +190,13 @@ async fn run(
                             continue;
                         }
                         pending_focused_exit = None;
-                        resize_view(framed, terminal.size()?.into(), &mut view).await?;
+                        resize_view(
+                            framed,
+                            terminal.size()?.into(),
+                            &mut view,
+                            ui.tab_bar_position,
+                        )
+                        .await?;
                         if navigator_selected && view.focused().terminal_id == old_terminal {
                             navigator = None;
                             view.invalidate_drawn();
@@ -204,7 +247,6 @@ async fn run(
                         }
                         let handled = navigator.as_mut().is_some_and(|nav| {
                             nav.switch_error(request_id, message.clone())
-                                || nav.list_error(request_id, message.clone())
                         });
                         if handled {
                             force_draw = true;
@@ -248,11 +290,11 @@ async fn run(
                                 send(framed, ClientMessage::Detach).await?;
                             }
                             PrefixAction::Navigator => {
-                                let request = Uuid::new_v4();
                                 let mut state = NavigatorState::open(view.focused());
-                                state.set_list_request(request);
+                                if let Some(snapshot) = resources.snapshot() {
+                                    state.accept_resources(snapshot, view.focused());
+                                }
                                 navigator = Some(state);
-                                send_request(framed, Some(request), ClientMessage::ListResources).await?;
                                 force_draw = true;
                             }
                             PrefixAction::CreateTab => if let Some(request) = create_tab.begin() {
@@ -283,7 +325,13 @@ async fn run(
                     },
                     Event::Paste(text) if navigator.is_none() => send(framed, ClientMessage::Input { bytes: text.into_bytes() }).await?,
                     Event::Resize(columns, rows) if columns > 0 && rows > 0 => {
-                        resize_view(framed, Rect::new(0, 0, columns, rows), &mut view).await?;
+                        resize_view(
+                            framed,
+                            Rect::new(0, 0, columns, rows),
+                            &mut view,
+                            ui.tab_bar_position,
+                        )
+                        .await?;
                         force_draw = true;
                     }
                     _ => {}
@@ -292,7 +340,16 @@ async fn run(
             _ = redraw.tick(), if force_draw || view.needs_draw() => {
                 terminal.draw(|frame| {
                     let area = frame.area();
-                    let cursor = render_view(&view, area, frame.buffer_mut());
+                    let layout = client_layout(area, ui.tab_bar_position);
+                    let cursor = render_view(&view, layout.terminal, frame.buffer_mut());
+                    if let Some(tab_bar) = layout.tab_bar {
+                        render_tab_bar(
+                            resources.snapshot(),
+                            view.focused(),
+                            tab_bar,
+                            frame.buffer_mut(),
+                        );
+                    }
                     if let Some(nav) = navigator.as_mut() {
                         nav.render(area, frame.buffer_mut());
                     } else if notice.is_none()
@@ -621,8 +678,10 @@ async fn resize_view(
     framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     area: Rect,
     view: &mut ViewState,
+    tab_bar_position: config::TabBarPosition,
 ) -> anyhow::Result<()> {
-    for (terminal_id, size) in view.resize_requests(area) {
+    let terminal = client_layout(area, tab_bar_position).terminal;
+    for (terminal_id, size) in view.resize_requests(terminal) {
         send(framed, ClientMessage::Resize { terminal_id, size }).await?;
     }
     Ok(())
