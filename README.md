@@ -17,6 +17,14 @@ cargo run -- open ../api --name api -- /bin/zsh
 cargo run -- list
 ```
 
+For a disposable dogfooding environment with three linked-worktree workspaces, seven tabs, and nine panes, run:
+
+```sh
+mise run demo
+```
+
+The demo builds the current binary, creates its fixture under `target/fut-demo`, starts an isolated daemon and socket, and attaches to the main shell. It includes interactive shells, multi-pane tabs, and slowly updating server/test/preview tabs for exercising the tab bar, workspace sidebar, accordion, global navigator, and command bar. Detach with `Ctrl-b d`, then use `mise run demo:attach` to return or `mise run demo:clean` to stop and remove it. `mise run demo:setup` creates the same fixture without attaching, which is useful for smoke tests. Keep [`scripts/demo`](scripts/demo) representative as new dogfoodable surfaces land.
+
 Interactive UI preferences are safe, non-executable global configuration. Fut reads `$XDG_CONFIG_HOME/fut/config.toml` when `XDG_CONFIG_HOME` is an absolute path and otherwise `~/.config/fut/config.toml`; `FUT_CONFIG` may select an explicit absolute file. A missing implicit file uses defaults and is never created automatically. Interactive startup rejects unknown fields, malformed TOML, non-regular files, and files larger than 64 KiB before bare Fut creates resources or changes the host terminal state. Explicit control commands and completion do not load UI configuration. Preferences are applied per client at attach time; live reload is deferred.
 
 ```toml

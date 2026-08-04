@@ -19,3 +19,19 @@ run = "cargo test --lib --all-features"
 
 [tasks."test:e2e"]
 run = "cargo test --test e2e --all-features"
+
+[tasks.demo]
+description = "Build and attach to a disposable multi-workspace Fut demo"
+run = "bash scripts/demo"
+
+[tasks."demo:setup"]
+description = "Build the Fut demo without attaching"
+run = "bash scripts/demo setup"
+
+[tasks."demo:attach"]
+description = "Attach to the running Fut demo"
+run = "bash scripts/demo attach"
+
+[tasks."demo:clean"]
+description = "Stop and remove the Fut demo"
+run = "bash scripts/demo clean"

@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Keep this fixture representative of Fut's currently dogfoodable UI. Add new
+# resources or startup hints here as new navigation and status surfaces land.
+
+PROJECT_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 1; }
+DEMO_ROOT=$(python3 -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' \
+  "${FUT_DEMO_ROOT:-"$PROJECT_ROOT/target/fut-demo"}")
+RUNTIME_DIR="$DEMO_ROOT/runtime"
+SOCKET="$RUNTIME_DIR/fut.sock"
+STATE_FILE="$DEMO_ROOT/demo.env"
+DAEMON_LOG="$DEMO_ROOT/daemon.log"
+DAEMON_PID_FILE="$DEMO_ROOT/daemon.pid"
+OWNERSHIP_FILE="$DEMO_ROOT/.fut-demo-owned"
+FUT_BIN=${FUT_BIN:-"$PROJECT_ROOT/target/debug/fut"}
+DEMO_SHELL=${SHELL:-/bin/sh}
+DEMO_DAEMON_PID=""
+
+MAIN="$DEMO_ROOT/main"
+FEATURE="$DEMO_ROOT/feature"
+DOCS="$DEMO_ROOT/docs"
+
+if [[ "$DEMO_ROOT" != /* || "$DEMO_ROOT" == / || "$DEMO_ROOT" == "$PROJECT_ROOT" ]]; then
+  echo "FUT_DEMO_ROOT must be an absolute disposable directory outside the project root" >&2
+  exit 2
+fi
+
+build_binary() {
+  (cd "$PROJECT_ROOT" && cargo build --quiet)
+}
+
+ensure_binary() {
+  if [[ ! -x "$FUT_BIN" ]]; then
+    build_binary
+  fi
+}
+
+wait_for_daemon() {
+  local attempts=0
+  until "$FUT_BIN" --socket "$SOCKET" daemon ping >/dev/null 2>&1; do
+    if [[ -f "$DAEMON_PID_FILE" ]] && ! kill -0 "$(cat "$DAEMON_PID_FILE")" 2>/dev/null; then
+      echo "Fut demo daemon exited during startup:" >&2
+      cat "$DAEMON_LOG" >&2 || true
+      return 1
+    fi
+    attempts=$((attempts + 1))
+    if (( attempts >= 100 )); then
+      echo "Timed out waiting for Fut demo daemon. See $DAEMON_LOG" >&2
+      return 1
+    fi
+    sleep 0.05
+  done
+}
+
+wait_for_exit() {
+  local pid=$1
+  local attempts=0
+  while kill -0 "$pid" 2>/dev/null; do
+    attempts=$((attempts + 1))
+    if (( attempts >= 100 )); then
+      return 1
+    fi
+    sleep 0.05
+  done
+}
+
+wait_for_socket_exit() {
+  local attempts=0
+  while [[ -S "$SOCKET" ]]; do
+    attempts=$((attempts + 1))
+    if (( attempts >= 100 )); then
+      return 1
+    fi
+    sleep 0.05
+  done
+}
+
+assert_owned_demo_root() {
+  if [[ ! -e "$DEMO_ROOT" ]]; then
+    return
+  fi
+  if [[ -L "$DEMO_ROOT" || -L "$OWNERSHIP_FILE" || ! -f "$OWNERSHIP_FILE" ]] ||
+    [[ $(cat "$OWNERSHIP_FILE") != fut-demo-v1 ]]; then
+    echo "Refusing to modify unowned demo directory: $DEMO_ROOT" >&2
+    echo "Remove it manually or choose another FUT_DEMO_ROOT." >&2
+    return 1
+  fi
+}
+
+is_demo_daemon_pid() {
+  local pid=$1
+  local command
+  command=$(ps -p "$pid" -o command= 2>/dev/null || true)
+  [[ "$command" == "$FUT_BIN --socket $SOCKET daemon run "* ]]
+}
+
+clean_demo() {
+  assert_owned_demo_root
+  if [[ ! -e "$DEMO_ROOT" ]]; then
+    return
+  fi
+
+  local pid=$DEMO_DAEMON_PID
+  if [[ -f "$DAEMON_PID_FILE" ]]; then
+    local file_pid
+    file_pid=$(cat "$DAEMON_PID_FILE")
+    if [[ "$file_pid" =~ ^[0-9]+$ ]]; then
+      pid=$file_pid
+    fi
+  fi
+
+  if [[ -L "$RUNTIME_DIR" || -L "$SOCKET" ]]; then
+    echo "Refusing to follow a symlink in the demo runtime: $RUNTIME_DIR" >&2
+    return 1
+  fi
+  if [[ -S "$SOCKET" && -x "$FUT_BIN" ]]; then
+    "$FUT_BIN" --socket "$SOCKET" daemon shutdown >/dev/null 2>&1 || true
+    wait_for_socket_exit || true
+  fi
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && is_demo_daemon_pid "$pid" &&
+    ! wait_for_exit "$pid"; then
+    if is_demo_daemon_pid "$pid"; then
+      kill "$pid" 2>/dev/null || true
+      if ! wait_for_exit "$pid" && is_demo_daemon_pid "$pid"; then
+        kill -9 "$pid" 2>/dev/null || true
+        wait_for_exit "$pid" || true
+      fi
+    fi
+  fi
+  if [[ -S "$SOCKET" ]]; then
+    echo "Refusing to remove a demo directory whose daemon could not be stopped: $SOCKET" >&2
+    return 1
+  fi
+  rm -rf "$DEMO_ROOT"
+}
+
+selected_field() {
+  local field=$1
+  python3 -c \
+    'import json, sys; print(json.load(sys.stdin)["result"]["selected"][sys.argv[1]])' \
+    "$field"
+}
+
+state_field() {
+  local field=$1
+  local value
+  value=$(awk -F= -v field="$field" '$1 == field { print $2 }' "$STATE_FILE")
+  if [[ ! "$value" =~ ^[0-9a-f-]{36}$ ]]; then
+    echo "Invalid $field in $STATE_FILE" >&2
+    exit 1
+  fi
+  printf '%s\n' "$value"
+}
+
+run_json() {
+  "$FUT_BIN" --socket "$SOCKET" --json "$@"
+}
+
+rename_resources() {
+  local session_id=$1
+  local workspace_id=$2
+  local tab_id=$3
+  local workspace_name=$4
+
+  "$FUT_BIN" --socket "$SOCKET" session rename "$session_id" fut-demo >/dev/null
+  "$FUT_BIN" --socket "$SOCKET" workspace rename "$workspace_id" "$workspace_name" >/dev/null
+  "$FUT_BIN" --socket "$SOCKET" tab rename "$tab_id" shell >/dev/null
+}
+
+new_shell_tab() {
+  local workspace_id=$1
+  local name=$2
+  local banner=$3
+
+  run_json tab new "$workspace_id" --name "$name" -- \
+    /bin/sh -c 'printf "\033[1;36m%s\033[0m\r\n" "$2"; exec "$1"' \
+    fut-demo "$DEMO_SHELL" "$banner"
+}
+
+open_workspace() {
+  local path=$1
+  local name=$2
+  local banner=$3
+
+  run_json open "$path" --name "$name" -- \
+    /bin/sh -c 'printf "\033[1;36m%s\033[0m\r\n" "$2"; exec "$1"' \
+    fut-demo "$DEMO_SHELL" "$banner"
+}
+
+setup_repository() {
+  mkdir -p "$MAIN"
+  git -C "$MAIN" init -q -b main
+  git -C "$MAIN" config user.name "Fut Demo"
+  git -C "$MAIN" config user.email "fut-demo@example.invalid"
+  cat >"$MAIN/README.md" <<'EOF'
+# Fut demo project
+
+This disposable repository exists to exercise Fut's session, workspace, tab,
+pane, navigation, and action surfaces.
+EOF
+  git -C "$MAIN" add README.md
+  git -C "$MAIN" commit -q -m "Seed Fut demo"
+  git -C "$MAIN" worktree add -q -b feature "$FEATURE"
+  git -C "$MAIN" worktree add -q -b docs "$DOCS"
+  printf '# Feature workspace\n' >"$FEATURE/FEATURE.md"
+  printf '# Documentation workspace\n' >"$DOCS/DOCS.md"
+}
+
+setup_demo() {
+  command -v git >/dev/null || { echo "git is required" >&2; exit 1; }
+  command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 1; }
+  if [[ "$DEMO_SHELL" != /* ]]; then
+    DEMO_SHELL=$(command -v "$DEMO_SHELL")
+  fi
+  if [[ ! -x "$DEMO_SHELL" ]]; then
+    echo "Demo shell is not executable: $DEMO_SHELL" >&2
+    exit 1
+  fi
+  if [[ "${FUT_DEMO_SKIP_BUILD:-0}" == 1 ]]; then
+    ensure_binary
+  else
+    build_binary
+  fi
+  clean_demo
+  mkdir -p "$DEMO_ROOT"
+  printf 'fut-demo-v1\n' >"$OWNERSHIP_FILE"
+  mkdir -p "$RUNTIME_DIR"
+  chmod 700 "$RUNTIME_DIR"
+  setup_repository
+
+  trap 'clean_demo' ERR INT TERM
+  "$FUT_BIN" --socket "$SOCKET" daemon run --cwd "$MAIN" -- \
+    /bin/sh -c \
+      'printf "\033[1;36mFut demo · main / shell\033[0m\r\nTry Ctrl-b k, Ctrl-b w, and Ctrl-b g.\r\n"; exec "$1"' \
+      fut-demo "$DEMO_SHELL" >"$DAEMON_LOG" 2>&1 &
+  local daemon_pid=$!
+  DEMO_DAEMON_PID=$daemon_pid
+  printf '%s\n' "$daemon_pid" >"$DAEMON_PID_FILE"
+  wait_for_daemon
+
+  local main_json feature_json docs_json
+  main_json=$(run_json open "$MAIN")
+  feature_json=$(open_workspace "$FEATURE" feature "Fut demo · feature / shell")
+  docs_json=$(open_workspace "$DOCS" docs "Fut demo · docs / shell")
+
+  local session_id main_workspace main_tab main_pane
+  local feature_workspace feature_tab docs_workspace docs_tab
+  session_id=$(printf '%s' "$main_json" | selected_field session_id)
+  main_workspace=$(printf '%s' "$main_json" | selected_field workspace_id)
+  main_tab=$(printf '%s' "$main_json" | selected_field tab_id)
+  main_pane=$(printf '%s' "$main_json" | selected_field pane_id)
+  feature_workspace=$(printf '%s' "$feature_json" | selected_field workspace_id)
+  feature_tab=$(printf '%s' "$feature_json" | selected_field tab_id)
+  docs_workspace=$(printf '%s' "$docs_json" | selected_field workspace_id)
+  docs_tab=$(printf '%s' "$docs_json" | selected_field tab_id)
+
+  rename_resources "$session_id" "$main_workspace" "$main_tab" main
+  "$FUT_BIN" --socket "$SOCKET" workspace rename "$feature_workspace" feature >/dev/null
+  "$FUT_BIN" --socket "$SOCKET" tab rename "$feature_tab" shell >/dev/null
+  "$FUT_BIN" --socket "$SOCKET" workspace rename "$docs_workspace" docs >/dev/null
+  "$FUT_BIN" --socket "$SOCKET" tab rename "$docs_tab" shell >/dev/null
+
+  local editor_json editor_tab tests_json tests_tab
+  editor_json=$(new_shell_tab "$main_workspace" editor "Fut demo · main / editor")
+  editor_tab=$(printf '%s' "$editor_json" | selected_field tab_id)
+  run_json pane new "$editor_tab" -- \
+    /bin/sh -c 'printf "Fut demo · editor companion pane\r\n"; exec "$1"' \
+    fut-demo "$DEMO_SHELL" >/dev/null
+
+  run_json tab new "$main_workspace" --name server -- \
+    /bin/sh -c \
+      'i=0; while :; do i=$((i + 1)); printf "demo server · request %03d · %s\r\n" "$i" "$(date +%H:%M:%S)"; sleep 4; done' \
+    >/dev/null
+
+  tests_json=$(run_json tab new "$feature_workspace" --name tests -- \
+    /bin/sh -c \
+      'i=0; while :; do i=$((i + 1)); printf "feature tests · run %02d · passing\r\n" "$i"; sleep 6; done')
+  tests_tab=$(printf '%s' "$tests_json" | selected_field tab_id)
+  run_json pane new "$tests_tab" -- \
+    /bin/sh -c 'printf "Fut demo · feature scratch pane\r\n"; exec "$1"' \
+    fut-demo "$DEMO_SHELL" >/dev/null
+
+  run_json tab new "$docs_workspace" --name preview -- \
+    /bin/sh -c \
+      'i=0; while :; do i=$((i + 1)); printf "docs preview · rebuild %02d complete\r\n" "$i"; sleep 7; done' \
+    >/dev/null
+
+  cat >"$STATE_FILE" <<EOF
+MAIN_PANE_ID=$main_pane
+SESSION_ID=$session_id
+EOF
+  trap - ERR INT TERM
+
+  cat <<EOF
+Fut demo is ready.
+
+  socket:   $SOCKET
+  project:  $MAIN
+  layout:   3 workspaces · 7 tabs · 9 panes
+
+  reattach: mise run demo:attach
+  clean up: mise run demo:clean
+
+Inside Fut try Ctrl-b k, Ctrl-b w, Ctrl-b g, and the pane focus bindings.
+EOF
+}
+
+attach_demo() {
+  ensure_binary
+  if [[ ! -S "$SOCKET" || ! -f "$STATE_FILE" ]]; then
+    echo "No Fut demo is running. Start one with: mise run demo" >&2
+    exit 1
+  fi
+  local main_pane_id
+  main_pane_id=$(state_field MAIN_PANE_ID)
+  "$FUT_BIN" --socket "$SOCKET" pane attach "$main_pane_id"
+}
+
+case ${1:-run} in
+  run)
+    setup_demo
+    attach_demo
+    ;;
+  setup)
+    setup_demo
+    ;;
+  attach)
+    attach_demo
+    ;;
+  clean)
+    ensure_binary
+    clean_demo
+    echo "Removed $DEMO_ROOT"
+    ;;
+  *)
+    echo "Usage: scripts/demo [run|setup|attach|clean]" >&2
+    exit 2
+    ;;
+esac
