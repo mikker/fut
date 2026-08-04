@@ -47,7 +47,7 @@ Workspace creation should make branching work cheap. Opening a worktree gives it
 
 ### Navigation follows the object model
 
-The hierarchy is visible and searchable, but never compulsory to traverse one level at a time. Stable resource identities and a global navigator make every session, workspace, tab, and pane a direct destination.
+The hierarchy is visible and searchable, but never compulsory to traverse one level at a time. A compact peer-workspace bar and tab/status bar keep immediate context visible; stable resource identities and a global navigator make every session, workspace, tab, and pane a direct destination. A searchable command bar exposes typed client actions and their direct bindings, so adding capability does not require memorizing every key before it becomes useful.
 
 Fut should support:
 

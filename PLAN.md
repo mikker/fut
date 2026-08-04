@@ -25,6 +25,8 @@ The public grammar is now `open`, `session`, `workspace`, `tab`, `pane`, `termin
 
 This validates tab and pane creation, same-workspace pane movement, multi-pane lifecycle, proper tab close, session, workspace, and tab rename, structured control output, live completion, revisioned resource streaming, and the first responsive simultaneous-pane UI end-to-end but does not complete authored split semantics in Milestone 2. The client/daemon protocol is version 10. Successful `--json` responses use a `version: 1` envelope and dotted command name. Failures use `{version:1,error:{code,message}}`: daemon codes are preserved, argument errors use `invalid_arguments`, and otherwise untyped command failures use `command_failed`. Human output is deliberately not a machine contract; agents retain raw IDs and use `--json`, while UIs use the typed protocol. Shell completion covers the static grammar and reads live resources without autostarting or mutating the daemon; it displays names, ancestry, roots, and pane-versus-terminal context while inserting raw IDs. `pane new` completion includes eligible tab IDs with hierarchy and excludes closing tabs. `pane move` completion offers movable pane placements and filters destinations to other live tabs in the source workspace. Tabs may contain multiple panes. Exact pane and terminal navigation works; moving a pane preserves its terminal process and attachment lease; ambiguous ancestor attach is rejected; one pane exiting or closing preserves siblings and ancestors; focused-pane exit transfers to an available sibling; the final pane cascades upward; and whole-tab close closes every descendant. The client streams every pane in its selected tab and renders a focus-biased horizontal accordion in resource order, with a 24-column focused minimum, 12-column sibling minimums, neutral focus rails, focused-pane fallback in narrow terminals, one focused cursor, and next/previous cycling. Input and PTY resize authority remain exclusive to the focused terminal, allowing separate clients to focus different sibling terminals while observing the whole tab read-only. Revisioned full resource snapshots and authoritative selected views now reconcile external creation, movement, closure, and lifecycle changes without reselecting; background changes preserve per-client focus, and a moved focused pane follows its terminal to the destination tab. A background close removes the pane at close request, while a focused close retains focus through the final snapshot and terminal exit before transferring or ending the client with its nonzero status. The same stream keeps an open navigator current. This baseline deliberately has no persisted split direction or ratio, explicit zoom, titles, or mouse focus. Input encoding remains a basic client-side mapping and terminal snapshots are full-grid JSON messages. Git checkouts use their canonical common directory as project identity and their top-level checkout as workspace root; non-Git directories use canonical directory identity. Worktrees are not eagerly discovered. Opening a linked checkout adds one peer workspace, while reopening it is side-effect free. Interactive connections can retarget through the global navigator. A workspace disappears when its last terminal exits, a session when its last workspace exits, and only the final session closes Fut and releases the socket.
 
+The next product slices prioritize visible navigation and action discovery so the existing resource behavior is practical to dogfood: first a tab bar that doubles as a compact status line, then a peer-workspace bar, then a searchable command bar over typed client actions. Deeper pane geometry and terminal ergonomics follow those surfaces rather than preceding them.
+
 ## Strategy
 
 Build Fut as a sequence of narrow vertical slices. The first slice must prove process ownership, terminal correctness, detach/reattach, and the resource model before investing in visual polish or broad integrations.
@@ -33,10 +35,12 @@ Each milestone should leave a runnable `fut` binary. New abstractions are earned
 
 Milestone numbers group capabilities; they do not force implementation order. The current execution order is:
 
-1. build Milestone 4's responsive spatial UI and daily-driver behavior while finishing the remaining authored split semantics from Milestone 2;
-2. prove Milestone 5's agent activity and attention model in a narrow Pi-backed spike;
-3. return to Milestone 3's trusted project definitions and workspace recipes;
-4. harden the resulting product through Milestone 6.
+1. add Milestone 4's navigation chrome: a tab/status bar followed by a peer-workspace bar;
+2. add a searchable command bar so typed client actions are discoverable before every action has a dedicated binding;
+3. continue Milestone 4's pane zoom, authored split geometry, navigation, and daily-driver terminal behavior while finishing the remaining split semantics from Milestone 2;
+4. prove Milestone 5's agent activity and attention model in a narrow Pi-backed spike;
+5. return to Milestone 3's trusted project definitions and workspace recipes;
+6. harden the resulting product through Milestone 6.
 
 UI work began before Milestone 2 closed: simultaneous pane rendering, per-client focus, and minimal split geometry now bridge resource semantics into Milestone 4. Milestone 4 treats visual quality as product work rather than a final polish pass. Terminal content should dominate a compact, responsive interface with unmistakable focus, a visible but unobtrusive hierarchy, restrained state color, and a small amount of character rather than ornamental panel chrome.
 
@@ -180,6 +184,9 @@ Reach the minimum tmux replacement level suggested by the current dotfiles, with
 
 ### Work
 
+- Add a persistent, responsive tab bar that doubles as a compact status line: preserve terminal space, make the active tab unmistakable, and leave room for scoped activity and attention later.
+- Add a peer-workspace bar that makes the current checkout and directly reachable worktrees visible without opening the global navigator.
+- Add a searchable command bar over a small typed set of client actions. Open it with `Ctrl-b k` initially, show each action's direct binding when one exists, and let direct keys and the command bar invoke the same action rather than constructing CLI commands. Treat terminal delivery of macOS Command-modified keys as a later compatibility path, not the baseline binding.
 - Establish a small theme and presentation-token system for hierarchy, focus, activity, attention, muted chrome, and terminal-safe contrast.
 - Render simultaneous panes with clear focus, responsive degradation in small terminals, pane zoom, and a focus-biased accordion layout. (The accordion and focused-only degradation are implemented; explicit zoom remains.)
 - Make project, workspace, tab, and pane context legible without surrounding the terminal in boxes or permanently consuming excessive space.
@@ -197,7 +204,9 @@ Reach the minimum tmux replacement level suggested by the current dotfiles, with
 
 ### Tests
 
-- Golden layout and navigation tests.
+- Golden layout and navigation tests, including narrow degradation for the workspace and tab/status bars.
+- Command-bar filtering, selection, action-dispatch, keybinding-label, empty-result, and tiny-terminal tests.
+- Parity tests proving direct bindings and command-bar choices dispatch the same typed client actions.
 - Input encoding fixtures for modified and extended keys.
 - CWD inheritance tests across shells and worktrees.
 - Long-running output and resize stress tests.
@@ -206,6 +215,7 @@ Reach the minimum tmux replacement level suggested by the current dotfiles, with
 
 - The normal tmux workflow can move to Fut without losing essential navigation or terminal behavior.
 - The UI remains useful with the project tree visible, compact, or hidden.
+- The current workspace and tab remain legible during normal terminal use, and available client actions are discoverable without consulting documentation.
 - Focus-biased layout works as a first-class policy rather than a resize hook.
 
 ## Milestone 5: Agent activity and attention spike
