@@ -5,6 +5,7 @@ mod config;
 mod input;
 mod layout;
 mod navigator;
+mod sidebar;
 
 use std::{io, path::Path, time::Duration};
 
@@ -36,6 +37,10 @@ use ratatui::{
 use tokio::{net::UnixStream, time};
 use tokio_util::codec::Framed;
 use uuid::Uuid;
+
+use sidebar::{
+    WorkspaceHistory, WorkspaceSidebarAction, WorkspaceSidebarState, render_workspace_sidebar,
+};
 
 use crate::{
     domain::{CellStyle, ScreenSnapshot, TerminalId, TerminalSize},
@@ -119,6 +124,9 @@ async fn run(
     let mut view = ViewState::new(selected)?;
     let mut resources = ResourceState::default();
     let mut navigator: Option<NavigatorState> = None;
+    let mut workspace_sidebar: Option<WorkspaceSidebarState> = None;
+    let mut workspace_history = WorkspaceHistory::default();
+    workspace_history.record(view.focused());
     let mut create_tab = CreateTabState::default();
     let mut focus = FocusState::default();
     let mut notice: Option<String> = None;
@@ -127,13 +135,7 @@ async fn run(
     let mut redraw = time::interval(Duration::from_millis(16));
     redraw.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     send_request(framed, Some(Uuid::new_v4()), ClientMessage::ListResources).await?;
-    resize_view(
-        framed,
-        terminal.size()?.into(),
-        &mut view,
-        ui.tab_bar_position,
-    )
-    .await?;
+    resize_view(framed, terminal.size()?.into(), &mut view, ui).await?;
 
     loop {
         tokio::select! {
@@ -163,6 +165,13 @@ async fn run(
                                     view.focused(),
                                 );
                             }
+                            if let Some(sidebar) = workspace_sidebar.as_mut() {
+                                sidebar.accept_resources(
+                                    resources.snapshot().expect("accepted resources exist"),
+                                    view.focused(),
+                                    &workspace_history,
+                                );
+                            }
                             force_draw = true;
                         }
                     }
@@ -174,29 +183,42 @@ async fn run(
                                     view.focused(),
                                 );
                             }
+                            if let Some(sidebar) = workspace_sidebar.as_mut() {
+                                sidebar.accept_resources(
+                                    resources.snapshot().expect("accepted resources exist"),
+                                    view.focused(),
+                                    &workspace_history,
+                                );
+                            }
                             force_draw = true;
                         }
                     }
                     ServerMessage::TargetSelected { selected: target } => {
                         let old_terminal = view.focused().terminal_id;
                         let navigator_selected = navigator.as_mut().is_some_and(|nav| nav.switch_selected(request_id));
-                        focus.complete(request_id);
+                        let workspace_selected =
+                            matches!(focus.complete(request_id), Some(FocusOrigin::Workspace));
                         if !view.replace(target)? {
                             if navigator_selected {
                                 navigator = None;
                                 view.invalidate_drawn();
                                 force_draw = true;
                             }
+                            if workspace_selected {
+                                workspace_sidebar = None;
+                                view.invalidate_drawn();
+                                force_draw = true;
+                            }
                             continue;
                         }
+                        workspace_history.record(view.focused());
                         pending_focused_exit = None;
-                        resize_view(
-                            framed,
-                            terminal.size()?.into(),
-                            &mut view,
-                            ui.tab_bar_position,
-                        )
-                        .await?;
+                        resize_view(framed, terminal.size()?.into(), &mut view, ui).await?;
+                        if let Some(sidebar) = workspace_sidebar.as_mut()
+                            && let Some(snapshot) = resources.snapshot()
+                        {
+                            sidebar.accept_resources(snapshot, view.focused(), &workspace_history);
+                        }
                         if navigator_selected && view.focused().terminal_id == old_terminal {
                             navigator = None;
                             view.invalidate_drawn();
@@ -204,6 +226,10 @@ async fn run(
                             && let Some(nav) = navigator.as_mut()
                         {
                             nav.status = navigator::NavigatorStatus::Switching;
+                        }
+                        if workspace_selected {
+                            workspace_sidebar = None;
+                            view.invalidate_drawn();
                         }
                         force_draw = true;
                     }
@@ -250,10 +276,23 @@ async fn run(
                         });
                         if handled {
                             force_draw = true;
-                        } else if focus.complete(request_id) {
-                            notice = Some(format!("pane unavailable · {message}"));
-                            force_draw = true;
-                        } else { bail!("daemon error ({code}): {message}") }
+                        } else {
+                            match focus.complete(request_id) {
+                                Some(FocusOrigin::Workspace) => {
+                                    if let Some(sidebar) = workspace_sidebar.as_mut() {
+                                        sidebar.switch_error(message);
+                                        force_draw = true;
+                                    } else {
+                                        bail!("daemon error ({code}): {message}")
+                                    }
+                                }
+                                Some(FocusOrigin::Pane) => {
+                                    notice = Some(format!("pane unavailable · {message}"));
+                                    force_draw = true;
+                                }
+                                None => bail!("daemon error ({code}): {message}"),
+                            }
+                        }
                     }
                     ServerMessage::IncompatibleProtocol { client, server } => {
                         bail!("protocol became incompatible: client {client}, server {server}")
@@ -282,6 +321,38 @@ async fn run(
                             }
                         }
                     }
+                    Event::Key(key) if workspace_sidebar.is_some() => {
+                        notice = None;
+                        match workspace_sidebar
+                            .as_mut()
+                            .expect("workspace sidebar exists")
+                            .key(key)
+                        {
+                            WorkspaceSidebarAction::Stay => force_draw = true,
+                            WorkspaceSidebarAction::Close => {
+                                workspace_sidebar = None;
+                                view.invalidate_drawn();
+                                force_draw = true;
+                            }
+                            WorkspaceSidebarAction::Select(terminal_id) => {
+                                if let Some(request) = focus.begin(FocusOrigin::Workspace) {
+                                    workspace_sidebar
+                                        .as_mut()
+                                        .expect("workspace sidebar exists")
+                                        .begin_switch();
+                                    send_request(
+                                        framed,
+                                        Some(request),
+                                        ClientMessage::SelectTarget {
+                                            selector: TargetSelector::Terminal(terminal_id),
+                                        },
+                                    )
+                                    .await?;
+                                    force_draw = true;
+                                }
+                            }
+                        }
+                    }
                     Event::Key(key) => if let Some(bytes) = encode_key(key) {
                         notice = None;
                         match prefix.feed(bytes) {
@@ -297,6 +368,24 @@ async fn run(
                                 navigator = Some(state);
                                 force_draw = true;
                             }
+                            PrefixAction::WorkspaceSidebar => {
+                                if let Some(snapshot) = resources.snapshot() {
+                                    workspace_sidebar = WorkspaceSidebarState::open(
+                                        snapshot,
+                                        view.focused(),
+                                        &workspace_history,
+                                    );
+                                    if workspace_sidebar.is_some() {
+                                        force_draw = true;
+                                    } else {
+                                        notice = Some("no workspace available".into());
+                                        force_draw = true;
+                                    }
+                                } else {
+                                    notice = Some("workspaces are still loading".into());
+                                    force_draw = true;
+                                }
+                            }
                             PrefixAction::CreateTab => if let Some(request) = create_tab.begin() {
                                 send_request(framed, Some(request), ClientMessage::CreateTab {
                                     workspace_id: view.focused().workspace_id,
@@ -309,7 +398,7 @@ async fn run(
                             action @ (PrefixAction::FocusNext | PrefixAction::FocusPrevious) => {
                                 let forward = matches!(action, PrefixAction::FocusNext);
                                 if let Some(target) = view.cycle(forward)
-                                    && let Some(request) = focus.begin()
+                                    && let Some(request) = focus.begin(FocusOrigin::Pane)
                                 {
                                     send_request(
                                         framed,
@@ -323,15 +412,9 @@ async fn run(
                             PrefixAction::Send(bytes) => send(framed, ClientMessage::Input { bytes }).await?,
                         }
                     },
-                    Event::Paste(text) if navigator.is_none() => send(framed, ClientMessage::Input { bytes: text.into_bytes() }).await?,
+                    Event::Paste(text) if navigator.is_none() && workspace_sidebar.is_none() => send(framed, ClientMessage::Input { bytes: text.into_bytes() }).await?,
                     Event::Resize(columns, rows) if columns > 0 && rows > 0 => {
-                        resize_view(
-                            framed,
-                            Rect::new(0, 0, columns, rows),
-                            &mut view,
-                            ui.tab_bar_position,
-                        )
-                        .await?;
+                        resize_view(framed, Rect::new(0, 0, columns, rows), &mut view, ui).await?;
                         force_draw = true;
                     }
                     _ => {}
@@ -340,7 +423,7 @@ async fn run(
             _ = redraw.tick(), if force_draw || view.needs_draw() => {
                 terminal.draw(|frame| {
                     let area = frame.area();
-                    let layout = client_layout(area, ui.tab_bar_position);
+                    let layout = client_layout(area, ui);
                     let cursor = render_view(&view, layout.terminal, frame.buffer_mut());
                     if let Some(tab_bar) = layout.tab_bar {
                         render_tab_bar(
@@ -350,9 +433,32 @@ async fn run(
                             frame.buffer_mut(),
                         );
                     }
+                    if let Some(sidebar) = workspace_sidebar.as_ref() {
+                        if let Some(sidebar_area) =
+                            layout.workspace_sidebar.map(|sidebar| sidebar.area())
+                        {
+                            sidebar.render(
+                                sidebar_area,
+                                ui.workspace_sidebar_position,
+                                frame.buffer_mut(),
+                            );
+                        }
+                    } else if let Some(sidebar_area) =
+                        layout.workspace_sidebar.and_then(|sidebar| sidebar.docked())
+                    {
+                        render_workspace_sidebar(
+                            resources.snapshot(),
+                            view.focused(),
+                            &workspace_history,
+                            sidebar_area,
+                            ui.workspace_sidebar_position,
+                            frame.buffer_mut(),
+                        );
+                    }
                     if let Some(nav) = navigator.as_mut() {
                         nav.render(area, frame.buffer_mut());
-                    } else if notice.is_none()
+                    } else if workspace_sidebar.is_none()
+                        && notice.is_none()
                         && let Some((column, row)) = cursor
                     {
                         frame.set_cursor_position((column, row));
@@ -427,24 +533,32 @@ impl CreateTabState {
 #[derive(Default)]
 struct FocusState {
     request_id: Option<Uuid>,
+    origin: Option<FocusOrigin>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FocusOrigin {
+    Pane,
+    Workspace,
 }
 
 impl FocusState {
-    fn begin(&mut self) -> Option<Uuid> {
+    fn begin(&mut self, origin: FocusOrigin) -> Option<Uuid> {
         if self.request_id.is_some() {
             return None;
         }
         let request_id = Uuid::new_v4();
         self.request_id = Some(request_id);
+        self.origin = Some(origin);
         Some(request_id)
     }
 
-    fn complete(&mut self, request_id: Option<Uuid>) -> bool {
+    fn complete(&mut self, request_id: Option<Uuid>) -> Option<FocusOrigin> {
         if request_id.is_none() || request_id != self.request_id {
-            return false;
+            return None;
         }
         self.request_id = None;
-        true
+        self.origin.take()
     }
 }
 
@@ -678,9 +792,9 @@ async fn resize_view(
     framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     area: Rect,
     view: &mut ViewState,
-    tab_bar_position: config::TabBarPosition,
+    ui: UiConfig,
 ) -> anyhow::Result<()> {
-    let terminal = client_layout(area, tab_bar_position).terminal;
+    let terminal = client_layout(area, ui).terminal;
     for (terminal_id, size) in view.resize_requests(terminal) {
         send(framed, ClientMessage::Resize { terminal_id, size }).await?;
     }
@@ -859,6 +973,20 @@ mod tests {
         assert!(state.begin().is_none());
         assert!(state.complete(Some(request)));
         assert!(state.begin().is_some());
+    }
+
+    #[test]
+    fn focus_state_correlates_one_request_and_preserves_its_origin() {
+        let mut state = FocusState::default();
+        let request = state
+            .begin(FocusOrigin::Workspace)
+            .expect("first focus starts");
+        assert!(state.begin(FocusOrigin::Pane).is_none());
+        assert_eq!(state.complete(None), None);
+        assert_eq!(state.complete(Some(Uuid::new_v4())), None);
+        assert_eq!(state.complete(Some(request)), Some(FocusOrigin::Workspace));
+        let pane = state.begin(FocusOrigin::Pane).expect("focus gate released");
+        assert_eq!(state.complete(Some(pane)), Some(FocusOrigin::Pane));
     }
 
     #[test]

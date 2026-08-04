@@ -81,6 +81,7 @@ pub(super) enum PrefixAction {
     Wait,
     Detach,
     Navigator,
+    WorkspaceSidebar,
     CreateTab,
     FocusNext,
     FocusPrevious,
@@ -101,6 +102,7 @@ impl PrefixState {
             match bytes.as_slice() {
                 b"d" => PrefixAction::Detach,
                 b"g" => PrefixAction::Navigator,
+                b"w" => PrefixAction::WorkspaceSidebar,
                 b"c" => PrefixAction::CreateTab,
                 b"l" | b"o" => PrefixAction::FocusNext,
                 b"h" | b";" => PrefixAction::FocusPrevious,
@@ -161,6 +163,8 @@ mod tests {
         assert_eq!(prefix.feed(b"d".to_vec()), PrefixAction::Detach);
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
         assert_eq!(prefix.feed(b"g".to_vec()), PrefixAction::Navigator);
+        assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
+        assert_eq!(prefix.feed(b"w".to_vec()), PrefixAction::WorkspaceSidebar);
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
         assert_eq!(prefix.feed(b"c".to_vec()), PrefixAction::CreateTab);
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);

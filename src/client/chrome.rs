@@ -12,42 +12,113 @@ use crate::{
     resources::{ResourceSnapshot, TabSnapshot},
 };
 
-use super::config::TabBarPosition;
+use super::config::{TabBarPosition, UiConfig, WorkspaceSidebarPosition};
+
+pub(super) const WORKSPACE_SIDEBAR_WIDTH: u16 = 24;
+const MIN_DOCKED_TERMINAL_WIDTH: u16 = 96;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ClientLayout {
     pub terminal: Rect,
     pub tab_bar: Option<Rect>,
+    pub workspace_sidebar: Option<WorkspaceSidebarLayout>,
 }
 
-pub(super) fn client_layout(host: Rect, position: TabBarPosition) -> ClientLayout {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WorkspaceSidebarLayout {
+    Docked(Rect),
+    Drawer(Rect),
+}
+
+impl WorkspaceSidebarLayout {
+    pub fn area(self) -> Rect {
+        match self {
+            Self::Docked(area) | Self::Drawer(area) => area,
+        }
+    }
+
+    pub fn docked(self) -> Option<Rect> {
+        match self {
+            Self::Docked(area) => Some(area),
+            Self::Drawer(_) => None,
+        }
+    }
+}
+
+pub(super) fn client_layout(host: Rect, ui: UiConfig) -> ClientLayout {
     if host.width == 0 || host.height < 2 {
         return ClientLayout {
             terminal: host,
             tab_bar: None,
+            workspace_sidebar: sidebar_rect(host, ui.workspace_sidebar_position)
+                .map(WorkspaceSidebarLayout::Drawer),
         };
     }
 
-    match position {
-        TabBarPosition::Top => ClientLayout {
-            terminal: Rect::new(
+    let (body, tab_bar) = match ui.tab_bar_position {
+        TabBarPosition::Top => (
+            Rect::new(
                 host.x,
                 host.y.saturating_add(1),
                 host.width,
                 host.height - 1,
             ),
-            tab_bar: Some(Rect::new(host.x, host.y, host.width, 1)),
-        },
-        TabBarPosition::Bottom => ClientLayout {
-            terminal: Rect::new(host.x, host.y, host.width, host.height - 1),
-            tab_bar: Some(Rect::new(
+            Some(Rect::new(host.x, host.y, host.width, 1)),
+        ),
+        TabBarPosition::Bottom => (
+            Rect::new(host.x, host.y, host.width, host.height - 1),
+            Some(Rect::new(
                 host.x,
                 host.y.saturating_add(host.height - 1),
                 host.width,
                 1,
             )),
-        },
+        ),
+    };
+
+    let drawer = sidebar_rect(body, ui.workspace_sidebar_position);
+    let docked = body.height >= 2
+        && body.width >= WORKSPACE_SIDEBAR_WIDTH.saturating_add(MIN_DOCKED_TERMINAL_WIDTH);
+    let (terminal, workspace_sidebar) = if docked {
+        let sidebar = drawer.expect("nonempty docked body has a sidebar rectangle");
+        let terminal = match ui.workspace_sidebar_position {
+            WorkspaceSidebarPosition::Left => Rect::new(
+                body.x.saturating_add(WORKSPACE_SIDEBAR_WIDTH),
+                body.y,
+                body.width - WORKSPACE_SIDEBAR_WIDTH,
+                body.height,
+            ),
+            WorkspaceSidebarPosition::Right => Rect::new(
+                body.x,
+                body.y,
+                body.width - WORKSPACE_SIDEBAR_WIDTH,
+                body.height,
+            ),
+        };
+        (terminal, Some(sidebar))
+    } else {
+        (body, None)
+    };
+
+    ClientLayout {
+        terminal,
+        tab_bar,
+        workspace_sidebar: workspace_sidebar
+            .map(WorkspaceSidebarLayout::Docked)
+            .or_else(|| drawer.map(WorkspaceSidebarLayout::Drawer)),
     }
+}
+
+fn sidebar_rect(body: Rect, position: WorkspaceSidebarPosition) -> Option<Rect> {
+    if body.width == 0 || body.height == 0 {
+        return None;
+    }
+    let width = body.width.min(WORKSPACE_SIDEBAR_WIDTH);
+    let x = match position {
+        WorkspaceSidebarPosition::Left => body.x,
+        WorkspaceSidebarPosition::Right => body.x.saturating_add(body.width - width),
+    };
+    Some(Rect::new(x, body.y, width, body.height))
 }
 
 #[derive(Default)]
@@ -241,7 +312,7 @@ fn active_only(name: &str, closing: bool, width: usize) -> String {
     }
 }
 
-fn truncate(value: &str, width: usize) -> String {
+pub(super) fn truncate(value: &str, width: usize) -> String {
     if UnicodeWidthStr::width(value) <= width {
         return value.to_owned();
     }
@@ -266,7 +337,7 @@ fn truncate(value: &str, width: usize) -> String {
     truncated
 }
 
-fn sanitize(value: &str) -> String {
+pub(super) fn sanitize(value: &str) -> String {
     value
         .chars()
         .map(|character| {
@@ -366,31 +437,56 @@ mod tests {
     }
 
     #[test]
-    fn chrome_layout_reserves_one_row_at_either_edge_and_suppresses_it_when_tiny() {
+    fn chrome_layout_composes_tab_and_sidebar_positions_at_the_exact_breakpoint() {
+        let top_left = UiConfig::default();
         assert_eq!(
-            client_layout(Rect::new(3, 4, 80, 24), TabBarPosition::Top),
+            client_layout(Rect::new(3, 4, 119, 24), top_left),
             ClientLayout {
-                tab_bar: Some(Rect::new(3, 4, 80, 1)),
-                terminal: Rect::new(3, 5, 80, 23),
+                tab_bar: Some(Rect::new(3, 4, 119, 1)),
+                terminal: Rect::new(3, 5, 119, 23),
+                workspace_sidebar: Some(WorkspaceSidebarLayout::Drawer(Rect::new(3, 5, 24, 23,))),
             }
         );
         assert_eq!(
-            client_layout(Rect::new(3, 4, 80, 24), TabBarPosition::Bottom),
+            client_layout(Rect::new(3, 4, 120, 24), top_left),
             ClientLayout {
-                tab_bar: Some(Rect::new(3, 27, 80, 1)),
-                terminal: Rect::new(3, 4, 80, 23),
+                tab_bar: Some(Rect::new(3, 4, 120, 1)),
+                terminal: Rect::new(27, 5, 96, 23),
+                workspace_sidebar: Some(WorkspaceSidebarLayout::Docked(Rect::new(3, 5, 24, 23,))),
             }
         );
-        for height in [0, 1] {
-            let host = Rect::new(3, 4, 80, height);
-            assert_eq!(
-                client_layout(host, TabBarPosition::Top),
-                ClientLayout {
-                    tab_bar: None,
-                    terminal: host,
-                }
-            );
-        }
+        let bottom_right = UiConfig {
+            tab_bar_position: TabBarPosition::Bottom,
+            workspace_sidebar_position: WorkspaceSidebarPosition::Right,
+        };
+        assert_eq!(
+            client_layout(Rect::new(3, 4, 120, 24), bottom_right),
+            ClientLayout {
+                tab_bar: Some(Rect::new(3, 27, 120, 1)),
+                terminal: Rect::new(3, 4, 96, 23),
+                workspace_sidebar: Some(WorkspaceSidebarLayout::Docked(Rect::new(99, 4, 24, 23,))),
+            }
+        );
+    }
+
+    #[test]
+    fn chrome_layout_returns_tiny_hosts_to_the_terminal_but_keeps_a_drawer_overlay() {
+        assert_eq!(
+            client_layout(Rect::new(3, 4, 80, 0), UiConfig::default()),
+            ClientLayout {
+                tab_bar: None,
+                terminal: Rect::new(3, 4, 80, 0),
+                workspace_sidebar: None,
+            }
+        );
+        assert_eq!(
+            client_layout(Rect::new(3, 4, 120, 1), UiConfig::default()),
+            ClientLayout {
+                tab_bar: None,
+                terminal: Rect::new(3, 4, 120, 1),
+                workspace_sidebar: Some(WorkspaceSidebarLayout::Drawer(Rect::new(3, 4, 24, 1,))),
+            }
+        );
     }
 
     #[test]

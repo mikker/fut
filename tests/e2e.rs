@@ -3647,6 +3647,163 @@ async fn public_tab_bar_tracks_live_tabs_resizes_content_and_honors_global_posit
 }
 
 #[tokio::test]
+async fn public_workspace_sidebar_docks_navigates_and_collapses_responsively() {
+    let main_script = r#"
+printf 'ALPHA_READY\r\n'
+while IFS= read -r line; do
+  case "$line" in
+    main) printf 'BRAVO_ACK\r\n' ;;
+    size-main) set -- $(stty size); printf 'ALPHA_SIZE_%s_%s\r\n' "$1" "$2" ;;
+    size-narrow) set -- $(stty size); printf 'NARROW_SIZE_%s_%s\r\n' "$1" "$2" ;;
+  esac
+done
+"#;
+    let harness = Harness::start_with(main_script, |root| {
+        let main = root.join("cwd");
+        git(&main, &["init", "-b", "main"]);
+        fs::write(main.join("tracked"), "x").unwrap();
+        git(&main, &["add", "tracked"]);
+        git(&main, &["commit", "-m", "initial"]);
+        let linked = root.join("linked");
+        git(
+            &main,
+            &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
+        );
+    })
+    .await;
+    let linked = harness.root.path().join("linked");
+    let ServerMessage::LocationOpened {
+        selected: linked_target,
+        disposition: fut::protocol::OpenDisposition::WorkspaceCreated,
+    } = harness
+        .control_command(ClientMessage::OpenLocation {
+            name: Some("feature".into()),
+            cwd: linked,
+            program: Some("/bin/sh".into()),
+            argv: vec![
+                "-c".into(),
+                "printf 'ZETA_READY\\r\\n'; while IFS= read -r line; do case \"$line\" in linked) printf 'ZETA_INPUT\\r\\n';; after-close) printf 'OMEGA_ACK\\r\\n';; size-linked) set -- $(stty size); printf 'ZETA_SIZE_%s_%s\\r\\n' \"$1\" \"$2\";; esac; done".into(),
+            ],
+        })
+        .await
+    else {
+        panic!("failed to create peer workspace")
+    };
+    let snapshot = harness.resources().await;
+    let main_workspace = &snapshot.sessions[0].workspaces[0];
+    let main_pane = main_workspace.tabs[0].panes[0].id;
+
+    let spawn_client = |columns: u16, pane: PaneId| {
+        let mut command = Command::new("/usr/bin/script");
+        command
+            .env_clear()
+            .env("HOME", harness.root.path().join("home"))
+            .env("PATH", "/usr/bin:/bin")
+            .env("TMPDIR", harness.root.path().join("runtime"))
+            .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+            .env("TERM", "xterm-256color")
+            .args(["-q", "/dev/null", "/bin/sh", "-c"])
+            .arg(format!(
+                "stty rows 24 cols {columns}; exec '{}' --socket '{}' pane attach {pane}",
+                env!("CARGO_BIN_EXE_fut"),
+                harness.socket.display(),
+            ));
+        PtyChild::spawn(command)
+    };
+
+    let mut left = spawn_client(120, main_pane);
+    left.wait_for("ALPHA_READY").await;
+    left.wait_for("feature").await;
+    left.send(b"size-main\n");
+    left.wait_for("ALPHA_SIZE_23_96").await;
+    left.send(b"\x02w");
+    left.wait_for("↑↓ enter · esc").await;
+    left.send(b"j\r");
+    left.wait_for("ZETA_READY").await;
+    left.send(b"linked\nsize-linked\n");
+    left.wait_for("ZETA_INPUT").await;
+    left.wait_for("ZETA_SIZE_23_96").await;
+    left.send(b"\x02w");
+    left.wait_for_count("↑↓ enter · esc", 2).await;
+    left.send(b"k\r");
+    left.send(b"main\n");
+    left.wait_for("BRAVO_ACK").await;
+    left.send(b"\x02d");
+    left.wait_success().await;
+
+    let config_directory = harness.root.path().join("home/.config/fut");
+    fs::create_dir_all(&config_directory).unwrap();
+    fs::write(
+        config_directory.join("config.toml"),
+        "[ui]\nworkspace_sidebar_position = \"right\"\n",
+    )
+    .unwrap();
+    let mut right = spawn_client(120, linked_target.pane_id);
+    right.wait_for("feature").await;
+    right.wait_for("\x1b[2;97H").await;
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::RenameTarget {
+                selector: RenameSelector::Workspace(linked_target.workspace_id),
+                name: "feature λ".into(),
+            })
+            .await,
+        ServerMessage::CommandCompleted { .. }
+    ));
+    right.wait_for(" λ").await;
+    right.send(b"size-linked\n");
+    right.wait_for("ZETA_SIZE_23_96").await;
+    right.send(b"\x02d");
+    right.wait_success().await;
+
+    let mut narrow = spawn_client(119, main_pane);
+    narrow.wait_for("ALPHA_READY").await;
+    narrow.send(b"size-narrow\n");
+    narrow.wait_for("NARROW_SIZE_23_119").await;
+    narrow.send(b"\x02w");
+    narrow.wait_for("feature").await;
+    narrow.wait_for("λ").await;
+    narrow.send(b"q");
+    narrow.send(b"size-narrow\n");
+    narrow.wait_for_count("NARROW_SIZE_23_119", 2).await;
+    narrow.send(b"\x02d");
+    narrow.wait_success().await;
+
+    let mut live_close = spawn_client(120, linked_target.pane_id);
+    live_close.wait_for("feature").await;
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::CloseTarget {
+                selector: TargetSelector::Workspace(main_workspace.id),
+            })
+            .await,
+        ServerMessage::CommandCompleted { .. }
+    ));
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::RenameTarget {
+                selector: RenameSelector::Workspace(linked_target.workspace_id),
+                name: "feature done".into(),
+            })
+            .await,
+        ServerMessage::CommandCompleted { .. }
+    ));
+    live_close.wait_for("done").await;
+    live_close.send(b"\x02w");
+    live_close.wait_for("↑↓ enter · esc").await;
+    live_close.send(b"k\r");
+    live_close.send(b"after-close\n");
+    live_close.wait_for("OMEGA_ACK").await;
+    live_close.send(b"\x02d");
+    live_close.wait_success().await;
+
+    let linked_pid = linked_target.child_pid;
+    assert!(process_alive(linked_pid));
+    harness.shutdown().await;
+    wait_for(DEADLINE, || !process_alive(linked_pid)).await;
+}
+
+#[tokio::test]
 async fn malformed_ui_config_prevents_bare_fut_from_starting_or_opening_resources() {
     let root = tempfile::Builder::new()
         .prefix("fut-e2e-config-")
