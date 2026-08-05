@@ -1,4 +1,62 @@
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) enum FocusDirection {
+    Left,
+    Down,
+    Up,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) enum NavigationScope {
+    Pane,
+    Tab,
+    Workspace,
+    Session,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) enum TabNumber {
+    One,
+    Two,
+    Three,
+    Four,
+    Five,
+    Six,
+    Seven,
+    Eight,
+    Nine,
+    Ten,
+}
+
+impl TabNumber {
+    pub(super) const fn get(self) -> u8 {
+        match self {
+            Self::One => 1,
+            Self::Two => 2,
+            Self::Three => 3,
+            Self::Four => 4,
+            Self::Five => 5,
+            Self::Six => 6,
+            Self::Seven => 7,
+            Self::Eight => 8,
+            Self::Nine => 9,
+            Self::Ten => 10,
+        }
+    }
+}
+
+impl NavigationScope {
+    pub(super) const fn label(self) -> &'static str {
+        match self {
+            Self::Pane => "pane",
+            Self::Tab => "tab",
+            Self::Workspace => "workspace",
+            Self::Session => "session",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum ClientAction {
     OpenCommandBar,
     OpenNavigator,
@@ -10,6 +68,9 @@ pub(super) enum ClientAction {
     SplitPaneDown,
     FocusNextPane,
     FocusPreviousPane,
+    FocusPane(FocusDirection),
+    FocusLast(NavigationScope),
+    FocusTab(TabNumber),
     TogglePaneZoom,
     Detach,
 }
@@ -28,7 +89,7 @@ pub(super) struct DirectBinding {
 }
 
 #[cfg(test)]
-const ALL_ACTIONS: [ClientAction; 12] = [
+const ALL_ACTIONS: [ClientAction; 30] = [
     ClientAction::OpenCommandBar,
     ClientAction::OpenNavigator,
     ClientAction::OpenWorkspaceSidebar,
@@ -39,11 +100,29 @@ const ALL_ACTIONS: [ClientAction; 12] = [
     ClientAction::SplitPaneDown,
     ClientAction::FocusNextPane,
     ClientAction::FocusPreviousPane,
+    ClientAction::FocusPane(FocusDirection::Left),
+    ClientAction::FocusPane(FocusDirection::Down),
+    ClientAction::FocusPane(FocusDirection::Up),
+    ClientAction::FocusPane(FocusDirection::Right),
+    ClientAction::FocusLast(NavigationScope::Pane),
+    ClientAction::FocusLast(NavigationScope::Tab),
+    ClientAction::FocusLast(NavigationScope::Workspace),
+    ClientAction::FocusLast(NavigationScope::Session),
+    ClientAction::FocusTab(TabNumber::One),
+    ClientAction::FocusTab(TabNumber::Two),
+    ClientAction::FocusTab(TabNumber::Three),
+    ClientAction::FocusTab(TabNumber::Four),
+    ClientAction::FocusTab(TabNumber::Five),
+    ClientAction::FocusTab(TabNumber::Six),
+    ClientAction::FocusTab(TabNumber::Seven),
+    ClientAction::FocusTab(TabNumber::Eight),
+    ClientAction::FocusTab(TabNumber::Nine),
+    ClientAction::FocusTab(TabNumber::Ten),
     ClientAction::TogglePaneZoom,
     ClientAction::Detach,
 ];
 
-pub(super) const COMMANDS: [ActionDefinition; 11] = [
+pub(super) const COMMANDS: [ActionDefinition; 29] = [
     ActionDefinition {
         action: ClientAction::OpenNavigator,
         title: "Open global navigator",
@@ -90,6 +169,96 @@ pub(super) const COMMANDS: [ActionDefinition; 11] = [
         keywords: "focus previous pane back backward cycle",
     },
     ActionDefinition {
+        action: ClientAction::FocusPane(FocusDirection::Left),
+        title: "Focus pane left",
+        keywords: "focus pane left vim direction",
+    },
+    ActionDefinition {
+        action: ClientAction::FocusPane(FocusDirection::Down),
+        title: "Focus pane down",
+        keywords: "focus pane down vim direction",
+    },
+    ActionDefinition {
+        action: ClientAction::FocusPane(FocusDirection::Up),
+        title: "Focus pane up",
+        keywords: "focus pane up vim direction",
+    },
+    ActionDefinition {
+        action: ClientAction::FocusPane(FocusDirection::Right),
+        title: "Focus pane right",
+        keywords: "focus pane right vim direction",
+    },
+    ActionDefinition {
+        action: ClientAction::FocusLast(NavigationScope::Pane),
+        title: "Switch to last pane",
+        keywords: "focus switch last previous pane history",
+    },
+    ActionDefinition {
+        action: ClientAction::FocusLast(NavigationScope::Tab),
+        title: "Switch to last tab",
+        keywords: "focus switch last previous tab history",
+    },
+    ActionDefinition {
+        action: ClientAction::FocusLast(NavigationScope::Workspace),
+        title: "Switch to last workspace",
+        keywords: "focus switch last previous workspace worktree history",
+    },
+    ActionDefinition {
+        action: ClientAction::FocusLast(NavigationScope::Session),
+        title: "Switch to last session",
+        keywords: "focus switch last previous session project history",
+    },
+    ActionDefinition {
+        action: ClientAction::FocusTab(TabNumber::One),
+        title: "Switch to tab 1",
+        keywords: "focus switch numbered tab first one",
+    },
+    ActionDefinition {
+        action: ClientAction::FocusTab(TabNumber::Two),
+        title: "Switch to tab 2",
+        keywords: "focus switch numbered tab second two",
+    },
+    ActionDefinition {
+        action: ClientAction::FocusTab(TabNumber::Three),
+        title: "Switch to tab 3",
+        keywords: "focus switch numbered tab third three",
+    },
+    ActionDefinition {
+        action: ClientAction::FocusTab(TabNumber::Four),
+        title: "Switch to tab 4",
+        keywords: "focus switch numbered tab fourth four",
+    },
+    ActionDefinition {
+        action: ClientAction::FocusTab(TabNumber::Five),
+        title: "Switch to tab 5",
+        keywords: "focus switch numbered tab fifth five",
+    },
+    ActionDefinition {
+        action: ClientAction::FocusTab(TabNumber::Six),
+        title: "Switch to tab 6",
+        keywords: "focus switch numbered tab sixth six",
+    },
+    ActionDefinition {
+        action: ClientAction::FocusTab(TabNumber::Seven),
+        title: "Switch to tab 7",
+        keywords: "focus switch numbered tab seventh seven",
+    },
+    ActionDefinition {
+        action: ClientAction::FocusTab(TabNumber::Eight),
+        title: "Switch to tab 8",
+        keywords: "focus switch numbered tab eighth eight",
+    },
+    ActionDefinition {
+        action: ClientAction::FocusTab(TabNumber::Nine),
+        title: "Switch to tab 9",
+        keywords: "focus switch numbered tab ninth nine",
+    },
+    ActionDefinition {
+        action: ClientAction::FocusTab(TabNumber::Ten),
+        title: "Switch to tab 10",
+        keywords: "focus switch numbered tab tenth ten zero",
+    },
+    ActionDefinition {
         action: ClientAction::TogglePaneZoom,
         title: "Toggle pane zoom",
         keywords: "pane zoom maximize restore fullscreen",
@@ -101,9 +270,9 @@ pub(super) const COMMANDS: [ActionDefinition; 11] = [
     },
 ];
 
-pub(super) const DIRECT_BINDINGS: [DirectBinding; 14] = [
+pub(super) const DIRECT_BINDINGS: [DirectBinding; 30] = [
     DirectBinding {
-        suffix: b"k",
+        suffix: b":",
         action: ClientAction::OpenCommandBar,
     },
     DirectBinding {
@@ -136,7 +305,7 @@ pub(super) const DIRECT_BINDINGS: [DirectBinding; 14] = [
     },
     DirectBinding {
         suffix: b"l",
-        action: ClientAction::FocusNextPane,
+        action: ClientAction::FocusPane(FocusDirection::Right),
     },
     DirectBinding {
         suffix: b"o",
@@ -144,11 +313,75 @@ pub(super) const DIRECT_BINDINGS: [DirectBinding; 14] = [
     },
     DirectBinding {
         suffix: b"h",
-        action: ClientAction::FocusPreviousPane,
+        action: ClientAction::FocusPane(FocusDirection::Left),
     },
     DirectBinding {
         suffix: b";",
         action: ClientAction::FocusPreviousPane,
+    },
+    DirectBinding {
+        suffix: b"j",
+        action: ClientAction::FocusPane(FocusDirection::Down),
+    },
+    DirectBinding {
+        suffix: b"k",
+        action: ClientAction::FocusPane(FocusDirection::Up),
+    },
+    DirectBinding {
+        suffix: b"P",
+        action: ClientAction::FocusLast(NavigationScope::Pane),
+    },
+    DirectBinding {
+        suffix: b"T",
+        action: ClientAction::FocusLast(NavigationScope::Tab),
+    },
+    DirectBinding {
+        suffix: b"W",
+        action: ClientAction::FocusLast(NavigationScope::Workspace),
+    },
+    DirectBinding {
+        suffix: b"S",
+        action: ClientAction::FocusLast(NavigationScope::Session),
+    },
+    DirectBinding {
+        suffix: b"1",
+        action: ClientAction::FocusTab(TabNumber::One),
+    },
+    DirectBinding {
+        suffix: b"2",
+        action: ClientAction::FocusTab(TabNumber::Two),
+    },
+    DirectBinding {
+        suffix: b"3",
+        action: ClientAction::FocusTab(TabNumber::Three),
+    },
+    DirectBinding {
+        suffix: b"4",
+        action: ClientAction::FocusTab(TabNumber::Four),
+    },
+    DirectBinding {
+        suffix: b"5",
+        action: ClientAction::FocusTab(TabNumber::Five),
+    },
+    DirectBinding {
+        suffix: b"6",
+        action: ClientAction::FocusTab(TabNumber::Six),
+    },
+    DirectBinding {
+        suffix: b"7",
+        action: ClientAction::FocusTab(TabNumber::Seven),
+    },
+    DirectBinding {
+        suffix: b"8",
+        action: ClientAction::FocusTab(TabNumber::Eight),
+    },
+    DirectBinding {
+        suffix: b"9",
+        action: ClientAction::FocusTab(TabNumber::Nine),
+    },
+    DirectBinding {
+        suffix: b"0",
+        action: ClientAction::FocusTab(TabNumber::Ten),
     },
     DirectBinding {
         suffix: b"z",
@@ -188,6 +421,42 @@ pub(super) fn action_for_suffix(suffix: &[u8]) -> Option<ClientAction> {
 }
 
 #[cfg(test)]
+const fn requires_launcher(action: ClientAction) -> bool {
+    match action {
+        ClientAction::OpenCommandBar => false,
+        ClientAction::OpenNavigator
+        | ClientAction::OpenWorkspaceSidebar
+        | ClientAction::CreateTab
+        | ClientAction::FocusNextTab
+        | ClientAction::FocusPreviousTab
+        | ClientAction::SplitPaneRight
+        | ClientAction::SplitPaneDown
+        | ClientAction::FocusNextPane
+        | ClientAction::FocusPreviousPane
+        | ClientAction::FocusPane(FocusDirection::Left)
+        | ClientAction::FocusPane(FocusDirection::Down)
+        | ClientAction::FocusPane(FocusDirection::Up)
+        | ClientAction::FocusPane(FocusDirection::Right)
+        | ClientAction::FocusLast(NavigationScope::Pane)
+        | ClientAction::FocusLast(NavigationScope::Tab)
+        | ClientAction::FocusLast(NavigationScope::Workspace)
+        | ClientAction::FocusLast(NavigationScope::Session)
+        | ClientAction::FocusTab(TabNumber::One)
+        | ClientAction::FocusTab(TabNumber::Two)
+        | ClientAction::FocusTab(TabNumber::Three)
+        | ClientAction::FocusTab(TabNumber::Four)
+        | ClientAction::FocusTab(TabNumber::Five)
+        | ClientAction::FocusTab(TabNumber::Six)
+        | ClientAction::FocusTab(TabNumber::Seven)
+        | ClientAction::FocusTab(TabNumber::Eight)
+        | ClientAction::FocusTab(TabNumber::Nine)
+        | ClientAction::FocusTab(TabNumber::Ten)
+        | ClientAction::TogglePaneZoom
+        | ClientAction::Detach => true,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 
@@ -209,7 +478,7 @@ mod tests {
         }
         assert!(definition(ClientAction::OpenCommandBar).is_none());
         for action in ALL_ACTIONS {
-            if action != ClientAction::OpenCommandBar {
+            if requires_launcher(action) {
                 assert!(
                     definition(action).is_some(),
                     "{action:?} is absent from launcher"

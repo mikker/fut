@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use ratatui::{
     buffer::Buffer,
@@ -8,80 +6,16 @@ use ratatui::{
 };
 
 use crate::{
-    domain::{TabId, TerminalId, WorkspaceId},
+    domain::{PaneId, WorkspaceId},
     protocol::SelectedTarget,
-    resources::{ResourceSnapshot, WorkspaceSnapshot},
+    resources::ResourceSnapshot,
 };
 
 use super::{
     chrome::{sanitize, truncate},
     config::WorkspaceSidebarPosition,
+    navigation::NavigationHistory,
 };
-
-#[derive(Default)]
-pub(super) struct WorkspaceHistory {
-    terminals: HashMap<WorkspaceId, TerminalId>,
-    tabs: HashMap<TabId, TerminalId>,
-}
-
-impl WorkspaceHistory {
-    pub fn record(&mut self, target: &SelectedTarget) {
-        self.terminals
-            .insert(target.workspace_id, target.terminal_id);
-        self.tabs.insert(target.tab_id, target.terminal_id);
-    }
-
-    pub fn adjacent_tab(
-        &self,
-        snapshot: &ResourceSnapshot,
-        focused: &SelectedTarget,
-        forward: bool,
-    ) -> Option<TerminalId> {
-        let workspace = snapshot
-            .sessions
-            .iter()
-            .flat_map(|session| &session.workspaces)
-            .find(|workspace| workspace.id == focused.workspace_id)?;
-        if workspace.tabs.len() < 2 {
-            return None;
-        }
-        let current = workspace
-            .tabs
-            .iter()
-            .position(|tab| tab.id == focused.tab_id)?;
-        for offset in 1..workspace.tabs.len() {
-            let index = if forward {
-                (current + offset) % workspace.tabs.len()
-            } else {
-                (current + workspace.tabs.len() - offset) % workspace.tabs.len()
-            };
-            let tab = &workspace.tabs[index];
-            if tab.closing {
-                continue;
-            }
-            let available = |terminal_id| {
-                tab.panes
-                    .iter()
-                    .any(|pane| !pane.closing && pane.terminal_id == terminal_id)
-            };
-            if let Some(terminal_id) = self
-                .tabs
-                .get(&tab.id)
-                .copied()
-                .filter(|terminal_id| available(*terminal_id))
-                .or_else(|| {
-                    tab.panes
-                        .iter()
-                        .find(|pane| !pane.closing)
-                        .map(|pane| pane.terminal_id)
-                })
-            {
-                return Some(terminal_id);
-            }
-        }
-        None
-    }
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct WorkspaceItem {
@@ -89,7 +23,7 @@ struct WorkspaceItem {
     name: String,
     current: bool,
     closing: bool,
-    destination: Option<TerminalId>,
+    destination: Option<PaneId>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -101,7 +35,7 @@ impl WorkspaceModel {
     fn from_snapshot(
         snapshot: &ResourceSnapshot,
         focused: &SelectedTarget,
-        history: &WorkspaceHistory,
+        history: &NavigationHistory,
     ) -> Self {
         let (session_id, workspace_id) = focused_ancestry(snapshot, focused);
         let Some(session) = snapshot
@@ -124,7 +58,7 @@ impl WorkspaceModel {
                         current: workspace.id == workspace_id,
                         closing,
                         destination: (!closing)
-                            .then(|| workspace_destination(workspace, history))
+                            .then(|| history.workspace_destination(workspace))
                             .flatten(),
                     }
                 })
@@ -145,41 +79,12 @@ fn focused_ancestry(
                 workspace.tabs.iter().find_map(|tab| {
                     tab.panes
                         .iter()
-                        .any(|pane| pane.terminal_id == focused.terminal_id)
+                        .any(|pane| pane.id == focused.pane_id)
                         .then_some((session.id, workspace.id))
                 })
             })
         })
         .unwrap_or((focused.session_id, focused.workspace_id))
-}
-
-fn workspace_destination(
-    workspace: &WorkspaceSnapshot,
-    history: &WorkspaceHistory,
-) -> Option<TerminalId> {
-    let available = |terminal_id| {
-        workspace.tabs.iter().any(|tab| {
-            !tab.closing
-                && tab
-                    .panes
-                    .iter()
-                    .any(|pane| !pane.closing && pane.terminal_id == terminal_id)
-        })
-    };
-    history
-        .terminals
-        .get(&workspace.id)
-        .copied()
-        .filter(|terminal_id| available(*terminal_id))
-        .or_else(|| {
-            workspace
-                .tabs
-                .iter()
-                .filter(|tab| !tab.closing)
-                .flat_map(|tab| &tab.panes)
-                .find(|pane| !pane.closing)
-                .map(|pane| pane.terminal_id)
-        })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -199,14 +104,14 @@ pub(super) struct WorkspaceSidebarState {
 pub(super) enum WorkspaceSidebarAction {
     Stay,
     Close,
-    Select(TerminalId),
+    Select(PaneId),
 }
 
 impl WorkspaceSidebarState {
     pub fn open(
         snapshot: &ResourceSnapshot,
         focused: &SelectedTarget,
-        history: &WorkspaceHistory,
+        history: &NavigationHistory,
     ) -> Option<Self> {
         let model = WorkspaceModel::from_snapshot(snapshot, focused, history);
         let selected = model
@@ -226,7 +131,7 @@ impl WorkspaceSidebarState {
         &mut self,
         snapshot: &ResourceSnapshot,
         focused: &SelectedTarget,
-        history: &WorkspaceHistory,
+        history: &NavigationHistory,
     ) {
         let previous = self.selected;
         self.model = WorkspaceModel::from_snapshot(snapshot, focused, history);
@@ -361,7 +266,7 @@ impl WorkspaceSidebarState {
 pub(super) fn render_workspace_sidebar(
     snapshot: Option<&ResourceSnapshot>,
     focused: &SelectedTarget,
-    history: &WorkspaceHistory,
+    history: &NavigationHistory,
     area: Rect,
     position: WorkspaceSidebarPosition,
     buffer: &mut Buffer,
@@ -586,7 +491,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        domain::{PaneId, SessionId, TabId},
+        domain::{PaneId, SessionId, TabId, TerminalId},
         resources::{
             PaneSnapshot, Project, ProjectIdentity, SessionSnapshot, TabSnapshot, WorkspaceSnapshot,
         },
@@ -688,22 +593,24 @@ mod tests {
             layout: crate::splits::SplitTree::leaf(remembered.id),
             panes: vec![remembered],
         });
-        let mut history = WorkspaceHistory::default();
+        let mut history = NavigationHistory::default();
         let mut remembered_target = focused.clone();
         remembered_target.workspace_id = feature.id;
+        remembered_target.tab_id = feature.tabs[1].id;
+        remembered_target.pane_id = remembered.id;
         remembered_target.terminal_id = remembered.terminal_id;
         history.record(&remembered_target);
 
         let model = WorkspaceModel::from_snapshot(&snapshot, &focused, &history);
         assert!(!model.items[0].current);
         assert!(model.items[1].current);
-        assert_eq!(model.items[1].destination, Some(remembered.terminal_id));
+        assert_eq!(model.items[1].destination, Some(remembered.id));
 
         snapshot.sessions[0].workspaces[1].tabs[1].panes[0].closing = true;
         let fallback = WorkspaceModel::from_snapshot(&snapshot, &focused, &history);
         assert_eq!(
             fallback.items[1].destination,
-            Some(snapshot.sessions[0].workspaces[1].tabs[0].panes[0].terminal_id)
+            Some(snapshot.sessions[0].workspaces[1].tabs[0].panes[0].id)
         );
     }
 
@@ -711,16 +618,16 @@ mod tests {
     fn selection_wraps_skips_closing_rows_and_switching_blocks_input_until_error() {
         let (mut snapshot, focused) = fixture(&["main", "retiring", "feature"], 0);
         snapshot.sessions[0].workspaces[1].closing = true;
-        let history = WorkspaceHistory::default();
+        let history = NavigationHistory::default();
         let mut state = WorkspaceSidebarState::open(&snapshot, &focused, &history).unwrap();
         assert_eq!(
             state.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
             WorkspaceSidebarAction::Stay
         );
-        let feature_terminal = snapshot.sessions[0].workspaces[2].tabs[0].panes[0].terminal_id;
+        let feature_pane = snapshot.sessions[0].workspaces[2].tabs[0].panes[0].id;
         assert_eq!(
             state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            WorkspaceSidebarAction::Select(feature_terminal)
+            WorkspaceSidebarAction::Select(feature_pane)
         );
 
         state.begin_switch();
@@ -731,7 +638,7 @@ mod tests {
         state.switch_error("busy".into());
         assert_eq!(
             state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            WorkspaceSidebarAction::Select(feature_terminal)
+            WorkspaceSidebarAction::Select(feature_pane)
         );
 
         snapshot.sessions[0].workspaces.pop();
@@ -747,7 +654,7 @@ mod tests {
         let (mut snapshot, focused) = fixture(&["main", "bad\nname", "closing"], 0);
         snapshot.sessions[0].workspaces[2].closing = true;
         let model =
-            WorkspaceModel::from_snapshot(&snapshot, &focused, &WorkspaceHistory::default());
+            WorkspaceModel::from_snapshot(&snapshot, &focused, &NavigationHistory::default());
         let (left, left_buffer) =
             rendered(&model, None, None, 24, 3, WorkspaceSidebarPosition::Left);
         assert!(left.contains("● main"));
@@ -781,7 +688,7 @@ mod tests {
             3,
         );
         let model =
-            WorkspaceModel::from_snapshot(&snapshot, &focused, &WorkspaceHistory::default());
+            WorkspaceModel::from_snapshot(&snapshot, &focused, &NavigationHistory::default());
         for width in 1..24 {
             let (text, _) = rendered(&model, None, None, width, 3, WorkspaceSidebarPosition::Left);
             assert!(text.contains('●'), "width {width}: {text:?}");
@@ -791,7 +698,7 @@ mod tests {
     #[test]
     fn active_render_marks_selection_and_exposes_compact_help() {
         let (snapshot, focused) = fixture(&["main", "feature"], 0);
-        let history = WorkspaceHistory::default();
+        let history = NavigationHistory::default();
         let mut state = WorkspaceSidebarState::open(&snapshot, &focused, &history).unwrap();
         state.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         let selected = state.selected.unwrap();

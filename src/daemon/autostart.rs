@@ -160,6 +160,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let socket = temporary.path().join("fut.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let incompatible_version = PROTOCOL_VERSION + 1;
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut framed = Framed::new(stream, codec());
@@ -178,7 +179,7 @@ mod tests {
                         request_id: hello.request_id,
                         message: ServerMessage::IncompatibleProtocol {
                             client: PROTOCOL_VERSION,
-                            server: PROTOCOL_VERSION - 1,
+                            server: incompatible_version,
                         },
                     })
                     .unwrap(),
@@ -192,7 +193,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains(&format!("uses protocol {}", PROTOCOL_VERSION - 1))
+                .contains(&format!("uses protocol {incompatible_version}"))
         );
         assert!(
             error

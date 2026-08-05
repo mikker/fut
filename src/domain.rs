@@ -105,13 +105,20 @@ pub struct Rgb {
     pub blue: u8,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CellColor {
+    Indexed(u8),
+    Rgb(Rgb),
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CellStyle {
     #[serde(rename = "f", skip_serializing_if = "Option::is_none")]
-    pub foreground: Option<Rgb>,
+    pub foreground: Option<CellColor>,
     #[serde(rename = "b", skip_serializing_if = "Option::is_none")]
-    pub background: Option<Rgb>,
+    pub background: Option<CellColor>,
     #[serde(rename = "B", skip_serializing_if = "is_false")]
     pub bold: bool,
     #[serde(rename = "i", skip_serializing_if = "is_false")]
@@ -324,16 +331,12 @@ mod tests {
         let cell = Cell {
             contents: "λ".into(),
             style: CellStyle {
-                foreground: Some(Rgb {
-                    red: 1,
-                    green: 2,
-                    blue: 3,
-                }),
-                background: Some(Rgb {
+                foreground: Some(CellColor::Indexed(1)),
+                background: Some(CellColor::Rgb(Rgb {
                     red: 250,
                     green: 240,
                     blue: 230,
-                }),
+                })),
                 bold: true,
                 italic: true,
                 underline: true,
@@ -342,7 +345,8 @@ mod tests {
         };
         let json = serde_json::to_string(&cell).unwrap();
         assert_eq!(serde_json::from_str::<Cell>(&json).unwrap(), cell);
-        assert!(json.contains("\"f\":{\"r\":1,\"g\":2,\"b\":3}"));
+        assert!(json.contains("\"f\":1"));
+        assert!(json.contains("\"b\":{\"r\":250,\"g\":240,\"b\":230}"));
         assert_eq!(
             serde_json::to_string(&Cell::default()).unwrap(),
             r#"{"c":" "}"#

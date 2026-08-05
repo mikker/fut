@@ -1,5 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+#[cfg(test)]
+use super::actions::FocusDirection;
 use super::actions::{ClientAction, action_for_suffix};
 
 pub(super) fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
@@ -176,7 +178,7 @@ mod tests {
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
         assert_eq!(
             prefix.feed(b"l".to_vec()),
-            PrefixAction::Dispatch(ClientAction::FocusNextPane)
+            PrefixAction::Dispatch(ClientAction::FocusPane(FocusDirection::Right))
         );
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
         assert_eq!(
@@ -186,7 +188,7 @@ mod tests {
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
         assert_eq!(
             prefix.feed(b"h".to_vec()),
-            PrefixAction::Dispatch(ClientAction::FocusPreviousPane)
+            PrefixAction::Dispatch(ClientAction::FocusPane(FocusDirection::Left))
         );
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
         assert_eq!(
@@ -196,6 +198,11 @@ mod tests {
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
         assert_eq!(
             prefix.feed(b"k".to_vec()),
+            PrefixAction::Dispatch(ClientAction::FocusPane(FocusDirection::Up))
+        );
+        assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
+        assert_eq!(
+            prefix.feed(b":".to_vec()),
             PrefixAction::Dispatch(ClientAction::OpenCommandBar)
         );
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);

@@ -301,7 +301,7 @@ fn run(
 ) {
     let mut exit_code = None;
     let mut reader_complete = false;
-    loop {
+    'runtime: loop {
         // Output has its own bounded queue, so PTY backpressure can never make
         // control commands Busy. Bound this drain to ensure output still moves.
         for _ in 0..32 {
@@ -346,7 +346,7 @@ fn run(
                     // forked foreground group. Re-read the tty group after
                     // killing the session leader before entering wait().
                     kill_terminal_processes(&*master, child_pid);
-                    let result = match child.wait() {
+                    match child.wait() {
                         Ok(status) => {
                             let code = Some(status.exit_code() as i32);
                             drain_output_until(
@@ -356,37 +356,67 @@ fn run(
                                 Duration::from_millis(100),
                             );
                             publish_exit(publishers.events, publishers.lifecycle, code);
-                            Ok(())
+                            let _ = completion.send(Ok(()));
+                            acknowledge_pending_closes(&mut queues.control);
+                            return;
                         }
                         Err(error) => {
                             send_error(publishers.events, anyhow!(error.to_string()));
-                            Err(CommandError::Stopped)
+                            drain_output_until(
+                                &queues.output,
+                                terminal,
+                                &publishers,
+                                Duration::from_millis(100),
+                            );
+                            publish_optional(
+                                terminal.finish_synchronized_output(),
+                                publishers.snapshots,
+                                publishers.events,
+                            );
+                            let _ = completion.send(Err(CommandError::Stopped));
+                            continue 'runtime;
                         }
-                    };
-                    let _ = completion.send(result);
-                    acknowledge_pending_closes(&mut queues.control);
-                    return;
+                    }
                 }
             }
         }
-        match queues.output.recv_timeout(Duration::from_millis(20)) {
-            Ok(OutputMessage::Bytes(bytes)) => publish(
-                terminal.feed(&bytes),
-                publishers.snapshots,
-                publishers.events,
-            ),
-            Ok(OutputMessage::ReaderError {
-                message,
-                raw_os_error,
-            }) => {
-                reader_complete = true;
-                if raw_os_error != Some(libc::EIO) {
-                    let _ = publishers.events.send(TerminalEvent::Error { message });
+        if reader_complete {
+            thread::sleep(Duration::from_millis(20));
+        } else {
+            match queues.output.recv_timeout(Duration::from_millis(20)) {
+                Ok(OutputMessage::Bytes(bytes)) => publish_optional(
+                    terminal.feed(&bytes),
+                    publishers.snapshots,
+                    publishers.events,
+                ),
+                Ok(OutputMessage::ReaderError {
+                    message,
+                    raw_os_error,
+                }) => {
+                    reader_complete = true;
+                    if raw_os_error != Some(libc::EIO) {
+                        let _ = publishers.events.send(TerminalEvent::Error { message });
+                    }
+                    publish_optional(
+                        terminal.finish_synchronized_output(),
+                        publishers.snapshots,
+                        publishers.events,
+                    );
                 }
+                Ok(OutputMessage::ReaderEof) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    reader_complete = true;
+                    publish_optional(
+                        terminal.finish_synchronized_output(),
+                        publishers.snapshots,
+                        publishers.events,
+                    );
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => publish_optional(
+                    terminal.flush_synchronized_output(),
+                    publishers.snapshots,
+                    publishers.events,
+                ),
             }
-            Ok(OutputMessage::ReaderEof) => reader_complete = true,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => reader_complete = true,
         }
         if exit_code.is_none() {
             match child.try_wait() {
@@ -396,6 +426,11 @@ fn run(
             }
         }
         if reader_complete && let Some(exit_code) = exit_code {
+            publish_optional(
+                terminal.finish_synchronized_output(),
+                publishers.snapshots,
+                publishers.events,
+            );
             publish_exit(publishers.events, publishers.lifecycle, Some(exit_code));
             break;
         }
@@ -411,7 +446,7 @@ fn drain_output_until(
     let deadline = std::time::Instant::now() + timeout;
     while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
         match output.recv_timeout(remaining) {
-            Ok(OutputMessage::Bytes(bytes)) => publish(
+            Ok(OutputMessage::Bytes(bytes)) => publish_optional(
                 terminal.feed(&bytes),
                 publishers.snapshots,
                 publishers.events,
@@ -429,6 +464,11 @@ fn drain_output_until(
             Err(mpsc::RecvTimeoutError::Timeout) => break,
         }
     }
+    publish_optional(
+        terminal.finish_synchronized_output(),
+        publishers.snapshots,
+        publishers.events,
+    );
 }
 
 #[cfg(unix)]
@@ -507,6 +547,19 @@ fn publish(
         Err(error) => send_error(events, error),
     }
 }
+fn publish_optional(
+    result: Result<Option<ScreenSnapshot>>,
+    snapshots: &watch::Sender<ScreenSnapshot>,
+    events: &broadcast::Sender<TerminalEvent>,
+) {
+    match result {
+        Ok(Some(snapshot)) => {
+            snapshots.send_replace(snapshot);
+        }
+        Ok(None) => {}
+        Err(error) => send_error(events, error),
+    }
+}
 fn publish_exit(
     events: &broadcast::Sender<TerminalEvent>,
     lifecycle: &watch::Sender<TerminalLifecycle>,
@@ -562,7 +615,15 @@ mod tests {
             }
         })
         .await
-        .unwrap();
+        .unwrap_or_else(|_| {
+            let contents = receiver
+                .borrow()
+                .cells
+                .iter()
+                .map(|cell| cell.contents.as_str())
+                .collect::<String>();
+            panic!("snapshot did not contain {needle:?}: {contents:?}");
+        });
     }
 
     #[tokio::test]
@@ -609,6 +670,39 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(snapshots.borrow().cells.len(), 68);
+        handle.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn synchronized_child_output_publishes_only_complete_frames() {
+        let handle = spawn_terminal(shell(
+            "stty -echo; printf 'OLD_FRAME'; IFS= read -r start; printf '\\033[?2026h\\r\\033[2KNEW_PARTIAL'; IFS= read -r finish; printf '_COMPLETE\\033[?2026l'; while IFS= read -r line; do :; done",
+            HashMap::new(),
+        ))
+        .unwrap();
+        let mut snapshots = handle.subscribe_snapshots();
+        wait_for_text(&mut snapshots, "OLD_FRAME").await;
+        handle.input(b"start\n".to_vec()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let partial = snapshots
+            .borrow()
+            .cells
+            .iter()
+            .map(|cell| cell.contents.as_str())
+            .collect::<String>();
+        assert!(partial.contains("OLD_FRAME"), "{partial:?}");
+        assert!(!partial.contains("NEW_PARTIAL"), "{partial:?}");
+
+        handle.input(b"release\n".to_vec()).await.unwrap();
+        wait_for_text(&mut snapshots, "NEW_PARTIAL_COMPLETE").await;
+        let complete = snapshots
+            .borrow()
+            .cells
+            .iter()
+            .map(|cell| cell.contents.as_str())
+            .collect::<String>();
+        assert!(!complete.contains("OLD_FRAME"), "{complete:?}");
         handle.close().await.unwrap();
     }
 
@@ -701,6 +795,48 @@ mod tests {
             .map(|cell| cell.contents.as_str())
             .collect::<String>();
         assert!(contents.contains("FUT_FINAL_MARKER"), "{contents:?}");
+    }
+
+    #[tokio::test]
+    async fn exit_forces_an_unclosed_synchronized_frame() {
+        let handle = spawn_terminal(shell(
+            "printf '\\033[?2026hFINAL_SYNC_FRAME'",
+            HashMap::new(),
+        ))
+        .unwrap();
+        let mut lifecycle = handle.subscribe_lifecycle();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while matches!(*lifecycle.borrow(), TerminalLifecycle::Running) {
+                lifecycle.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+
+        let contents = handle
+            .subscribe_snapshots()
+            .borrow()
+            .cells
+            .iter()
+            .map(|cell| cell.contents.as_str())
+            .collect::<String>();
+        assert!(contents.contains("FINAL_SYNC_FRAME"), "{contents:?}");
+    }
+
+    #[tokio::test]
+    async fn reader_eof_finishes_sync_and_keeps_control_responsive() {
+        let handle = spawn_terminal(shell(
+            "printf '\\033[?2026hEOF_SYNC_FRAME'; exec 0<&- 1>&- 2>&-; sleep 60",
+            HashMap::new(),
+        ))
+        .unwrap();
+        let mut snapshots = handle.subscribe_snapshots();
+        wait_for_text(&mut snapshots, "EOF_SYNC_FRAME").await;
+
+        tokio::time::timeout(Duration::from_secs(5), handle.close())
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

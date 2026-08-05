@@ -13,7 +13,9 @@ use crate::{
     splits::{SplitDirection, SplitTree},
 };
 
-pub const PROTOCOL_VERSION: u16 = 11;
+/// Reserved development epoch. Wire compatibility is intentionally not
+/// maintained between builds until Fut's protocol stabilizes.
+pub const PROTOCOL_VERSION: u16 = 0;
 /// Enough for 50,000 individually styled JSON cells while remaining a firm
 /// pre-allocation bound for the length-delimited transport.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
@@ -64,6 +66,14 @@ pub struct SelectedTarget {
     pub child_pid: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "scope", content = "id", rename_all = "snake_case")]
+pub enum SelectionExpectation {
+    Tab(TabId),
+    Workspace(WorkspaceId),
+    Session(SessionId),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SelectedView {
     /// Resource-tree revision from which this complete view was derived.
@@ -101,6 +111,8 @@ pub enum ClientMessage {
     },
     SelectTarget {
         selector: TargetSelector,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected: Option<SelectionExpectation>,
     },
     Detach,
     OpenLocation {
@@ -429,6 +441,7 @@ mod tests {
 
         let select = ClientMessage::SelectTarget {
             selector: selector.clone(),
+            expected: Some(SelectionExpectation::Tab(TabId::new())),
         };
         assert_eq!(
             decode_payload::<ClientMessage>(&encode_payload(&select).unwrap()).unwrap(),
@@ -480,7 +493,7 @@ mod tests {
             decode_payload::<ServerMessage>(&encode_payload(&switched).unwrap()).unwrap(),
             switched
         );
-        assert_eq!(PROTOCOL_VERSION, 11);
+        assert_eq!(PROTOCOL_VERSION, 0);
     }
 
     #[test]

@@ -2281,8 +2281,13 @@ async fn immediate_exit_interactive_create_pane_preserves_its_original_sibling()
                         terminal_id,
                         screen,
                     } => {
-                        assert_eq!(terminal_id, selected.terminal_id);
-                        saw_final_snapshot |= snapshot_text(&screen).contains("PANE_B_FINAL");
+                        assert!(
+                            terminal_id == selected.terminal_id || terminal_id == terminal_a,
+                            "snapshot came from an unrelated terminal"
+                        );
+                        if terminal_id == selected.terminal_id {
+                            saw_final_snapshot |= snapshot_text(&screen).contains("PANE_B_FINAL");
+                        }
                     }
                     ServerMessage::TerminalExited {
                         terminal_id,
@@ -3078,6 +3083,72 @@ done
 }
 
 #[tokio::test]
+async fn public_last_session_navigation_toggles_after_global_selection() {
+    let harness = Harness::start(
+        "printf 'LAST_SESSION_A_READY\r\n'; while IFS= read -r line; do [ \"$line\" = a ] && { printf x >> last-session-a-input; printf 'LAST_SESSION_A_INPUT\r\n'; }; done",
+    )
+    .await;
+    let second_root = harness.root.path().join("second-project");
+    fs::create_dir(&second_root).unwrap();
+    let ServerMessage::LocationOpened { selected: second, .. } = harness
+        .control_command(ClientMessage::OpenLocation {
+            name: Some("second-project".into()),
+            cwd: second_root,
+            program: Some("/bin/sh".into()),
+            argv: vec![
+                "-c".into(),
+                "printf 'LAST_SESSION_B_READY\r\n'; while IFS= read -r line; do [ \"$line\" = b ] && { printf x >> last-session-b-input; printf 'LAST_SESSION_B_INPUT\r\n'; }; done".into(),
+            ],
+        })
+        .await
+    else {
+        panic!("failed to create second session")
+    };
+    let snapshot = harness.resources().await;
+    let first_pane = snapshot.sessions[0].workspaces[0].tabs[0].panes[0].id;
+    let first_input = harness.root.path().join("cwd/last-session-a-input");
+    let second_input = harness
+        .root
+        .path()
+        .join("second-project/last-session-b-input");
+
+    let mut command = Command::new("/usr/bin/script");
+    command
+        .env_clear()
+        .env("HOME", harness.root.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", harness.root.path().join("runtime"))
+        .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+        .env("TERM", "xterm-256color")
+        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .arg(format!(
+            "stty rows 24 cols 90; exec '{}' --socket '{}' pane attach {first_pane}",
+            env!("CARGO_BIN_EXE_fut"),
+            harness.socket.display(),
+        ));
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("LAST_SESSION_A_READY").await;
+    client.send(b"\x02g");
+    client.wait_for("second-project").await;
+    client.send(b"\x1b[F\r");
+    client.wait_for("LAST_SESSION_B_READY").await;
+    client.send(b"b\n");
+    wait_for(DEADLINE, || second_input.exists()).await;
+    client.send(b"\x02Sa\n");
+    wait_for(DEADLINE, || first_input.exists()).await;
+    client.send(b"\x02Sb\n");
+    wait_for(DEADLINE, || {
+        fs::metadata(&second_input).is_ok_and(|metadata| metadata.len() >= 2)
+    })
+    .await;
+    client.send(b"\x02d");
+    client.wait_success().await;
+
+    assert!(process_alive(second.child_pid));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn linked_git_worktree_is_a_peer_workspace_and_reopens_idempotently() {
     let main_script = r#"printf 'MAIN_READY\r\n'; while IFS= read -r line; do case "$line" in main) printf 'MAIN_INPUT\r\n';; esac; done"#;
     let mut harness = Harness::start_with(main_script, |root| {
@@ -3396,6 +3467,54 @@ async fn public_client_navigator_switches_live_pty_and_preserves_terminal_isolat
 }
 
 #[tokio::test]
+async fn public_client_preserves_host_palette_indices_and_truecolor() {
+    let harness = Harness::start(
+        r"printf '\033[31mPALETTE_RED\033[0m \033[38;2;1;2;3mEXACT_RGB\033[0m\r\n'; while IFS= read -r line; do :; done",
+    )
+    .await;
+    let pane = harness.resources().await.sessions[0].workspaces[0].tabs[0].panes[0].id;
+
+    let mut command = Command::new("/usr/bin/script");
+    command
+        .env_clear()
+        .env("HOME", harness.root.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", harness.root.path().join("runtime"))
+        .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+        .env("TERM", "xterm-256color")
+        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .arg(format!(
+            "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {pane}",
+            env!("CARGO_BIN_EXE_fut"),
+            harness.socket.display(),
+        ));
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("PALETTE_RED").await;
+    client.wait_for("EXACT_RGB").await;
+    let output = client.text();
+    let content = output
+        .find("PALETTE_RED")
+        .expect("rendered output contains palette fixture");
+    assert!(
+        output[..content].rfind("\x1b[?2026h").is_some()
+            && output[content..].find("\x1b[?2026l").is_some(),
+        "client frame was not emitted atomically: {output:?}"
+    );
+    assert!(
+        output.contains("\x1b[38;5;1;49mPALETTE_RED"),
+        "indexed ANSI color was not emitted as a palette reference: {output:?}"
+    );
+    assert!(
+        output.contains("\x1b[38;2;1;2;3;49mEXACT_RGB"),
+        "truecolor was not emitted as exact RGB: {output:?}"
+    );
+
+    client.send(b"\x02d");
+    client.wait_success().await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn public_client_renders_simultaneous_panes_and_cycles_focus() {
     let harness = Harness::start(
         "printf 'SPLIT_A_READY\r\n'; while IFS= read -r line; do [ \"$line\" = a ] && printf 'SPLIT_A_INPUT\r\n'; done",
@@ -3439,7 +3558,7 @@ async fn public_client_renders_simultaneous_panes_and_cycles_focus() {
         panic!("failed to create public split pane")
     };
     client.wait_for("SPLIT_B_READY").await;
-    client.send(b"\x02l");
+    client.send(b"\x02o");
     client.send(b"b\n");
     client.wait_for("SPLIT_B_INPUT").await;
 
@@ -3453,7 +3572,7 @@ async fn public_client_renders_simultaneous_panes_and_cycles_focus() {
             program: Some("/bin/sh".into()),
             argv: vec![
                 "-c".into(),
-                "printf 'ZZZZZZZZ_READY\r\n'; while IFS= read -r line; do [ \"$line\" = d ] && printf 'DESTINATION_INPUT\r\n'; done".into(),
+                "printf 'ZZZZZZZZ_READY\r\n'; while IFS= read -r line; do [ \"$line\" = d ] && { : > destination-input; printf 'DESTINATION_INPUT\r\n'; }; done".into(),
             ],
         })
         .await
@@ -3482,8 +3601,15 @@ async fn public_client_renders_simultaneous_panes_and_cycles_focus() {
             command: fut::protocol::AcknowledgedCommand::CloseTarget,
         }
     );
-    client.send(b"d\n");
-    client.wait_for("DESTINATION_INPUT").await;
+    let destination_marker = harness.root.path().join("cwd/destination-input");
+    time::timeout(DEADLINE, async {
+        while !destination_marker.exists() {
+            client.send(b"d\n");
+            time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("pane-close fallback never reconciled: {:?}", client.text()));
     client.send(b"\x02d");
     client.wait_success().await;
 
@@ -3494,6 +3620,101 @@ async fn public_client_renders_simultaneous_panes_and_cycles_focus() {
     let a_screen = snapshot_containing(&mut a, terminal_a, "SPLIT_A_READY").await;
     assert!(!snapshot_text(&a_screen).contains("SPLIT_B_INPUT"));
     harness.detach(&mut a).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn public_directional_focus_follows_authored_geometry_when_zoomed_and_tiny() {
+    let harness = Harness::start(
+        "printf 'DIRECTION_A_READY\r\n'; while IFS= read -r line; do [ \"$line\" = a ] && { printf x >> direction-a; printf 'DIRECTION_A_INPUT\r\n'; }; done",
+    )
+    .await;
+    let resources = harness.resources().await;
+    let pane_a = resources.sessions[0].workspaces[0].tabs[0].panes[0].id;
+    let ServerMessage::PaneCreated { selected: pane_b } = harness
+        .control_command(ClientMessage::SplitPane {
+            pane_id: pane_a,
+            direction: fut::splits::SplitDirection::Right,
+            cwd: None,
+            program: Some("/bin/sh".into()),
+            argv: vec![
+                "-c".into(),
+                "printf 'DIRECTION_B_READY\r\n'; while IFS= read -r line; do case \"$line\" in b) printf x >> direction-b; printf 'DIRECTION_B_INPUT\r\n';; b2) printf x >> direction-b-up; printf 'DIRECTION_B_UP\r\n';; b3) printf x >> direction-b-zoom; printf 'DIRECTION_B_ZOOM\r\n';; esac; done".into(),
+            ],
+        })
+        .await
+    else {
+        panic!("failed to create right directional pane")
+    };
+    let ServerMessage::PaneCreated { selected: pane_c } = harness
+        .control_command(ClientMessage::SplitPane {
+            pane_id: pane_b.pane_id,
+            direction: fut::splits::SplitDirection::Down,
+            cwd: None,
+            program: Some("/bin/sh".into()),
+            argv: vec![
+                "-c".into(),
+                "printf 'DIRECTION_C_READY\r\n'; while IFS= read -r line; do case \"$line\" in c) printf x >> direction-c; printf 'DIRECTION_C_INPUT\r\n';; tiny) printf x >> direction-c-tiny; printf 'DIRECTION_C_TINY\r\n';; esac; done".into(),
+            ],
+        })
+        .await
+    else {
+        panic!("failed to create down directional pane")
+    };
+
+    let spawn = |columns: u16, pane: PaneId| {
+        let mut command = Command::new("/usr/bin/script");
+        command
+            .env_clear()
+            .env("HOME", harness.root.path().join("home"))
+            .env("PATH", "/usr/bin:/bin")
+            .env("TMPDIR", harness.root.path().join("runtime"))
+            .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+            .env("TERM", "xterm-256color")
+            .args(["-q", "/dev/null", "/bin/sh", "-c"])
+            .arg(format!(
+                "stty rows 30 cols {columns}; exec '{}' --socket '{}' pane attach {pane}",
+                env!("CARGO_BIN_EXE_fut"),
+                harness.socket.display(),
+            ));
+        PtyChild::spawn(command)
+    };
+
+    let cwd = harness.root.path().join("cwd");
+    let marker_size = |name: &str| {
+        fs::metadata(cwd.join(name))
+            .map(|metadata| metadata.len())
+            .unwrap_or(0)
+    };
+
+    let mut client = spawn(100, pane_a);
+    client.wait_for("DIRECTION_C_READY").await;
+    client.send(b"\x02lb\n");
+    wait_for(DEADLINE, || marker_size("direction-b") >= 1).await;
+    client.send(b"\x02jc\n");
+    wait_for(DEADLINE, || marker_size("direction-c") >= 1).await;
+    client.send(b"\x02kb2\n");
+    wait_for(DEADLINE, || marker_size("direction-b-up") >= 1).await;
+    client.send(b"\x02Pc\n");
+    wait_for(DEADLINE, || marker_size("direction-c") >= 2).await;
+    client.send(b"\x02Pb2\n");
+    wait_for(DEADLINE, || marker_size("direction-b-up") >= 2).await;
+    client.send(b"\x02ha\n");
+    wait_for(DEADLINE, || marker_size("direction-a") >= 1).await;
+    client.send(b"\x02z\x02lb3\n");
+    wait_for(DEADLINE, || marker_size("direction-b-zoom") >= 1).await;
+    client.send(b"\x02d");
+    client.wait_success().await;
+
+    let mut tiny = spawn(20, pane_b.pane_id);
+    tiny.wait_for("DIRECTION_B_READY").await;
+    tiny.send(b"\x02jtiny\n");
+    wait_for(DEADLINE, || marker_size("direction-c-tiny") >= 1).await;
+    tiny.send(b"\x02d");
+    tiny.wait_success().await;
+
+    assert!(process_alive(pane_b.child_pid));
+    assert!(process_alive(pane_c.child_pid));
     harness.shutdown().await;
 }
 
@@ -3551,7 +3772,7 @@ async fn public_client_accordion_resizes_focus_and_falls_back_narrowly() {
     narrow.wait_for("AAAAAAAA").await;
     narrow.send(b"size-a\n");
     narrow.wait_for("A_SIZE_23_37").await;
-    narrow.send(b"\x02l");
+    narrow.send(b"\x02o");
     narrow.send(b"size-b\n");
     narrow.wait_for("B_SIZE_23_37").await;
     narrow.send(b"\x02d");
@@ -3562,7 +3783,7 @@ async fn public_client_accordion_resizes_focus_and_falls_back_narrowly() {
     accordion.wait_for("BBBBBBBB").await;
     accordion.send(b"size-a\n");
     accordion.wait_for("A_SIZE_23_24").await;
-    accordion.send(b"\x02l");
+    accordion.send(b"\x02o");
     accordion.send(b"size-b\n");
     accordion.wait_for("B_SIZE_23_24").await;
     accordion.send(b"\x02d");
@@ -3626,7 +3847,7 @@ async fn public_pane_zoom_toggles_full_width_and_matches_command_dispatch() {
     client.send(b"restored\n");
     client.wait_for("RESTORED_23_39").await;
 
-    client.send(b"\x02k");
+    client.send(b"\x02:");
     client.send(b"pane zoom");
     client.send(b"\r");
     client.send(b"command\n");
@@ -3642,9 +3863,11 @@ async fn public_pane_zoom_toggles_full_width_and_matches_command_dispatch() {
 #[tokio::test]
 async fn public_tab_navigation_and_right_down_splits_share_the_command_catalog() {
     let split_cwd = tempfile::tempdir().unwrap();
+    let back_marker = split_cwd.path().join("back-marker");
     let script = format!(
-        "printf 'ACTION_A_READY\\r\\n'; while IFS= read -r line; do case \"$line\" in back) printf 'ACTION_A_BACK\\r\\n';; cd-now) cd '{}'; printf 'ACTION_A_CHANGED_DIR\\r\\n';; esac; done",
-        split_cwd.path().display()
+        "printf 'ACTION_A_READY\\r\\n'; while IFS= read -r line; do case \"$line\" in back) printf x >> '{}'; printf 'ACTION_A_BACK\\r\\n';; cd-now) cd '{}'; printf 'ACTION_A_CHANGED_DIR\\r\\n';; esac; done",
+        back_marker.display(),
+        split_cwd.path().display(),
     );
     let harness = Harness::start(&script).await;
     let resources = harness.resources().await;
@@ -3683,13 +3906,50 @@ async fn public_tab_navigation_and_right_down_splits_share_the_command_catalog()
         ));
     let mut client = PtyChild::spawn(command);
     client.wait_for("ACTION_A_READY").await;
+    client.wait_for("second").await;
     client.send(b"\x02n");
     client.wait_for("TAB_B_READY").await;
-    client.send(b"\x02p");
+    client.send(b"\x02T");
     client.send(b"back\n");
-    client.wait_for("ACTION_A_BACK").await;
+    wait_for(DEADLINE, || {
+        fs::metadata(&back_marker).is_ok_and(|metadata| metadata.len() >= 1)
+    })
+    .await;
     client.send(b"cd-now\n");
     client.wait_for("ACTION_A_CHANGED_DIR").await;
+
+    let inherited_marker = split_cwd.path().join("tab-cwd");
+    client.send(b"\x02c");
+    client.wait_for("sh-3.2$").await;
+    client.send(b"pwd>tab-cwd\n");
+    wait_for(DEADLINE, || inherited_marker.exists()).await;
+    assert_eq!(
+        fs::read_to_string(&inherited_marker).unwrap().trim(),
+        split_cwd
+            .path()
+            .canonicalize()
+            .unwrap()
+            .display()
+            .to_string()
+    );
+    client.send(b"exit\n");
+    resources_when(&harness, |snapshot| {
+        snapshot.sessions[0].workspaces[0].tabs.len() == 2
+    })
+    .await;
+    time::timeout(DEADLINE, async {
+        while !fs::metadata(&back_marker).is_ok_and(|metadata| metadata.len() >= 2) {
+            client.send(b"\x021back\n");
+            time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "numbered tab navigation never reconciled: {:?}",
+            client.text()
+        )
+    });
 
     client.send(b"\x02|");
     client.send(b": > right-split-marker\n");
@@ -3698,7 +3958,7 @@ async fn public_tab_navigation_and_right_down_splits_share_the_command_catalog()
     })
     .await;
 
-    client.send(b"\x02k");
+    client.send(b"\x02:");
     client.send(b"split pane down\r");
     client.send(b": > down-split-marker\n");
     wait_for(DEADLINE, || {
@@ -3735,7 +3995,7 @@ async fn public_tab_navigation_and_right_down_splits_share_the_command_catalog()
 #[tokio::test]
 async fn isolated_daily_driver_journey() {
     let harness = Harness::start(
-        "printf 'JOURNEY_MAIN_READY\r\n'; while IFS= read -r line; do case \"$line\" in main) printf 'JOURNEY_MAIN_INPUT\r\n';; fallback) printf 'JOURNEY_EXIT_FALLBACK\r\n';; reattach) printf 'JOURNEY_REATTACHED_INPUT\r\n';; esac; done",
+        "printf 'JOURNEY_MAIN_READY\r\n'; while IFS= read -r line; do case \"$line\" in main) : > journey-main; printf 'JOURNEY_MAIN_INPUT\r\n';; fallback) : > journey-fallback; printf 'JOURNEY_EXIT_FALLBACK\r\n';; reattach) : > journey-reattach; printf 'JOURNEY_REATTACHED_INPUT\r\n';; esac; done",
     )
     .await;
     let resources = harness.resources().await;
@@ -3749,7 +4009,7 @@ async fn isolated_daily_driver_journey() {
             program: Some("/bin/sh".into()),
             argv: vec![
                 "-c".into(),
-                "printf 'TAB2_READY_729\r\n'; while IFS= read -r line; do case \"$line\" in second) printf 'TAB2_INPUT_729\r\n';; exit-now) exit;; esac; done"
+                "printf 'TAB2_READY_729\r\n'; while IFS= read -r line; do case \"$line\" in second) : > journey-second; printf 'TAB2_INPUT_729\r\n';; exit-now) exit;; esac; done"
                     .into(),
             ],
         })
@@ -3776,18 +4036,20 @@ async fn isolated_daily_driver_journey() {
         PtyChild::spawn(command)
     };
 
+    let journey_marker = |name: &str| harness.root.path().join("cwd").join(name);
+
     let mut client = spawn_client(original_pane, 100);
     client.wait_for("JOURNEY_MAIN_READY").await;
     client.send(b"main\n");
-    client.wait_for("JOURNEY_MAIN_INPUT").await;
+    wait_for_file(journey_marker("journey-main")).await;
 
     client.send(b"\x02|");
-    client.send(b"printf 'JOURNEY_RIGHT_SPLIT\\r\\n'\n");
-    client.wait_for("JOURNEY_RIGHT_SPLIT").await;
-    client.send(b"\x02k");
+    client.send(b":>journey-right\n");
+    wait_for_file(journey_marker("journey-right")).await;
+    client.send(b"\x02:");
     client.send(b"split pane down\r");
-    client.send(b"printf 'JOURNEY_DOWN_SPLIT\\r\\n'\n");
-    client.wait_for("JOURNEY_DOWN_SPLIT").await;
+    client.send(b":>journey-down\n");
+    wait_for_file(journey_marker("journey-down")).await;
 
     let split_resources = resources_when(&harness, |snapshot| {
         snapshot.sessions[0].workspaces[0].tabs[0].panes.len() == 3
@@ -3805,17 +4067,17 @@ async fn isolated_daily_driver_journey() {
 
     client.send(b"\x02z");
     client.wait_for("zoom ").await;
-    client.send(b"printf 'JOURNEY_ZOOMED\\r\\n'\n");
-    client.wait_for("JOURNEY_ZOOMED").await;
+    client.send(b":>journey-zoomed\n");
+    wait_for_file(journey_marker("journey-zoomed")).await;
     client.send(b"\x02z");
 
     client.send(b"\x02n");
     client.wait_for("TAB2_READY_729").await;
     client.send(b"second\n");
-    client.wait_for("TAB2_INPUT_729").await;
+    wait_for_file(journey_marker("journey-second")).await;
     client.send(b"\x02p");
-    client.send(b"printf 'JOURNEY_BACK_ON_MAIN\\r\\n'\n");
-    client.wait_for("JOURNEY_BACK_ON_MAIN").await;
+    client.send(b":>journey-back\n");
+    wait_for_file(journey_marker("journey-back")).await;
     client.send(b"\x02n");
     client.send(b"exit-now\n");
 
@@ -3824,8 +4086,20 @@ async fn isolated_daily_driver_journey() {
     })
     .await;
     assert_eq!(remaining.sessions[0].workspaces[0].tabs[0].panes.len(), 3);
-    client.send(b"fallback\n");
-    client.wait_for("JOURNEY_EXIT_FALLBACK").await;
+    let fallback_marker = journey_marker("journey-fallback");
+    time::timeout(DEADLINE, async {
+        while !fallback_marker.exists() {
+            client.send(b"fallback\n");
+            time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "focused-exit fallback never reconciled: {:?}",
+            client.text()
+        )
+    });
     assert!(!process_alive(second.child_pid));
 
     client.send(b"\x02d");
@@ -3834,7 +4108,7 @@ async fn isolated_daily_driver_journey() {
     let mut reattached = spawn_client(reattach_pane, 60);
     reattached.wait_for("JOURNEY_MAIN_READY").await;
     reattached.send(b"reattach\n");
-    reattached.wait_for("JOURNEY_REATTACHED_INPUT").await;
+    wait_for_file(journey_marker("journey-reattach")).await;
     reattached.send(b"\x02d");
     reattached.wait_success().await;
 
@@ -3864,6 +4138,8 @@ async fn isolated_keyboard_chaos_journey() {
     let mut rng = ChaosRng::new(seed);
     let mut pane_processes = HashMap::new();
     let mut tab_history = HashMap::from([(current_tab, current_pane)]);
+    let mut last_panes = HashMap::new();
+    let mut last_tab = None;
 
     let spawn_client = |pane: PaneId, columns: u16| {
         let mut command = Command::new("/usr/bin/script");
@@ -3907,7 +4183,10 @@ async fn isolated_keyboard_chaos_journey() {
             .iter()
             .position(|pane| pane.id == current_pane)
             .expect("current chaos pane remains open");
-        let mut action = rng.index(10);
+        let previous_tab = current_tab;
+        let previous_pane = current_pane;
+        let mut reset_history = false;
+        let mut action = rng.index(14);
         if matches!(action, 0 | 1) && tab.panes.len() >= 6 {
             action = 2 + rng.index(3);
         }
@@ -3919,6 +4198,23 @@ async fn isolated_keyboard_chaos_journey() {
         }
         if matches!(action, 5 | 6) && workspace.tabs.len() == 1 {
             action = 7;
+        }
+        if action == 11 && workspace.tabs.len() == 1 {
+            action = 7;
+        }
+        if action == 12
+            && !last_panes.get(&current_tab).is_some_and(|pane_id| {
+                *pane_id != current_pane && tab.panes.iter().any(|pane| pane.id == *pane_id)
+            })
+        {
+            action = 2;
+        }
+        if action == 13
+            && !last_tab.is_some_and(|tab_id| {
+                tab_id != current_tab && workspace.tabs.iter().any(|tab| tab.id == tab_id)
+            })
+        {
+            action = if workspace.tabs.len() > 1 { 5 } else { 7 };
         }
 
         let action_name = match action {
@@ -3955,7 +4251,7 @@ async fn isolated_keyboard_chaos_journey() {
                 "split-right"
             }
             1 => {
-                client.send(b"\x02k");
+                client.send(b"\x02:");
                 client.send(b"split pane down\r");
                 let pane_count = tab.panes.len() + 1;
                 let snapshot = resources_when(&harness, |snapshot| {
@@ -3979,12 +4275,12 @@ async fn isolated_keyboard_chaos_journey() {
                 "launcher-split-down"
             }
             2 => {
-                client.send(b"\x02l");
+                client.send(b"\x02o");
                 current_pane = tab.panes[(pane_index + 1) % tab.panes.len()].id;
                 "focus-next"
             }
             3 => {
-                client.send(b"\x02h");
+                client.send(b"\x02;");
                 current_pane = tab.panes[(pane_index + tab.panes.len() - 1) % tab.panes.len()].id;
                 "focus-previous"
             }
@@ -4070,12 +4366,77 @@ async fn isolated_keyboard_chaos_journey() {
                 client = spawn_client(current_pane, 48 + rng.index(73) as u16);
                 tab_history.clear();
                 tab_history.insert(current_tab, current_pane);
+                last_panes.clear();
+                last_tab = None;
+                reset_history = true;
                 "detach-reattach"
+            }
+            10 => {
+                let (binding, name) = match rng.index(4) {
+                    0 => (b"\x02h".as_slice(), "focus-left"),
+                    1 => (b"\x02j".as_slice(), "focus-down"),
+                    2 => (b"\x02k".as_slice(), "focus-up"),
+                    _ => (b"\x02l".as_slice(), "focus-right"),
+                };
+                client.send(binding);
+                let process =
+                    chaos_identify_pane(&mut client, harness.root.path(), step, seed).await;
+                current_pane = pane_processes
+                    .iter()
+                    .find_map(|(pane_id, expected)| (expected == &process).then_some(*pane_id))
+                    .expect("directional focus remains on a known pane");
+                name
+            }
+            11 => {
+                let numbered = workspace
+                    .tabs
+                    .iter()
+                    .take(10)
+                    .enumerate()
+                    .filter(|(_, tab)| tab.id != current_tab)
+                    .collect::<Vec<_>>();
+                let (index, tab) = numbered[rng.index(numbered.len())];
+                let suffix = if index == 9 { b'0' } else { b'1' + index as u8 };
+                client.send(&[2, suffix]);
+                current_tab = tab.id;
+                current_pane = tab_history
+                    .get(&current_tab)
+                    .copied()
+                    .filter(|pane_id| tab.panes.iter().any(|pane| pane.id == *pane_id))
+                    .unwrap_or(tab.panes[0].id);
+                "tab-numbered"
+            }
+            12 => {
+                client.send(b"\x02P");
+                current_pane = last_panes[&current_tab];
+                "pane-last"
+            }
+            13 => {
+                client.send(b"\x02T");
+                current_tab = last_tab.expect("last tab action was validated");
+                let tab = workspace
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.id == current_tab)
+                    .unwrap();
+                current_pane = tab_history
+                    .get(&current_tab)
+                    .copied()
+                    .filter(|pane_id| tab.panes.iter().any(|pane| pane.id == *pane_id))
+                    .unwrap_or(tab.panes[0].id);
+                "tab-last"
             }
             _ => unreachable!(),
         };
 
         eprintln!("chaos seed={seed} step={step}/{steps} action={action_name}");
+        if !reset_history {
+            if previous_tab == current_tab && previous_pane != current_pane {
+                last_panes.insert(current_tab, previous_pane);
+            } else if previous_tab != current_tab {
+                last_tab = Some(previous_tab);
+            }
+        }
         tab_history.insert(current_tab, current_pane);
         chaos_probe_pane(
             &mut client,
@@ -4305,11 +4666,13 @@ done
     left.send(b"linked\nsize-linked\n");
     left.wait_for("ZETA_INPUT").await;
     left.wait_for("ZETA_SIZE_23_96").await;
-    left.send(b"\x02w");
-    left.wait_for_count("↑↓ enter · esc", 2).await;
-    left.send(b"k\r");
+    left.send(b"\x02W");
     left.send(b"main\n");
     left.wait_for("BRAVO_ACK").await;
+    left.send(b"\x02Wlinked\n");
+    left.wait_for_count("ZETA_INPUT", 2).await;
+    left.send(b"\x02Wmain\n");
+    left.wait_for_count("BRAVO_ACK", 2).await;
     left.send(b"\x02d");
     left.wait_success().await;
 
@@ -4322,7 +4685,6 @@ done
     .unwrap();
     let mut right = spawn_client(120, linked_target.pane_id);
     right.wait_for("feature").await;
-    right.wait_for("\x1b[2;97H").await;
     assert!(matches!(
         harness
             .control_command(ClientMessage::RenameTarget {
@@ -4427,7 +4789,7 @@ async fn public_command_bar_filters_labels_actions_and_matches_direct_dispatch()
     client.wait_for("COMMAND_ALPHA_READY").await;
     client.wait_for("COMMAND_ZETA_READY").await;
 
-    client.send(b"\x02k");
+    client.send(b"\x02:");
     client.wait_for("Open global navigator").await;
     client.wait_for("Ctrl-b g").await;
     client.send(b"\x1b[200~frobnicate\nzeta\x1b[201~");
@@ -4435,7 +4797,7 @@ async fn public_command_bar_filters_labels_actions_and_matches_direct_dispatch()
     client.send(b"\x15next pane\rzeta\n");
     client.wait_for("COMMAND_ZETA_ACK").await;
 
-    client.send(b"\x02halpha\n");
+    client.send(b"\x02;alpha\n");
     client.wait_for("COMMAND_ALPHA_ACK").await;
     assert!(
         !client.text().contains("UNEXPECTED"),
@@ -4477,7 +4839,7 @@ async fn command_bar_create_failure_releases_input_to_the_original_terminal() {
         ));
     let mut client = PtyChild::spawn(command);
     client.wait_for("CREATE_FAILURE_READY").await;
-    client.send(b"\x02kcreate tab\r");
+    client.send(b"\x02:create tab\r");
     client.wait_for("create tab failed").await;
     client.send(b"after\n");
     client.wait_for("CREATE_FAILURE_RECOVERED").await;
@@ -5497,7 +5859,10 @@ async fn select_view_response(
         connection,
         Envelope {
             request_id: Some(request_id),
-            message: ClientMessage::SelectTarget { selector },
+            message: ClientMessage::SelectTarget {
+                selector,
+                expected: None,
+            },
         },
     )
     .await;
@@ -5520,7 +5885,10 @@ async fn select_error(connection: &mut Connection, selector: TargetSelector) -> 
         connection,
         Envelope {
             request_id: Some(request_id),
-            message: ClientMessage::SelectTarget { selector },
+            message: ClientMessage::SelectTarget {
+                selector,
+                expected: None,
+            },
         },
     )
     .await;
@@ -5653,6 +6021,16 @@ async fn wait_for(timeout: Duration, mut condition: impl FnMut() -> bool) {
     .expect("condition did not become true before timeout");
 }
 
+async fn wait_for_file(path: PathBuf) {
+    time::timeout(DEADLINE, async {
+        while !path.exists() {
+            time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("marker did not appear before timeout: {}", path.display()));
+}
+
 async fn chaos_identify_pane(
     client: &mut PtyChild,
     root: &std::path::Path,
@@ -5660,14 +6038,15 @@ async fn chaos_identify_pane(
     seed: u64,
 ) -> String {
     let marker = root.join("cwd").join(format!("a{step}"));
-    let command = format!("echo $$>a{step}\n");
+    let command = format!("echo $$>'{}'\n", marker.display());
+    let paste = format!("\x1b[200~{command}\x1b[201~");
     time::sleep(Duration::from_millis(100)).await;
     time::timeout(DEADLINE, async {
         loop {
             if marker.exists() {
                 break;
             }
-            client.send(command.as_bytes());
+            client.send(paste.as_bytes());
             time::sleep(Duration::from_millis(100)).await;
         }
     })
@@ -5684,14 +6063,15 @@ async fn chaos_probe_pane(
     seed: u64,
 ) {
     let marker = root.join("cwd").join(format!("p{step}"));
-    let command = format!("echo $$>p{step}\n");
+    let command = format!("echo $$>'{}'\n", marker.display());
+    let paste = format!("\x1b[200~{command}\x1b[201~");
     time::sleep(Duration::from_millis(100)).await;
     time::timeout(DEADLINE, async {
         loop {
             if marker.exists() {
                 break;
             }
-            client.send(command.as_bytes());
+            client.send(paste.as_bytes());
             time::sleep(Duration::from_millis(100)).await;
         }
     })

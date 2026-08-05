@@ -33,8 +33,8 @@ use crate::{
     project::{ProjectError, ProjectResolver, ResolvedLocation},
     protocol::{
         AcknowledgedCommand, ClientMessage, ClientMode, Envelope, OpenDisposition,
-        PROTOCOL_VERSION, RenameSelector, SelectedTarget, SelectedView, ServerMessage, codec,
-        decode_payload, encode_payload,
+        PROTOCOL_VERSION, RenameSelector, SelectedTarget, SelectedView, SelectionExpectation,
+        ServerMessage, codec, decode_payload, encode_payload,
     },
     resources::{
         CheckoutDestination, InitialPath, ResourceError, ResourceTree, TabPath, TargetSelector,
@@ -1008,7 +1008,7 @@ async fn handle_connection(
                 .await?;
                 return Ok(());
             }
-            let attachment = match lease_view(&shared, selector, client).await {
+            let attachment = match lease_view(&shared, selector, None, client).await {
                 Ok(attachment) => attachment,
                 Err(error) => {
                     send_error(&mut framed, first.request_id, error.code, &error.message).await?;
@@ -1061,7 +1061,11 @@ async fn handle_connection(
                                 AcknowledgedCommand::Resize,
                                 attachment.focused_terminal().resize(size).await,
                             ).await?;
-                        } else {
+                        // An old focused pane can leave one resize queued while
+                        // exit fallback selects its replacement. Interactive
+                        // resizes are uncorrelated, so discard only that stale
+                        // transition message; correlated callers keep the error.
+                        } else if should_report_unfocused_resize(envelope.request_id) {
                             send_error(
                                 &mut framed,
                                 envelope.request_id,
@@ -1070,10 +1074,11 @@ async fn handle_connection(
                             ).await?;
                         }
                     }
-                    ClientMessage::SelectTarget { selector } => {
+                    ClientMessage::SelectTarget { selector, expected } => {
                         let selection = match observe_selection(
                             &shared,
                             &selector,
+                            expected.as_ref(),
                             attachment.focused.selected.terminal_id,
                         ).await {
                             Ok(selection) => selection,
@@ -1104,7 +1109,7 @@ async fn handle_connection(
                             ).await?;
                             continue;
                         }
-                        match switch_candidate(&shared, selector, client).await {
+                        match switch_candidate(&shared, selector, expected.as_ref(), client).await {
                             Ok(candidate) => {
                                 attachment = candidate;
                                 send(
@@ -1117,10 +1122,22 @@ async fn handle_connection(
                         }
                     }
                     ClientMessage::CreateTab { workspace_id, name, cwd, program, argv } => {
+                        let inherited_cwd = if cwd.is_none()
+                            && workspace_id == attachment.focused.selected.workspace_id
+                        {
+                            let terminal = attachment.focused_terminal();
+                            Some((
+                                terminal.child_pid(),
+                                terminal.spawn_cwd().to_path_buf(),
+                            ))
+                        } else {
+                            None
+                        };
                         let request = CreateTabRequest {
                             workspace_id,
                             name,
                             cwd,
+                            inherited_cwd,
                             program,
                             argv,
                             size: spawn_size,
@@ -1293,6 +1310,7 @@ async fn handle_connection(
                             if let Ok(candidate) = lease_view(
                                 &shared,
                                 Some(TargetSelector::Terminal(terminal_id)),
+                                None,
                                 client,
                             ).await
                                 && candidate.all_running().is_ok()
@@ -1380,6 +1398,7 @@ async fn control_loop(
                     workspace_id,
                     name,
                     cwd,
+                    inherited_cwd: None,
                     program,
                     argv,
                     size: TerminalSize {
@@ -1602,6 +1621,7 @@ async fn control_loop(
 async fn lease_view(
     shared: &Shared,
     selector: Option<TargetSelector>,
+    expected: Option<&SelectionExpectation>,
     client: ClientId,
 ) -> Result<Attachment, DaemonError> {
     let state = shared.lock().await;
@@ -1609,6 +1629,7 @@ async fn lease_view(
         return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
     }
     let focused = state.resources.resolve_terminal_target(selector)?;
+    validate_selection_expectation(focused, expected)?;
     let paths = state
         .resources
         .open_terminal_paths_for_tab(focused.tab_id)?;
@@ -1670,6 +1691,26 @@ async fn lease_view(
     ))
 }
 
+fn validate_selection_expectation(
+    path: crate::resources::ResolvedTerminalPath,
+    expected: Option<&SelectionExpectation>,
+) -> Result<(), DaemonError> {
+    let matches = match expected {
+        None => true,
+        Some(SelectionExpectation::Tab(tab_id)) => path.tab_id == *tab_id,
+        Some(SelectionExpectation::Workspace(workspace_id)) => path.workspace_id == *workspace_id,
+        Some(SelectionExpectation::Session(session_id)) => path.session_id == *session_id,
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(DaemonError::new(
+            "target_moved",
+            "navigation target moved outside its expected scope",
+        ))
+    }
+}
+
 async fn focus_leased_attachment(
     shared: &Shared,
     attachment: &mut Attachment,
@@ -1722,6 +1763,7 @@ enum TargetSelection {
 async fn observe_selection(
     shared: &Shared,
     selector: &TargetSelector,
+    expected: Option<&SelectionExpectation>,
     focused_terminal_id: TerminalId,
 ) -> Result<TargetSelection, DaemonError> {
     let state = shared.lock().await;
@@ -1731,6 +1773,7 @@ async fn observe_selection(
     let path = state
         .resources
         .resolve_terminal_target(Some(selector.clone()))?;
+    validate_selection_expectation(path, expected)?;
     let runtime = state
         .runtimes
         .get(&path.terminal_id)
@@ -1879,9 +1922,10 @@ async fn reconcile_attachment(
 async fn switch_candidate(
     shared: &Shared,
     selector: TargetSelector,
+    expected: Option<&SelectionExpectation>,
     client: ClientId,
 ) -> Result<Attachment, DaemonError> {
-    let attachment = lease_view(shared, Some(selector), client).await?;
+    let attachment = lease_view(shared, Some(selector), expected, client).await?;
     attachment.all_running()?;
     Ok(attachment)
 }
@@ -2065,6 +2109,7 @@ struct CreateTabRequest {
     workspace_id: WorkspaceId,
     name: Option<String>,
     cwd: Option<PathBuf>,
+    inherited_cwd: Option<(u32, PathBuf)>,
     program: Option<PathBuf>,
     argv: Vec<String>,
     size: TerminalSize,
@@ -2090,6 +2135,7 @@ async fn create_tab(
         workspace_id,
         name,
         cwd,
+        inherited_cwd,
         program,
         argv,
         size,
@@ -2101,7 +2147,7 @@ async fn create_tab(
         }
         state.resources.workspace_root(workspace_id)?.to_path_buf()
     };
-    let cwd = resolve_spawn_cwd(&root, cwd).await?;
+    let cwd = resolve_creation_cwd(&root, cwd, inherited_cwd).await?;
     let program = program.unwrap_or_else(|| {
         std::env::var_os("SHELL")
             .map(PathBuf::from)
@@ -2249,13 +2295,7 @@ async fn create_pane(
         };
         (workspace_id, session_id, root, inherited_cwd)
     };
-    let cwd = match (cwd, inherited_cwd) {
-        (Some(cwd), _) => resolve_spawn_cwd(&root, Some(cwd)).await?,
-        (None, Some((pid, fallback))) => {
-            resolve_spawn_cwd(&root, process_cwd(pid).await.or(Some(fallback))).await?
-        }
-        (None, None) => resolve_spawn_cwd(&root, None).await?,
-    };
+    let cwd = resolve_creation_cwd(&root, cwd, inherited_cwd).await?;
     let program = program.unwrap_or_else(|| {
         std::env::var_os("SHELL")
             .map(PathBuf::from)
@@ -2377,6 +2417,27 @@ async fn resolve_spawn_cwd(root: &Path, cwd: Option<PathBuf>) -> Result<PathBuf,
     Ok(canonical)
 }
 
+async fn resolve_creation_cwd(
+    root: &Path,
+    explicit: Option<PathBuf>,
+    inherited: Option<(u32, PathBuf)>,
+) -> Result<PathBuf, DaemonError> {
+    if explicit.is_some() {
+        return resolve_spawn_cwd(root, explicit).await;
+    }
+    if let Some((pid, fallback)) = inherited {
+        if let Some(current) = process_cwd(pid).await
+            && let Ok(cwd) = resolve_spawn_cwd(root, Some(current)).await
+        {
+            return Ok(cwd);
+        }
+        if let Ok(cwd) = resolve_spawn_cwd(root, Some(fallback)).await {
+            return Ok(cwd);
+        }
+    }
+    resolve_spawn_cwd(root, None).await
+}
+
 async fn process_cwd(pid: u32) -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
@@ -2471,6 +2532,10 @@ fn is_uncorrelated_transition_error(
     request_id.is_none() && matches!(result, Err(CommandError::Stopped))
 }
 
+fn should_report_unfocused_resize(request_id: Option<uuid::Uuid>) -> bool {
+    request_id.is_some()
+}
+
 async fn send_command_error(
     framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     request_id: Option<uuid::Uuid>,
@@ -2518,8 +2583,57 @@ async fn send(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn inherited_cwd_falls_back_through_spawn_directory_to_workspace_root() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let spawn = root.join("spawn");
+        tokio::fs::create_dir(&spawn).await.unwrap();
+
+        assert_eq!(
+            resolve_creation_cwd(root, None, Some((u32::MAX, spawn.clone())))
+                .await
+                .unwrap(),
+            spawn.canonicalize().unwrap()
+        );
+        assert_eq!(
+            resolve_creation_cwd(root, None, Some((u32::MAX, root.join("missing"))))
+                .await
+                .unwrap(),
+            root.canonicalize().unwrap()
+        );
+        assert_eq!(
+            resolve_creation_cwd(root, Some(PathBuf::from("missing")), None)
+                .await
+                .unwrap_err()
+                .code,
+            "invalid_cwd"
+        );
+    }
+
     #[test]
-    fn stopped_transition_input_is_silent_only_when_uncorrelated() {
+    fn scoped_selection_rejects_a_pane_that_moved_before_acquisition() {
+        let path = crate::resources::ResolvedTerminalPath {
+            session_id: SessionId::new(),
+            workspace_id: WorkspaceId::new(),
+            tab_id: TabId::new(),
+            pane_id: PaneId::new(),
+            terminal_id: TerminalId::new(),
+        };
+        assert!(
+            validate_selection_expectation(path, Some(&SelectionExpectation::Tab(path.tab_id)))
+                .is_ok()
+        );
+        assert_eq!(
+            validate_selection_expectation(path, Some(&SelectionExpectation::Tab(TabId::new())))
+                .unwrap_err()
+                .code,
+            "target_moved"
+        );
+    }
+
+    #[test]
+    fn transition_input_and_resize_are_silent_only_when_uncorrelated() {
         assert!(is_uncorrelated_transition_error(
             None,
             &Err(CommandError::Stopped)
@@ -2532,6 +2646,8 @@ mod tests {
             None,
             &Err(CommandError::Busy)
         ));
+        assert!(!should_report_unfocused_resize(None));
+        assert!(should_report_unfocused_resize(Some(uuid::Uuid::new_v4())));
     }
 
     fn inconsistent_state() -> (SharedState, InitialPath) {
@@ -2740,6 +2856,7 @@ mod tests {
         let stale_attachment = lease_view(
             &shared,
             Some(TargetSelector::Pane(path.pane_id)),
+            None,
             ClientId::new(),
         )
         .await
@@ -2761,9 +2878,14 @@ mod tests {
             layout: _,
             fallback_terminal_ids,
             resource_revision,
-        } = observe_selection(&shared, &TargetSelector::Pane(path.pane_id), focused.id())
-            .await
-            .unwrap()
+        } = observe_selection(
+            &shared,
+            &TargetSelector::Pane(path.pane_id),
+            None,
+            focused.id(),
+        )
+        .await
+        .unwrap()
         else {
             panic!("the focused terminal should be observed in place");
         };
@@ -2780,11 +2902,14 @@ mod tests {
         assert_eq!(resource_revision, shared.lock().await.resources.revision());
 
         sibling.close().await.unwrap();
-        let TargetSelection::Focused { panes, layout, .. } =
-            observe_selection(&shared, &TargetSelector::Pane(path.pane_id), focused.id())
-                .await
-                .unwrap()
-        else {
+        let TargetSelection::Focused { panes, layout, .. } = observe_selection(
+            &shared,
+            &TargetSelector::Pane(path.pane_id),
+            None,
+            focused.id(),
+        )
+        .await
+        .unwrap() else {
             unreachable!()
         };
         assert_eq!(panes.len(), 1);

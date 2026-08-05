@@ -56,57 +56,64 @@ pub(super) fn client_layout(host: Rect, ui: UiConfig) -> ClientLayout {
         };
     }
 
-    let (body, tab_bar) = match ui.tab_bar_position {
+    let docked = host.width >= WORKSPACE_SIDEBAR_WIDTH.saturating_add(MIN_DOCKED_TERMINAL_WIDTH);
+    let (workspace, docked_sidebar) = if docked {
+        let sidebar = sidebar_rect(host, ui.workspace_sidebar_position)
+            .expect("nonempty host has a sidebar rectangle");
+        let workspace = match ui.workspace_sidebar_position {
+            WorkspaceSidebarPosition::Left => Rect::new(
+                host.x.saturating_add(WORKSPACE_SIDEBAR_WIDTH),
+                host.y,
+                host.width - WORKSPACE_SIDEBAR_WIDTH,
+                host.height,
+            ),
+            WorkspaceSidebarPosition::Right => Rect::new(
+                host.x,
+                host.y,
+                host.width - WORKSPACE_SIDEBAR_WIDTH,
+                host.height,
+            ),
+        };
+        (workspace, Some(sidebar))
+    } else {
+        (host, None)
+    };
+
+    let (terminal, tab_bar) = match ui.tab_bar_position {
         TabBarPosition::Top => (
             Rect::new(
-                host.x,
-                host.y.saturating_add(1),
-                host.width,
-                host.height - 1,
+                workspace.x,
+                workspace.y.saturating_add(1),
+                workspace.width,
+                workspace.height - 1,
             ),
-            Some(Rect::new(host.x, host.y, host.width, 1)),
+            Some(Rect::new(workspace.x, workspace.y, workspace.width, 1)),
         ),
         TabBarPosition::Bottom => (
-            Rect::new(host.x, host.y, host.width, host.height - 1),
+            Rect::new(
+                workspace.x,
+                workspace.y,
+                workspace.width,
+                workspace.height - 1,
+            ),
             Some(Rect::new(
-                host.x,
-                host.y.saturating_add(host.height - 1),
-                host.width,
+                workspace.x,
+                workspace.y.saturating_add(workspace.height - 1),
+                workspace.width,
                 1,
             )),
         ),
     };
 
-    let drawer = sidebar_rect(body, ui.workspace_sidebar_position);
-    let docked = body.height >= 2
-        && body.width >= WORKSPACE_SIDEBAR_WIDTH.saturating_add(MIN_DOCKED_TERMINAL_WIDTH);
-    let (terminal, workspace_sidebar) = if docked {
-        let sidebar = drawer.expect("nonempty docked body has a sidebar rectangle");
-        let terminal = match ui.workspace_sidebar_position {
-            WorkspaceSidebarPosition::Left => Rect::new(
-                body.x.saturating_add(WORKSPACE_SIDEBAR_WIDTH),
-                body.y,
-                body.width - WORKSPACE_SIDEBAR_WIDTH,
-                body.height,
-            ),
-            WorkspaceSidebarPosition::Right => Rect::new(
-                body.x,
-                body.y,
-                body.width - WORKSPACE_SIDEBAR_WIDTH,
-                body.height,
-            ),
-        };
-        (terminal, Some(sidebar))
-    } else {
-        (body, None)
-    };
-
     ClientLayout {
         terminal,
         tab_bar,
-        workspace_sidebar: workspace_sidebar
+        workspace_sidebar: docked_sidebar
             .map(WorkspaceSidebarLayout::Docked)
-            .or_else(|| drawer.map(WorkspaceSidebarLayout::Drawer)),
+            .or_else(|| {
+                sidebar_rect(host, ui.workspace_sidebar_position)
+                    .map(WorkspaceSidebarLayout::Drawer)
+            }),
     }
 }
 
@@ -479,15 +486,15 @@ mod tests {
             ClientLayout {
                 tab_bar: Some(Rect::new(3, 4, 119, 1)),
                 terminal: Rect::new(3, 5, 119, 23),
-                workspace_sidebar: Some(WorkspaceSidebarLayout::Drawer(Rect::new(3, 5, 24, 23,))),
+                workspace_sidebar: Some(WorkspaceSidebarLayout::Drawer(Rect::new(3, 4, 24, 24,))),
             }
         );
         assert_eq!(
             client_layout(Rect::new(3, 4, 120, 24), top_left),
             ClientLayout {
-                tab_bar: Some(Rect::new(3, 4, 120, 1)),
+                tab_bar: Some(Rect::new(27, 4, 96, 1)),
                 terminal: Rect::new(27, 5, 96, 23),
-                workspace_sidebar: Some(WorkspaceSidebarLayout::Docked(Rect::new(3, 5, 24, 23,))),
+                workspace_sidebar: Some(WorkspaceSidebarLayout::Docked(Rect::new(3, 4, 24, 24,))),
             }
         );
         let bottom_right = UiConfig {
@@ -498,9 +505,9 @@ mod tests {
         assert_eq!(
             client_layout(Rect::new(3, 4, 120, 24), bottom_right),
             ClientLayout {
-                tab_bar: Some(Rect::new(3, 27, 120, 1)),
+                tab_bar: Some(Rect::new(3, 27, 96, 1)),
                 terminal: Rect::new(3, 4, 96, 23),
-                workspace_sidebar: Some(WorkspaceSidebarLayout::Docked(Rect::new(99, 4, 24, 23,))),
+                workspace_sidebar: Some(WorkspaceSidebarLayout::Docked(Rect::new(99, 4, 24, 24,))),
             }
         );
     }

@@ -6,18 +6,20 @@ mod command_bar;
 mod config;
 mod input;
 mod layout;
+mod navigation;
 mod navigator;
 mod sidebar;
 
 use std::{io, path::Path, time::Duration};
 
-use actions::ClientAction;
+use actions::{ClientAction, FocusDirection, NavigationScope};
 use anyhow::{Context, bail};
 use bytes::Bytes;
 use chrome::{ResourceState, client_layout, render_tab_bar};
 use command_bar::{CommandBarAction, CommandBarState};
 use config::{PaneLayoutPolicy, UiConfig};
 use crossterm::{
+    SynchronizedUpdate,
     cursor::{Hide, Show},
     event::{DisableBracketedPaste, EnableBracketedPaste, Event, EventStream},
     execute,
@@ -28,7 +30,11 @@ use crossterm::{
 };
 use futures_util::{SinkExt, StreamExt};
 use input::{PrefixAction, PrefixState, encode_key};
-use layout::{PaneLayout, authored_layout, pane_layouts};
+use layout::{
+    PaneLayout, authored_layout, authored_navigation_layout, directional_neighbor,
+    navigation_pane_layouts, pane_layouts,
+};
+use navigation::NavigationHistory;
 use navigator::{NavigatorAction, NavigatorState};
 use ratatui::{
     Terminal,
@@ -42,15 +48,13 @@ use tokio::{net::UnixStream, time};
 use tokio_util::codec::Framed;
 use uuid::Uuid;
 
-use sidebar::{
-    WorkspaceHistory, WorkspaceSidebarAction, WorkspaceSidebarState, render_workspace_sidebar,
-};
+use sidebar::{WorkspaceSidebarAction, WorkspaceSidebarState, render_workspace_sidebar};
 
 use crate::{
-    domain::{CellStyle, ScreenSnapshot, TerminalId, TerminalSize},
+    domain::{CellColor, CellStyle, ScreenSnapshot, TerminalId, TerminalSize},
     protocol::{
         ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, SelectedTarget, SelectedView,
-        ServerMessage, codec, decode_payload, encode_payload,
+        SelectionExpectation, ServerMessage, codec, decode_payload, encode_payload,
     },
     resources::TargetSelector,
     splits::SplitTree,
@@ -135,7 +139,7 @@ async fn run(
     let mut view = ViewState::new(selected)?;
     let mut resources = ResourceState::default();
     let mut surface: Option<ClientSurface> = None;
-    let mut workspace_history = WorkspaceHistory::default();
+    let mut workspace_history = NavigationHistory::default();
     workspace_history.record(view.focused());
     let mut create_tab = CreateTabState::default();
     let mut split_pane = CreateTabState::default();
@@ -197,6 +201,7 @@ async fn run(
                     }
                     ServerMessage::TargetSelected { selected: target } => {
                         let old_terminal = view.focused().terminal_id;
+                        let previous_target = view.focused().clone();
                         let navigator_selected = match surface.as_mut() {
                             Some(ClientSurface::Navigator(nav)) => nav.switch_selected(request_id),
                             _ => false,
@@ -217,7 +222,13 @@ async fn run(
                             }
                             continue;
                         }
-                        workspace_history.record(view.focused());
+                        workspace_history.record_transition(&previous_target, view.focused());
+                        if !resources
+                            .snapshot()
+                            .is_some_and(|snapshot| view.resources_are_current(snapshot))
+                        {
+                            send(framed, ClientMessage::ListResources).await?;
+                        }
                         pending_focused_exit = None;
                         resize_view(framed, terminal.size()?.into(), &mut view, ui).await?;
                         if let Some(ClientSurface::WorkspaceSidebar(sidebar)) = surface.as_mut()
@@ -301,7 +312,8 @@ async fn run(
                                         sidebar.switch_error(message);
                                         force_draw = true;
                                     } else {
-                                        bail!("daemon error ({code}): {message}")
+                                        notice = Some(format!("workspace unavailable · {message}"));
+                                        force_draw = true;
                                     }
                                 }
                                 Some(FocusOrigin::Pane) => {
@@ -310,6 +322,10 @@ async fn run(
                                 }
                                 Some(FocusOrigin::Tab) => {
                                     notice = Some(format!("tab unavailable · {message}"));
+                                    force_draw = true;
+                                }
+                                Some(FocusOrigin::Session) => {
+                                    notice = Some(format!("session unavailable · {message}"));
                                     force_draw = true;
                                 }
                                 None => bail!("daemon error ({code}): {message}"),
@@ -345,7 +361,14 @@ async fn run(
                                     ClientSurface::Navigator(nav) => nav.begin_switch(request),
                                     _ => unreachable!("surface guard ensures navigator"),
                                 }
-                                send_request(framed, Some(request), ClientMessage::SelectTarget { selector }).await?;
+                                send_request(
+                                    framed,
+                                    Some(request),
+                                    ClientMessage::SelectTarget {
+                                        selector,
+                                        expected: None,
+                                    },
+                                ).await?;
                                 force_draw = true;
                             }
                         }
@@ -363,7 +386,7 @@ async fn run(
                                 view.invalidate_drawn();
                                 force_draw = true;
                             }
-                            WorkspaceSidebarAction::Select(terminal_id) => {
+                            WorkspaceSidebarAction::Select(pane_id) => {
                                 if let Some(request) = focus.begin(FocusOrigin::Workspace) {
                                     match surface.as_mut().expect("workspace sidebar exists") {
                                         ClientSurface::WorkspaceSidebar(sidebar) => sidebar.begin_switch(),
@@ -373,7 +396,14 @@ async fn run(
                                         framed,
                                         Some(request),
                                         ClientMessage::SelectTarget {
-                                            selector: TargetSelector::Terminal(terminal_id),
+                                            selector: TargetSelector::Pane(pane_id),
+                                            expected: resources.snapshot().and_then(|snapshot| {
+                                                selection_expectation(
+                                                    snapshot,
+                                                    pane_id,
+                                                    NavigationScope::Workspace,
+                                                )
+                                            }),
                                         },
                                     )
                                     .await?;
@@ -453,65 +483,67 @@ async fn run(
                 }
             }
             _ = redraw.tick(), if force_draw || view.needs_draw() => {
-                terminal.draw(|frame| {
-                    let area = frame.area();
-                    let layout = client_layout(area, ui);
-                    let cursor = render_view(
-                        &view,
-                        layout.terminal,
-                        ui.pane_layout,
-                        frame.buffer_mut(),
-                    );
-                    if let Some(tab_bar) = layout.tab_bar {
-                        render_tab_bar(
-                            resources.snapshot(),
-                            view.focused(),
-                            view.is_zoomed(),
-                            tab_bar,
+                io::stdout().sync_update(|_| {
+                    terminal.draw(|frame| {
+                        let area = frame.area();
+                        let layout = client_layout(area, ui);
+                        let cursor = render_view(
+                            &view,
+                            layout.terminal,
+                            ui.pane_layout,
                             frame.buffer_mut(),
                         );
-                    }
-                    if let Some(ClientSurface::WorkspaceSidebar(sidebar)) = surface.as_ref() {
-                        if let Some(sidebar_area) =
-                            layout.workspace_sidebar.map(|sidebar| sidebar.area())
+                        if let Some(tab_bar) = layout.tab_bar {
+                            render_tab_bar(
+                                resources.snapshot(),
+                                view.focused(),
+                                view.is_zoomed(),
+                                tab_bar,
+                                frame.buffer_mut(),
+                            );
+                        }
+                        if let Some(ClientSurface::WorkspaceSidebar(sidebar)) = surface.as_ref() {
+                            if let Some(sidebar_area) =
+                                layout.workspace_sidebar.map(|sidebar| sidebar.area())
+                            {
+                                sidebar.render(
+                                    sidebar_area,
+                                    ui.workspace_sidebar_position,
+                                    frame.buffer_mut(),
+                                );
+                            }
+                        } else if let Some(sidebar_area) =
+                            layout.workspace_sidebar.and_then(|sidebar| sidebar.docked())
                         {
-                            sidebar.render(
+                            render_workspace_sidebar(
+                                resources.snapshot(),
+                                view.focused(),
+                                &workspace_history,
                                 sidebar_area,
                                 ui.workspace_sidebar_position,
                                 frame.buffer_mut(),
                             );
                         }
-                    } else if let Some(sidebar_area) =
-                        layout.workspace_sidebar.and_then(|sidebar| sidebar.docked())
-                    {
-                        render_workspace_sidebar(
-                            resources.snapshot(),
-                            view.focused(),
-                            &workspace_history,
-                            sidebar_area,
-                            ui.workspace_sidebar_position,
-                            frame.buffer_mut(),
-                        );
-                    }
-                    match surface.as_mut() {
-                        Some(ClientSurface::Navigator(nav)) => {
-                            nav.render(area, frame.buffer_mut());
+                        match surface.as_mut() {
+                            Some(ClientSurface::Navigator(nav)) => {
+                                nav.render(area, frame.buffer_mut());
+                            }
+                            Some(ClientSurface::CommandBar(command_bar)) => {
+                                command_bar.render(layout.terminal, frame.buffer_mut());
+                            }
+                            Some(ClientSurface::WorkspaceSidebar(_)) | None => {}
                         }
-                        Some(ClientSurface::CommandBar(command_bar)) => {
-                            command_bar.render(layout.terminal, frame.buffer_mut());
+                        if surface.is_none()
+                            && notice.is_none()
+                            && let Some((column, row)) = cursor
+                        {
+                            frame.set_cursor_position((column, row));
                         }
-                        Some(ClientSurface::WorkspaceSidebar(_)) | None => {}
-                    }
-                    if surface.is_none()
-                        && notice.is_none()
-                        && let Some((column, row)) = cursor
-                    {
-                        frame.set_cursor_position((column, row));
-                    }
-                    if let Some(message) = notice.as_deref() {
-                        render_notice(area, frame.buffer_mut(), message);
-                    }
-                })?;
+                        if let Some(message) = notice.as_deref() {
+                            render_notice(area, frame.buffer_mut(), message);
+                        }
+                    })
+                })??;
                 view.mark_drawn();
                 force_draw = false;
             }
@@ -524,7 +556,7 @@ fn refresh_surface_resources(
     surface: &mut Option<ClientSurface>,
     snapshot: &crate::resources::ResourceSnapshot,
     focused: &SelectedTarget,
-    workspace_history: &WorkspaceHistory,
+    workspace_history: &NavigationHistory,
 ) {
     match surface.as_mut() {
         Some(ClientSurface::Navigator(nav)) => {
@@ -535,6 +567,29 @@ fn refresh_surface_resources(
         }
         Some(ClientSurface::CommandBar(_)) | None => {}
     }
+}
+
+fn selection_expectation(
+    snapshot: &crate::resources::ResourceSnapshot,
+    pane_id: crate::domain::PaneId,
+    scope: NavigationScope,
+) -> Option<SelectionExpectation> {
+    snapshot.sessions.iter().find_map(|session| {
+        session.workspaces.iter().find_map(|workspace| {
+            workspace.tabs.iter().find_map(|tab| {
+                tab.panes
+                    .iter()
+                    .any(|pane| pane.id == pane_id)
+                    .then_some(match scope {
+                        NavigationScope::Pane | NavigationScope::Tab => {
+                            SelectionExpectation::Tab(tab.id)
+                        }
+                        NavigationScope::Workspace => SelectionExpectation::Workspace(workspace.id),
+                        NavigationScope::Session => SelectionExpectation::Session(session.id),
+                    })
+            })
+        })
+    })
 }
 
 fn accepts_client_input(
@@ -559,7 +614,7 @@ async fn dispatch_client_action(
     view: &mut ViewState,
     resources: &ResourceState,
     surface: &mut Option<ClientSurface>,
-    workspace_history: &WorkspaceHistory,
+    workspace_history: &NavigationHistory,
     create_tab: &mut CreateTabState,
     split_pane: &mut CreateTabState,
     focus: &mut FocusState,
@@ -581,6 +636,9 @@ async fn dispatch_client_action(
             let Some(snapshot) = resources.snapshot() else {
                 return Ok(Some("workspaces are still loading".into()));
             };
+            if !view.resources_are_current(snapshot) {
+                return Ok(Some("navigation is syncing".into()));
+            }
             let Some(sidebar) =
                 WorkspaceSidebarState::open(snapshot, view.focused(), workspace_history)
             else {
@@ -608,16 +666,19 @@ async fn dispatch_client_action(
             let Some(snapshot) = resources.snapshot() else {
                 return Ok(Some("tabs are still loading".into()));
             };
+            if !view.resources_are_current(snapshot) {
+                return Ok(Some("navigation is syncing".into()));
+            }
             let forward = action == ClientAction::FocusNextTab;
-            if let Some(terminal_id) =
-                workspace_history.adjacent_tab(snapshot, view.focused(), forward)
+            if let Some(pane_id) = workspace_history.adjacent_tab(snapshot, view.focused(), forward)
                 && let Some(request) = focus.begin(FocusOrigin::Tab)
             {
                 send_request(
                     framed,
                     Some(request),
                     ClientMessage::SelectTarget {
-                        selector: TargetSelector::Terminal(terminal_id),
+                        selector: TargetSelector::Pane(pane_id),
+                        expected: selection_expectation(snapshot, pane_id, NavigationScope::Tab),
                     },
                 )
                 .await?;
@@ -653,6 +714,79 @@ async fn dispatch_client_action(
                     Some(request),
                     ClientMessage::SelectTarget {
                         selector: TargetSelector::Pane(target.pane_id),
+                        expected: Some(SelectionExpectation::Tab(view.focused().tab_id)),
+                    },
+                )
+                .await?;
+            }
+        }
+        ClientAction::FocusPane(direction) => {
+            let terminal = client_layout(host, ui).terminal;
+            if let Some(target) = view.directional(direction, terminal, ui.pane_layout)
+                && let Some(request) = focus.begin(FocusOrigin::Pane)
+            {
+                send_request(
+                    framed,
+                    Some(request),
+                    ClientMessage::SelectTarget {
+                        selector: TargetSelector::Pane(target.pane_id),
+                        expected: Some(SelectionExpectation::Tab(view.focused().tab_id)),
+                    },
+                )
+                .await?;
+            }
+        }
+        ClientAction::FocusLast(scope) => {
+            let Some(snapshot) = resources.snapshot() else {
+                return Ok(Some("resources are still loading".into()));
+            };
+            if !view.resources_are_current(snapshot) {
+                return Ok(Some("navigation is syncing".into()));
+            }
+            let pane_id = match scope {
+                NavigationScope::Pane => workspace_history.last_pane(snapshot, view.focused()),
+                NavigationScope::Tab => workspace_history.last_tab(snapshot, view.focused()),
+                NavigationScope::Workspace => {
+                    workspace_history.last_workspace(snapshot, view.focused())
+                }
+                NavigationScope::Session => {
+                    workspace_history.last_session(snapshot, view.focused())
+                }
+            };
+            let Some(pane_id) = pane_id else {
+                return Ok(Some(format!("no previous {}", scope.label())));
+            };
+            if let Some(request) = focus.begin(FocusOrigin::for_scope(scope)) {
+                send_request(
+                    framed,
+                    Some(request),
+                    ClientMessage::SelectTarget {
+                        selector: TargetSelector::Pane(pane_id),
+                        expected: selection_expectation(snapshot, pane_id, scope),
+                    },
+                )
+                .await?;
+            }
+        }
+        ClientAction::FocusTab(number) => {
+            let Some(snapshot) = resources.snapshot() else {
+                return Ok(Some("tabs are still loading".into()));
+            };
+            if !view.resources_are_current(snapshot) {
+                return Ok(Some("navigation is syncing".into()));
+            }
+            let number = number.get();
+            let Some(pane_id) = workspace_history.numbered_tab(snapshot, view.focused(), number)
+            else {
+                return Ok(Some(format!("tab {number} is unavailable")));
+            };
+            if let Some(request) = focus.begin(FocusOrigin::Tab) {
+                send_request(
+                    framed,
+                    Some(request),
+                    ClientMessage::SelectTarget {
+                        selector: TargetSelector::Pane(pane_id),
+                        expected: selection_expectation(snapshot, pane_id, NavigationScope::Tab),
                     },
                 )
                 .await?;
@@ -785,6 +919,18 @@ enum FocusOrigin {
     Pane,
     Tab,
     Workspace,
+    Session,
+}
+
+impl FocusOrigin {
+    fn for_scope(scope: NavigationScope) -> Self {
+        match scope {
+            NavigationScope::Pane => Self::Pane,
+            NavigationScope::Tab => Self::Tab,
+            NavigationScope::Workspace => Self::Workspace,
+            NavigationScope::Session => Self::Session,
+        }
+    }
 }
 
 impl FocusState {
@@ -961,6 +1107,10 @@ impl ViewState {
             .target
     }
 
+    fn resources_are_current(&self, snapshot: &crate::resources::ResourceSnapshot) -> bool {
+        snapshot.revision >= self.selected_revision
+    }
+
     fn is_zoomed(&self) -> bool {
         self.zoomed
     }
@@ -1016,6 +1166,46 @@ impl ViewState {
             current - 1
         };
         Some(self.panes[next].target.clone())
+    }
+
+    fn directional(
+        &self,
+        direction: FocusDirection,
+        area: Rect,
+        policy: PaneLayoutPolicy,
+    ) -> Option<SelectedTarget> {
+        if self.panes.len() < 2 {
+            return None;
+        }
+        match policy {
+            PaneLayoutPolicy::Splits => {
+                let focused = self.focused().pane_id;
+                let layout = authored_navigation_layout(area, &self.layout, focused);
+                let order = self
+                    .panes
+                    .iter()
+                    .map(|pane| pane.target.pane_id)
+                    .collect::<Vec<_>>();
+                let pane_id = directional_neighbor(&layout.panes, &order, focused, direction)?;
+                self.panes
+                    .iter()
+                    .find(|pane| pane.target.pane_id == pane_id)
+                    .map(|pane| pane.target.clone())
+            }
+            PaneLayoutPolicy::Accordion => {
+                let order = self.terminal_ids();
+                let layout = navigation_pane_layouts(area, &order, self.focused);
+                let panes = layout
+                    .into_iter()
+                    .map(|(terminal_id, layout)| (terminal_id, layout.content))
+                    .collect();
+                let terminal_id = directional_neighbor(&panes, &order, self.focused, direction)?;
+                self.panes
+                    .iter()
+                    .find(|pane| pane.target.terminal_id == terminal_id)
+                    .map(|pane| pane.target.clone())
+            }
+        }
     }
 
     fn remove(&mut self, terminal_id: TerminalId) {
@@ -1223,10 +1413,10 @@ impl Widget for Screen<'_> {
 fn style(source: CellStyle) -> Style {
     let mut target = Style::default();
     if let Some(color) = source.foreground {
-        target = target.fg(Color::Rgb(color.red, color.green, color.blue));
+        target = target.fg(color.into());
     }
     if let Some(color) = source.background {
-        target = target.bg(Color::Rgb(color.red, color.green, color.blue));
+        target = target.bg(color.into());
     }
     for (enabled, modifier) in [
         (source.bold, Modifier::BOLD),
@@ -1239,6 +1429,15 @@ fn style(source: CellStyle) -> Style {
         }
     }
     target
+}
+
+impl From<CellColor> for Color {
+    fn from(color: CellColor) -> Self {
+        match color {
+            CellColor::Indexed(index) => Self::Indexed(index),
+            CellColor::Rgb(color) => Self::Rgb(color.red, color.green, color.blue),
+        }
+    }
 }
 
 struct TerminalGuard {
@@ -1660,27 +1859,32 @@ mod tests {
     }
 
     #[test]
-    fn style_conversion_preserves_rgb_and_modifiers() {
+    fn style_conversion_preserves_indexed_rgb_and_modifiers() {
         let converted = style(CellStyle {
-            foreground: Some(Rgb {
-                red: 1,
-                green: 2,
-                blue: 3,
-            }),
-            background: Some(Rgb {
+            foreground: Some(CellColor::Indexed(1)),
+            background: Some(CellColor::Rgb(Rgb {
                 red: 4,
                 green: 5,
                 blue: 6,
-            }),
+            })),
             bold: true,
             italic: true,
             underline: true,
             inverse: true,
         });
-        assert_eq!(converted.fg, Some(Color::Rgb(1, 2, 3)));
+        assert_eq!(converted.fg, Some(Color::Indexed(1)));
         assert_eq!(converted.bg, Some(Color::Rgb(4, 5, 6)));
         assert!(converted.add_modifier.contains(
             Modifier::BOLD | Modifier::ITALIC | Modifier::UNDERLINED | Modifier::REVERSED
         ));
+
+        assert_eq!(
+            Color::from(CellColor::Rgb(Rgb {
+                red: 1,
+                green: 2,
+                blue: 3,
+            })),
+            Color::Rgb(1, 2, 3)
+        );
     }
 }

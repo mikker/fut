@@ -8,6 +8,8 @@ use crate::{
     splits::{SplitAxis, SplitTree},
 };
 
+use super::actions::FocusDirection;
+
 const FOCUSED_MIN_WIDTH: u32 = 24;
 const BACKGROUND_MIN_WIDTH: u32 = 12;
 const RAIL_WIDTH: u32 = 1;
@@ -55,6 +57,114 @@ pub(super) fn authored_layout(
     };
     place_split(tree, focused, host, &mut layout);
     layout
+}
+
+pub(super) fn authored_navigation_layout(
+    host: Rect,
+    tree: &SplitTree,
+    focused: PaneId,
+) -> AuthoredLayout {
+    let minimum = split_minimum(tree, focused);
+    authored_layout(
+        Rect::new(0, 0, host.width.max(minimum.0), host.height.max(minimum.1)),
+        tree,
+        focused,
+        false,
+    )
+}
+
+pub(super) fn directional_neighbor<Id: Copy + Ord>(
+    panes: &BTreeMap<Id, Rect>,
+    order: &[Id],
+    focused: Id,
+    direction: FocusDirection,
+) -> Option<Id> {
+    let focused_rect = *panes.get(&focused)?;
+    order
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(index, id)| {
+            let candidate = *panes.get(&id)?;
+            let (primary_gap, orthogonal, orthogonal_centers) = match direction {
+                FocusDirection::Left if candidate.right() <= focused_rect.x => (
+                    focused_rect.x - candidate.right(),
+                    interval_separation(
+                        candidate.y,
+                        candidate.bottom(),
+                        focused_rect.y,
+                        focused_rect.bottom(),
+                    ),
+                    center_twice(candidate.y, candidate.height)
+                        .abs_diff(center_twice(focused_rect.y, focused_rect.height)),
+                ),
+                FocusDirection::Right if candidate.x >= focused_rect.right() => (
+                    candidate.x - focused_rect.right(),
+                    interval_separation(
+                        candidate.y,
+                        candidate.bottom(),
+                        focused_rect.y,
+                        focused_rect.bottom(),
+                    ),
+                    center_twice(candidate.y, candidate.height)
+                        .abs_diff(center_twice(focused_rect.y, focused_rect.height)),
+                ),
+                FocusDirection::Up if candidate.bottom() <= focused_rect.y => (
+                    focused_rect.y - candidate.bottom(),
+                    interval_separation(
+                        candidate.x,
+                        candidate.right(),
+                        focused_rect.x,
+                        focused_rect.right(),
+                    ),
+                    center_twice(candidate.x, candidate.width)
+                        .abs_diff(center_twice(focused_rect.x, focused_rect.width)),
+                ),
+                FocusDirection::Down if candidate.y >= focused_rect.bottom() => (
+                    candidate.y - focused_rect.bottom(),
+                    interval_separation(
+                        candidate.x,
+                        candidate.right(),
+                        focused_rect.x,
+                        focused_rect.right(),
+                    ),
+                    center_twice(candidate.x, candidate.width)
+                        .abs_diff(center_twice(focused_rect.x, focused_rect.width)),
+                ),
+                _ => return None,
+            };
+            Some((
+                (
+                    orthogonal.0,
+                    primary_gap,
+                    orthogonal.1,
+                    orthogonal_centers,
+                    index,
+                ),
+                id,
+            ))
+        })
+        .min_by_key(|(rank, _)| *rank)
+        .map(|(_, id)| id)
+}
+
+fn interval_separation(
+    first_start: u16,
+    first_end: u16,
+    second_start: u16,
+    second_end: u16,
+) -> (u8, u16) {
+    if first_end <= second_start {
+        (1, second_start - first_end)
+    } else if second_end <= first_start {
+        (1, first_start - second_end)
+    } else {
+        (0, 0)
+    }
+}
+
+fn center_twice(start: u16, length: u16) -> u32 {
+    u32::from(start) * 2 + u32::from(length)
 }
 
 fn split_minimum(tree: &SplitTree, focused: PaneId) -> (u16, u16) {
@@ -154,10 +264,7 @@ pub(super) fn pane_layouts(
     }
 
     let pane_count = u32::try_from(terminals.len()).unwrap_or(u32::MAX);
-    let background_count = pane_count.saturating_sub(1);
-    let required_width = FOCUSED_MIN_WIDTH
-        .saturating_add(background_count.saturating_mul(BACKGROUND_MIN_WIDTH))
-        .saturating_add(pane_count.saturating_mul(RAIL_WIDTH));
+    let required_width = accordion_required_width(terminals.len());
 
     if u32::from(host.width) < required_width {
         return BTreeMap::from([(
@@ -208,6 +315,30 @@ pub(super) fn pane_layouts(
         .collect()
 }
 
+pub(super) fn navigation_pane_layouts(
+    host: Rect,
+    terminals: &[TerminalId],
+    focused: TerminalId,
+) -> BTreeMap<TerminalId, PaneLayout> {
+    let width = u16::try_from(accordion_required_width(terminals.len()))
+        .unwrap_or(u16::MAX)
+        .max(host.width);
+    pane_layouts(
+        Rect::new(0, 0, width, host.height.max(1)),
+        terminals,
+        focused,
+        false,
+    )
+}
+
+fn accordion_required_width(pane_count: usize) -> u32 {
+    let pane_count = u32::try_from(pane_count).unwrap_or(u32::MAX);
+    let background_count = pane_count.saturating_sub(1);
+    FOCUSED_MIN_WIDTH
+        .saturating_add(background_count.saturating_mul(BACKGROUND_MIN_WIDTH))
+        .saturating_add(pane_count.saturating_mul(RAIL_WIDTH))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,6 +349,72 @@ mod tests {
 
     fn widths(layouts: &BTreeMap<TerminalId, PaneLayout>, ids: &[TerminalId]) -> Vec<u16> {
         ids.iter().map(|id| layouts[id].content.width).collect()
+    }
+
+    #[test]
+    fn directional_neighbors_follow_edges_overlap_and_stable_leaf_order() {
+        let a = PaneId::new();
+        let b = PaneId::new();
+        let c = PaneId::new();
+        let order = [a, b, c];
+        let panes = BTreeMap::from([
+            (a, Rect::new(0, 0, 30, 21)),
+            (b, Rect::new(31, 0, 30, 10)),
+            (c, Rect::new(31, 11, 30, 10)),
+        ]);
+
+        assert_eq!(
+            directional_neighbor(&panes, &order, a, FocusDirection::Right),
+            Some(b),
+            "equal right candidates use leaf order"
+        );
+        assert_eq!(
+            directional_neighbor(&panes, &order, b, FocusDirection::Down),
+            Some(c)
+        );
+        assert_eq!(
+            directional_neighbor(&panes, &order, c, FocusDirection::Up),
+            Some(b)
+        );
+        assert_eq!(
+            directional_neighbor(&panes, &order, c, FocusDirection::Left),
+            Some(a)
+        );
+        assert_eq!(
+            directional_neighbor(&panes, &order, a, FocusDirection::Left),
+            None
+        );
+
+        let direct = PaneId::new();
+        let corner = PaneId::new();
+        let panes = BTreeMap::from([
+            (a, Rect::new(0, 10, 10, 10)),
+            (corner, Rect::new(11, 0, 10, 10)),
+            (direct, Rect::new(20, 11, 10, 8)),
+        ]);
+        assert_eq!(
+            directional_neighbor(&panes, &[a, corner, direct], a, FocusDirection::Right),
+            Some(direct),
+            "orthogonal overlap beats a nearer corner touch"
+        );
+    }
+
+    #[test]
+    fn navigation_layout_expands_tiny_authored_and_accordion_hosts() {
+        let left = PaneId::new();
+        let top_right = PaneId::new();
+        let bottom_right = PaneId::new();
+        let mut tree = SplitTree::leaf(left);
+        assert!(tree.split(left, crate::splits::SplitDirection::Right, top_right));
+        assert!(tree.split(top_right, crate::splits::SplitDirection::Down, bottom_right));
+        let authored = authored_navigation_layout(Rect::new(7, 9, 1, 1), &tree, left);
+        assert_eq!(authored.panes.len(), 3);
+        assert_eq!(authored.panes[&left].x, 0);
+
+        let terminals = terminals(4);
+        let accordion = navigation_pane_layouts(Rect::new(7, 9, 1, 1), &terminals, terminals[2]);
+        assert_eq!(accordion.len(), 4);
+        assert_eq!(accordion[&terminals[0]].content.x, 1);
     }
 
     #[test]

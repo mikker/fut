@@ -437,7 +437,7 @@ mod tests {
         assert_eq!(bar.filtered.len(), COMMANDS.len());
         assert_eq!(bar.selected_action(), Some(ClientAction::OpenNavigator));
 
-        bar.paste("FOCUS   pane");
+        bar.paste("CYCLE   pane");
         assert_eq!(
             bar.filtered,
             [ClientAction::FocusNextPane, ClientAction::FocusPreviousPane]
@@ -527,8 +527,8 @@ mod tests {
         let prompt = (0..narrow.width)
             .map(|column| narrow_buffer[(column, 0)].symbol())
             .collect::<String>();
-        assert!(prompt.contains("1/11"));
-        assert!(!prompt.contains("command1/11"));
+        assert!(prompt.contains("1/29"));
+        assert!(!prompt.contains("command1/29"));
     }
 
     #[test]
