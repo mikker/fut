@@ -5,16 +5,12 @@ description: Agent-aware terminal multiplexing.
 permalink: /
 ---
 
-# Fut
-
-Agent-aware terminal multiplexing.
-
 ```text
-one multiplexer
-└── session / project
-    └── workspace
-        └── tab
-            └── pane
+multiplexer                 (just one)
+└── session[name]           (this is the project)
+    └── workspace[name]     (this is the worktree)
+        └── tab             (this is the agent/vim/you do you)
+            └── pane        (same as above)
 ```
 
 ## Docs
