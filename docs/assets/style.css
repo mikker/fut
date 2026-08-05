@@ -2,6 +2,7 @@
   color-scheme: light;
   --paper: #f7f7f7;
   --ink: #1b1b1b;
+  --accent: oklch(69.6% 0.17 162.48);
   --line: #c9c9c9;
   --code: #eeeeee;
   --measure: 76ch;
@@ -26,7 +27,7 @@ body {
 
 a {
   color: inherit;
-  text-decoration-color: var(--ink);
+  text-decoration-color: var(--accent);
   text-underline-offset: 0.2em;
 }
 
@@ -52,6 +53,7 @@ a:focus-visible {
 }
 
 .wordmark span {
+  color: var(--accent);
   margin-left: 0.2em;
 }
 
@@ -82,6 +84,7 @@ aside a[aria-current="page"] {
 
 aside a[aria-current="page"]::before {
   content: "● ";
+  color: var(--accent);
 }
 
 main {
