@@ -2,7 +2,7 @@
 
 `fut` is an agent-oriented terminal multiplexer organized as sessions, workspaces, tabs, panes, and terminals. One daemon owns the live resource tree; clients and automation address resources by their raw IDs.
 
-The current Rust vertical slice supports multiple project sessions, user-defined workspaces, explicitly opened Git worktrees as natural peer workspaces, multiple tabs and panes, detach/reattach, rename, move, and close operations, semantic `libghostty-vt` terminal snapshots, responsive focus-biased multi-pane rendering with client-local focus and zoom, live tab and workspace chrome, a searchable typed command bar, and reconciliation after external resource changes.
+The current Rust vertical slice supports multiple project sessions, user-defined workspaces, explicitly opened Git worktrees as natural peer workspaces, multiple tabs and panes, detach/reattach, rename, move, and close operations, semantic `libghostty-vt` terminal snapshots, responsive focus-biased multi-pane rendering with client-local focus and zoom, configurable token-driven tab and workspace chrome, a searchable typed command bar, read-only diagnostics, and reconciliation after external resource changes.
 
 ## Run it
 
@@ -15,6 +15,7 @@ cargo run -- daemon run            # explicitly run the daemon
 cargo run -- open ../api           # control-only; daemon must already exist
 cargo run -- open ../api --name api -- /bin/zsh
 cargo run -- list
+cargo run -- doctor
 ```
 
 For a disposable dogfooding environment with three linked-worktree workspaces, seven tabs, and nine panes, run:
@@ -27,20 +28,33 @@ The demo builds the current binary, creates its fixture under `target/fut-demo`,
 
 `mise run journey` runs one deterministic keyboard-driven workflow in a temporary home, runtime, workspace, socket, daemon, and PTY. `mise run journey:chaos` runs a seeded state-machine variant that checks input routing and resource/layout invariants after every action. Reproduce or extend a run with `FUT_CHAOS_SEED=123` and `FUT_CHAOS_STEPS=1000`; step counts are bounded at 2,000.
 
-Interactive UI preferences are safe, non-executable global configuration. Fut reads `$XDG_CONFIG_HOME/fut/config.toml` when `XDG_CONFIG_HOME` is an absolute path and otherwise `~/.config/fut/config.toml`; `FUT_CONFIG` may select an explicit absolute file. A missing implicit file uses defaults and is never created automatically. Interactive startup rejects unknown fields, malformed TOML, non-regular files, and files larger than 64 KiB before bare Fut creates resources or changes the host terminal state. Explicit control commands and completion do not load UI configuration. Preferences are applied per client at attach time; live reload is deferred.
+Interactive UI preferences are safe, non-executable global configuration. Fut reads `$XDG_CONFIG_HOME/fut/config.toml` when `XDG_CONFIG_HOME` is absolute and otherwise `~/.config/fut/config.toml`; `FUT_CONFIG` may select an explicit absolute file. Configuration controls tab-bar and workspace-row tokens, left/center/right groups, semantic styles, indexed or RGB colors, icon presets and overrides, placement, sidebar width, and pane layout. The Unicode preset is the default; Nerd Fonts are an explicit opt-in because Fut cannot reliably detect the active terminal font.
 
 ```toml
 [ui]
-tab_bar_position = "top"            # "top" or "bottom"
-workspace_sidebar_position = "left" # "left" or "right"
-pane_layout = "splits"               # "splits" or "accordion"
+pane_layout = "splits"
+
+[ui.icons]
+preset = "nerd_font"
+
+[ui.tab_bar]
+position = "top"
+left = [{ segments = [{ token = "workspace.name" }], style = "muted", priority = 200 }]
+center = [{ segments = [{ component = "tabs" }] }]
+right = [{ segments = [{ token = "client.zoom" }], style = "current", priority = 255 }]
+
+[ui.workspace_sidebar]
+position = "left"
+width = 24
 ```
+
+Unknown fields, unsafe text, malformed or oversized files, ambiguous segments, and out-of-scope tokens are rejected before interactive startup changes terminal state. Preferences are attach-time-only; control commands and completion do not load them. Run `fut doctor` for a read-only configuration, terminal, runtime, protocol, and icon probe. See the [documentation index](docs/index.md), [complete configuration reference](docs/configuration.md), [token catalog](docs/tokens.md), and [`fut doctor` reference](docs/doctor.md).
 
 `fut open [PATH] [--name NAME] [-- COMMAND...]` replaces the former `new` command. It is always control-only and requires an existing daemon. Bare `fut` is the convenience path that opens the current directory and then attaches to the returned terminal. Attaching to an existing resource is a separate `RESOURCE attach ID` operation; the CLI does not offer an atomic create-and-attach command. Child commands always follow `--`; they are passed as arguments without shell evaluation.
 
 ## Control surface
 
-Resource operations are noun-first. Top-level `open` and `list`, plus the `daemon` lifecycle commands, are intentional non-resource entry points:
+Resource operations are noun-first. Top-level `open`, `list`, and the read-only `doctor`, plus the `daemon` lifecycle commands, are intentional non-resource entry points:
 
 ```sh
 fut session attach SESSION

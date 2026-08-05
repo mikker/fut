@@ -1,9 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::{
-    buffer::Buffer,
-    layout::Rect,
-    style::{Modifier, Style},
-};
+use ratatui::{buffer::Buffer, layout::Rect, style::Style};
 
 use crate::{
     domain::{PaneId, WorkspaceId},
@@ -12,15 +8,19 @@ use crate::{
 };
 
 use super::{
-    chrome::{sanitize, truncate},
-    config::WorkspaceSidebarPosition,
+    chrome::sanitize,
+    config::{SemanticStyle, UiConfig, WorkspaceSidebarPosition},
     navigation::NavigationHistory,
+    presentation::{ItemState, TokenValue, render_token_segments, truncate_line},
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct WorkspaceItem {
     id: WorkspaceId,
     name: String,
+    root: std::path::PathBuf,
+    index: usize,
+    tab_count: usize,
     current: bool,
     closing: bool,
     destination: Option<PaneId>,
@@ -28,6 +28,7 @@ struct WorkspaceItem {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct WorkspaceModel {
+    session_name: String,
     items: Vec<WorkspaceItem>,
 }
 
@@ -47,14 +48,19 @@ impl WorkspaceModel {
         };
 
         Self {
+            session_name: sanitize(&session.name),
             items: session
                 .workspaces
                 .iter()
-                .map(|workspace| {
+                .enumerate()
+                .map(|(index, workspace)| {
                     let closing = session.closing || workspace.closing;
                     WorkspaceItem {
                         id: workspace.id,
                         name: workspace.name.clone(),
+                        root: workspace.root.clone(),
+                        index,
+                        tab_count: workspace.tabs.len(),
                         current: workspace.id == workspace_id,
                         closing,
                         destination: (!closing)
@@ -239,13 +245,20 @@ impl WorkspaceSidebarState {
         self.status = WorkspaceStatus::Error(sanitize(&message));
     }
 
-    pub fn render(&self, area: Rect, position: WorkspaceSidebarPosition, buffer: &mut Buffer) {
+    pub fn render(
+        &self,
+        area: Rect,
+        position: WorkspaceSidebarPosition,
+        ui: &UiConfig,
+        buffer: &mut Buffer,
+    ) {
         render_model(
             &self.model,
             self.selected,
             Some(&self.status),
             area,
             position,
+            ui,
             buffer,
         );
     }
@@ -297,12 +310,13 @@ pub(super) fn render_workspace_sidebar(
     history: &NavigationHistory,
     area: Rect,
     position: WorkspaceSidebarPosition,
+    ui: &UiConfig,
     buffer: &mut Buffer,
 ) {
     let model = snapshot
         .map(|snapshot| WorkspaceModel::from_snapshot(snapshot, focused, history))
         .unwrap_or_default();
-    render_model(&model, None, None, area, position, buffer);
+    render_model(&model, None, None, area, position, ui, buffer);
 }
 
 fn render_model(
@@ -311,12 +325,17 @@ fn render_model(
     status: Option<&WorkspaceStatus>,
     area: Rect,
     position: WorkspaceSidebarPosition,
+    ui: &UiConfig,
     buffer: &mut Buffer,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    clear(area, buffer);
+    clear(
+        area,
+        ui.styles.apply(SemanticStyle::Normal, Style::default()),
+        buffer,
+    );
     let (content, divider_x) = if area.width == 1 {
         (area, None)
     } else {
@@ -337,9 +356,12 @@ fn render_model(
         }
     };
     if let Some(divider_x) = divider_x {
+        let icons = ui.icons.resolve();
         for row in area.y..area.y.saturating_add(area.height) {
             if let Some(cell) = buffer.cell_mut((divider_x, row)) {
-                cell.set_symbol("│").set_style(muted_style());
+                let style = ui.styles.apply(SemanticStyle::Normal, Style::default());
+                cell.set_symbol(&icons.vertical_divider)
+                    .set_style(ui.styles.apply(SemanticStyle::Divider, style));
             }
         }
     }
@@ -347,17 +369,47 @@ fn render_model(
         return;
     }
 
+    let header_line = render_sidebar_chrome(&ui.workspace_sidebar.header, model, status, ui);
+    let footer_line = render_sidebar_chrome(&ui.workspace_sidebar.footer, model, status, ui);
+    let header = (!header_line.spans.is_empty() && content.height >= 3).then_some(header_line);
+    let footer_allowed = status
+        .is_none_or(|status| content.height >= 5 || !matches!(status, WorkspaceStatus::Ready));
+    let urgent_footer = matches!(
+        status,
+        Some(WorkspaceStatus::Switching | WorkspaceStatus::Error(_))
+    );
     let footer =
-        status.filter(|status| content.height >= 5 || !matches!(status, WorkspaceStatus::Ready));
-    let row_height = content.height.saturating_sub(u16::from(footer.is_some()));
-    if model.items.is_empty() {
-        let fallback = format_workspace("workspace", true, false, usize::from(content.width));
-        buffer.set_stringn(
+        (!footer_line.spans.is_empty() && footer_allowed && (content.height >= 2 || urgent_footer))
+            .then_some(footer_line);
+    let row_y = content.y.saturating_add(u16::from(header.is_some()));
+    let row_height = content
+        .height
+        .saturating_sub(u16::from(header.is_some()) + u16::from(footer.is_some()));
+    if let Some(header) = header.as_ref() {
+        buffer.set_line(
             content.x,
             content.y,
-            fallback,
-            usize::from(content.width),
-            active_style(),
+            &truncate_line(header, usize::from(content.width)),
+            content.width,
+        );
+    }
+    if model.items.is_empty() {
+        let item = WorkspaceItem {
+            id: WorkspaceId::new(),
+            name: "workspace".into(),
+            root: std::path::PathBuf::new(),
+            index: 0,
+            tab_count: 0,
+            current: true,
+            closing: false,
+            destination: None,
+        };
+        render_workspace_row(
+            &item,
+            false,
+            Rect::new(content.x, row_y, content.width, 1),
+            ui,
+            buffer,
         );
     } else {
         let anchor = selected
@@ -368,58 +420,157 @@ fn render_model(
             .into_iter()
             .enumerate()
         {
-            let y = content
-                .y
-                .saturating_add(u16::try_from(offset).unwrap_or(u16::MAX));
+            let y = row_y.saturating_add(u16::try_from(offset).unwrap_or(u16::MAX));
             match row {
                 VisibleRow::Ellipsis => {
                     buffer.set_stringn(
                         content.x,
                         y,
-                        " …",
+                        format!(" {}", ui.icons.resolve().overflow),
                         usize::from(content.width),
-                        muted_style(),
+                        ui.styles.apply(
+                            SemanticStyle::Muted,
+                            ui.styles.apply(SemanticStyle::Normal, Style::default()),
+                        ),
                     );
                 }
                 VisibleRow::Item(index) => {
                     let item = &model.items[index];
-                    let text = format_workspace(
-                        &item.name,
-                        item.current,
-                        item.closing,
-                        usize::from(content.width),
+                    render_workspace_row(
+                        item,
+                        selected == Some(item.id),
+                        Rect::new(content.x, y, content.width, 1),
+                        ui,
+                        buffer,
                     );
-                    let mut style = Style::default();
-                    if item.current {
-                        style = style.add_modifier(Modifier::BOLD);
-                    }
-                    if item.closing {
-                        style = style.add_modifier(Modifier::DIM);
-                    }
-                    if selected == Some(item.id) {
-                        style = style.add_modifier(Modifier::REVERSED);
-                    }
-                    buffer.set_stringn(content.x, y, text, usize::from(content.width), style);
                 }
             }
         }
     }
 
-    if let Some(status) = footer {
-        let text = match status {
-            WorkspaceStatus::Ready => " ↑↓ ↵ c new · r rename".into(),
-            WorkspaceStatus::Switching => " switching…".into(),
-            WorkspaceStatus::Error(message) => format!(" {message} · retry"),
-        };
-        let text = truncate(&text, usize::from(content.width));
-        buffer.set_stringn(
+    if let Some(footer) = footer.as_ref() {
+        buffer.set_line(
             content.x,
             content.y.saturating_add(content.height - 1),
-            &text,
-            usize::from(content.width),
-            muted_style(),
+            &truncate_line(footer, usize::from(content.width)),
+            content.width,
         );
     }
+}
+
+fn render_sidebar_chrome(
+    segments: &[super::config::SegmentConfig],
+    model: &WorkspaceModel,
+    status: Option<&WorkspaceStatus>,
+    ui: &UiConfig,
+) -> ratatui::text::Line<'static> {
+    let current = model.items.iter().find(|item| item.current);
+    let icons = ui.icons.resolve();
+    render_token_segments(
+        segments,
+        None,
+        ItemState::default(),
+        &ui.styles,
+        |token| match token {
+            "fut" => TokenValue::plain("fut"),
+            "session.name" => TokenValue::plain(model.session_name.clone()),
+            "workspace.name" => {
+                TokenValue::plain(sanitize(current.map_or("", |item| item.name.as_str())))
+            }
+            "workspace.icon" => TokenValue::plain(icons.workspace.clone()),
+            "sidebar.status" => match status {
+                Some(WorkspaceStatus::Ready) => TokenValue::plain(" ↑↓ ↵ c new · r rename"),
+                Some(WorkspaceStatus::Switching) => TokenValue::plain(" switching…"),
+                Some(WorkspaceStatus::Error(message)) => {
+                    TokenValue::styled(format!(" {message} · retry"), SemanticStyle::Error)
+                }
+                None => TokenValue::plain(""),
+            },
+            _ => TokenValue::plain(""),
+        },
+    )
+}
+
+fn render_workspace_row(
+    item: &WorkspaceItem,
+    selected: bool,
+    area: Rect,
+    ui: &UiConfig,
+    buffer: &mut Buffer,
+) {
+    if area.width == 0 {
+        return;
+    }
+    let icons = ui.icons.resolve();
+    let state = ItemState {
+        current: item.current,
+        selected,
+        closing: item.closing,
+        attention: false,
+    };
+    let resolve = |token: &str| match token {
+        "workspace.marker" if item.current => TokenValue::plain(icons.current.clone()),
+        "workspace.marker" => TokenValue::plain(" "),
+        "workspace.index" => TokenValue::plain((item.index + 1).to_string()),
+        "workspace.name" => TokenValue::plain(sanitize(&item.name)),
+        "workspace.id" => TokenValue::plain(item.id.to_string()),
+        "workspace.root" => TokenValue::plain(sanitize(&item.root.to_string_lossy())),
+        "workspace.root_name" => TokenValue::plain(sanitize(
+            &item
+                .root
+                .file_name()
+                .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
+        )),
+        "workspace.closing" if item.closing => {
+            TokenValue::styled(icons.closing.clone(), SemanticStyle::Closing)
+        }
+        "workspace.tab_count" => TokenValue::plain(item.tab_count.to_string()),
+        "workspace.icon" => TokenValue::plain(icons.workspace.clone()),
+        _ => TokenValue::plain(""),
+    };
+    let left = render_token_segments(
+        &ui.workspace_sidebar.row.left,
+        None,
+        state,
+        &ui.styles,
+        resolve,
+    );
+    let body = render_token_segments(
+        &ui.workspace_sidebar.row.body,
+        None,
+        state,
+        &ui.styles,
+        resolve,
+    );
+    let right = render_token_segments(
+        &ui.workspace_sidebar.row.right,
+        None,
+        state,
+        &ui.styles,
+        resolve,
+    );
+    let width = usize::from(area.width);
+    let left_width = left.width().min(width);
+    let right_width = right.width().min(width.saturating_sub(left_width));
+    let body_width = width.saturating_sub(left_width + right_width);
+    buffer.set_line(
+        area.x,
+        area.y,
+        &truncate_line(&left, left_width),
+        left_width as u16,
+    );
+    buffer.set_line(
+        area.x.saturating_add(left_width as u16),
+        area.y,
+        &truncate_line(&body, body_width),
+        body_width as u16,
+    );
+    buffer.set_line(
+        area.x.saturating_add((width - right_width) as u16),
+        area.y,
+        &truncate_line(&right, right_width),
+        right_width as u16,
+    );
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -472,44 +623,15 @@ fn visible_rows(length: usize, anchor: usize, height: usize) -> Vec<VisibleRow> 
     }
 }
 
-fn format_workspace(name: &str, current: bool, closing: bool, width: usize) -> String {
-    let name = sanitize(name);
-    match width {
-        0 => String::new(),
-        1 => {
-            if current {
-                "●".into()
-            } else if closing {
-                "×".into()
-            } else {
-                " ".into()
-            }
-        }
-        _ => {
-            let marker = if current { "●" } else { " " };
-            let suffix = if closing && width >= 5 { " ×" } else { "" };
-            let available = width.saturating_sub(2 + unicode_width::UnicodeWidthStr::width(suffix));
-            format!("{marker} {}{suffix}", truncate(&name, available))
-        }
-    }
-}
-
-fn clear(area: Rect, buffer: &mut Buffer) {
+fn clear(area: Rect, style: Style, buffer: &mut Buffer) {
     for row in area.y..area.y.saturating_add(area.height) {
         for column in area.x..area.x.saturating_add(area.width) {
             if let Some(cell) = buffer.cell_mut((column, row)) {
                 cell.reset();
+                cell.set_style(style);
             }
         }
     }
-}
-
-fn active_style() -> Style {
-    Style::default().add_modifier(Modifier::BOLD)
-}
-
-fn muted_style() -> Style {
-    Style::default().add_modifier(Modifier::DIM)
 }
 
 #[cfg(test)]
@@ -517,6 +639,7 @@ mod tests {
     use std::path::PathBuf;
 
     use crossterm::event::KeyModifiers;
+    use ratatui::style::Modifier;
 
     use super::*;
     use crate::{
@@ -593,7 +716,15 @@ mod tests {
     ) -> (String, Buffer) {
         let area = Rect::new(0, 0, width, height);
         let mut buffer = Buffer::empty(area);
-        render_model(model, selected, status, area, position, &mut buffer);
+        render_model(
+            model,
+            selected,
+            status,
+            area,
+            position,
+            &UiConfig::default(),
+            &mut buffer,
+        );
         let text = (0..height)
             .map(|row| {
                 (0..width)
@@ -696,7 +827,8 @@ mod tests {
             rendered(&model, None, None, 24, 3, WorkspaceSidebarPosition::Left);
         assert!(left.contains("● main"));
         assert!(left.contains("bad�name"));
-        assert!(left.contains("closing ×"));
+        assert!(left.contains("closing"));
+        assert!(left.contains('×'));
         assert!(left_buffer[(0, 0)].modifier.contains(Modifier::BOLD));
         assert_eq!(left_buffer[(23, 0)].symbol(), "│");
         assert!(left_buffer[(23, 0)].modifier.contains(Modifier::DIM));
@@ -781,5 +913,30 @@ mod tests {
             WorkspaceSidebarPosition::Left,
         );
         assert!(tiny_error.contains("destination busy"));
+    }
+
+    #[test]
+    fn passive_static_footer_never_replaces_the_only_workspace_row() {
+        let (snapshot, focused) = fixture(&["main"], 0);
+        let model =
+            WorkspaceModel::from_snapshot(&snapshot, &focused, &NavigationHistory::default());
+        let ui: UiConfig =
+            toml::from_str("[workspace_sidebar]\nfooter = [{ text = 'FOOTER' }]\n").unwrap();
+        let area = Rect::new(0, 0, 24, 1);
+        let mut buffer = Buffer::empty(area);
+        render_model(
+            &model,
+            None,
+            None,
+            area,
+            WorkspaceSidebarPosition::Left,
+            &ui,
+            &mut buffer,
+        );
+        let text = (0..area.width)
+            .map(|column| buffer[(column, 0)].symbol())
+            .collect::<String>();
+        assert!(text.contains("main"));
+        assert!(!text.contains("FOOTER"));
     }
 }

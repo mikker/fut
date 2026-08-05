@@ -1,7 +1,7 @@
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Modifier, Style},
+    style::Style,
     text::{Line, Span},
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -13,11 +13,12 @@ use crate::{
     resources::{ResourceSnapshot, TabSnapshot},
 };
 
-use super::config::{TabBarPosition, UiConfig, WorkspaceSidebarPosition};
+use super::{
+    config::{GroupConfig, SemanticStyle, TabBarPosition, UiConfig, WorkspaceSidebarPosition},
+    presentation::{ItemState, TokenValue, render_token_segments, truncate_line},
+};
 
-pub(super) const WORKSPACE_SIDEBAR_WIDTH: u16 = 24;
 const MIN_DOCKED_TERMINAL_WIDTH: u16 = 96;
-const ZOOM_STATUS: &str = "zoom ";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ClientLayout {
@@ -47,40 +48,42 @@ impl WorkspaceSidebarLayout {
     }
 }
 
-pub(super) fn client_layout(host: Rect, ui: UiConfig) -> ClientLayout {
+pub(super) fn client_layout(host: Rect, ui: &UiConfig) -> ClientLayout {
     if host.width == 0 || host.height < 2 {
         return ClientLayout {
             terminal: host,
             tab_bar: None,
-            workspace_sidebar: sidebar_rect(host, ui.workspace_sidebar_position)
-                .map(WorkspaceSidebarLayout::Drawer),
+            workspace_sidebar: sidebar_rect(
+                host,
+                ui.workspace_sidebar.position,
+                ui.workspace_sidebar.width,
+            )
+            .map(WorkspaceSidebarLayout::Drawer),
         };
     }
 
-    let docked = host.width >= WORKSPACE_SIDEBAR_WIDTH.saturating_add(MIN_DOCKED_TERMINAL_WIDTH);
+    let sidebar_width = ui.workspace_sidebar.width;
+    let docked = host.width >= sidebar_width.saturating_add(MIN_DOCKED_TERMINAL_WIDTH);
     let (workspace, docked_sidebar) = if docked {
-        let sidebar = sidebar_rect(host, ui.workspace_sidebar_position)
+        let sidebar = sidebar_rect(host, ui.workspace_sidebar.position, sidebar_width)
             .expect("nonempty host has a sidebar rectangle");
-        let workspace = match ui.workspace_sidebar_position {
+        let workspace = match ui.workspace_sidebar.position {
             WorkspaceSidebarPosition::Left => Rect::new(
-                host.x.saturating_add(WORKSPACE_SIDEBAR_WIDTH),
+                host.x.saturating_add(sidebar_width),
                 host.y,
-                host.width - WORKSPACE_SIDEBAR_WIDTH,
+                host.width - sidebar_width,
                 host.height,
             ),
-            WorkspaceSidebarPosition::Right => Rect::new(
-                host.x,
-                host.y,
-                host.width - WORKSPACE_SIDEBAR_WIDTH,
-                host.height,
-            ),
+            WorkspaceSidebarPosition::Right => {
+                Rect::new(host.x, host.y, host.width - sidebar_width, host.height)
+            }
         };
         (workspace, Some(sidebar))
     } else {
         (host, None)
     };
 
-    let (terminal, tab_bar) = match ui.tab_bar_position {
+    let (terminal, tab_bar) = match ui.tab_bar.position {
         TabBarPosition::Top => (
             Rect::new(
                 workspace.x,
@@ -112,17 +115,21 @@ pub(super) fn client_layout(host: Rect, ui: UiConfig) -> ClientLayout {
         workspace_sidebar: docked_sidebar
             .map(WorkspaceSidebarLayout::Docked)
             .or_else(|| {
-                sidebar_rect(host, ui.workspace_sidebar_position)
+                sidebar_rect(host, ui.workspace_sidebar.position, sidebar_width)
                     .map(WorkspaceSidebarLayout::Drawer)
             }),
     }
 }
 
-fn sidebar_rect(body: Rect, position: WorkspaceSidebarPosition) -> Option<Rect> {
+fn sidebar_rect(
+    body: Rect,
+    position: WorkspaceSidebarPosition,
+    configured_width: u16,
+) -> Option<Rect> {
     if body.width == 0 || body.height == 0 {
         return None;
     }
-    let width = body.width.min(WORKSPACE_SIDEBAR_WIDTH);
+    let width = body.width.min(configured_width);
     let x = match position {
         WorkspaceSidebarPosition::Left => body.x,
         WorkspaceSidebarPosition::Right => body.x.saturating_add(body.width - width),
@@ -158,20 +165,24 @@ struct TabItem {
     id: TabId,
     name: String,
     closing: bool,
+    pane_count: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TabBarModel {
+    session_name: String,
+    workspace_name: String,
     tabs: Vec<TabItem>,
     active: usize,
 }
 
 impl TabBarModel {
     fn from_snapshot(snapshot: &ResourceSnapshot, focused: &SelectedTarget) -> Option<Self> {
-        let workspace = snapshot
+        let session = snapshot
             .sessions
             .iter()
-            .find(|session| session.id == focused.session_id)?
+            .find(|session| session.id == focused.session_id)?;
+        let workspace = session
             .workspaces
             .iter()
             .find(|workspace| workspace.id == focused.workspace_id)?;
@@ -180,6 +191,8 @@ impl TabBarModel {
             .iter()
             .position(|tab| tab.id == focused.tab_id)?;
         Some(Self {
+            session_name: sanitize(&session.name),
+            workspace_name: sanitize(&workspace.name),
             tabs: workspace.tabs.iter().map(TabItem::from).collect(),
             active,
         })
@@ -192,8 +205,25 @@ impl From<&TabSnapshot> for TabItem {
             id: tab.id,
             name: sanitize(&tab.name),
             closing: tab.closing,
+            pane_count: tab.panes.len(),
         }
     }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Lane {
+    Left,
+    Center,
+    Right,
+}
+
+struct ResolvedGroup {
+    lane: Lane,
+    line: Line<'static>,
+    tabs: bool,
+    style: Option<SemanticStyle>,
+    priority: u8,
+    allocation: usize,
 }
 
 pub(super) fn render_tab_bar(
@@ -201,78 +231,181 @@ pub(super) fn render_tab_bar(
     focused: &SelectedTarget,
     zoomed: bool,
     selected: Option<TabId>,
+    ui: &UiConfig,
     area: Rect,
     buffer: &mut Buffer,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    clear_row(area, buffer);
-    let width = usize::from(area.width);
-    let zoom_width = if zoomed {
-        width.min(UnicodeWidthStr::width(ZOOM_STATUS))
-    } else {
-        0
-    };
-    let tab_width = width.saturating_sub(zoom_width);
-    let Some(model) = snapshot.and_then(|snapshot| TabBarModel::from_snapshot(snapshot, focused))
-    else {
-        let fallback = single_tab("●", "tab", false, tab_width);
-        buffer.set_line(
-            area.x,
-            area.y,
-            &Line::styled(fallback, active_style()),
-            u16::try_from(tab_width).expect("tab width fits u16"),
-        );
-        render_zoom_status(zoom_width, area, buffer);
-        return;
-    };
-
-    let (line, complete) = visible_tabs(&model, selected, tab_width);
-    buffer.set_line(
-        area.x,
-        area.y,
-        &line,
-        u16::try_from(tab_width).expect("tab width fits u16"),
+    clear_row(
+        area,
+        ui.styles.apply(SemanticStyle::Normal, Style::default()),
+        buffer,
     );
-
-    if zoom_width > 0 {
-        render_zoom_status(zoom_width, area, buffer);
-        return;
+    let width = usize::from(area.width);
+    let model = snapshot
+        .and_then(|snapshot| TabBarModel::from_snapshot(snapshot, focused))
+        .unwrap_or_else(|| TabBarModel {
+            session_name: "session".into(),
+            workspace_name: "workspace".into(),
+            tabs: vec![TabItem {
+                id: focused.tab_id,
+                name: "tab".into(),
+                closing: false,
+                pane_count: 1,
+            }],
+            active: 0,
+        });
+    let mut groups = Vec::new();
+    for (lane, configured) in [
+        (Lane::Left, &ui.tab_bar.left),
+        (Lane::Center, &ui.tab_bar.center),
+        (Lane::Right, &ui.tab_bar.right),
+    ] {
+        for group in configured {
+            let tabs = group
+                .segments
+                .iter()
+                .any(|segment| segment.component.as_deref() == Some("tabs"));
+            let line = if tabs {
+                selected_line(&model, selected, 0, model.tabs.len() - 1, group.style, ui)
+            } else {
+                render_bar_group(group, &model, zoomed, selected, ui)
+            };
+            if tabs || line.width() > 0 {
+                groups.push(ResolvedGroup {
+                    lane,
+                    line,
+                    tabs,
+                    style: group.style,
+                    priority: group.priority,
+                    allocation: 0,
+                });
+            }
+        }
     }
-
-    let suffix = if selected.is_some() {
-        "c new · r rename · esc "
-    } else {
-        "fut "
+    allocate_groups(&mut groups, width);
+    let lane_width = |lane| {
+        groups
+            .iter()
+            .filter(|group| group.lane == lane)
+            .map(|group| group.allocation)
+            .sum::<usize>()
     };
-    let suffix_width = UnicodeWidthStr::width(suffix);
-    if complete && line.width().saturating_add(suffix_width) <= width {
-        buffer.set_string(
-            area.x + area.width - u16::try_from(suffix_width).expect("suffix width fits u16"),
-            area.y,
-            suffix,
-            muted_style(),
-        );
+    let left_width = lane_width(Lane::Left);
+    let center_width = lane_width(Lane::Center);
+    let right_width = lane_width(Lane::Right);
+    let center_x = width
+        .saturating_sub(center_width)
+        .checked_div(2)
+        .unwrap_or(0)
+        .clamp(left_width, width.saturating_sub(right_width + center_width));
+    for (lane, mut x) in [
+        (Lane::Left, 0usize),
+        (Lane::Center, center_x),
+        (Lane::Right, width.saturating_sub(right_width)),
+    ] {
+        for group in groups.iter().filter(|group| group.lane == lane) {
+            if group.allocation == 0 {
+                continue;
+            }
+            let line = if group.tabs {
+                visible_tabs(&model, selected, group.allocation, group.style, ui).0
+            } else {
+                truncate_line(&group.line, group.allocation)
+            };
+            buffer.set_line(
+                area.x.saturating_add(u16::try_from(x).unwrap_or(u16::MAX)),
+                area.y,
+                &line,
+                u16::try_from(group.allocation).unwrap_or(u16::MAX),
+            );
+            x += group.allocation;
+        }
     }
 }
 
-fn render_zoom_status(width: usize, area: Rect, buffer: &mut Buffer) {
-    if width == 0 {
-        return;
+fn render_bar_group(
+    group: &GroupConfig,
+    model: &TabBarModel,
+    zoomed: bool,
+    selected: Option<TabId>,
+    ui: &UiConfig,
+) -> Line<'static> {
+    let icons = ui.icons.resolve();
+    let active = &model.tabs[model.active];
+    render_token_segments(
+        &group.segments,
+        group.style,
+        ItemState::default(),
+        &ui.styles,
+        |token| match token {
+            "fut" if selected.is_none() => TokenValue::plain("fut "),
+            "session.name" => TokenValue::plain(model.session_name.clone()),
+            "workspace.name" => TokenValue::plain(model.workspace_name.clone()),
+            "workspace.icon" => TokenValue::plain(icons.workspace.clone()),
+            "tab.name" => TokenValue::plain(active.name.clone()),
+            "tab.index" => TokenValue::plain((model.active + 1).to_string()),
+            "tab.pane_count" => TokenValue::plain(active.pane_count.to_string()),
+            "client.zoom" if zoomed => TokenValue::plain(icons.zoom.clone()),
+            "client.help" if selected.is_some() => TokenValue::plain("c new · r rename · esc "),
+            _ => TokenValue::plain(""),
+        },
+    )
+}
+
+fn allocate_groups(groups: &mut [ResolvedGroup], width: usize) {
+    let tabs = groups.iter().position(|group| group.tabs);
+    let mut remaining = width;
+    if let Some(index) = tabs
+        && remaining > 0
+    {
+        groups[index].allocation = 1;
+        remaining -= 1;
     }
-    buffer.set_string(
-        area.x + area.width - u16::try_from(width).expect("zoom width fits u16"),
-        area.y,
-        &ZOOM_STATUS[..width],
-        active_style(),
-    );
+    let tab_priority = tabs.map_or(0, |index| groups[index].priority);
+    let mut indices = (0..groups.len())
+        .filter(|index| Some(*index) != tabs)
+        .collect::<Vec<_>>();
+    indices.sort_by_key(|index| std::cmp::Reverse(groups[*index].priority));
+    for index in indices.iter().copied() {
+        if groups[index].priority <= tab_priority {
+            continue;
+        }
+        let demand = groups[index].line.width();
+        if demand <= remaining {
+            groups[index].allocation = demand;
+            remaining -= demand;
+        }
+    }
+    if let Some(index) = tabs {
+        let growth = groups[index]
+            .line
+            .width()
+            .saturating_sub(groups[index].allocation)
+            .min(remaining);
+        groups[index].allocation += growth;
+        remaining -= growth;
+    }
+    for index in indices {
+        if groups[index].priority > tab_priority {
+            continue;
+        }
+        let demand = groups[index].line.width();
+        if demand <= remaining {
+            groups[index].allocation = demand;
+            remaining -= demand;
+        }
+    }
 }
 
 fn visible_tabs(
     model: &TabBarModel,
     selected: Option<TabId>,
     width: usize,
+    component_style: Option<SemanticStyle>,
+    ui: &UiConfig,
 ) -> (Line<'static>, bool) {
     if width == 0 {
         return (Line::default(), false);
@@ -282,35 +415,34 @@ fn visible_tabs(
         .unwrap_or(model.active);
     let mut first = anchor;
     let mut last = anchor;
-    let mut line = selected_line(model, selected, first, last);
+    let mut line = selected_line(model, selected, first, last, component_style, ui);
     if line.width() > width {
-        let tab = &model.tabs[anchor];
-        let active = anchor == model.active;
-        let marker = if active {
-            "●".to_owned()
-        } else {
-            (anchor + 1).to_string()
-        };
-        let mut style = if active {
-            active_style()
-        } else if tab.closing {
-            muted_style()
-        } else {
-            Style::default()
-        };
-        if selected == Some(tab.id) {
-            style = style.add_modifier(Modifier::REVERSED);
+        let fallback = render_tab_item(model, anchor, selected, component_style, ui);
+        if width == 1 {
+            let marker = tab_token(model, anchor, "tab.marker", &ui.icons.resolve());
+            let mut style = ui.styles.apply(SemanticStyle::Normal, Style::default());
+            if let Some(role) = component_style {
+                style = ui.styles.apply(role, style);
+            }
+            let tab = &model.tabs[anchor];
+            if anchor == model.active {
+                style = ui.styles.apply(SemanticStyle::Current, style);
+            }
+            if tab.closing {
+                style = ui.styles.apply(SemanticStyle::Closing, style);
+            }
+            if selected == Some(tab.id) {
+                style = ui.styles.apply(SemanticStyle::Selected, style);
+            }
+            return (Line::styled(truncate(&marker.text, 1), style), false);
         }
-        return (
-            Line::styled(single_tab(&marker, &tab.name, tab.closing, width), style),
-            false,
-        );
+        return (truncate_line(&fallback, width), false);
     }
 
     loop {
         let mut changed = false;
         if first > 0 {
-            let candidate = selected_line(model, selected, first - 1, last);
+            let candidate = selected_line(model, selected, first - 1, last, component_style, ui);
             if candidate.width() <= width {
                 first -= 1;
                 line = candidate;
@@ -318,7 +450,7 @@ fn visible_tabs(
             }
         }
         if last + 1 < model.tabs.len() {
-            let candidate = selected_line(model, selected, first, last + 1);
+            let candidate = selected_line(model, selected, first, last + 1, component_style, ui);
             if candidate.width() <= width {
                 last += 1;
                 line = candidate;
@@ -337,51 +469,79 @@ fn selected_line(
     selected: Option<TabId>,
     first: usize,
     last: usize,
+    component_style: Option<SemanticStyle>,
+    ui: &UiConfig,
 ) -> Line<'static> {
     let mut spans = Vec::new();
+    let icons = ui.icons.resolve();
     if first > 0 {
-        spans.push(Span::styled(" … ", muted_style()));
+        let mut style = ui.styles.apply(SemanticStyle::Normal, Style::default());
+        if let Some(role) = component_style {
+            style = ui.styles.apply(role, style);
+        }
+        spans.push(Span::styled(
+            format!(" {} ", icons.overflow),
+            ui.styles.apply(SemanticStyle::Muted, style),
+        ));
     }
     for index in first..=last {
-        let tab = &model.tabs[index];
-        let active = index == model.active;
-        let marker = if active {
-            "●".to_owned()
-        } else {
-            (index + 1).to_string()
-        };
-        let closing = if tab.closing { " ×" } else { "" };
-        let text = format!(" {marker} {}{closing} ", tab.name);
-        let mut style = if active {
-            active_style()
-        } else if tab.closing {
-            muted_style()
-        } else {
-            Style::default()
-        };
-        if selected == Some(tab.id) {
-            style = style.add_modifier(Modifier::REVERSED);
-        }
-        spans.push(Span::styled(text, style));
+        spans.extend(render_tab_item(model, index, selected, component_style, ui).spans);
     }
     if last + 1 < model.tabs.len() {
-        spans.push(Span::styled(" … ", muted_style()));
+        let mut style = ui.styles.apply(SemanticStyle::Normal, Style::default());
+        if let Some(role) = component_style {
+            style = ui.styles.apply(role, style);
+        }
+        spans.push(Span::styled(
+            format!(" {} ", icons.overflow),
+            ui.styles.apply(SemanticStyle::Muted, style),
+        ));
     }
     Line::from(spans)
 }
 
-fn single_tab(marker: &str, name: &str, closing: bool, width: usize) -> String {
-    match width {
-        0 => String::new(),
-        1 => truncate(marker, 1),
-        2 => format!("{} ", truncate(marker, 1)),
-        _ => {
-            let suffix = if closing && width >= 7 { " × " } else { " " };
-            let available = width.saturating_sub(
-                2 + UnicodeWidthStr::width(marker) + UnicodeWidthStr::width(suffix),
-            );
-            format!(" {marker} {}{suffix}", truncate(name, available))
+fn render_tab_item(
+    model: &TabBarModel,
+    index: usize,
+    selected: Option<TabId>,
+    component_style: Option<SemanticStyle>,
+    ui: &UiConfig,
+) -> Line<'static> {
+    let tab = &model.tabs[index];
+    let icons = ui.icons.resolve();
+    render_token_segments(
+        &ui.tab_bar.item.segments,
+        component_style,
+        ItemState {
+            current: index == model.active,
+            selected: selected == Some(tab.id),
+            closing: tab.closing,
+            attention: false,
+        },
+        &ui.styles,
+        |token| tab_token(model, index, token, &icons),
+    )
+}
+
+fn tab_token(
+    model: &TabBarModel,
+    index: usize,
+    token: &str,
+    icons: &super::config::IconSet,
+) -> TokenValue {
+    let tab = &model.tabs[index];
+    match token {
+        "tab.marker" if index == model.active => TokenValue::plain(icons.current.clone()),
+        "tab.marker" => TokenValue::plain((index + 1).to_string()),
+        "tab.index" => TokenValue::plain((index + 1).to_string()),
+        "tab.name" => TokenValue::plain(tab.name.clone()),
+        "tab.id" => TokenValue::plain(tab.id.to_string()),
+        "tab.closing" if tab.closing => {
+            TokenValue::styled(icons.closing.clone(), SemanticStyle::Closing)
         }
+        "tab.pane_count" => TokenValue::plain(tab.pane_count.to_string()),
+        "tab.icon" => TokenValue::plain(icons.tab.clone()),
+        _ => TokenValue::plain(""),
     }
 }
 
@@ -414,7 +574,16 @@ pub(super) fn sanitize(value: &str) -> String {
     value
         .chars()
         .map(|character| {
-            if character.is_control() {
+            if character.is_control()
+                || matches!(
+                    character,
+                    '\u{061c}'
+                        | '\u{200e}'
+                        | '\u{200f}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2066}'..='\u{2069}'
+                )
+            {
                 '�'
             } else {
                 character
@@ -423,20 +592,13 @@ pub(super) fn sanitize(value: &str) -> String {
         .collect()
 }
 
-fn clear_row(area: Rect, buffer: &mut Buffer) {
+fn clear_row(area: Rect, style: Style, buffer: &mut Buffer) {
     for column in area.x..area.x.saturating_add(area.width) {
         if let Some(cell) = buffer.cell_mut((column, area.y)) {
             cell.reset();
+            cell.set_style(style);
         }
     }
-}
-
-fn active_style() -> Style {
-    Style::default().add_modifier(Modifier::BOLD)
-}
-
-fn muted_style() -> Style {
-    Style::default().add_modifier(Modifier::DIM)
 }
 
 #[cfg(test)]
@@ -448,6 +610,7 @@ mod tests {
         domain::{PaneId, SessionId, TabId, TerminalId, WorkspaceId},
         resources::{PaneSnapshot, Project, ProjectIdentity, SessionSnapshot, WorkspaceSnapshot},
     };
+    use ratatui::style::Modifier;
 
     fn fixture(names: &[&str], active: usize) -> (ResourceSnapshot, SelectedTarget) {
         let session_id = SessionId::new();
@@ -506,7 +669,15 @@ mod tests {
         let (snapshot, focused) = fixture(names, active);
         let area = Rect::new(0, 0, width, 1);
         let mut buffer = Buffer::empty(area);
-        render_tab_bar(Some(&snapshot), &focused, false, None, area, &mut buffer);
+        render_tab_bar(
+            Some(&snapshot),
+            &focused,
+            false,
+            None,
+            &UiConfig::default(),
+            area,
+            &mut buffer,
+        );
         let text = (0..width)
             .map(|column| buffer[(column, 0)].symbol())
             .collect::<String>();
@@ -517,7 +688,7 @@ mod tests {
     fn chrome_layout_composes_tab_and_sidebar_positions_at_the_exact_breakpoint() {
         let top_left = UiConfig::default();
         assert_eq!(
-            client_layout(Rect::new(3, 4, 119, 24), top_left),
+            client_layout(Rect::new(3, 4, 119, 24), &top_left),
             ClientLayout {
                 tab_bar: Some(Rect::new(3, 4, 119, 1)),
                 terminal: Rect::new(3, 5, 119, 23),
@@ -525,20 +696,18 @@ mod tests {
             }
         );
         assert_eq!(
-            client_layout(Rect::new(3, 4, 120, 24), top_left),
+            client_layout(Rect::new(3, 4, 120, 24), &top_left),
             ClientLayout {
                 tab_bar: Some(Rect::new(27, 4, 96, 1)),
                 terminal: Rect::new(27, 5, 96, 23),
                 workspace_sidebar: Some(WorkspaceSidebarLayout::Docked(Rect::new(3, 4, 24, 24,))),
             }
         );
-        let bottom_right = UiConfig {
-            tab_bar_position: TabBarPosition::Bottom,
-            workspace_sidebar_position: WorkspaceSidebarPosition::Right,
-            pane_layout: crate::client::config::PaneLayoutPolicy::Splits,
-        };
+        let mut bottom_right = UiConfig::default();
+        bottom_right.tab_bar.position = TabBarPosition::Bottom;
+        bottom_right.workspace_sidebar.position = WorkspaceSidebarPosition::Right;
         assert_eq!(
-            client_layout(Rect::new(3, 4, 120, 24), bottom_right),
+            client_layout(Rect::new(3, 4, 120, 24), &bottom_right),
             ClientLayout {
                 tab_bar: Some(Rect::new(3, 27, 96, 1)),
                 terminal: Rect::new(3, 4, 96, 23),
@@ -550,7 +719,7 @@ mod tests {
     #[test]
     fn chrome_layout_returns_tiny_hosts_to_the_terminal_but_keeps_a_drawer_overlay() {
         assert_eq!(
-            client_layout(Rect::new(3, 4, 80, 0), UiConfig::default()),
+            client_layout(Rect::new(3, 4, 80, 0), &UiConfig::default()),
             ClientLayout {
                 tab_bar: None,
                 terminal: Rect::new(3, 4, 80, 0),
@@ -558,7 +727,7 @@ mod tests {
             }
         );
         assert_eq!(
-            client_layout(Rect::new(3, 4, 120, 1), UiConfig::default()),
+            client_layout(Rect::new(3, 4, 120, 1), &UiConfig::default()),
             ClientLayout {
                 tab_bar: None,
                 terminal: Rect::new(3, 4, 120, 1),
@@ -578,6 +747,70 @@ mod tests {
         first.revision = 2;
         assert!(state.accept(first));
         assert_eq!(state.snapshot().unwrap().revision, 2);
+    }
+
+    #[test]
+    fn configurable_group_allocation_never_overlaps_and_honors_priority() {
+        for width in 0..=200 {
+            let mut groups = vec![
+                ResolvedGroup {
+                    lane: Lane::Left,
+                    line: Line::raw("tabs preferred content"),
+                    tabs: true,
+                    style: None,
+                    priority: 100,
+                    allocation: 0,
+                },
+                ResolvedGroup {
+                    lane: Lane::Center,
+                    line: Line::raw("CENTER"),
+                    tabs: false,
+                    style: None,
+                    priority: 20,
+                    allocation: 0,
+                },
+                ResolvedGroup {
+                    lane: Lane::Right,
+                    line: Line::raw("ZOOM"),
+                    tabs: false,
+                    style: None,
+                    priority: 255,
+                    allocation: 0,
+                },
+            ];
+            allocate_groups(&mut groups, width);
+            assert!(
+                groups.iter().map(|group| group.allocation).sum::<usize>() <= width,
+                "width {width}"
+            );
+            if width >= 5 {
+                assert_eq!(groups[2].allocation, 4, "width {width}");
+                assert!(groups[0].allocation >= 1, "width {width}");
+            }
+        }
+    }
+
+    #[test]
+    fn configured_normal_background_covers_the_complete_bar() {
+        let ui: UiConfig = toml::from_str(
+            "[styles.normal]\nbackground = 'blue'\n\n[tab_bar]\nleft = []\ncenter = []\nright = []\n",
+        )
+        .unwrap();
+        let (snapshot, focused) = fixture(&["shell"], 0);
+        let area = Rect::new(0, 0, 20, 1);
+        let mut buffer = Buffer::empty(area);
+        render_tab_bar(
+            Some(&snapshot),
+            &focused,
+            false,
+            None,
+            &ui,
+            area,
+            &mut buffer,
+        );
+        assert!(
+            (0..area.width).all(|column| { buffer[(column, 0)].bg == ratatui::style::Color::Blue })
+        );
     }
 
     #[test]
@@ -615,7 +848,7 @@ mod tests {
             }
         }
         assert_eq!(truncate("👩🏽‍💻abc", 3), "👩🏽‍💻…");
-        assert_eq!(sanitize("bad\nname"), "bad�name");
+        assert_eq!(sanitize("bad\nname\u{202e}"), "bad�name�");
     }
 
     #[test]
@@ -624,7 +857,15 @@ mod tests {
         snapshot.sessions[0].workspaces[0].tabs[1].closing = true;
         let area = Rect::new(0, 0, 40, 1);
         let mut buffer = Buffer::empty(area);
-        render_tab_bar(Some(&snapshot), &focused, false, None, area, &mut buffer);
+        render_tab_bar(
+            Some(&snapshot),
+            &focused,
+            false,
+            None,
+            &UiConfig::default(),
+            area,
+            &mut buffer,
+        );
         let text = (0..area.width)
             .map(|column| buffer[(column, 0)].symbol())
             .collect::<String>();
@@ -633,7 +874,15 @@ mod tests {
         let mut missing = focused.clone();
         missing.workspace_id = WorkspaceId::new();
         let mut fallback = Buffer::empty(area);
-        render_tab_bar(Some(&snapshot), &missing, false, None, area, &mut fallback);
+        render_tab_bar(
+            Some(&snapshot),
+            &missing,
+            false,
+            None,
+            &UiConfig::default(),
+            area,
+            &mut fallback,
+        );
         assert_eq!(fallback[(1, 0)].symbol(), "●");
     }
 
@@ -642,7 +891,15 @@ mod tests {
         let (snapshot, focused) = fixture(&["shell", "editor", "tests"], 1);
         let area = Rect::new(3, 4, 24, 1);
         let mut buffer = Buffer::empty(area);
-        render_tab_bar(Some(&snapshot), &focused, true, None, area, &mut buffer);
+        render_tab_bar(
+            Some(&snapshot),
+            &focused,
+            true,
+            None,
+            &UiConfig::default(),
+            area,
+            &mut buffer,
+        );
         let text = (area.x..area.x + area.width)
             .map(|column| buffer[(column, area.y)].symbol())
             .collect::<String>();
@@ -659,14 +916,22 @@ mod tests {
         for width in 1..=6 {
             let area = Rect::new(0, 0, width, 1);
             let mut buffer = Buffer::empty(area);
-            render_tab_bar(Some(&snapshot), &focused, true, None, area, &mut buffer);
+            render_tab_bar(
+                Some(&snapshot),
+                &focused,
+                true,
+                None,
+                &UiConfig::default(),
+                area,
+                &mut buffer,
+            );
             let text = (0..width)
                 .map(|column| buffer[(column, 0)].symbol())
                 .collect::<String>();
-            let status_width = usize::from(width).min(ZOOM_STATUS.len());
-            assert!(text.ends_with(&ZOOM_STATUS[..status_width]));
-            assert!(buffer[(0, 0)].modifier.contains(Modifier::BOLD));
             if width == 6 {
+                assert!(text.contains('●'));
+                assert!(text.ends_with("zoom "));
+            } else {
                 assert!(text.contains('●'));
             }
         }

@@ -122,6 +122,10 @@ The presentation of an idle terminal with an unseen completion event. Done is de
 
 The derived summary shown on a tab, workspace, or session from the activity and attention of its descendants. Rollups make background work visible in the normal project tree.
 
+### Presentation token
+
+A pure, typed value expanded by a client from resource and client state already in memory, such as a workspace name, tab index, closing marker, or zoom state. Presentation tokens perform no I/O or execution. Future dynamic providers publish asynchronously into this rendering context rather than running during a frame.
+
 ### Direct navigation
 
 Moving from any current location to any session, workspace, tab, or pane without detaching, changing server namespaces, or walking through each intermediate level.

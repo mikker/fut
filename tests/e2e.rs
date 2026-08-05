@@ -4,7 +4,11 @@ use std::{
     collections::HashMap,
     fs,
     io::{Read, Write},
-    os::unix::{fs::PermissionsExt, net::UnixListener},
+    os::unix::{
+        ffi::OsStringExt,
+        fs::{PermissionsExt, symlink},
+        net::UnixListener,
+    },
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex, mpsc},
@@ -4540,13 +4544,35 @@ async fn public_tab_bar_tracks_live_tabs_resizes_content_and_honors_global_posit
     fs::create_dir_all(&config_directory).unwrap();
     fs::write(
         config_directory.join("config.toml"),
-        "[ui]\ntab_bar_position = \"bottom\"\nworkspace_sidebar_position = \"right\"\n",
+        r#"
+[ui.icons]
+preset = "ascii"
+current = "@"
+
+[ui.tab_bar]
+position = "bottom"
+left = [
+  { segments = [{ text = "LEFT " }], priority = 200 },
+  { segments = [{ component = "tabs" }] },
+]
+center = []
+right = [{ segments = [{ text = " RIGHT" }], priority = 200 }]
+
+[ui.tab_bar.item]
+segments = [{ text = "{" }, { token = "tab.marker" }, { text = ":" }, { token = "tab.name" }, { text = "}" }]
+
+[ui.workspace_sidebar]
+position = "right"
+"#,
     )
     .unwrap();
 
     let mut bottom = spawn_client();
     bottom.wait_for("work").await;
     bottom.wait_for("checks").await;
+    bottom.wait_for("LEFT").await;
+    bottom.wait_for("RIGHT").await;
+    bottom.wait_for("work}").await;
     bottom.wait_for("\x1b[24;1H").await;
     let bar_positioned_on_last_row = bottom.text().split("\x1b[24;1H").any(|suffix| {
         let nearby = &suffix[..suffix.len().min(200)];
@@ -4564,7 +4590,7 @@ async fn public_tab_bar_tracks_live_tabs_resizes_content_and_honors_global_posit
 
     fs::write(
         config_directory.join("config.toml"),
-        "[ui]\ntab_bar_position = \"sideways\"\n",
+        "[ui.tab_bar]\nposition = \"sideways\"\n",
     )
     .unwrap();
     let invalid = harness
@@ -4680,10 +4706,21 @@ done
     fs::create_dir_all(&config_directory).unwrap();
     fs::write(
         config_directory.join("config.toml"),
-        "[ui]\nworkspace_sidebar_position = \"right\"\n",
+        r#"
+[ui.workspace_sidebar]
+position = "right"
+header = [{ text = "WORKSPACES" }]
+
+[ui.workspace_sidebar.row]
+left = [{ text = "WS[" }]
+body = [{ token = "workspace.name" }]
+right = [{ text = "]" }, { token = "workspace.tab_count" }]
+"#,
     )
     .unwrap();
     let mut right = spawn_client(120, linked_target.pane_id);
+    right.wait_for("WORKSPACES").await;
+    right.wait_for("WS[").await;
     right.wait_for("feature").await;
     assert!(matches!(
         harness
@@ -4846,7 +4883,6 @@ async fn workspace_and_tab_bars_create_and_rename_logical_contexts() {
         client.send(b"\x02t");
         time::sleep(Duration::from_millis(50)).await;
     }
-    client.wait_for("c new · r rename · esc").await;
     client.send(b"r");
     client.wait_for("Rename tab").await;
     client.send("\x15main λ\r".as_bytes());
@@ -5070,7 +5106,7 @@ async fn malformed_ui_config_prevents_bare_fut_from_starting_or_opening_resource
     fs::create_dir_all(&cwd).unwrap();
     fs::write(
         home.join(".config/fut/config.toml"),
-        "[ui]\ntab_bar_position = \"sideways\"\n",
+        "[ui.tab_bar]\nposition = \"sideways\"\n",
     )
     .unwrap();
 
@@ -5092,6 +5128,175 @@ async fn malformed_ui_config_prevents_bare_fut_from_starting_or_opening_resource
     );
     assert!(!runtime.join("fut.sock").exists());
     assert!(fs::read_dir(&cwd).unwrap().next().is_none());
+}
+
+#[test]
+fn public_doctor_is_read_only_and_json_reports_configuration_errors() {
+    let root = tempfile::Builder::new()
+        .prefix("fut-e2e-doctor-")
+        .tempdir()
+        .unwrap();
+    let home = root.path().join("home");
+    let runtime = root.path().join("missing-runtime");
+    fs::create_dir_all(&home).unwrap();
+
+    let healthy = Command::new(env!("CARGO_BIN_EXE_fut"))
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", "/usr/bin:/bin")
+        .env("LANG", "en_US.UTF-8")
+        .env("TERM", "xterm-256color")
+        .env("FUT_RUNTIME_DIR", &runtime)
+        .arg("doctor")
+        .output()
+        .unwrap();
+    assert!(
+        healthy.status.success(),
+        "{}",
+        String::from_utf8_lossy(&healthy.stderr)
+    );
+    let human = String::from_utf8(healthy.stdout).unwrap();
+    assert!(human.contains("Fut doctor"));
+    assert!(human.contains("active font cannot be detected") || human.contains("visually verify"));
+    assert!(!runtime.exists(), "doctor created the runtime directory");
+
+    fs::create_dir(&runtime).unwrap();
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o500)).unwrap();
+    let unwritable = Command::new(env!("CARGO_BIN_EXE_fut"))
+        .env_clear()
+        .env("HOME", &home)
+        .env("TERM", "xterm-256color")
+        .env("LANG", "en_US.UTF-8")
+        .env("FUT_RUNTIME_DIR", &runtime)
+        .args(["--json", "doctor"])
+        .output()
+        .unwrap();
+    assert_eq!(unwritable.status.code(), Some(1));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&unwritable.stdout).unwrap()["result"]["status"],
+        "error"
+    );
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::remove_dir(&runtime).unwrap();
+
+    let relative_socket = Command::new(env!("CARGO_BIN_EXE_fut"))
+        .env_clear()
+        .env("HOME", &home)
+        .env("TERM", "xterm-256color")
+        .env("LANG", "en_US.UTF-8")
+        .args(["--json", "--socket", "relative.sock", "doctor"])
+        .output()
+        .unwrap();
+    assert_eq!(relative_socket.status.code(), Some(1));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&relative_socket.stdout).unwrap()["result"]["status"],
+        "error"
+    );
+
+    let relative_runtime = Command::new(env!("CARGO_BIN_EXE_fut"))
+        .env_clear()
+        .env("HOME", &home)
+        .env("TERM", "xterm-256color")
+        .env("LANG", "en_US.UTF-8")
+        .env("FUT_RUNTIME_DIR", "relative-runtime")
+        .current_dir(root.path())
+        .args(["--json", "doctor"])
+        .output()
+        .unwrap();
+    assert!(relative_runtime.status.success());
+    assert!(!root.path().join("relative-runtime").exists());
+
+    let real_parent = root.path().join("real-runtime-parent");
+    let linked_parent = root.path().join("linked-runtime-parent");
+    fs::create_dir(&real_parent).unwrap();
+    fs::set_permissions(&real_parent, fs::Permissions::from_mode(0o700)).unwrap();
+    symlink(&real_parent, &linked_parent).unwrap();
+    let linked_runtime = linked_parent.join("runtime");
+    let linked_parent_output = Command::new(env!("CARGO_BIN_EXE_fut"))
+        .env_clear()
+        .env("HOME", &home)
+        .env("TERM", "xterm-256color")
+        .env("LANG", "en_US.UTF-8")
+        .env("FUT_RUNTIME_DIR", &linked_runtime)
+        .args(["--json", "doctor"])
+        .output()
+        .unwrap();
+    assert!(linked_parent_output.status.success());
+    assert!(!linked_runtime.exists());
+
+    fs::create_dir_all(home.join(".config/fut")).unwrap();
+    fs::write(
+        home.join(".config/fut/config.toml"),
+        "[ui.tab_bar]\nposition = 'sideways'\n",
+    )
+    .unwrap();
+    let invalid = Command::new(env!("CARGO_BIN_EXE_fut"))
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", "/usr/bin:/bin")
+        .env("LANG", "en_US.UTF-8")
+        .env("TERM", "xterm-256color")
+        .env("FUT_RUNTIME_DIR", &runtime)
+        .args(["--json", "doctor"])
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    assert!(invalid.stderr.is_empty());
+    let lines = String::from_utf8(invalid.stdout).unwrap();
+    assert_eq!(lines.lines().count(), 1);
+    let envelope: serde_json::Value = serde_json::from_str(lines.trim()).unwrap();
+    assert_eq!(envelope["version"], 1);
+    assert_eq!(envelope["command"], "doctor");
+    assert_eq!(envelope["result"]["status"], "error");
+    assert!(
+        !runtime.exists(),
+        "doctor created state after a config error"
+    );
+
+    let non_utf8 = root
+        .path()
+        .join(std::ffi::OsString::from_vec(b"config-\xff.toml".to_vec()));
+    let non_utf8_output = Command::new(env!("CARGO_BIN_EXE_fut"))
+        .env_clear()
+        .env("FUT_CONFIG", non_utf8)
+        .env("TERM", "xterm-256color")
+        .env("LANG", "en_US.UTF-8")
+        .env("FUT_RUNTIME_DIR", &runtime)
+        .args(["--json", "doctor"])
+        .output()
+        .unwrap();
+    assert_eq!(non_utf8_output.status.code(), Some(1));
+    let non_utf8_json = String::from_utf8(non_utf8_output.stdout).unwrap();
+    assert_eq!(non_utf8_json.lines().count(), 1);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&non_utf8_json).unwrap()["result"]["status"],
+        "error"
+    );
+}
+
+#[tokio::test]
+async fn public_doctor_probes_a_running_daemon_without_mutating_resources() {
+    let harness = Harness::start("while :; do sleep 1; done").await;
+    let before = harness.resources().await;
+    let output = harness.cli().args(["--json", "doctor"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let protocol = envelope["result"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["id"] == "protocol")
+        .unwrap();
+    assert_eq!(protocol["status"], "warning");
+    assert_eq!(protocol["details"]["client_protocol"], 0);
+    let after = harness.resources().await;
+    assert_eq!(after, before);
+    harness.shutdown().await;
 }
 
 #[tokio::test]

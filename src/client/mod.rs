@@ -3,11 +3,12 @@
 mod actions;
 mod chrome;
 mod command_bar;
-mod config;
+pub(crate) mod config;
 mod input;
 mod layout;
 mod navigation;
 mod navigator;
+mod presentation;
 mod rename;
 mod sidebar;
 mod tab_bar;
@@ -157,7 +158,7 @@ async fn run(
     let mut redraw = time::interval(Duration::from_millis(16));
     redraw.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     send_request(framed, Some(Uuid::new_v4()), ClientMessage::ListResources).await?;
-    resize_view(framed, terminal.size()?.into(), &mut view, ui).await?;
+    resize_view(framed, terminal.size()?.into(), &mut view, &ui).await?;
 
     loop {
         tokio::select! {
@@ -261,7 +262,7 @@ async fn run(
                             send(framed, ClientMessage::ListResources).await?;
                         }
                         pending_focused_exit = None;
-                        resize_view(framed, terminal.size()?.into(), &mut view, ui).await?;
+                        resize_view(framed, terminal.size()?.into(), &mut view, &ui).await?;
                         if let Some(snapshot) = resources.snapshot() {
                             refresh_surface_resources(
                                 &mut surface,
@@ -613,7 +614,7 @@ async fn run(
                                     &mut split_pane,
                                     &mut focus,
                                     terminal.size()?.into(),
-                                    ui,
+                                    &ui,
                                 ).await?;
                                 force_draw = true;
                             }
@@ -641,7 +642,7 @@ async fn run(
                                     &mut split_pane,
                                     &mut focus,
                                     terminal.size()?.into(),
-                                    ui,
+                                    &ui,
                                 ).await?;
                                 force_draw = true;
                             }
@@ -650,7 +651,7 @@ async fn run(
                     },
                     Event::Paste(text) if surface.is_none() => send(framed, ClientMessage::Input { bytes: text.into_bytes() }).await?,
                     Event::Resize(columns, rows) if columns > 0 && rows > 0 => {
-                        resize_view(framed, Rect::new(0, 0, columns, rows), &mut view, ui).await?;
+                        resize_view(framed, Rect::new(0, 0, columns, rows), &mut view, &ui).await?;
                         force_draw = true;
                     }
                     _ => {}
@@ -660,7 +661,7 @@ async fn run(
                 io::stdout().sync_update(|_| {
                     terminal.draw(|frame| {
                         let area = frame.area();
-                        let layout = client_layout(area, ui);
+                        let layout = client_layout(area, &ui);
                         let cursor = render_view(
                             &view,
                             layout.terminal,
@@ -673,6 +674,7 @@ async fn run(
                                     resources.snapshot(),
                                     view.focused(),
                                     view.is_zoomed(),
+                                    &ui,
                                     tab_bar,
                                     frame.buffer_mut(),
                                 );
@@ -682,6 +684,7 @@ async fn run(
                                     view.focused(),
                                     view.is_zoomed(),
                                     None,
+                                    &ui,
                                     tab_bar,
                                     frame.buffer_mut(),
                                 );
@@ -693,7 +696,8 @@ async fn run(
                             {
                                 sidebar.render(
                                     sidebar_area,
-                                    ui.workspace_sidebar_position,
+                                    ui.workspace_sidebar.position,
+                                    &ui,
                                     frame.buffer_mut(),
                                 );
                             }
@@ -705,7 +709,8 @@ async fn run(
                                 view.focused(),
                                 &workspace_history,
                                 sidebar_area,
-                                ui.workspace_sidebar_position,
+                                ui.workspace_sidebar.position,
+                                &ui,
                                 frame.buffer_mut(),
                             );
                         }
@@ -833,7 +838,7 @@ async fn dispatch_client_action(
     split_pane: &mut CreateState,
     focus: &mut FocusState,
     host: Rect,
-    ui: UiConfig,
+    ui: &UiConfig,
 ) -> anyhow::Result<Option<String>> {
     match action {
         ClientAction::OpenCommandBar => {
@@ -1570,7 +1575,7 @@ async fn resize_view(
     framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     area: Rect,
     view: &mut ViewState,
-    ui: UiConfig,
+    ui: &UiConfig,
 ) -> anyhow::Result<()> {
     let terminal = client_layout(area, ui).terminal;
     for (terminal_id, size) in view.resize_requests(terminal, ui.pane_layout) {

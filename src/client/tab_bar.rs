@@ -7,6 +7,7 @@ use crate::{
     resources::ResourceSnapshot,
 };
 
+use super::config::UiConfig;
 use super::{chrome::render_tab_bar, navigation::NavigationHistory};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -144,10 +145,11 @@ impl TabBarState {
         snapshot: Option<&ResourceSnapshot>,
         focused: &SelectedTarget,
         zoomed: bool,
+        ui: &UiConfig,
         area: Rect,
         buffer: &mut Buffer,
     ) {
-        render_tab_bar(snapshot, focused, zoomed, self.selected, area, buffer);
+        render_tab_bar(snapshot, focused, zoomed, self.selected, ui, area, buffer);
     }
 
     fn selectable(&self, id: TabId) -> bool {
@@ -343,7 +345,14 @@ mod tests {
         state.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         let area = Rect::new(0, 0, 80, 1);
         let mut buffer = Buffer::empty(area);
-        state.render(Some(&snapshot), &focused, false, area, &mut buffer);
+        state.render(
+            Some(&snapshot),
+            &focused,
+            false,
+            &UiConfig::default(),
+            area,
+            &mut buffer,
+        );
         let text = (0..area.width)
             .map(|column| buffer[(column, 0)].symbol())
             .collect::<String>();
@@ -356,7 +365,14 @@ mod tests {
 
         let tiny = Rect::new(0, 0, 4, 1);
         let mut tiny_buffer = Buffer::empty(tiny);
-        state.render(Some(&snapshot), &focused, false, tiny, &mut tiny_buffer);
+        state.render(
+            Some(&snapshot),
+            &focused,
+            false,
+            &UiConfig::default(),
+            tiny,
+            &mut tiny_buffer,
+        );
         assert_eq!(tiny_buffer[(1, 0)].symbol(), "2");
         assert!(
             tiny_buffer[(1, 0)]

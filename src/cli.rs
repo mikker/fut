@@ -95,6 +95,8 @@ enum Command {
     },
     /// List resources from the existing daemon.
     List,
+    /// Diagnose configuration, terminal capabilities, and daemon connectivity.
+    Doctor,
     /// Run or control the daemon.
     Daemon {
         /// Daemon operation to perform.
@@ -278,6 +280,33 @@ async fn run_from(args: impl IntoIterator<Item = OsString>) -> ExitCode {
         }
     };
     let json_output = cli.json;
+    if matches!(cli.command, Some(Command::Doctor)) {
+        let socket = match socket_path(cli.socket.as_deref()) {
+            Ok(socket) => socket,
+            Err(error) => {
+                if json_output {
+                    render_json_error("command_failed", format!("{error:#}"));
+                } else {
+                    eprintln!("Error: {error:#}");
+                }
+                return ExitCode::FAILURE;
+            }
+        };
+        let report = crate::doctor::run(&socket).await;
+        if json_output {
+            if let Err(error) = output(true, "doctor", &report, "") {
+                render_json_error("command_failed", format!("{error:#}"));
+                return ExitCode::FAILURE;
+            }
+        } else {
+            print!("{}", report.render_human());
+        }
+        return if report.has_errors() {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        };
+    }
     match execute(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -531,6 +560,7 @@ async fn execute(cli: Cli) -> Result<()> {
                 "shutdown=true",
             )
         }
+        Some(Command::Doctor) => unreachable!("doctor is handled before command execution"),
         Some(command) => run_mutation(&socket, cli.json, command).await,
     }
 }
@@ -1204,6 +1234,7 @@ mod tests {
                 "pane",
                 "terminal",
                 "list",
+                "doctor",
                 "daemon"
             ]
         );
