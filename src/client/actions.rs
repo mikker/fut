@@ -61,6 +61,7 @@ pub(super) enum ClientAction {
     OpenCommandBar,
     OpenNavigator,
     OpenWorkspaceSidebar,
+    OpenTabBar,
     CreateTab,
     FocusNextTab,
     FocusPreviousTab,
@@ -89,10 +90,11 @@ pub(super) struct DirectBinding {
 }
 
 #[cfg(test)]
-const ALL_ACTIONS: [ClientAction; 30] = [
+const ALL_ACTIONS: [ClientAction; 31] = [
     ClientAction::OpenCommandBar,
     ClientAction::OpenNavigator,
     ClientAction::OpenWorkspaceSidebar,
+    ClientAction::OpenTabBar,
     ClientAction::CreateTab,
     ClientAction::FocusNextTab,
     ClientAction::FocusPreviousTab,
@@ -122,7 +124,7 @@ const ALL_ACTIONS: [ClientAction; 30] = [
     ClientAction::Detach,
 ];
 
-pub(super) const COMMANDS: [ActionDefinition; 29] = [
+pub(super) const COMMANDS: [ActionDefinition; 30] = [
     ActionDefinition {
         action: ClientAction::OpenNavigator,
         title: "Open global navigator",
@@ -132,6 +134,11 @@ pub(super) const COMMANDS: [ActionDefinition; 29] = [
         action: ClientAction::OpenWorkspaceSidebar,
         title: "Switch workspace",
         keywords: "workspace worktree checkout sidebar drawer switch",
+    },
+    ActionDefinition {
+        action: ClientAction::OpenTabBar,
+        title: "Focus tab bar",
+        keywords: "tab bar list switch navigation",
     },
     ActionDefinition {
         action: ClientAction::CreateTab,
@@ -270,7 +277,7 @@ pub(super) const COMMANDS: [ActionDefinition; 29] = [
     },
 ];
 
-pub(super) const DIRECT_BINDINGS: [DirectBinding; 30] = [
+pub(super) const DIRECT_BINDINGS: [DirectBinding; 31] = [
     DirectBinding {
         suffix: b":",
         action: ClientAction::OpenCommandBar,
@@ -282,6 +289,10 @@ pub(super) const DIRECT_BINDINGS: [DirectBinding; 30] = [
     DirectBinding {
         suffix: b"w",
         action: ClientAction::OpenWorkspaceSidebar,
+    },
+    DirectBinding {
+        suffix: b"t",
+        action: ClientAction::OpenTabBar,
     },
     DirectBinding {
         suffix: b"c",
@@ -426,6 +437,7 @@ const fn requires_launcher(action: ClientAction) -> bool {
         ClientAction::OpenCommandBar => false,
         ClientAction::OpenNavigator
         | ClientAction::OpenWorkspaceSidebar
+        | ClientAction::OpenTabBar
         | ClientAction::CreateTab
         | ClientAction::FocusNextTab
         | ClientAction::FocusPreviousTab

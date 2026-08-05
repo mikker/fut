@@ -155,6 +155,14 @@ impl NavigationHistory {
             })
     }
 
+    pub fn tab_destination(&self, tab: &TabSnapshot) -> Option<PaneId> {
+        self.tab_destinations
+            .get(&tab.id)
+            .copied()
+            .filter(|pane_id| open_pane(tab, *pane_id).is_some())
+            .or_else(|| tab_destination(tab, None))
+    }
+
     fn session_destination(&self, session: &SessionSnapshot) -> Option<PaneId> {
         self.session_destinations
             .get(&session.id)

@@ -8,7 +8,9 @@ mod input;
 mod layout;
 mod navigation;
 mod navigator;
+mod rename;
 mod sidebar;
+mod tab_bar;
 
 use std::{io, path::Path, time::Duration};
 
@@ -44,11 +46,13 @@ use ratatui::{
     style::{Color, Modifier, Style},
     widgets::Widget,
 };
+use rename::{RenameAction, RenameState};
 use tokio::{net::UnixStream, time};
 use tokio_util::codec::Framed;
 use uuid::Uuid;
 
 use sidebar::{WorkspaceSidebarAction, WorkspaceSidebarState, render_workspace_sidebar};
+use tab_bar::{TabBarAction, TabBarState};
 
 use crate::{
     domain::{CellColor, CellStyle, ScreenSnapshot, TerminalId, TerminalSize},
@@ -63,6 +67,7 @@ use crate::{
 enum ClientSurface {
     Navigator(NavigatorState),
     WorkspaceSidebar(WorkspaceSidebarState),
+    TabBar(TabBarState),
     CommandBar(CommandBarState),
 }
 
@@ -139,10 +144,12 @@ async fn run(
     let mut view = ViewState::new(selected)?;
     let mut resources = ResourceState::default();
     let mut surface: Option<ClientSurface> = None;
+    let mut rename: Option<RenameState> = None;
     let mut workspace_history = NavigationHistory::default();
     workspace_history.record(view.focused());
-    let mut create_tab = CreateTabState::default();
-    let mut split_pane = CreateTabState::default();
+    let mut create_workspace = CreateState::default();
+    let mut create_tab = CreateState::default();
+    let mut split_pane = CreateState::default();
     let mut focus = FocusState::default();
     let mut notice: Option<String> = None;
     let mut pending_focused_exit: Option<Option<i32>> = None;
@@ -179,22 +186,38 @@ async fn run(
                     }
                     ServerMessage::Resources { snapshot } => {
                         if resources.accept(snapshot) {
+                            let snapshot = resources.snapshot().expect("accepted resources exist");
                             refresh_surface_resources(
                                 &mut surface,
-                                resources.snapshot().expect("accepted resources exist"),
+                                snapshot,
                                 view.focused(),
                                 &workspace_history,
+                            );
+                            reconcile_resource_barriers(
+                                snapshot,
+                                &mut create_workspace,
+                                &mut create_tab,
+                                &mut split_pane,
+                                &mut rename,
                             );
                             force_draw = true;
                         }
                     }
                     ServerMessage::ResourcesChanged { snapshot } => {
                         if resources.accept(snapshot) {
+                            let snapshot = resources.snapshot().expect("accepted resources exist");
                             refresh_surface_resources(
                                 &mut surface,
-                                resources.snapshot().expect("accepted resources exist"),
+                                snapshot,
                                 view.focused(),
                                 &workspace_history,
+                            );
+                            reconcile_resource_barriers(
+                                snapshot,
+                                &mut create_workspace,
+                                &mut create_tab,
+                                &mut split_pane,
+                                &mut rename,
                             );
                             force_draw = true;
                         }
@@ -209,15 +232,23 @@ async fn run(
                         let focus_origin = focus.complete(request_id);
                         let workspace_selected = matches!(focus_origin, Some(FocusOrigin::Workspace));
                         let tab_selected = matches!(focus_origin, Some(FocusOrigin::Tab));
-                        let create_selected = create_tab.selected(request_id, &target.focused);
-                        let split_selected = split_pane.selected(request_id, &target.focused);
+                        let observed_revision = resources.snapshot().map(|snapshot| snapshot.revision);
+                        let workspace_created_selected = create_workspace.selected(
+                            request_id,
+                            &target,
+                            observed_revision,
+                        );
+                        let create_selected =
+                            create_tab.selected(request_id, &target, observed_revision);
+                        let split_selected =
+                            split_pane.selected(request_id, &target, observed_revision);
                         if !view.replace(target)? {
                             if navigator_selected || workspace_selected || tab_selected {
                                 surface = None;
                                 view.invalidate_drawn();
                                 force_draw = true;
                             }
-                            if create_selected || split_selected {
+                            if workspace_created_selected || create_selected || split_selected {
                                 force_draw = true;
                             }
                             continue;
@@ -231,10 +262,13 @@ async fn run(
                         }
                         pending_focused_exit = None;
                         resize_view(framed, terminal.size()?.into(), &mut view, ui).await?;
-                        if let Some(ClientSurface::WorkspaceSidebar(sidebar)) = surface.as_mut()
-                            && let Some(snapshot) = resources.snapshot()
-                        {
-                            sidebar.accept_resources(snapshot, view.focused(), &workspace_history);
+                        if let Some(snapshot) = resources.snapshot() {
+                            refresh_surface_resources(
+                                &mut surface,
+                                snapshot,
+                                view.focused(),
+                                &workspace_history,
+                            );
                         }
                         if navigator_selected && view.focused().terminal_id == old_terminal {
                             surface = None;
@@ -249,10 +283,17 @@ async fn run(
                             view.invalidate_drawn();
                         }
                         if tab_selected {
+                            surface = None;
                             view.invalidate_drawn();
                         }
-                        if create_selected || split_selected {
+                        if workspace_created_selected || create_selected || split_selected {
                             view.invalidate_drawn();
+                        }
+                        force_draw = true;
+                    }
+                    ServerMessage::WorkspaceCreated { selected: target } => {
+                        if !create_workspace.created(request_id, target.terminal_id) {
+                            continue;
                         }
                         force_draw = true;
                     }
@@ -275,7 +316,18 @@ async fn run(
                         // Pane movement is currently a control-plane operation.
                         bail!("unexpected pane movement response")
                     }
-                    ServerMessage::Pong { .. } | ServerMessage::CommandCompleted { .. } | ServerMessage::LocationOpened { .. } => {}
+                    ServerMessage::TargetRenamed { resource_revision } => {
+                        if rename
+                            .as_mut()
+                            .is_some_and(|rename| rename.complete(request_id, resource_revision))
+                        {
+                            rename = None;
+                            force_draw = true;
+                        }
+                    }
+                    ServerMessage::Pong { .. }
+                    | ServerMessage::CommandCompleted { .. }
+                    | ServerMessage::LocationOpened { .. } => {}
                     ServerMessage::TerminalExited { terminal_id, exit_code } => {
                         if terminal_id == view.focused().terminal_id {
                             pending_focused_exit = Some(exit_code);
@@ -287,6 +339,18 @@ async fn run(
                     }
                     ServerMessage::Detached => break,
                     ServerMessage::Error { code, message } => {
+                        if rename
+                            .as_mut()
+                            .is_some_and(|rename| rename.fail(request_id, message.clone()))
+                        {
+                            force_draw = true;
+                            continue;
+                        }
+                        if create_workspace.fail(request_id) {
+                            notice = Some(format!("create workspace failed · {message}"));
+                            force_draw = true;
+                            continue;
+                        }
                         if create_tab.fail(request_id) {
                             notice = Some(format!("create tab failed · {message}"));
                             force_draw = true;
@@ -338,9 +402,37 @@ async fn run(
                     ServerMessage::Welcome { .. } => bail!("unexpected second welcome from daemon"),
                 }
             }
-            event = events.next(), if accepts_client_input(&focus, &create_tab, &split_pane, &pending_focused_exit) => {
+            event = events.next(), if accepts_client_input(&focus, &create_workspace, &create_tab, &split_pane, &pending_focused_exit) => {
                 let Some(event) = event else { break };
                 match event? {
+                    Event::Key(key) if rename.is_some() => {
+                        let action = rename.as_mut().expect("rename exists").key(key);
+                        match action {
+                            RenameAction::Stay => force_draw = true,
+                            RenameAction::Close => {
+                                rename = None;
+                                force_draw = true;
+                            }
+                            RenameAction::Submit { request_id, selector, name } => {
+                                if let Some(snapshot) = resources.snapshot() {
+                                    rename
+                                        .as_mut()
+                                        .expect("submitted rename exists")
+                                        .accept_resources(snapshot);
+                                }
+                                send_request(
+                                    framed,
+                                    Some(request_id),
+                                    ClientMessage::RenameTarget { selector, name },
+                                ).await?;
+                                force_draw = true;
+                            }
+                        }
+                    }
+                    Event::Paste(text) if rename.is_some() => {
+                        rename.as_mut().expect("rename exists").paste(&text);
+                        force_draw = true;
+                    }
                     Event::Key(key) if matches!(surface.as_ref(), Some(ClientSurface::Navigator(_))) => {
                         notice = None;
                         let visible = terminal.size()?.height.saturating_sub(2) as usize;
@@ -386,6 +478,30 @@ async fn run(
                                 view.invalidate_drawn();
                                 force_draw = true;
                             }
+                            WorkspaceSidebarAction::Create => {
+                                if let Some(request) = create_workspace.begin() {
+                                    send_request(
+                                        framed,
+                                        Some(request),
+                                        ClientMessage::CreateWorkspace {
+                                            session_id: view.focused().session_id,
+                                            name: None,
+                                            cwd: None,
+                                            program: None,
+                                            argv: Vec::new(),
+                                        },
+                                    ).await?;
+                                }
+                                force_draw = true;
+                            }
+                            WorkspaceSidebarAction::Rename(workspace_id, name) => {
+                                rename = Some(RenameState::open(
+                                    crate::protocol::RenameSelector::Workspace(workspace_id),
+                                    "workspace",
+                                    name,
+                                ));
+                                force_draw = true;
+                            }
                             WorkspaceSidebarAction::Select(pane_id) => {
                                 if let Some(request) = focus.begin(FocusOrigin::Workspace) {
                                     match surface.as_mut().expect("workspace sidebar exists") {
@@ -407,6 +523,64 @@ async fn run(
                                         },
                                     )
                                     .await?;
+                                    force_draw = true;
+                                }
+                            }
+                        }
+                    }
+                    Event::Key(key) if matches!(surface.as_ref(), Some(ClientSurface::TabBar(_))) => {
+                        notice = None;
+                        let action = match surface.as_mut().expect("tab bar exists") {
+                            ClientSurface::TabBar(tab_bar) => tab_bar.key(key),
+                            _ => unreachable!("surface guard ensures tab bar"),
+                        };
+                        match action {
+                            TabBarAction::Stay => force_draw = true,
+                            TabBarAction::Close => {
+                                surface = None;
+                                view.invalidate_drawn();
+                                force_draw = true;
+                            }
+                            TabBarAction::Create => {
+                                if let Some(request) = create_tab.begin() {
+                                    send_request(
+                                        framed,
+                                        Some(request),
+                                        ClientMessage::CreateTab {
+                                            workspace_id: view.focused().workspace_id,
+                                            name: None,
+                                            cwd: None,
+                                            program: None,
+                                            argv: Vec::new(),
+                                        },
+                                    ).await?;
+                                }
+                                force_draw = true;
+                            }
+                            TabBarAction::Rename(tab_id, name) => {
+                                rename = Some(RenameState::open(
+                                    crate::protocol::RenameSelector::Tab(tab_id),
+                                    "tab",
+                                    name,
+                                ));
+                                force_draw = true;
+                            }
+                            TabBarAction::Select(pane_id) => {
+                                if let Some(request) = focus.begin(FocusOrigin::Tab) {
+                                    send_request(
+                                        framed,
+                                        Some(request),
+                                        ClientMessage::SelectTarget {
+                                            selector: TargetSelector::Pane(pane_id),
+                                            expected: resources.snapshot().and_then(|snapshot| {
+                                                selection_expectation(
+                                                    snapshot,
+                                                    pane_id,
+                                                    NavigationScope::Tab,
+                                                )
+                                            }),
+                                        },
+                                    ).await?;
                                     force_draw = true;
                                 }
                             }
@@ -494,13 +668,24 @@ async fn run(
                             frame.buffer_mut(),
                         );
                         if let Some(tab_bar) = layout.tab_bar {
-                            render_tab_bar(
-                                resources.snapshot(),
-                                view.focused(),
-                                view.is_zoomed(),
-                                tab_bar,
-                                frame.buffer_mut(),
-                            );
+                            if let Some(ClientSurface::TabBar(state)) = surface.as_ref() {
+                                state.render(
+                                    resources.snapshot(),
+                                    view.focused(),
+                                    view.is_zoomed(),
+                                    tab_bar,
+                                    frame.buffer_mut(),
+                                );
+                            } else {
+                                render_tab_bar(
+                                    resources.snapshot(),
+                                    view.focused(),
+                                    view.is_zoomed(),
+                                    None,
+                                    tab_bar,
+                                    frame.buffer_mut(),
+                                );
+                            }
                         }
                         if let Some(ClientSurface::WorkspaceSidebar(sidebar)) = surface.as_ref() {
                             if let Some(sidebar_area) =
@@ -531,9 +716,15 @@ async fn run(
                             Some(ClientSurface::CommandBar(command_bar)) => {
                                 command_bar.render(layout.terminal, frame.buffer_mut());
                             }
-                            Some(ClientSurface::WorkspaceSidebar(_)) | None => {}
+                            Some(ClientSurface::WorkspaceSidebar(_))
+                            | Some(ClientSurface::TabBar(_))
+                            | None => {}
+                        }
+                        if let Some(rename) = rename.as_ref() {
+                            rename.render(layout.terminal, frame.buffer_mut());
                         }
                         if surface.is_none()
+                            && rename.is_none()
                             && notice.is_none()
                             && let Some((column, row)) = cursor
                         {
@@ -565,7 +756,28 @@ fn refresh_surface_resources(
         Some(ClientSurface::WorkspaceSidebar(sidebar)) => {
             sidebar.accept_resources(snapshot, focused, workspace_history);
         }
+        Some(ClientSurface::TabBar(tab_bar)) => {
+            tab_bar.accept_resources(snapshot, focused, workspace_history);
+        }
         Some(ClientSurface::CommandBar(_)) | None => {}
+    }
+}
+
+fn reconcile_resource_barriers(
+    snapshot: &crate::resources::ResourceSnapshot,
+    create_workspace: &mut CreateState,
+    create_tab: &mut CreateState,
+    split_pane: &mut CreateState,
+    rename: &mut Option<RenameState>,
+) {
+    create_workspace.accept_resources(snapshot.revision);
+    create_tab.accept_resources(snapshot.revision);
+    split_pane.accept_resources(snapshot.revision);
+    if rename
+        .as_mut()
+        .is_some_and(|rename| rename.accept_resources(snapshot))
+    {
+        *rename = None;
     }
 }
 
@@ -594,11 +806,13 @@ fn selection_expectation(
 
 fn accepts_client_input(
     focus: &FocusState,
-    create_tab: &CreateTabState,
-    split_pane: &CreateTabState,
+    create_workspace: &CreateState,
+    create_tab: &CreateState,
+    split_pane: &CreateState,
     pending_focused_exit: &Option<Option<i32>>,
 ) -> bool {
     focus.request_id.is_none()
+        && !create_workspace.blocks_input()
         && !create_tab.blocks_input()
         && !split_pane.blocks_input()
         && pending_focused_exit.is_none()
@@ -615,8 +829,8 @@ async fn dispatch_client_action(
     resources: &ResourceState,
     surface: &mut Option<ClientSurface>,
     workspace_history: &NavigationHistory,
-    create_tab: &mut CreateTabState,
-    split_pane: &mut CreateTabState,
+    create_tab: &mut CreateState,
+    split_pane: &mut CreateState,
     focus: &mut FocusState,
     host: Rect,
     ui: UiConfig,
@@ -645,6 +859,22 @@ async fn dispatch_client_action(
                 return Ok(Some("no workspace available".into()));
             };
             *surface = Some(ClientSurface::WorkspaceSidebar(sidebar));
+        }
+        ClientAction::OpenTabBar => {
+            let Some(snapshot) = resources.snapshot() else {
+                return Ok(Some("tabs are still loading".into()));
+            };
+            if !view.resources_are_current(snapshot) {
+                return Ok(Some("navigation is syncing".into()));
+            }
+            if client_layout(host, ui).tab_bar.is_none() {
+                return Ok(Some("tab bar is unavailable at this size".into()));
+            }
+            let Some(tab_bar) = TabBarState::open(snapshot, view.focused(), workspace_history)
+            else {
+                return Ok(Some("no tab available".into()));
+            };
+            *surface = Some(ClientSurface::TabBar(tab_bar));
         }
         ClientAction::CreateTab => {
             if let Some(request) = create_tab.begin() {
@@ -835,7 +1065,7 @@ async fn receive(
 }
 
 #[derive(Default)]
-enum CreateTabState {
+enum CreateState {
     #[default]
     Idle,
     AwaitingCreated {
@@ -845,9 +1075,13 @@ enum CreateTabState {
         request_id: Uuid,
         terminal_id: TerminalId,
     },
+    AwaitingResources {
+        request_id: Uuid,
+        resource_revision: u64,
+    },
 }
 
-impl CreateTabState {
+impl CreateState {
     fn begin(&mut self) -> Option<Uuid> {
         if !matches!(self, Self::Idle) {
             return None;
@@ -874,7 +1108,12 @@ impl CreateTabState {
         true
     }
 
-    fn selected(&mut self, request_id: Option<Uuid>, selected: &SelectedTarget) -> bool {
+    fn selected(
+        &mut self,
+        request_id: Option<Uuid>,
+        selected: &SelectedView,
+        observed_revision: Option<u64>,
+    ) -> bool {
         let Self::AwaitingSelected {
             request_id: expected,
             terminal_id,
@@ -882,7 +1121,28 @@ impl CreateTabState {
         else {
             return false;
         };
-        if request_id != Some(*expected) || *terminal_id != selected.terminal_id {
+        if request_id != Some(*expected) || *terminal_id != selected.focused.terminal_id {
+            return false;
+        }
+        if observed_revision.is_some_and(|revision| revision >= selected.resource_revision) {
+            *self = Self::Idle;
+        } else {
+            *self = Self::AwaitingResources {
+                request_id: *expected,
+                resource_revision: selected.resource_revision,
+            };
+        }
+        true
+    }
+
+    fn accept_resources(&mut self, revision: u64) -> bool {
+        let Self::AwaitingResources {
+            resource_revision, ..
+        } = self
+        else {
+            return false;
+        };
+        if revision < *resource_revision {
             return false;
         }
         *self = Self::Idle;
@@ -892,9 +1152,9 @@ impl CreateTabState {
     fn fail(&mut self, request_id: Option<Uuid>) -> bool {
         let expected = match self {
             Self::Idle => return false,
-            Self::AwaitingCreated { request_id } | Self::AwaitingSelected { request_id, .. } => {
-                *request_id
-            }
+            Self::AwaitingCreated { request_id }
+            | Self::AwaitingSelected { request_id, .. }
+            | Self::AwaitingResources { request_id, .. } => *request_id,
         };
         if request_id != Some(expected) {
             return false;
@@ -1536,33 +1796,46 @@ mod tests {
 
     #[test]
     fn create_tab_state_blocks_input_through_correlated_ack_and_selection() {
-        let mut state = CreateTabState::default();
-        let split = CreateTabState::default();
+        let workspace = CreateState::default();
+        let mut state = CreateState::default();
+        let split = CreateState::default();
         let focus = FocusState::default();
         let no_exit = None;
         let request = state.begin().expect("first request starts");
         assert!(state.begin().is_none());
         assert!(state.blocks_input());
-        assert!(!accepts_client_input(&focus, &state, &split, &no_exit));
+        assert!(!accepts_client_input(
+            &focus, &workspace, &state, &split, &no_exit
+        ));
         let target = targets(1).remove(0);
         assert!(!state.created(None, target.terminal_id));
         assert!(!state.created(Some(Uuid::new_v4()), target.terminal_id));
         assert!(state.created(Some(request), target.terminal_id));
         assert!(state.blocks_input());
-        assert!(!accepts_client_input(&focus, &state, &split, &no_exit));
-        assert!(!state.selected(Some(Uuid::new_v4()), &target));
+        assert!(!accepts_client_input(
+            &focus, &workspace, &state, &split, &no_exit
+        ));
+        let selected = selected_view(2, target.clone(), vec![target]);
+        assert!(!state.selected(Some(Uuid::new_v4()), &selected, Some(1)));
         assert!(state.begin().is_none());
-        assert!(state.selected(Some(request), &target));
+        assert!(state.selected(Some(request), &selected, Some(1)));
+        assert!(state.blocks_input());
+        assert!(!state.accept_resources(1));
+        assert!(state.accept_resources(2));
         assert!(!state.blocks_input());
-        assert!(accepts_client_input(&focus, &state, &split, &no_exit));
+        assert!(accepts_client_input(
+            &focus, &workspace, &state, &split, &no_exit
+        ));
         assert!(state.begin().is_some());
 
-        let mut failed = CreateTabState::default();
+        let mut failed = CreateState::default();
         let request = failed.begin().unwrap();
         assert!(!failed.fail(Some(Uuid::new_v4())));
         assert!(failed.fail(Some(request)));
         assert!(!failed.blocks_input());
-        assert!(accepts_client_input(&focus, &failed, &split, &no_exit));
+        assert!(accepts_client_input(
+            &focus, &workspace, &failed, &split, &no_exit
+        ));
     }
 
     #[test]

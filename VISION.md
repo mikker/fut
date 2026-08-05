@@ -7,7 +7,7 @@ Fut is a modern terminal multiplexer for work that happens across projects, Git 
 ```text
 one Fut multiplexer
 └── session: a live project
-    └── workspace: a checkout or worktree
+    └── workspace: a user-defined context and collection of tabs
         └── tab: an activity
             └── pane: a terminal placement
 ```
@@ -39,15 +39,15 @@ last session closes   → Fut exits
 
 Fut will not initially pretend it can restore arbitrary processes after a daemon or machine restart. Reopening a project applies its recipe to create a new runtime. Cold restoration, if ever added, must be explicit about the difference between restoring structure and preserving processes.
 
-### Project and worktree are first-class
+### Projects and worktrees fit without dictating workflow
 
-A Git repository is one project even when work occurs in several linked checkouts. Its main checkout and all worktrees appear as peer workspaces beneath one session. Non-Git directories use their canonical root as project identity.
+A Git repository is one project even when work occurs in several linked checkouts. Open checkouts and worktrees can appear as peer workspaces beneath one session, while non-Git directories use their canonical root as project identity. A workspace is fundamentally a user-defined collection of tabs with a working-directory context, not a declaration that its root has any particular Git meaning. Multiple workspaces in one project session may intentionally share a root.
 
-Workspace creation should make branching work cheap. Opening a worktree gives it the same useful starting topology as the main checkout without requiring the project file to enumerate every future branch.
+Workspace creation should be cheap and neutral: it inherits the focused terminal's directory and starts a shell, leaving users and scripts free to create branches, worktrees, containers, or any other surrounding context themselves. Explicitly opening a worktree can still give it the same useful starting topology as the main checkout without requiring the project file to enumerate every future branch.
 
 ### Navigation follows the object model
 
-The hierarchy is visible and searchable, but never compulsory to traverse one level at a time. A horizontal tab/status bar defaults to the top and can move to the bottom; a responsive peer-workspace sidebar defaults to the left and can move to the right. Both remain client-owned presentation. Together they keep immediate context visible, while stable resource identities and a global navigator make every session, workspace, tab, and pane a direct destination. A searchable command bar exposes typed client actions and their direct bindings, so adding capability does not require memorizing every key before it becomes useful.
+The hierarchy is visible and searchable, but never compulsory to traverse one level at a time. A horizontal tab/status bar defaults to the top and can move to the bottom; a responsive workspace sidebar defaults to the left and can move to the right. Both remain client-owned presentation. Together they keep immediate context visible, while stable resource identities and a global navigator make every session, workspace, tab, and pane a direct destination. A searchable command bar exposes typed client actions and their direct bindings, so adding capability does not require memorizing every key before it becomes useful.
 
 Fut should support:
 
@@ -127,7 +127,7 @@ The daemon owns processes and terminal state. A terminal has an opaque stable id
 
 The core protocol exposes resources, mutations, snapshots, terminal updates, and typed events. It does not require every client to consume one server-rendered application screen. The initial Ratatui client lives in the same repository and executable, but the core model does not depend on Ratatui widgets or global UI focus. Each tab owns a shared authored split tree whose leaves reference pane placements and whose branches carry left/right or top/bottom direction and ratio. The tree records user intent and survives detachment; each client computes its own rectangles from that topology and its viewport. Resource order and split-tree leaf order remain one validated order.
 
-The default client policy renders the authored split tree. A focus-biased horizontal accordion is an alternate client-owned layout policy over the same leaves, not a replacement for split topology or a consequence of `pane_min_width`. Explicit zoom overlays either policy without mutating the tree. The authored policy computes recursive minimums using 24 columns for the focused leaf, 12 columns for every sibling leaf, three content rows per leaf, and one neutral divider cell per branch. If the complete tree does not fit, only the focused pane uses the full area; otherwise ratios are clamped to subtree minimums. Degradation never rewrites authored direction or ratios. The daemon streams terminal-specific snapshots, revisioned resource snapshots, and authoritative reconciled tab views; the client adds a horizontal tab/status bar and a wide peer-workspace dock that becomes a zero-cost edge drawer on narrower hosts.
+The default client policy renders the authored split tree. A focus-biased horizontal accordion is an alternate client-owned layout policy over the same leaves, not a replacement for split topology or a consequence of `pane_min_width`. Explicit zoom overlays either policy without mutating the tree. The authored policy computes recursive minimums using 24 columns for the focused leaf, 12 columns for every sibling leaf, three content rows per leaf, and one neutral divider cell per branch. If the complete tree does not fit, only the focused pane uses the full area; otherwise ratios are clamped to subtree minimums. Degradation never rewrites authored direction or ratios. The daemon streams terminal-specific snapshots, revisioned resource snapshots, and authoritative reconciled tab views; the client adds a horizontal tab/status bar and a wide workspace dock that becomes a zero-cost edge drawer on narrower hosts.
 
 A transient command bar indexes the same typed client actions used by direct bindings, keeping discovery separate from daemon resources or CLI strings. Every dispatchable client action except opening the already-open launcher must be represented in the launcher, and parity is enforced from the shared action catalog. This includes wrapping next/previous tab navigation, right/down splits, pane navigation, zoom, workspace and global navigation, tab creation, and detach.
 
@@ -179,7 +179,7 @@ A representative flow should be:
 The initial product direction is validated when Fut can:
 
 - keep several project sessions in one daemon;
-- model a project's main checkout and worktrees as peer workspaces;
+- allow a project's main checkout and worktrees to be opened as peer workspaces;
 - jump directly between any live resources;
 - preserve terminals across client detach and reattach;
 - remove a session when its last terminal closes and exit Fut when its last session closes;

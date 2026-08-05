@@ -8,6 +8,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
+    domain::TabId,
     protocol::SelectedTarget,
     resources::{ResourceSnapshot, TabSnapshot},
 };
@@ -154,6 +155,7 @@ impl ResourceState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TabItem {
+    id: TabId,
     name: String,
     closing: bool,
 }
@@ -187,6 +189,7 @@ impl TabBarModel {
 impl From<&TabSnapshot> for TabItem {
     fn from(tab: &TabSnapshot) -> Self {
         Self {
+            id: tab.id,
             name: sanitize(&tab.name),
             closing: tab.closing,
         }
@@ -197,6 +200,7 @@ pub(super) fn render_tab_bar(
     snapshot: Option<&ResourceSnapshot>,
     focused: &SelectedTarget,
     zoomed: bool,
+    selected: Option<TabId>,
     area: Rect,
     buffer: &mut Buffer,
 ) {
@@ -213,7 +217,7 @@ pub(super) fn render_tab_bar(
     let tab_width = width.saturating_sub(zoom_width);
     let Some(model) = snapshot.and_then(|snapshot| TabBarModel::from_snapshot(snapshot, focused))
     else {
-        let fallback = active_only("tab", false, tab_width);
+        let fallback = single_tab("●", "tab", false, tab_width);
         buffer.set_line(
             area.x,
             area.y,
@@ -224,7 +228,7 @@ pub(super) fn render_tab_bar(
         return;
     };
 
-    let (line, complete) = visible_tabs(&model, tab_width);
+    let (line, complete) = visible_tabs(&model, selected, tab_width);
     buffer.set_line(
         area.x,
         area.y,
@@ -237,13 +241,17 @@ pub(super) fn render_tab_bar(
         return;
     }
 
-    const BRAND: &str = "fut ";
-    let brand_width = UnicodeWidthStr::width(BRAND);
-    if complete && line.width().saturating_add(brand_width) <= width {
+    let suffix = if selected.is_some() {
+        "c new · r rename · esc "
+    } else {
+        "fut "
+    };
+    let suffix_width = UnicodeWidthStr::width(suffix);
+    if complete && line.width().saturating_add(suffix_width) <= width {
         buffer.set_string(
-            area.x + area.width - u16::try_from(brand_width).expect("brand width fits u16"),
+            area.x + area.width - u16::try_from(suffix_width).expect("suffix width fits u16"),
             area.y,
-            BRAND,
+            suffix,
             muted_style(),
         );
     }
@@ -261,23 +269,40 @@ fn render_zoom_status(width: usize, area: Rect, buffer: &mut Buffer) {
     );
 }
 
-fn visible_tabs(model: &TabBarModel, width: usize) -> (Line<'static>, bool) {
+fn visible_tabs(
+    model: &TabBarModel,
+    selected: Option<TabId>,
+    width: usize,
+) -> (Line<'static>, bool) {
     if width == 0 {
         return (Line::default(), false);
     }
-    let mut first = model.active;
-    let mut last = model.active;
-    let mut line = selected_line(model, first, last);
+    let anchor = selected
+        .and_then(|id| model.tabs.iter().position(|tab| tab.id == id))
+        .unwrap_or(model.active);
+    let mut first = anchor;
+    let mut last = anchor;
+    let mut line = selected_line(model, selected, first, last);
     if line.width() > width {
+        let tab = &model.tabs[anchor];
+        let active = anchor == model.active;
+        let marker = if active {
+            "●".to_owned()
+        } else {
+            (anchor + 1).to_string()
+        };
+        let mut style = if active {
+            active_style()
+        } else if tab.closing {
+            muted_style()
+        } else {
+            Style::default()
+        };
+        if selected == Some(tab.id) {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
         return (
-            Line::styled(
-                active_only(
-                    &model.tabs[model.active].name,
-                    model.tabs[model.active].closing,
-                    width,
-                ),
-                active_style(),
-            ),
+            Line::styled(single_tab(&marker, &tab.name, tab.closing, width), style),
             false,
         );
     }
@@ -285,7 +310,7 @@ fn visible_tabs(model: &TabBarModel, width: usize) -> (Line<'static>, bool) {
     loop {
         let mut changed = false;
         if first > 0 {
-            let candidate = selected_line(model, first - 1, last);
+            let candidate = selected_line(model, selected, first - 1, last);
             if candidate.width() <= width {
                 first -= 1;
                 line = candidate;
@@ -293,7 +318,7 @@ fn visible_tabs(model: &TabBarModel, width: usize) -> (Line<'static>, bool) {
             }
         }
         if last + 1 < model.tabs.len() {
-            let candidate = selected_line(model, first, last + 1);
+            let candidate = selected_line(model, selected, first, last + 1);
             if candidate.width() <= width {
                 last += 1;
                 line = candidate;
@@ -307,7 +332,12 @@ fn visible_tabs(model: &TabBarModel, width: usize) -> (Line<'static>, bool) {
     (line, first == 0 && last + 1 == model.tabs.len())
 }
 
-fn selected_line(model: &TabBarModel, first: usize, last: usize) -> Line<'static> {
+fn selected_line(
+    model: &TabBarModel,
+    selected: Option<TabId>,
+    first: usize,
+    last: usize,
+) -> Line<'static> {
     let mut spans = Vec::new();
     if first > 0 {
         spans.push(Span::styled(" … ", muted_style()));
@@ -322,13 +352,16 @@ fn selected_line(model: &TabBarModel, first: usize, last: usize) -> Line<'static
         };
         let closing = if tab.closing { " ×" } else { "" };
         let text = format!(" {marker} {}{closing} ", tab.name);
-        let style = if active {
+        let mut style = if active {
             active_style()
         } else if tab.closing {
             muted_style()
         } else {
             Style::default()
         };
+        if selected == Some(tab.id) {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
         spans.push(Span::styled(text, style));
     }
     if last + 1 < model.tabs.len() {
@@ -337,15 +370,17 @@ fn selected_line(model: &TabBarModel, first: usize, last: usize) -> Line<'static
     Line::from(spans)
 }
 
-fn active_only(name: &str, closing: bool, width: usize) -> String {
+fn single_tab(marker: &str, name: &str, closing: bool, width: usize) -> String {
     match width {
         0 => String::new(),
-        1 => "●".into(),
-        2 => "● ".into(),
+        1 => truncate(marker, 1),
+        2 => format!("{} ", truncate(marker, 1)),
         _ => {
             let suffix = if closing && width >= 7 { " × " } else { " " };
-            let available = width.saturating_sub(3 + UnicodeWidthStr::width(suffix));
-            format!(" ● {}{suffix}", truncate(name, available))
+            let available = width.saturating_sub(
+                2 + UnicodeWidthStr::width(marker) + UnicodeWidthStr::width(suffix),
+            );
+            format!(" {marker} {}{suffix}", truncate(name, available))
         }
     }
 }
@@ -471,7 +506,7 @@ mod tests {
         let (snapshot, focused) = fixture(names, active);
         let area = Rect::new(0, 0, width, 1);
         let mut buffer = Buffer::empty(area);
-        render_tab_bar(Some(&snapshot), &focused, false, area, &mut buffer);
+        render_tab_bar(Some(&snapshot), &focused, false, None, area, &mut buffer);
         let text = (0..width)
             .map(|column| buffer[(column, 0)].symbol())
             .collect::<String>();
@@ -589,7 +624,7 @@ mod tests {
         snapshot.sessions[0].workspaces[0].tabs[1].closing = true;
         let area = Rect::new(0, 0, 40, 1);
         let mut buffer = Buffer::empty(area);
-        render_tab_bar(Some(&snapshot), &focused, false, area, &mut buffer);
+        render_tab_bar(Some(&snapshot), &focused, false, None, area, &mut buffer);
         let text = (0..area.width)
             .map(|column| buffer[(column, 0)].symbol())
             .collect::<String>();
@@ -598,7 +633,7 @@ mod tests {
         let mut missing = focused.clone();
         missing.workspace_id = WorkspaceId::new();
         let mut fallback = Buffer::empty(area);
-        render_tab_bar(Some(&snapshot), &missing, false, area, &mut fallback);
+        render_tab_bar(Some(&snapshot), &missing, false, None, area, &mut fallback);
         assert_eq!(fallback[(1, 0)].symbol(), "●");
     }
 
@@ -607,7 +642,7 @@ mod tests {
         let (snapshot, focused) = fixture(&["shell", "editor", "tests"], 1);
         let area = Rect::new(3, 4, 24, 1);
         let mut buffer = Buffer::empty(area);
-        render_tab_bar(Some(&snapshot), &focused, true, area, &mut buffer);
+        render_tab_bar(Some(&snapshot), &focused, true, None, area, &mut buffer);
         let text = (area.x..area.x + area.width)
             .map(|column| buffer[(column, area.y)].symbol())
             .collect::<String>();
@@ -624,7 +659,7 @@ mod tests {
         for width in 1..=6 {
             let area = Rect::new(0, 0, width, 1);
             let mut buffer = Buffer::empty(area);
-            render_tab_bar(Some(&snapshot), &focused, true, area, &mut buffer);
+            render_tab_bar(Some(&snapshot), &focused, true, None, area, &mut buffer);
             let text = (0..width)
                 .map(|column| buffer[(column, 0)].symbol())
                 .collect::<String>();

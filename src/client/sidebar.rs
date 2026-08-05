@@ -1,4 +1,4 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -54,7 +54,7 @@ impl WorkspaceModel {
                     let closing = session.closing || workspace.closing;
                     WorkspaceItem {
                         id: workspace.id,
-                        name: sanitize(&workspace.name),
+                        name: workspace.name.clone(),
                         current: workspace.id == workspace_id,
                         closing,
                         destination: (!closing)
@@ -104,6 +104,8 @@ pub(super) struct WorkspaceSidebarState {
 pub(super) enum WorkspaceSidebarAction {
     Stay,
     Close,
+    Create,
+    Rename(WorkspaceId, String),
     Select(PaneId),
 }
 
@@ -134,9 +136,22 @@ impl WorkspaceSidebarState {
         history: &NavigationHistory,
     ) {
         let previous = self.selected;
+        let previous_current = self
+            .model
+            .items
+            .iter()
+            .find(|item| item.current)
+            .map(|item| item.id);
         self.model = WorkspaceModel::from_snapshot(snapshot, focused, history);
-        self.selected = previous
-            .filter(|id| self.selectable(*id))
+        let current = self
+            .model
+            .items
+            .iter()
+            .find(|item| item.current)
+            .map(|item| item.id);
+        self.selected = current
+            .filter(|current| Some(*current) != previous_current)
+            .or_else(|| previous.filter(|id| self.selectable(*id)))
             .or_else(|| {
                 self.model
                     .items
@@ -161,6 +176,13 @@ impl WorkspaceSidebarState {
         }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => WorkspaceSidebarAction::Close,
+            KeyCode::Char('c') if key.modifiers == KeyModifiers::NONE => {
+                WorkspaceSidebarAction::Create
+            }
+            KeyCode::Char('r') if key.modifiers == KeyModifiers::NONE => self
+                .selected_item()
+                .map(|item| WorkspaceSidebarAction::Rename(item.id, item.name.clone()))
+                .unwrap_or(WorkspaceSidebarAction::Stay),
             KeyCode::Up | KeyCode::Char('k') => {
                 self.move_selection(false);
                 WorkspaceSidebarAction::Stay
@@ -233,6 +255,12 @@ impl WorkspaceSidebarState {
             .items
             .iter()
             .any(|item| item.id == id && item.destination.is_some())
+    }
+
+    fn selected_item(&self) -> Option<&WorkspaceItem> {
+        self.selected
+            .and_then(|id| self.model.items.iter().find(|item| item.id == id))
+            .filter(|item| !item.closing)
     }
 
     fn move_selection(&mut self, forward: bool) {
@@ -379,7 +407,7 @@ fn render_model(
 
     if let Some(status) = footer {
         let text = match status {
-            WorkspaceStatus::Ready => " ↑↓ enter · esc".into(),
+            WorkspaceStatus::Ready => " ↑↓ ↵ c new · r rename".into(),
             WorkspaceStatus::Switching => " switching…".into(),
             WorkspaceStatus::Error(message) => format!(" {message} · retry"),
         };
@@ -445,6 +473,7 @@ fn visible_rows(length: usize, anchor: usize, height: usize) -> Vec<VisibleRow> 
 }
 
 fn format_workspace(name: &str, current: bool, closing: bool, width: usize) -> String {
+    let name = sanitize(name);
     match width {
         0 => String::new(),
         1 => {
@@ -460,7 +489,7 @@ fn format_workspace(name: &str, current: bool, closing: bool, width: usize) -> S
             let marker = if current { "●" } else { " " };
             let suffix = if closing && width >= 5 { " ×" } else { "" };
             let available = width.saturating_sub(2 + unicode_width::UnicodeWidthStr::width(suffix));
-            format!("{marker} {}{suffix}", truncate(name, available))
+            format!("{marker} {}{suffix}", truncate(&name, available))
         }
     }
 }
@@ -621,6 +650,14 @@ mod tests {
         let history = NavigationHistory::default();
         let mut state = WorkspaceSidebarState::open(&snapshot, &focused, &history).unwrap();
         assert_eq!(
+            state.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+            WorkspaceSidebarAction::Create
+        );
+        assert!(matches!(
+            state.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+            WorkspaceSidebarAction::Rename(_, ref name) if name == "main"
+        ));
+        assert_eq!(
             state.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
             WorkspaceSidebarAction::Stay
         );
@@ -710,7 +747,7 @@ mod tests {
             6,
             WorkspaceSidebarPosition::Left,
         );
-        assert!(ready.contains("↑↓ enter · esc"));
+        assert!(ready.contains("c new · r rename"));
         let index = state
             .model
             .items

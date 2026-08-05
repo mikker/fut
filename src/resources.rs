@@ -370,8 +370,8 @@ impl ResourceTree {
         }
         let root_owner = self
             .workspaces
-            .iter()
-            .find(|(_, workspace)| workspace.root == root);
+            .values()
+            .find(|workspace| workspace.root == root);
         let Some(&session_id) = matching_sessions.first() else {
             return if root_owner.is_some() {
                 self.invalid("workspace root belongs to another project")
@@ -383,14 +383,23 @@ impl ResourceTree {
         if session.closing {
             return Err(ResourceError::Closing("session"));
         }
-        if let Some((&workspace_id, workspace)) = root_owner {
-            if workspace.session_id != session_id {
-                return self.invalid("workspace root belongs to another project");
-            }
-            if workspace.closing {
-                return Err(ResourceError::Closing("workspace"));
-            }
-            return Ok(CheckoutDestination::Existing(workspace_id));
+        if root_owner.is_some_and(|workspace| workspace.session_id != session_id) {
+            return self.invalid("workspace root belongs to another project");
+        }
+        let matching_roots = session
+            .workspaces
+            .iter()
+            .filter(|workspace_id| self.workspaces[workspace_id].root == root)
+            .copied()
+            .collect::<Vec<_>>();
+        if let Some(workspace_id) = matching_roots
+            .iter()
+            .find(|workspace_id| !self.workspaces[workspace_id].closing)
+        {
+            return Ok(CheckoutDestination::Existing(*workspace_id));
+        }
+        if !matching_roots.is_empty() {
+            return Err(ResourceError::Closing("workspace"));
         }
         Ok(CheckoutDestination::AddWorkspace { session_id })
     }
@@ -540,7 +549,11 @@ impl ResourceTree {
         {
             return Err(ResourceError::Duplicate("project identity"));
         }
-        if self.workspaces.values().any(|w| w.root == path.root) {
+        if self
+            .workspaces
+            .values()
+            .any(|workspace| workspace.root == path.root)
+        {
             return Err(ResourceError::Duplicate("workspace root"));
         }
         self.check_ids(
@@ -760,8 +773,14 @@ impl ResourceTree {
         {
             return Err(ResourceError::Duplicate("workspace name"));
         }
-        if self.workspaces.values().any(|w| w.root == path.root) {
-            return Err(ResourceError::Duplicate("workspace root"));
+        if self
+            .workspaces
+            .values()
+            .any(|workspace| workspace.root == path.root && workspace.session_id != session_id)
+        {
+            return Err(ResourceError::Duplicate(
+                "workspace root in another session",
+            ));
         }
         self.check_child_ids(
             path.workspace_id,
@@ -1388,7 +1407,7 @@ impl ResourceTree {
         }
         let mut session_names = BTreeSet::new();
         let mut projects = BTreeSet::new();
-        let mut roots = BTreeSet::new();
+        let mut roots = BTreeMap::new();
         let mut seen_workspaces = BTreeSet::new();
         let mut seen_tabs = BTreeSet::new();
         let mut seen_panes = BTreeSet::new();
@@ -1411,7 +1430,9 @@ impl ResourceTree {
                     || workspace.name.trim().is_empty()
                     || workspace.tabs.is_empty()
                     || !workspace_names.insert(&workspace.name)
-                    || !roots.insert(&workspace.root)
+                    || roots
+                        .insert(&workspace.root, *sid)
+                        .is_some_and(|owner| owner != *sid)
                     || !seen_workspaces.insert(*wid)
                     || !unique(&workspace.tabs)
                 {
@@ -2069,11 +2090,12 @@ mod tests {
     }
 
     #[test]
-    fn roots_are_snapshotted_and_unique_across_peer_workspaces() {
+    fn roots_are_snapshotted_and_may_repeat_within_one_session() {
         let mut tree = ResourceTree::default();
         let p = initial("s", "/project");
         let sid = p.session_id;
         let root = p.root.clone();
+        let project = p.project.clone();
         tree.create_session(p).unwrap();
         let peer = WorkspacePath {
             workspace_id: WorkspaceId::new(),
@@ -2084,6 +2106,7 @@ mod tests {
             pane_id: PaneId::new(),
             terminal_id: TerminalId::new(),
         };
+        let peer_id = peer.workspace_id;
         tree.add_workspace(sid, peer).unwrap();
         assert_eq!(
             tree.snapshot().sessions[0]
@@ -2102,11 +2125,24 @@ mod tests {
             pane_id: PaneId::new(),
             terminal_id: TerminalId::new(),
         };
-        let before = tree.snapshot();
-        let result = tree.add_workspace(sid, duplicate);
-        assert_eq!(result, Err(ResourceError::Duplicate("workspace root")));
-        assert_eq!(tree.snapshot(), before);
-        assert_valid(&tree, &result);
+        let duplicate_id = duplicate.workspace_id;
+        tree.add_workspace(sid, duplicate).unwrap();
+        let snapshot = tree.snapshot();
+        assert_eq!(snapshot.sessions[0].workspaces.len(), 3);
+        assert_eq!(
+            snapshot.sessions[0].workspaces[1].root,
+            snapshot.sessions[0].workspaces[2].root
+        );
+        assert_eq!(
+            tree.checkout_destination(&project, Path::new("/project/peer")),
+            Ok(CheckoutDestination::Existing(peer_id))
+        );
+        tree.close_workspace(peer_id).unwrap();
+        assert_eq!(
+            tree.checkout_destination(&project, Path::new("/project/peer")),
+            Ok(CheckoutDestination::Existing(duplicate_id))
+        );
+        tree.validate().unwrap();
     }
 
     #[test]

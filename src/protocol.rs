@@ -124,6 +124,17 @@ pub enum ClientMessage {
         #[serde(default)]
         argv: Vec<String>,
     },
+    CreateWorkspace {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        program: Option<PathBuf>,
+        #[serde(default)]
+        argv: Vec<String>,
+    },
     CreateTab {
         workspace_id: WorkspaceId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -182,6 +193,9 @@ pub enum ServerMessage {
         selected: SelectedTarget,
         disposition: OpenDisposition,
     },
+    WorkspaceCreated {
+        selected: SelectedTarget,
+    },
     TabCreated {
         selected: SelectedTarget,
     },
@@ -193,6 +207,9 @@ pub enum ServerMessage {
         moved: bool,
         source_tab_closed: bool,
         selected: SelectedTarget,
+    },
+    TargetRenamed {
+        resource_revision: u64,
     },
     TargetSelected {
         selected: SelectedView,
@@ -596,6 +613,20 @@ mod tests {
                 response
             );
             assert_eq!(response.request_id, request.request_id);
+
+            let interactive_response = Envelope {
+                request_id: Some(request_id),
+                message: ServerMessage::TargetRenamed {
+                    resource_revision: 42,
+                },
+            };
+            assert_eq!(
+                decode_payload::<Envelope<ServerMessage>>(
+                    &encode_payload(&interactive_response).unwrap()
+                )
+                .unwrap(),
+                interactive_response
+            );
         }
     }
 
@@ -731,5 +762,41 @@ mod tests {
             response
         );
         assert_eq!(response.request_id, request.request_id);
+    }
+
+    #[test]
+    fn create_workspace_round_trips_logical_duplicate_root_request() {
+        let request_id = Uuid::new_v4();
+        let request = Envelope {
+            request_id: Some(request_id),
+            message: ClientMessage::CreateWorkspace {
+                session_id: SessionId::new(),
+                name: Some("focused context".into()),
+                cwd: None,
+                program: None,
+                argv: Vec::new(),
+            },
+        };
+        assert_eq!(
+            decode_payload::<Envelope<ClientMessage>>(&encode_payload(&request).unwrap()).unwrap(),
+            request
+        );
+        let response = Envelope {
+            request_id: Some(request_id),
+            message: ServerMessage::WorkspaceCreated {
+                selected: SelectedTarget {
+                    session_id: SessionId::new(),
+                    workspace_id: WorkspaceId::new(),
+                    tab_id: TabId::new(),
+                    pane_id: PaneId::new(),
+                    terminal_id: TerminalId::new(),
+                    child_pid: 42,
+                },
+            },
+        };
+        assert_eq!(
+            decode_payload::<Envelope<ServerMessage>>(&encode_payload(&response).unwrap()).unwrap(),
+            response
+        );
     }
 }

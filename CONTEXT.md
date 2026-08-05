@@ -36,11 +36,11 @@ A session is a navigable resource inside Fut, not a server, socket namespace, or
 
 ### Workspace
 
-A live checkout of a project. The main checkout and every Git worktree are peers and each becomes one workspace. A workspace supplies the filesystem root and working context inherited by its tabs and terminals.
+A user-defined live context that groups tabs. A workspace records the filesystem root and working context inherited by its tabs and terminals, but it does not prescribe what that directory means. A Git checkout or worktree fits naturally as a workspace; users may also create several logical workspaces from the same directory within one project session.
 
 ### Worktree
 
-A Git checkout linked to the same repository as other checkouts. A worktree is represented by a workspace; it is not an additional level in Fut's hierarchy.
+A Git checkout linked to the same repository as other checkouts. A worktree can be opened as a workspace; it is not an additional level in Fut's hierarchy, and Fut does not create or manage worktrees implicitly.
 
 ### Tab
 

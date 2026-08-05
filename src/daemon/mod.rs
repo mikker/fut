@@ -364,7 +364,11 @@ impl SharedState {
         })
     }
 
-    fn rename_target(&mut self, selector: RenameSelector, name: String) -> Result<(), DaemonError> {
+    fn rename_target(
+        &mut self,
+        selector: RenameSelector,
+        name: String,
+    ) -> Result<u64, DaemonError> {
         if !self.accepting {
             return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
         }
@@ -377,7 +381,7 @@ impl SharedState {
             RenameSelector::Tab(id) => self.resources.rename_tab(id, name)?,
         };
         self.publish_resource_change(mutation.revision);
-        Ok(())
+        Ok(mutation.revision)
     }
 
     fn begin_shutdown(&mut self) -> Vec<Arc<TerminalHandle>> {
@@ -1121,6 +1125,55 @@ async fn handle_connection(
                             Err(error) => send_error(&mut framed, envelope.request_id, error.code, &error.message).await?,
                         }
                     }
+                    ClientMessage::CreateWorkspace { session_id, name, cwd, program, argv } => {
+                        if session_id != attachment.focused.selected.session_id {
+                            send_error(&mut framed, envelope.request_id, "outside_session", "workspace must be created in the attached session").await?;
+                            continue;
+                        }
+                        let inherited_cwd = if cwd.is_none() {
+                            let terminal = attachment.focused_terminal();
+                            Some((
+                                terminal.child_pid(),
+                                terminal.spawn_cwd().to_path_buf(),
+                            ))
+                        } else {
+                            None
+                        };
+                        let request = CreateWorkspaceRequest {
+                            session_id,
+                            source_workspace_id: attachment.focused.selected.workspace_id,
+                            source_terminal_id: attachment.focused.selected.terminal_id,
+                            name,
+                            cwd,
+                            inherited_cwd,
+                            program,
+                            argv,
+                            size: spawn_size,
+                        };
+                        match create_workspace(&shared, &exited, request, CreationMode::Attached(client)).await {
+                            Ok(CreatedTerminal::Attached(target)) => {
+                                let selected = target.selected.clone();
+                                match focus_leased_attachment(&shared, &mut attachment, target).await {
+                                    Ok(()) => {
+                                        send(&mut framed, envelope.request_id, ServerMessage::WorkspaceCreated { selected }).await?;
+                                        send(
+                                            &mut framed,
+                                            envelope.request_id,
+                                            ServerMessage::TargetSelected { selected: attachment.selected() },
+                                        ).await?;
+                                    }
+                                    Err(error) => send_error(
+                                        &mut framed,
+                                        envelope.request_id,
+                                        error.code,
+                                        &error.message,
+                                    ).await?,
+                                }
+                            }
+                            Ok(CreatedTerminal::Detached(_)) => unreachable!("attached creation acquires a lease"),
+                            Err(error) => send_error(&mut framed, envelope.request_id, error.code, &error.message).await?,
+                        }
+                    }
                     ClientMessage::CreateTab { workspace_id, name, cwd, program, argv } => {
                         let inherited_cwd = if cwd.is_none()
                             && workspace_id == attachment.focused.selected.workspace_id
@@ -1253,7 +1306,33 @@ async fn handle_connection(
                         return Ok(());
                     }
                     ClientMessage::Ping => send(&mut framed, envelope.request_id, ServerMessage::Pong { daemon_pid: std::process::id() }).await?,
-                    ClientMessage::OpenLocation { .. } | ClientMessage::MovePane { .. } | ClientMessage::CloseTarget { .. } | ClientMessage::RenameTarget { .. } | ClientMessage::Shutdown => send_error(&mut framed, envelope.request_id, "control_only", "command requires a control connection").await?,
+                    ClientMessage::RenameTarget { selector, name } => {
+                        let result = {
+                            let mut state = shared.lock().await;
+                            if interactive_rename_allowed(
+                                &state.resources,
+                                attachment.focused.selected.session_id,
+                                attachment.focused.selected.workspace_id,
+                                &selector,
+                            ) {
+                                state.rename_target(selector, name)
+                            } else {
+                                Err(DaemonError::new(
+                                    "outside_scope",
+                                    "interactive rename target is outside the active resource list",
+                                ))
+                            }
+                        };
+                        match result {
+                            Ok(resource_revision) => send(
+                                &mut framed,
+                                envelope.request_id,
+                                ServerMessage::TargetRenamed { resource_revision },
+                            ).await?,
+                            Err(error) => send_error(&mut framed, envelope.request_id, error.code, &error.message).await?,
+                        }
+                    }
+                    ClientMessage::OpenLocation { .. } | ClientMessage::MovePane { .. } | ClientMessage::CloseTarget { .. } | ClientMessage::Shutdown => send_error(&mut framed, envelope.request_id, "control_only", "command requires a control connection").await?,
                     ClientMessage::Hello { .. } => send_error(&mut framed, envelope.request_id, "already_hello", "hello was already received").await?,
                 }
             },
@@ -1539,7 +1618,7 @@ async fn control_loop(
             }
             ClientMessage::CloseTarget { selector } => {
                 match close_target(&shared, selector).await {
-                    Ok(()) => {
+                    Ok(_) => {
                         send(
                             framed,
                             envelope.request_id,
@@ -1557,7 +1636,7 @@ async fn control_loop(
             ClientMessage::RenameTarget { selector, name } => {
                 let result = shared.lock().await.rename_target(selector, name);
                 match result {
-                    Ok(()) => {
+                    Ok(_) => {
                         send(
                             framed,
                             envelope.request_id,
@@ -1593,14 +1672,15 @@ async fn control_loop(
                 send(framed, envelope.request_id, ServerMessage::Detached).await?;
                 break;
             }
-            ClientMessage::Input { .. }
+            ClientMessage::CreateWorkspace { .. }
+            | ClientMessage::Input { .. }
             | ClientMessage::Resize { .. }
             | ClientMessage::SelectTarget { .. } => {
                 send_error(
                     framed,
                     envelope.request_id,
                     "interactive_only",
-                    "input, resize, and target selection require an interactive connection",
+                    "workspace creation, input, resize, and target selection require an interactive connection",
                 )
                 .await?
             }
@@ -1708,6 +1788,23 @@ fn validate_selection_expectation(
             "target_moved",
             "navigation target moved outside its expected scope",
         ))
+    }
+}
+
+fn interactive_rename_allowed(
+    resources: &ResourceTree,
+    session_id: SessionId,
+    workspace_id: WorkspaceId,
+    selector: &RenameSelector,
+) -> bool {
+    match selector {
+        RenameSelector::Workspace(target) => resources
+            .session_id_for_workspace(*target)
+            .is_ok_and(|owner| owner == session_id),
+        RenameSelector::Tab(target) => resources
+            .workspace_id_for_tab(*target)
+            .is_ok_and(|owner| owner == workspace_id),
+        RenameSelector::Session(_) => false,
     }
 }
 
@@ -2115,6 +2212,18 @@ struct CreateTabRequest {
     size: TerminalSize,
 }
 
+struct CreateWorkspaceRequest {
+    session_id: SessionId,
+    source_workspace_id: WorkspaceId,
+    source_terminal_id: TerminalId,
+    name: Option<String>,
+    cwd: Option<PathBuf>,
+    inherited_cwd: Option<(u32, PathBuf)>,
+    program: Option<PathBuf>,
+    argv: Vec<String>,
+    size: TerminalSize,
+}
+
 enum CreationMode {
     Detached,
     Attached(ClientId),
@@ -2123,6 +2232,177 @@ enum CreationMode {
 enum CreatedTerminal {
     Detached(SelectedTarget),
     Attached(LeasedTarget),
+}
+
+async fn create_workspace(
+    shared: &Shared,
+    exited: &mpsc::UnboundedSender<TerminalId>,
+    request: CreateWorkspaceRequest,
+    mode: CreationMode,
+) -> Result<CreatedTerminal, DaemonError> {
+    let CreateWorkspaceRequest {
+        session_id,
+        source_workspace_id,
+        source_terminal_id,
+        name,
+        cwd,
+        inherited_cwd,
+        program,
+        argv,
+        size,
+    } = request;
+    let source_root = {
+        let state = shared.lock().await;
+        if !state.accepting {
+            return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
+        }
+        if state
+            .resources
+            .session_id_for_workspace(source_workspace_id)?
+            != session_id
+        {
+            return Err(DaemonError::new(
+                "outside_session",
+                "workspace source moved outside the target session",
+            ));
+        }
+        let source = state
+            .resources
+            .resolve_terminal_target(Some(TargetSelector::Terminal(source_terminal_id)))?;
+        if source.session_id != session_id || source.workspace_id != source_workspace_id {
+            return Err(DaemonError::new(
+                "invalid_source",
+                "workspace creation source does not match the attached terminal",
+            ));
+        }
+        let runtime = state
+            .runtimes
+            .get(&source_terminal_id)
+            .ok_or_else(|| DaemonError::new("not_found", "terminal runtime not found"))?;
+        if !matches!(
+            *runtime.handle.subscribe_lifecycle().borrow(),
+            TerminalLifecycle::Running
+        ) {
+            return Err(DaemonError::new(
+                "terminal_exited",
+                "workspace creation source has exited",
+            ));
+        }
+        state
+            .resources
+            .workspace_root(source_workspace_id)?
+            .to_path_buf()
+    };
+    let cwd = resolve_creation_cwd(&source_root, cwd, inherited_cwd).await?;
+    let root = cwd.clone();
+    let program = program.unwrap_or_else(|| {
+        std::env::var_os("SHELL")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| "/bin/sh".into())
+    });
+
+    let (terminal, creation) = {
+        let mut state = shared.lock().await;
+        if !state.accepting {
+            return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
+        }
+        let source = state
+            .resources
+            .resolve_terminal_target(Some(TargetSelector::Terminal(source_terminal_id)))?;
+        if source.session_id != session_id || source.workspace_id != source_workspace_id {
+            return Err(DaemonError::new(
+                "source_moved",
+                "workspace creation source changed during CWD lookup",
+            ));
+        }
+        let runtime = state
+            .runtimes
+            .get(&source_terminal_id)
+            .ok_or_else(|| DaemonError::new("not_found", "terminal runtime not found"))?;
+        if !matches!(
+            *runtime.handle.subscribe_lifecycle().borrow(),
+            TerminalLifecycle::Running
+        ) {
+            return Err(DaemonError::new(
+                "terminal_exited",
+                "workspace creation source exited during CWD lookup",
+            ));
+        }
+        let workspace_name = name.unwrap_or_else(|| {
+            let suggested = root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or("workspace");
+            state
+                .resources
+                .available_workspace_name(session_id, suggested)
+        });
+        let proposed = WorkspacePath {
+            workspace_id: WorkspaceId::new(),
+            workspace_name,
+            root,
+            tab_id: TabId::new(),
+            tab_name: "shell".into(),
+            pane_id: PaneId::new(),
+            terminal_id: TerminalId::new(),
+        };
+        let mut validated = state.resources.clone();
+        validated.add_workspace(session_id, proposed.clone())?;
+
+        let terminal = Arc::new(
+            spawn_terminal(SpawnSpec {
+                program,
+                argv,
+                cwd,
+                env: std::env::vars().collect(),
+                size,
+            })
+            .map_err(|error| DaemonError::new("spawn_failed", error.to_string()))?,
+        );
+        let mut path = proposed;
+        path.terminal_id = terminal.id();
+        let resolved = crate::resources::ResolvedTerminalPath {
+            session_id,
+            workspace_id: path.workspace_id,
+            tab_id: path.tab_id,
+            pane_id: path.pane_id,
+            terminal_id: path.terminal_id,
+        };
+        let selected = selected_target(resolved, &terminal);
+        let insertion = state.register_workspace(session_id, path, Arc::clone(&terminal));
+        let creation = match insertion {
+            Ok(()) => Ok(match mode {
+                CreationMode::Detached => CreatedTerminal::Detached(selected),
+                CreationMode::Attached(client) => {
+                    let runtime = state
+                        .runtimes
+                        .get(&terminal.id())
+                        .expect("new runtime inserted");
+                    let guard = runtime
+                        .lease
+                        .acquire(client)
+                        .expect("new terminal has an independent lease");
+                    CreatedTerminal::Attached(LeasedTarget {
+                        selected,
+                        terminal: Arc::clone(&terminal),
+                        _lease: guard,
+                    })
+                }
+            }),
+            Err(error) => Err(error),
+        };
+        (terminal, creation)
+    };
+    let created = match creation {
+        Ok(created) => created,
+        Err(error) => {
+            let _ = terminal.close().await;
+            return Err(error);
+        }
+    };
+    watch_terminal(terminal, exited.clone());
+    Ok(created)
 }
 
 async fn create_tab(
@@ -2648,6 +2928,51 @@ mod tests {
         ));
         assert!(!should_report_unfocused_resize(None));
         assert!(should_report_unfocused_resize(Some(uuid::Uuid::new_v4())));
+    }
+
+    #[test]
+    fn interactive_rename_is_limited_to_the_visible_resource_scope() {
+        let (mut state, path) = inconsistent_state();
+        let peer = WorkspacePath {
+            workspace_id: WorkspaceId::new(),
+            workspace_name: "peer".into(),
+            root: "/peer".into(),
+            tab_id: TabId::new(),
+            tab_name: "shell".into(),
+            pane_id: PaneId::new(),
+            terminal_id: TerminalId::new(),
+        };
+        let peer_workspace = peer.workspace_id;
+        let peer_tab = peer.tab_id;
+        state
+            .resources
+            .add_workspace(path.session_id, peer)
+            .unwrap();
+
+        assert!(interactive_rename_allowed(
+            &state.resources,
+            path.session_id,
+            path.workspace_id,
+            &RenameSelector::Workspace(peer_workspace),
+        ));
+        assert!(interactive_rename_allowed(
+            &state.resources,
+            path.session_id,
+            path.workspace_id,
+            &RenameSelector::Tab(path.tab_id),
+        ));
+        assert!(!interactive_rename_allowed(
+            &state.resources,
+            path.session_id,
+            path.workspace_id,
+            &RenameSelector::Tab(peer_tab),
+        ));
+        assert!(!interactive_rename_allowed(
+            &state.resources,
+            path.session_id,
+            path.workspace_id,
+            &RenameSelector::Session(crate::resources::SessionSelector::Id(path.session_id,)),
+        ));
     }
 
     fn inconsistent_state() -> (SharedState, InitialPath) {

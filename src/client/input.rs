@@ -172,6 +172,11 @@ mod tests {
         );
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
         assert_eq!(
+            prefix.feed(b"t".to_vec()),
+            PrefixAction::Dispatch(ClientAction::OpenTabBar)
+        );
+        assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
+        assert_eq!(
             prefix.feed(b"c".to_vec()),
             PrefixAction::Dispatch(ClientAction::CreateTab)
         );

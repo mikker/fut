@@ -4660,7 +4660,7 @@ done
     left.send(b"size-main\n");
     left.wait_for("ALPHA_SIZE_23_96").await;
     left.send(b"\x02w");
-    left.wait_for("↑↓ enter · esc").await;
+    left.wait_for("c new · r rename").await;
     left.send(b"j\r");
     left.wait_for("ZETA_READY").await;
     left.send(b"linked\nsize-linked\n");
@@ -4734,7 +4734,7 @@ done
     ));
     live_close.wait_for("done").await;
     live_close.send(b"\x02w");
-    live_close.wait_for("↑↓ enter · esc").await;
+    live_close.wait_for("c new · r rename").await;
     live_close.send(b"k\r");
     live_close.send(b"after-close\n");
     live_close.wait_for("OMEGA_ACK").await;
@@ -4745,6 +4745,208 @@ done
     assert!(process_alive(linked_pid));
     harness.shutdown().await;
     wait_for(DEADLINE, || !process_alive(linked_pid)).await;
+}
+
+#[tokio::test]
+async fn workspace_and_tab_bars_create_and_rename_logical_contexts() {
+    let harness = Harness::start_with(
+        "cd nested; printf 'CONTEXT_READY\\r\\n'; while IFS= read -r line; do :; done",
+        |root| fs::create_dir_all(root.join("cwd/nested")).unwrap(),
+    )
+    .await;
+    let snapshot = harness.resources().await;
+    let original_workspace = snapshot.sessions[0].workspaces[0].id;
+    let original_pane = snapshot.sessions[0].workspaces[0].tabs[0].panes[0].id;
+
+    let mut command = Command::new("/usr/bin/script");
+    command
+        .env_clear()
+        .env("HOME", harness.root.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", harness.root.path().join("runtime"))
+        .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+        .env("TERM", "xterm-256color")
+        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .arg(format!(
+            "stty rows 24 cols 120; exec '{}' --socket '{}' pane attach {original_pane}",
+            env!("CARGO_BIN_EXE_fut"),
+            harness.socket.display(),
+        ));
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("CONTEXT_READY").await;
+
+    client.send(b"\x02w");
+    client.wait_for("c new · r rename").await;
+    client.send(b"c");
+    let created_workspace = time::timeout(DEADLINE, async {
+        loop {
+            let snapshot = harness.resources().await;
+            if snapshot.sessions[0].workspaces.len() == 2 {
+                break snapshot.sessions[0].workspaces[1].id;
+            }
+            time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("logical workspace was not published");
+    client.send(b"q");
+    let created_cwd = harness.root.path().join("created-workspace-cwd");
+    let created_command = format!(
+        "\x1b[200~pwd > '{}'; printf 'CREATED_WORKSPACE_READY\\n'\n\x1b[201~",
+        created_cwd.display()
+    );
+    time::timeout(DEADLINE, async {
+        while !created_cwd.exists() {
+            client.send(created_command.as_bytes());
+            time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "created workspace never accepted input: {:?}",
+            client.text()
+        )
+    });
+    assert_eq!(
+        fs::read_to_string(&created_cwd).unwrap().trim(),
+        fs::canonicalize(harness.root.path().join("cwd/nested"))
+            .unwrap()
+            .display()
+            .to_string()
+    );
+
+    let roots = harness.resources().await.sessions[0]
+        .workspaces
+        .iter()
+        .map(|workspace| workspace.root.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        roots[1],
+        fs::canonicalize(harness.root.path().join("cwd/nested")).unwrap()
+    );
+
+    client.send(b"\x02wr");
+    client.wait_for("Rename workspace").await;
+    client.send("\x15context λ\r".as_bytes());
+    time::timeout(DEADLINE, async {
+        loop {
+            let snapshot = harness.resources().await;
+            if snapshot.sessions[0].workspaces[1].name == "context λ" {
+                break;
+            }
+            time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("workspace rename was not published");
+    for _ in 0..10 {
+        client.send(b"\x1b");
+        time::sleep(Duration::from_millis(50)).await;
+        client.send(b"\x02t");
+        time::sleep(Duration::from_millis(50)).await;
+    }
+    client.wait_for("c new · r rename · esc").await;
+    client.send(b"r");
+    client.wait_for("Rename tab").await;
+    client.send("\x15main λ\r".as_bytes());
+    time::timeout(DEADLINE, async {
+        loop {
+            let snapshot = harness.resources().await;
+            if snapshot.sessions[0].workspaces[1].tabs[0].name == "main λ" {
+                break;
+            }
+            time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("first tab rename was not published");
+    for _ in 0..10 {
+        client.send(b"\x1b");
+        time::sleep(Duration::from_millis(50)).await;
+        client.send(b"\x02t");
+        time::sleep(Duration::from_millis(50)).await;
+    }
+    client.send(b"c q");
+
+    let second_tab_cwd = harness.root.path().join("created-tab-cwd");
+    let tab_command = format!(
+        "\x1b[200~pwd > '{}'; printf 'CREATED_TAB_READY\\n'\n\x1b[201~",
+        second_tab_cwd.display()
+    );
+    time::timeout(DEADLINE, async {
+        while !second_tab_cwd.exists() {
+            client.send(tab_command.as_bytes());
+            time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("created tab never accepted input: {:?}", client.text()));
+    assert_eq!(
+        fs::read_to_string(&second_tab_cwd).unwrap().trim(),
+        fs::canonicalize(harness.root.path().join("cwd/nested"))
+            .unwrap()
+            .display()
+            .to_string()
+    );
+
+    for _ in 0..10 {
+        client.send(b"\x1b");
+        time::sleep(Duration::from_millis(50)).await;
+        client.send(b"\x02t");
+        time::sleep(Duration::from_millis(50)).await;
+    }
+    client.send(b"hr");
+    client.wait_for("Rename tab").await;
+    client.send(b"\x15first\r");
+    time::timeout(DEADLINE, async {
+        loop {
+            let snapshot = harness.resources().await;
+            if snapshot.sessions[0].workspaces[1].tabs[0].name == "first" {
+                break;
+            }
+            time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("selected tab rename was not published");
+    for _ in 0..10 {
+        client.send(b"\r");
+        time::sleep(Duration::from_millis(50)).await;
+    }
+    let returned = harness.root.path().join("returned-tab-cwd");
+    let returned_command = format!("\x1b[200~pwd > '{}'\n\x1b[201~", returned.display());
+    time::timeout(DEADLINE, async {
+        while !returned.exists() {
+            client.send(returned_command.as_bytes());
+            time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("renamed tab was not selected: {:?}", client.text()));
+
+    let final_snapshot = harness.resources().await;
+    assert_eq!(
+        final_snapshot.sessions[0].workspaces[0].id,
+        original_workspace
+    );
+    assert_eq!(
+        final_snapshot.sessions[0].workspaces[1].id,
+        created_workspace
+    );
+    assert_eq!(final_snapshot.sessions[0].workspaces[1].name, "context λ");
+    assert_eq!(
+        final_snapshot.sessions[0].workspaces[1]
+            .tabs
+            .iter()
+            .map(|tab| tab.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["first", "shell"]
+    );
+
+    client.send(b"\x02d");
+    client.wait_success().await;
+    harness.shutdown().await;
 }
 
 #[tokio::test]
@@ -5618,7 +5820,7 @@ async fn public_rename_preserves_a_live_process_and_rejects_invalid_changes_atom
         );
     }
 
-    let after = harness.resources().await;
+    let mut after = harness.resources().await;
     assert_eq!(after.revision, before.revision + 3);
     let mut expected = before.clone();
     expected.revision += 3;
@@ -5711,14 +5913,20 @@ async fn public_rename_preserves_a_live_process_and_rejects_invalid_changes_atom
         &mut attached,
         ClientMessage::RenameTarget {
             selector: RenameSelector::Tab(tab_id),
-            name: "forbidden".into(),
+            name: "interactive".into(),
         },
     )
     .await;
-    assert!(
-        matches!(receive_matching(&mut attached, |message| matches!(message, ServerMessage::Error { code, .. } if code == "control_only")).await,
-        ServerMessage::Error { ref code, .. } if code == "control_only")
-    );
+    assert!(matches!(
+        receive_matching(&mut attached, |message| matches!(
+            message,
+            ServerMessage::TargetRenamed { .. }
+        ))
+        .await,
+        ServerMessage::TargetRenamed { .. }
+    ));
+    after.revision += 1;
+    after.sessions[0].workspaces[0].tabs[0].name = "interactive".into();
     assert_eq!(harness.resources().await, after);
 
     let invalid = [
