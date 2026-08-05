@@ -87,6 +87,7 @@ aside a[aria-current="page"] {
 aside a[aria-current="page"]::before {
   content: "● ";
   color: var(--accent);
+  margin-left: -2ch;
 }
 
 main {
@@ -210,8 +211,8 @@ th {
     --paper: #1b1b1b;
     --ink: #f7f7f7;
     --syntax: var(--accent);
-    --line: #555555;
-    --code: #292929;
+    --line: #333333;
+    --code: #222222;
   }
 }
 
@@ -236,7 +237,7 @@ th {
   }
 
   aside a {
-    display: inline-block;
+    display: block;
     margin: 4px 16px 4px 0;
   }
 

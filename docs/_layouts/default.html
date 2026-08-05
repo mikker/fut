@@ -12,12 +12,11 @@
   <body>
     <header class="site-header">
       <a class="wordmark" href="{{ '/' | relative_url }}" aria-label="Fut documentation home">FUT<span aria-hidden="true">█</span></a>
-      <a href="https://github.com/mikker/fut">[ GITHUB ↗ ]</a>
+      <a href="https://github.com/mikker/fut">GITHUB ↗</a>
     </header>
 
     <div class="shell">
       <aside aria-label="Documentation sections">
-        <p>FUT / DOCS</p>
         <a {% if page.url == '/' %}aria-current="page"{% endif %} href="{{ '/' | relative_url }}">00 / Introduction</a>
         <a {% if page.url contains '/configuration/' %}aria-current="page"{% endif %} href="{{ '/configuration/' | relative_url }}">01 / Configuration</a>
         <a {% if page.url contains '/tokens/' %}aria-current="page"{% endif %} href="{{ '/tokens/' | relative_url }}">02 / Tokens</a>
