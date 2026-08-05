@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <rect width="1200" height="630" fill="#f7f7f7"/>
+  <g font-family="SF Mono" font-size="34" fill="#1b1b1b">
+    <text x="84" y="116">fut<tspan fill="#00bc7d" style="fill: oklch(69.6% 0.17 162.48)">█</tspan></text>
+    <text x="640" y="116">(just one)</text>
+
+    <text x="84" y="196">└── session[name]</text>
+    <text x="640" y="196">(this is the project)</text>
+
+    <text x="148" y="276">└── workspace[name]</text>
+    <text x="640" y="276">(this is the worktree)</text>
+
+    <text x="212" y="356">└── tab</text>
+    <text x="640" y="356">(agent / vim / you do you)</text>
+
+    <text x="276" y="436">└── pane</text>
+    <text x="640" y="436">(same as above)</text>
+  </g>
+  <line x1="84" y1="520" x2="1116" y2="520" stroke="#c9c9c9"/>
+  <text x="84" y="570" font-family="SF Mono" font-size="24" fill="#1b1b1b">fut.sh</text>
+</svg>

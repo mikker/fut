@@ -151,6 +151,10 @@ pre code {
   background: transparent;
 }
 
+.cursor {
+  color: var(--accent);
+}
+
 .highlight .c,
 .highlight .c1,
 .highlight .cm {
