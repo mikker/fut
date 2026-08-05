@@ -1,5 +1,6 @@
 [tools]
 rust = "1.95.0"
+ruby = "3.3"
 zig = "0.16.0"
 
 [tasks.check]
@@ -43,3 +44,12 @@ run = "bash scripts/demo attach"
 [tasks."demo:clean"]
 description = "Stop and remove the Fut demo"
 run = "bash scripts/demo clean"
+
+[tasks."docs:setup"]
+description = "Install local documentation dependencies"
+run = "bundle config set --local path .bundle && bundle install"
+
+[tasks."docs:serve"]
+description = "Preview the documentation at http://127.0.0.1:4000"
+depends = ["docs:setup"]
+run = "bundle exec jekyll serve --source docs --destination target/docs --baseurl '' --livereload"

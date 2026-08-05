@@ -1,13 +1,13 @@
 ---
 layout: default
 title: Documentation
-description: A terminal multiplexer for people and their agents.
+description: Agent-aware terminal multiplexing.
 permalink: /
 ---
 
-# One multiplexer. Every context.
+# Fut
 
-Fut keeps sessions, workspaces, tabs, panes, and terminals addressable without taking process ownership away from the daemon.
+Agent-aware terminal multiplexing.
 
 ```text
 one multiplexer
@@ -17,12 +17,10 @@ one multiplexer
             └── pane
 ```
 
-## Start here
+## Docs
 
-- [Configuration](configuration.md) — safe global UI configuration and complete examples
-- [Presentation tokens](tokens.md) — tab-bar and workspace-sidebar formatting reference
-- [Diagnostics](doctor.md) — `fut doctor`, exit statuses, and JSON output
+- [Configuration](configuration.md)
+- [Presentation tokens](tokens.md)
+- [Diagnostics](doctor.md)
 
-## Repository
-
-The implementation, project vocabulary, product direction, and current plan live in the [GitHub repository](https://github.com/mikker/fut).
+[Source](https://github.com/mikker/fut)
