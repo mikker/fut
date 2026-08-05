@@ -1,0 +1,14 @@
+title: Fut
+description: Agent-aware terminal multiplexing
+url: https://mikker.github.io
+baseurl: /fut
+repository: mikker/fut
+markdown: kramdown
+permalink: pretty
+relative_links:
+  enabled: true
+  collections: true
+plugins:
+  - jekyll-relative-links
+exclude:
+  - README.md

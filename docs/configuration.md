@@ -1,3 +1,10 @@
+---
+layout: default
+title: Configuration
+description: Configure Fut's client chrome and bindings.
+permalink: /configuration/
+---
+
 # Configuration
 
 Fut's global UI configuration is safe, declarative, and non-executable. It controls each newly attached client; it never changes daemon-owned resources or runs commands.

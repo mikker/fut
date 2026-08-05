@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#f4f1e8" media="(prefers-color-scheme: light)">
+    <meta name="theme-color" content="#11110f" media="(prefers-color-scheme: dark)">
+    <meta name="description" content="{{ page.description | default: site.description | escape }}">
+    <title>{{ page.title }} · {{ site.title }}</title>
+    <link rel="stylesheet" href="{{ '/assets/style.css' | relative_url }}">
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="wordmark" href="{{ '/' | relative_url }}" aria-label="Fut documentation home">FUT<span aria-hidden="true">█</span></a>
+      <nav aria-label="Primary navigation">
+        <a href="{{ '/configuration/' | relative_url }}">[ CONFIG ]</a>
+        <a href="{{ '/tokens/' | relative_url }}">[ TOKENS ]</a>
+        <a href="{{ '/doctor/' | relative_url }}">[ DOCTOR ]</a>
+        <a href="https://github.com/mikker/fut">[ GITHUB ↗ ]</a>
+      </nav>
+    </header>
+
+    <div class="shell">
+      <aside aria-label="Documentation sections">
+        <p>FUT / DOCS</p>
+        <a {% if page.url == '/' %}aria-current="page"{% endif %} href="{{ '/' | relative_url }}">00 / Introduction</a>
+        <a {% if page.url contains '/configuration/' %}aria-current="page"{% endif %} href="{{ '/configuration/' | relative_url }}">01 / Configuration</a>
+        <a {% if page.url contains '/tokens/' %}aria-current="page"{% endif %} href="{{ '/tokens/' | relative_url }}">02 / Tokens</a>
+        <a {% if page.url contains '/doctor/' %}aria-current="page"{% endif %} href="{{ '/doctor/' | relative_url }}">03 / Doctor</a>
+      </aside>
+
+      <main id="content">
+        {{ content }}
+      </main>
+    </div>
+
+    <footer>
+      <span>FUT / DAEMON OWNS THE TERMINAL</span>
+      <a href="https://github.com/mikker/fut">SOURCE ↗</a>
+    </footer>
+  </body>
+</html>

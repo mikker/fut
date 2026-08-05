@@ -1,3 +1,10 @@
+---
+layout: default
+title: Presentation tokens
+description: Pure values for tab and workspace presentation.
+permalink: /tokens/
+---
+
 # Presentation tokens
 
 Presentation tokens are pure, typed values expanded from the resource snapshot and client state already held by Fut. They never execute commands or perform I/O. Tokens are valid only in the documented context; a misspelling or out-of-scope token prevents the interactive client from starting.

@@ -1,3 +1,10 @@
+---
+layout: default
+title: Diagnostics
+description: Read-only checks for Fut's environment and configuration.
+permalink: /doctor/
+---
+
 # Diagnostics
 
 `fut doctor` performs a bounded, read-only diagnosis of the client environment:
