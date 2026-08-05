@@ -5,7 +5,9 @@ description: Agent-aware terminal multiplexing.
 permalink: /
 ---
 
-<pre class="resource-tree"><code>fut<span class="cursor">█</span>                        (just one)
+# fear, uncertainty and ... terminals?
+
+<pre class="resource-tree"><code>$ fut <span class="cursor">█</span>                     (just one)
 └── session[name]           (this is the project)
     └── workspace[name]     (this is the worktree)
         └── tab             (this is the agent/vim/you do you)
