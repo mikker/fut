@@ -141,7 +141,7 @@ async fn run(
     ui: UiConfig,
 ) -> anyhow::Result<()> {
     let mut events = EventStream::new();
-    let mut prefix = PrefixState::default();
+    let mut prefix = PrefixState::new(ui.bindings.clone());
     let mut view = ViewState::new(selected)?;
     let mut resources = ResourceState::default();
     let mut surface: Option<ClientSurface> = None;
@@ -158,7 +158,7 @@ async fn run(
     let mut redraw = time::interval(Duration::from_millis(16));
     redraw.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     send_request(framed, Some(Uuid::new_v4()), ClientMessage::ListResources).await?;
-    resize_view(framed, terminal.size()?.into(), &mut view, &ui).await?;
+    resize_view(framed, terminal.size()?.into(), &mut view, &resources, &ui).await?;
 
     loop {
         tokio::select! {
@@ -201,6 +201,13 @@ async fn run(
                                 &mut split_pane,
                                 &mut rename,
                             );
+                            resize_view(
+                                framed,
+                                terminal.size()?.into(),
+                                &mut view,
+                                &resources,
+                                &ui,
+                            ).await?;
                             force_draw = true;
                         }
                     }
@@ -220,6 +227,13 @@ async fn run(
                                 &mut split_pane,
                                 &mut rename,
                             );
+                            resize_view(
+                                framed,
+                                terminal.size()?.into(),
+                                &mut view,
+                                &resources,
+                                &ui,
+                            ).await?;
                             force_draw = true;
                         }
                     }
@@ -262,7 +276,13 @@ async fn run(
                             send(framed, ClientMessage::ListResources).await?;
                         }
                         pending_focused_exit = None;
-                        resize_view(framed, terminal.size()?.into(), &mut view, &ui).await?;
+                        resize_view(
+                            framed,
+                            terminal.size()?.into(),
+                            &mut view,
+                            &resources,
+                            &ui,
+                        ).await?;
                         if let Some(snapshot) = resources.snapshot() {
                             refresh_surface_resources(
                                 &mut surface,
@@ -651,7 +671,13 @@ async fn run(
                     },
                     Event::Paste(text) if surface.is_none() => send(framed, ClientMessage::Input { bytes: text.into_bytes() }).await?,
                     Event::Resize(columns, rows) if columns > 0 && rows > 0 => {
-                        resize_view(framed, Rect::new(0, 0, columns, rows), &mut view, &ui).await?;
+                        resize_view(
+                            framed,
+                            Rect::new(0, 0, columns, rows),
+                            &mut view,
+                            &resources,
+                            &ui,
+                        ).await?;
                         force_draw = true;
                     }
                     _ => {}
@@ -661,11 +687,16 @@ async fn run(
                 io::stdout().sync_update(|_| {
                     terminal.draw(|frame| {
                         let area = frame.area();
-                        let layout = client_layout(area, &ui);
+                        let layout = client_layout(
+                            area,
+                            &ui,
+                            resources.workspace_count(view.focused()),
+                        );
                         let cursor = render_view(
                             &view,
                             layout.terminal,
                             ui.pane_layout,
+                            &ui.styles,
                             frame.buffer_mut(),
                         );
                         if let Some(tab_bar) = layout.tab_bar {
@@ -842,7 +873,9 @@ async fn dispatch_client_action(
 ) -> anyhow::Result<Option<String>> {
     match action {
         ClientAction::OpenCommandBar => {
-            *surface = Some(ClientSurface::CommandBar(CommandBarState::open()));
+            *surface = Some(ClientSurface::CommandBar(
+                CommandBarState::open_with_bindings(ui.bindings.clone()),
+            ));
         }
         ClientAction::OpenNavigator => {
             let mut navigator = NavigatorState::open(view.focused());
@@ -872,7 +905,10 @@ async fn dispatch_client_action(
             if !view.resources_are_current(snapshot) {
                 return Ok(Some("navigation is syncing".into()));
             }
-            if client_layout(host, ui).tab_bar.is_none() {
+            if client_layout(host, ui, resources.workspace_count(view.focused()))
+                .tab_bar
+                .is_none()
+            {
                 return Ok(Some("tab bar is unavailable at this size".into()));
             }
             let Some(tab_bar) = TabBarState::open(snapshot, view.focused(), workspace_history)
@@ -956,7 +992,8 @@ async fn dispatch_client_action(
             }
         }
         ClientAction::FocusPane(direction) => {
-            let terminal = client_layout(host, ui).terminal;
+            let terminal =
+                client_layout(host, ui, resources.workspace_count(view.focused())).terminal;
             if let Some(target) = view.directional(direction, terminal, ui.pane_layout)
                 && let Some(request) = focus.begin(FocusOrigin::Pane)
             {
@@ -1031,7 +1068,7 @@ async fn dispatch_client_action(
             let Some(_) = view.toggle_zoom() else {
                 return Ok(Some("pane zoom needs more than one pane".into()));
             };
-            resize_view(framed, host, view, ui).await?;
+            resize_view(framed, host, view, resources, ui).await?;
         }
         ClientAction::Detach => send(framed, ClientMessage::Detach).await?,
     }
@@ -1575,9 +1612,10 @@ async fn resize_view(
     framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     area: Rect,
     view: &mut ViewState,
+    resources: &ResourceState,
     ui: &UiConfig,
 ) -> anyhow::Result<()> {
-    let terminal = client_layout(area, ui).terminal;
+    let terminal = client_layout(area, ui, resources.workspace_count(view.focused())).terminal;
     for (terminal_id, size) in view.resize_requests(terminal, ui.pane_layout) {
         send(framed, ClientMessage::Resize { terminal_id, size }).await?;
     }
@@ -1588,16 +1626,20 @@ fn render_view(
     view: &ViewState,
     area: Rect,
     policy: PaneLayoutPolicy,
+    styles: &config::StylesConfig,
     buffer: &mut Buffer,
 ) -> Option<(u16, u16)> {
     let (layouts, dividers) = view.pane_layouts(area, policy);
+    let divider_style = styles.apply(
+        config::SemanticStyle::Divider,
+        styles.apply(config::SemanticStyle::Normal, Style::default()),
+    );
     for divider in dividers {
         let symbol = if divider.width == 1 { "│" } else { "─" };
         for row in divider.y..divider.y + divider.height {
             for column in divider.x..divider.x + divider.width {
                 if let Some(cell) = buffer.cell_mut((column, row)) {
-                    cell.set_symbol(symbol)
-                        .set_style(Style::default().add_modifier(Modifier::DIM));
+                    cell.set_symbol(symbol).set_style(divider_style);
                 }
             }
         }
@@ -1610,9 +1652,9 @@ fn render_view(
         if let Some(rail) = rail {
             let focused = pane.target.terminal_id == view.focused;
             let style = if focused {
-                Style::default().add_modifier(Modifier::BOLD)
+                divider_style.add_modifier(Modifier::BOLD)
             } else {
-                Style::default().add_modifier(Modifier::DIM)
+                divider_style
             };
             let symbol = if focused { "┃" } else { "│" };
             for row in rail.y..rail.y + rail.height {
@@ -2103,16 +2145,22 @@ mod tests {
         let area = Rect::new(0, 0, 38, 2);
         let mut buffer = Buffer::empty(area);
         assert_eq!(
-            render_view(&state, area, PaneLayoutPolicy::Accordion, &mut buffer),
+            render_view(
+                &state,
+                area,
+                PaneLayoutPolicy::Accordion,
+                &UiConfig::default().styles,
+                &mut buffer,
+            ),
             Some((1, 0))
         );
         assert_eq!(buffer[(0, 0)].symbol(), "┃");
         assert!(buffer[(0, 0)].modifier.contains(Modifier::BOLD));
-        assert_eq!(buffer[(0, 0)].fg, Color::Reset);
+        assert_eq!(buffer[(0, 0)].fg, Color::DarkGray);
         assert_eq!(buffer[(0, 0)].bg, Color::Reset);
         assert_eq!(buffer[(1, 0)].symbol(), "A");
         assert_eq!(buffer[(25, 0)].symbol(), "│");
-        assert!(buffer[(25, 0)].modifier.contains(Modifier::DIM));
+        assert_eq!(buffer[(25, 0)].fg, Color::DarkGray);
         assert_eq!(buffer[(26, 0)].symbol(), "B");
 
         state
@@ -2120,16 +2168,28 @@ mod tests {
             .unwrap();
         let mut moved = Buffer::empty(area);
         assert_eq!(
-            render_view(&state, area, PaneLayoutPolicy::Accordion, &mut moved),
+            render_view(
+                &state,
+                area,
+                PaneLayoutPolicy::Accordion,
+                &UiConfig::default().styles,
+                &mut moved,
+            ),
             Some((14, 0))
         );
-        assert!(moved[(0, 0)].modifier.contains(Modifier::DIM));
+        assert_eq!(moved[(0, 0)].fg, Color::DarkGray);
         assert!(moved[(13, 0)].modifier.contains(Modifier::BOLD));
 
         let tiny = Rect::new(0, 0, 20, 2);
         let mut tiny_buffer = Buffer::empty(tiny);
         assert_eq!(
-            render_view(&state, tiny, PaneLayoutPolicy::Accordion, &mut tiny_buffer,),
+            render_view(
+                &state,
+                tiny,
+                PaneLayoutPolicy::Accordion,
+                &UiConfig::default().styles,
+                &mut tiny_buffer,
+            ),
             Some((0, 0))
         );
         assert_eq!(tiny_buffer[(0, 0)].symbol(), "B");

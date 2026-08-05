@@ -36,6 +36,20 @@ pub(super) struct ItemState {
     pub attention: bool,
 }
 
+pub(super) fn apply_item_state(styles: &StylesConfig, state: ItemState, mut style: Style) -> Style {
+    for (enabled, role) in [
+        (state.current, SemanticStyle::Current),
+        (state.attention, SemanticStyle::Attention),
+        (state.closing, SemanticStyle::Closing),
+        (state.selected, SemanticStyle::Selected),
+    ] {
+        if enabled {
+            style = styles.apply(role, style);
+        }
+    }
+    style
+}
+
 pub(super) fn render_token_segments(
     segments: &[SegmentConfig],
     group_style: Option<SemanticStyle>,
@@ -76,16 +90,7 @@ pub(super) fn render_token_segments(
         if let Some(role) = segment.style {
             style = styles.apply(role, style);
         }
-        for (enabled, role) in [
-            (state.current, SemanticStyle::Current),
-            (state.attention, SemanticStyle::Attention),
-            (state.closing, SemanticStyle::Closing),
-            (state.selected, SemanticStyle::Selected),
-        ] {
-            if enabled {
-                style = styles.apply(role, style);
-            }
-        }
+        style = apply_item_state(styles, state, style);
         spans.push(Span::styled(text, style));
     }
     Line::from(spans)

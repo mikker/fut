@@ -15,7 +15,7 @@ use crate::{
 
 use super::{
     config::{GroupConfig, SemanticStyle, TabBarPosition, UiConfig, WorkspaceSidebarPosition},
-    presentation::{ItemState, TokenValue, render_token_segments, truncate_line},
+    presentation::{ItemState, TokenValue, apply_item_state, render_token_segments, truncate_line},
 };
 
 const MIN_DOCKED_TERMINAL_WIDTH: u16 = 96;
@@ -48,7 +48,11 @@ impl WorkspaceSidebarLayout {
     }
 }
 
-pub(super) fn client_layout(host: Rect, ui: &UiConfig) -> ClientLayout {
+pub(super) fn client_layout(
+    host: Rect,
+    ui: &UiConfig,
+    workspace_count: Option<usize>,
+) -> ClientLayout {
     if host.width == 0 || host.height < 2 {
         return ClientLayout {
             terminal: host,
@@ -63,7 +67,10 @@ pub(super) fn client_layout(host: Rect, ui: &UiConfig) -> ClientLayout {
     }
 
     let sidebar_width = ui.workspace_sidebar.width;
-    let docked = host.width >= sidebar_width.saturating_add(MIN_DOCKED_TERMINAL_WIDTH);
+    let sidebar_needed =
+        !ui.workspace_sidebar.hide_when_single || workspace_count.is_none_or(|count| count > 1);
+    let docked =
+        sidebar_needed && host.width >= sidebar_width.saturating_add(MIN_DOCKED_TERMINAL_WIDTH);
     let (workspace, docked_sidebar) = if docked {
         let sidebar = sidebar_rect(host, ui.workspace_sidebar.position, sidebar_width)
             .expect("nonempty host has a sidebar rectangle");
@@ -157,6 +164,16 @@ impl ResourceState {
 
     pub fn snapshot(&self) -> Option<&ResourceSnapshot> {
         self.snapshot.as_ref()
+    }
+
+    pub fn workspace_count(&self, focused: &SelectedTarget) -> Option<usize> {
+        self.snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .sessions
+                .iter()
+                .find(|session| session.id == focused.session_id)
+                .map(|session| session.workspaces.len())
+        })
     }
 }
 
@@ -417,9 +434,9 @@ fn visible_tabs(
     let mut last = anchor;
     let mut line = selected_line(model, selected, first, last, component_style, ui);
     if line.width() > width {
-        let fallback = render_tab_item(model, anchor, selected, component_style, ui);
-        if width == 1 {
-            let marker = tab_token(model, anchor, "tab.marker", &ui.icons.resolve());
+        let fallback = render_tab_item_content(model, anchor, selected, component_style, ui);
+        let marker = tab_token(model, anchor, "tab.index", &ui.icons.resolve());
+        if width <= UnicodeWidthStr::width(marker.text.as_str()).saturating_add(2) {
             let mut style = ui.styles.apply(SemanticStyle::Normal, Style::default());
             if let Some(role) = component_style {
                 style = ui.styles.apply(role, style);
@@ -434,7 +451,10 @@ fn visible_tabs(
             if selected == Some(tab.id) {
                 style = ui.styles.apply(SemanticStyle::Selected, style);
             }
-            return (Line::styled(truncate(&marker.text, 1), style), false);
+            return (
+                Line::styled(format!("{:^width$}", marker.text), style),
+                false,
+            );
         }
         return (truncate_line(&fallback, width), false);
     }
@@ -507,6 +527,26 @@ fn render_tab_item(
     component_style: Option<SemanticStyle>,
     ui: &UiConfig,
 ) -> Line<'static> {
+    let line = render_tab_item_content(model, index, selected, component_style, ui);
+    let minimum = usize::from(ui.tab_bar.item.min_width);
+    let padding = minimum.saturating_sub(line.width());
+    if padding == 0 {
+        return line;
+    }
+    let style = tab_item_style(model, index, selected, component_style, ui);
+    let mut spans = Vec::with_capacity(line.spans.len() + 1);
+    spans.extend(line.spans);
+    spans.push(Span::styled(" ".repeat(padding), style));
+    Line::from(spans)
+}
+
+fn render_tab_item_content(
+    model: &TabBarModel,
+    index: usize,
+    selected: Option<TabId>,
+    component_style: Option<SemanticStyle>,
+    ui: &UiConfig,
+) -> Line<'static> {
     let tab = &model.tabs[index];
     let icons = ui.icons.resolve();
     render_token_segments(
@@ -520,6 +560,30 @@ fn render_tab_item(
         },
         &ui.styles,
         |token| tab_token(model, index, token, &icons),
+    )
+}
+
+fn tab_item_style(
+    model: &TabBarModel,
+    index: usize,
+    selected: Option<TabId>,
+    component_style: Option<SemanticStyle>,
+    ui: &UiConfig,
+) -> Style {
+    let tab = &model.tabs[index];
+    let mut style = ui.styles.apply(SemanticStyle::Normal, Style::default());
+    if let Some(role) = component_style {
+        style = ui.styles.apply(role, style);
+    }
+    apply_item_state(
+        &ui.styles,
+        ItemState {
+            current: index == model.active,
+            selected: selected == Some(tab.id),
+            closing: tab.closing,
+            attention: false,
+        },
+        style,
     )
 }
 
@@ -688,7 +752,7 @@ mod tests {
     fn chrome_layout_composes_tab_and_sidebar_positions_at_the_exact_breakpoint() {
         let top_left = UiConfig::default();
         assert_eq!(
-            client_layout(Rect::new(3, 4, 119, 24), &top_left),
+            client_layout(Rect::new(3, 4, 119, 24), &top_left, Some(2)),
             ClientLayout {
                 tab_bar: Some(Rect::new(3, 4, 119, 1)),
                 terminal: Rect::new(3, 5, 119, 23),
@@ -696,7 +760,7 @@ mod tests {
             }
         );
         assert_eq!(
-            client_layout(Rect::new(3, 4, 120, 24), &top_left),
+            client_layout(Rect::new(3, 4, 120, 24), &top_left, Some(2)),
             ClientLayout {
                 tab_bar: Some(Rect::new(27, 4, 96, 1)),
                 terminal: Rect::new(27, 5, 96, 23),
@@ -707,7 +771,7 @@ mod tests {
         bottom_right.tab_bar.position = TabBarPosition::Bottom;
         bottom_right.workspace_sidebar.position = WorkspaceSidebarPosition::Right;
         assert_eq!(
-            client_layout(Rect::new(3, 4, 120, 24), &bottom_right),
+            client_layout(Rect::new(3, 4, 120, 24), &bottom_right, Some(2)),
             ClientLayout {
                 tab_bar: Some(Rect::new(3, 27, 96, 1)),
                 terminal: Rect::new(3, 4, 96, 23),
@@ -717,9 +781,27 @@ mod tests {
     }
 
     #[test]
+    fn single_workspace_hides_only_the_docked_sidebar() {
+        let ui = UiConfig::default();
+        let layout = client_layout(Rect::new(0, 0, 120, 24), &ui, Some(1));
+        assert_eq!(layout.terminal, Rect::new(0, 1, 120, 23));
+        assert_eq!(
+            layout.workspace_sidebar,
+            Some(WorkspaceSidebarLayout::Drawer(Rect::new(0, 0, 24, 24)))
+        );
+
+        let mut always_visible = UiConfig::default();
+        always_visible.workspace_sidebar.hide_when_single = false;
+        assert!(matches!(
+            client_layout(Rect::new(0, 0, 120, 24), &always_visible, Some(1)).workspace_sidebar,
+            Some(WorkspaceSidebarLayout::Docked(_))
+        ));
+    }
+
+    #[test]
     fn chrome_layout_returns_tiny_hosts_to_the_terminal_but_keeps_a_drawer_overlay() {
         assert_eq!(
-            client_layout(Rect::new(3, 4, 80, 0), &UiConfig::default()),
+            client_layout(Rect::new(3, 4, 80, 0), &UiConfig::default(), Some(2)),
             ClientLayout {
                 tab_bar: None,
                 terminal: Rect::new(3, 4, 80, 0),
@@ -727,7 +809,7 @@ mod tests {
             }
         );
         assert_eq!(
-            client_layout(Rect::new(3, 4, 120, 1), &UiConfig::default()),
+            client_layout(Rect::new(3, 4, 120, 1), &UiConfig::default(), Some(2)),
             ClientLayout {
                 tab_bar: None,
                 terminal: Rect::new(3, 4, 120, 1),
@@ -814,37 +896,69 @@ mod tests {
     }
 
     #[test]
-    fn tab_bar_preserves_order_marks_focus_and_uses_terminal_native_styles() {
+    fn tab_bar_defaults_to_stable_numbered_items_and_theme_native_selection() {
         let (text, buffer) = render(&["shell", "editor", "tests"], 1, 60);
-        assert!(text.contains(" 1 shell "));
-        assert!(text.contains(" ● editor "));
-        assert!(text.contains(" 3 tests "));
+        assert_eq!(text.chars().nth(1), Some('1'));
+        assert_eq!(text.chars().nth(13), Some('2'));
+        assert_eq!(text.chars().nth(25), Some('3'));
+        assert!(!text.contains("shell"));
+        assert!(!text.contains("editor"));
         assert!(text.ends_with("fut "));
-        let marker = text.find('●').unwrap() as u16;
-        assert!(buffer[(marker, 0)].modifier.contains(Modifier::BOLD));
-        assert_eq!(buffer[(marker, 0)].fg, ratatui::style::Color::Reset);
-        assert_eq!(buffer[(marker, 0)].bg, ratatui::style::Color::Reset);
+        let active = 17;
+        assert_eq!(buffer[(active, 0)].bg, ratatui::style::Color::DarkGray);
+        assert!(!buffer[(active, 0)].modifier.contains(Modifier::REVERSED));
+        assert!(!buffer[(active, 0)].modifier.contains(Modifier::UNDERLINED));
+        assert!(!buffer[(active, 0)].modifier.contains(Modifier::BOLD));
+
+        let (snapshot, focused) = fixture(&["shell", "editor", "tests"], 1);
+        let area = Rect::new(0, 0, 60, 1);
+        let mut selected = Buffer::empty(area);
+        render_tab_bar(
+            Some(&snapshot),
+            &focused,
+            false,
+            Some(snapshot.sessions[0].workspaces[0].tabs[2].id),
+            &UiConfig::default(),
+            area,
+            &mut selected,
+        );
+        let selected_text = (0..area.width)
+            .map(|column| selected[(column, 0)].symbol())
+            .collect::<String>();
+        for number in ['1', '2', '3'] {
+            assert_eq!(
+                text.find(number),
+                selected_text.find(number),
+                "selection styling must not move tab {number:?}"
+            );
+        }
+        assert!((24..36).all(|column| {
+            selected[(column, 0)].bg == ratatui::style::Color::DarkGray
+                && selected[(column, 0)]
+                    .modifier
+                    .contains(Modifier::UNDERLINED)
+                && !selected[(column, 0)].modifier.contains(Modifier::REVERSED)
+        }));
     }
 
     #[test]
     fn narrow_rows_keep_focus_and_choose_nearby_tabs_in_resource_order() {
         let (text, _) = render(&["one", "two", "three", "four", "five"], 2, 24);
-        assert!(text.contains('●'));
-        assert!(text.contains("three"));
-        let visible = ["one", "two", "three", "four", "five"]
+        assert!(text.contains('3'));
+        let visible = ['1', '2', '3', '4', '5']
             .into_iter()
-            .filter_map(|name| text.find(name).map(|index| (index, name)))
+            .filter_map(|index| text.find(index).map(|position| (position, index)))
             .collect::<Vec<_>>();
         assert!(visible.windows(2).all(|pair| pair[0].0 < pair[1].0));
         assert!(text.matches('…').count() <= 2);
     }
 
     #[test]
-    fn tiny_and_unicode_rows_clip_by_cells_without_losing_the_active_marker() {
+    fn tiny_and_unicode_rows_clip_by_cells_without_losing_the_active_number() {
         for width in 0..20 {
             let (text, _) = render(&["前の", "agent 👩🏽‍💻 long", "後ろ"], 1, width);
             if width > 0 {
-                assert!(text.contains('●'), "width {width}: {text:?}");
+                assert!(text.contains('2'), "width {width}: {text:?}");
             }
         }
         assert_eq!(truncate("👩🏽‍💻abc", 3), "👩🏽‍💻…");
@@ -869,7 +983,7 @@ mod tests {
         let text = (0..area.width)
             .map(|column| buffer[(column, 0)].symbol())
             .collect::<String>();
-        assert!(text.contains("closing ×"));
+        assert!(text.contains("2 ×"));
 
         let mut missing = focused.clone();
         missing.workspace_id = WorkspaceId::new();
@@ -883,11 +997,11 @@ mod tests {
             area,
             &mut fallback,
         );
-        assert_eq!(fallback[(1, 0)].symbol(), "●");
+        assert_eq!(fallback[(1, 0)].symbol(), "1");
     }
 
     #[test]
-    fn zoom_status_is_persistent_bold_and_preserves_the_active_tab() {
+    fn zoom_status_is_persistent_and_preserves_the_active_tab() {
         let (snapshot, focused) = fixture(&["shell", "editor", "tests"], 1);
         let area = Rect::new(3, 4, 24, 1);
         let mut buffer = Buffer::empty(area);
@@ -904,14 +1018,8 @@ mod tests {
             .map(|column| buffer[(column, area.y)].symbol())
             .collect::<String>();
 
-        assert!(text.contains("●"));
-        assert!(text.contains("editor"));
-        assert!(text.ends_with("zoom "));
-        assert!(
-            buffer[(area.x + area.width - 5, area.y)]
-                .modifier
-                .contains(Modifier::BOLD)
-        );
+        assert!(text.contains('2'));
+        assert!(text.contains("zoom"));
 
         for width in 1..=6 {
             let area = Rect::new(0, 0, width, 1);
@@ -929,10 +1037,10 @@ mod tests {
                 .map(|column| buffer[(column, 0)].symbol())
                 .collect::<String>();
             if width == 6 {
-                assert!(text.contains('●'));
+                assert!(text.contains('2'));
                 assert!(text.ends_with("zoom "));
             } else {
-                assert!(text.contains('●'));
+                assert!(text.contains('2'));
             }
         }
     }

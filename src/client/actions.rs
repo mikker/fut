@@ -89,8 +89,7 @@ pub(super) struct DirectBinding {
     pub action: ClientAction,
 }
 
-#[cfg(test)]
-const ALL_ACTIONS: [ClientAction; 31] = [
+pub(super) const ALL_ACTIONS: [ClientAction; 31] = [
     ClientAction::OpenCommandBar,
     ClientAction::OpenNavigator,
     ClientAction::OpenWorkspaceSidebar,
@@ -279,7 +278,7 @@ pub(super) const COMMANDS: [ActionDefinition; 30] = [
 
 pub(super) const DIRECT_BINDINGS: [DirectBinding; 31] = [
     DirectBinding {
-        suffix: b":",
+        suffix: b" ",
         action: ClientAction::OpenCommandBar,
     },
     DirectBinding {
@@ -410,25 +409,62 @@ pub(super) fn definition(action: ClientAction) -> Option<&'static ActionDefiniti
         .find(|definition| definition.action == action)
 }
 
-pub(super) fn binding_label(action: ClientAction) -> String {
-    DIRECT_BINDINGS
-        .iter()
-        .filter(|binding| binding.action == action)
-        .map(|binding| {
-            format!(
-                "Ctrl-b {}",
-                std::str::from_utf8(binding.suffix).expect("binding suffixes are UTF-8")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" · ")
+pub(super) fn config_key(action: ClientAction) -> &'static str {
+    match action {
+        ClientAction::OpenCommandBar => "open_command_bar",
+        ClientAction::OpenNavigator => "open_navigator",
+        ClientAction::OpenWorkspaceSidebar => "open_workspace_sidebar",
+        ClientAction::OpenTabBar => "open_tab_bar",
+        ClientAction::CreateTab => "create_tab",
+        ClientAction::FocusNextTab => "focus_next_tab",
+        ClientAction::FocusPreviousTab => "focus_previous_tab",
+        ClientAction::SplitPaneRight => "split_pane_right",
+        ClientAction::SplitPaneDown => "split_pane_down",
+        ClientAction::FocusNextPane => "focus_next_pane",
+        ClientAction::FocusPreviousPane => "focus_previous_pane",
+        ClientAction::FocusPane(FocusDirection::Left) => "focus_pane_left",
+        ClientAction::FocusPane(FocusDirection::Down) => "focus_pane_down",
+        ClientAction::FocusPane(FocusDirection::Up) => "focus_pane_up",
+        ClientAction::FocusPane(FocusDirection::Right) => "focus_pane_right",
+        ClientAction::FocusLast(NavigationScope::Pane) => "focus_last_pane",
+        ClientAction::FocusLast(NavigationScope::Tab) => "focus_last_tab",
+        ClientAction::FocusLast(NavigationScope::Workspace) => "focus_last_workspace",
+        ClientAction::FocusLast(NavigationScope::Session) => "focus_last_session",
+        ClientAction::FocusTab(TabNumber::One) => "focus_tab_1",
+        ClientAction::FocusTab(TabNumber::Two) => "focus_tab_2",
+        ClientAction::FocusTab(TabNumber::Three) => "focus_tab_3",
+        ClientAction::FocusTab(TabNumber::Four) => "focus_tab_4",
+        ClientAction::FocusTab(TabNumber::Five) => "focus_tab_5",
+        ClientAction::FocusTab(TabNumber::Six) => "focus_tab_6",
+        ClientAction::FocusTab(TabNumber::Seven) => "focus_tab_7",
+        ClientAction::FocusTab(TabNumber::Eight) => "focus_tab_8",
+        ClientAction::FocusTab(TabNumber::Nine) => "focus_tab_9",
+        ClientAction::FocusTab(TabNumber::Ten) => "focus_tab_10",
+        ClientAction::TogglePaneZoom => "toggle_pane_zoom",
+        ClientAction::Detach => "detach",
+    }
 }
 
-pub(super) fn action_for_suffix(suffix: &[u8]) -> Option<ClientAction> {
+pub(super) fn default_suffix(action: ClientAction) -> &'static [u8] {
     DIRECT_BINDINGS
         .iter()
-        .find(|binding| binding.suffix == suffix)
-        .map(|binding| binding.action)
+        .find(|binding| binding.action == action)
+        .expect("every action has a default binding")
+        .suffix
+}
+
+pub(super) fn parse_suffix(value: &str) -> Option<(Vec<u8>, String)> {
+    let (bytes, label) = match value {
+        "space" => (b" ".to_vec(), "Space".into()),
+        "enter" => (b"\r".to_vec(), "Enter".into()),
+        "tab" => (b"\t".to_vec(), "Tab".into()),
+        "escape" | "esc" => (b"\x1b".to_vec(), "Esc".into()),
+        _ if value.chars().count() == 1 && !value.chars().next()?.is_control() => {
+            (value.as_bytes().to_vec(), value.into())
+        }
+        _ => return None,
+    };
+    Some((bytes, label))
 }
 
 #[cfg(test)]
@@ -473,19 +509,25 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+    use crate::client::config::BindingsConfig;
 
     #[test]
     fn every_command_has_bindings_from_the_same_catalog() {
+        let bindings = BindingsConfig::default();
         for command in COMMANDS {
-            let label = binding_label(command.action);
+            let label = bindings.label(command.action);
             assert!(!label.is_empty(), "{} has no direct binding", command.title);
             for binding in DIRECT_BINDINGS
                 .iter()
                 .filter(|binding| binding.action == command.action)
             {
-                assert_eq!(action_for_suffix(binding.suffix), Some(command.action));
+                assert_eq!(
+                    bindings.action_for_suffix(binding.suffix),
+                    Some(command.action)
+                );
                 let suffix = std::str::from_utf8(binding.suffix).unwrap();
-                assert!(label.contains(&format!("Ctrl-b {suffix}")));
+                let expected = if suffix == " " { "Space" } else { suffix };
+                assert!(label.contains(&format!("Ctrl-b {expected}")));
             }
         }
         assert!(definition(ClientAction::OpenCommandBar).is_none());
@@ -520,7 +562,10 @@ mod tests {
             COMMANDS.len(),
             "launcher actions must be unique"
         );
-        assert_eq!(action_for_suffix(b"z"), Some(ClientAction::TogglePaneZoom));
-        assert_eq!(binding_label(ClientAction::TogglePaneZoom), "Ctrl-b z");
+        assert_eq!(
+            bindings.action_for_suffix(b"z"),
+            Some(ClientAction::TogglePaneZoom)
+        );
+        assert_eq!(bindings.label(ClientAction::TogglePaneZoom), "Ctrl-b z");
     }
 }

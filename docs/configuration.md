@@ -20,6 +20,11 @@ Files must be regular UTF-8 files no larger than 64 KiB. Unknown fields, invalid
 [ui]
 pane_layout = "splits" # "splits" or "accordion"
 
+[ui.bindings]
+open_command_bar = "space"
+# open_navigator = "g"
+# create_tab = "c"
+
 [ui.icons]
 preset = "nerd_font" # "ascii", "unicode", or "nerd_font"
 # current = "*"      # Every icon may be overridden.
@@ -31,10 +36,16 @@ preset = "nerd_font" # "ascii", "unicode", or "nerd_font"
 # vertical_divider = "|"
 
 [ui.styles.current]
-add_modifiers = ["bold"]
+background = "dark_gray"
+remove_modifiers = ["reversed", "underlined"]
 
 [ui.styles.selected]
-add_modifiers = ["reversed"]
+background = "dark_gray"
+add_modifiers = ["underlined"]
+remove_modifiers = ["reversed"]
+
+[ui.styles.divider]
+foreground = "dark_gray"
 
 [ui.styles.attention]
 foreground = "yellow"
@@ -49,16 +60,15 @@ center = [
   { segments = [{ component = "tabs" }], priority = 100 },
 ]
 right = [
-  { segments = [{ token = "client.zoom", suffix = " " }], style = "current", priority = 255 },
+  { segments = [{ token = "client.zoom", suffix = " " }], priority = 255 },
   { segments = [{ token = "client.help" }], style = "muted", priority = 0 },
 ]
 
 [ui.tab_bar.item]
+min_width = 12
 segments = [
   { text = " " },
-  { token = "tab.marker" },
-  { text = " " },
-  { token = "tab.name", max_width = 32 },
+  { token = "tab.index" },
   { token = "tab.closing", prefix = " " },
   { text = " " },
 ]
@@ -66,6 +76,7 @@ segments = [
 [ui.workspace_sidebar]
 position = "left" # "left" or "right"
 width = 24
+hide_when_single = true
 header = [{ token = "session.name", style = "current" }]
 footer = [{ token = "sidebar.status", style = "muted" }]
 
@@ -73,11 +84,14 @@ footer = [{ token = "sidebar.status", style = "muted" }]
 left = [{ token = "workspace.marker" }, { text = " " }]
 body = [{ token = "workspace.name" }]
 right = [{ token = "workspace.tab_count" }, { token = "workspace.closing", prefix = " " }]
+detail = [{ token = "workspace.root", style = "muted" }]
 ```
 
 Omitted fields use defaults. An explicitly empty array hides that lane or format.
 
-Sidebar width is 4 through 80 cells and includes its one-cell divider. It docks when the host is at least `width + 96` columns wide, so the default width retains the 120-column breakpoint. Below that threshold it remains available as an edge drawer without reducing terminal geometry. `vertical_divider` must be exactly one grapheme and one display cell.
+Bindings are suffixes after the fixed `Ctrl-b` prefix. Override any action under `ui.bindings`; accepted values are one printable character or the names `space`, `enter`, `tab`, and `esc`. Keys must remain unique. Action names are `open_command_bar`, `open_navigator`, `open_workspace_sidebar`, `open_tab_bar`, `create_tab`, `focus_next_tab`, `focus_previous_tab`, `split_pane_right`, `split_pane_down`, `focus_next_pane`, `focus_previous_pane`, `focus_pane_left`, `focus_pane_down`, `focus_pane_up`, `focus_pane_right`, `focus_last_pane`, `focus_last_tab`, `focus_last_workspace`, `focus_last_session`, `focus_tab_1` through `focus_tab_10`, `toggle_pane_zoom`, and `detach`. The command bar displays and searches the configured bindings.
+
+Sidebar width is 4 through 80 cells and includes its one-cell divider. By default, it collapses when the current session has only one workspace; set `hide_when_single = false` to keep it docked. Otherwise it docks when the host is at least `width + 96` columns wide, so the default width retains the 120-column breakpoint. When collapsed or below that threshold it remains available as an edge drawer without reducing terminal geometry. `vertical_divider` must be exactly one grapheme and one display cell.
 
 ## Segments, groups, and components
 
@@ -89,9 +103,11 @@ Every segment sets exactly one of:
 
 Token segments may also set `prefix`, `suffix`, `max_width`, and `style`. Prefix and suffix are emitted only when the token is nonempty. Text segments accept `style` but not affixes or `max_width`. Components must be the only segment in their group and do not accept segment options.
 
+`ui.tab_bar.item.min_width` is a display-cell minimum from 0 through 256. Short items are left-aligned and padded on the right with styled spaces, so current and keyboard-selected states always occupy the same width. The default format supplies one cell of leading padding, and the default minimum is 12; use `0` for intrinsic-width tabs.
+
 Tab-bar lanes contain groups. A group has `segments`, an optional semantic `style`, and a `priority` from 0 through 255. The tabs component is flexible and keeps its active or keyboard-selected item visible. Groups with higher priority than tabs reserve their complete width first. Tabs then grow toward their complete preferred width. Lower-priority groups appear only in remaining space. Left and right lanes stay edge-aligned; the center lane is geometrically centered and clamped between them. Groups never overlap.
 
-Workspace rows have intrinsic `left` and `right` lanes; `body` receives the remaining cells and truncates safely. Header and footer are optional single-line segment lists. At tiny heights Fut preserves resource rows over decorative header/footer content, while switching and error status remains visible.
+Workspace rows have intrinsic `left` and `right` lanes; `body` receives the remaining cells and truncates safely. A nonempty `detail` format adds a second full-width line. The default detail is the workspace root: this is stable daemon-owned resource state, unlike a shell's live working directory, and avoids process inspection during rendering. Set `detail = []` for compact one-line rows. Header and footer are optional single-line segment lists. At tiny heights Fut preserves resource rows over decorative header/footer content, while switching and error status remains visible.
 
 All widths are terminal display cells. Dynamic values are sanitized and truncated at grapheme boundaries. Bars never wrap.
 

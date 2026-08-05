@@ -1,10 +1,18 @@
-use std::{env, fs, io::Read, os::unix::fs::OpenOptionsExt, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashSet},
+    env, fs,
+    io::Read,
+    os::unix::fs::OpenOptionsExt,
+    path::PathBuf,
+};
 
 use anyhow::{Context, Result, bail};
 use ratatui::style::{Color, Modifier, Style};
 use serde::{Deserialize, Deserializer};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+
+use super::actions::{ALL_ACTIONS, ClientAction, config_key, default_suffix, parse_suffix};
 
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_SEGMENTS: usize = 64;
@@ -55,6 +63,41 @@ pub(super) enum SemanticStyle {
     Attention,
     Error,
     Divider,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize)]
+#[serde(transparent)]
+pub(super) struct BindingsConfig {
+    values: BTreeMap<String, String>,
+}
+
+impl BindingsConfig {
+    pub(super) fn suffix(&self, action: ClientAction) -> Vec<u8> {
+        self.values
+            .get(config_key(action))
+            .and_then(|value| parse_suffix(value))
+            .map_or_else(|| default_suffix(action).to_vec(), |(bytes, _)| bytes)
+    }
+
+    pub(super) fn label(&self, action: ClientAction) -> String {
+        let suffix = self.values.get(config_key(action)).map_or_else(
+            || {
+                if default_suffix(action) == b" " {
+                    "Space".into()
+                } else {
+                    String::from_utf8_lossy(default_suffix(action)).into_owned()
+                }
+            },
+            |value| parse_suffix(value).expect("bindings are validated").1,
+        );
+        format!("Ctrl-b {suffix}")
+    }
+
+    pub(super) fn action_for_suffix(&self, suffix: &[u8]) -> Option<ClientAction> {
+        ALL_ACTIONS
+            .into_iter()
+            .find(|action| self.suffix(*action) == suffix)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -290,8 +333,17 @@ impl Default for StylesConfig {
         Self {
             normal: StyleConfig::default(),
             muted: with(ModifierName::Dim),
-            current: with(ModifierName::Bold),
-            selected: with(ModifierName::Reversed),
+            current: StyleConfig {
+                background: Some(UiColor::DarkGray),
+                remove_modifiers: vec![ModifierName::Reversed, ModifierName::Underlined],
+                ..StyleConfig::default()
+            },
+            selected: StyleConfig {
+                background: Some(UiColor::DarkGray),
+                add_modifiers: vec![ModifierName::Underlined],
+                remove_modifiers: vec![ModifierName::Reversed],
+                ..StyleConfig::default()
+            },
             closing: with(ModifierName::Dim),
             attention: StyleConfig {
                 foreground: Some(UiColor::Yellow),
@@ -303,7 +355,10 @@ impl Default for StylesConfig {
                 add_modifiers: vec![ModifierName::Bold],
                 ..StyleConfig::default()
             },
-            divider: with(ModifierName::Dim),
+            divider: StyleConfig {
+                foreground: Some(UiColor::DarkGray),
+                ..StyleConfig::default()
+            },
         }
     }
 }
@@ -443,10 +498,34 @@ impl Default for GroupConfig {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize)]
+fn default_tab_min_width() -> u16 {
+    12
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct ItemFormat {
     pub segments: Vec<SegmentConfig>,
+    #[serde(default = "default_tab_min_width")]
+    pub min_width: u16,
+}
+
+impl Default for ItemFormat {
+    fn default() -> Self {
+        Self {
+            segments: vec![
+                SegmentConfig::text(" "),
+                SegmentConfig::token("tab.index"),
+                SegmentConfig {
+                    token: Some("tab.closing".into()),
+                    prefix: " ".into(),
+                    ..SegmentConfig::default()
+                },
+                SegmentConfig::text(" "),
+            ],
+            min_width: default_tab_min_width(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
@@ -476,7 +555,7 @@ impl Default for TabBarConfig {
                         suffix: " ".into(),
                         ..SegmentConfig::default()
                     }],
-                    style: Some(SemanticStyle::Current),
+                    style: None,
                     priority: 255,
                 },
                 GroupConfig {
@@ -490,20 +569,7 @@ impl Default for TabBarConfig {
                     priority: 0,
                 },
             ],
-            item: ItemFormat {
-                segments: vec![
-                    SegmentConfig::text(" "),
-                    SegmentConfig::token("tab.marker"),
-                    SegmentConfig::text(" "),
-                    SegmentConfig::token("tab.name"),
-                    SegmentConfig {
-                        token: Some("tab.closing".into()),
-                        prefix: " ".into(),
-                        ..SegmentConfig::default()
-                    },
-                    SegmentConfig::text(" "),
-                ],
-            },
+            item: ItemFormat::default(),
         }
     }
 }
@@ -518,6 +584,7 @@ pub(super) struct SidebarRowConfig {
     pub left: Vec<SegmentConfig>,
     pub body: Vec<SegmentConfig>,
     pub right: Vec<SegmentConfig>,
+    pub detail: Vec<SegmentConfig>,
 }
 
 impl Default for SidebarRowConfig {
@@ -533,8 +600,17 @@ impl Default for SidebarRowConfig {
                 prefix: " ".into(),
                 ..SegmentConfig::default()
             }],
+            detail: vec![SegmentConfig {
+                token: Some("workspace.root".into()),
+                style: Some(SemanticStyle::Muted),
+                ..SegmentConfig::default()
+            }],
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
@@ -543,6 +619,8 @@ pub(super) struct WorkspaceSidebarConfig {
     pub position: WorkspaceSidebarPosition,
     #[serde(default = "default_sidebar_width")]
     pub width: u16,
+    #[serde(default = "default_true")]
+    pub hide_when_single: bool,
     pub header: Vec<SegmentConfig>,
     pub footer: Vec<SegmentConfig>,
     pub row: SidebarRowConfig,
@@ -553,6 +631,7 @@ impl Default for WorkspaceSidebarConfig {
         Self {
             position: WorkspaceSidebarPosition::Left,
             width: default_sidebar_width(),
+            hide_when_single: true,
             header: Vec::new(),
             footer: vec![SegmentConfig {
                 token: Some("sidebar.status".into()),
@@ -568,6 +647,7 @@ impl Default for WorkspaceSidebarConfig {
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct UiConfig {
     pub(super) pane_layout: PaneLayoutPolicy,
+    pub(super) bindings: BindingsConfig,
     pub(super) icons: IconsConfig,
     pub(super) styles: StylesConfig,
     pub(super) tab_bar: TabBarConfig,
@@ -578,6 +658,7 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             pane_layout: PaneLayoutPolicy::Splits,
+            bindings: BindingsConfig::default(),
             icons: IconsConfig::default(),
             styles: StylesConfig::default(),
             tab_bar: TabBarConfig::default(),
@@ -742,8 +823,29 @@ fn load_path_outcome(path: &std::path::Path, explicit: bool) -> Result<LoadedUiC
 }
 
 fn validate(ui: &UiConfig) -> Result<()> {
+    let valid_binding_keys = ALL_ACTIONS
+        .into_iter()
+        .map(config_key)
+        .collect::<HashSet<_>>();
+    let mut bound_suffixes = HashSet::new();
+    for (key, value) in &ui.bindings.values {
+        if !valid_binding_keys.contains(key.as_str()) {
+            bail!("unknown ui.bindings action {key:?}");
+        }
+        if parse_suffix(value).is_none() {
+            bail!("ui.bindings.{key} must be one character or space, enter, tab, or esc");
+        }
+    }
+    for action in ALL_ACTIONS {
+        if !bound_suffixes.insert(ui.bindings.suffix(action)) {
+            bail!("ui.bindings must not assign the same key to multiple actions");
+        }
+    }
     if !(4..=80).contains(&ui.workspace_sidebar.width) {
         bail!("ui.workspace_sidebar.width must be between 4 and 80");
+    }
+    if ui.tab_bar.item.min_width > 256 {
+        bail!("ui.tab_bar.item.min_width must be at most 256");
     }
     for (name, value) in [
         ("current", &ui.icons.current),
@@ -817,6 +919,11 @@ fn validate(ui: &UiConfig) -> Result<()> {
         (
             "row.right",
             &ui.workspace_sidebar.row.right,
+            TokenScope::Workspace,
+        ),
+        (
+            "row.detail",
+            &ui.workspace_sidebar.row.detail,
             TokenScope::Workspace,
         ),
     ] {
@@ -1026,6 +1133,7 @@ right = [{ token = "workspace.tab_count" }]
             WorkspaceSidebarPosition::Right
         );
         assert_eq!(config.workspace_sidebar.width, 30);
+        assert_eq!(config.tab_bar.item.min_width, 12);
         assert_eq!(config.icons.resolve().workspace, "W");
         assert_eq!(
             config.styles.attention.foreground,
@@ -1039,20 +1147,33 @@ right = [{ token = "workspace.tab_count" }]
         let path = temporary.path().join("config.toml");
         fs::write(
             &path,
-            "[ui.tab_bar]\nposition = 'bottom'\n\n[ui.styles.current]\nforeground = 'red'\n\n[ui.styles.attention]\nforeground = 'blue'\n\n[ui.workspace_sidebar.row]\nbody = [{ text = 'custom' }]\n",
+            "[ui.bindings]\nopen_command_bar = ':'\n\n[ui.tab_bar]\nposition = 'bottom'\n\n[ui.styles.current]\nforeground = 'red'\n\n[ui.styles.attention]\nforeground = 'blue'\n\n[ui.workspace_sidebar.row]\nbody = [{ text = 'custom' }]\n",
         )
         .unwrap();
         let config = load_path(&path, true).unwrap();
+        assert_eq!(
+            config
+                .bindings
+                .action_for_suffix(b":")
+                .map(super::config_key),
+            Some("open_command_bar")
+        );
+        assert_eq!(
+            config.bindings.label(ClientAction::OpenCommandBar),
+            "Ctrl-b :"
+        );
         assert_eq!(config.tab_bar.position, TabBarPosition::Bottom);
+        assert_eq!(config.tab_bar.item.min_width, 12);
         assert!(config.tab_bar.left.iter().any(|group| {
             group
                 .segments
                 .iter()
                 .any(|segment| segment.component.as_deref() == Some("tabs"))
         }));
+        assert_eq!(config.styles.current.background, Some(UiColor::DarkGray));
         assert_eq!(
-            config.styles.current.add_modifiers,
-            vec![ModifierName::Bold]
+            config.styles.current.remove_modifiers,
+            vec![ModifierName::Reversed, ModifierName::Underlined]
         );
         assert_eq!(config.styles.current.foreground, Some(UiColor::Red));
         assert_eq!(config.styles.attention.foreground, Some(UiColor::Blue));
@@ -1076,6 +1197,10 @@ right = [{ token = "workspace.tab_count" }]
             "[ui.tab_bar]\nleft = [{ segments = [{ text = \"x\\n\" }] }]\n",
             "[ui]\nexecute = 'surprise'\n",
             "[ui.workspace_sidebar]\nwidth = 2\n",
+            "[ui.tab_bar.item]\nmin_width = 257\n",
+            "[ui.bindings]\nunknown = 'x'\n",
+            "[ui.bindings]\nopen_command_bar = 'g'\n",
+            "[ui.bindings]\nopen_command_bar = 'ctrl-x'\n",
             "[ui.icons]\nvertical_divider = '||'\n",
             "[ui.styles.normal]\nforeground = '#aéabc'\n",
         ] {

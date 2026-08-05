@@ -11,7 +11,7 @@ use super::{
     chrome::sanitize,
     config::{SemanticStyle, UiConfig, WorkspaceSidebarPosition},
     navigation::NavigationHistory,
-    presentation::{ItemState, TokenValue, render_token_segments, truncate_line},
+    presentation::{ItemState, TokenValue, apply_item_state, render_token_segments, truncate_line},
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -407,20 +407,28 @@ fn render_model(
         render_workspace_row(
             &item,
             false,
-            Rect::new(content.x, row_y, content.width, 1),
+            Rect::new(content.x, row_y, content.width, row_height.min(2)),
             ui,
             buffer,
         );
     } else {
+        let item_height = if ui.workspace_sidebar.row.detail.is_empty() {
+            1
+        } else {
+            2
+        };
         let anchor = selected
             .and_then(|id| model.items.iter().position(|item| item.id == id))
             .or_else(|| model.items.iter().position(|item| item.current))
             .unwrap_or(0);
-        for (offset, row) in visible_rows(model.items.len(), anchor, usize::from(row_height))
-            .into_iter()
-            .enumerate()
-        {
-            let y = row_y.saturating_add(u16::try_from(offset).unwrap_or(u16::MAX));
+        let mut y = row_y;
+        let row_bottom = row_y.saturating_add(row_height);
+        for row in visible_rows_with_item_height(
+            model.items.len(),
+            anchor,
+            usize::from(row_height),
+            item_height,
+        ) {
             match row {
                 VisibleRow::Ellipsis => {
                     buffer.set_stringn(
@@ -433,16 +441,25 @@ fn render_model(
                             ui.styles.apply(SemanticStyle::Normal, Style::default()),
                         ),
                     );
+                    y = y.saturating_add(1);
                 }
                 VisibleRow::Item(index) => {
                     let item = &model.items[index];
                     render_workspace_row(
                         item,
                         selected == Some(item.id),
-                        Rect::new(content.x, y, content.width, 1),
+                        Rect::new(
+                            content.x,
+                            y,
+                            content.width,
+                            u16::try_from(item_height)
+                                .unwrap_or(u16::MAX)
+                                .min(row_bottom.saturating_sub(y)),
+                        ),
                         ui,
                         buffer,
                     );
+                    y = y.saturating_add(u16::try_from(item_height).unwrap_or(u16::MAX));
                 }
             }
         }
@@ -503,11 +520,22 @@ fn render_workspace_row(
     }
     let icons = ui.icons.resolve();
     let state = ItemState {
-        current: item.current,
+        // The workspace marker carries active state so keyboard selection can own
+        // the row background without making two rows look selected at once.
+        current: false,
         selected,
         closing: item.closing,
         attention: false,
     };
+    clear(
+        area,
+        apply_item_state(
+            &ui.styles,
+            state,
+            ui.styles.apply(SemanticStyle::Normal, Style::default()),
+        ),
+        buffer,
+    );
     let resolve = |token: &str| match token {
         "workspace.marker" if item.current => TokenValue::plain(icons.current.clone()),
         "workspace.marker" => TokenValue::plain(" "),
@@ -571,6 +599,30 @@ fn render_workspace_row(
         &truncate_line(&right, right_width),
         right_width as u16,
     );
+    if area.height > 1 && !ui.workspace_sidebar.row.detail.is_empty() {
+        let detail = render_token_segments(
+            &ui.workspace_sidebar.row.detail,
+            None,
+            state,
+            &ui.styles,
+            resolve,
+        );
+        buffer.set_line(
+            area.x,
+            area.y.saturating_add(1),
+            &truncate_line(&detail, width),
+            area.width,
+        );
+    }
+    if item.current {
+        for row in area.y..area.y.saturating_add(area.height) {
+            for column in area.x..area.x.saturating_add(area.width) {
+                if let Some(cell) = buffer.cell_mut((column, row)) {
+                    cell.set_style(Style::default().add_modifier(ratatui::style::Modifier::BOLD));
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -579,24 +631,31 @@ enum VisibleRow {
     Item(usize),
 }
 
-fn visible_rows(length: usize, anchor: usize, height: usize) -> Vec<VisibleRow> {
+fn visible_rows_with_item_height(
+    length: usize,
+    anchor: usize,
+    height: usize,
+    item_height: usize,
+) -> Vec<VisibleRow> {
     if length == 0 || height == 0 {
         return Vec::new();
     }
+    let item_height = item_height.max(1);
     let anchor = anchor.min(length - 1);
-    if length <= height {
+    if length.saturating_mul(item_height) <= height {
         return (0..length).map(VisibleRow::Item).collect();
     }
-    if height == 1 {
+    if height <= item_height {
         return vec![VisibleRow::Item(anchor)];
     }
-    for count in (1..=height.min(length)).rev() {
+    for count in (1..=(height / item_height).min(length)).rev() {
         let minimum = anchor.saturating_add(1).saturating_sub(count);
         let maximum = anchor.min(length - count);
         let desired = anchor.saturating_sub(count / 2).clamp(minimum, maximum);
         let candidates = [desired, minimum, maximum];
         if let Some(first) = candidates.into_iter().find(|first| {
-            count + usize::from(*first > 0) + usize::from(*first + count < length) <= height
+            count * item_height + usize::from(*first > 0) + usize::from(*first + count < length)
+                <= height
         }) {
             let mut rows = Vec::with_capacity(height);
             if first > 0 {
@@ -824,18 +883,21 @@ mod tests {
         let model =
             WorkspaceModel::from_snapshot(&snapshot, &focused, &NavigationHistory::default());
         let (left, left_buffer) =
-            rendered(&model, None, None, 24, 3, WorkspaceSidebarPosition::Left);
-        assert!(left.contains("● main"));
+            rendered(&model, None, None, 24, 6, WorkspaceSidebarPosition::Left);
+        assert!(left.contains("main"));
+        assert!(left.contains("/project/0"));
         assert!(left.contains("bad�name"));
         assert!(left.contains("closing"));
         assert!(left.contains('×'));
+        assert_eq!(left_buffer[(0, 0)].symbol(), "●");
+        assert!(!left_buffer[(0, 0)].modifier.contains(Modifier::REVERSED));
         assert!(left_buffer[(0, 0)].modifier.contains(Modifier::BOLD));
         assert_eq!(left_buffer[(23, 0)].symbol(), "│");
-        assert!(left_buffer[(23, 0)].modifier.contains(Modifier::DIM));
+        assert_eq!(left_buffer[(23, 0)].fg, ratatui::style::Color::DarkGray);
 
         let (right, right_buffer) =
-            rendered(&model, None, None, 24, 3, WorkspaceSidebarPosition::Right);
-        assert!(right.contains("● main"));
+            rendered(&model, None, None, 24, 6, WorkspaceSidebarPosition::Right);
+        assert!(right.contains("main"));
         assert_eq!(right_buffer[(0, 0)].symbol(), "│");
         assert_eq!(right_buffer[(1, 0)].symbol(), "●");
     }
@@ -845,7 +907,7 @@ mod tests {
         for length in 1..12 {
             for anchor in 0..length {
                 for height in 1..8 {
-                    let rows = visible_rows(length, anchor, height);
+                    let rows = visible_rows_with_item_height(length, anchor, height, 1);
                     assert!(rows.contains(&VisibleRow::Item(anchor)));
                     assert!(rows.len() <= height);
                 }
@@ -870,7 +932,6 @@ mod tests {
         let history = NavigationHistory::default();
         let mut state = WorkspaceSidebarState::open(&snapshot, &focused, &history).unwrap();
         state.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        let selected = state.selected.unwrap();
         let (ready, buffer) = rendered(
             &state.model,
             state.selected,
@@ -880,17 +941,8 @@ mod tests {
             WorkspaceSidebarPosition::Left,
         );
         assert!(ready.contains("c new · r rename"));
-        let index = state
-            .model
-            .items
-            .iter()
-            .position(|item| item.id == selected)
-            .unwrap();
-        assert!(
-            buffer[(0, index as u16)]
-                .modifier
-                .contains(Modifier::REVERSED)
-        );
+        assert_eq!(buffer[(0, 2)].bg, ratatui::style::Color::DarkGray);
+        assert!(buffer[(0, 2)].modifier.contains(Modifier::UNDERLINED));
 
         state.begin_switch();
         let (switching, _) = rendered(

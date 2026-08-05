@@ -46,7 +46,7 @@ Current, closing, and keyboard-selected styles are composed over every item segm
 
 ## Workspace-row tokens
 
-These may appear in `ui.workspace_sidebar.row.left`, `body`, or `right`.
+These may appear in `ui.workspace_sidebar.row.left`, `body`, `right`, or `detail`.
 
 | Token | Value |
 | --- | --- |
@@ -54,7 +54,7 @@ These may appear in `ui.workspace_sidebar.row.left`, `body`, or `right`.
 | `workspace.index` | One-based workspace index |
 | `workspace.name` | Workspace name |
 | `workspace.id` | Full stable workspace UUID |
-| `workspace.root` | Complete workspace root path |
+| `workspace.root` | Complete, stable workspace root path |
 | `workspace.root_name` | Final component of the workspace root |
 | `workspace.closing` | Closing icon while closing; otherwise empty |
 | `workspace.tab_count` | Number of tabs in the workspace |

@@ -242,6 +242,20 @@ Add agent awareness as metadata on the established resource tree.
 
 Start this milestone as a proof-of-concept against the now-usable UI: one explicit reporting protocol, one first-party Pi integration, inline rollups, and direct navigation to attention. Do not begin with process heuristics or a generic integration framework.
 
+### Terminal-native alert foundation
+
+Keep terminal alerts separate from semantic agent state, but let both feed the same discoverable attention surfaces.
+
+1. Detect BEL (`0x07`) at the daemon-owned PTY/parser boundary without changing the bytes delivered to the terminal emulator. Record a monotonic alert revision, timestamp, and source terminal instead of an unbounded event log.
+2. Add opt-in activity monitoring for output received while a terminal is not visible to any client. Treat this only as unread output, never as proof that work completed or needs intervention.
+3. Add opt-in silence monitoring as a timer over the terminal's last-output timestamp. Keep its configured threshold and state distinct from bell and activity.
+4. Carry compact bell, activity, and silence metadata in authoritative resource snapshots and roll it up through pane, tab, workspace, and session ancestry.
+5. Give every client independent seen cursors. Viewing a pane advances only that client's cursor, so one attached client cannot clear another client's unread state and detached intervals remain observable.
+6. Render compact alert markers in tabs, workspace rows, and the navigator, then add typed actions for next alert and clearing the current client's seen state. Keep outer-terminal ringing and visual notices behind explicit client preferences.
+7. Layer agent reports on top as a separate source: `working`, `blocked`, and completion attention remain explicit semantic observations and are never inferred from arbitrary PTY output.
+
+Terminal-alert tests must cover BEL adjacent to fragmented terminal sequences, multiple bells before observation, output while focused and unfocused, detach/reattach, multiple clients with different seen cursors, silence timer reset and expiry, process exit ordering, rollup precedence, and bounded snapshot state.
+
 ### Work
 
 - Expose terminal, pane, workspace, session, and socket identity through scoped `FUT_*` environment variables.

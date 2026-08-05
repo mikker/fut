@@ -3843,7 +3843,7 @@ async fn public_pane_zoom_toggles_full_width_and_matches_command_dispatch() {
     client.wait_for("BEFORE_23_39").await;
 
     client.send(b"\x02z");
-    client.wait_for("zoom ").await;
+    client.wait_for("zoom").await;
     client.send(b"zoomed\n");
     client.wait_for("ZOOMED_23_80").await;
 
@@ -3851,7 +3851,7 @@ async fn public_pane_zoom_toggles_full_width_and_matches_command_dispatch() {
     client.send(b"restored\n");
     client.wait_for("RESTORED_23_39").await;
 
-    client.send(b"\x02:");
+    client.send(b"\x02 ");
     client.send(b"pane zoom");
     client.send(b"\r");
     client.send(b"command\n");
@@ -3910,9 +3910,14 @@ async fn public_tab_navigation_and_right_down_splits_share_the_command_catalog()
         ));
     let mut client = PtyChild::spawn(command);
     client.wait_for("ACTION_A_READY").await;
-    client.wait_for("second").await;
-    client.send(b"\x02n");
-    client.wait_for("TAB_B_READY").await;
+    time::timeout(DEADLINE, async {
+        while !client.text().contains("TAB_B_READY") {
+            client.send(b"\x02n");
+            time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("tab navigation never reconciled: {:?}", client.text()));
     client.send(b"\x02T");
     client.send(b"back\n");
     wait_for(DEADLINE, || {
@@ -3962,7 +3967,7 @@ async fn public_tab_navigation_and_right_down_splits_share_the_command_catalog()
     })
     .await;
 
-    client.send(b"\x02:");
+    client.send(b"\x02 ");
     client.send(b"split pane down\r");
     client.send(b": > down-split-marker\n");
     wait_for(DEADLINE, || {
@@ -4050,7 +4055,7 @@ async fn isolated_daily_driver_journey() {
     client.send(b"\x02|");
     client.send(b":>journey-right\n");
     wait_for_file(journey_marker("journey-right")).await;
-    client.send(b"\x02:");
+    client.send(b"\x02 ");
     client.send(b"split pane down\r");
     client.send(b":>journey-down\n");
     wait_for_file(journey_marker("journey-down")).await;
@@ -4070,7 +4075,7 @@ async fn isolated_daily_driver_journey() {
     );
 
     client.send(b"\x02z");
-    client.wait_for("zoom ").await;
+    client.wait_for("zoom").await;
     client.send(b":>journey-zoomed\n");
     wait_for_file(journey_marker("journey-zoomed")).await;
     client.send(b"\x02z");
@@ -4255,7 +4260,7 @@ async fn isolated_keyboard_chaos_journey() {
                 "split-right"
             }
             1 => {
-                client.send(b"\x02:");
+                client.send(b"\x02 ");
                 client.send(b"split pane down\r");
                 let pane_count = tab.panes.len() + 1;
                 let snapshot = resources_when(&harness, |snapshot| {
@@ -4513,7 +4518,6 @@ async fn public_tab_bar_tracks_live_tabs_resizes_content_and_honors_global_posit
 
     let mut top = spawn_client();
     top.wait_for("TAB_BAR_READY").await;
-    top.wait_for("tests").await;
     top.send(b"top-probe\n");
     top.wait_for("TOP_SIZE_23_80").await;
 
@@ -4526,7 +4530,10 @@ async fn public_tab_bar_tracks_live_tabs_resizes_content_and_honors_global_posit
             .await,
         ServerMessage::CommandCompleted { .. }
     ));
-    top.wait_for("checks").await;
+    resources_when(&harness, |snapshot| {
+        snapshot.sessions[0].workspaces[0].tabs[1].name == "checks"
+    })
+    .await;
     assert!(matches!(
         harness
             .control_command(ClientMessage::RenameTarget {
@@ -4536,7 +4543,10 @@ async fn public_tab_bar_tracks_live_tabs_resizes_content_and_honors_global_posit
             .await,
         ServerMessage::CommandCompleted { .. }
     ));
-    top.wait_for("work").await;
+    resources_when(&harness, |snapshot| {
+        snapshot.sessions[0].workspaces[0].tabs[0].name == "work"
+    })
+    .await;
     top.send(b"\x02d");
     top.wait_success().await;
 
@@ -4731,7 +4741,7 @@ right = [{ text = "]" }, { token = "workspace.tab_count" }]
             .await,
         ServerMessage::CommandCompleted { .. }
     ));
-    right.wait_for(" λ").await;
+    right.wait_for("λ").await;
     right.send(b"size-linked\n");
     right.wait_for("ZETA_SIZE_23_96").await;
     right.send(b"\x02d");
@@ -4769,8 +4779,15 @@ right = [{ text = "]" }, { token = "workspace.tab_count" }]
             .await,
         ServerMessage::CommandCompleted { .. }
     ));
-    live_close.wait_for("done").await;
+    resources_when(&harness, |snapshot| {
+        snapshot.sessions[0].workspaces.len() == 1
+            && snapshot.sessions[0].workspaces[0].name == "feature done"
+    })
+    .await;
+    live_close.send(b"size-linked\n");
+    live_close.wait_for("ZETA_SIZE_23_120").await;
     live_close.send(b"\x02w");
+    live_close.wait_for("done").await;
     live_close.wait_for("c new · r rename").await;
     live_close.send(b"k\r");
     live_close.send(b"after-close\n");
@@ -5027,7 +5044,7 @@ async fn public_command_bar_filters_labels_actions_and_matches_direct_dispatch()
     client.wait_for("COMMAND_ALPHA_READY").await;
     client.wait_for("COMMAND_ZETA_READY").await;
 
-    client.send(b"\x02:");
+    client.send(b"\x02 ");
     client.wait_for("Open global navigator").await;
     client.wait_for("Ctrl-b g").await;
     client.send(b"\x1b[200~frobnicate\nzeta\x1b[201~");
@@ -5077,7 +5094,7 @@ async fn command_bar_create_failure_releases_input_to_the_original_terminal() {
         ));
     let mut client = PtyChild::spawn(command);
     client.wait_for("CREATE_FAILURE_READY").await;
-    client.send(b"\x02:create tab\r");
+    client.send(b"\x02 create tab\r");
     client.wait_for("create tab failed").await;
     client.send(b"after\n");
     client.wait_for("CREATE_FAILURE_RECOVERED").await;

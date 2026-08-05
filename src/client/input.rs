@@ -2,7 +2,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 #[cfg(test)]
 use super::actions::FocusDirection;
-use super::actions::{ClientAction, action_for_suffix};
+use super::{actions::ClientAction, config::BindingsConfig};
 
 pub(super) fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
@@ -75,9 +75,15 @@ fn function_key(number: u8) -> Option<&'static [u8]> {
     })
 }
 
-#[derive(Default)]
 pub(super) struct PrefixState {
     waiting: bool,
+    bindings: BindingsConfig,
+}
+
+impl Default for PrefixState {
+    fn default() -> Self {
+        Self::new(BindingsConfig::default())
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -88,6 +94,13 @@ pub(super) enum PrefixAction {
 }
 
 impl PrefixState {
+    pub(super) fn new(bindings: BindingsConfig) -> Self {
+        Self {
+            waiting: false,
+            bindings,
+        }
+    }
+
     pub(super) fn feed(&mut self, bytes: Vec<u8>) -> PrefixAction {
         if !self.waiting {
             if bytes == [2] {
@@ -100,7 +113,7 @@ impl PrefixState {
             self.waiting = false;
             if bytes == [2] {
                 PrefixAction::Send(vec![2])
-            } else if let Some(action) = action_for_suffix(&bytes) {
+            } else if let Some(action) = self.bindings.action_for_suffix(&bytes) {
                 PrefixAction::Dispatch(action)
             } else {
                 PrefixAction::Send([vec![2], bytes].concat())
@@ -207,7 +220,7 @@ mod tests {
         );
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
         assert_eq!(
-            prefix.feed(b":".to_vec()),
+            prefix.feed(b" ".to_vec()),
             PrefixAction::Dispatch(ClientAction::OpenCommandBar)
         );
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);

@@ -357,10 +357,11 @@ mod tests {
             .map(|column| buffer[(column, 0)].symbol())
             .collect::<String>();
         assert!(text.contains("c new · r rename · esc"));
+        assert_eq!(buffer[(17, 0)].bg, ratatui::style::Color::DarkGray);
         assert!(
-            buffer[(10, 0)]
+            buffer[(17, 0)]
                 .modifier
-                .contains(ratatui::style::Modifier::REVERSED)
+                .contains(ratatui::style::Modifier::UNDERLINED)
         );
 
         let tiny = Rect::new(0, 0, 4, 1);
@@ -374,10 +375,11 @@ mod tests {
             &mut tiny_buffer,
         );
         assert_eq!(tiny_buffer[(1, 0)].symbol(), "2");
+        assert_eq!(tiny_buffer[(1, 0)].bg, ratatui::style::Color::DarkGray);
         assert!(
             tiny_buffer[(1, 0)]
                 .modifier
-                .contains(ratatui::style::Modifier::REVERSED)
+                .contains(ratatui::style::Modifier::UNDERLINED)
         );
     }
 }

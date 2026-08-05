@@ -8,8 +8,9 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::{
-    actions::{COMMANDS, ClientAction, binding_label, definition},
+    actions::{COMMANDS, ClientAction, definition},
     chrome::{sanitize, truncate},
+    config::BindingsConfig,
 };
 
 const MAX_QUERY_BYTES: usize = 512;
@@ -17,6 +18,7 @@ const MAX_WIDTH: u16 = 72;
 const MAX_HEIGHT: u16 = 8;
 
 pub(super) struct CommandBarState {
+    bindings: BindingsConfig,
     query: String,
     filtered: Vec<ClientAction>,
     selected: Option<usize>,
@@ -31,8 +33,14 @@ pub(super) enum CommandBarAction {
 }
 
 impl CommandBarState {
+    #[cfg(test)]
     pub fn open() -> Self {
+        Self::open_with_bindings(BindingsConfig::default())
+    }
+
+    pub fn open_with_bindings(bindings: BindingsConfig) -> Self {
         let mut state = Self {
+            bindings,
             query: String::new(),
             filtered: Vec::new(),
             selected: None,
@@ -170,6 +178,7 @@ impl CommandBarState {
                 render_result(
                     action,
                     self.selected == Some(index),
+                    &self.bindings,
                     Rect::new(
                         area.x,
                         area.y + 1 + u16::try_from(offset).expect("visible offset fits u16"),
@@ -224,7 +233,7 @@ impl CommandBarState {
                     "{} {} {}",
                     command.title,
                     command.keywords,
-                    binding_label(command.action)
+                    self.bindings.label(command.action)
                 )
                 .to_lowercase();
                 tokens.iter().all(|token| haystack.contains(token))
@@ -349,7 +358,13 @@ fn render_prompt(area: Rect, query: &str, position: Option<(usize, usize)>, buff
     }
 }
 
-fn render_result(action: ClientAction, selected: bool, area: Rect, buffer: &mut Buffer) {
+fn render_result(
+    action: ClientAction,
+    selected: bool,
+    bindings: &BindingsConfig,
+    area: Rect,
+    buffer: &mut Buffer,
+) {
     let style = if selected {
         Style::default().add_modifier(Modifier::REVERSED)
     } else {
@@ -357,7 +372,7 @@ fn render_result(action: ClientAction, selected: bool, area: Rect, buffer: &mut 
     };
     fill_row(area, style, buffer);
     let definition = definition(action).expect("command bar actions have definitions");
-    let full_binding = binding_label(action);
+    let full_binding = bindings.label(action);
     let binding = if area.width >= 56 {
         full_binding.as_str()
     } else if area.width >= 32 {
