@@ -7,7 +7,7 @@
   --line: #c9c9c9;
   --code: #eeeeee;
   --measure: 76ch;
-  --leading: 1.65;
+  --leading: 20px;
 }
 
 *,
@@ -43,13 +43,13 @@ a:focus-visible {
 }
 
 .site-header {
-  min-height: 72px;
-  padding: 18px clamp(18px, 4vw, 56px);
+  min-height: 4lh;
+  padding: 1lh clamp(2ch, 4vw, 7ch);
   border-bottom: 1px solid var(--line);
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 24px;
+  gap: 1lh;
 }
 
 .wordmark {
@@ -60,27 +60,27 @@ a:focus-visible {
 
 .wordmark span {
   color: var(--accent);
-  margin-left: 0.2em;
+  margin-left: 1ch;
 }
 
 .shell {
   display: grid;
-  grid-template-columns: minmax(180px, 240px) minmax(0, 1fr);
-  min-height: calc(100vh - 72px);
+  grid-template-columns: minmax(25ch, 33ch) minmax(0, 1fr);
+  min-height: calc(100vh - 4lh);
 }
 
 aside {
-  padding: 48px 28px 48px clamp(18px, 4vw, 56px);
+  padding: 2lh 4ch 2lh clamp(2ch, 4vw, 7ch);
   border-right: 1px solid var(--line);
 }
 
 aside p {
-  margin: 0 0 20px;
+  margin: 0 0 1lh;
 }
 
 aside a {
   display: block;
-  margin: 10px 0;
+  margin: 1lh 0;
   text-decoration: none;
 }
 
@@ -95,8 +95,8 @@ aside a[aria-current="page"]::before {
 }
 
 main {
-  width: min(100%, calc(var(--measure) + 112px));
-  padding: 64px 56px 96px;
+  width: min(100%, calc(var(--measure) + 14ch));
+  padding: 3lh 7ch 5lh;
 }
 
 h1,
@@ -107,19 +107,42 @@ h3 {
   text-wrap: balance;
 }
 
+h1,
+h2,
+h3,
+p,
+ul,
+ol,
+table,
+pre {
+  margin-block: 0;
+}
+
+p,
+ul,
+ol,
+table {
+  margin-bottom: 1lh;
+}
+
+ul,
+ol {
+  padding-left: 4ch;
+}
+
 h1 {
-  margin: 0 0 32px;
+  margin: 0 0 2lh;
   font-weight: 800;
 }
 
 h2 {
-  margin: 64px 0 20px;
-  padding-top: 14px;
+  margin: 3lh 0 1lh;
+  padding-top: 1lh;
   border-top: 1px solid var(--line);
 }
 
 h3 {
-  margin-top: 40px;
+  margin: 2lh 0 1lh;
 }
 
 p,
@@ -131,18 +154,18 @@ pre {
 }
 
 li + li {
-  margin-top: 0.4em;
+  margin-top: 0;
 }
 
 code {
-  padding: 0.08em 0.3em;
+  padding: 0 1ch;
   background: var(--code);
   font: inherit;
 }
 
 pre {
-  margin: 28px 0;
-  padding: 20px 22px;
+  margin: 1lh 0;
+  padding: 1lh 2ch;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
   background: var(--code);
@@ -207,7 +230,7 @@ table {
 
 th,
 td {
-  padding: 10px 12px;
+  padding: 1lh 2ch;
   border-bottom: 1px solid var(--line);
   text-align: left;
   vertical-align: top;
@@ -239,22 +262,22 @@ th {
   }
 
   aside {
-    padding: 18px;
+    padding: 1lh 2ch;
     border-right: 0;
     border-bottom: 1px solid var(--line);
   }
 
   aside p {
-    margin-bottom: 8px;
+    margin-bottom: 1lh;
   }
 
   aside a {
     display: block;
-    margin: 4px 16px 4px 0;
+    margin: 1lh 2ch 1lh 0;
   }
 
   main {
-    padding: 44px 18px 72px;
+    padding: 2lh 2ch 4lh;
   }
 }
 
