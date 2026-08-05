@@ -7,13 +7,18 @@
   --line: #c9c9c9;
   --code: #eeeeee;
   --measure: 76ch;
+  --leading: 1.65;
 }
 
-* {
+*,
+*::before,
+*::after {
   box-sizing: border-box;
+  line-height: inherit;
 }
 
 html {
+  line-height: var(--leading);
   scroll-behavior: smooth;
 }
 
@@ -24,7 +29,6 @@ body {
   font-family:
     "SFMono-Regular", "Cascadia Code", "Roboto Mono", ui-monospace, monospace;
   font-size: 12px;
-  line-height: 1.65;
 }
 
 a {
@@ -99,7 +103,6 @@ h1,
 h2,
 h3 {
   font-size: inherit;
-  line-height: 1.2;
   letter-spacing: -0.025em;
   text-wrap: balance;
 }
@@ -143,7 +146,6 @@ pre {
   overflow-wrap: anywhere;
   white-space: pre-wrap;
   background: var(--code);
-  line-height: 1.55;
 }
 
 pre code {
