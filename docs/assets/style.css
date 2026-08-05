@@ -20,9 +20,10 @@ body {
   margin: 0;
   background: var(--paper);
   color: var(--ink);
-  font-family: "SFMono-Regular", "Cascadia Code", "Roboto Mono", ui-monospace, monospace;
-  font-size: 14px;
-  line-height: 1.65;
+  font-family:
+    "SFMono-Regular", "Cascadia Code", "Roboto Mono", ui-monospace, monospace;
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 a {
@@ -203,7 +204,6 @@ th {
   main {
     padding: 44px 18px 72px;
   }
-
 }
 
 @media (prefers-reduced-motion: reduce) {
