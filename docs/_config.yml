@@ -1,7 +1,7 @@
 title: Fut
 description: Agent-aware terminal multiplexing
-url: https://mikker.github.io
-baseurl: /fut
+url: https://fut.sh
+baseurl: ""
 repository: mikker/fut
 markdown: kramdown
 permalink: pretty
