@@ -20,3 +20,6 @@ permalink: /
 - [Diagnostics](doctor.md)
 
 [Source](https://github.com/mikker/fut)
+
+![Fut illustration]({{ '/assets/illustration.webp' | relative_url }})
+{: .illustration }

@@ -186,6 +186,17 @@ pre code {
   white-space: pre;
 }
 
+.illustration {
+  width: 100%;
+  max-width: 69ch;
+}
+
+.illustration img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
 .highlight .c,
 .highlight .c1,
 .highlight .cm {
