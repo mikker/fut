@@ -155,6 +155,12 @@ pre code {
   color: var(--accent);
 }
 
+.resource-tree {
+  overflow: auto;
+  overflow-wrap: normal;
+  white-space: pre;
+}
+
 .highlight .c,
 .highlight .c1,
 .highlight .cm {
