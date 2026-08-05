@@ -1,0 +1,165 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Validate release version
+        run: |
+          [[ "$GITHUB_REF_NAME" =~ ^0\.[1-9][0-9]*$ ]]
+          cargo_version="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
+          test "$cargo_version" = "$GITHUB_REF_NAME.0"
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --all-targets --all-features
+
+  build:
+    needs: test
+    strategy:
+      matrix:
+        include:
+          - os: macos-15
+            arch: arm64
+          - os: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: release-${{ matrix.arch }}
+      - run: cargo build --release --locked
+      - name: Package binary
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          test "$(uname -m)" = "$ARCH"
+          mkdir dist
+          cp target/release/fut dist/fut
+          archive="fut-macos-$ARCH.tar.gz"
+          tar -C dist -czf "dist/$archive" fut
+          shasum -a 256 "dist/$archive" > "dist/$archive.sha256"
+          "dist/fut" --version
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fut-macos-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: fut-macos-*
+          path: dist
+          merge-multiple: true
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes
+          fi
+
+  homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: fut-macos-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: mikker/homebrew-tap
+          ref: main
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+      - name: Update formula
+        run: |
+          arm_sha="$(sha256sum dist/fut-macos-arm64.tar.gz | cut -d ' ' -f 1)"
+          intel_sha="$(sha256sum dist/fut-macos-x86_64.tar.gz | cut -d ' ' -f 1)"
+          tag="$GITHUB_REF_NAME"
+
+          cd tap
+          git pull --rebase origin main
+
+          current_tag=""
+          if [[ -f Formula/fut.rb ]]; then
+            current_tag="$(sed -nE 's#.*mikker/fut/releases/download/(0\.[0-9]+)/.*#\1#p' Formula/fut.rb | head -1)"
+          fi
+          if [[ "$current_tag" =~ ^0\.([0-9]+)$ ]] && (( 10#${BASH_REMATCH[1]} >= 10#${tag#0.} )); then
+            echo "Formula already contains $current_tag; leaving it unchanged"
+            exit 0
+          fi
+
+          cat > Formula/fut.rb <<RUBY
+          class Fut < Formula
+            desc "Agent-aware terminal multiplexer"
+            homepage "https://fut.sh"
+
+            if Hardware::CPU.arm?
+              url "https://github.com/mikker/fut/releases/download/$tag/fut-macos-arm64.tar.gz"
+              sha256 "$arm_sha"
+            else
+              url "https://github.com/mikker/fut/releases/download/$tag/fut-macos-x86_64.tar.gz"
+              sha256 "$intel_sha"
+            end
+
+            depends_on :macos
+
+            def install
+              bin.install "fut"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/fut --version")
+            end
+          end
+          RUBY
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/fut.rb
+          if git diff --cached --quiet; then
+            echo "Formula is already current"
+            exit 0
+          fi
+          git commit -m "Update fut to $tag"
+          if ! git push origin main; then
+            git pull --rebase origin main
+            git push origin main
+          fi

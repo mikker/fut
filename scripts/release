@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+die() {
+  echo "release: $*" >&2
+  exit 1
+}
+
+[[ "$(git branch --show-current)" == "main" ]] || die "run this from main"
+[[ -z "$(git status --porcelain)" ]] || die "working tree is not clean"
+
+git fetch origin main --tags
+[[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/main)" ]] || die "main is not synchronized with origin/main"
+
+latest="$(git ls-remote --tags --refs origin \
+  | awk '{ sub("refs/tags/", "", $2); if ($2 ~ /^0\.[1-9][0-9]*$/) print $2 }' \
+  | sort -t. -k2,2n \
+  | tail -1)"
+if [[ -z "$latest" ]]; then
+  version="0.1"
+else
+  version="0.$((10#${latest#0.} + 1))"
+fi
+
+package_version="$version.0"
+current_package_version="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
+
+if [[ "$current_package_version" != "$package_version" ]]; then
+  perl -0pi -e "s/\A(\[package\].*?^version = \x22)[^\x22]+/\${1}$package_version/ms" Cargo.toml
+  cargo check --quiet
+fi
+
+echo "Releasing $version"
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+
+if ! git diff --quiet -- Cargo.toml Cargo.lock; then
+  git add Cargo.toml Cargo.lock
+  git commit -m "Release $version"
+fi
+
+[[ "$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)" == "$package_version" ]] || die "Cargo package version does not match $version"
+if git rev-parse --verify "refs/tags/$version" >/dev/null 2>&1; then
+  git tag -d "$version"
+fi
+git tag -a "$version" -m "Release $version"
+if ! git push --atomic origin main "$version"; then
+  git tag -d "$version"
+  die "push failed; no remote release was created"
+fi
+
+echo "Release $version is running at https://github.com/mikker/fut/actions"
