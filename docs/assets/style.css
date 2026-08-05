@@ -3,6 +3,7 @@
   --paper: #f7f7f7;
   --ink: #1b1b1b;
   --accent: oklch(69.6% 0.17 162.48);
+  --syntax: oklch(42% 0.12 162.48);
   --line: #c9c9c9;
   --code: #eeeeee;
   --measure: 76ch;
@@ -23,7 +24,7 @@ body {
   font-family:
     "SFMono-Regular", "Cascadia Code", "Roboto Mono", ui-monospace, monospace;
   font-size: 12px;
-  line-height: 1.5;
+  line-height: 1.65;
 }
 
 a {
@@ -99,6 +100,7 @@ h3 {
   font-size: inherit;
   line-height: 1.2;
   letter-spacing: -0.025em;
+  text-wrap: balance;
 }
 
 h1 {
@@ -137,7 +139,8 @@ code {
 pre {
   margin: 28px 0;
   padding: 20px 22px;
-  overflow-x: auto;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
   background: var(--code);
   line-height: 1.55;
 }
@@ -145,6 +148,43 @@ pre {
 pre code {
   padding: 0;
   background: transparent;
+}
+
+.highlight .c,
+.highlight .c1,
+.highlight .cm {
+  font-style: italic;
+}
+
+.highlight .k,
+.highlight .kc,
+.highlight .kd,
+.highlight .kn,
+.highlight .kp,
+.highlight .kr,
+.highlight .kt,
+.highlight .m,
+.highlight .mb,
+.highlight .mf,
+.highlight .mh,
+.highlight .mi,
+.highlight .mo,
+.highlight .s,
+.highlight .s1,
+.highlight .s2 {
+  color: var(--syntax);
+}
+
+.highlight .na,
+.highlight .nb,
+.highlight .nc,
+.highlight .nd,
+.highlight .ne,
+.highlight .nf,
+.highlight .nn,
+.highlight .nt,
+.highlight .py {
+  font-weight: 700;
 }
 
 table {
@@ -169,6 +209,7 @@ th {
     color-scheme: dark;
     --paper: #1b1b1b;
     --ink: #f7f7f7;
+    --syntax: var(--accent);
     --line: #555555;
     --code: #292929;
   }
