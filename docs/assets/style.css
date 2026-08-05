@@ -99,11 +99,9 @@ h3 {
   font-size: inherit;
   line-height: 1.2;
   letter-spacing: -0.025em;
-  text-wrap: balance;
 }
 
 h1 {
-  max-width: 18ch;
   margin: 0 0 32px;
   font-weight: 800;
 }
