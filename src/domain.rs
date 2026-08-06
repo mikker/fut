@@ -167,14 +167,99 @@ pub enum MouseWheelDirection {
     Down,
 }
 
-/// A wheel event normalized to zero-based terminal cell coordinates.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct MouseWheelEvent {
-    pub direction: MouseWheelDirection,
+#[serde(rename_all = "snake_case")]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MouseButtons {
+    pub left: bool,
+    pub middle: bool,
+    pub right: bool,
+}
+
+impl MouseButtons {
+    #[must_use]
+    pub fn contains(self, button: MouseButton) -> bool {
+        match button {
+            MouseButton::Left => self.left,
+            MouseButton::Middle => self.middle,
+            MouseButton::Right => self.right,
+        }
+    }
+
+    pub fn set(&mut self, button: MouseButton, pressed: bool) {
+        match button {
+            MouseButton::Left => self.left = pressed,
+            MouseButton::Middle => self.middle = pressed,
+            MouseButton::Right => self.right = pressed,
+        }
+    }
+
+    #[must_use]
+    pub fn any(self) -> bool {
+        self.left || self.middle || self.right
+    }
+}
+
+impl MouseButton {
+    pub const ALL: [Self; 3] = [Self::Left, Self::Middle, Self::Right];
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MouseEventKind {
+    Press {
+        button: MouseButton,
+    },
+    Release {
+        button: MouseButton,
+    },
+    Motion {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        button: Option<MouseButton>,
+    },
+    Wheel {
+        direction: MouseWheelDirection,
+    },
+}
+
+/// Mouse input normalized to zero-based terminal cell coordinates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MouseEvent {
+    pub kind: MouseEventKind,
     pub column: u16,
     pub row: u16,
     #[serde(default)]
     pub modifiers: MouseModifiers,
+    /// Button state after this event. Ghostty uses this to distinguish a
+    /// requested drag from unbuttoned motion.
+    #[serde(default)]
+    pub buttons: MouseButtons,
+}
+
+impl MouseEvent {
+    /// Validate the post-event button snapshot supplied by an untrusted client.
+    pub fn validate(self) -> Result<(), &'static str> {
+        match self.kind {
+            MouseEventKind::Press { button } if !self.buttons.contains(button) => {
+                Err("pressed button is absent from the post-event button snapshot")
+            }
+            MouseEventKind::Release { button } if self.buttons.contains(button) => {
+                Err("released button remains in the post-event button snapshot")
+            }
+            MouseEventKind::Motion {
+                button: Some(button),
+            } if !self.buttons.contains(button) => {
+                Err("drag button is absent from the button snapshot")
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

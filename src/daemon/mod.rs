@@ -46,7 +46,7 @@ use crate::{
     },
     splits::{SplitDirection, SplitTree},
     terminal::{
-        CommandError, CopyModeOutcome, MouseWheelOutcome, SpawnSpec, TerminalEvent, TerminalHandle,
+        CommandError, CopyModeOutcome, MouseInputOutcome, SpawnSpec, TerminalEvent, TerminalHandle,
         TerminalLifecycle, spawn_terminal,
     },
 };
@@ -676,10 +676,10 @@ impl Attachment {
         }
     }
 
-    async fn mouse_wheel(
+    async fn mouse_input(
         &mut self,
         terminal_id: TerminalId,
-        event: crate::domain::MouseWheelEvent,
+        event: crate::domain::MouseEvent,
     ) -> Result<Option<crate::domain::ScreenSnapshot>, CommandError> {
         if self.copy_mode_active() {
             return Ok(None);
@@ -687,16 +687,20 @@ impl Attachment {
         let Some(terminal) = self.terminal(terminal_id) else {
             return Ok(None);
         };
-        let offset = self.viewport_offsets.get(&terminal_id).copied();
         let pty_input_allowed = terminal_id == self.focused.selected.terminal_id;
+        if !pty_input_allowed && !matches!(event.kind, crate::domain::MouseEventKind::Wheel { .. })
+        {
+            return Ok(None);
+        }
+        let offset = self.viewport_offsets.get(&terminal_id).copied();
         match terminal
-            .mouse_wheel(event, offset, pty_input_allowed)
+            .mouse_input(event, offset, pty_input_allowed)
             .await?
         {
-            MouseWheelOutcome::Forwarded => Ok(None),
-            MouseWheelOutcome::Scrolled(viewport) => {
-                self.set_viewport_offset(terminal_id, viewport.offset);
-                Ok(self.accept_snapshot(terminal_id, viewport.screen))
+            MouseInputOutcome::Handled => Ok(None),
+            MouseInputOutcome::ReturnedToBottom(viewport)
+            | MouseInputOutcome::Scrolled(viewport) => {
+                Ok(self.accept_mouse_viewport(terminal_id, viewport))
             }
         }
     }
@@ -765,6 +769,24 @@ impl Attachment {
         } else {
             self.viewport_offsets.remove(&terminal_id);
         }
+    }
+
+    fn accept_mouse_viewport(
+        &mut self,
+        terminal_id: TerminalId,
+        viewport: crate::terminal::ViewportSnapshot,
+    ) -> Option<crate::domain::ScreenSnapshot> {
+        if self
+            .snapshot_revisions
+            .get(&terminal_id)
+            .is_some_and(|revision| viewport.screen.revision <= *revision)
+        {
+            return None;
+        }
+        self.set_viewport_offset(terminal_id, viewport.offset);
+        self.snapshot_revisions
+            .insert(terminal_id, viewport.screen.revision);
+        Some(viewport.screen)
     }
 
     async fn clear_active_copy_mode(
@@ -1491,11 +1513,20 @@ async fn handle_connection(
                             }
                         }
                     }
-                    ClientMessage::MouseWheel { terminal_id, event } => {
+                    ClientMessage::MouseInput { terminal_id, event } => {
+                        if let Err(reason) = event.validate() {
+                            tracing::warn!(
+                                %terminal_id,
+                                ?event,
+                                reason,
+                                "discarding invalid fire-and-forget mouse input"
+                            );
+                            continue;
+                        }
                         if attachment.terminal(terminal_id).is_none() {
                             continue;
                         }
-                        match attachment.mouse_wheel(terminal_id, event).await {
+                        match attachment.mouse_input(terminal_id, event).await {
                             Ok(Some(screen)) => {
                                 send(
                                     &mut framed,
@@ -1508,7 +1539,7 @@ async fn handle_connection(
                                 respond_to_ui_event_error(
                                     &mut framed,
                                     envelope.request_id,
-                                    "mouse wheel",
+                                    "mouse input",
                                     error,
                                     UiEventPolicy::Disposable,
                                 ).await?;
@@ -2243,7 +2274,7 @@ async fn control_loop(
                 send(framed, envelope.request_id, ServerMessage::Detached).await?;
                 break;
             }
-            ClientMessage::MouseWheel { .. } | ClientMessage::ResetViewport { .. } => {}
+            ClientMessage::MouseInput { .. } | ClientMessage::ResetViewport { .. } => {}
             ClientMessage::CreateWorkspace { .. }
             | ClientMessage::Input { .. }
             | ClientMessage::Paste { .. }
@@ -3537,7 +3568,7 @@ async fn reject_fire_and_forget_request_id(
 
 fn fire_and_forget_operation(message: &ClientMessage) -> Option<&'static str> {
     match message {
-        ClientMessage::MouseWheel { .. } => Some("mouse wheel"),
+        ClientMessage::MouseInput { .. } => Some("mouse input"),
         ClientMessage::ResetViewport { .. } => Some("reset viewport"),
         _ => None,
     }
@@ -3708,6 +3739,60 @@ mod tests {
         assert!(should_report_unfocused_resize(Some(uuid::Uuid::new_v4())));
     }
 
+    #[test]
+    fn raw_mouse_validation_rejects_incoherent_transition_and_drag_snapshots() {
+        use crate::domain::{MouseButton, MouseButtons, MouseEvent, MouseEventKind};
+
+        for event in [
+            MouseEvent {
+                kind: MouseEventKind::Press {
+                    button: MouseButton::Left,
+                },
+                column: 0,
+                row: 0,
+                modifiers: Default::default(),
+                buttons: MouseButtons::default(),
+            },
+            MouseEvent {
+                kind: MouseEventKind::Release {
+                    button: MouseButton::Middle,
+                },
+                column: 0,
+                row: 0,
+                modifiers: Default::default(),
+                buttons: MouseButtons {
+                    middle: true,
+                    ..Default::default()
+                },
+            },
+            MouseEvent {
+                kind: MouseEventKind::Motion {
+                    button: Some(MouseButton::Right),
+                },
+                column: 0,
+                row: 0,
+                modifiers: Default::default(),
+                buttons: MouseButtons::default(),
+            },
+        ] {
+            assert!(event.validate().is_err(), "accepted {event:?}");
+        }
+
+        let valid = MouseEvent {
+            kind: MouseEventKind::Press {
+                button: MouseButton::Right,
+            },
+            column: 0,
+            row: 0,
+            modifiers: Default::default(),
+            buttons: MouseButtons {
+                right: true,
+                ..Default::default()
+            },
+        };
+        assert!(valid.validate().is_ok());
+    }
+
     #[tokio::test]
     async fn failed_viewport_reset_preserves_the_offset() {
         let (mut attachment, terminal) = test_attachment("sleep 60");
@@ -3753,7 +3838,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn copy_mode_ignores_server_side_wheel_and_viewport_reset() {
+    async fn mouse_viewport_commit_is_transactional() {
+        let (mut attachment, terminal) = test_attachment("sleep 60");
+        let terminal_id = terminal.id();
+        let mut screen = terminal.subscribe_snapshots().borrow().clone();
+        attachment.viewport_offsets.insert(terminal_id, 7);
+        attachment
+            .snapshot_revisions
+            .insert(terminal_id, screen.revision);
+
+        assert!(
+            attachment
+                .accept_mouse_viewport(
+                    terminal_id,
+                    crate::terminal::ViewportSnapshot {
+                        offset: None,
+                        screen: screen.clone(),
+                    },
+                )
+                .is_none()
+        );
+        assert_eq!(attachment.viewport_offsets.get(&terminal_id), Some(&7));
+
+        screen.revision += 1;
+        assert_eq!(
+            attachment
+                .accept_mouse_viewport(
+                    terminal_id,
+                    crate::terminal::ViewportSnapshot {
+                        offset: None,
+                        screen: screen.clone(),
+                    },
+                )
+                .unwrap(),
+            screen
+        );
+        assert!(!attachment.viewport_offsets.contains_key(&terminal_id));
+        terminal.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn copy_mode_ignores_server_side_mouse_input_and_viewport_reset() {
         let (mut attachment, terminal) = test_attachment("printf content; sleep 60");
         let terminal_id = terminal.id();
         attachment
@@ -3765,13 +3890,16 @@ mod tests {
 
         assert!(
             attachment
-                .mouse_wheel(
+                .mouse_input(
                     terminal_id,
-                    crate::domain::MouseWheelEvent {
-                        direction: crate::domain::MouseWheelDirection::Up,
+                    crate::domain::MouseEvent {
+                        kind: crate::domain::MouseEventKind::Wheel {
+                            direction: crate::domain::MouseWheelDirection::Up,
+                        },
                         column: 0,
                         row: 0,
                         modifiers: crate::domain::MouseModifiers::default(),
+                        buttons: Default::default(),
                     },
                 )
                 .await

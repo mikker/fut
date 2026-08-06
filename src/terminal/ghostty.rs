@@ -22,15 +22,16 @@ use uuid::Uuid;
 use crate::domain::{
     Cell, CellColor, CellStyle, ClientId, CopyModeAction, CopyModeError, CopyModeMovement, Cursor,
     MAX_COPY_BYTES, MAX_COPY_CELLS, MAX_SEARCH_CELL_CODEPOINTS, MAX_SEARCH_CELLS,
-    MAX_SEARCH_QUERY_BYTES, MAX_SEARCH_TEXT_BYTES, MouseModifiers, MouseWheelDirection,
-    MouseWheelEvent, Rgb, ScreenSnapshot, SearchDirection, TerminalSize,
+    MAX_SEARCH_QUERY_BYTES, MAX_SEARCH_TEXT_BYTES, MouseButton, MouseEvent, MouseEventKind,
+    MouseModifiers, MouseWheelDirection, Rgb, ScreenSnapshot, SearchDirection, TerminalSize,
 };
 
 const SYNCHRONIZED_OUTPUT_TIMEOUT: Duration = Duration::from_secs(1);
 const MOUSE_WHEEL_LINES: isize = 3;
 
-pub(crate) enum MouseWheelOutcome {
-    Forwarded,
+pub(crate) enum MouseInputOutcome {
+    Handled,
+    ReturnedToBottom(ViewportSnapshot),
     Scrolled(ViewportSnapshot),
 }
 
@@ -111,6 +112,8 @@ pub(super) struct GhosttyTerminal {
     render_state: RenderState<'static>,
     rows: RowIterator<'static>,
     cells: CellIterator<'static>,
+    key_encoder: key::Encoder<'static>,
+    key_event: key::Event<'static>,
     mouse_encoder: mouse::Encoder<'static>,
     mouse_event: mouse::Event<'static>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
@@ -144,6 +147,8 @@ impl GhosttyTerminal {
             render_state: RenderState::new()?,
             rows: RowIterator::new()?,
             cells: CellIterator::new()?,
+            key_encoder: key::Encoder::new()?,
+            key_event: key::Event::new()?,
             mouse_encoder: mouse::Encoder::new()?,
             mouse_event: mouse::Event::new()?,
             writer,
@@ -156,11 +161,20 @@ impl GhosttyTerminal {
 
     pub(super) fn feed(&mut self, bytes: &[u8]) -> Result<Option<ScreenSnapshot>> {
         self.terminal.vt_write(bytes);
-        self.present_synchronized_output()
+        if self.holds_synchronized_output()? {
+            return Ok(None);
+        }
+        self.snapshot().map(Some)
     }
 
+    /// Publish an idle terminal only when an unterminated synchronized-output
+    /// frame has expired. A quiet terminal must not manufacture revisions:
+    /// every published snapshot wakes every attached client.
     pub(super) fn flush_synchronized_output(&mut self) -> Result<Option<ScreenSnapshot>> {
-        self.present_synchronized_output()
+        if self.synchronized_output_started.is_none() || self.holds_synchronized_output()? {
+            return Ok(None);
+        }
+        self.snapshot().map(Some)
     }
 
     pub(super) fn finish_synchronized_output(&mut self) -> Result<Option<ScreenSnapshot>> {
@@ -196,17 +210,36 @@ impl GhosttyTerminal {
         self.snapshot_viewport_and_restore_bottom()
     }
 
-    pub(super) fn mouse_wheel(
+    pub(super) fn mouse_input(
         &mut self,
-        event: MouseWheelEvent,
+        event: MouseEvent,
         offset: Option<usize>,
         pty_input_allowed: bool,
-    ) -> Result<MouseWheelOutcome> {
-        if self.terminal.is_mouse_tracking()? {
-            if pty_input_allowed {
-                self.forward_mouse_wheel(event)?;
+    ) -> Result<MouseInputOutcome> {
+        let MouseEventKind::Wheel { direction } = event.kind else {
+            if !pty_input_allowed || !self.terminal.is_mouse_tracking()? {
+                return Ok(MouseInputOutcome::Handled);
             }
-            return Ok(MouseWheelOutcome::Forwarded);
+            self.forward_mouse(event)?;
+            return self.finish_application_mouse_input(offset);
+        };
+
+        if self.terminal.is_mouse_tracking()? {
+            if !pty_input_allowed {
+                return Ok(MouseInputOutcome::Handled);
+            }
+            self.forward_mouse(event)?;
+            return self.finish_application_mouse_input(offset);
+        }
+
+        if self.terminal.active_screen()? == Screen::Alternate
+            && self.terminal.mode(Mode::ALT_SCROLL)?
+        {
+            if !pty_input_allowed {
+                return Ok(MouseInputOutcome::Handled);
+            }
+            self.forward_alternate_scroll(direction)?;
+            return self.finish_application_mouse_input(offset);
         }
 
         self.terminal.set_selection(None)?;
@@ -214,13 +247,24 @@ impl GhosttyTerminal {
             Some(offset) => ScrollViewport::Row(offset),
             None => ScrollViewport::Bottom,
         });
-        let delta = match event.direction {
+        let delta = match direction {
             MouseWheelDirection::Up => -MOUSE_WHEEL_LINES,
             MouseWheelDirection::Down => MOUSE_WHEEL_LINES,
         };
         self.terminal.scroll_viewport(ScrollViewport::Delta(delta));
         self.snapshot_viewport_and_restore_bottom()
-            .map(MouseWheelOutcome::Scrolled)
+            .map(MouseInputOutcome::Scrolled)
+    }
+
+    fn finish_application_mouse_input(
+        &mut self,
+        previous_offset: Option<usize>,
+    ) -> Result<MouseInputOutcome> {
+        if previous_offset.is_none() {
+            return Ok(MouseInputOutcome::Handled);
+        }
+        self.viewport_snapshot(None)
+            .map(MouseInputOutcome::ReturnedToBottom)
     }
 
     pub(super) fn paste(&mut self, text: String) -> Result<()> {
@@ -859,21 +903,44 @@ impl GhosttyTerminal {
         }
     }
 
-    fn forward_mouse_wheel(&mut self, event: MouseWheelEvent) -> Result<()> {
+    fn forward_mouse(&mut self, event: MouseEvent) -> Result<()> {
         let column = event.column.min(self.size.columns - 1);
         let row = event.row.min(self.size.rows - 1);
+        let (action, button) = match event.kind {
+            MouseEventKind::Press { button } => (mouse::Action::Press, Some(mouse_button(button))),
+            MouseEventKind::Release { button } => {
+                (mouse::Action::Release, Some(mouse_button(button)))
+            }
+            MouseEventKind::Motion { button } => (
+                mouse::Action::Motion,
+                button
+                    .filter(|button| event.buttons.contains(*button))
+                    .map(mouse_button),
+            ),
+            MouseEventKind::Wheel { direction } => (
+                mouse::Action::Press,
+                Some(match direction {
+                    MouseWheelDirection::Up => mouse::Button::Four,
+                    MouseWheelDirection::Down => mouse::Button::Five,
+                }),
+            ),
+        };
         self.mouse_event
             .set_mods(mouse_modifiers(event.modifiers))
             .set_position(mouse::Position {
                 x: f32::from(column) + 0.5,
                 y: f32::from(row) + 0.5,
             })
-            .set_button(Some(match event.direction {
-                MouseWheelDirection::Up => mouse::Button::Four,
-                MouseWheelDirection::Down => mouse::Button::Five,
-            }));
+            .set_action(action)
+            .set_button(button);
+        let sgr_pixels = self.terminal.mode(Mode::SGR_PIXELS_MOUSE)?;
+        self.mouse_encoder.set_options_from_terminal(&self.terminal);
+        if sgr_pixels {
+            // Fut receives terminal-cell coordinates, never surface pixels.
+            // Preserve SGR framing while explicitly declining mode 1016.
+            self.mouse_encoder.set_format(mouse::Format::Sgr);
+        }
         self.mouse_encoder
-            .set_options_from_terminal(&self.terminal)
             .set_size(mouse::EncoderSize {
                 screen_width: u32::from(self.size.columns),
                 screen_height: u32::from(self.size.rows),
@@ -884,36 +951,66 @@ impl GhosttyTerminal {
                 padding_right: 0,
                 padding_left: 0,
             })
-            .set_any_button_pressed(false);
+            .set_any_button_pressed(event.buttons.any())
+            .set_track_last_cell(true);
 
         let mut response = Vec::new();
-        self.mouse_event.set_action(mouse::Action::Press);
         self.mouse_encoder
             .encode_to_vec(&self.mouse_event, &mut response)?;
+        self.write_encoded_input(&response, "mouse input")
+    }
+
+    fn forward_alternate_scroll(&mut self, direction: MouseWheelDirection) -> Result<()> {
+        self.key_event
+            .set_action(key::Action::Press)
+            .set_key(match direction {
+                MouseWheelDirection::Up => key::Key::ArrowUp,
+                MouseWheelDirection::Down => key::Key::ArrowDown,
+            })
+            .set_mods(key::Mods::empty())
+            .set_consumed_mods(key::Mods::empty())
+            .set_composing(false)
+            .set_utf8(None::<String>)
+            .set_unshifted_codepoint('\0');
+        self.key_encoder.set_options_from_terminal(&self.terminal);
+        let mut response = Vec::with_capacity(64);
+        for _ in 0..MOUSE_WHEEL_LINES {
+            self.key_encoder
+                .encode_to_vec(&self.key_event, &mut response)?;
+        }
+        self.write_encoded_input(&response, "alternate scroll")
+    }
+
+    fn write_encoded_input(&self, response: &[u8], operation: &str) -> Result<()> {
+        if response.is_empty() {
+            return Ok(());
+        }
         let mut writer = self
             .writer
             .lock()
             .map_err(|_| anyhow::anyhow!("PTY writer lock poisoned"))?;
         writer
-            .write_all(&response)
-            .context("writing encoded mouse wheel to PTY")?;
+            .write_all(response)
+            .with_context(|| format!("writing encoded {operation} to PTY"))?;
         writer
             .flush()
-            .context("flushing encoded mouse wheel to PTY")
+            .with_context(|| format!("flushing encoded {operation} to PTY"))
     }
 
-    fn present_synchronized_output(&mut self) -> Result<Option<ScreenSnapshot>> {
+    /// Whether the screen must stay hidden inside an open synchronized-output
+    /// frame. Ends an expired frame so the terminal fails open.
+    fn holds_synchronized_output(&mut self) -> Result<bool> {
         if self.terminal.mode(Mode::SYNC_OUTPUT)? {
             let started = self
                 .synchronized_output_started
                 .get_or_insert_with(Instant::now);
             if started.elapsed() < SYNCHRONIZED_OUTPUT_TIMEOUT {
-                return Ok(None);
+                return Ok(true);
             }
             self.terminal.set_mode(Mode::SYNC_OUTPUT, false)?;
         }
         self.synchronized_output_started = None;
-        self.snapshot().map(Some)
+        Ok(false)
     }
 
     pub(super) fn snapshot(&mut self) -> Result<ScreenSnapshot> {
@@ -1230,6 +1327,14 @@ fn mouse_modifiers(modifiers: MouseModifiers) -> key::Mods {
     result
 }
 
+fn mouse_button(button: MouseButton) -> mouse::Button {
+    match button {
+        MouseButton::Left => mouse::Button::Left,
+        MouseButton::Middle => mouse::Button::Middle,
+        MouseButton::Right => mouse::Button::Right,
+    }
+}
+
 fn validate_size(size: TerminalSize) -> Result<()> {
     ensure!(
         size.columns > 0 && size.rows > 0,
@@ -1259,6 +1364,7 @@ mod tests {
     use std::io;
 
     use super::*;
+    use crate::domain::MouseButtons;
 
     #[derive(Clone)]
     struct RecordingWriter(Arc<Mutex<Vec<u8>>>);
@@ -1290,6 +1396,24 @@ mod tests {
         )
         .unwrap();
         (terminal, output)
+    }
+
+    fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: MouseModifiers::default(),
+            buttons: Default::default(),
+        }
+    }
+
+    fn wheel(direction: MouseWheelDirection, column: u16, row: u16) -> MouseEvent {
+        mouse_event(MouseEventKind::Wheel { direction }, column, row)
+    }
+
+    fn take_output(output: &Arc<Mutex<Vec<u8>>>) -> Vec<u8> {
+        std::mem::take(&mut *output.lock().unwrap())
     }
 
     fn text(snapshot: &ScreenSnapshot) -> String {
@@ -1399,17 +1523,8 @@ mod tests {
             .unwrap();
         assert!(text(&bottom).contains("05"));
 
-        let MouseWheelOutcome::Scrolled(history) = terminal
-            .mouse_wheel(
-                MouseWheelEvent {
-                    direction: MouseWheelDirection::Up,
-                    column: 0,
-                    row: 0,
-                    modifiers: MouseModifiers::default(),
-                },
-                None,
-                true,
-            )
+        let MouseInputOutcome::Scrolled(history) = terminal
+            .mouse_input(wheel(MouseWheelDirection::Up, 0, 0), None, true)
             .unwrap()
         else {
             panic!("wheel was unexpectedly forwarded");
@@ -1432,42 +1547,330 @@ mod tests {
         output.lock().unwrap().clear();
 
         let outcome = terminal
-            .mouse_wheel(
-                MouseWheelEvent {
-                    direction: MouseWheelDirection::Up,
-                    column: 2,
-                    row: 1,
+            .mouse_input(
+                MouseEvent {
                     modifiers: MouseModifiers {
                         shift: true,
                         control: false,
                         alt: false,
                     },
+                    ..wheel(MouseWheelDirection::Up, 2, 1)
                 },
                 None,
                 true,
             )
             .unwrap();
-        assert!(matches!(outcome, MouseWheelOutcome::Forwarded));
+        assert!(matches!(outcome, MouseInputOutcome::Handled));
         assert_eq!(
             String::from_utf8(output.lock().unwrap().clone()).unwrap(),
             "\x1b[<68;3;2M"
         );
         output.lock().unwrap().clear();
         let outcome = terminal
-            .mouse_wheel(
-                MouseWheelEvent {
-                    direction: MouseWheelDirection::Down,
-                    column: 2,
-                    row: 1,
-                    modifiers: MouseModifiers::default(),
-                },
-                None,
-                false,
-            )
+            .mouse_input(wheel(MouseWheelDirection::Down, 2, 1), None, false)
             .unwrap();
-        assert!(matches!(outcome, MouseWheelOutcome::Forwarded));
+        assert!(matches!(outcome, MouseInputOutcome::Handled));
         assert!(output.lock().unwrap().is_empty());
         assert!(terminal.terminal.viewport_active().unwrap());
+    }
+
+    #[test]
+    fn sgr_mouse_encodes_all_buttons_releases_coordinates_and_modifiers_exactly() {
+        let (mut terminal, output) = recording_terminal(10, 4);
+        terminal.feed(b"\x1b[?1000h\x1b[?1006h").unwrap().unwrap();
+        take_output(&output);
+
+        let cases = [
+            (
+                MouseEvent {
+                    modifiers: MouseModifiers {
+                        shift: true,
+                        control: true,
+                        alt: true,
+                    },
+                    buttons: MouseButtons {
+                        left: true,
+                        ..Default::default()
+                    },
+                    ..mouse_event(
+                        MouseEventKind::Press {
+                            button: MouseButton::Left,
+                        },
+                        2,
+                        1,
+                    )
+                },
+                "\x1b[<28;3;2M",
+            ),
+            (
+                mouse_event(
+                    MouseEventKind::Press {
+                        button: MouseButton::Middle,
+                    },
+                    3,
+                    2,
+                ),
+                "\x1b[<1;4;3M",
+            ),
+            (
+                mouse_event(
+                    MouseEventKind::Release {
+                        button: MouseButton::Middle,
+                    },
+                    3,
+                    2,
+                ),
+                "\x1b[<1;4;3m",
+            ),
+            (
+                mouse_event(
+                    MouseEventKind::Press {
+                        button: MouseButton::Right,
+                    },
+                    u16::MAX,
+                    u16::MAX,
+                ),
+                "\x1b[<2;10;4M",
+            ),
+            (
+                mouse_event(
+                    MouseEventKind::Release {
+                        button: MouseButton::Right,
+                    },
+                    u16::MAX,
+                    u16::MAX,
+                ),
+                "\x1b[<2;10;4m",
+            ),
+        ];
+        for (event, expected) in cases {
+            assert!(matches!(
+                terminal.mouse_input(event, None, true).unwrap(),
+                MouseInputOutcome::Handled
+            ));
+            assert_eq!(String::from_utf8(take_output(&output)).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn sgr_pixels_mode_is_explicitly_downgraded_to_cell_sgr_bytes() {
+        let (mut terminal, output) = recording_terminal(10, 4);
+        terminal.feed(b"\x1b[?1000h\x1b[?1016h").unwrap().unwrap();
+        take_output(&output);
+        assert!(terminal.terminal.mode(Mode::SGR_PIXELS_MOUSE).unwrap());
+
+        for (event, expected) in [
+            (
+                MouseEvent {
+                    buttons: MouseButtons {
+                        left: true,
+                        ..Default::default()
+                    },
+                    ..mouse_event(
+                        MouseEventKind::Press {
+                            button: MouseButton::Left,
+                        },
+                        7,
+                        2,
+                    )
+                },
+                b"\x1b[<0;8;3M".as_slice(),
+            ),
+            (
+                mouse_event(
+                    MouseEventKind::Release {
+                        button: MouseButton::Left,
+                    },
+                    7,
+                    2,
+                ),
+                b"\x1b[<0;8;3m".as_slice(),
+            ),
+        ] {
+            assert!(matches!(
+                terminal.mouse_input(event, None, true).unwrap(),
+                MouseInputOutcome::Handled
+            ));
+            assert_eq!(take_output(&output), expected);
+        }
+    }
+
+    #[test]
+    fn ghostty_tracking_modes_filter_drag_and_requested_motion_exactly() {
+        let drag = MouseEvent {
+            buttons: MouseButtons {
+                left: true,
+                ..Default::default()
+            },
+            ..mouse_event(
+                MouseEventKind::Motion {
+                    button: Some(MouseButton::Left),
+                },
+                2,
+                1,
+            )
+        };
+        let hover = mouse_event(MouseEventKind::Motion { button: None }, 4, 2);
+
+        let (mut x10, x10_output) = recording_terminal(10, 4);
+        x10.feed(b"\x1b[?9h").unwrap().unwrap();
+        take_output(&x10_output);
+        x10.mouse_input(
+            mouse_event(
+                MouseEventKind::Press {
+                    button: MouseButton::Left,
+                },
+                0,
+                0,
+            ),
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(take_output(&x10_output), b"\x1b[M !!");
+        x10.mouse_input(
+            mouse_event(
+                MouseEventKind::Release {
+                    button: MouseButton::Left,
+                },
+                0,
+                0,
+            ),
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(take_output(&x10_output).is_empty());
+
+        let (mut normal, normal_output) = recording_terminal(10, 4);
+        normal.feed(b"\x1b[?1000h\x1b[?1006h").unwrap().unwrap();
+        take_output(&normal_output);
+        normal.mouse_input(drag, None, true).unwrap();
+        normal.mouse_input(hover, None, true).unwrap();
+        assert!(take_output(&normal_output).is_empty());
+
+        let (mut button, button_output) = recording_terminal(10, 4);
+        button.feed(b"\x1b[?1002h\x1b[?1006h").unwrap().unwrap();
+        take_output(&button_output);
+        button.mouse_input(hover, None, true).unwrap();
+        assert!(take_output(&button_output).is_empty());
+        button
+            .mouse_input(
+                MouseEvent {
+                    buttons: MouseButtons::default(),
+                    ..drag
+                },
+                None,
+                true,
+            )
+            .unwrap();
+        assert!(take_output(&button_output).is_empty());
+        button.mouse_input(drag, None, true).unwrap();
+        assert_eq!(take_output(&button_output), b"\x1b[<32;3;2M");
+        for (button_id, column, expected) in [
+            (MouseButton::Middle, 3, b"\x1b[<33;4;2M".as_slice()),
+            (MouseButton::Right, 4, b"\x1b[<34;5;2M".as_slice()),
+        ] {
+            let mut buttons = MouseButtons::default();
+            buttons.set(button_id, true);
+            button
+                .mouse_input(
+                    MouseEvent {
+                        buttons,
+                        ..mouse_event(
+                            MouseEventKind::Motion {
+                                button: Some(button_id),
+                            },
+                            column,
+                            1,
+                        )
+                    },
+                    None,
+                    true,
+                )
+                .unwrap();
+            assert_eq!(take_output(&button_output), expected);
+        }
+
+        let (mut any, any_output) = recording_terminal(10, 4);
+        any.feed(b"\x1b[?1003h\x1b[?1006h").unwrap().unwrap();
+        take_output(&any_output);
+        any.mouse_input(hover, None, true).unwrap();
+        assert_eq!(take_output(&any_output), b"\x1b[<35;5;3M");
+    }
+
+    #[test]
+    fn alternate_scroll_precedence_uses_repeated_terminal_key_encoding() {
+        let (mut terminal, output) = recording_terminal(10, 4);
+        terminal.feed(b"\x1b[?1049h").unwrap().unwrap();
+        take_output(&output);
+
+        assert!(matches!(
+            terminal
+                .mouse_input(wheel(MouseWheelDirection::Up, 2, 1), None, true)
+                .unwrap(),
+            MouseInputOutcome::Handled
+        ));
+        assert_eq!(take_output(&output), b"\x1b[A\x1b[A\x1b[A");
+
+        terminal.feed(b"\x1b[?1h").unwrap().unwrap();
+        take_output(&output);
+        terminal
+            .mouse_input(wheel(MouseWheelDirection::Down, 2, 1), None, true)
+            .unwrap();
+        assert_eq!(take_output(&output), b"\x1bOB\x1bOB\x1bOB");
+
+        terminal.feed(b"\x1b[?1000h\x1b[?1006h").unwrap().unwrap();
+        take_output(&output);
+        terminal
+            .mouse_input(wheel(MouseWheelDirection::Up, 2, 1), None, true)
+            .unwrap();
+        assert_eq!(take_output(&output), b"\x1b[<64;3;2M");
+
+        terminal.feed(b"\x1b[?1000l\x1b[?1007l").unwrap().unwrap();
+        take_output(&output);
+        assert!(matches!(
+            terminal
+                .mouse_input(wheel(MouseWheelDirection::Down, 2, 1), None, true)
+                .unwrap(),
+            MouseInputOutcome::Scrolled(_)
+        ));
+        assert!(take_output(&output).is_empty());
+    }
+
+    #[test]
+    fn pty_mouse_paths_are_silent_when_input_is_not_allowed() {
+        let (mut terminal, output) = recording_terminal(10, 4);
+        terminal
+            .feed(b"\x1b[?1049h\x1b[?1003h\x1b[?1006h")
+            .unwrap()
+            .unwrap();
+        take_output(&output);
+
+        for event in [
+            mouse_event(
+                MouseEventKind::Press {
+                    button: MouseButton::Left,
+                },
+                1,
+                1,
+            ),
+            mouse_event(MouseEventKind::Motion { button: None }, 2, 1),
+            wheel(MouseWheelDirection::Up, 2, 1),
+        ] {
+            assert!(matches!(
+                terminal.mouse_input(event, None, false).unwrap(),
+                MouseInputOutcome::Handled
+            ));
+        }
+        assert!(take_output(&output).is_empty());
+
+        terminal.feed(b"\x1b[?1003l").unwrap().unwrap();
+        take_output(&output);
+        terminal
+            .mouse_input(wheel(MouseWheelDirection::Up, 2, 1), None, false)
+            .unwrap();
+        assert!(take_output(&output).is_empty());
     }
 
     #[test]
@@ -1890,17 +2293,8 @@ mod tests {
             .feed(b"00\r\n01\r\n02\r\n03\r\n04\r\n05")
             .unwrap()
             .unwrap();
-        let MouseWheelOutcome::Scrolled(history) = terminal
-            .mouse_wheel(
-                MouseWheelEvent {
-                    direction: MouseWheelDirection::Up,
-                    column: 0,
-                    row: 0,
-                    modifiers: MouseModifiers::default(),
-                },
-                None,
-                true,
-            )
+        let MouseInputOutcome::Scrolled(history) = terminal
+            .mouse_input(wheel(MouseWheelDirection::Up, 0, 0), None, true)
             .unwrap()
         else {
             panic!("history wheel was forwarded")
@@ -2283,6 +2677,18 @@ mod tests {
         let complete = terminal.feed(b"26l").unwrap().unwrap();
         assert!(text(&complete).starts_with("NEW_PARTIAL_COMPLETE"));
         assert!(!text(&complete).contains("OLD_AT_RIGHT"));
+    }
+
+    #[test]
+    fn idle_flushes_publish_nothing_for_a_quiet_terminal() {
+        let mut terminal = terminal(20, 1);
+        let fed = terminal.feed(b"QUIET").unwrap().unwrap();
+        assert!(text(&fed).starts_with("QUIET"));
+
+        for _ in 0..3 {
+            assert!(terminal.flush_synchronized_output().unwrap().is_none());
+        }
+        assert_eq!(terminal.snapshot().unwrap().revision, fed.revision + 1);
     }
 
     #[test]

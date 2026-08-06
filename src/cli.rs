@@ -1229,6 +1229,7 @@ mod tests {
         );
         assert_eq!(shutdown_downgrade_version(1), None);
         assert_eq!(shutdown_downgrade_version(2), None);
+        assert_eq!(shutdown_downgrade_version(3), None);
         assert_eq!(shutdown_downgrade_version(PROTOCOL_VERSION), None);
         assert_eq!(shutdown_downgrade_version(PROTOCOL_VERSION + 1), None);
         assert_eq!(shutdown_downgrade_version(u16::MAX), None);

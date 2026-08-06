@@ -29,7 +29,7 @@ Doctor reports:
 - a bounded Fut protocol handshake when a safe socket exists;
 - the configured icon preset and a visual glyph probe.
 
-The current development protocol is `3` and requires an exact client/daemon match. A successful handshake reports a compatible protocol-`3` daemon; any other protocol version is incompatible.
+The current development protocol is `4` and requires an exact client/daemon match. A successful handshake reports a compatible protocol-`4` daemon; any other protocol version is incompatible.
 
 ## Nerd Fonts
 

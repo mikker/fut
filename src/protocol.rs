@@ -9,8 +9,8 @@ use std::path::PathBuf;
 
 use crate::{
     domain::{
-        AgentReport, CopyModeAction, CopyModeError, MouseWheelEvent, PaneId, ScreenSnapshot,
-        SessionId, TabId, TerminalId, TerminalSize, WorkspaceId,
+        AgentReport, CopyModeAction, CopyModeError, MouseEvent, PaneId, ScreenSnapshot, SessionId,
+        TabId, TerminalId, TerminalSize, WorkspaceId,
     },
     resources::{ResourceSnapshot, SessionSelector, TargetSelector},
     splits::{SplitDirection, SplitTree},
@@ -19,7 +19,7 @@ use crate::{
 /// Protocol version used by released Fut 0.1 builds.
 pub const PROTOCOL_VERSION_0_1: u16 = 0;
 /// Current clients and daemons require an exact protocol match.
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 /// Enough for 50,000 individually styled JSON cells while remaining a firm
 /// pre-allocation bound for the length-delimited transport.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
@@ -115,9 +115,9 @@ pub enum ClientMessage {
         text: String,
     },
     /// Fire-and-forget; its envelope must not carry a request ID.
-    MouseWheel {
+    MouseInput {
         terminal_id: TerminalId,
-        event: MouseWheelEvent,
+        event: MouseEvent,
     },
     /// Fire-and-forget; its envelope must not carry a request ID.
     ResetViewport {
@@ -343,8 +343,8 @@ mod tests {
 
     use super::*;
     use crate::domain::{
-        Cell, Cursor, MAX_CELL_CONTENT_BYTES, MAX_VISIBLE_CELLS, MouseModifiers,
-        MouseWheelDirection, MouseWheelEvent,
+        Cell, Cursor, MAX_CELL_CONTENT_BYTES, MAX_VISIBLE_CELLS, MouseButton, MouseButtons,
+        MouseEvent, MouseEventKind, MouseModifiers, MouseWheelDirection,
     };
 
     fn ping(request_id: Option<Uuid>) -> Envelope<ClientMessage> {
@@ -698,29 +698,50 @@ mod tests {
             switched
         );
         assert_eq!(PROTOCOL_VERSION_0_1, 0);
-        assert_eq!(PROTOCOL_VERSION, 3);
+        assert_eq!(PROTOCOL_VERSION, 4);
     }
 
     #[test]
     fn resize_and_selected_view_round_trip() {
         let terminal_id = TerminalId::new();
-        let wheel = ClientMessage::MouseWheel {
-            terminal_id,
-            event: MouseWheelEvent {
-                direction: MouseWheelDirection::Up,
-                column: 12,
-                row: 4,
-                modifiers: MouseModifiers {
-                    shift: true,
-                    control: false,
-                    alt: true,
-                },
+        for kind in [
+            MouseEventKind::Press {
+                button: MouseButton::Left,
             },
-        };
-        assert_eq!(
-            decode_payload::<ClientMessage>(&encode_payload(&wheel).unwrap()).unwrap(),
-            wheel
-        );
+            MouseEventKind::Release {
+                button: MouseButton::Middle,
+            },
+            MouseEventKind::Motion {
+                button: Some(MouseButton::Right),
+            },
+            MouseEventKind::Motion { button: None },
+            MouseEventKind::Wheel {
+                direction: MouseWheelDirection::Up,
+            },
+        ] {
+            let mouse = ClientMessage::MouseInput {
+                terminal_id,
+                event: MouseEvent {
+                    kind,
+                    column: 12,
+                    row: 4,
+                    modifiers: MouseModifiers {
+                        shift: true,
+                        control: false,
+                        alt: true,
+                    },
+                    buttons: MouseButtons {
+                        left: true,
+                        middle: false,
+                        right: true,
+                    },
+                },
+            };
+            assert_eq!(
+                decode_payload::<ClientMessage>(&encode_payload(&mouse).unwrap()).unwrap(),
+                mouse
+            );
+        }
         let reset = ClientMessage::ResetViewport { terminal_id };
         assert_eq!(
             decode_payload::<ClientMessage>(&encode_payload(&reset).unwrap()).unwrap(),

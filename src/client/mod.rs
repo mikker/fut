@@ -31,7 +31,8 @@ use crossterm::{
     cursor::{Hide, Show},
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, EventStream, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        Event, EventStream, KeyModifiers, MouseButton as HostMouseButton,
+        MouseEvent as HostMouseEvent, MouseEventKind as HostMouseEventKind,
     },
     execute,
     terminal::{
@@ -66,8 +67,8 @@ use tab_bar::{TabBarAction, TabBarState};
 
 use crate::{
     domain::{
-        CellColor, CellStyle, MouseModifiers, MouseWheelDirection, MouseWheelEvent, ScreenSnapshot,
-        TerminalId, TerminalSize,
+        CellColor, CellStyle, MouseButton, MouseButtons, MouseEvent, MouseEventKind,
+        MouseModifiers, MouseWheelDirection, ScreenSnapshot, TerminalId, TerminalSize,
     },
     protocol::{
         ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, SelectedTarget, SelectedView,
@@ -87,11 +88,29 @@ enum ClientSurface {
 
 #[derive(Debug, Eq, PartialEq)]
 enum PaneMouseAction {
-    Wheel {
+    Input {
         terminal_id: TerminalId,
-        event: MouseWheelEvent,
+        event: MouseEvent,
     },
     Focus(crate::domain::PaneId),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum MouseButtonState {
+    #[default]
+    Idle,
+    Suppressed,
+    Captured {
+        terminal_id: TerminalId,
+        column: u16,
+        row: u16,
+        modifiers: MouseModifiers,
+    },
+}
+
+#[derive(Default)]
+struct MouseInputState {
+    buttons: [MouseButtonState; 3],
 }
 
 enum ClipboardResult {
@@ -172,6 +191,7 @@ async fn run(
 ) -> anyhow::Result<()> {
     let mut events = EventStream::new();
     let mut prefix = PrefixState::new(ui.bindings.clone());
+    let mut mouse_input = MouseInputState::default();
     let mut view = ViewState::new(selected)?;
     let mut resources = ResourceState::default();
     let mut surface: Option<ClientSurface> = None;
@@ -412,6 +432,9 @@ async fn run(
                             }
                             continue;
                         }
+                        if old_terminal != view.focused().terminal_id {
+                            mouse_input.clear();
+                        }
                         workspace_history.record_transition(&previous_target, view.focused());
                         if copy_mode.as_ref().is_some_and(|copy_mode| {
                             copy_mode.terminal_id() != view.focused().terminal_id
@@ -511,6 +534,7 @@ async fn run(
                             copy_mode = None;
                         }
                         if terminal_id == view.focused().terminal_id {
+                            mouse_input.clear();
                             pending_focused_exit = Some(exit_code);
                             force_draw = true;
                             continue;
@@ -611,7 +635,14 @@ async fn run(
                 }
             }
             event = events.next(), if accepts_client_input(&focus, &create_workspace, &create_tab, &split_pane, &pending_focused_exit) => {
-                let Some(event) = event else { break };
+                let Some(event) = event else {
+                    release_captured_mouse_input(
+                        framed,
+                        &mut mouse_input,
+                        view.focused().terminal_id,
+                    ).await?;
+                    break
+                };
                 match event? {
                     Event::Key(key) if copy_mode.is_some() => {
                         notice = None;
@@ -684,6 +715,11 @@ async fn run(
                                 force_draw = true;
                             }
                             NotificationsAction::Select(pane_id) => {
+                                release_captured_mouse_input(
+                                    framed,
+                                    &mut mouse_input,
+                                    view.focused().terminal_id,
+                                ).await?;
                                 surface = None;
                                 view.invalidate_drawn();
                                 if let Some(request) = focus.begin(FocusOrigin::Notification) {
@@ -715,6 +751,11 @@ async fn run(
                                 force_draw = true;
                             }
                             NavigatorAction::Select(selector) => {
+                                release_captured_mouse_input(
+                                    framed,
+                                    &mut mouse_input,
+                                    view.focused().terminal_id,
+                                ).await?;
                                 let request = Uuid::new_v4();
                                 match surface.as_mut().expect("navigator exists") {
                                     ClientSurface::Navigator(nav) => nav.begin_switch(request),
@@ -770,6 +811,11 @@ async fn run(
                                 force_draw = true;
                             }
                             WorkspaceSidebarAction::Select(pane_id) => {
+                                release_captured_mouse_input(
+                                    framed,
+                                    &mut mouse_input,
+                                    view.focused().terminal_id,
+                                ).await?;
                                 if let Some(request) = focus.begin(FocusOrigin::Workspace) {
                                     match surface.as_mut().expect("workspace sidebar exists") {
                                         ClientSurface::WorkspaceSidebar(sidebar) => sidebar.begin_switch(),
@@ -833,6 +879,11 @@ async fn run(
                                 force_draw = true;
                             }
                             TabBarAction::Select(pane_id) => {
+                                release_captured_mouse_input(
+                                    framed,
+                                    &mut mouse_input,
+                                    view.focused().terminal_id,
+                                ).await?;
                                 if let Some(request) = focus.begin(FocusOrigin::Tab) {
                                     send_request(
                                         framed,
@@ -867,6 +918,11 @@ async fn run(
                                 force_draw = true;
                             }
                             CommandBarAction::Dispatch(action) => {
+                                release_captured_mouse_input(
+                                    framed,
+                                    &mut mouse_input,
+                                    view.focused().terminal_id,
+                                ).await?;
                                 surface = None;
                                 view.invalidate_drawn();
                                 notice = dispatch_client_action(
@@ -900,21 +956,31 @@ async fn run(
                             &ui,
                             resources.workspace_count(view.focused()),
                         ).terminal;
-                        if let Some(action) =
-                            pane_mouse_action(&view, terminal_area, ui.pane_layout, mouse)
+                        if let Some(action) = mouse_input.route(
+                            &view,
+                            terminal_area,
+                            ui.pane_layout,
+                            mouse,
+                        )
                         {
                             match action {
-                                PaneMouseAction::Wheel { terminal_id, event } => {
+                                PaneMouseAction::Input { terminal_id, event } => {
                                     send(
                                         framed,
-                                        ClientMessage::MouseWheel {
+                                        ClientMessage::MouseInput {
                                             terminal_id,
                                             event,
                                         },
                                     ).await?;
+                                    mouse_input.finish_release(terminal_id, event);
                                 }
                                 PaneMouseAction::Focus(pane_id) => {
                                     if let Some(request) = focus.begin(FocusOrigin::Pane) {
+                                        release_captured_mouse_input(
+                                            framed,
+                                            &mut mouse_input,
+                                            view.focused().terminal_id,
+                                        ).await?;
                                         send_request(
                                             framed,
                                             Some(request),
@@ -930,6 +996,7 @@ async fn run(
                             }
                         }
                     }
+                    Event::Mouse(mouse) => mouse_input.discard(mouse),
                     Event::Key(key) if surface.is_none() && copy_mode.is_none() => if let Some(bytes) = encode_key(key) {
                         notice = None;
                         match prefix.feed(bytes) {
@@ -942,6 +1009,11 @@ async fn run(
                                 ).await?;
                             }
                             PrefixAction::Dispatch(action) => {
+                                release_captured_mouse_input(
+                                    framed,
+                                    &mut mouse_input,
+                                    view.focused().terminal_id,
+                                ).await?;
                                 send(
                                     framed,
                                     ClientMessage::ResetViewport {
@@ -971,6 +1043,11 @@ async fn run(
                         send(framed, ClientMessage::Paste { text }).await?
                     }
                     Event::Resize(columns, rows) if columns > 0 && rows > 0 => {
+                        release_captured_mouse_input(
+                            framed,
+                            &mut mouse_input,
+                            view.focused().terminal_id,
+                        ).await?;
                         if copy_mode.is_none() {
                             send(
                                 framed,
@@ -1237,42 +1314,322 @@ fn accepts_client_input(
         && pending_focused_exit.is_none()
 }
 
-fn mouse_wheel_event(mouse: MouseEvent, column: u16, row: u16) -> MouseWheelEvent {
-    MouseWheelEvent {
-        direction: match mouse.kind {
-            MouseEventKind::ScrollUp => MouseWheelDirection::Up,
-            MouseEventKind::ScrollDown => MouseWheelDirection::Down,
-            _ => unreachable!("wheel conversion requires a vertical wheel event"),
-        },
-        column,
-        row,
-        modifiers: MouseModifiers {
-            shift: mouse.modifiers.contains(KeyModifiers::SHIFT),
-            control: mouse.modifiers.contains(KeyModifiers::CONTROL),
-            alt: mouse.modifiers.contains(KeyModifiers::ALT),
-        },
+impl MouseInputState {
+    fn route(
+        &mut self,
+        view: &ViewState,
+        area: Rect,
+        policy: PaneLayoutPolicy,
+        mouse: HostMouseEvent,
+    ) -> Option<PaneMouseAction> {
+        match mouse.kind {
+            HostMouseEventKind::ScrollUp | HostMouseEventKind::ScrollDown => {
+                let (target, column, row) = view.pane_at(area, policy, mouse.column, mouse.row)?;
+                Some(PaneMouseAction::Input {
+                    terminal_id: target.terminal_id,
+                    event: normalized_mouse_event(
+                        mouse,
+                        MouseEventKind::Wheel {
+                            direction: if mouse.kind == HostMouseEventKind::ScrollUp {
+                                MouseWheelDirection::Up
+                            } else {
+                                MouseWheelDirection::Down
+                            },
+                        },
+                        column,
+                        row,
+                        self.captured_buttons(target.terminal_id, None),
+                    ),
+                })
+            }
+            HostMouseEventKind::ScrollLeft | HostMouseEventKind::ScrollRight => None,
+            HostMouseEventKind::Down(button) => {
+                let button = normalize_mouse_button(button);
+                if !matches!(self.button(button), MouseButtonState::Idle) {
+                    return None;
+                }
+                let Some((target, column, row)) =
+                    view.pane_at(area, policy, mouse.column, mouse.row)
+                else {
+                    self.suppress(button);
+                    return None;
+                };
+                if target.terminal_id != view.focused().terminal_id {
+                    self.suppress(button);
+                    return (button == MouseButton::Left)
+                        .then_some(PaneMouseAction::Focus(target.pane_id));
+                }
+
+                self.set_button(
+                    button,
+                    MouseButtonState::Captured {
+                        terminal_id: target.terminal_id,
+                        column,
+                        row,
+                        modifiers: normalized_mouse_modifiers(mouse.modifiers),
+                    },
+                );
+                Some(PaneMouseAction::Input {
+                    terminal_id: target.terminal_id,
+                    event: normalized_mouse_event(
+                        mouse,
+                        MouseEventKind::Press { button },
+                        column,
+                        row,
+                        self.captured_buttons(target.terminal_id, None),
+                    ),
+                })
+            }
+            HostMouseEventKind::Up(button) => {
+                let button = normalize_mouse_button(button);
+                let MouseButtonState::Captured {
+                    terminal_id,
+                    column: previous_column,
+                    row: previous_row,
+                    ..
+                } = self.button(button)
+                else {
+                    self.set_button(button, MouseButtonState::Idle);
+                    return None;
+                };
+                if terminal_id != view.focused().terminal_id {
+                    self.set_button(button, MouseButtonState::Idle);
+                    return None;
+                }
+                let (column, row) = view
+                    .terminal_cell(area, policy, terminal_id, mouse.column, mouse.row, true)
+                    .unwrap_or((previous_column, previous_row));
+                self.set_button(
+                    button,
+                    MouseButtonState::Captured {
+                        terminal_id,
+                        column,
+                        row,
+                        modifiers: normalized_mouse_modifiers(mouse.modifiers),
+                    },
+                );
+                Some(PaneMouseAction::Input {
+                    terminal_id,
+                    event: normalized_mouse_event(
+                        mouse,
+                        MouseEventKind::Release { button },
+                        column,
+                        row,
+                        self.captured_buttons(terminal_id, Some(button)),
+                    ),
+                })
+            }
+            HostMouseEventKind::Drag(button) => {
+                let button = normalize_mouse_button(button);
+                let MouseButtonState::Captured { terminal_id, .. } = self.button(button) else {
+                    self.suppress(button);
+                    return None;
+                };
+                if terminal_id != view.focused().terminal_id {
+                    self.set_button(button, MouseButtonState::Idle);
+                    return None;
+                }
+                let (column, row) =
+                    view.terminal_cell(area, policy, terminal_id, mouse.column, mouse.row, true)?;
+                self.set_button(
+                    button,
+                    MouseButtonState::Captured {
+                        terminal_id,
+                        column,
+                        row,
+                        modifiers: normalized_mouse_modifiers(mouse.modifiers),
+                    },
+                );
+                Some(PaneMouseAction::Input {
+                    terminal_id,
+                    event: normalized_mouse_event(
+                        mouse,
+                        MouseEventKind::Motion {
+                            button: Some(button),
+                        },
+                        column,
+                        row,
+                        self.captured_buttons(terminal_id, None),
+                    ),
+                })
+            }
+            HostMouseEventKind::Moved => {
+                let (target, column, row) = view.pane_at(area, policy, mouse.column, mouse.row)?;
+                if target.terminal_id != view.focused().terminal_id {
+                    return None;
+                }
+                Some(PaneMouseAction::Input {
+                    terminal_id: target.terminal_id,
+                    event: normalized_mouse_event(
+                        mouse,
+                        MouseEventKind::Motion { button: None },
+                        column,
+                        row,
+                        self.captured_buttons(target.terminal_id, None),
+                    ),
+                })
+            }
+        }
+    }
+
+    fn discard(&mut self, mouse: HostMouseEvent) {
+        match mouse.kind {
+            HostMouseEventKind::Down(button) | HostMouseEventKind::Drag(button) => {
+                let button = normalize_mouse_button(button);
+                self.suppress(button);
+            }
+            HostMouseEventKind::Up(button) => {
+                let button = normalize_mouse_button(button);
+                self.set_button(button, MouseButtonState::Idle);
+            }
+            HostMouseEventKind::Moved
+            | HostMouseEventKind::ScrollDown
+            | HostMouseEventKind::ScrollUp
+            | HostMouseEventKind::ScrollLeft
+            | HostMouseEventKind::ScrollRight => {}
+        }
+    }
+
+    fn suppress(&mut self, button: MouseButton) {
+        if !matches!(self.button(button), MouseButtonState::Captured { .. }) {
+            self.set_button(button, MouseButtonState::Suppressed);
+        }
+    }
+
+    fn button(&self, button: MouseButton) -> MouseButtonState {
+        self.buttons[mouse_button_index(button)]
+    }
+
+    fn set_button(&mut self, button: MouseButton, state: MouseButtonState) {
+        self.buttons[mouse_button_index(button)] = state;
+    }
+
+    fn captured_buttons(
+        &self,
+        terminal_id: TerminalId,
+        excluding: Option<MouseButton>,
+    ) -> MouseButtons {
+        let mut buttons = MouseButtons::default();
+        for button in MouseButton::ALL {
+            if excluding != Some(button)
+                && matches!(
+                    self.button(button),
+                    MouseButtonState::Captured {
+                        terminal_id: captured,
+                        ..
+                    } if captured == terminal_id
+                )
+            {
+                buttons.set(button, true);
+            }
+        }
+        buttons
+    }
+
+    fn synthetic_releases(&self, focused_terminal_id: TerminalId) -> Vec<PaneMouseAction> {
+        let mut held = self.captured_buttons(focused_terminal_id, None);
+        let mut releases = Vec::new();
+        for button in MouseButton::ALL {
+            let MouseButtonState::Captured {
+                terminal_id,
+                column,
+                row,
+                modifiers,
+            } = self.button(button)
+            else {
+                continue;
+            };
+            if terminal_id != focused_terminal_id {
+                continue;
+            }
+            held.set(button, false);
+            releases.push(PaneMouseAction::Input {
+                terminal_id,
+                event: MouseEvent {
+                    kind: MouseEventKind::Release { button },
+                    column,
+                    row,
+                    modifiers,
+                    buttons: held,
+                },
+            });
+        }
+        releases
+    }
+
+    fn finish_release(&mut self, terminal_id: TerminalId, event: MouseEvent) {
+        let MouseEventKind::Release { button } = event.kind else {
+            return;
+        };
+        if matches!(
+            self.button(button),
+            MouseButtonState::Captured {
+                terminal_id: captured,
+                ..
+            } if captured == terminal_id
+        ) {
+            self.set_button(button, MouseButtonState::Idle);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.buttons.fill(MouseButtonState::Idle);
     }
 }
 
-fn pane_mouse_action(
-    view: &ViewState,
-    area: Rect,
-    policy: PaneLayoutPolicy,
-    mouse: MouseEvent,
-) -> Option<PaneMouseAction> {
-    let (target, column, row) = view.pane_at(area, policy, mouse.column, mouse.row)?;
-    match mouse.kind {
-        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => Some(PaneMouseAction::Wheel {
-            terminal_id: target.terminal_id,
-            event: mouse_wheel_event(mouse, column, row),
-        }),
-        MouseEventKind::Down(MouseButton::Left)
-            if target.terminal_id != view.focused().terminal_id =>
-        {
-            Some(PaneMouseAction::Focus(target.pane_id))
-        }
-        _ => None,
+fn normalized_mouse_event(
+    mouse: HostMouseEvent,
+    kind: MouseEventKind,
+    column: u16,
+    row: u16,
+    buttons: MouseButtons,
+) -> MouseEvent {
+    MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: normalized_mouse_modifiers(mouse.modifiers),
+        buttons,
     }
+}
+
+fn normalized_mouse_modifiers(modifiers: KeyModifiers) -> MouseModifiers {
+    MouseModifiers {
+        shift: modifiers.contains(KeyModifiers::SHIFT),
+        control: modifiers.contains(KeyModifiers::CONTROL),
+        alt: modifiers.contains(KeyModifiers::ALT),
+    }
+}
+
+fn normalize_mouse_button(button: HostMouseButton) -> MouseButton {
+    match button {
+        HostMouseButton::Left => MouseButton::Left,
+        HostMouseButton::Middle => MouseButton::Middle,
+        HostMouseButton::Right => MouseButton::Right,
+    }
+}
+
+fn mouse_button_index(button: MouseButton) -> usize {
+    match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    }
+}
+
+async fn release_captured_mouse_input(
+    framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    state: &mut MouseInputState,
+    focused_terminal_id: TerminalId,
+) -> anyhow::Result<()> {
+    for action in state.synthetic_releases(focused_terminal_id) {
+        let PaneMouseAction::Input { terminal_id, event } = action else {
+            unreachable!("synthetic mouse releases are terminal input")
+        };
+        send(framed, ClientMessage::MouseInput { terminal_id, event }).await?;
+    }
+    state.clear();
+    Ok(())
 }
 
 #[allow(
@@ -2160,6 +2517,32 @@ impl ViewState {
         })
     }
 
+    fn terminal_cell(
+        &self,
+        area: Rect,
+        policy: PaneLayoutPolicy,
+        terminal_id: TerminalId,
+        column: u16,
+        row: u16,
+        clamp: bool,
+    ) -> Option<(u16, u16)> {
+        let content = self.pane_layouts(area, policy).0.get(&terminal_id)?.content;
+        if content.width == 0 || content.height == 0 {
+            return None;
+        }
+        let inside = column >= content.x
+            && column < content.x.saturating_add(content.width)
+            && row >= content.y
+            && row < content.y.saturating_add(content.height);
+        if !inside && !clamp {
+            return None;
+        }
+        Some((
+            column.saturating_sub(content.x).min(content.width - 1),
+            row.saturating_sub(content.y).min(content.height - 1),
+        ))
+    }
+
     fn resize_requests(
         &mut self,
         area: Rect,
@@ -2353,8 +2736,10 @@ impl TerminalGuard {
         guard.alternate_screen = true;
         execute!(io::stdout(), EnableBracketedPaste)?;
         guard.bracketed_paste = true;
-        execute!(io::stdout(), EnableMouseCapture)?;
+        // Mark capture before the multi-sequence command so a partial write or
+        // flush failure still runs the disabling cleanup in Drop.
         guard.mouse_capture = true;
+        execute!(io::stdout(), EnableMouseCapture)?;
         execute!(io::stdout(), Hide)?;
         guard.cursor_hidden = true;
         execute!(io::stdout(), DisableLineWrap)?;
@@ -2662,48 +3047,511 @@ mod tests {
     }
 
     #[test]
-    fn crossterm_wheel_is_normalized_for_the_terminal_protocol() {
-        let event = mouse_wheel_event(
-            MouseEvent {
-                kind: MouseEventKind::ScrollDown,
-                column: 30,
-                row: 12,
+    fn crossterm_wheel_is_hit_tested_and_normalized_for_the_terminal_protocol() {
+        let panes = targets(2);
+        let state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
+        let area = Rect::new(7, 3, 49, 8);
+        let content =
+            state.pane_layouts(area, PaneLayoutPolicy::Splits).0[&panes[1].terminal_id].content;
+        let mut input = MouseInputState::default();
+        let action = input.route(
+            &state,
+            area,
+            PaneLayoutPolicy::Splits,
+            HostMouseEvent {
+                kind: HostMouseEventKind::ScrollDown,
+                column: content.x + 4,
+                row: content.y + 2,
                 modifiers: KeyModifiers::SHIFT | KeyModifiers::ALT,
             },
-            4,
-            2,
         );
-        assert_eq!(event.direction, MouseWheelDirection::Down);
-        assert_eq!((event.column, event.row), (4, 2));
         assert_eq!(
-            event.modifiers,
-            MouseModifiers {
-                shift: true,
-                control: false,
-                alt: true,
-            }
+            action,
+            Some(PaneMouseAction::Input {
+                terminal_id: panes[1].terminal_id,
+                event: MouseEvent {
+                    kind: MouseEventKind::Wheel {
+                        direction: MouseWheelDirection::Down,
+                    },
+                    column: 4,
+                    row: 2,
+                    modifiers: MouseModifiers {
+                        shift: true,
+                        control: false,
+                        alt: true,
+                    },
+                    buttons: Default::default(),
+                },
+            })
         );
     }
 
     #[test]
-    fn left_click_on_an_unfocused_pane_chooses_typed_pane_focus() {
+    fn unfocused_left_click_focuses_and_swallows_the_complete_initiating_gesture() {
         let panes = targets(2);
-        let state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
+        let mut state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
         let area = Rect::new(0, 0, 49, 8);
         let content =
             state.pane_layouts(area, PaneLayoutPolicy::Splits).0[&panes[1].terminal_id].content;
-        let action = pane_mouse_action(
+        let mut input = MouseInputState::default();
+        let action = input.route(
             &state,
             area,
             PaneLayoutPolicy::Splits,
-            MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
+            HostMouseEvent {
+                kind: HostMouseEventKind::Down(HostMouseButton::Left),
                 column: content.x,
                 row: content.y,
                 modifiers: KeyModifiers::NONE,
             },
         );
         assert_eq!(action, Some(PaneMouseAction::Focus(panes[1].pane_id)));
+
+        state
+            .replace(selected_view(1, panes[1].clone(), panes.clone()))
+            .unwrap();
+        assert_eq!(
+            input.route(
+                &state,
+                area,
+                PaneLayoutPolicy::Splits,
+                HostMouseEvent {
+                    kind: HostMouseEventKind::Up(HostMouseButton::Left),
+                    column: content.x,
+                    row: content.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+            ),
+            None
+        );
+
+        let action = input.route(
+            &state,
+            area,
+            PaneLayoutPolicy::Splits,
+            HostMouseEvent {
+                kind: HostMouseEventKind::Down(HostMouseButton::Left),
+                column: content.x + 2,
+                row: content.y + 1,
+                modifiers: KeyModifiers::CONTROL,
+            },
+        );
+        assert!(matches!(
+            action,
+            Some(PaneMouseAction::Input {
+                terminal_id,
+                event: MouseEvent {
+                    kind: MouseEventKind::Press { button: MouseButton::Left },
+                    column: 2,
+                    row: 1,
+                    modifiers: MouseModifiers { control: true, .. },
+                    buttons: MouseButtons { left: true, .. },
+                },
+            }) if terminal_id == panes[1].terminal_id
+        ));
+    }
+
+    #[test]
+    fn focused_drag_is_captured_clamped_and_modal_mouse_is_discarded() {
+        let panes = targets(2);
+        let state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
+        let area = Rect::new(7, 3, 49, 8);
+        let content =
+            state.pane_layouts(area, PaneLayoutPolicy::Splits).0[&panes[0].terminal_id].content;
+        let background =
+            state.pane_layouts(area, PaneLayoutPolicy::Splits).0[&panes[1].terminal_id].content;
+        let mut input = MouseInputState::default();
+
+        assert_eq!(
+            input.route(
+                &state,
+                area,
+                PaneLayoutPolicy::Splits,
+                HostMouseEvent {
+                    kind: HostMouseEventKind::Moved,
+                    column: background.x,
+                    row: background.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+            ),
+            None
+        );
+        assert!(matches!(
+            input.route(
+                &state,
+                area,
+                PaneLayoutPolicy::Splits,
+                HostMouseEvent {
+                    kind: HostMouseEventKind::Moved,
+                    column: content.x,
+                    row: content.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+            ),
+            Some(PaneMouseAction::Input {
+                event: MouseEvent {
+                    kind: MouseEventKind::Motion { button: None },
+                    ..
+                },
+                ..
+            })
+        ));
+        assert!(matches!(
+            input.route(
+                &state,
+                area,
+                PaneLayoutPolicy::Splits,
+                HostMouseEvent {
+                    kind: HostMouseEventKind::Down(HostMouseButton::Left),
+                    column: content.x + 1,
+                    row: content.y + 1,
+                    modifiers: KeyModifiers::NONE,
+                },
+            ),
+            Some(PaneMouseAction::Input { .. })
+        ));
+        let drag = input.route(
+            &state,
+            area,
+            PaneLayoutPolicy::Splits,
+            HostMouseEvent {
+                kind: HostMouseEventKind::Drag(HostMouseButton::Left),
+                column: u16::MAX,
+                row: u16::MAX,
+                modifiers: KeyModifiers::ALT,
+            },
+        );
+        assert!(matches!(
+            drag,
+            Some(PaneMouseAction::Input {
+                terminal_id,
+                event: MouseEvent {
+                    kind: MouseEventKind::Motion { button: Some(MouseButton::Left) },
+                    column,
+                    row,
+                    buttons: MouseButtons { left: true, .. },
+                    ..
+                },
+            }) if terminal_id == panes[0].terminal_id
+                && column == content.width - 1
+                && row == content.height - 1
+        ));
+        assert!(matches!(
+            input.route(
+                &state,
+                area,
+                PaneLayoutPolicy::Splits,
+                HostMouseEvent {
+                    kind: HostMouseEventKind::Up(HostMouseButton::Left),
+                    column: u16::MAX,
+                    row: u16::MAX,
+                    modifiers: KeyModifiers::NONE,
+                },
+            ),
+            Some(PaneMouseAction::Input {
+                event: MouseEvent {
+                    kind: MouseEventKind::Release { .. },
+                    buttons: MouseButtons { left: false, .. },
+                    ..
+                },
+                ..
+            })
+        ));
+
+        input.discard(HostMouseEvent {
+            kind: HostMouseEventKind::Down(HostMouseButton::Right),
+            column: content.x,
+            row: content.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            input.route(
+                &state,
+                area,
+                PaneLayoutPolicy::Splits,
+                HostMouseEvent {
+                    kind: HostMouseEventKind::Drag(HostMouseButton::Right),
+                    column: content.x + 1,
+                    row: content.y + 1,
+                    modifiers: KeyModifiers::NONE,
+                },
+            ),
+            None
+        );
+        input.discard(HostMouseEvent {
+            kind: HostMouseEventKind::Up(HostMouseButton::Right),
+            column: content.x + 1,
+            row: content.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    #[test]
+    fn per_button_capture_derives_destination_buttons_and_orders_synthetic_releases() {
+        let panes = targets(2);
+        let state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
+        let area = Rect::new(7, 3, 49, 8);
+        let layouts = state.pane_layouts(area, PaneLayoutPolicy::Splits).0;
+        let focused = layouts[&panes[0].terminal_id].content;
+        let background = layouts[&panes[1].terminal_id].content;
+        let mut input = MouseInputState::default();
+
+        assert!(matches!(
+            input.route(
+                &state,
+                area,
+                PaneLayoutPolicy::Splits,
+                HostMouseEvent {
+                    kind: HostMouseEventKind::Down(HostMouseButton::Left),
+                    column: focused.x + 1,
+                    row: focused.y + 1,
+                    modifiers: KeyModifiers::SHIFT,
+                },
+            ),
+            Some(PaneMouseAction::Input {
+                event: MouseEvent {
+                    buttons: MouseButtons {
+                        left: true,
+                        middle: false,
+                        right: false,
+                    },
+                    ..
+                },
+                ..
+            })
+        ));
+        assert_eq!(
+            input.route(
+                &state,
+                area,
+                PaneLayoutPolicy::Splits,
+                HostMouseEvent {
+                    kind: HostMouseEventKind::Down(HostMouseButton::Middle),
+                    column: background.x,
+                    row: background.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+            ),
+            None
+        );
+        assert!(matches!(
+            input.route(
+                &state,
+                area,
+                PaneLayoutPolicy::Splits,
+                HostMouseEvent {
+                    kind: HostMouseEventKind::ScrollUp,
+                    column: focused.x + 2,
+                    row: focused.y + 2,
+                    modifiers: KeyModifiers::NONE,
+                },
+            ),
+            Some(PaneMouseAction::Input {
+                event: MouseEvent {
+                    buttons: MouseButtons {
+                        left: true,
+                        middle: false,
+                        right: false,
+                    },
+                    ..
+                },
+                ..
+            })
+        ));
+        assert!(matches!(
+            input.route(
+                &state,
+                area,
+                PaneLayoutPolicy::Splits,
+                HostMouseEvent {
+                    kind: HostMouseEventKind::Down(HostMouseButton::Right),
+                    column: focused.x + 3,
+                    row: focused.y + 2,
+                    modifiers: KeyModifiers::CONTROL,
+                },
+            ),
+            Some(PaneMouseAction::Input {
+                event: MouseEvent {
+                    buttons: MouseButtons {
+                        left: true,
+                        middle: false,
+                        right: true,
+                    },
+                    ..
+                },
+                ..
+            })
+        ));
+        input.route(
+            &state,
+            area,
+            PaneLayoutPolicy::Splits,
+            HostMouseEvent {
+                kind: HostMouseEventKind::Drag(HostMouseButton::Left),
+                column: focused.x + 4,
+                row: focused.y + 3,
+                modifiers: KeyModifiers::ALT,
+            },
+        );
+
+        assert_eq!(
+            input.synthetic_releases(panes[0].terminal_id),
+            vec![
+                PaneMouseAction::Input {
+                    terminal_id: panes[0].terminal_id,
+                    event: MouseEvent {
+                        kind: MouseEventKind::Release {
+                            button: MouseButton::Left,
+                        },
+                        column: 4,
+                        row: 3,
+                        modifiers: MouseModifiers {
+                            alt: true,
+                            ..Default::default()
+                        },
+                        buttons: MouseButtons {
+                            right: true,
+                            ..Default::default()
+                        },
+                    },
+                },
+                PaneMouseAction::Input {
+                    terminal_id: panes[0].terminal_id,
+                    event: MouseEvent {
+                        kind: MouseEventKind::Release {
+                            button: MouseButton::Right,
+                        },
+                        column: 3,
+                        row: 2,
+                        modifiers: MouseModifiers {
+                            control: true,
+                            ..Default::default()
+                        },
+                        buttons: MouseButtons::default(),
+                    },
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn real_release_updates_capture_before_forwarding_and_clears_only_after_send() {
+        let panes = targets(1);
+        let state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
+        let area = Rect::new(7, 3, 20, 8);
+        let content =
+            state.pane_layouts(area, PaneLayoutPolicy::Splits).0[&panes[0].terminal_id].content;
+        let mut input = MouseInputState::default();
+        input.route(
+            &state,
+            area,
+            PaneLayoutPolicy::Splits,
+            HostMouseEvent {
+                kind: HostMouseEventKind::Down(HostMouseButton::Left),
+                column: content.x,
+                row: content.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
+        let Some(PaneMouseAction::Input { terminal_id, event }) = input.route(
+            &state,
+            area,
+            PaneLayoutPolicy::Splits,
+            HostMouseEvent {
+                kind: HostMouseEventKind::Up(HostMouseButton::Left),
+                column: content.x + 5,
+                row: content.y + 2,
+                modifiers: KeyModifiers::ALT,
+            },
+        ) else {
+            panic!("captured release was not forwarded")
+        };
+        assert_eq!(
+            event,
+            MouseEvent {
+                kind: MouseEventKind::Release {
+                    button: MouseButton::Left,
+                },
+                column: 5,
+                row: 2,
+                modifiers: MouseModifiers {
+                    alt: true,
+                    ..Default::default()
+                },
+                buttons: MouseButtons::default(),
+            }
+        );
+        assert!(matches!(
+            input.button(MouseButton::Left),
+            MouseButtonState::Captured {
+                column: 5,
+                row: 2,
+                modifiers: MouseModifiers { alt: true, .. },
+                ..
+            }
+        ));
+        input.finish_release(terminal_id, event);
+        assert_eq!(input.button(MouseButton::Left), MouseButtonState::Idle);
+    }
+
+    #[test]
+    fn failed_focus_gesture_stays_suppressed_without_replay() {
+        let panes = targets(2);
+        let state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
+        let area = Rect::new(0, 0, 49, 8);
+        let background =
+            state.pane_layouts(area, PaneLayoutPolicy::Splits).0[&panes[1].terminal_id].content;
+        let mut input = MouseInputState::default();
+
+        assert_eq!(
+            input.route(
+                &state,
+                area,
+                PaneLayoutPolicy::Splits,
+                HostMouseEvent {
+                    kind: HostMouseEventKind::Down(HostMouseButton::Left),
+                    column: background.x,
+                    row: background.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+            ),
+            Some(PaneMouseAction::Focus(panes[1].pane_id))
+        );
+        input.clear();
+        assert_eq!(
+            input.route(
+                &state,
+                area,
+                PaneLayoutPolicy::Splits,
+                HostMouseEvent {
+                    kind: HostMouseEventKind::Drag(HostMouseButton::Left),
+                    column: background.x + 1,
+                    row: background.y + 1,
+                    modifiers: KeyModifiers::NONE,
+                },
+            ),
+            None
+        );
+        assert_eq!(
+            input.button(MouseButton::Left),
+            MouseButtonState::Suppressed
+        );
+        assert_eq!(
+            input.route(
+                &state,
+                area,
+                PaneLayoutPolicy::Splits,
+                HostMouseEvent {
+                    kind: HostMouseEventKind::Up(HostMouseButton::Left),
+                    column: background.x + 1,
+                    row: background.y + 1,
+                    modifiers: KeyModifiers::NONE,
+                },
+            ),
+            None
+        );
+        assert_eq!(input.button(MouseButton::Left), MouseButtonState::Idle);
     }
 
     #[test]

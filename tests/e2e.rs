@@ -19,8 +19,9 @@ use bytes::Bytes;
 use fut::{
     domain::{
         AgentReport, AgentState, AttentionKind, CopyModeAction, CopyModeError, CopyModeMovement,
-        MAX_SEARCH_QUERY_BYTES, MouseModifiers, MouseWheelDirection, MouseWheelEvent, PaneId,
-        ScreenSnapshot, SearchDirection, TabId, TerminalId, TerminalSize,
+        MAX_SEARCH_QUERY_BYTES, MouseButton, MouseButtons, MouseEvent, MouseEventKind,
+        MouseModifiers, MouseWheelDirection, PaneId, ScreenSnapshot, SearchDirection, TabId,
+        TerminalId, TerminalSize,
     },
     protocol::{
         ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, PROTOCOL_VERSION_0_1,
@@ -2204,14 +2205,15 @@ async fn scrollback_is_attachment_local_survives_output_and_paste_returns_only_f
     snapshot_containing(&mut client_a, terminal_a, "HIST_40").await;
     snapshot_containing(&mut client_b, terminal_a, "HIST_40").await;
 
-    let wheel = ClientMessage::MouseWheel {
+    let wheel = ClientMessage::MouseInput {
         terminal_id: terminal_a,
-        event: MouseWheelEvent {
-            direction: MouseWheelDirection::Up,
-            column: 0,
-            row: 0,
-            modifiers: MouseModifiers::default(),
-        },
+        event: mouse_event(
+            MouseEventKind::Wheel {
+                direction: MouseWheelDirection::Up,
+            },
+            0,
+            0,
+        ),
     };
     assert_fire_and_forget_request_id_rejected(&mut client_b, wheel.clone()).await;
     send_uncorrelated(&mut client_b, wheel.clone()).await;
@@ -2273,6 +2275,266 @@ async fn scrollback_is_attachment_local_survives_output_and_paste_returns_only_f
 
     harness.detach(&mut client_a).await;
     harness.detach(&mut client_b).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn focused_application_mouse_returns_only_its_attachment_viewport_to_bottom() {
+    let expected = b"\x1b[<0;2;2M";
+    let script = format!(
+        "i=0; while [ $i -le 40 ]; do printf 'APP_HIST_%02d\\r\\n' \"$i\"; i=$((i + 1)); done; while [ ! -e app-mouse-go ]; do sleep 0.01; done; stty raw -echo; printf '\\033[?1000h\\033[?1006hAPP_MOUSE_READY\\r\\n'; dd bs=1 count={} of=app-mouse.capture 2>/dev/null; printf 'APP_MOUSE_CAPTURED\\r\\n'; exec cat >/dev/null",
+        expected.len(),
+    );
+    let mut harness = Harness::start(&script).await;
+    let resources = harness.resources().await;
+    let tab_id = resources.sessions[0].workspaces[0].tabs[0].id;
+    let terminal_a = resources.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
+    let ServerMessage::PaneCreated { selected: pane_b } = harness
+        .control_command(ClientMessage::CreatePane {
+            tab_id,
+            cwd: None,
+            program: Some("/bin/sh".into()),
+            argv: vec![
+                "-c".into(),
+                "printf 'APP_PANE_B_READY\\r\\n'; sleep 60".into(),
+            ],
+        })
+        .await
+    else {
+        panic!("failed to create second application-mouse pane")
+    };
+    let (mut client_a, selected_a, _) = harness
+        .interactive_for(Some(TargetSelector::Terminal(terminal_a)))
+        .await;
+    assert_eq!(selected_a, terminal_a);
+    let (mut client_b, selected_b) =
+        attach_once(&harness, TargetSelector::Terminal(pane_b.terminal_id)).await;
+    assert_eq!(selected_b, pane_b);
+    snapshot_containing(&mut client_a, terminal_a, "APP_HIST_40").await;
+    snapshot_containing(&mut client_b, terminal_a, "APP_HIST_40").await;
+
+    let wheel = mouse_wheel_message(terminal_a);
+    send_uncorrelated(&mut client_a, wheel.clone()).await;
+    send_uncorrelated(&mut client_b, wheel).await;
+    let ServerMessage::Snapshot {
+        screen: history_a, ..
+    } = receive_matching(&mut client_a, |message| {
+        matches!(message, ServerMessage::Snapshot { terminal_id, screen }
+            if *terminal_id == terminal_a && !snapshot_text(screen).contains("APP_HIST_40"))
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    let ServerMessage::Snapshot {
+        screen: history_b, ..
+    } = receive_matching(&mut client_b, |message| {
+        matches!(message, ServerMessage::Snapshot { terminal_id, screen }
+            if *terminal_id == terminal_a && !snapshot_text(screen).contains("APP_HIST_40"))
+    })
+    .await
+    else {
+        unreachable!()
+    };
+
+    fs::write(harness.root.path().join("cwd/app-mouse-go"), b"").unwrap();
+    receive_matching(&mut client_a, |message| {
+        matches!(message, ServerMessage::Snapshot { terminal_id, screen }
+            if *terminal_id == terminal_a && screen.revision > history_a.revision)
+    })
+    .await;
+    let mut buttons = MouseButtons::default();
+    buttons.set(MouseButton::Left, true);
+    send_uncorrelated(
+        &mut client_a,
+        ClientMessage::MouseInput {
+            terminal_id: terminal_a,
+            event: MouseEvent {
+                buttons,
+                ..mouse_event(
+                    MouseEventKind::Press {
+                        button: MouseButton::Left,
+                    },
+                    1,
+                    1,
+                )
+            },
+        },
+    )
+    .await;
+    let bottom_a = snapshot_containing(&mut client_a, terminal_a, "APP_MOUSE_READY").await;
+    assert!(bottom_a.revision > history_a.revision);
+    assert!(snapshot_text(&bottom_a).contains("APP_HIST_40"));
+    wait_for(DEADLINE, || {
+        fs::read(harness.root.path().join("cwd/app-mouse.capture"))
+            .is_ok_and(|bytes| bytes.len() == expected.len())
+    })
+    .await;
+    assert_eq!(
+        fs::read(harness.root.path().join("cwd/app-mouse.capture")).unwrap(),
+        expected
+    );
+
+    let ServerMessage::Snapshot {
+        screen: history_b_after_mouse,
+        ..
+    } = receive_matching(&mut client_b, |message| {
+        matches!(message, ServerMessage::Snapshot { terminal_id, screen }
+            if *terminal_id == terminal_a && screen.revision > history_b.revision)
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    let history_text = snapshot_text(&history_b_after_mouse);
+    assert!(
+        !history_text.contains("APP_MOUSE_READY"),
+        "{history_text:?}"
+    );
+    assert!(!history_text.contains("APP_HIST_40"), "{history_text:?}");
+
+    harness.detach(&mut client_a).await;
+    harness.detach(&mut client_b).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn raw_mouse_input_reaches_only_the_attachments_focused_terminal() {
+    let expected_a = b"\x1b[<0;2;2M";
+    let expected_b = b"\x1b[<2;3;2M";
+    let script = format!(
+        "stty raw -echo; printf '\\033[?1000h\\033[?1006hRAW_MOUSE_A_READY\\r\\n'; dd bs=1 count={} of=raw-mouse-a.capture 2>/dev/null; printf 'RAW_MOUSE_A_CAPTURED\\r\\n'; exec cat >/dev/null",
+        expected_a.len(),
+    );
+    let mut harness = Harness::start(&script).await;
+    let resources = harness.resources().await;
+    let tab_id = resources.sessions[0].workspaces[0].tabs[0].id;
+    let terminal_a = resources.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
+    let ServerMessage::PaneCreated { selected: pane_b } = harness
+        .control_command(ClientMessage::CreatePane {
+            tab_id,
+            cwd: None,
+            program: Some("/bin/sh".into()),
+            argv: vec![
+                "-c".into(),
+                format!(
+                    "stty raw -echo; printf '\\033[?1000h\\033[?1006hRAW_MOUSE_B_READY\\r\\n'; dd bs=1 count={} of=raw-mouse-b.capture 2>/dev/null; printf 'RAW_MOUSE_B_CAPTURED\\r\\n'; exec cat >/dev/null",
+                    expected_b.len(),
+                ),
+            ],
+        })
+        .await
+    else {
+        panic!("failed to create raw mouse sibling")
+    };
+    let (mut connection, selected, _) = harness
+        .interactive_for(Some(TargetSelector::Terminal(terminal_a)))
+        .await;
+    assert_eq!(selected, terminal_a);
+    snapshot_containing(&mut connection, terminal_a, "RAW_MOUSE_A_READY").await;
+    snapshot_containing(&mut connection, pane_b.terminal_id, "RAW_MOUSE_B_READY").await;
+
+    for event in [
+        mouse_event(
+            MouseEventKind::Press {
+                button: MouseButton::Left,
+            },
+            1,
+            1,
+        ),
+        MouseEvent {
+            buttons: MouseButtons {
+                middle: true,
+                ..Default::default()
+            },
+            ..mouse_event(
+                MouseEventKind::Release {
+                    button: MouseButton::Middle,
+                },
+                1,
+                1,
+            )
+        },
+        mouse_event(
+            MouseEventKind::Motion {
+                button: Some(MouseButton::Right),
+            },
+            1,
+            1,
+        ),
+    ] {
+        send_uncorrelated(
+            &mut connection,
+            ClientMessage::MouseInput {
+                terminal_id: terminal_a,
+                event,
+            },
+        )
+        .await;
+    }
+    assert_no_error_before_pong(&mut connection).await;
+
+    let press = |button, column, row| {
+        let mut buttons = MouseButtons::default();
+        buttons.set(button, true);
+        MouseEvent {
+            buttons,
+            ..mouse_event(MouseEventKind::Press { button }, column, row)
+        }
+    };
+    send_uncorrelated(
+        &mut connection,
+        ClientMessage::MouseInput {
+            terminal_id: pane_b.terminal_id,
+            event: press(MouseButton::Left, 0, 0),
+        },
+    )
+    .await;
+    send_uncorrelated(
+        &mut connection,
+        ClientMessage::MouseInput {
+            terminal_id: terminal_a,
+            event: press(MouseButton::Left, 1, 1),
+        },
+    )
+    .await;
+    snapshot_containing(&mut connection, terminal_a, "RAW_MOUSE_A_CAPTURED").await;
+    assert_eq!(
+        fs::read(harness.root.path().join("cwd/raw-mouse-a.capture")).unwrap(),
+        expected_a
+    );
+
+    send(
+        &mut connection,
+        ClientMessage::SelectTarget {
+            selector: TargetSelector::Pane(pane_b.pane_id),
+            expected: Some(fut::protocol::SelectionExpectation::Tab(tab_id)),
+        },
+    )
+    .await;
+    receive_matching(&mut connection, |message| {
+        matches!(
+            message,
+            ServerMessage::TargetSelected { selected }
+                if selected.focused.terminal_id == pane_b.terminal_id
+        )
+    })
+    .await;
+    send_uncorrelated(
+        &mut connection,
+        ClientMessage::MouseInput {
+            terminal_id: pane_b.terminal_id,
+            event: press(MouseButton::Right, 2, 1),
+        },
+    )
+    .await;
+    snapshot_containing(&mut connection, pane_b.terminal_id, "RAW_MOUSE_B_CAPTURED").await;
+    assert_eq!(
+        fs::read(harness.root.path().join("cwd/raw-mouse-b.capture")).unwrap(),
+        expected_b
+    );
+
+    harness.detach(&mut connection).await;
     harness.shutdown().await;
 }
 
@@ -3787,6 +4049,307 @@ async fn public_client_preserves_host_palette_indices_and_truecolor() {
 }
 
 #[tokio::test]
+async fn public_held_mouse_releases_before_modal_focus_and_detach_transitions() {
+    let modal_expected = b"\x1b[<0;8;5M\x1b[<0;8;5m";
+    let copy_expected = b"\x1b[<0;8;6M\x1b[<0;8;6m";
+    let focus_expected = b"\x1b[<0;8;7M\x1b[<0;8;7m";
+    let detach_expected = b"\x1b[<0;8;5M\x1b[<0;8;5m";
+    let script = format!(
+        "stty raw -echo; printf '\\033[?1000h\\033[?1006hHELD_A_READY\\r\\n'; dd bs=1 count={} of=held-modal.capture 2>/dev/null; printf 'HELD_MODAL_CAPTURED\\r\\n'; dd bs=1 count={} of=held-copy.capture 2>/dev/null; printf 'HELD_COPY_CAPTURED\\r\\n'; dd bs=1 count={} of=held-focus.capture 2>/dev/null; printf 'HELD_FOCUS_CAPTURED\\r\\n'; exec cat >/dev/null",
+        modal_expected.len(),
+        copy_expected.len(),
+        focus_expected.len(),
+    );
+    let harness = Harness::start(&script).await;
+    let resources = harness.resources().await;
+    let tab_id = resources.sessions[0].workspaces[0].tabs[0].id;
+    let pane_a = resources.sessions[0].workspaces[0].tabs[0].panes[0].id;
+    let ServerMessage::PaneCreated { selected: pane_b } = harness
+        .control_command(ClientMessage::CreatePane {
+            tab_id,
+            cwd: None,
+            program: Some("/bin/sh".into()),
+            argv: vec![
+                "-c".into(),
+                format!(
+                    "stty raw -echo; printf '\\033[?1000h\\033[?1006hHELD_B_READY\\r\\n'; dd bs=1 count={} of=held-detach.capture 2>/dev/null; printf 'HELD_DETACH_CAPTURED\\r\\n'; exec cat >/dev/null",
+                    detach_expected.len(),
+                ),
+            ],
+        })
+        .await
+    else {
+        panic!("failed to create held-mouse target pane")
+    };
+
+    let mut command = Command::new("/usr/bin/script");
+    command
+        .env_clear()
+        .env("HOME", harness.root.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", harness.root.path().join("runtime"))
+        .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+        .env("TERM", "xterm-256color")
+        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .arg(format!(
+            "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {pane_a}",
+            env!("CARGO_BIN_EXE_fut"),
+            harness.socket.display(),
+        ));
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("HELD_A_READY").await;
+    client.wait_for("HELD_B_READY").await;
+
+    client.send(&[sgr_mouse(0, 8, 6, false), b"\x02 ".to_vec()].concat());
+    client.wait_for("Open global navigator").await;
+    wait_for(DEADLINE, || {
+        fs::read(harness.root.path().join("cwd/held-modal.capture"))
+            .is_ok_and(|bytes| bytes.len() == modal_expected.len())
+    })
+    .await;
+    assert_eq!(
+        fs::read(harness.root.path().join("cwd/held-modal.capture")).unwrap(),
+        modal_expected
+    );
+
+    client.send(
+        &[
+            sgr_mouse(0, 8, 6, true),
+            b"\x03".to_vec(),
+            sgr_mouse(0, 8, 7, false),
+            b"\x02[".to_vec(),
+        ]
+        .concat(),
+    );
+    client.wait_for("COPY ·").await;
+    wait_for(DEADLINE, || {
+        fs::read(harness.root.path().join("cwd/held-copy.capture"))
+            .is_ok_and(|bytes| bytes.len() == copy_expected.len())
+    })
+    .await;
+    assert_eq!(
+        fs::read(harness.root.path().join("cwd/held-copy.capture")).unwrap(),
+        copy_expected
+    );
+    client.send(&[sgr_mouse(0, 8, 7, true), b"q".to_vec()].concat());
+    client.wait_for("copy mode cancelled").await;
+    client.send(
+        &[
+            sgr_mouse(0, 8, 8, false),
+            b"\x02o".to_vec(),
+            sgr_mouse(0, 8, 8, true),
+        ]
+        .concat(),
+    );
+    wait_for(DEADLINE, || {
+        fs::read(harness.root.path().join("cwd/held-focus.capture"))
+            .is_ok_and(|bytes| bytes.len() == focus_expected.len())
+    })
+    .await;
+    assert_eq!(
+        fs::read(harness.root.path().join("cwd/held-focus.capture")).unwrap(),
+        focus_expected
+    );
+
+    client.send(&[sgr_mouse(0, 48, 6, false), b"\x02d".to_vec()].concat());
+    client.wait_success().await;
+    wait_for(DEADLINE, || {
+        fs::read(harness.root.path().join("cwd/held-detach.capture"))
+            .is_ok_and(|bytes| bytes.len() == detach_expected.len())
+    })
+    .await;
+    assert_eq!(
+        fs::read(harness.root.path().join("cwd/held-detach.capture")).unwrap(),
+        detach_expected
+    );
+    assert!(process_alive(pane_b.child_pid));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn public_sgr_mouse_focuses_without_leaking_then_forwards_focused_app_input_and_cleans_up() {
+    let expected_a = b"\x1b[<18;8;5M\x1b[<18;8;5m";
+    let expected_b = concat!(
+        "\x1b[<0;6;4M",
+        "\x1b[<0;6;4m",
+        "\x1b[<1;7;5M",
+        "\x1b[<1;7;5m",
+        "\x1b[<14;8;6M",
+        "\x1b[<14;8;6m",
+        "\x1b[<0;9;7M",
+        "\x1b[<32;11;8M",
+        "\x1b[<0;11;8m",
+        "\x1b[<35;12;9M",
+        "\x1b[<80;13;10M",
+        "\x1b[<65;14;11M",
+    )
+    .as_bytes();
+    let script = format!(
+        "stty raw -echo; printf '\\033[?1003h\\033[?1006hMOUSE_A_READY\\r\\n'; dd bs=1 count={} of=mouse-a.tmp 2>/dev/null; mv mouse-a.tmp mouse-a.capture; printf 'MOUSE_A_CAPTURED\\r\\n'; exec cat >/dev/null",
+        expected_a.len(),
+    );
+    let harness = Harness::start(&script).await;
+    let resources = harness.resources().await;
+    let tab_id = resources.sessions[0].workspaces[0].tabs[0].id;
+    let pane_a = resources.sessions[0].workspaces[0].tabs[0].panes[0].id;
+    let ServerMessage::PaneCreated { selected: pane_b } = harness
+        .control_command(ClientMessage::CreatePane {
+            tab_id,
+            cwd: None,
+            program: Some("/bin/sh".into()),
+            argv: vec![
+                "-c".into(),
+                format!(
+                    "stty raw -echo; printf '\\033[?1003h\\033[?1006hMOUSE_B_READY\\r\\n'; dd bs=1 count={} of=mouse-b.tmp 2>/dev/null; mv mouse-b.tmp mouse-b.capture; printf 'MOUSE_B_CAPTURED\\r\\n'; exec cat >/dev/null",
+                    expected_b.len(),
+                ),
+            ],
+        })
+        .await
+    else {
+        panic!("failed to create mouse target pane")
+    };
+
+    let mut command = Command::new("/usr/bin/script");
+    command
+        .env_clear()
+        .env("HOME", harness.root.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", harness.root.path().join("runtime"))
+        .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+        .env("TERM", "xterm-256color")
+        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .arg(format!(
+            "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {pane_a}",
+            env!("CARGO_BIN_EXE_fut"),
+            harness.socket.display(),
+        ));
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("MOUSE_A_READY").await;
+    client.wait_for("MOUSE_B_READY").await;
+
+    // Fut modal surfaces own mouse input. These gestures must not become the
+    // first bytes captured by the focused application.
+    client.send(b"\x02 ");
+    client.wait_for("Open global navigator").await;
+    client.send(
+        &[
+            sgr_mouse(0, 8, 6, false),
+            sgr_mouse(0, 8, 6, true),
+            b"\x03".to_vec(),
+            b"\x02[".to_vec(),
+        ]
+        .concat(),
+    );
+    client.wait_for("COPY ·").await;
+    client.send(
+        &[
+            sgr_mouse(0, 8, 6, false),
+            sgr_mouse(0, 8, 6, true),
+            b"q".to_vec(),
+        ]
+        .concat(),
+    );
+    client.wait_for("copy mode cancelled").await;
+
+    // At 80 columns the right pane begins at outer column 41 and terminal
+    // content begins on outer row 2 below the tab bar. The first complete
+    // left gesture only focuses B and is swallowed. Everything after it is
+    // encoded in B-local cells by Ghostty.
+    let b_input = [
+        sgr_mouse(0, 45, 4, false),
+        sgr_mouse(0, 45, 4, true),
+        sgr_mouse(0, 46, 5, false),
+        sgr_mouse(0, 46, 5, true),
+        sgr_mouse(1, 47, 6, false),
+        sgr_mouse(1, 47, 6, true),
+        sgr_mouse(14, 48, 7, false),
+        sgr_mouse(14, 48, 7, true),
+        sgr_mouse(0, 49, 8, false),
+        sgr_mouse(32, 51, 9, false),
+        sgr_mouse(0, 51, 9, true),
+        sgr_mouse(35, 52, 10, false),
+        sgr_mouse(80, 53, 11, false),
+        sgr_mouse(65, 54, 12, false),
+    ]
+    .concat();
+    client.send(&b_input);
+    client.wait_for("MOUSE_B_CAPTURED").await;
+    assert_eq!(
+        fs::read(harness.root.path().join("cwd/mouse-b.capture")).unwrap(),
+        expected_b
+    );
+
+    // Focusing A is also a swallowed gesture. The following control-right
+    // press/release proves subsequent events use A's local coordinates.
+    client.send(
+        &[
+            sgr_mouse(0, 5, 4, false),
+            sgr_mouse(0, 5, 4, true),
+            sgr_mouse(18, 8, 6, false),
+            sgr_mouse(18, 8, 6, true),
+        ]
+        .concat(),
+    );
+    client.wait_for("MOUSE_A_CAPTURED").await;
+    assert_eq!(
+        fs::read(harness.root.path().join("cwd/mouse-a.capture")).unwrap(),
+        expected_a
+    );
+
+    client.send(b"\x02d");
+    client.wait_success().await;
+    let outer = client.text();
+    assert!(
+        outer.contains("\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l"),
+        "outer mouse capture was not disabled: {outer:?}"
+    );
+    assert!(process_alive(pane_b.child_pid));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn public_wheel_uses_dec_alternate_scroll_and_terminal_cursor_key_mode() {
+    let harness = Harness::start(
+        "stty raw -echo; printf '\\033[?1049h\\033[?1007hALT_SCROLL_NORMAL_READY\\r\\n'; dd bs=1 count=9 of=alt-normal.capture 2>/dev/null; printf '\\033[?1hALT_SCROLL_APPLICATION_READY\\r\\n'; dd bs=1 count=9 of=alt-application.capture 2>/dev/null; printf 'ALT_SCROLL_CAPTURED\\r\\n'; exec cat >/dev/null",
+    )
+    .await;
+    let pane = harness.resources().await.sessions[0].workspaces[0].tabs[0].panes[0].id;
+    let mut command = Command::new("/usr/bin/script");
+    command
+        .env_clear()
+        .env("HOME", harness.root.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", harness.root.path().join("runtime"))
+        .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+        .env("TERM", "xterm-256color")
+        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .arg(format!(
+            "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {pane}",
+            env!("CARGO_BIN_EXE_fut"),
+            harness.socket.display(),
+        ));
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("ALT_SCROLL_NORMAL_READY").await;
+    client.send(&sgr_mouse(64, 8, 6, false));
+    client.wait_for("ALT_SCROLL_APPLICATION_READY").await;
+    client.send(&sgr_mouse(65, 8, 6, false));
+    client.wait_for("ALT_SCROLL_CAPTURED").await;
+
+    assert_eq!(
+        fs::read(harness.root.path().join("cwd/alt-normal.capture")).unwrap(),
+        b"\x1b[A\x1b[A\x1b[A"
+    );
+    assert_eq!(
+        fs::read(harness.root.path().join("cwd/alt-application.capture")).unwrap(),
+        b"\x1bOB\x1bOB\x1bOB"
+    );
+    client.send(b"\x02d");
+    client.wait_success().await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn public_client_renders_simultaneous_panes_and_cycles_focus() {
     let harness = Harness::start(
         "printf 'SPLIT_A_READY\r\n'; while IFS= read -r line; do [ \"$line\" = a ] && printf 'SPLIT_A_INPUT\r\n'; done",
@@ -4045,6 +4608,10 @@ async fn public_client_accordion_resizes_focus_and_falls_back_narrowly() {
     narrow.send(b"size-a\n");
     narrow.wait_for("A_SIZE_23_37").await;
     narrow.send(b"\x02o");
+    // The narrow fallback renders one pane, so the sibling's banner is the
+    // switch itself. Typing before it lands lets the incremental renderer
+    // coalesce the switch with the reply and emit only the changed cells.
+    narrow.wait_for("BBBBBBBB").await;
     narrow.send(b"size-b\n");
     narrow.wait_for("B_SIZE_23_37").await;
     narrow.send(b"\x02d");
@@ -5463,15 +6030,16 @@ async fn raw_copy_mode_ignores_wheel_and_reset_until_cancelled() {
         ServerMessage::CopyModeSnapshot { .. }
     ));
 
-    let wheel = MouseWheelEvent {
-        direction: MouseWheelDirection::Up,
-        column: 0,
-        row: 0,
-        modifiers: MouseModifiers::default(),
-    };
+    let wheel = mouse_event(
+        MouseEventKind::Wheel {
+            direction: MouseWheelDirection::Up,
+        },
+        0,
+        0,
+    );
     send(
         &mut connection,
-        ClientMessage::MouseWheel {
+        ClientMessage::MouseInput {
             terminal_id,
             event: wheel,
         },
@@ -7400,15 +7968,34 @@ async fn send_uncorrelated(connection: &mut Connection, message: ClientMessage) 
 }
 
 fn mouse_wheel_message(terminal_id: TerminalId) -> ClientMessage {
-    ClientMessage::MouseWheel {
+    ClientMessage::MouseInput {
         terminal_id,
-        event: MouseWheelEvent {
-            direction: MouseWheelDirection::Up,
-            column: 0,
-            row: 0,
-            modifiers: MouseModifiers::default(),
-        },
+        event: mouse_event(
+            MouseEventKind::Wheel {
+                direction: MouseWheelDirection::Up,
+            },
+            0,
+            0,
+        ),
     }
+}
+
+fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: MouseModifiers::default(),
+        buttons: MouseButtons::default(),
+    }
+}
+
+fn sgr_mouse(code: u16, column: u16, row: u16, release: bool) -> Vec<u8> {
+    format!(
+        "\x1b[<{code};{column};{row}{}",
+        if release { 'm' } else { 'M' }
+    )
+    .into_bytes()
 }
 
 async fn assert_no_error_before_pong(connection: &mut Connection) {

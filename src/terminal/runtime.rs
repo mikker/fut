@@ -16,12 +16,12 @@ use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::{broadcast, mpsc as async_mpsc, oneshot, watch};
 
 use crate::domain::{
-    ClientId, CopyModeAction, CopyModeError, MouseWheelEvent, ScreenSnapshot, TerminalId,
-    TerminalSize,
+    ClientId, CopyModeAction, CopyModeError, MouseEvent, MouseEventKind, ScreenSnapshot,
+    TerminalId, TerminalSize,
 };
 
 use super::{
-    CopyModeOutcome, MouseWheelOutcome, ViewportSnapshot,
+    CopyModeOutcome, MouseInputOutcome, ViewportSnapshot,
     ghostty::{CopyModeFailure, GhosttyTerminal},
 };
 
@@ -102,20 +102,13 @@ impl TerminalHandle {
         self.send(RuntimeMessage::Resize(size))
     }
 
-    pub(crate) async fn mouse_wheel(
+    pub(crate) async fn mouse_input(
         &self,
-        event: MouseWheelEvent,
+        event: MouseEvent,
         viewport_offset: Option<usize>,
         pty_input_allowed: bool,
-    ) -> Result<MouseWheelOutcome, CommandError> {
-        let (completion, completed) = oneshot::channel();
-        self.send(RuntimeMessage::MouseWheel {
-            event,
-            viewport_offset,
-            pty_input_allowed,
-            completion,
-        })?;
-        completed.await.unwrap_or(Err(CommandError::Stopped))
+    ) -> Result<MouseInputOutcome, CommandError> {
+        send_mouse_input(&self.commands, event, viewport_offset, pty_input_allowed).await
     }
 
     pub(crate) async fn viewport_snapshot(
@@ -318,6 +311,43 @@ async fn send_with_backpressure(
         .map_err(|_| CommandError::Stopped)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MouseSendPolicy {
+    Lossless,
+    Disposable,
+}
+
+fn mouse_send_policy(kind: MouseEventKind) -> MouseSendPolicy {
+    match kind {
+        MouseEventKind::Press { .. } | MouseEventKind::Release { .. } => MouseSendPolicy::Lossless,
+        MouseEventKind::Motion { .. } | MouseEventKind::Wheel { .. } => MouseSendPolicy::Disposable,
+    }
+}
+
+async fn send_mouse_input(
+    commands: &async_mpsc::Sender<RuntimeMessage>,
+    event: MouseEvent,
+    viewport_offset: Option<usize>,
+    pty_input_allowed: bool,
+) -> Result<MouseInputOutcome, CommandError> {
+    let policy = mouse_send_policy(event.kind);
+    let (completion, completed) = oneshot::channel();
+    let message = RuntimeMessage::MouseInput {
+        event,
+        viewport_offset,
+        pty_input_allowed,
+        completion,
+    };
+    match policy {
+        MouseSendPolicy::Lossless => send_with_backpressure(commands, message).await?,
+        MouseSendPolicy::Disposable => commands.try_send(message).map_err(|error| match error {
+            async_mpsc::error::TrySendError::Full(_) => CommandError::Busy,
+            async_mpsc::error::TrySendError::Closed(_) => CommandError::Stopped,
+        })?,
+    }
+    completed.await.unwrap_or(Err(CommandError::Stopped))
+}
+
 enum RuntimeMessage {
     Input(Vec<u8>),
     Paste {
@@ -325,11 +355,11 @@ enum RuntimeMessage {
         completion: oneshot::Sender<Result<(), CommandError>>,
     },
     Resize(TerminalSize),
-    MouseWheel {
-        event: MouseWheelEvent,
+    MouseInput {
+        event: MouseEvent,
         viewport_offset: Option<usize>,
         pty_input_allowed: bool,
-        completion: oneshot::Sender<Result<MouseWheelOutcome, CommandError>>,
+        completion: oneshot::Sender<Result<MouseInputOutcome, CommandError>>,
     },
     ViewportSnapshot {
         viewport_offset: Option<usize>,
@@ -587,15 +617,21 @@ fn run(
                         );
                     }
                 }
-                RuntimeMessage::MouseWheel {
+                RuntimeMessage::MouseInput {
                     event,
                     viewport_offset,
                     pty_input_allowed,
                     completion,
                 } => {
-                    let result = terminal
-                        .mouse_wheel(event, viewport_offset, pty_input_allowed)
-                        .map_err(|error| CommandError::Emulator(error.to_string()));
+                    let result = mouse_input_after_output_barrier(
+                        &mut queues.output,
+                        terminal,
+                        &publishers,
+                        &mut reader_complete,
+                        event,
+                        viewport_offset,
+                        pty_input_allowed,
+                    );
                     let _ = completion.send(result);
                 }
                 RuntimeMessage::ViewportSnapshot {
@@ -753,6 +789,21 @@ fn paste_after_output_barrier(
     drain_output_barrier(output, terminal, publishers, reader_complete);
     terminal
         .paste(text)
+        .map_err(|error| CommandError::Emulator(error.to_string()))
+}
+
+fn mouse_input_after_output_barrier(
+    output: &mut OutputQueue,
+    terminal: &mut GhosttyTerminal,
+    publishers: &RuntimePublishers<'_>,
+    reader_complete: &mut bool,
+    event: MouseEvent,
+    viewport_offset: Option<usize>,
+    pty_input_allowed: bool,
+) -> Result<MouseInputOutcome, CommandError> {
+    drain_output_barrier(output, terminal, publishers, reader_complete);
+    terminal
+        .mouse_input(event, viewport_offset, pty_input_allowed)
         .map_err(|error| CommandError::Emulator(error.to_string()))
 }
 
@@ -1225,6 +1276,125 @@ mod tests {
     }
 
     #[test]
+    fn saturated_output_barrier_makes_mouse_tracking_mode_authoritative() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut terminal = test_terminal(Box::new(RecordingWriter(Arc::clone(&captured))));
+        let initial = terminal.snapshot().unwrap();
+        let (snapshots, _) = watch::channel(initial);
+        let (events, _) = broadcast::channel(4);
+        let (lifecycle, _) = watch::channel(TerminalLifecycle::Running);
+        let publishers = RuntimePublishers {
+            snapshots: &snapshots,
+            events: &events,
+            lifecycle: &lifecycle,
+        };
+        let (output, mut queued_output) = output_queue();
+        let mut reader_complete = false;
+
+        for _ in 0..OUTPUT_QUEUE_CAPACITY {
+            output.send(OutputMessage::Bytes(b"x".to_vec())).unwrap();
+        }
+        let producer = thread::spawn(move || {
+            output
+                .send(OutputMessage::Bytes(
+                    b"\x1b[?1049h\x1b[?1007h\x1b[?1h\x1b[?1000h\x1b[?1006h".to_vec(),
+                ))
+                .unwrap();
+            output
+                .send(OutputMessage::Bytes(b"\x1b[?1000l".to_vec()))
+                .unwrap();
+            output
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while queued_output.barrier_target() != 17 {
+            assert!(
+                Instant::now() < deadline,
+                "tracking transition never reached the saturated output barrier"
+            );
+            thread::yield_now();
+        }
+
+        let event = MouseEvent {
+            kind: MouseEventKind::Press {
+                button: crate::domain::MouseButton::Left,
+            },
+            column: 2,
+            row: 1,
+            modifiers: Default::default(),
+            buttons: crate::domain::MouseButtons {
+                left: true,
+                ..Default::default()
+            },
+        };
+        assert!(matches!(
+            mouse_input_after_output_barrier(
+                &mut queued_output,
+                &mut terminal,
+                &publishers,
+                &mut reader_complete,
+                event,
+                None,
+                true,
+            )
+            .unwrap(),
+            MouseInputOutcome::Handled
+        ));
+        let output = producer.join().unwrap();
+        assert_eq!(queued_output.consumed, 17);
+        assert_eq!(queued_output.barrier_target(), 18);
+        assert_eq!(*captured.lock().unwrap(), b"\x1b[<0;3;2M".to_vec());
+
+        let wheel = MouseEvent {
+            kind: MouseEventKind::Wheel {
+                direction: crate::domain::MouseWheelDirection::Up,
+            },
+            buttons: Default::default(),
+            ..event
+        };
+        assert!(matches!(
+            mouse_input_after_output_barrier(
+                &mut queued_output,
+                &mut terminal,
+                &publishers,
+                &mut reader_complete,
+                wheel,
+                None,
+                true,
+            )
+            .unwrap(),
+            MouseInputOutcome::Handled
+        ));
+        assert_eq!(queued_output.consumed, 18);
+        assert_eq!(
+            *captured.lock().unwrap(),
+            b"\x1b[<0;3;2M\x1bOA\x1bOA\x1bOA".to_vec()
+        );
+
+        output
+            .send(OutputMessage::Bytes(b"\x1b[?1007l".to_vec()))
+            .unwrap();
+        assert!(matches!(
+            mouse_input_after_output_barrier(
+                &mut queued_output,
+                &mut terminal,
+                &publishers,
+                &mut reader_complete,
+                wheel,
+                None,
+                true,
+            )
+            .unwrap(),
+            MouseInputOutcome::Scrolled(_)
+        ));
+        assert_eq!(queued_output.consumed, 19);
+        assert_eq!(
+            *captured.lock().unwrap(),
+            b"\x1b[<0;3;2M\x1bOA\x1bOA\x1bOA".to_vec()
+        );
+        assert!(!reader_complete);
+    }
+
+    #[test]
     fn paste_barrier_includes_blocked_seventeenth_output_and_stops_at_its_target() {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let mut terminal = test_terminal(Box::new(RecordingWriter(Arc::clone(&captured))));
@@ -1639,6 +1809,85 @@ mod tests {
         assert!(matches!(
             waiting.await.unwrap(),
             Err(CommandError::Emulator(message)) if message == "write failed"
+        ));
+    }
+
+    #[tokio::test]
+    async fn mouse_release_backpressures_behind_a_saturated_press_without_reordering() {
+        assert_eq!(
+            mouse_send_policy(MouseEventKind::Press {
+                button: crate::domain::MouseButton::Left,
+            }),
+            MouseSendPolicy::Lossless
+        );
+        assert_eq!(
+            mouse_send_policy(MouseEventKind::Motion { button: None }),
+            MouseSendPolicy::Disposable
+        );
+
+        let (commands, mut receiver) = async_mpsc::channel(1);
+        let (press_completion, _press_completed) = oneshot::channel();
+        commands
+            .try_send(RuntimeMessage::MouseInput {
+                event: MouseEvent {
+                    kind: MouseEventKind::Press {
+                        button: crate::domain::MouseButton::Left,
+                    },
+                    column: 1,
+                    row: 1,
+                    modifiers: Default::default(),
+                    buttons: crate::domain::MouseButtons {
+                        left: true,
+                        ..Default::default()
+                    },
+                },
+                viewport_offset: None,
+                pty_input_allowed: true,
+                completion: press_completion,
+            })
+            .unwrap();
+
+        let release = tokio::spawn({
+            let commands = commands.clone();
+            async move {
+                send_mouse_input(
+                    &commands,
+                    MouseEvent {
+                        kind: MouseEventKind::Release {
+                            button: crate::domain::MouseButton::Left,
+                        },
+                        column: 2,
+                        row: 1,
+                        modifiers: Default::default(),
+                        buttons: Default::default(),
+                    },
+                    None,
+                    true,
+                )
+                .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !release.is_finished(),
+            "release was discarded at saturation"
+        );
+
+        let RuntimeMessage::MouseInput { event, .. } = receiver.recv().await.unwrap() else {
+            panic!("first queued command was not a mouse press")
+        };
+        assert!(matches!(event.kind, MouseEventKind::Press { .. }));
+        let RuntimeMessage::MouseInput {
+            event, completion, ..
+        } = receiver.recv().await.unwrap()
+        else {
+            panic!("backpressured command was not a mouse release")
+        };
+        assert!(matches!(event.kind, MouseEventKind::Release { .. }));
+        assert!(completion.send(Ok(MouseInputOutcome::Handled)).is_ok());
+        assert!(matches!(
+            release.await.unwrap(),
+            Ok(MouseInputOutcome::Handled)
         ));
     }
 
