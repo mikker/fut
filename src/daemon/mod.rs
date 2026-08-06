@@ -30,7 +30,10 @@ use tokio::{
 use tokio_util::codec::Framed;
 
 use crate::{
-    domain::{ClientId, PaneId, SessionId, TabId, TerminalId, TerminalSize, WorkspaceId},
+    domain::{
+        ClientId, CopyModeAction, CopyModeError, PaneId, SessionId, TabId, TerminalId,
+        TerminalSize, WorkspaceId,
+    },
     project::{ProjectError, ProjectResolver, ResolvedLocation},
     protocol::{
         AcknowledgedCommand, ClientMessage, ClientMode, Envelope, OpenDisposition,
@@ -43,7 +46,7 @@ use crate::{
     },
     splits::{SplitDirection, SplitTree},
     terminal::{
-        CommandError, MouseWheelOutcome, SpawnSpec, TerminalEvent, TerminalHandle,
+        CommandError, CopyModeOutcome, MouseWheelOutcome, SpawnSpec, TerminalEvent, TerminalHandle,
         TerminalLifecycle, spawn_terminal,
     },
 };
@@ -484,6 +487,7 @@ enum AttachmentUpdate {
 }
 
 struct Attachment {
+    owner: ClientId,
     panes: Vec<ObservedTarget>,
     focused: LeasedTarget,
     layout: SplitTree,
@@ -496,6 +500,7 @@ struct Attachment {
     watchers: HashMap<TerminalId, (u64, JoinHandle<()>)>,
     viewport_offsets: HashMap<TerminalId, usize>,
     snapshot_revisions: HashMap<TerminalId, u64>,
+    copy_mode_terminal: Option<Arc<TerminalHandle>>,
     next_watcher_generation: u64,
 }
 
@@ -508,6 +513,7 @@ struct FocusedViewportState {
 
 impl Attachment {
     fn new(
+        owner: ClientId,
         panes: Vec<ObservedTarget>,
         focused: LeasedTarget,
         layout: SplitTree,
@@ -517,6 +523,7 @@ impl Attachment {
     ) -> Self {
         let (update_sender, updates) = mpsc::channel(ATTACHMENT_UPDATE_CAPACITY);
         let mut attachment = Self {
+            owner,
             panes,
             focused,
             layout,
@@ -529,6 +536,7 @@ impl Attachment {
             watchers: HashMap::new(),
             viewport_offsets: HashMap::new(),
             snapshot_revisions: HashMap::new(),
+            copy_mode_terminal: None,
             next_watcher_generation: 0,
         };
         attachment.reconcile_watchers();
@@ -585,11 +593,97 @@ impl Attachment {
             .map(|pane| Arc::clone(&pane.terminal))
     }
 
+    fn copy_mode_active(&self) -> bool {
+        self.copy_mode_terminal.is_some()
+    }
+
+    fn owns_copy_mode(&self, terminal_id: TerminalId) -> bool {
+        self.copy_mode_terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal.id() == terminal_id)
+    }
+
+    fn record_copy_mode_begin(&mut self) -> Result<(), CommandError> {
+        if self.copy_mode_active() {
+            return Err(CopyModeError::AlreadyActive.into());
+        }
+        self.copy_mode_terminal = Some(Arc::clone(&self.focused.terminal));
+        Ok(())
+    }
+
+    fn forget_copy_mode(&mut self, terminal_id: TerminalId) {
+        if self.owns_copy_mode(terminal_id) {
+            self.copy_mode_terminal = None;
+        }
+        self.viewport_offsets.remove(&terminal_id);
+    }
+
+    async fn copy_mode(&mut self, action: CopyModeAction) -> Result<CopyModeOutcome, CommandError> {
+        let terminal_id = self.focused.selected.terminal_id;
+        let offset = self.viewport_offsets.get(&terminal_id).copied();
+        let beginning = matches!(&action, CopyModeAction::Begin);
+        if beginning {
+            self.record_copy_mode_begin()?;
+        }
+        let outcome = match self
+            .focused
+            .terminal
+            .copy_mode(self.owner, action, offset)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if beginning
+                    || matches!(
+                        &error,
+                        CommandError::CopyMode(
+                            CopyModeError::CursorLost | CopyModeError::NotActive
+                        )
+                    )
+                {
+                    self.forget_copy_mode(terminal_id);
+                }
+                return Err(error);
+            }
+        };
+        match outcome {
+            CopyModeOutcome::Active(viewport) => {
+                self.set_viewport_offset(terminal_id, viewport.offset);
+                let Some(screen) = self.accept_snapshot(terminal_id, viewport.screen) else {
+                    self.clear_active_copy_mode().await?;
+                    return Err(CommandError::Emulator(
+                        "stale copy-mode snapshot revision".into(),
+                    ));
+                };
+                Ok(CopyModeOutcome::Active(crate::terminal::ViewportSnapshot {
+                    offset: self.viewport_offsets.get(&terminal_id).copied(),
+                    screen,
+                }))
+            }
+            CopyModeOutcome::Prepared { copy_id, text } => {
+                Ok(CopyModeOutcome::Prepared { copy_id, text })
+            }
+            CopyModeOutcome::Finalized { screen } => {
+                self.forget_copy_mode(terminal_id);
+                self.observe_snapshot_revision(terminal_id, screen.revision);
+                Ok(CopyModeOutcome::Finalized { screen })
+            }
+            CopyModeOutcome::Cancelled { screen } => {
+                self.forget_copy_mode(terminal_id);
+                self.observe_snapshot_revision(terminal_id, screen.revision);
+                Ok(CopyModeOutcome::Cancelled { screen })
+            }
+        }
+    }
+
     async fn mouse_wheel(
         &mut self,
         terminal_id: TerminalId,
         event: crate::domain::MouseWheelEvent,
     ) -> Result<Option<crate::domain::ScreenSnapshot>, CommandError> {
+        if self.copy_mode_active() {
+            return Ok(None);
+        }
         let Some(terminal) = self.terminal(terminal_id) else {
             return Ok(None);
         };
@@ -610,6 +704,9 @@ impl Attachment {
     async fn return_focused_to_bottom(
         &mut self,
     ) -> Result<Option<crate::domain::ScreenSnapshot>, CommandError> {
+        if self.copy_mode_active() {
+            return Ok(None);
+        }
         let terminal_id = self.focused.selected.terminal_id;
         if !self.viewport_offsets.contains_key(&terminal_id) {
             return Ok(None);
@@ -629,7 +726,27 @@ impl Attachment {
         if !self.accepts(terminal_id, generation) {
             return Ok(None);
         }
-        let screen = if let Some(offset) = self.viewport_offsets.get(&terminal_id).copied() {
+        let screen = if self.owns_copy_mode(terminal_id) {
+            let Some(terminal) = self.terminal(terminal_id) else {
+                return Ok(None);
+            };
+            let offset = self.viewport_offsets.get(&terminal_id).copied();
+            match terminal.copy_mode_snapshot(self.owner, offset).await {
+                Ok(viewport) => {
+                    self.set_viewport_offset(terminal_id, viewport.offset);
+                    viewport.screen
+                }
+                Err(
+                    error @ CommandError::CopyMode(
+                        CopyModeError::CursorLost | CopyModeError::NotActive,
+                    ),
+                ) => {
+                    self.forget_copy_mode(terminal_id);
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
+        } else if let Some(offset) = self.viewport_offsets.get(&terminal_id).copied() {
             let Some(terminal) = self.terminal(terminal_id) else {
                 return Ok(None);
             };
@@ -650,6 +767,21 @@ impl Attachment {
         }
     }
 
+    async fn clear_active_copy_mode(
+        &mut self,
+    ) -> Result<Option<crate::domain::ScreenSnapshot>, CommandError> {
+        let Some(terminal) = self.copy_mode_terminal.clone() else {
+            return Ok(None);
+        };
+        let terminal_id = terminal.id();
+        let screen = terminal.clear_client(self.owner).await?;
+        self.forget_copy_mode(terminal_id);
+        if let Some(screen) = &screen {
+            self.observe_snapshot_revision(terminal_id, screen.revision);
+        }
+        Ok(screen)
+    }
+
     fn accept_snapshot(
         &mut self,
         terminal_id: TerminalId,
@@ -661,6 +793,11 @@ impl Attachment {
         }
         *revision = screen.revision;
         Some(screen)
+    }
+
+    fn observe_snapshot_revision(&mut self, terminal_id: TerminalId, revision: u64) {
+        let current = self.snapshot_revisions.entry(terminal_id).or_default();
+        *current = (*current).max(revision);
     }
 
     fn reconcile(
@@ -712,7 +849,7 @@ impl Attachment {
         if let Some((_, task)) = self.watchers.remove(&terminal_id) {
             task.abort();
         }
-        self.viewport_offsets.remove(&terminal_id);
+        self.forget_copy_mode(terminal_id);
         self.snapshot_revisions.remove(&terminal_id);
         self.panes.remove(index);
         if let Some(layout) = self.layout.clone().without(pane_id) {
@@ -777,10 +914,18 @@ impl Attachment {
         }
         Ok(())
     }
+
+    async fn close(&mut self) -> Result<(), CommandError> {
+        self.clear_active_copy_mode().await?;
+        Ok(())
+    }
 }
 
 impl Drop for Attachment {
     fn drop(&mut self) {
+        if let Some(terminal) = self.copy_mode_terminal.take() {
+            terminal.clear_client_on_drop(self.owner);
+        }
         for (_, task) in self.watchers.values() {
             task.abort();
         }
@@ -1218,8 +1363,9 @@ async fn handle_connection(
     };
     let mut attachment = leased.expect("interactive connection selected a tab view");
 
-    loop {
-        tokio::select! {
+    let connection_result: Result<()> = async {
+        loop {
+            tokio::select! {
             frame = framed.next() => {
                 let Some(frame) = frame else { break };
                 let envelope: Envelope<ClientMessage> = decode_payload(&frame?)?;
@@ -1234,22 +1380,116 @@ async fn handle_connection(
                 }
                 match envelope.message {
                     ClientMessage::Input { bytes } => {
-                        focused_input_response(
-                            &mut framed,
-                            &mut attachment,
-                            envelope.request_id,
-                            AcknowledgedCommand::Input,
-                            FocusedInput::Bytes(bytes),
-                        ).await?;
+                        if attachment.copy_mode_active() {
+                            send_error(
+                                &mut framed,
+                                envelope.request_id,
+                                "copy_mode_active",
+                                "terminal input is disabled while copy mode is active",
+                            ).await?;
+                        } else {
+                            focused_input_response(
+                                &mut framed,
+                                &mut attachment,
+                                envelope.request_id,
+                                AcknowledgedCommand::Input,
+                                FocusedInput::Bytes(bytes),
+                            ).await?;
+                        }
                     }
                     ClientMessage::Paste { text } => {
-                        focused_input_response(
-                            &mut framed,
-                            &mut attachment,
-                            envelope.request_id,
-                            AcknowledgedCommand::Paste,
-                            FocusedInput::Paste(text),
-                        ).await?;
+                        if attachment.copy_mode_active() {
+                            send_error(
+                                &mut framed,
+                                envelope.request_id,
+                                "copy_mode_active",
+                                "terminal paste is disabled while copy mode is active",
+                            ).await?;
+                        } else {
+                            focused_input_response(
+                                &mut framed,
+                                &mut attachment,
+                                envelope.request_id,
+                                AcknowledgedCommand::Paste,
+                                FocusedInput::Paste(text),
+                            ).await?;
+                        }
+                    }
+                    ClientMessage::CopyMode { terminal_id, action } => {
+                        if envelope.request_id.is_none() {
+                            send_error(
+                                &mut framed,
+                                None,
+                                "request_id_required",
+                                "copy-mode commands require a request ID",
+                            ).await?;
+                            continue;
+                        }
+                        if terminal_id != attachment.focused.selected.terminal_id {
+                            send_error(
+                                &mut framed,
+                                envelope.request_id,
+                                "not_focused",
+                                "copy mode requires the focused terminal",
+                            ).await?;
+                            continue;
+                        }
+                        match attachment.copy_mode(action).await {
+                            Ok(CopyModeOutcome::Active(viewport)) => {
+                                send(
+                                    &mut framed,
+                                    envelope.request_id,
+                                    ServerMessage::CopyModeSnapshot {
+                                        terminal_id,
+                                        screen: viewport.screen,
+                                    },
+                                ).await?;
+                            }
+                            Ok(CopyModeOutcome::Prepared { copy_id, text }) => {
+                                send(
+                                    &mut framed,
+                                    envelope.request_id,
+                                    ServerMessage::CopyModePrepared {
+                                        terminal_id,
+                                        copy_id,
+                                        text,
+                                    },
+                                ).await?;
+                            }
+                            Ok(CopyModeOutcome::Finalized { screen }) => {
+                                send(
+                                    &mut framed,
+                                    envelope.request_id,
+                                    ServerMessage::CopyModeFinalized {
+                                        terminal_id,
+                                        screen,
+                                    },
+                                ).await?;
+                            }
+                            Ok(CopyModeOutcome::Cancelled { screen }) => {
+                                send(
+                                    &mut framed,
+                                    envelope.request_id,
+                                    ServerMessage::CopyModeCancelled {
+                                        terminal_id,
+                                        screen,
+                                    },
+                                ).await?;
+                            }
+                            Err(CommandError::CopyMode(error)) => {
+                                send(
+                                    &mut framed,
+                                    envelope.request_id,
+                                    ServerMessage::CopyModeError {
+                                        terminal_id,
+                                        error,
+                                    },
+                                ).await?;
+                            }
+                            Err(error) => {
+                                send_command_error(&mut framed, envelope.request_id, error).await?;
+                            }
+                        }
                     }
                     ClientMessage::MouseWheel { terminal_id, event } => {
                         if attachment.terminal(terminal_id).is_none() {
@@ -1360,6 +1600,10 @@ async fn handle_connection(
                         }
                         match switch_candidate(&shared, selector, expected.as_ref(), client).await {
                             Ok(candidate) => {
+                                if let Err(error) = attachment.close().await {
+                                    send_command_error(&mut framed, envelope.request_id, error).await?;
+                                    continue;
+                                }
                                 attachment = candidate;
                                 send(
                                     &mut framed,
@@ -1546,9 +1790,15 @@ async fn handle_connection(
                         send(&mut framed, envelope.request_id, ServerMessage::Resources { snapshot }).await?;
                     }
                     ClientMessage::Detach => {
-                        drop(attachment);
-                        send(&mut framed, envelope.request_id, ServerMessage::Detached).await?;
-                        return Ok(());
+                        match attachment.close().await {
+                            Ok(()) => {
+                                send(&mut framed, envelope.request_id, ServerMessage::Detached).await?;
+                                return Ok(());
+                            }
+                            Err(error) => {
+                                send_command_error(&mut framed, envelope.request_id, error).await?;
+                            }
+                        }
                     }
                     ClientMessage::Ping => send(&mut framed, envelope.request_id, ServerMessage::Pong { daemon_pid: std::process::id() }).await?,
                     ClientMessage::RenameTarget { selector, name } => {
@@ -1609,6 +1859,20 @@ async fn handle_connection(
                             send(&mut framed, None, ServerMessage::Snapshot { terminal_id, screen }).await?;
                         }
                         Ok(None) => {}
+                        Err(CommandError::CopyMode(error)) => {
+                            // Runtime cursor invalidation also publishes its
+                            // canonical snapshot. Send the semantic exit first
+                            // so an interactive client cannot retain local copy
+                            // mode while accepting that normal screen.
+                            send(
+                                &mut framed,
+                                None,
+                                ServerMessage::CopyModeError {
+                                    terminal_id,
+                                    error,
+                                },
+                            ).await?;
+                        }
                         Err(error) => {
                             respond_to_ui_event_error(
                                 &mut framed,
@@ -1629,6 +1893,7 @@ async fn handle_connection(
                     if !attachment.accepts(terminal_id, generation) {
                         continue;
                     }
+                    attachment.forget_copy_mode(terminal_id);
                     let focused = terminal_id == attachment.focused.selected.terminal_id;
                     let replacements = if focused {
                         exit_replacement_ids(&shared, &attachment, terminal_id).await
@@ -1658,6 +1923,16 @@ async fn handle_connection(
                         let Some(replacement) = replacement else {
                             break;
                         };
+                        if let Err(error) = attachment.close().await {
+                            respond_to_ui_event_error(
+                                &mut framed,
+                                None,
+                                "clean up exited attachment",
+                                error,
+                                UiEventPolicy::Disposable,
+                            ).await?;
+                            break;
+                        }
                         attachment = replacement;
                     } else {
                         attachment.remove(terminal_id);
@@ -1676,9 +1951,22 @@ async fn handle_connection(
                 }
                 None => break,
             },
+            }
+        }
+        Ok(())
+    }
+    .await;
+    let cleanup_result = attachment
+        .close()
+        .await
+        .context("clean up disconnected terminal attachment");
+    match (connection_result, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(cleanup_error)) => {
+            Err(error.context(format!("also failed attachment cleanup: {cleanup_error:#}")))
         }
     }
-    Ok(())
 }
 
 async fn control_loop(
@@ -1959,6 +2247,7 @@ async fn control_loop(
             ClientMessage::CreateWorkspace { .. }
             | ClientMessage::Input { .. }
             | ClientMessage::Paste { .. }
+            | ClientMessage::CopyMode { .. }
             | ClientMessage::Resize { .. }
             | ClientMessage::SelectTarget { .. } => {
                 send_error(
@@ -2047,6 +2336,7 @@ async fn lease_view(
     }
     let layout = retain_observed_layout(layout, &panes)?;
     Ok(Attachment::new(
+        client,
         panes,
         focused_target,
         layout,
@@ -2098,6 +2388,10 @@ async fn focus_leased_attachment(
     attachment: &mut Attachment,
     mut focused: LeasedTarget,
 ) -> Result<(), DaemonError> {
+    attachment
+        .clear_active_copy_mode()
+        .await
+        .map_err(|error| DaemonError::new(command_error_code(&error), error.to_string()))?;
     let state = shared.lock().await;
     if !state.accepting {
         return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
@@ -3195,6 +3489,7 @@ fn ui_event_error_disposition(
         (UiEventPolicy::Input, CommandError::Busy | CommandError::Emulator(_)) => {
             UiEventErrorDisposition::Reply
         }
+        (_, CommandError::CopyMode(_)) => UiEventErrorDisposition::Reply,
         (UiEventPolicy::Disposable, CommandError::Emulator(_)) => UiEventErrorDisposition::Diagnose,
     }
 }
@@ -3267,6 +3562,7 @@ fn command_error_code(error: &CommandError) -> &'static str {
         CommandError::Busy => "busy",
         CommandError::Stopped => "terminal_stopped",
         CommandError::Emulator(_) => "terminal_emulator",
+        CommandError::CopyMode(_) => "copy_mode",
     }
 }
 
@@ -3457,6 +3753,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn copy_mode_ignores_server_side_wheel_and_viewport_reset() {
+        let (mut attachment, terminal) = test_attachment("printf content; sleep 60");
+        let terminal_id = terminal.id();
+        attachment
+            .copy_mode(crate::domain::CopyModeAction::Begin)
+            .await
+            .unwrap();
+        attachment.viewport_offsets.insert(terminal_id, 7);
+        let revisions = attachment.snapshot_revisions.clone();
+
+        assert!(
+            attachment
+                .mouse_wheel(
+                    terminal_id,
+                    crate::domain::MouseWheelEvent {
+                        direction: crate::domain::MouseWheelDirection::Up,
+                        column: 0,
+                        row: 0,
+                        modifiers: crate::domain::MouseModifiers::default(),
+                    },
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            attachment
+                .return_focused_to_bottom()
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(attachment.viewport_offsets.get(&terminal_id), Some(&7));
+        assert_eq!(attachment.snapshot_revisions, revisions);
+
+        attachment.clear_active_copy_mode().await.unwrap();
+        terminal.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn removing_a_pane_clears_its_viewport_state() {
         let (mut attachment, focused) = test_attachment("sleep 60");
         let removed = Arc::new(spawn_test_terminal("sleep 60"));
@@ -3488,6 +3824,91 @@ mod tests {
         removed.close().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn acknowledged_attachment_cleanup_clears_its_runtime_copy_owner() {
+        let (mut attachment, terminal) = test_attachment("printf copy; sleep 60");
+        let owner = attachment.owner;
+        attachment
+            .copy_mode(crate::domain::CopyModeAction::Begin)
+            .await
+            .unwrap();
+        attachment.close().await.unwrap();
+
+        assert!(matches!(
+            terminal
+                .copy_mode(
+                    owner,
+                    crate::domain::CopyModeAction::Move {
+                        movement: crate::domain::CopyModeMovement::Left,
+                    },
+                    None,
+                )
+                .await,
+            Err(CommandError::CopyMode(
+                crate::domain::CopyModeError::NotActive
+            ))
+        ));
+        terminal.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn drop_cleanup_closes_a_cancelled_begin_after_runtime_acceptance() {
+        let (mut attachment, terminal) = test_attachment("printf copy; sleep 60");
+        let owner = attachment.owner;
+        // This is the cancellation boundary inside Attachment::copy_mode:
+        // ownership is recorded, the runtime accepts Begin, and the awaiting
+        // attachment future is then dropped before observing the response.
+        attachment.record_copy_mode_begin().unwrap();
+        assert!(matches!(
+            terminal
+                .copy_mode(owner, crate::domain::CopyModeAction::Begin, None)
+                .await
+                .unwrap(),
+            CopyModeOutcome::Active(_)
+        ));
+        assert_eq!(
+            attachment
+                .copy_mode_terminal
+                .as_ref()
+                .map(|terminal| terminal.id()),
+            Some(terminal.id())
+        );
+        drop(attachment);
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match terminal
+                    .copy_mode(owner, crate::domain::CopyModeAction::Begin, None)
+                    .await
+                {
+                    Ok(CopyModeOutcome::Active(_)) => break,
+                    Err(CommandError::CopyMode(crate::domain::CopyModeError::AlreadyActive)) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    _ => panic!("unexpected copy-mode cleanup result"),
+                }
+            }
+        })
+        .await
+        .expect("drop cleanup did not release the recorded copy owner");
+        terminal.clear_client(owner).await.unwrap();
+        terminal.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn begin_dispatch_failure_clears_the_write_ahead_owner() {
+        let (mut attachment, terminal) = test_attachment("printf copy; sleep 60");
+        terminal.close().await.unwrap();
+
+        assert!(matches!(
+            attachment
+                .copy_mode(crate::domain::CopyModeAction::Begin)
+                .await,
+            Err(CommandError::Stopped)
+        ));
+        assert!(attachment.copy_mode_terminal.is_none());
+    }
+
     fn test_attachment(script: &str) -> (Attachment, Arc<TerminalHandle>) {
         let terminal = Arc::new(spawn_test_terminal(script));
         let pane_id = PaneId::new();
@@ -3500,9 +3921,11 @@ mod tests {
             child_pid: terminal.child_pid(),
         };
         let lease = AttachmentLease::default();
-        let guard = lease.acquire(ClientId::new()).unwrap();
+        let owner = ClientId::new();
+        let guard = lease.acquire(owner).unwrap();
         let (_, resource_changes) = watch::channel(0);
         let attachment = Attachment::new(
+            owner,
             vec![ObservedTarget {
                 selected: selected.clone(),
                 terminal: Arc::clone(&terminal),

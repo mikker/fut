@@ -25,8 +25,7 @@ use crate::{
     domain::{AgentReport, PaneId, SessionId, TabId, TerminalId, WorkspaceId},
     protocol::{
         AcknowledgedCommand, ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION,
-        PROTOCOL_VERSION_0_1, PROTOCOL_VERSION_PREVIOUS_DEV, RenameSelector, ServerMessage, codec,
-        decode_payload, encode_payload,
+        PROTOCOL_VERSION_0_1, RenameSelector, ServerMessage, codec, decode_payload, encode_payload,
     },
     resources::{ResourceSnapshot, SessionSelector, TargetSelector},
 };
@@ -898,8 +897,8 @@ async fn shutdown_control(socket: &std::path::Path) -> Result<ServerMessage> {
             },
             None => bail!(
                 "daemon at {} uses protocol {server}, but this Fut client can only shut down \
-                 current protocol {PROTOCOL_VERSION}, prior development protocol \
-                 {PROTOCOL_VERSION_PREVIOUS_DEV}, or Fut 0.1 protocol {PROTOCOL_VERSION_0_1}",
+                 current protocol {PROTOCOL_VERSION} or Fut 0.1 protocol \
+                 {PROTOCOL_VERSION_0_1}",
                 socket.display()
             ),
         },
@@ -907,7 +906,7 @@ async fn shutdown_control(socket: &std::path::Path) -> Result<ServerMessage> {
 }
 
 fn shutdown_downgrade_version(server: u16) -> Option<u16> {
-    matches!(server, PROTOCOL_VERSION_PREVIOUS_DEV | PROTOCOL_VERSION_0_1).then_some(server)
+    (server == PROTOCOL_VERSION_0_1).then_some(server)
 }
 
 enum ControlAttempt {
@@ -1099,8 +1098,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_reconnects_with_known_compatible_daemon_protocols() {
-        assert_shutdown_reconnects_with(PROTOCOL_VERSION_PREVIOUS_DEV).await;
+    async fn shutdown_reconnects_with_fut_0_1_daemon_protocol() {
         assert_shutdown_reconnects_with(PROTOCOL_VERSION_0_1).await;
     }
 
@@ -1226,13 +1224,11 @@ mod tests {
     #[test]
     fn shutdown_downgrade_is_restricted_to_known_compatible_protocols() {
         assert_eq!(
-            shutdown_downgrade_version(PROTOCOL_VERSION_PREVIOUS_DEV),
-            Some(PROTOCOL_VERSION_PREVIOUS_DEV)
-        );
-        assert_eq!(
             shutdown_downgrade_version(PROTOCOL_VERSION_0_1),
             Some(PROTOCOL_VERSION_0_1)
         );
+        assert_eq!(shutdown_downgrade_version(1), None);
+        assert_eq!(shutdown_downgrade_version(2), None);
         assert_eq!(shutdown_downgrade_version(PROTOCOL_VERSION), None);
         assert_eq!(shutdown_downgrade_version(PROTOCOL_VERSION + 1), None);
         assert_eq!(shutdown_downgrade_version(u16::MAX), None);

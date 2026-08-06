@@ -59,6 +59,7 @@ impl NavigationScope {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum ClientAction {
     OpenCommandBar,
+    EnterCopyMode,
     OpenNavigator,
     OpenWorkspaceSidebar,
     OpenTabBar,
@@ -91,8 +92,9 @@ pub(super) struct DirectBinding {
     pub action: ClientAction,
 }
 
-pub(super) const ALL_ACTIONS: [ClientAction; 33] = [
+pub(super) const ALL_ACTIONS: [ClientAction; 34] = [
     ClientAction::OpenCommandBar,
+    ClientAction::EnterCopyMode,
     ClientAction::OpenNavigator,
     ClientAction::OpenWorkspaceSidebar,
     ClientAction::OpenTabBar,
@@ -127,7 +129,7 @@ pub(super) const ALL_ACTIONS: [ClientAction; 33] = [
     ClientAction::Detach,
 ];
 
-pub(super) const COMMANDS: [ActionDefinition; 32] = [
+pub(super) const COMMANDS: [ActionDefinition; 33] = [
     ActionDefinition {
         action: ClientAction::OpenNavigator,
         title: "Open global navigator",
@@ -284,16 +286,25 @@ pub(super) const COMMANDS: [ActionDefinition; 32] = [
         keywords: "pane zoom maximize restore fullscreen",
     },
     ActionDefinition {
+        action: ClientAction::EnterCopyMode,
+        title: "Enter copy mode",
+        keywords: "copy select scrollback search clipboard",
+    },
+    ActionDefinition {
         action: ClientAction::Detach,
         title: "Detach client",
         keywords: "detach disconnect leave client",
     },
 ];
 
-pub(super) const DIRECT_BINDINGS: [DirectBinding; 33] = [
+pub(super) const DIRECT_BINDINGS: [DirectBinding; 34] = [
     DirectBinding {
         suffix: b" ",
         action: ClientAction::OpenCommandBar,
+    },
+    DirectBinding {
+        suffix: b"[",
+        action: ClientAction::EnterCopyMode,
     },
     DirectBinding {
         suffix: b"g",
@@ -434,6 +445,7 @@ pub(super) fn definition(action: ClientAction) -> Option<&'static ActionDefiniti
 pub(super) fn config_key(action: ClientAction) -> &'static str {
     match action {
         ClientAction::OpenCommandBar => "open_command_bar",
+        ClientAction::EnterCopyMode => "enter_copy_mode",
         ClientAction::OpenNavigator => "open_navigator",
         ClientAction::OpenWorkspaceSidebar => "open_workspace_sidebar",
         ClientAction::OpenTabBar => "open_tab_bar",
@@ -495,7 +507,8 @@ pub(super) fn parse_suffix(value: &str) -> Option<(Vec<u8>, String)> {
 const fn requires_launcher(action: ClientAction) -> bool {
     match action {
         ClientAction::OpenCommandBar => false,
-        ClientAction::OpenNavigator
+        ClientAction::EnterCopyMode
+        | ClientAction::OpenNavigator
         | ClientAction::OpenWorkspaceSidebar
         | ClientAction::OpenTabBar
         | ClientAction::OpenNotifications

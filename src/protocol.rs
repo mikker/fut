@@ -9,8 +9,8 @@ use std::path::PathBuf;
 
 use crate::{
     domain::{
-        AgentReport, MouseWheelEvent, PaneId, ScreenSnapshot, SessionId, TabId, TerminalId,
-        TerminalSize, WorkspaceId,
+        AgentReport, CopyModeAction, CopyModeError, MouseWheelEvent, PaneId, ScreenSnapshot,
+        SessionId, TabId, TerminalId, TerminalSize, WorkspaceId,
     },
     resources::{ResourceSnapshot, SessionSelector, TargetSelector},
     splits::{SplitDirection, SplitTree},
@@ -18,10 +18,8 @@ use crate::{
 
 /// Protocol version used by released Fut 0.1 builds.
 pub const PROTOCOL_VERSION_0_1: u16 = 0;
-/// Protocol used by unreleased development builds before mode-aware paste.
-pub(crate) const PROTOCOL_VERSION_PREVIOUS_DEV: u16 = 1;
 /// Current clients and daemons require an exact protocol match.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 /// Enough for 50,000 individually styled JSON cells while remaining a firm
 /// pre-allocation bound for the length-delimited transport.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
@@ -124,6 +122,10 @@ pub enum ClientMessage {
     /// Fire-and-forget; its envelope must not carry a request ID.
     ResetViewport {
         terminal_id: TerminalId,
+    },
+    CopyMode {
+        terminal_id: TerminalId,
+        action: CopyModeAction,
     },
     Resize {
         terminal_id: TerminalId,
@@ -248,6 +250,27 @@ pub enum ServerMessage {
         terminal_id: TerminalId,
         screen: ScreenSnapshot,
     },
+    CopyModeSnapshot {
+        terminal_id: TerminalId,
+        screen: ScreenSnapshot,
+    },
+    CopyModePrepared {
+        terminal_id: TerminalId,
+        copy_id: Uuid,
+        text: String,
+    },
+    CopyModeFinalized {
+        terminal_id: TerminalId,
+        screen: ScreenSnapshot,
+    },
+    CopyModeCancelled {
+        terminal_id: TerminalId,
+        screen: ScreenSnapshot,
+    },
+    CopyModeError {
+        terminal_id: TerminalId,
+        error: CopyModeError,
+    },
     TerminalExited {
         terminal_id: TerminalId,
         exit_code: Option<i32>,
@@ -320,7 +343,8 @@ mod tests {
 
     use super::*;
     use crate::domain::{
-        Cell, Cursor, MAX_VISIBLE_CELLS, MouseModifiers, MouseWheelDirection, MouseWheelEvent,
+        Cell, Cursor, MAX_CELL_CONTENT_BYTES, MAX_VISIBLE_CELLS, MouseModifiers,
+        MouseWheelDirection, MouseWheelEvent,
     };
 
     fn ping(request_id: Option<Uuid>) -> Envelope<ClientMessage> {
@@ -351,6 +375,67 @@ mod tests {
             decode_payload::<ClientMessage>(&encode_payload(&message).unwrap()).unwrap(),
             message
         );
+    }
+
+    #[test]
+    fn typed_copy_mode_commands_results_and_errors_round_trip() {
+        let terminal_id = TerminalId::new();
+        let actions = [
+            CopyModeAction::Begin,
+            CopyModeAction::Move {
+                movement: crate::domain::CopyModeMovement::PageUp,
+            },
+            CopyModeAction::ToggleSelection,
+            CopyModeAction::Search {
+                query: "literal λ 雪".into(),
+            },
+            CopyModeAction::RepeatSearch {
+                direction: crate::domain::SearchDirection::Backward,
+            },
+            CopyModeAction::Copy,
+            CopyModeAction::FinalizeCopy {
+                copy_id: Uuid::new_v4(),
+            },
+            CopyModeAction::Cancel,
+        ];
+        for action in actions {
+            let message = ClientMessage::CopyMode {
+                terminal_id,
+                action,
+            };
+            assert_eq!(
+                decode_payload::<ClientMessage>(&encode_payload(&message).unwrap()).unwrap(),
+                message
+            );
+        }
+
+        let error = ServerMessage::CopyModeError {
+            terminal_id,
+            error: CopyModeError::SearchSpaceTooLarge {
+                actual: 250_001,
+                maximum: 250_000,
+            },
+        };
+        assert_eq!(
+            decode_payload::<ServerMessage>(&encode_payload(&error).unwrap()).unwrap(),
+            error
+        );
+    }
+
+    #[test]
+    fn maximum_copy_text_frame_has_headroom_without_a_screen() {
+        let terminal_id = TerminalId::new();
+        let message = Envelope {
+            request_id: Some(Uuid::new_v4()),
+            message: ServerMessage::CopyModePrepared {
+                terminal_id,
+                copy_id: Uuid::new_v4(),
+                // NUL forces JSON's six-byte escaping, the exact worst case
+                // for one UTF-8 input byte.
+                text: "\0".repeat(crate::domain::MAX_COPY_BYTES),
+            },
+        };
+        assert!(encode_payload(&message).unwrap().len() < MAX_FRAME_LEN);
     }
 
     #[test]
@@ -429,6 +514,70 @@ mod tests {
             decode_payload::<ScreenSnapshot>(&payload).unwrap(),
             snapshot
         );
+    }
+
+    #[test]
+    fn maximum_content_selected_styled_snapshot_and_copy_frames_fit() {
+        let size = TerminalSize {
+            columns: 250,
+            rows: 200,
+        };
+        let maximum_content = format!("a{}\u{1ab0}", "\u{301}".repeat(14));
+        assert_eq!(maximum_content.len(), MAX_CELL_CONTENT_BYTES);
+        let cell = Cell {
+            contents: maximum_content,
+            style: crate::domain::CellStyle {
+                foreground: Some(crate::domain::CellColor::Rgb(crate::domain::Rgb {
+                    red: 255,
+                    green: 255,
+                    blue: 255,
+                })),
+                background: Some(crate::domain::CellColor::Rgb(crate::domain::Rgb {
+                    red: 255,
+                    green: 255,
+                    blue: 255,
+                })),
+                bold: true,
+                italic: true,
+                underline: true,
+                inverse: true,
+            },
+            selected: true,
+        };
+        let screen = ScreenSnapshot::new(
+            u64::MAX,
+            size,
+            vec![cell; MAX_VISIBLE_CELLS],
+            Cursor {
+                column: 249,
+                row: 199,
+                visible: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(screen.cells[0].contents.len(), MAX_CELL_CONTENT_BYTES);
+        let terminal_id = TerminalId::new();
+        for message in [
+            ServerMessage::Snapshot {
+                terminal_id,
+                screen: screen.clone(),
+            },
+            ServerMessage::CopyModeSnapshot {
+                terminal_id,
+                screen,
+            },
+        ] {
+            let payload = encode_payload(&Envelope {
+                request_id: Some(Uuid::new_v4()),
+                message,
+            })
+            .unwrap();
+            assert!(
+                payload.len() < MAX_FRAME_LEN,
+                "maximum snapshot frame was {} bytes",
+                payload.len()
+            );
+        }
     }
 
     #[test]
@@ -549,8 +698,7 @@ mod tests {
             switched
         );
         assert_eq!(PROTOCOL_VERSION_0_1, 0);
-        assert_eq!(PROTOCOL_VERSION_PREVIOUS_DEV, 1);
-        assert_eq!(PROTOCOL_VERSION, 2);
+        assert_eq!(PROTOCOL_VERSION, 3);
     }
 
     #[test]

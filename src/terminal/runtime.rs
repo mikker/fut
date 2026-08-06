@@ -8,19 +8,26 @@ use std::{
         mpsc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow};
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::{broadcast, mpsc as async_mpsc, oneshot, watch};
 
-use crate::domain::{MouseWheelEvent, ScreenSnapshot, TerminalId, TerminalSize};
+use crate::domain::{
+    ClientId, CopyModeAction, CopyModeError, MouseWheelEvent, ScreenSnapshot, TerminalId,
+    TerminalSize,
+};
 
-use super::{MouseWheelOutcome, ViewportSnapshot, ghostty::GhosttyTerminal};
+use super::{
+    CopyModeOutcome, MouseWheelOutcome, ViewportSnapshot,
+    ghostty::{CopyModeFailure, GhosttyTerminal},
+};
 
 const QUEUE_CAPACITY: usize = 64;
 const OUTPUT_QUEUE_CAPACITY: usize = 16;
+const DROP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 pub struct SpawnSpec {
@@ -52,6 +59,8 @@ pub enum CommandError {
     Stopped,
     #[error("terminal emulator operation failed: {0}")]
     Emulator(String),
+    #[error(transparent)]
+    CopyMode(#[from] CopyModeError),
 }
 
 #[derive(Clone)]
@@ -121,6 +130,83 @@ impl TerminalHandle {
         completed.await.unwrap_or(Err(CommandError::Stopped))
     }
 
+    pub(crate) async fn copy_mode(
+        &self,
+        owner: ClientId,
+        action: CopyModeAction,
+        viewport_offset: Option<usize>,
+    ) -> Result<CopyModeOutcome, CommandError> {
+        let (completion, completed) = oneshot::channel();
+        send_with_backpressure(
+            &self.commands,
+            RuntimeMessage::CopyMode {
+                owner,
+                action,
+                viewport_offset,
+                completion,
+            },
+        )
+        .await?;
+        completed.await.unwrap_or(Err(CommandError::Stopped))
+    }
+
+    pub(crate) async fn copy_mode_snapshot(
+        &self,
+        owner: ClientId,
+        viewport_offset: Option<usize>,
+    ) -> Result<ViewportSnapshot, CommandError> {
+        let (completion, completed) = oneshot::channel();
+        send_with_backpressure(
+            &self.commands,
+            RuntimeMessage::CopyModeSnapshot {
+                owner,
+                viewport_offset,
+                completion,
+            },
+        )
+        .await?;
+        completed.await.unwrap_or(Err(CommandError::Stopped))
+    }
+
+    pub(crate) async fn clear_client(
+        &self,
+        owner: ClientId,
+    ) -> Result<Option<ScreenSnapshot>, CommandError> {
+        let (completion, completed) = oneshot::channel();
+        let sent = send_with_backpressure(
+            &self.commands,
+            RuntimeMessage::ClearCopyMode { owner, completion },
+        )
+        .await;
+        if matches!(sent, Err(CommandError::Stopped))
+            && matches!(*self.lifecycle.borrow(), TerminalLifecycle::Exited { .. })
+        {
+            return Ok(None);
+        }
+        sent?;
+        match completed.await.unwrap_or(Err(CommandError::Stopped)) {
+            Err(CommandError::Stopped)
+                if matches!(*self.lifecycle.borrow(), TerminalLifecycle::Exited { .. }) =>
+            {
+                Ok(None)
+            }
+            result => result,
+        }
+    }
+
+    /// Last-resort cleanup for an unexpectedly dropped attachment. Normal
+    /// lifecycle paths await [`Self::clear_client`] before dropping ownership.
+    /// This fallback retries the bounded ordered queue and waits for runtime
+    /// acknowledgement only until one deadline on a short-lived helper thread.
+    pub(crate) fn clear_client_on_drop(&self, owner: ClientId) {
+        let commands = self.commands.clone();
+        let terminal_id = self.id;
+        let deadline = Instant::now() + DROP_CLEANUP_TIMEOUT;
+        let _ = thread::Builder::new()
+            .name(format!("fut-copy-cleanup-{terminal_id}"))
+            .spawn(move || clear_client_before_deadline(&commands, owner, deadline));
+    }
+
     pub async fn close(&self) -> Result<(), CommandError> {
         if matches!(*self.lifecycle.borrow(), TerminalLifecycle::Exited { .. }) {
             return Ok(());
@@ -182,6 +268,37 @@ impl TerminalHandle {
     }
 }
 
+fn clear_client_before_deadline(
+    commands: &async_mpsc::Sender<RuntimeMessage>,
+    owner: ClientId,
+    deadline: Instant,
+) {
+    let (completion, mut completed) = oneshot::channel();
+    let mut message = RuntimeMessage::ClearCopyMode { owner, completion };
+    loop {
+        match commands.try_send(message) {
+            Ok(()) => break,
+            Err(async_mpsc::error::TrySendError::Full(returned)) => message = returned,
+            Err(async_mpsc::error::TrySendError::Closed(_)) => return,
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return;
+        };
+        thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+
+    loop {
+        match completed.try_recv() {
+            Ok(_) | Err(oneshot::error::TryRecvError::Closed) => return,
+            Err(oneshot::error::TryRecvError::Empty) => {}
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return;
+        };
+        thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+}
+
 async fn send_paste_with_backpressure(
     commands: &async_mpsc::Sender<RuntimeMessage>,
     text: String,
@@ -217,6 +334,21 @@ enum RuntimeMessage {
     ViewportSnapshot {
         viewport_offset: Option<usize>,
         completion: oneshot::Sender<Result<ViewportSnapshot, CommandError>>,
+    },
+    CopyMode {
+        owner: ClientId,
+        action: CopyModeAction,
+        viewport_offset: Option<usize>,
+        completion: oneshot::Sender<Result<CopyModeOutcome, CommandError>>,
+    },
+    CopyModeSnapshot {
+        owner: ClientId,
+        viewport_offset: Option<usize>,
+        completion: oneshot::Sender<Result<ViewportSnapshot, CommandError>>,
+    },
+    ClearCopyMode {
+        owner: ClientId,
+        completion: oneshot::Sender<Result<Option<ScreenSnapshot>, CommandError>>,
     },
     Close(oneshot::Sender<Result<(), CommandError>>),
 }
@@ -475,6 +607,51 @@ fn run(
                         .map_err(|error| CommandError::Emulator(error.to_string()));
                     let _ = completion.send(result);
                 }
+                RuntimeMessage::CopyMode {
+                    owner,
+                    action,
+                    viewport_offset,
+                    completion,
+                } => {
+                    drain_output_barrier(
+                        &mut queues.output,
+                        terminal,
+                        &publishers,
+                        &mut reader_complete,
+                    );
+                    let result = copy_mode_result(
+                        terminal.copy_mode(owner, action, viewport_offset),
+                        &publishers,
+                    );
+                    publish_copy_exit(&result, publishers.snapshots);
+                    let _ = completion.send(result);
+                }
+                RuntimeMessage::CopyModeSnapshot {
+                    owner,
+                    viewport_offset,
+                    completion,
+                } => {
+                    let result = copy_mode_result(
+                        terminal.copy_mode_snapshot(owner, viewport_offset),
+                        &publishers,
+                    );
+                    let _ = completion.send(result);
+                }
+                RuntimeMessage::ClearCopyMode { owner, completion } => {
+                    drain_output_barrier(
+                        &mut queues.output,
+                        terminal,
+                        &publishers,
+                        &mut reader_complete,
+                    );
+                    let result = terminal
+                        .clear_copy_mode(owner)
+                        .map_err(|error| CommandError::Emulator(error.to_string()));
+                    if let Ok(Some(screen)) = &result {
+                        publishers.snapshots.send_replace(screen.clone());
+                    }
+                    let _ = completion.send(result);
+                }
                 RuntimeMessage::Close(completion) => {
                     kill_terminal_processes(&*master, child_pid);
                     if exit_code.is_none()
@@ -573,6 +750,18 @@ fn paste_after_output_barrier(
     reader_complete: &mut bool,
     text: String,
 ) -> Result<(), CommandError> {
+    drain_output_barrier(output, terminal, publishers, reader_complete);
+    terminal
+        .paste(text)
+        .map_err(|error| CommandError::Emulator(error.to_string()))
+}
+
+fn drain_output_barrier(
+    output: &mut OutputQueue,
+    terminal: &mut GhosttyTerminal,
+    publishers: &RuntimePublishers<'_>,
+    reader_complete: &mut bool,
+) {
     if !*reader_complete {
         let target = output.barrier_target();
         while output.consumed < target {
@@ -597,9 +786,39 @@ fn paste_after_output_barrier(
             }
         }
     }
-    terminal
-        .paste(text)
-        .map_err(|error| CommandError::Emulator(error.to_string()))
+}
+
+fn copy_mode_result<T>(
+    result: std::result::Result<T, CopyModeFailure>,
+    publishers: &RuntimePublishers<'_>,
+) -> std::result::Result<T, CommandError> {
+    result.map_err(|error| match error {
+        CopyModeFailure::Semantic(error) => CommandError::CopyMode(error),
+        CopyModeFailure::CursorLost {
+            canonical,
+            cleanup_error,
+        } => {
+            if let Some(canonical) = canonical {
+                publishers.snapshots.send_replace(canonical);
+            }
+            if let Some(cleanup_error) = cleanup_error {
+                send_error(publishers.events, cleanup_error);
+            }
+            CommandError::CopyMode(CopyModeError::CursorLost)
+        }
+        CopyModeFailure::Emulator(error) => CommandError::Emulator(error.to_string()),
+    })
+}
+
+fn publish_copy_exit(
+    result: &std::result::Result<CopyModeOutcome, CommandError>,
+    snapshots: &watch::Sender<ScreenSnapshot>,
+) {
+    if let Ok(CopyModeOutcome::Finalized { screen } | CopyModeOutcome::Cancelled { screen }) =
+        result
+    {
+        snapshots.send_replace(screen.clone());
+    }
 }
 
 fn consume_output_message(
@@ -1132,6 +1351,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acknowledged_copy_cleanup_is_ordered_before_same_owner_can_begin_again() {
+        let handle = spawn_terminal(shell("printf content; sleep 60", HashMap::new())).unwrap();
+        let owner = ClientId::new();
+        let CopyModeOutcome::Active(selected) = handle
+            .copy_mode(owner, CopyModeAction::Begin, None)
+            .await
+            .unwrap()
+        else {
+            panic!("copy mode did not begin")
+        };
+        let canonical = handle
+            .clear_client(owner)
+            .await
+            .unwrap()
+            .expect("active copy mode returns a canonical snapshot");
+        assert!(canonical.revision > selected.screen.revision);
+        assert!(canonical.cells.iter().all(|cell| !cell.selected));
+
+        assert!(matches!(
+            handle
+                .copy_mode(owner, CopyModeAction::Begin, None)
+                .await
+                .unwrap(),
+            CopyModeOutcome::Active(_)
+        ));
+        handle.clear_client(owner).await.unwrap();
+        handle.close().await.unwrap();
+    }
+
+    #[test]
+    fn drop_cleanup_is_bounded_when_the_command_queue_is_saturated_or_stalled() {
+        for saturated in [true, false] {
+            let (commands, _stalled_receiver) = async_mpsc::channel(1);
+            if saturated {
+                assert!(commands.try_send(RuntimeMessage::Input(Vec::new())).is_ok());
+            }
+            let started = Instant::now();
+            clear_client_before_deadline(
+                &commands,
+                ClientId::new(),
+                started + Duration::from_millis(40),
+            );
+            assert!(
+                started.elapsed() < Duration::from_millis(250),
+                "drop cleanup outlived its deadline with saturated={saturated}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn synchronized_child_output_publishes_only_complete_frames() {
         let handle = spawn_terminal(shell(
             "stty -echo; printf 'OLD_FRAME'; IFS= read -r start; printf '\\033[?2026h\\r\\033[2KNEW_PARTIAL'; IFS= read -r finish; printf '_COMPLETE\\033[?2026l'; while IFS= read -r line; do :; done",
@@ -1228,6 +1497,22 @@ mod tests {
             handle.lifecycle(),
             TerminalLifecycle::Exited { exit_code: Some(7) }
         );
+    }
+
+    #[tokio::test]
+    async fn copy_cleanup_is_idempotent_after_the_runtime_has_exited() {
+        let handle = spawn_terminal(shell("exit 0", HashMap::new())).unwrap();
+        let mut lifecycle = handle.subscribe_lifecycle();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while matches!(*lifecycle.borrow(), TerminalLifecycle::Running) {
+                lifecycle.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(handle.clear_client(ClientId::new()).await.unwrap(), None);
     }
 
     #[tokio::test]

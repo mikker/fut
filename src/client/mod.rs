@@ -4,6 +4,7 @@ mod actions;
 mod chrome;
 mod command_bar;
 pub(crate) mod config;
+mod copy_mode;
 mod input;
 mod layout;
 mod navigation;
@@ -14,7 +15,7 @@ mod rename;
 mod sidebar;
 mod tab_bar;
 
-use std::{io, path::Path, time::Duration};
+use std::{io, path::Path, process::Stdio, time::Duration};
 
 use actions::{ClientAction, FocusDirection, NavigationScope};
 use anyhow::{Context, bail};
@@ -22,6 +23,9 @@ use bytes::Bytes;
 use chrome::{ResourceState, client_layout, render_tab_bar};
 use command_bar::{CommandBarAction, CommandBarState};
 use config::{PaneLayoutPolicy, UiConfig};
+use copy_mode::{
+    CopyModeErrorDisposition, CopyModeInput, CopyModePaste, CopyModeReply, CopyModeState,
+};
 use crossterm::{
     SynchronizedUpdate,
     cursor::{Hide, Show},
@@ -53,7 +57,7 @@ use ratatui::{
     widgets::Widget,
 };
 use rename::{RenameAction, RenameState};
-use tokio::{net::UnixStream, time};
+use tokio::{io::AsyncWriteExt, net::UnixStream, sync::mpsc, time};
 use tokio_util::codec::Framed;
 use uuid::Uuid;
 
@@ -89,6 +93,14 @@ enum PaneMouseAction {
     },
     Focus(crate::domain::PaneId),
 }
+
+enum ClipboardResult {
+    Copied { request_id: Uuid, bytes: usize },
+    Failed { request_id: Uuid, message: String },
+}
+
+const PBCOPY_TIMEOUT: Duration = Duration::from_secs(2);
+const PBCOPY_REAP_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Attach an interactive full-screen client to an already-running daemon.
 pub async fn attach(socket_path: &Path, selector: Option<TargetSelector>) -> anyhow::Result<()> {
@@ -163,6 +175,7 @@ async fn run(
     let mut view = ViewState::new(selected)?;
     let mut resources = ResourceState::default();
     let mut surface: Option<ClientSurface> = None;
+    let mut copy_mode: Option<CopyModeState> = None;
     let mut rename: Option<RenameState> = None;
     let mut workspace_history = NavigationHistory::default();
     workspace_history.record(view.focused());
@@ -178,6 +191,7 @@ async fn run(
     redraw.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut spinner = time::interval(Duration::from_millis(100));
     spinner.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let (clipboard_results, mut clipboard_result) = mpsc::channel(1);
     send_request(framed, Some(Uuid::new_v4()), ClientMessage::ListResources).await?;
     resize_view(framed, terminal.size()?.into(), &mut view, &resources, &ui).await?;
 
@@ -204,6 +218,111 @@ async fn run(
                             )
                         {
                             surface = None;
+                        }
+                    }
+                    ServerMessage::CopyModeSnapshot { terminal_id, screen } => {
+                        let accepted = copy_mode.as_mut().is_some_and(|state| {
+                            state.complete(
+                                terminal_id,
+                                request_id,
+                                CopyModeReply::Snapshot,
+                            )
+                        });
+                        if accepted {
+                            if view.accept(terminal_id, screen) {
+                                force_draw = true;
+                            }
+                            pump_copy_mode(
+                                framed,
+                                copy_mode.as_mut().expect("accepted copy-mode snapshot"),
+                            ).await?;
+                        }
+                    }
+                    ServerMessage::CopyModePrepared {
+                        terminal_id,
+                        copy_id,
+                        text,
+                    } => {
+                        let accepted = request_id.and_then(|request_id| {
+                            let state = copy_mode.as_mut()?;
+                            (state.complete(
+                                terminal_id,
+                                Some(request_id),
+                                CopyModeReply::Prepared,
+                            )
+                                && state.begin_clipboard(request_id, copy_id))
+                                .then_some(request_id)
+                        });
+                        if let Some(request_id) = accepted {
+                            spawn_pbcopy(
+                                request_id,
+                                text,
+                                clipboard_results.clone(),
+                            );
+                            force_draw = true;
+                        }
+                    }
+                    ServerMessage::CopyModeFinalized { terminal_id, screen } => {
+                        let accepted = copy_mode.as_mut().is_some_and(|state| {
+                            state.complete(
+                                terminal_id,
+                                request_id,
+                                CopyModeReply::Finalized,
+                            )
+                        });
+                        if accepted {
+                            let copied_bytes = copy_mode
+                                .as_mut()
+                                .and_then(CopyModeState::take_copied_bytes);
+                            view.accept(terminal_id, screen);
+                            copy_mode = None;
+                            if let Some(bytes) = copied_bytes {
+                                notice = Some(format!("copied {bytes} bytes to clipboard"));
+                            }
+                            force_draw = true;
+                        }
+                    }
+                    ServerMessage::CopyModeCancelled { terminal_id, screen } => {
+                        let accepted = copy_mode.as_mut().is_some_and(|state| {
+                            state.complete(
+                                terminal_id,
+                                request_id,
+                                CopyModeReply::Cancelled,
+                            )
+                        });
+                        if accepted {
+                            view.accept(terminal_id, screen);
+                            copy_mode = None;
+                            notice = Some("copy mode cancelled".into());
+                            force_draw = true;
+                        }
+                    }
+                    ServerMessage::CopyModeError { terminal_id, error } => {
+                        let disposition = copy_mode.as_mut().map_or(
+                            CopyModeErrorDisposition::Ignored,
+                            |state| {
+                                state.copy_mode_error(
+                                    terminal_id,
+                                    request_id,
+                                    &error,
+                                )
+                            },
+                        );
+                        match disposition {
+                            CopyModeErrorDisposition::Ignored => {}
+                            CopyModeErrorDisposition::Continue => {
+                                notice = Some(format!("copy mode · {error}"));
+                                pump_copy_mode(
+                                    framed,
+                                    copy_mode.as_mut().expect("recoverable copy-mode error"),
+                                ).await?;
+                                force_draw = true;
+                            }
+                            CopyModeErrorDisposition::Exit => {
+                                notice = Some(format!("copy mode · {error}"));
+                                copy_mode = None;
+                                force_draw = true;
+                            }
                         }
                     }
                     ServerMessage::Resources { snapshot } => {
@@ -294,6 +413,12 @@ async fn run(
                             continue;
                         }
                         workspace_history.record_transition(&previous_target, view.focused());
+                        if copy_mode.as_ref().is_some_and(|copy_mode| {
+                            copy_mode.terminal_id() != view.focused().terminal_id
+                        }) {
+                            copy_mode = None;
+                            notice = Some("copy mode cancelled · focus changed".into());
+                        }
                         if !resources
                             .snapshot()
                             .is_some_and(|snapshot| view.resources_are_current(snapshot))
@@ -379,6 +504,12 @@ async fn run(
                     | ServerMessage::CommandCompleted { .. }
                     | ServerMessage::LocationOpened { .. } => {}
                     ServerMessage::TerminalExited { terminal_id, exit_code } => {
+                        if copy_mode
+                            .as_ref()
+                            .is_some_and(|copy_mode| copy_mode.terminal_id() == terminal_id)
+                        {
+                            copy_mode = None;
+                        }
                         if terminal_id == view.focused().terminal_id {
                             pending_focused_exit = Some(exit_code);
                             force_draw = true;
@@ -389,6 +520,29 @@ async fn run(
                     }
                     ServerMessage::Detached => break,
                     ServerMessage::Error { code, message } => {
+                        let copy_failure = copy_mode
+                            .as_mut()
+                            .map_or(CopyModeErrorDisposition::Ignored, |copy_mode| {
+                                copy_mode.fail(request_id)
+                            });
+                        match copy_failure {
+                            CopyModeErrorDisposition::Ignored => {}
+                            CopyModeErrorDisposition::Continue => {
+                                notice = Some(format!("copy mode failed · {message}"));
+                                pump_copy_mode(
+                                    framed,
+                                    copy_mode.as_mut().expect("recoverable copy-mode failure"),
+                                ).await?;
+                                force_draw = true;
+                                continue;
+                            }
+                            CopyModeErrorDisposition::Exit => {
+                                copy_mode = None;
+                                notice = Some(format!("copy mode failed · {message}"));
+                                force_draw = true;
+                                continue;
+                            }
+                        }
                         if rename
                             .as_mut()
                             .is_some_and(|rename| rename.fail(request_id, message.clone()))
@@ -459,6 +613,34 @@ async fn run(
             event = events.next(), if accepts_client_input(&focus, &create_workspace, &create_tab, &split_pane, &pending_focused_exit) => {
                 let Some(event) = event else { break };
                 match event? {
+                    Event::Key(key) if copy_mode.is_some() => {
+                        notice = None;
+                        let input = copy_mode.as_mut().expect("copy mode exists").key(key);
+                        match input {
+                            CopyModeInput::Stay => {}
+                            CopyModeInput::Pump => {
+                                pump_copy_mode(
+                                    framed,
+                                    copy_mode.as_mut().expect("copy mode exists"),
+                                ).await?;
+                            }
+                            CopyModeInput::Notice(message) => notice = Some(message.into()),
+                        }
+                        force_draw = true;
+                    }
+                    Event::Paste(text) if copy_mode.is_some() => {
+                        notice = match copy_mode
+                            .as_mut()
+                            .expect("copy mode exists")
+                            .paste(&text)
+                        {
+                            CopyModePaste::Accepted | CopyModePaste::Ignored => None,
+                            CopyModePaste::TooLarge => Some(
+                                "search query is too large; paste was not added".into(),
+                            ),
+                        };
+                        force_draw = true;
+                    }
                     Event::Key(key) if rename.is_some() => {
                         let action = rename.as_mut().expect("rename exists").key(key);
                         match action {
@@ -697,6 +879,7 @@ async fn run(
                                     &mut create_tab,
                                     &mut split_pane,
                                     &mut focus,
+                                    &mut copy_mode,
                                     terminal.size()?.into(),
                                     &ui,
                                 ).await?;
@@ -710,7 +893,8 @@ async fn run(
                             force_draw = true;
                         }
                     }
-                    Event::Mouse(mouse) if surface.is_none() && rename.is_none() => {
+                    Event::Mouse(mouse)
+                        if surface.is_none() && rename.is_none() && copy_mode.is_none() => {
                         let terminal_area = client_layout(
                             terminal.size()?.into(),
                             &ui,
@@ -746,7 +930,7 @@ async fn run(
                             }
                         }
                     }
-                    Event::Key(key) if surface.is_none() => if let Some(bytes) = encode_key(key) {
+                    Event::Key(key) if surface.is_none() && copy_mode.is_none() => if let Some(bytes) = encode_key(key) {
                         notice = None;
                         match prefix.feed(bytes) {
                             PrefixAction::Wait => {
@@ -774,6 +958,7 @@ async fn run(
                                     &mut create_tab,
                                     &mut split_pane,
                                     &mut focus,
+                                    &mut copy_mode,
                                     terminal.size()?.into(),
                                     &ui,
                                 ).await?;
@@ -782,16 +967,18 @@ async fn run(
                             PrefixAction::Send(bytes) => send(framed, ClientMessage::Input { bytes }).await?,
                         }
                     },
-                    Event::Paste(text) if surface.is_none() => {
+                    Event::Paste(text) if surface.is_none() && copy_mode.is_none() => {
                         send(framed, ClientMessage::Paste { text }).await?
                     }
                     Event::Resize(columns, rows) if columns > 0 && rows > 0 => {
-                        send(
-                            framed,
-                            ClientMessage::ResetViewport {
-                                terminal_id: view.focused().terminal_id,
-                            },
-                        ).await?;
+                        if copy_mode.is_none() {
+                            send(
+                                framed,
+                                ClientMessage::ResetViewport {
+                                    terminal_id: view.focused().terminal_id,
+                                },
+                            ).await?;
+                        }
                         resize_view(
                             framed,
                             Rect::new(0, 0, columns, rows),
@@ -802,6 +989,42 @@ async fn run(
                         force_draw = true;
                     }
                     _ => {}
+                }
+            }
+            result = clipboard_result.recv() => {
+                if let Some(result) = result {
+                    match result {
+                        ClipboardResult::Copied { request_id, bytes } => {
+                            if let Some(copy_id) = copy_mode
+                                .as_mut()
+                                .and_then(|state| state.finish_clipboard(request_id))
+                            {
+                                let state = copy_mode
+                                    .as_mut()
+                                    .expect("accepted clipboard copy is active");
+                                state.finalize_copy(copy_id, bytes);
+                                notice = None;
+                                pump_copy_mode(framed, state).await?;
+                                force_draw = true;
+                            }
+                        }
+                        ClipboardResult::Failed { request_id, message } => {
+                            if copy_mode
+                                .as_mut()
+                                .and_then(|state| state.finish_clipboard(request_id))
+                                .is_some()
+                            {
+                                notice = Some(format!(
+                                    "COPY FAILED · press y to retry · {message}"
+                                ));
+                                pump_copy_mode(
+                                    framed,
+                                    copy_mode.as_mut().expect("failed clipboard copy is active"),
+                                ).await?;
+                                force_draw = true;
+                            }
+                        }
+                    }
                 }
             }
             _ = spinner.tick(), if resources.has_working() => {
@@ -904,14 +1127,24 @@ async fn run(
                         if let Some(rename) = rename.as_ref() {
                             rename.render(layout.terminal, frame.buffer_mut());
                         }
+                        if let Some(copy_mode) = copy_mode.as_ref() {
+                            copy_mode.render(
+                                layout.terminal,
+                                frame.buffer_mut(),
+                                notice.as_deref(),
+                            );
+                        }
                         if surface.is_none()
                             && rename.is_none()
+                            && copy_mode.is_none()
                             && notice.is_none()
                             && let Some((column, row)) = cursor
                         {
                             frame.set_cursor_position((column, row));
                         }
-                        if let Some(message) = notice.as_deref() {
+                        if copy_mode.is_none()
+                            && let Some(message) = notice.as_deref()
+                        {
                             render_notice(area, frame.buffer_mut(), message);
                         }
                     })
@@ -1056,6 +1289,7 @@ async fn dispatch_client_action(
     create_tab: &mut CreateState,
     split_pane: &mut CreateState,
     focus: &mut FocusState,
+    copy_mode: &mut Option<CopyModeState>,
     host: Rect,
     ui: &UiConfig,
 ) -> anyhow::Result<Option<String>> {
@@ -1064,6 +1298,13 @@ async fn dispatch_client_action(
             *surface = Some(ClientSurface::CommandBar(
                 CommandBarState::open_with_bindings(ui.bindings.clone()),
             ));
+        }
+        ClientAction::EnterCopyMode => {
+            if copy_mode.is_none() {
+                let mut state = CopyModeState::enter(view.focused().terminal_id);
+                pump_copy_mode(framed, &mut state).await?;
+                *copy_mode = Some(state);
+            }
         }
         ClientAction::OpenNavigator => {
             let mut navigator = NavigatorState::open(view.focused());
@@ -1302,6 +1543,98 @@ async fn dispatch_client_action(
         ClientAction::Detach => send(framed, ClientMessage::Detach).await?,
     }
     Ok(None)
+}
+
+async fn pump_copy_mode(
+    framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    state: &mut CopyModeState,
+) -> anyhow::Result<()> {
+    let Some(submission) = state.start_next() else {
+        return Ok(());
+    };
+    send_request(
+        framed,
+        Some(submission.request_id),
+        ClientMessage::CopyMode {
+            terminal_id: state.terminal_id(),
+            action: submission.action,
+        },
+    )
+    .await
+}
+
+fn spawn_pbcopy(request_id: Uuid, text: String, results: mpsc::Sender<ClipboardResult>) {
+    tokio::spawn(async move {
+        let result = pbcopy(text).await;
+        let _ = results
+            .send(match result {
+                Ok(bytes) => ClipboardResult::Copied { request_id, bytes },
+                Err(error) => ClipboardResult::Failed {
+                    request_id,
+                    message: error.to_string(),
+                },
+            })
+            .await;
+    });
+}
+
+async fn pbcopy(text: String) -> anyhow::Result<usize> {
+    copy_to_clipboard(Path::new("pbcopy"), text, PBCOPY_TIMEOUT).await
+}
+
+async fn copy_to_clipboard(
+    program: &Path,
+    text: String,
+    deadline: Duration,
+) -> anyhow::Result<usize> {
+    let bytes = text.len();
+    let mut child = tokio::process::Command::new(program)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("start {}", program.display()))?;
+    let Some(mut stdin) = child.stdin.take() else {
+        kill_and_reap(&mut child).await;
+        bail!("open clipboard process stdin");
+    };
+    let operation = async {
+        stdin
+            .write_all(text.as_bytes())
+            .await
+            .context("write selected text to clipboard process")?;
+        stdin
+            .shutdown()
+            .await
+            .context("close clipboard process stdin")?;
+        drop(stdin);
+        let status = child.wait().await.context("wait for clipboard process")?;
+        if !status.success() {
+            bail!("clipboard process exited with {status}");
+        }
+        Ok(bytes)
+    };
+
+    match time::timeout(deadline, operation).await {
+        Ok(Ok(bytes)) => Ok(bytes),
+        Ok(Err(error)) => {
+            kill_and_reap(&mut child).await;
+            Err(error)
+        }
+        Err(_) => {
+            kill_and_reap(&mut child).await;
+            bail!(
+                "clipboard process timed out after {} ms",
+                deadline.as_millis()
+            )
+        }
+    }
+}
+
+async fn kill_and_reap(child: &mut tokio::process::Child) {
+    let _ = child.start_kill();
+    let _ = time::timeout(PBCOPY_REAP_TIMEOUT, child.wait()).await;
 }
 
 async fn send(
@@ -1958,14 +2291,14 @@ impl Widget for Screen<'_> {
                 if let Some(target) = buffer.cell_mut((area.x + column, area.y + row)) {
                     target
                         .set_symbol(&cell.contents)
-                        .set_style(style(cell.style));
+                        .set_style(style(cell.style, cell.selected));
                 }
             }
         }
     }
 }
 
-fn style(source: CellStyle) -> Style {
+fn style(source: CellStyle, selected: bool) -> Style {
     let mut target = Style::default();
     if let Some(color) = source.foreground {
         target = target.fg(color.into());
@@ -1977,7 +2310,7 @@ fn style(source: CellStyle) -> Style {
         (source.bold, Modifier::BOLD),
         (source.italic, Modifier::ITALIC),
         (source.underline, Modifier::UNDERLINED),
-        (source.inverse, Modifier::REVERSED),
+        (source.inverse ^ selected, Modifier::REVERSED),
     ] {
         if enabled {
             target = target.add_modifier(modifier);
@@ -2450,6 +2783,7 @@ mod tests {
                     Cell {
                         contents: contents.into(),
                         style: CellStyle::default(),
+                        selected: false,
                     };
                     usize::from(columns) * 2
                 ],
@@ -2521,18 +2855,21 @@ mod tests {
 
     #[test]
     fn style_conversion_preserves_indexed_rgb_and_modifiers() {
-        let converted = style(CellStyle {
-            foreground: Some(CellColor::Indexed(1)),
-            background: Some(CellColor::Rgb(Rgb {
-                red: 4,
-                green: 5,
-                blue: 6,
-            })),
-            bold: true,
-            italic: true,
-            underline: true,
-            inverse: true,
-        });
+        let converted = style(
+            CellStyle {
+                foreground: Some(CellColor::Indexed(1)),
+                background: Some(CellColor::Rgb(Rgb {
+                    red: 4,
+                    green: 5,
+                    blue: 6,
+                })),
+                bold: true,
+                italic: true,
+                underline: true,
+                inverse: true,
+            },
+            false,
+        );
         assert_eq!(converted.fg, Some(Color::Indexed(1)));
         assert_eq!(converted.bg, Some(Color::Rgb(4, 5, 6)));
         assert!(converted.add_modifier.contains(
@@ -2546,6 +2883,92 @@ mod tests {
                 blue: 3,
             })),
             Color::Rgb(1, 2, 3)
+        );
+
+        assert!(
+            style(CellStyle::default(), true)
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert!(
+            !style(
+                CellStyle {
+                    inverse: true,
+                    ..CellStyle::default()
+                },
+                true,
+            )
+            .add_modifier
+            .contains(Modifier::REVERSED)
+        );
+    }
+
+    #[cfg(unix)]
+    fn clipboard_script(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("clipboard");
+        std::fs::write(&script, format!("#!/bin/sh\n{contents}\n")).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (directory, script)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clipboard_process_success_failure_timeout_and_missing_executable_are_bounded() {
+        let capture_dir = tempfile::tempdir().unwrap();
+        let capture = capture_dir.path().join("copied");
+        let (_success_dir, success) = clipboard_script(&format!("cat > '{}'", capture.display()));
+        assert_eq!(
+            copy_to_clipboard(&success, "selected λ雪".into(), Duration::from_secs(1))
+                .await
+                .unwrap(),
+            "selected λ雪".len()
+        );
+        assert_eq!(std::fs::read_to_string(capture).unwrap(), "selected λ雪");
+
+        let (_failure_dir, failure) = clipboard_script("cat >/dev/null; exit 23");
+        assert!(
+            copy_to_clipboard(&failure, "retry me".into(), Duration::from_secs(1))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("exit status: 23")
+        );
+
+        let pid_dir = tempfile::tempdir().unwrap();
+        let pid_file = pid_dir.path().join("pid");
+        let (_timeout_dir, timeout_script) = clipboard_script(&format!(
+            "echo $$ > '{}'; exec sleep 30",
+            pid_file.display()
+        ));
+        let error = copy_to_clipboard(
+            &timeout_script,
+            "blocked".into(),
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        let pid = std::fs::read_to_string(pid_file).unwrap();
+        let status = std::process::Command::new("/bin/kill")
+            .args(["-0", pid.trim()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success(), "timed-out clipboard process survived");
+
+        assert!(
+            copy_to_clipboard(
+                Path::new("/definitely/missing/fut-pbcopy"),
+                "text".into(),
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("start")
         );
     }
 }

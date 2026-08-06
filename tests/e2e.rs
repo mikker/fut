@@ -18,8 +18,9 @@ use std::{
 use bytes::Bytes;
 use fut::{
     domain::{
-        AgentReport, AgentState, AttentionKind, MouseModifiers, MouseWheelDirection,
-        MouseWheelEvent, PaneId, ScreenSnapshot, TabId, TerminalId, TerminalSize,
+        AgentReport, AgentState, AttentionKind, CopyModeAction, CopyModeError, CopyModeMovement,
+        MAX_SEARCH_QUERY_BYTES, MouseModifiers, MouseWheelDirection, MouseWheelEvent, PaneId,
+        ScreenSnapshot, SearchDirection, TabId, TerminalId, TerminalSize,
     },
     protocol::{
         ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, PROTOCOL_VERSION_0_1,
@@ -5336,6 +5337,554 @@ async fn public_command_bar_filters_labels_actions_and_matches_direct_dispatch()
 }
 
 #[tokio::test]
+async fn keyboard_copy_search_uses_client_pbcopy_and_surfaces_success_and_failure() {
+    let root = tempfile::Builder::new()
+        .prefix("fut-copy-mode-e2e-")
+        .tempdir()
+        .unwrap();
+    let input_log = root.path().join("pty-input");
+    let script = format!(
+        "printf 'COPY_TARGET λ雪\\r\\nCOPY_READY\\r\\n'; while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{}'; [ \"$line\" = probe ] && printf 'AFTER_COPY_MODE\\r\\n'; done",
+        input_log.display()
+    );
+    let harness = Harness::start(&script).await;
+    let snapshot = harness.resources().await;
+    let pane = snapshot.sessions[0].workspaces[0].tabs[0].panes[0].id;
+
+    let bin = root.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let pbcopy = bin.join("pbcopy");
+    fs::write(
+        &pbcopy,
+        "#!/bin/sh\nif [ \"$PBCOPY_FAIL\" = 1 ] && [ ! -e \"$PBCOPY_FAILED_ONCE\" ]; then touch \"$PBCOPY_FAILED_ONCE\"; cat >/dev/null; exit 23; fi\ncount=0\n[ ! -f \"$PBCOPY_COUNT\" ] || read -r count < \"$PBCOPY_COUNT\"\ncount=$((count + 1))\ncat > \"$PBCOPY_CAPTURE.$count\"\nprintf '%s\\n' \"$count\" > \"$PBCOPY_COUNT\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&pbcopy, fs::Permissions::from_mode(0o755)).unwrap();
+    let capture = root.path().join("clipboard");
+    let copy_count = root.path().join("clipboard-count");
+
+    let spawn_client = |fail: bool| {
+        let mut command = Command::new("/usr/bin/script");
+        command
+            .env_clear()
+            .env("HOME", harness.root.path().join("home"))
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("PBCOPY_CAPTURE", &capture)
+            .env("PBCOPY_COUNT", &copy_count)
+            .env("PBCOPY_FAILED_ONCE", root.path().join("pbcopy-failed-once"))
+            .env("PBCOPY_FAIL", if fail { "1" } else { "0" })
+            .env("TMPDIR", harness.root.path().join("runtime"))
+            .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+            .env("TERM", "xterm-256color")
+            .args(["-q", "/dev/null", "/bin/sh", "-c"])
+            .arg(format!(
+                "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {pane}",
+                env!("CARGO_BIN_EXE_fut"),
+                harness.socket.display(),
+            ));
+        PtyChild::spawn(command)
+    };
+
+    let mut success = spawn_client(false);
+    success.wait_for("COPY_READY").await;
+    for _ in 0..10 {
+        success.send(b"\x02[hjlq");
+        success.wait_for("copy mode cancelled").await;
+        success.clear_output();
+    }
+    for iteration in 1..=10 {
+        // Begin, search, select, move, and copy arrive without pacing. The
+        // client must preserve this exact order behind one wire request.
+        success.send(b"\x02[/COPY_TARGET\r \x1b[Fy");
+        let captured = PathBuf::from(format!("{}.{}", capture.display(), iteration));
+        wait_for(DEADLINE, || {
+            fs::read_to_string(&captured).is_ok_and(|text| text == "COPY_TARGET λ雪")
+        })
+        .await;
+        assert_eq!(fs::read_to_string(captured).unwrap(), "COPY_TARGET λ雪");
+        success.wait_for("copied ").await;
+        success.clear_output();
+    }
+    assert!(!input_log.exists(), "copy-mode keys reached the PTY");
+    success.send(b"\x02d");
+    success.wait_success().await;
+
+    let mut failure = spawn_client(true);
+    failure.wait_for("COPY_READY").await;
+    failure.send(b"\x02[/COPY_TARGET\r \x1b[Fy");
+    failure.wait_for("FAILED").await;
+    assert!(!input_log.exists(), "failed copy exited copy mode");
+    failure.clear_output();
+    failure.send(b"y");
+    let retried_capture = PathBuf::from(format!("{}.11", capture.display()));
+    wait_for(DEADLINE, || {
+        fs::read_to_string(&retried_capture).is_ok_and(|text| text == "COPY_TARGET λ雪")
+    })
+    .await;
+    assert_eq!(
+        fs::read_to_string(retried_capture).unwrap(),
+        "COPY_TARGET λ雪"
+    );
+    failure.wait_for("copied ").await;
+    failure.send(b"probe\n");
+    failure.wait_for("AFTER_COPY_MODE").await;
+    assert_eq!(fs::read_to_string(&input_log).unwrap(), "probe\n");
+    failure.send(b"\x02d");
+    failure.wait_success().await;
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn raw_copy_mode_ignores_wheel_and_reset_until_cancelled() {
+    let mut script = String::new();
+    for index in 0..40 {
+        use std::fmt::Write as _;
+        writeln!(&mut script, "printf 'RAW_SCROLL_{index:02}\\r\\n'").unwrap();
+    }
+    script.push_str(
+        "stty raw -echo; printf '\\033[?1000h\\033[?1006hRAW_MOUSE_READY\r\n'; dd bs=1 count=10 of=wheel.tmp 2>/dev/null; mv wheel.tmp wheel.capture; printf 'RAW_MOUSE_CAPTURED\r\n'; while :; do sleep 1; done",
+    );
+    let mut harness = Harness::start(&script).await;
+    let capture = harness.root.path().join("cwd/wheel.capture");
+    let (mut connection, terminal_id, _) = harness.interactive().await;
+    snapshot_containing(&mut connection, terminal_id, "RAW_MOUSE_READY").await;
+    copy_command(&mut connection, terminal_id, CopyModeAction::Begin).await;
+    let historical = copy_command(
+        &mut connection,
+        terminal_id,
+        CopyModeAction::Search {
+            query: "RAW_SCROLL_00".into(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        historical.message,
+        ServerMessage::CopyModeSnapshot { .. }
+    ));
+
+    let wheel = MouseWheelEvent {
+        direction: MouseWheelDirection::Up,
+        column: 0,
+        row: 0,
+        modifiers: MouseModifiers::default(),
+    };
+    send(
+        &mut connection,
+        ClientMessage::MouseWheel {
+            terminal_id,
+            event: wheel,
+        },
+    )
+    .await;
+    send(
+        &mut connection,
+        ClientMessage::ResetViewport { terminal_id },
+    )
+    .await;
+    let request_id = Uuid::new_v4();
+    send_envelope(
+        &mut connection,
+        Envelope {
+            request_id: Some(request_id),
+            message: ClientMessage::CopyMode {
+                terminal_id,
+                action: CopyModeAction::Move {
+                    movement: CopyModeMovement::Right,
+                },
+            },
+        },
+    )
+    .await;
+    let response = time::timeout(DEADLINE, async {
+        loop {
+            let envelope = receive_envelope(&mut connection)
+                .await
+                .expect("copy-mode connection closed");
+            if envelope.request_id == Some(request_id) {
+                break envelope.message;
+            }
+            if matches!(
+                envelope.message,
+                ServerMessage::Snapshot {
+                    terminal_id: id,
+                    ref screen,
+                } if id == terminal_id && screen.cells.iter().all(|cell| !cell.selected)
+            ) {
+                panic!("reset emitted a canonical snapshot during copy mode");
+            }
+        }
+    })
+    .await
+    .expect("copy-mode update timed out");
+    assert!(matches!(response, ServerMessage::CopyModeSnapshot { .. }));
+    assert!(!capture.exists(), "active copy-mode wheel reached the PTY");
+
+    copy_command(&mut connection, terminal_id, CopyModeAction::Cancel).await;
+    send(
+        &mut connection,
+        ClientMessage::Input {
+            bytes: b"after-copy".to_vec(),
+        },
+    )
+    .await;
+    wait_for(DEADLINE, || capture.exists()).await;
+    assert_eq!(fs::read(capture).unwrap(), b"after-copy");
+
+    harness.detach(&mut connection).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn asynchronous_copy_cursor_loss_precedes_the_canonical_snapshot() {
+    let mut harness = Harness::start(
+        "printf 'RAW_INVALIDATION_READY\r\n'; while [ ! -e invalidate-now ]; do sleep 0.01; done; printf '\\033[?1049hRAW_ALTERNATE_READY\r\n'; while :; do sleep 1; done",
+    )
+    .await;
+    let (mut connection, terminal_id, _) = harness.interactive().await;
+    snapshot_containing(&mut connection, terminal_id, "RAW_INVALIDATION_READY").await;
+    copy_command(&mut connection, terminal_id, CopyModeAction::Begin).await;
+    fs::write(harness.root.path().join("cwd/invalidate-now"), b"").unwrap();
+
+    time::timeout(DEADLINE, async {
+        let mut saw_cursor_loss = false;
+        loop {
+            let envelope = receive_envelope(&mut connection)
+                .await
+                .expect("connection closed during copy invalidation");
+            match envelope.message {
+                ServerMessage::CopyModeError {
+                    terminal_id: id,
+                    error: CopyModeError::CursorLost,
+                    ..
+                } if id == terminal_id => {
+                    assert_eq!(envelope.request_id, None);
+                    saw_cursor_loss = true;
+                }
+                ServerMessage::Snapshot {
+                    terminal_id: id,
+                    screen,
+                } if id == terminal_id => {
+                    assert!(
+                        saw_cursor_loss,
+                        "canonical snapshot arrived before typed cursor loss"
+                    );
+                    if snapshot_text(&screen).contains("RAW_ALTERNATE_READY") {
+                        assert!(screen.cells.iter().all(|cell| !cell.selected));
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("copy cursor invalidation timed out");
+
+    harness.detach(&mut connection).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn public_client_exits_copy_mode_on_unsolicited_cursor_loss() {
+    let harness = Harness::start(
+        "printf 'PUBLIC_INVALIDATION_READY\r\n'; while [ ! -e public-invalidate-now ]; do sleep 0.01; done; printf '\\033[?1049hPUBLIC_ALTERNATE_READY\r\n'; while IFS= read -r line; do [ \"$line\" = probe ] && printf 'PUBLIC_CLIENT_LEFT_COPY_MODE\r\n'; done",
+    )
+    .await;
+    let pane = harness.resources().await.sessions[0].workspaces[0].tabs[0].panes[0].id;
+    let mut command = Command::new("/usr/bin/script");
+    command
+        .env_clear()
+        .env("HOME", harness.root.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", harness.root.path().join("runtime"))
+        .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+        .env("TERM", "xterm-256color")
+        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .arg(format!(
+            "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {pane}",
+            env!("CARGO_BIN_EXE_fut"),
+            harness.socket.display(),
+        ));
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("PUBLIC_INVALIDATION_READY").await;
+    client.send(b"\x02[");
+    client.wait_for("COPY ·").await;
+    fs::write(harness.root.path().join("cwd/public-invalidate-now"), b"").unwrap();
+    client.wait_for("copy-mode cursor").await;
+    client.send(b"probe\n");
+    client.wait_for("PUBLIC_CLIENT_LEFT_COPY_MODE").await;
+    client.send(b"\x02d");
+    client.wait_success().await;
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn copy_mode_attachments_cleanup_independently_across_output_focus_and_exit() {
+    let mut harness = Harness::start(
+        "printf 'COPY_A_READY\\r\\n'; (sleep 1; printf 'COPY_A_DURING\\r\\n') & while :; do sleep 1; done",
+    )
+    .await;
+    let resources = harness.resources().await;
+    let tab_id = resources.sessions[0].workspaces[0].tabs[0].id;
+    let pane_a = resources.sessions[0].workspaces[0].tabs[0].panes[0];
+    let ServerMessage::PaneCreated { selected: pane_b } = harness
+        .control_command(ClientMessage::CreatePane {
+            tab_id,
+            cwd: None,
+            program: Some("/bin/sh".into()),
+            argv: vec![
+                "-c".into(),
+                "printf 'COPY_B_READY\\r\\n'; while :; do sleep 1; done".into(),
+            ],
+        })
+        .await
+    else {
+        panic!("failed to create copy-mode sibling")
+    };
+
+    let (mut client_a, terminal_a, _) = harness
+        .interactive_for(Some(TargetSelector::Pane(pane_a.id)))
+        .await;
+    let (mut client_b, selected_b) =
+        attach_once(&harness, TargetSelector::Pane(pane_b.pane_id)).await;
+    snapshot_containing(&mut client_a, terminal_a, "COPY_A_READY").await;
+    snapshot_containing(&mut client_b, selected_b.terminal_id, "COPY_B_READY").await;
+
+    let begin_a = copy_command(&mut client_a, terminal_a, CopyModeAction::Begin).await;
+    let begin_b = copy_command(&mut client_b, selected_b.terminal_id, CopyModeAction::Begin).await;
+    assert!(matches!(
+        begin_a.message,
+        ServerMessage::CopyModeSnapshot { .. }
+    ));
+    assert!(matches!(
+        begin_b.message,
+        ServerMessage::CopyModeSnapshot { .. }
+    ));
+    copy_command(&mut client_a, terminal_a, CopyModeAction::ToggleSelection).await;
+    copy_command(
+        &mut client_b,
+        selected_b.terminal_id,
+        CopyModeAction::ToggleSelection,
+    )
+    .await;
+
+    let during = receive_matching(&mut client_a, |message| {
+        matches!(message, ServerMessage::Snapshot { terminal_id, screen }
+            if *terminal_id == terminal_a
+                && snapshot_text(screen).contains("COPY_A_DURING")
+                && screen.cells.iter().any(|cell| cell.selected))
+    })
+    .await;
+    assert!(matches!(during, ServerMessage::Snapshot { .. }));
+
+    harness.detach(&mut client_a).await;
+    let still_active = copy_command(
+        &mut client_b,
+        selected_b.terminal_id,
+        CopyModeAction::Move {
+            movement: CopyModeMovement::Left,
+        },
+    )
+    .await;
+    assert!(matches!(
+        still_active.message,
+        ServerMessage::CopyModeSnapshot { ref screen, .. }
+            if screen.cells.iter().any(|cell| cell.selected)
+    ));
+
+    let switched = select_view_response(&mut client_b, TargetSelector::Pane(pane_a.id)).await;
+    assert_eq!(switched.focused.terminal_id, terminal_a);
+    let switched_back =
+        select_view_response(&mut client_b, TargetSelector::Pane(pane_b.pane_id)).await;
+    assert_eq!(switched_back.focused.terminal_id, selected_b.terminal_id);
+    assert!(matches!(
+        copy_command(&mut client_b, selected_b.terminal_id, CopyModeAction::Begin,)
+            .await
+            .message,
+        ServerMessage::CopyModeSnapshot { .. }
+    ));
+
+    assert_eq!(
+        harness
+            .control_command(ClientMessage::CloseTarget {
+                selector: TargetSelector::Pane(pane_b.pane_id),
+            })
+            .await,
+        ServerMessage::CommandCompleted {
+            command: fut::protocol::AcknowledgedCommand::CloseTarget,
+        }
+    );
+    let mut exited = false;
+    time::timeout(DEADLINE, async {
+        loop {
+            let Some(message) = receive(&mut client_b).await else {
+                assert!(
+                    exited,
+                    "copy-mode attachment disconnected before terminal exit: {}",
+                    harness.logs()
+                );
+                break;
+            };
+            match message {
+                ServerMessage::TerminalExited { terminal_id, .. }
+                    if terminal_id == selected_b.terminal_id =>
+                {
+                    exited = true;
+                }
+                ServerMessage::TargetSelected { selected }
+                    if selected.focused.terminal_id == terminal_a =>
+                {
+                    assert!(exited, "fallback preceded terminal exit");
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("copy-mode terminal exit cleanup timed out");
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn copy_search_scans_scrollback_hard_newlines_unicode_repeat_and_recovers() {
+    let mut script = String::new();
+    for index in 0..40 {
+        use std::fmt::Write as _;
+        writeln!(&mut script, "printf 'SCROLL_{index:02}\\r\\n'").unwrap();
+    }
+    script.push_str(
+        "printf 'HARD λ\\r\\nNEXT 雪\\r\\né-one é-two\\r\\nSEARCH_READY\\r\\n'; while :; do sleep 1; done",
+    );
+    let mut harness = Harness::start(&script).await;
+    let (mut connection, terminal_id, _) = harness.interactive().await;
+    snapshot_containing(&mut connection, terminal_id, "SEARCH_READY").await;
+    copy_command(&mut connection, terminal_id, CopyModeAction::Begin).await;
+
+    let scrollback = copy_command(
+        &mut connection,
+        terminal_id,
+        CopyModeAction::Search {
+            query: "SCROLL_00".into(),
+        },
+    )
+    .await;
+    let ServerMessage::CopyModeSnapshot {
+        screen: scrollback, ..
+    } = scrollback.message
+    else {
+        panic!("scrollback search did not return a snapshot")
+    };
+    assert!(snapshot_text(&scrollback).contains("SCROLL_00"));
+
+    let hard = copy_command(
+        &mut connection,
+        terminal_id,
+        CopyModeAction::Search {
+            query: "HARD λ\nNEXT 雪".into(),
+        },
+    )
+    .await;
+    let ServerMessage::CopyModeSnapshot { screen: hard, .. } = hard.message else {
+        panic!("hard-newline search did not return a snapshot")
+    };
+    assert!(
+        snapshot_text(&hard).contains("HARD λ"),
+        "hard-newline viewport was {:?}",
+        snapshot_text(&hard)
+    );
+
+    let first = copy_command(
+        &mut connection,
+        terminal_id,
+        CopyModeAction::Search {
+            query: "\u{301}".into(),
+        },
+    )
+    .await;
+    let ServerMessage::CopyModeSnapshot { screen: first, .. } = first.message else {
+        panic!("first Unicode search did not return a snapshot")
+    };
+    let first_cell = selected_cell(&first);
+    let next = copy_command(
+        &mut connection,
+        terminal_id,
+        CopyModeAction::RepeatSearch {
+            direction: SearchDirection::Forward,
+        },
+    )
+    .await;
+    let ServerMessage::CopyModeSnapshot { screen: next, .. } = next.message else {
+        panic!("forward repeat did not return a snapshot")
+    };
+    assert_ne!(selected_cell(&next), first_cell);
+    let previous = copy_command(
+        &mut connection,
+        terminal_id,
+        CopyModeAction::RepeatSearch {
+            direction: SearchDirection::Backward,
+        },
+    )
+    .await;
+    let ServerMessage::CopyModeSnapshot {
+        screen: previous, ..
+    } = previous.message
+    else {
+        panic!("backward repeat did not return a snapshot")
+    };
+    assert_eq!(selected_cell(&previous), first_cell);
+
+    assert!(matches!(
+        copy_command(
+            &mut connection,
+            terminal_id,
+            CopyModeAction::Search {
+                query: "definitely absent".into(),
+            },
+        )
+        .await
+        .message,
+        ServerMessage::CopyModeError {
+            error: CopyModeError::NoMatch,
+            ..
+        }
+    ));
+    assert!(matches!(
+        copy_command(
+            &mut connection,
+            terminal_id,
+            CopyModeAction::RepeatSearch {
+                direction: SearchDirection::Forward,
+            },
+        )
+        .await
+        .message,
+        ServerMessage::CopyModeSnapshot { .. }
+    ));
+    assert!(matches!(
+        copy_command(
+            &mut connection,
+            terminal_id,
+            CopyModeAction::Search {
+                query: "x".repeat(MAX_SEARCH_QUERY_BYTES + 1),
+            },
+        )
+        .await
+        .message,
+        ServerMessage::CopyModeError {
+            error: CopyModeError::SearchQueryTooLarge { .. },
+            ..
+        }
+    ));
+
+    copy_command(&mut connection, terminal_id, CopyModeAction::Cancel).await;
+    harness.detach(&mut connection).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn public_client_paste_is_mode_aware_focused_literal_and_not_a_fut_prefix() {
     let harness = Harness::start("while :; do sleep 1; done").await;
     let snapshot = harness.resources().await;
@@ -6812,6 +7361,33 @@ async fn send(connection: &mut Connection, message: ClientMessage) {
     .await;
 }
 
+async fn copy_command(
+    connection: &mut Connection,
+    terminal_id: TerminalId,
+    action: CopyModeAction,
+) -> Envelope<ServerMessage> {
+    let request_id = Uuid::new_v4();
+    send_envelope(
+        connection,
+        Envelope {
+            request_id: Some(request_id),
+            message: ClientMessage::CopyMode {
+                terminal_id,
+                action,
+            },
+        },
+    )
+    .await;
+    loop {
+        let response = receive_envelope(connection)
+            .await
+            .expect("connection closed during copy-mode command");
+        if response.request_id == Some(request_id) {
+            return response;
+        }
+    }
+}
+
 async fn send_uncorrelated(connection: &mut Connection, message: ClientMessage) {
     send_envelope(
         connection,
@@ -7063,6 +7639,14 @@ fn snapshot_text(snapshot: &ScreenSnapshot) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn selected_cell(snapshot: &ScreenSnapshot) -> usize {
+    snapshot
+        .cells
+        .iter()
+        .position(|cell| cell.selected)
+        .expect("copy-mode snapshot has no selected cursor cell")
 }
 
 fn assert_ordered(text: &str, needles: &[&str]) {

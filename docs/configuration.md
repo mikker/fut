@@ -29,6 +29,7 @@ pane_layout = "splits" # "splits" or "accordion"
 
 [ui.bindings]
 open_command_bar = "space"
+# enter_copy_mode = "["
 # open_navigator = "g"
 # create_tab = "c"
 
@@ -99,7 +100,9 @@ detail = [{ token = "workspace.root", style = "muted" }]
 
 Omitted fields use defaults. An explicitly empty array hides that lane or format.
 
-Bindings are suffixes after the fixed `Ctrl-b` prefix. Override any action under `ui.bindings`; accepted values are one printable character or the names `space`, `enter`, `tab`, and `esc`. Keys must remain unique. Action names are `open_command_bar`, `open_navigator`, `open_workspace_sidebar`, `open_tab_bar`, `open_notifications`, `focus_next_notification`, `create_tab`, `focus_next_tab`, `focus_previous_tab`, `split_pane_right`, `split_pane_down`, `focus_next_pane`, `focus_previous_pane`, `focus_pane_left`, `focus_pane_down`, `focus_pane_up`, `focus_pane_right`, `focus_last_pane`, `focus_last_tab`, `focus_last_workspace`, `focus_last_session`, `focus_tab_1` through `focus_tab_10`, `toggle_pane_zoom`, and `detach`. The command bar displays and searches the configured bindings.
+Bindings are suffixes after the fixed `Ctrl-b` prefix. Override any action under `ui.bindings`; accepted values are one printable character or the names `space`, `enter`, `tab`, and `esc`. Keys must remain unique. Action names are `open_command_bar`, `enter_copy_mode`, `open_navigator`, `open_workspace_sidebar`, `open_tab_bar`, `open_notifications`, `focus_next_notification`, `create_tab`, `focus_next_tab`, `focus_previous_tab`, `split_pane_right`, `split_pane_down`, `focus_next_pane`, `focus_previous_pane`, `focus_pane_left`, `focus_pane_down`, `focus_pane_up`, `focus_pane_right`, `focus_last_pane`, `focus_last_tab`, `focus_last_workspace`, `focus_last_session`, `focus_tab_1` through `focus_tab_10`, `toggle_pane_zoom`, and `detach`. The command bar displays and searches the configured bindings.
+
+`enter_copy_mode` (default `Ctrl-b [`) opens per-client scrollback navigation for the focused terminal. Move by physical terminal cells with arrows or `hjkl`, Home/End, and Page Up/Page Down. Space starts or clears a selection; movement extends it. `y` or Enter copies plain text through the local client's bounded `pbcopy` process and exits only after the clipboard write succeeds. A clipboard error leaves the selection active so `y` can retry. Escape or `q` cancels. `/` opens a literal-search prompt, where Escape closes only the prompt (`q` is ordinary query text); `n` and `N` repeat forward and backward after the prompt closes. Rapid actions are processed in key order; the copy cue reports if the bounded local queue cannot accept another action. Copy-mode keys and search paste never reach the terminal process.
 
 `open_notifications` (default `Ctrl-b u`) opens the per-client list of terminals with unseen blocked or completed reports. `focus_next_notification` (default `Ctrl-b .`) switches to the next such terminal in resource order. Selecting or viewing that terminal marks its current attention seen only for that client.
 

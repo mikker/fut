@@ -170,6 +170,11 @@ mod tests {
         let mut prefix = PrefixState::default();
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
         assert_eq!(
+            prefix.feed(b"[".to_vec()),
+            PrefixAction::Dispatch(ClientAction::EnterCopyMode)
+        );
+        assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
+        assert_eq!(
             prefix.feed(b"d".to_vec()),
             PrefixAction::Dispatch(ClientAction::Detach)
         );

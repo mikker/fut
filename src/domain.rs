@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
 
 /// Upper bound for the number of cells in a terminal's visible grid.
@@ -13,6 +14,36 @@ use uuid::Uuid;
 /// dimensions before constructing a grid prevents hostile `u16` dimensions
 /// from driving multi-gigabyte allocations.
 pub const MAX_VISIBLE_CELLS: usize = 50_000;
+/// Maximum UTF-8 bytes retained for one serialized terminal cell.
+///
+/// Cell contents are also constrained to one control-free grapheme, so JSON
+/// can add at most one short quote/backslash escape. At 32 bytes, 50,000 fully
+/// styled and selected cells still fit below the protocol's eight-MiB limit,
+/// while ordinary emoji clusters remain exact. Pathological combining
+/// sequences are represented by a fixed marker.
+pub const MAX_CELL_CONTENT_BYTES: usize = 32;
+pub const OVERSIZED_CELL_CONTENT_MARKER: &str = "�";
+/// Maximum plain-text payload returned by a copy-mode request. At one MiB,
+/// even worst-case JSON escaping remains below the eight-MiB frame limit.
+pub const MAX_COPY_BYTES: usize = 1024 * 1024;
+/// Maximum physical cells traversed while formatting one selection.
+///
+/// This is deliberately separate from [`MAX_COPY_BYTES`]: a large blank
+/// selection can produce very little text while still requiring substantial
+/// emulator work.
+pub const MAX_COPY_CELLS: usize = 250_000;
+/// Maximum literal query accepted by the bounded on-demand scrollback scan.
+pub const MAX_SEARCH_QUERY_BYTES: usize = 4 * 1024;
+/// Maximum number of terminal cells inspected by one literal search. The
+/// search map uses three `u32` values per retained cell, bounding its primary
+/// temporary allocation to roughly three MiB.
+pub const MAX_SEARCH_CELLS: usize = 250_000;
+/// Maximum UTF-8 search material assembled from those cells.
+pub const MAX_SEARCH_TEXT_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum Unicode scalar values accepted from one terminal cell while
+/// building search text. This bounds the temporary `Vec<char>` independently
+/// of the UTF-8 text cap.
+pub const MAX_SEARCH_CELL_CODEPOINTS: usize = 4 * 1024;
 
 macro_rules! id_type {
     ($name:ident) => {
@@ -57,6 +88,70 @@ id_type!(SessionId);
 id_type!(WorkspaceId);
 id_type!(TabId);
 id_type!(PaneId);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CopyModeMovement {
+    Left,
+    Down,
+    Up,
+    Right,
+    BeginningOfLine,
+    EndOfLine,
+    PageUp,
+    PageDown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchDirection {
+    Forward,
+    Backward,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CopyModeAction {
+    Begin,
+    Move { movement: CopyModeMovement },
+    ToggleSelection,
+    Search { query: String },
+    RepeatSearch { direction: SearchDirection },
+    Copy,
+    FinalizeCopy { copy_id: Uuid },
+    Cancel,
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CopyModeError {
+    #[error("copy mode is not active")]
+    NotActive,
+    #[error("copy mode is already active")]
+    AlreadyActive,
+    #[error("copy-mode cursor was discarded by the terminal")]
+    CursorLost,
+    #[error("search query is empty")]
+    EmptySearchQuery,
+    #[error("search query is {actual} bytes; maximum is {maximum}")]
+    SearchQueryTooLarge { actual: usize, maximum: usize },
+    #[error("search would inspect {actual} cells; maximum is {maximum}")]
+    SearchSpaceTooLarge { actual: usize, maximum: usize },
+    #[error("search text is at least {actual} bytes; maximum is {maximum}")]
+    SearchTextTooLarge { actual: usize, maximum: usize },
+    #[error("there is no previous search")]
+    NoSearch,
+    #[error("literal text was not found")]
+    NoMatch,
+    #[error("search cell has {actual} codepoints; maximum is {maximum}")]
+    SearchCellTooLarge { actual: usize, maximum: usize },
+    #[error("selection spans {actual} cells; maximum is {maximum}")]
+    CopySpanTooLarge { actual: usize, maximum: usize },
+    #[error("selected text is {actual} bytes; maximum is {maximum}")]
+    CopyTooLarge { actual: usize, maximum: usize },
+    #[error("copy confirmation does not match the prepared selection")]
+    CopyConfirmationMismatch,
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MouseModifiers {
@@ -204,6 +299,8 @@ pub struct Cell {
     pub contents: String,
     #[serde(rename = "s", default, skip_serializing_if = "CellStyle::is_default")]
     pub style: CellStyle,
+    #[serde(rename = "x", default, skip_serializing_if = "is_false")]
+    pub selected: bool,
 }
 
 impl CellStyle {
@@ -217,6 +314,18 @@ impl Default for Cell {
         Self {
             contents: " ".into(),
             style: CellStyle::default(),
+            selected: false,
+        }
+    }
+}
+
+impl Cell {
+    fn bound_contents(&mut self) {
+        if self.contents.len() > MAX_CELL_CONTENT_BYTES
+            || self.contents.chars().any(char::is_control)
+            || self.contents.graphemes(true).count() > 1
+        {
+            self.contents = OVERSIZED_CELL_CONTENT_MARKER.into();
         }
     }
 }
@@ -257,7 +366,7 @@ impl ScreenSnapshot {
     pub fn new(
         revision: u64,
         size: TerminalSize,
-        cells: Vec<Cell>,
+        mut cells: Vec<Cell>,
         cursor: Cursor,
     ) -> Result<Self, SnapshotError> {
         let expected = size.cell_count()?;
@@ -272,6 +381,9 @@ impl ScreenSnapshot {
                 column: cursor.column,
                 row: cursor.row,
             });
+        }
+        for cell in &mut cells {
+            cell.bound_contents();
         }
 
         Ok(Self {
@@ -317,6 +429,54 @@ mod tests {
 
         assert_eq!(snapshot.revision, 7);
         assert_eq!(snapshot.cells.len(), 4);
+    }
+
+    #[test]
+    fn snapshot_preserves_normal_graphemes_and_marks_overlong_cell_content() {
+        let normal = ["a", "é", "雪", "😀", "👍🏽", "👨‍👩‍👧‍👦"];
+        let mut cells = normal
+            .iter()
+            .map(|contents| Cell {
+                contents: (*contents).into(),
+                ..Cell::default()
+            })
+            .collect::<Vec<_>>();
+        cells.push(Cell {
+            contents: format!("a{}", "\u{301}".repeat(MAX_CELL_CONTENT_BYTES)),
+            ..Cell::default()
+        });
+        let snapshot = ScreenSnapshot::new(
+            1,
+            TerminalSize {
+                columns: cells.len() as u16,
+                rows: 1,
+            },
+            cells,
+            Cursor {
+                column: 0,
+                row: 0,
+                visible: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            snapshot.cells[..normal.len()]
+                .iter()
+                .map(|cell| cell.contents.as_str())
+                .collect::<Vec<_>>(),
+            normal
+        );
+        assert_eq!(
+            snapshot.cells.last().unwrap().contents,
+            OVERSIZED_CELL_CONTENT_MARKER
+        );
+        assert!(
+            snapshot
+                .cells
+                .iter()
+                .all(|cell| cell.contents.len() <= MAX_CELL_CONTENT_BYTES)
+        );
     }
 
     #[test]
@@ -407,11 +567,13 @@ mod tests {
                 underline: true,
                 inverse: true,
             },
+            selected: true,
         };
         let json = serde_json::to_string(&cell).unwrap();
         assert_eq!(serde_json::from_str::<Cell>(&json).unwrap(), cell);
         assert!(json.contains("\"f\":1"));
         assert!(json.contains("\"b\":{\"r\":250,\"g\":240,\"b\":230}"));
+        assert!(json.contains("\"x\":true"));
         assert_eq!(
             serde_json::to_string(&Cell::default()).unwrap(),
             r#"{"c":" "}"#

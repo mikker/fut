@@ -464,6 +464,14 @@ mod tests {
         bar = CommandBarState::open();
         bar.paste("ctrl-b ;");
         assert_eq!(bar.filtered, [ClientAction::FocusPreviousPane]);
+
+        bar = CommandBarState::open();
+        bar.paste("copy scrollback");
+        assert_eq!(bar.filtered, [ClientAction::EnterCopyMode]);
+        assert_eq!(
+            bar.key(key(KeyCode::Enter, KeyModifiers::NONE)),
+            CommandBarAction::Dispatch(ClientAction::EnterCopyMode)
+        );
     }
 
     #[test]
@@ -542,7 +550,7 @@ mod tests {
         let prompt = (0..narrow.width)
             .map(|column| narrow_buffer[(column, 0)].symbol())
             .collect::<String>();
-        assert!(prompt.contains("1/32"));
+        assert!(prompt.contains(&format!("1/{}", COMMANDS.len())));
         assert!(!prompt.contains("command1/29"));
     }
 
