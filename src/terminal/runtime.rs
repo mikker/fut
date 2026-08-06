@@ -78,7 +78,7 @@ impl TerminalHandle {
     }
 
     pub async fn input(&self, bytes: Vec<u8>) -> Result<(), CommandError> {
-        self.send(RuntimeMessage::Input(bytes))
+        send_input_with_backpressure(&self.commands, bytes).await
     }
 
     pub async fn resize(&self, size: TerminalSize) -> Result<(), CommandError> {
@@ -172,6 +172,16 @@ impl TerminalHandle {
             result => result,
         }
     }
+}
+
+async fn send_input_with_backpressure(
+    commands: &async_mpsc::Sender<RuntimeMessage>,
+    bytes: Vec<u8>,
+) -> Result<(), CommandError> {
+    commands
+        .send(RuntimeMessage::Input(bytes))
+        .await
+        .map_err(|_| CommandError::Stopped)
 }
 
 enum RuntimeMessage {
@@ -923,5 +933,53 @@ mod tests {
             .await
             .unwrap();
         assert!(!matches!(close, Err(CommandError::Busy)));
+    }
+
+    #[tokio::test]
+    async fn input_waits_for_bounded_queue_capacity_without_losing_bytes() {
+        let (commands, mut receiver) = async_mpsc::channel(1);
+        commands
+            .try_send(RuntimeMessage::Input(b"first".to_vec()))
+            .unwrap();
+
+        let waiting = tokio::spawn({
+            let commands = commands.clone();
+            async move { send_input_with_backpressure(&commands, b"second".to_vec()).await }
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!waiting.is_finished());
+
+        let RuntimeMessage::Input(first) = receiver.recv().await.unwrap() else {
+            panic!("queued command was not input")
+        };
+        assert_eq!(first, b"first");
+        waiting.await.unwrap().unwrap();
+        let RuntimeMessage::Input(second) = receiver.recv().await.unwrap() else {
+            panic!("backpressured command was not input")
+        };
+        assert_eq!(second, b"second");
+    }
+
+    #[tokio::test]
+    async fn input_waiting_for_capacity_reports_receiver_closure_as_stopped() {
+        let (commands, mut receiver) = async_mpsc::channel(1);
+        commands
+            .try_send(RuntimeMessage::Input(b"first".to_vec()))
+            .unwrap();
+
+        let waiting = tokio::spawn({
+            let commands = commands.clone();
+            async move { send_input_with_backpressure(&commands, b"second".to_vec()).await }
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!waiting.is_finished());
+
+        receiver.close();
+        assert!(matches!(waiting.await.unwrap(), Err(CommandError::Stopped)));
+        let RuntimeMessage::Input(first) = receiver.recv().await.unwrap() else {
+            panic!("queued command was not input")
+        };
+        assert_eq!(first, b"first");
+        assert!(receiver.recv().await.is_none());
     }
 }

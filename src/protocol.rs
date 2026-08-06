@@ -16,9 +16,10 @@ use crate::{
     splits::{SplitDirection, SplitTree},
 };
 
-/// Reserved development epoch. Wire compatibility is intentionally not
-/// maintained between builds until Fut's protocol stabilizes.
-pub const PROTOCOL_VERSION: u16 = 0;
+/// Protocol version used by released Fut 0.1 builds.
+pub const PROTOCOL_VERSION_0_1: u16 = 0;
+/// Current clients and daemons require an exact protocol match.
+pub const PROTOCOL_VERSION: u16 = 1;
 /// Enough for 50,000 individually styled JSON cells while remaining a firm
 /// pre-allocation bound for the length-delimited transport.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
@@ -109,10 +110,12 @@ pub enum ClientMessage {
     Input {
         bytes: Vec<u8>,
     },
+    /// Fire-and-forget; its envelope must not carry a request ID.
     MouseWheel {
         terminal_id: TerminalId,
         event: MouseWheelEvent,
     },
+    /// Fire-and-forget; its envelope must not carry a request ID.
     ResetViewport {
         terminal_id: TerminalId,
     },
@@ -527,7 +530,8 @@ mod tests {
             decode_payload::<ServerMessage>(&encode_payload(&switched).unwrap()).unwrap(),
             switched
         );
-        assert_eq!(PROTOCOL_VERSION, 0);
+        assert_eq!(PROTOCOL_VERSION_0_1, 0);
+        assert_eq!(PROTOCOL_VERSION, 1);
     }
 
     #[test]

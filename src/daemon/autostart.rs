@@ -148,6 +148,7 @@ async fn probe_protocol(socket: &Path) -> ProtocolProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::PROTOCOL_VERSION_0_1;
 
     #[tokio::test]
     async fn absent_socket_is_not_ready() {
@@ -160,7 +161,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let socket = temporary.path().join("fut.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-        let incompatible_version = PROTOCOL_VERSION + 1;
+        let incompatible_version = PROTOCOL_VERSION_0_1;
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut framed = Framed::new(stream, codec());

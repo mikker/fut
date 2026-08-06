@@ -24,8 +24,8 @@ use crate::{
     },
     domain::{AgentReport, PaneId, SessionId, TabId, TerminalId, WorkspaceId},
     protocol::{
-        AcknowledgedCommand, ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, RenameSelector,
-        ServerMessage, codec, decode_payload, encode_payload,
+        AcknowledgedCommand, ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION,
+        PROTOCOL_VERSION_0_1, RenameSelector, ServerMessage, codec, decode_payload, encode_payload,
     },
     resources::{ResourceSnapshot, SessionSelector, TargetSelector},
 };
@@ -886,16 +886,26 @@ async fn control(socket: &std::path::Path, command: ClientMessage) -> Result<Ser
 async fn shutdown_control(socket: &std::path::Path) -> Result<ServerMessage> {
     match control_attempt(socket, ClientMessage::Shutdown, PROTOCOL_VERSION).await? {
         ControlAttempt::Response(response) => Ok(response),
-        ControlAttempt::Incompatible { server } => {
-            match control_attempt(socket, ClientMessage::Shutdown, server).await? {
+        ControlAttempt::Incompatible { server } => match shutdown_downgrade_version(server) {
+            Some(version) => match control_attempt(socket, ClientMessage::Shutdown, version).await?
+            {
                 ControlAttempt::Response(response) => Ok(response),
                 ControlAttempt::Incompatible { server: changed } => bail!(
                     "daemon at {} changed protocol from {server} to {changed} during shutdown",
                     socket.display()
                 ),
-            }
-        }
+            },
+            None => bail!(
+                "daemon at {} uses protocol {server}, but this Fut client can only shut down \
+                 protocol {PROTOCOL_VERSION} or Fut 0.1 protocol {PROTOCOL_VERSION_0_1}",
+                socket.display()
+            ),
+        },
     }
+}
+
+fn shutdown_downgrade_version(server: u16) -> Option<u16> {
+    (server == PROTOCOL_VERSION_0_1).then_some(PROTOCOL_VERSION_0_1)
 }
 
 enum ControlAttempt {
@@ -912,7 +922,7 @@ async fn control_attempt(
         .await
         .with_context(|| format!("connect to {}", socket.display()))?;
     let mut framed = Framed::new(stream, codec());
-    send(
+    let hello_request_id = send(
         &mut framed,
         ClientMessage::Hello {
             version,
@@ -923,6 +933,7 @@ async fn control_attempt(
     .await?;
     match receive(
         &mut framed,
+        hello_request_id,
         Duration::from_secs(2),
         "daemon handshake timed out",
     )
@@ -936,10 +947,11 @@ async fn control_attempt(
         }
         other => return unexpected(other),
     }
-    send(&mut framed, command).await?;
+    let command_request_id = send(&mut framed, command).await?;
     Ok(ControlAttempt::Response(
         receive(
             &mut framed,
+            command_request_id,
             Duration::from_secs(15),
             "daemon response timed out",
         )
@@ -993,18 +1005,20 @@ fn print_resources(snapshot: &ResourceSnapshot) {
 async fn send(
     framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     message: ClientMessage,
-) -> Result<()> {
+) -> Result<Uuid> {
+    let request_id = Uuid::new_v4();
     framed
         .send(Bytes::from(encode_payload(&Envelope {
-            request_id: Some(Uuid::new_v4()),
+            request_id: Some(request_id),
             message,
         })?))
         .await?;
-    Ok(())
+    Ok(request_id)
 }
 
 async fn receive(
     framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    expected_request_id: Uuid,
     duration: Duration,
     timeout_message: &'static str,
 ) -> Result<ServerMessage> {
@@ -1012,7 +1026,23 @@ async fn receive(
         .await
         .context(timeout_message)?
         .context("daemon disconnected")??;
-    Ok(decode_payload::<Envelope<ServerMessage>>(&frame)?.message)
+    correlated_message(
+        decode_payload::<Envelope<ServerMessage>>(&frame)?,
+        expected_request_id,
+    )
+}
+
+fn correlated_message(
+    envelope: Envelope<ServerMessage>,
+    expected_request_id: Uuid,
+) -> Result<ServerMessage> {
+    if envelope.request_id != Some(expected_request_id) {
+        bail!(
+            "daemon response request ID {:?} did not match expected request ID {expected_request_id}",
+            envelope.request_id
+        );
+    }
+    Ok(envelope.message)
 }
 
 fn response_ok(response: ServerMessage, expected: AcknowledgedCommand) -> Result<()> {
@@ -1067,7 +1097,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_reconnects_with_the_running_daemon_protocol() {
+    async fn shutdown_reconnects_with_the_0_1_daemon_protocol() {
         let temporary = tempfile::tempdir().unwrap();
         let socket = temporary.path().join("fut.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
@@ -1089,7 +1119,7 @@ mod tests {
                         request_id: first.request_id,
                         message: ServerMessage::IncompatibleProtocol {
                             client: PROTOCOL_VERSION,
-                            server: 4,
+                            server: PROTOCOL_VERSION_0_1,
                         },
                     })
                     .unwrap(),
@@ -1104,14 +1134,17 @@ mod tests {
             let second: Envelope<ClientMessage> = decode_payload(&second).unwrap();
             assert!(matches!(
                 second.message,
-                ClientMessage::Hello { version: 4, .. }
+                ClientMessage::Hello {
+                    version: PROTOCOL_VERSION_0_1,
+                    ..
+                }
             ));
             framed
                 .send(Bytes::from(
                     encode_payload(&Envelope {
                         request_id: second.request_id,
                         message: ServerMessage::Welcome {
-                            version: 4,
+                            version: PROTOCOL_VERSION_0_1,
                             server_version: "old".into(),
                             selected: None,
                         },
@@ -1144,6 +1177,54 @@ mod tests {
             }
         );
         server.await.unwrap();
+    }
+
+    #[test]
+    fn handshake_and_command_responses_require_the_exact_request_id() {
+        let expected = Uuid::new_v4();
+        let messages = [
+            ServerMessage::IncompatibleProtocol {
+                client: PROTOCOL_VERSION,
+                server: PROTOCOL_VERSION_0_1,
+            },
+            ServerMessage::Welcome {
+                version: PROTOCOL_VERSION,
+                server_version: "test".into(),
+                selected: None,
+            },
+            ServerMessage::CommandCompleted {
+                command: AcknowledgedCommand::Shutdown,
+            },
+        ];
+
+        for message in messages {
+            for request_id in [None, Some(Uuid::new_v4())] {
+                let error = correlated_message(
+                    Envelope {
+                        request_id,
+                        message: message.clone(),
+                    },
+                    expected,
+                )
+                .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("did not match expected request ID")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shutdown_downgrade_is_restricted_to_fut_0_1() {
+        assert_eq!(
+            shutdown_downgrade_version(PROTOCOL_VERSION_0_1),
+            Some(PROTOCOL_VERSION_0_1)
+        );
+        assert_eq!(shutdown_downgrade_version(PROTOCOL_VERSION), None);
+        assert_eq!(shutdown_downgrade_version(PROTOCOL_VERSION + 1), None);
+        assert_eq!(shutdown_downgrade_version(u16::MAX), None);
     }
 
     #[test]

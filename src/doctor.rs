@@ -359,10 +359,8 @@ async fn probe_protocol(socket: &Path) -> DoctorCheck {
             selected: None,
         })) if version == PROTOCOL_VERSION => check(
             "protocol",
-            CheckStatus::Warning,
-            format!(
-                "daemon {server_version} answered development protocol epoch {version}; matching builds are not guaranteed"
-            ),
+            CheckStatus::Ok,
+            format!("daemon {server_version} answered compatible protocol {version}"),
             json!({ "client_protocol": PROTOCOL_VERSION, "server_protocol": version, "client_version": env!("CARGO_PKG_VERSION"), "server_version": server_version }),
         ),
         Ok(Ok(ServerMessage::IncompatibleProtocol { client, server })) => check(
@@ -438,6 +436,42 @@ fn safe_text(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn matching_protocol_is_reported_as_compatible() {
+        let temporary = tempfile::tempdir().unwrap();
+        let socket = temporary.path().join("fut.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut framed = Framed::new(stream, codec());
+            let request = framed.next().await.unwrap().unwrap();
+            let hello: Envelope<ClientMessage> = decode_payload(&request).unwrap();
+            framed
+                .send(Bytes::from(
+                    encode_payload(&Envelope {
+                        request_id: hello.request_id,
+                        message: ServerMessage::Welcome {
+                            version: PROTOCOL_VERSION,
+                            server_version: "0.2.0".into(),
+                            selected: None,
+                        },
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let protocol = probe_protocol(&socket).await;
+
+        assert_eq!(protocol.status, CheckStatus::Ok);
+        assert_eq!(
+            protocol.summary,
+            format!("daemon 0.2.0 answered compatible protocol {PROTOCOL_VERSION}")
+        );
+        server.await.unwrap();
+    }
 
     #[test]
     fn human_report_is_ascii_structured_and_errors_control_exit_status() {

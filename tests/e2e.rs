@@ -22,8 +22,8 @@ use fut::{
         MouseWheelEvent, PaneId, ScreenSnapshot, TabId, TerminalId, TerminalSize,
     },
     protocol::{
-        ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, RenameSelector, SelectedTarget,
-        ServerMessage, codec, decode_payload, encode_payload,
+        ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, PROTOCOL_VERSION_0_1,
+        RenameSelector, SelectedTarget, ServerMessage, codec, decode_payload, encode_payload,
     },
     resources::{SessionSelector, TargetSelector},
 };
@@ -1922,6 +1922,8 @@ async fn external_pane_moves_reconcile_both_tabs_and_preserve_per_client_focus()
         unreachable!()
     };
     assert_eq!(source_view.focused.terminal_id, terminal_a);
+    send_uncorrelated(&mut first, mouse_wheel_message(pane_c.terminal_id)).await;
+    assert_no_error_before_pong(&mut first).await;
     let ServerMessage::TargetSelected {
         selected: destination_view,
     } = receive_matching(&mut second, |message| {
@@ -2060,6 +2062,8 @@ async fn external_pane_closes_reconcile_background_then_transfer_focused_input()
         unreachable!()
     };
     assert_eq!(background_removed.focused.terminal_id, terminal_a);
+    send_uncorrelated(&mut attached, mouse_wheel_message(pane_b.terminal_id)).await;
+    assert_no_error_before_pong(&mut attached).await;
     send(
         &mut attached,
         ClientMessage::Input {
@@ -2209,7 +2213,8 @@ async fn scrollback_is_attachment_local_survives_output_and_keyboard_returns_onl
             modifiers: MouseModifiers::default(),
         },
     };
-    send(&mut client_b, wheel.clone()).await;
+    assert_fire_and_forget_request_id_rejected(&mut client_b, wheel.clone()).await;
+    send_uncorrelated(&mut client_b, wheel.clone()).await;
     let ServerMessage::Snapshot {
         screen: history_b, ..
     } = receive_matching(&mut client_b, |message| {
@@ -2221,7 +2226,15 @@ async fn scrollback_is_attachment_local_survives_output_and_keyboard_returns_onl
         unreachable!()
     };
 
-    send(&mut client_a, wheel).await;
+    assert_fire_and_forget_request_id_rejected(
+        &mut client_b,
+        ClientMessage::ResetViewport {
+            terminal_id: terminal_a,
+        },
+    )
+    .await;
+
+    send_uncorrelated(&mut client_a, wheel).await;
     let ServerMessage::Snapshot {
         screen: history_a, ..
     } = receive_matching(&mut client_a, |message| {
@@ -5564,8 +5577,8 @@ async fn public_doctor_probes_a_running_daemon_without_mutating_resources() {
         .iter()
         .find(|check| check["id"] == "protocol")
         .unwrap();
-    assert_eq!(protocol["status"], "warning");
-    assert_eq!(protocol["details"]["client_protocol"], 0);
+    assert_eq!(protocol["status"], "ok");
+    assert_eq!(protocol["details"]["client_protocol"], 1);
     let after = harness.resources().await;
     assert_eq!(after, before);
     harness.shutdown().await;
@@ -6010,6 +6023,207 @@ async fn unsupported_protocol_is_rejected_without_harming_daemon() {
 }
 
 #[tokio::test]
+async fn control_connections_never_reply_to_fire_and_forget_ui_messages() {
+    let harness = Harness::start("while IFS= read -r line; do :; done").await;
+    let terminal_id =
+        harness.resources().await.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
+    let mut control = harness.connect().await.expect("connect control client");
+    assert!(matches!(
+        hello(&mut control, ClientMode::Control, PROTOCOL_VERSION)
+            .await
+            .expect("receive control welcome"),
+        ServerMessage::Welcome { .. }
+    ));
+
+    for message in [
+        mouse_wheel_message(terminal_id),
+        ClientMessage::ResetViewport { terminal_id },
+    ] {
+        send_uncorrelated(&mut control, message.clone()).await;
+        let ping_request_id = Uuid::new_v4();
+        send_envelope(
+            &mut control,
+            Envelope {
+                request_id: Some(ping_request_id),
+                message: ClientMessage::Ping,
+            },
+        )
+        .await;
+        assert!(matches!(
+            receive_envelope(&mut control).await,
+            Some(Envelope {
+                request_id: Some(request_id),
+                message: ServerMessage::Pong { .. },
+            }) if request_id == ping_request_id
+        ));
+
+        assert_fire_and_forget_request_id_rejected(&mut control, message).await;
+    }
+
+    drop(control);
+    harness.shutdown().await;
+}
+
+#[test]
+fn protocol_0_daemon_rejects_current_client_and_accepts_shutdown() {
+    let root = tempfile::Builder::new()
+        .prefix("fut-e2e-protocol-upgrade-")
+        .tempdir()
+        .unwrap();
+    let runtime = root.path().join("runtime");
+    let home = root.path().join("home");
+    let cwd = root.path().join("cwd");
+    fs::create_dir_all(&runtime).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&cwd).unwrap();
+    let socket = runtime.join("fut.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let server = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut first = Framed::new(stream, codec());
+                let hello: Envelope<ClientMessage> =
+                    decode_payload(&first.next().await.unwrap().unwrap()).unwrap();
+                assert!(matches!(
+                    hello.message,
+                    ClientMessage::Hello {
+                        version: PROTOCOL_VERSION,
+                        ..
+                    }
+                ));
+                first
+                    .send(Bytes::from(
+                        encode_payload(&Envelope {
+                            request_id: hello.request_id,
+                            message: ServerMessage::IncompatibleProtocol {
+                                client: PROTOCOL_VERSION,
+                                server: PROTOCOL_VERSION_0_1,
+                            },
+                        })
+                        .unwrap(),
+                    ))
+                    .await
+                    .unwrap();
+
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut retry = Framed::new(stream, codec());
+                let hello: Envelope<ClientMessage> =
+                    decode_payload(&retry.next().await.unwrap().unwrap()).unwrap();
+                assert!(matches!(
+                    hello.message,
+                    ClientMessage::Hello {
+                        version: PROTOCOL_VERSION,
+                        ..
+                    }
+                ));
+                retry
+                    .send(Bytes::from(
+                        encode_payload(&Envelope {
+                            request_id: hello.request_id,
+                            message: ServerMessage::IncompatibleProtocol {
+                                client: PROTOCOL_VERSION,
+                                server: PROTOCOL_VERSION_0_1,
+                            },
+                        })
+                        .unwrap(),
+                    ))
+                    .await
+                    .unwrap();
+
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut shutdown = Framed::new(stream, codec());
+                let hello: Envelope<ClientMessage> =
+                    decode_payload(&shutdown.next().await.unwrap().unwrap()).unwrap();
+                assert!(matches!(
+                    hello.message,
+                    ClientMessage::Hello {
+                        version: PROTOCOL_VERSION_0_1,
+                        ..
+                    }
+                ));
+                shutdown
+                    .send(Bytes::from(
+                        encode_payload(&Envelope {
+                            request_id: hello.request_id,
+                            message: ServerMessage::Welcome {
+                                version: PROTOCOL_VERSION_0_1,
+                                server_version: "0.1.0".into(),
+                                selected: None,
+                            },
+                        })
+                        .unwrap(),
+                    ))
+                    .await
+                    .unwrap();
+                let request: Envelope<ClientMessage> =
+                    decode_payload(&shutdown.next().await.unwrap().unwrap()).unwrap();
+                assert_eq!(request.message, ClientMessage::Shutdown);
+                shutdown
+                    .send(Bytes::from(
+                        encode_payload(&Envelope {
+                            request_id: request.request_id,
+                            message: ServerMessage::CommandCompleted {
+                                command: fut::protocol::AcknowledgedCommand::Shutdown,
+                            },
+                        })
+                        .unwrap(),
+                    ))
+                    .await
+                    .unwrap();
+            });
+    });
+
+    let current = Command::new(env!("CARGO_BIN_EXE_fut"))
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", "/usr/bin:/bin")
+        .env("TERM", "xterm-256color")
+        .env("TMPDIR", &runtime)
+        .env("FUT_RUNTIME_DIR", &runtime)
+        .current_dir(&cwd)
+        .arg("--socket")
+        .arg(&socket)
+        .output()
+        .unwrap();
+    assert!(!current.status.success());
+    let current_error = String::from_utf8_lossy(&current.stderr);
+    assert!(current_error.contains("uses protocol 0"), "{current_error}");
+    assert!(
+        current_error.contains("requires protocol 1"),
+        "{current_error}"
+    );
+    assert!(socket.exists());
+    assert!(!runtime.join("fut-daemon.log").exists());
+
+    let shutdown = Command::new(env!("CARGO_BIN_EXE_fut"))
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", "/usr/bin:/bin")
+        .env("TERM", "xterm-256color")
+        .env("TMPDIR", &runtime)
+        .env("FUT_RUNTIME_DIR", &runtime)
+        .arg("--socket")
+        .arg(&socket)
+        .args(["daemon", "shutdown"])
+        .output()
+        .unwrap();
+    assert!(
+        shutdown.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shutdown.stderr)
+    );
+    assert!(String::from_utf8_lossy(&shutdown.stdout).contains("shutdown=true"));
+    server.join().unwrap();
+}
+
+#[tokio::test]
 async fn focused_exit_falls_back_through_previous_tabs_in_the_same_session() {
     let harness = Harness::start(
         "printf 'FALLBACK_A_READY\r\n'; while IFS= read -r line; do [ \"$line\" = a ] && printf 'FALLBACK_A_INPUT\r\n'; done",
@@ -6078,6 +6292,15 @@ async fn focused_exit_falls_back_through_previous_tabs_in_the_same_session() {
             .iter()
             .all(|tab| tab.id != tab_c.tab_id)
     );
+    send_uncorrelated(&mut attached, mouse_wheel_message(tab_c.terminal_id)).await;
+    send_uncorrelated(
+        &mut attached,
+        ClientMessage::ResetViewport {
+            terminal_id: tab_c.terminal_id,
+        },
+    )
+    .await;
+    assert_no_error_before_pong(&mut attached).await;
     send(
         &mut attached,
         ClientMessage::Input {
@@ -6505,6 +6728,80 @@ async fn send(connection: &mut Connection, message: ClientMessage) {
         },
     )
     .await;
+}
+
+async fn send_uncorrelated(connection: &mut Connection, message: ClientMessage) {
+    send_envelope(
+        connection,
+        Envelope {
+            request_id: None,
+            message,
+        },
+    )
+    .await;
+}
+
+fn mouse_wheel_message(terminal_id: TerminalId) -> ClientMessage {
+    ClientMessage::MouseWheel {
+        terminal_id,
+        event: MouseWheelEvent {
+            direction: MouseWheelDirection::Up,
+            column: 0,
+            row: 0,
+            modifiers: MouseModifiers::default(),
+        },
+    }
+}
+
+async fn assert_no_error_before_pong(connection: &mut Connection) {
+    let request_id = Uuid::new_v4();
+    send_envelope(
+        connection,
+        Envelope {
+            request_id: Some(request_id),
+            message: ClientMessage::Ping,
+        },
+    )
+    .await;
+    loop {
+        let response = receive_envelope(connection)
+            .await
+            .expect("connection closed before ping response");
+        if let ServerMessage::Error { code, message } = response.message {
+            panic!("unexpected daemon error ({code}): {message}");
+        }
+        if response.request_id == Some(request_id) {
+            assert!(matches!(response.message, ServerMessage::Pong { .. }));
+            return;
+        }
+    }
+}
+
+async fn assert_fire_and_forget_request_id_rejected(
+    connection: &mut Connection,
+    message: ClientMessage,
+) {
+    let request_id = Uuid::new_v4();
+    send_envelope(
+        connection,
+        Envelope {
+            request_id: Some(request_id),
+            message,
+        },
+    )
+    .await;
+    loop {
+        let response = receive_envelope(connection)
+            .await
+            .expect("connection closed before fire-and-forget rejection");
+        if response.request_id == Some(request_id) {
+            assert!(matches!(
+                response.message,
+                ServerMessage::Error { ref code, .. } if code == "request_id_not_allowed"
+            ));
+            return;
+        }
+    }
 }
 
 async fn send_envelope(connection: &mut Connection, envelope: Envelope<ClientMessage>) {

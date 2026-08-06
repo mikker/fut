@@ -499,6 +499,13 @@ struct Attachment {
     next_watcher_generation: u64,
 }
 
+#[derive(Clone, Copy)]
+struct FocusedViewportState {
+    terminal_id: TerminalId,
+    offset: Option<usize>,
+    snapshot_revision: Option<u64>,
+}
+
 impl Attachment {
     fn new(
         panes: Vec<ObservedTarget>,
@@ -545,6 +552,32 @@ impl Attachment {
         &self.focused.terminal
     }
 
+    fn focused_viewport_state(&self) -> FocusedViewportState {
+        let terminal_id = self.focused.selected.terminal_id;
+        FocusedViewportState {
+            terminal_id,
+            offset: self.viewport_offsets.get(&terminal_id).copied(),
+            snapshot_revision: self.snapshot_revisions.get(&terminal_id).copied(),
+        }
+    }
+
+    fn finish_focused_input(&mut self, before: FocusedViewportState, succeeded: bool) {
+        if succeeded {
+            self.viewport_offsets.remove(&before.terminal_id);
+            return;
+        }
+        if let Some(offset) = before.offset {
+            self.viewport_offsets.insert(before.terminal_id, offset);
+        } else {
+            self.viewport_offsets.remove(&before.terminal_id);
+        }
+        if let Some(revision) = before.snapshot_revision {
+            self.snapshot_revisions.insert(before.terminal_id, revision);
+        } else {
+            self.snapshot_revisions.remove(&before.terminal_id);
+        }
+    }
+
     fn terminal(&self, terminal_id: TerminalId) -> Option<Arc<TerminalHandle>> {
         self.panes
             .iter()
@@ -578,11 +611,12 @@ impl Attachment {
         &mut self,
     ) -> Result<Option<crate::domain::ScreenSnapshot>, CommandError> {
         let terminal_id = self.focused.selected.terminal_id;
-        if self.viewport_offsets.remove(&terminal_id).is_none() {
+        if !self.viewport_offsets.contains_key(&terminal_id) {
             return Ok(None);
         }
         let viewport = self.focused.terminal.viewport_snapshot(None).await?;
         debug_assert!(viewport.offset.is_none());
+        self.set_viewport_offset(terminal_id, viewport.offset);
         Ok(self.accept_snapshot(terminal_id, viewport.screen))
     }
 
@@ -678,6 +712,8 @@ impl Attachment {
         if let Some((_, task)) = self.watchers.remove(&terminal_id) {
             task.abort();
         }
+        self.viewport_offsets.remove(&terminal_id);
+        self.snapshot_revisions.remove(&terminal_id);
         self.panes.remove(index);
         if let Some(layout) = self.layout.clone().without(pane_id) {
             self.layout = layout;
@@ -1187,10 +1223,25 @@ async fn handle_connection(
             frame = framed.next() => {
                 let Some(frame) = frame else { break };
                 let envelope: Envelope<ClientMessage> = decode_payload(&frame?)?;
+                if let Some(operation) = fire_and_forget_operation(&envelope.message)
+                    && reject_fire_and_forget_request_id(
+                        &mut framed,
+                        envelope.request_id,
+                        operation,
+                    ).await?
+                {
+                    continue;
+                }
                 match envelope.message {
                     ClientMessage::Input { bytes } => {
-                        match attachment.return_focused_to_bottom().await {
-                            Ok(Some(screen)) => {
+                        let viewport_before_input = attachment.focused_viewport_state();
+                        let reset_result = attachment.return_focused_to_bottom().await;
+                        let input_result = attachment.focused_terminal().input(bytes).await;
+                        let input_succeeded = input_result.is_ok();
+                        attachment.finish_focused_input(viewport_before_input, input_succeeded);
+
+                        match (input_succeeded, reset_result) {
+                            (true, Ok(Some(screen))) => {
                                 send(
                                     &mut framed,
                                     None,
@@ -1200,27 +1251,25 @@ async fn handle_connection(
                                     },
                                 ).await?;
                             }
-                            Ok(None) => {}
-                            Err(error) => {
-                                send_command_error(&mut framed, envelope.request_id, error).await?;
-                                continue;
+                            (true, Ok(None)) | (false, Ok(_)) => {}
+                            (_, Err(error)) => {
+                                tracing::warn!(
+                                    %error,
+                                    operation = "reset historical viewport before input",
+                                    "viewport reset failed during terminal input"
+                                );
                             }
                         }
                         command_response(
                             &mut framed,
                             envelope.request_id,
                             AcknowledgedCommand::Input,
-                            attachment.focused_terminal().input(bytes).await,
+                            input_result,
+                            UiEventPolicy::Input,
                         ).await?;
                     }
                     ClientMessage::MouseWheel { terminal_id, event } => {
                         if attachment.terminal(terminal_id).is_none() {
-                            send_error(
-                                &mut framed,
-                                envelope.request_id,
-                                "outside_view",
-                                "mouse target is not in the attached pane view",
-                            ).await?;
                             continue;
                         }
                         match attachment.mouse_wheel(terminal_id, event).await {
@@ -1233,20 +1282,18 @@ async fn handle_connection(
                             }
                             Ok(None) => {}
                             Err(error) => {
-                                send_command_error(&mut framed, envelope.request_id, error).await?;
+                                respond_to_ui_event_error(
+                                    &mut framed,
+                                    envelope.request_id,
+                                    "mouse wheel",
+                                    error,
+                                    UiEventPolicy::Disposable,
+                                ).await?;
                             }
                         }
                     }
                     ClientMessage::ResetViewport { terminal_id } => {
                         if terminal_id != attachment.focused.selected.terminal_id {
-                            if envelope.request_id.is_some() {
-                                send_error(
-                                    &mut framed,
-                                    envelope.request_id,
-                                    "not_focused",
-                                    "only the focused terminal viewport may be reset",
-                                ).await?;
-                            }
                             continue;
                         }
                         match attachment.return_focused_to_bottom().await {
@@ -1259,7 +1306,13 @@ async fn handle_connection(
                             }
                             Ok(None) => {}
                             Err(error) => {
-                                send_command_error(&mut framed, envelope.request_id, error).await?;
+                                respond_to_ui_event_error(
+                                    &mut framed,
+                                    envelope.request_id,
+                                    "reset viewport",
+                                    error,
+                                    UiEventPolicy::Disposable,
+                                ).await?;
                             }
                         }
                     }
@@ -1273,11 +1326,11 @@ async fn handle_connection(
                                 envelope.request_id,
                                 AcknowledgedCommand::Resize,
                                 attachment.focused_terminal().resize(size).await,
+                                UiEventPolicy::Disposable,
                             ).await?;
-                        // An old focused pane can leave one resize queued while
-                        // exit fallback selects its replacement. Interactive
-                        // resizes are uncorrelated, so discard only that stale
-                        // transition message; correlated callers keep the error.
+                        // An old focused pane can leave one resize queued while exit
+                        // fallback selects its replacement. Uncorrelated resizes are
+                        // fire-and-forget; correlated callers keep the semantic error.
                         } else if should_report_unfocused_resize(envelope.request_id) {
                             send_error(
                                 &mut framed,
@@ -1574,7 +1627,13 @@ async fn handle_connection(
                         }
                         Ok(None) => {}
                         Err(error) => {
-                            send_command_error(&mut framed, None, error).await?;
+                            respond_to_ui_event_error(
+                                &mut framed,
+                                None,
+                                "render historical viewport",
+                                error,
+                                UiEventPolicy::Disposable,
+                            ).await?;
                         }
                     }
                 }
@@ -1647,6 +1706,11 @@ async fn control_loop(
 ) -> Result<()> {
     while let Some(frame) = framed.next().await {
         let envelope: Envelope<ClientMessage> = decode_payload(&frame?)?;
+        if let Some(operation) = fire_and_forget_operation(&envelope.message)
+            && reject_fire_and_forget_request_id(framed, envelope.request_id, operation).await?
+        {
+            continue;
+        }
         match envelope.message {
             ClientMessage::Ping => {
                 send(
@@ -1908,10 +1972,9 @@ async fn control_loop(
                 send(framed, envelope.request_id, ServerMessage::Detached).await?;
                 break;
             }
+            ClientMessage::MouseWheel { .. } | ClientMessage::ResetViewport { .. } => {}
             ClientMessage::CreateWorkspace { .. }
             | ClientMessage::Input { .. }
-            | ClientMessage::MouseWheel { .. }
-            | ClientMessage::ResetViewport { .. }
             | ClientMessage::Resize { .. }
             | ClientMessage::SelectTarget { .. } => {
                 send_error(
@@ -3045,16 +3108,17 @@ async fn command_response(
     request_id: Option<uuid::Uuid>,
     command: AcknowledgedCommand,
     result: Result<(), CommandError>,
+    policy: UiEventPolicy,
 ) -> Result<()> {
-    if is_uncorrelated_transition_error(request_id, &result) {
-        // Interactive input and resize messages are intentionally uncorrelated.
-        // Their terminal can exit after the client sends them but before this
-        // loop reconciles its attachment. Drop that transition input rather
-        // than turning a normal focused-exit fallback into a fatal client error.
-        return Ok(());
-    }
     if let Err(error) = result {
-        send_command_error(framed, request_id, error).await?;
+        respond_to_ui_event_error(
+            framed,
+            request_id,
+            "terminal input or resize",
+            error,
+            policy,
+        )
+        .await?;
     } else if request_id.is_some() {
         send(
             framed,
@@ -3066,15 +3130,86 @@ async fn command_response(
     Ok(())
 }
 
-fn is_uncorrelated_transition_error(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UiEventErrorDisposition {
+    DropTransient,
+    Diagnose,
+    Reply,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UiEventPolicy {
+    Input,
+    Disposable,
+}
+
+fn ui_event_error_disposition(
+    policy: UiEventPolicy,
     request_id: Option<uuid::Uuid>,
-    result: &Result<(), CommandError>,
-) -> bool {
-    request_id.is_none() && matches!(result, Err(CommandError::Stopped))
+    error: &CommandError,
+) -> UiEventErrorDisposition {
+    if request_id.is_some() {
+        return UiEventErrorDisposition::Reply;
+    }
+    match (policy, error) {
+        (UiEventPolicy::Input, CommandError::Stopped)
+        | (UiEventPolicy::Disposable, CommandError::Busy | CommandError::Stopped) => {
+            UiEventErrorDisposition::DropTransient
+        }
+        (UiEventPolicy::Input, CommandError::Busy | CommandError::Emulator(_)) => {
+            UiEventErrorDisposition::Reply
+        }
+        (UiEventPolicy::Disposable, CommandError::Emulator(_)) => UiEventErrorDisposition::Diagnose,
+    }
 }
 
 fn should_report_unfocused_resize(request_id: Option<uuid::Uuid>) -> bool {
     request_id.is_some()
+}
+
+async fn respond_to_ui_event_error(
+    framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    request_id: Option<uuid::Uuid>,
+    operation: &'static str,
+    error: CommandError,
+    policy: UiEventPolicy,
+) -> Result<()> {
+    match ui_event_error_disposition(policy, request_id, &error) {
+        UiEventErrorDisposition::DropTransient => {}
+        UiEventErrorDisposition::Diagnose => {
+            tracing::warn!(%error, operation, "uncorrelated UI event failed");
+        }
+        UiEventErrorDisposition::Reply => {
+            send_command_error(framed, request_id, error).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn reject_fire_and_forget_request_id(
+    framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    request_id: Option<uuid::Uuid>,
+    operation: &'static str,
+) -> Result<bool> {
+    let Some(request_id) = request_id else {
+        return Ok(false);
+    };
+    send_error(
+        framed,
+        Some(request_id),
+        "request_id_not_allowed",
+        &format!("{operation} is fire-and-forget and must not include a request ID"),
+    )
+    .await?;
+    Ok(true)
+}
+
+fn fire_and_forget_operation(message: &ClientMessage) -> Option<&'static str> {
+    match message {
+        ClientMessage::MouseWheel { .. } => Some("mouse wheel"),
+        ClientMessage::ResetViewport { .. } => Some("reset viewport"),
+        _ => None,
+    }
 }
 
 async fn send_command_error(
@@ -3082,12 +3217,21 @@ async fn send_command_error(
     request_id: Option<uuid::Uuid>,
     error: CommandError,
 ) -> Result<()> {
-    let code = match error {
+    send_error(
+        framed,
+        request_id,
+        command_error_code(&error),
+        &error.to_string(),
+    )
+    .await
+}
+
+fn command_error_code(error: &CommandError) -> &'static str {
+    match error {
         CommandError::Busy => "busy",
         CommandError::Stopped => "terminal_stopped",
         CommandError::Emulator(_) => "terminal_emulator",
-    };
-    send_error(framed, request_id, code, &error.to_string()).await
+    }
 }
 
 async fn send_error(
@@ -3175,21 +3319,184 @@ mod tests {
     }
 
     #[test]
-    fn transition_input_and_resize_are_silent_only_when_uncorrelated() {
-        assert!(is_uncorrelated_transition_error(
-            None,
-            &Err(CommandError::Stopped)
-        ));
-        assert!(!is_uncorrelated_transition_error(
-            Some(uuid::Uuid::new_v4()),
-            &Err(CommandError::Stopped)
-        ));
-        assert!(!is_uncorrelated_transition_error(
-            None,
-            &Err(CommandError::Busy)
-        ));
+    fn uncorrelated_input_discards_only_stopped() {
+        assert_eq!(
+            ui_event_error_disposition(UiEventPolicy::Input, None, &CommandError::Stopped),
+            UiEventErrorDisposition::DropTransient
+        );
+        assert_eq!(
+            ui_event_error_disposition(UiEventPolicy::Input, None, &CommandError::Busy),
+            UiEventErrorDisposition::Reply
+        );
+        assert_eq!(
+            ui_event_error_disposition(
+                UiEventPolicy::Input,
+                None,
+                &CommandError::Emulator("broken".into()),
+            ),
+            UiEventErrorDisposition::Reply
+        );
+    }
+
+    #[test]
+    fn uncorrelated_disposable_ui_events_drop_expected_pressure_and_exit_errors() {
+        assert_eq!(
+            ui_event_error_disposition(UiEventPolicy::Disposable, None, &CommandError::Stopped),
+            UiEventErrorDisposition::DropTransient
+        );
+        assert_eq!(
+            ui_event_error_disposition(UiEventPolicy::Disposable, None, &CommandError::Busy),
+            UiEventErrorDisposition::DropTransient
+        );
+        assert_eq!(
+            ui_event_error_disposition(
+                UiEventPolicy::Disposable,
+                None,
+                &CommandError::Emulator("broken".into()),
+            ),
+            UiEventErrorDisposition::Diagnose
+        );
+    }
+
+    #[test]
+    fn correlated_ui_errors_reply_for_every_command_error_variant() {
+        let request_id = Some(uuid::Uuid::new_v4());
+        for (error, code) in [
+            (CommandError::Stopped, "terminal_stopped"),
+            (CommandError::Busy, "busy"),
+            (CommandError::Emulator("broken".into()), "terminal_emulator"),
+        ] {
+            assert_eq!(
+                ui_event_error_disposition(UiEventPolicy::Disposable, request_id, &error),
+                UiEventErrorDisposition::Reply
+            );
+            assert_eq!(command_error_code(&error), code);
+        }
         assert!(!should_report_unfocused_resize(None));
         assert!(should_report_unfocused_resize(Some(uuid::Uuid::new_v4())));
+    }
+
+    #[tokio::test]
+    async fn failed_viewport_reset_preserves_the_offset() {
+        let (mut attachment, terminal) = test_attachment("sleep 60");
+        let terminal_id = terminal.id();
+        attachment.viewport_offsets.insert(terminal_id, 7);
+        terminal.close().await.unwrap();
+
+        assert!(matches!(
+            attachment.return_focused_to_bottom().await,
+            Err(CommandError::Stopped)
+        ));
+        assert_eq!(attachment.viewport_offsets.get(&terminal_id), Some(&7));
+    }
+
+    #[tokio::test]
+    async fn successful_input_leaves_failed_viewport_reset_logically_at_bottom() {
+        let (mut attachment, terminal) = test_attachment("sleep 60");
+        let terminal_id = terminal.id();
+        attachment.viewport_offsets.insert(terminal_id, 7);
+        let before = attachment.focused_viewport_state();
+
+        attachment.finish_focused_input(before, true);
+
+        assert!(!attachment.viewport_offsets.contains_key(&terminal_id));
+        terminal.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_input_restores_viewport_transaction_state() {
+        let (mut attachment, terminal) = test_attachment("sleep 60");
+        let terminal_id = terminal.id();
+        attachment.viewport_offsets.insert(terminal_id, 7);
+        attachment.snapshot_revisions.insert(terminal_id, 11);
+        let before = attachment.focused_viewport_state();
+        attachment.viewport_offsets.remove(&terminal_id);
+        attachment.snapshot_revisions.insert(terminal_id, 12);
+
+        attachment.finish_focused_input(before, false);
+
+        assert_eq!(attachment.viewport_offsets.get(&terminal_id), Some(&7));
+        assert_eq!(attachment.snapshot_revisions.get(&terminal_id), Some(&11));
+        terminal.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn removing_a_pane_clears_its_viewport_state() {
+        let (mut attachment, focused) = test_attachment("sleep 60");
+        let removed = Arc::new(spawn_test_terminal("sleep 60"));
+        let terminal_id = removed.id();
+        let pane_id = PaneId::new();
+        let mut selected = attachment.focused.selected.clone();
+        selected.pane_id = pane_id;
+        selected.terminal_id = terminal_id;
+        selected.child_pid = removed.child_pid();
+        assert!(attachment.layout.split(
+            attachment.focused.selected.pane_id,
+            SplitDirection::Right,
+            pane_id,
+        ));
+        attachment.panes.push(ObservedTarget {
+            selected,
+            terminal: Arc::clone(&removed),
+        });
+        attachment.reconcile_watchers();
+        attachment.viewport_offsets.insert(terminal_id, 7);
+        attachment.snapshot_revisions.insert(terminal_id, 11);
+
+        assert!(attachment.remove(terminal_id));
+        assert!(!attachment.viewport_offsets.contains_key(&terminal_id));
+        assert!(!attachment.snapshot_revisions.contains_key(&terminal_id));
+
+        drop(attachment);
+        focused.close().await.unwrap();
+        removed.close().await.unwrap();
+    }
+
+    fn test_attachment(script: &str) -> (Attachment, Arc<TerminalHandle>) {
+        let terminal = Arc::new(spawn_test_terminal(script));
+        let pane_id = PaneId::new();
+        let selected = SelectedTarget {
+            session_id: SessionId::new(),
+            workspace_id: WorkspaceId::new(),
+            tab_id: TabId::new(),
+            pane_id,
+            terminal_id: terminal.id(),
+            child_pid: terminal.child_pid(),
+        };
+        let lease = AttachmentLease::default();
+        let guard = lease.acquire(ClientId::new()).unwrap();
+        let (_, resource_changes) = watch::channel(0);
+        let attachment = Attachment::new(
+            vec![ObservedTarget {
+                selected: selected.clone(),
+                terminal: Arc::clone(&terminal),
+            }],
+            LeasedTarget {
+                selected,
+                terminal: Arc::clone(&terminal),
+                _lease: guard,
+            },
+            SplitTree::leaf(pane_id),
+            Vec::new(),
+            0,
+            resource_changes,
+        );
+        (attachment, terminal)
+    }
+
+    fn spawn_test_terminal(script: &str) -> TerminalHandle {
+        spawn_terminal(SpawnSpec {
+            id: TerminalId::new(),
+            program: "/bin/sh".into(),
+            argv: vec!["-c".into(), script.into()],
+            cwd: "/".into(),
+            env: HashMap::new(),
+            size: TerminalSize {
+                columns: 80,
+                rows: 24,
+            },
+        })
+        .unwrap()
     }
 
     #[test]
