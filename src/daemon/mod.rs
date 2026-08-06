@@ -6,7 +6,7 @@ pub mod path;
 pub mod autostart;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs::{self, File, OpenOptions},
     io,
     os::{
@@ -20,10 +20,13 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{
+    SinkExt, StreamExt,
+    stream::{SplitSink, SplitStream},
+};
 use tokio::{
     net::{UnixListener, UnixStream},
-    sync::{Mutex, mpsc, watch},
+    sync::{Mutex, Notify, mpsc, watch},
     task::{JoinHandle, JoinSet},
     time::{Duration, timeout},
 };
@@ -31,8 +34,8 @@ use tokio_util::codec::Framed;
 
 use crate::{
     domain::{
-        ClientId, CopyModeAction, CopyModeError, PaneId, SessionId, TabId, TerminalId,
-        TerminalSize, WorkspaceId,
+        ClientId, CopyModeAction, CopyModeError, PaneId, ScreenSnapshot, SessionId, TabId,
+        TerminalId, TerminalSize, WorkspaceId,
     },
     project::{ProjectError, ProjectResolver, ResolvedLocation},
     protocol::{
@@ -1085,6 +1088,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     watch_terminal(terminal, exited_tx.clone());
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let mut connections = JoinSet::new();
+    let writers = WriterTasks::default();
 
     loop {
         tokio::select! {
@@ -1104,8 +1108,10 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
                 let shared = Arc::clone(&shared);
                 let exited = exited_tx.clone();
                 let shutdown = shutdown_tx.clone();
+                let writers = Arc::clone(&writers);
                 connections.spawn(async move {
-                    if let Err(error) = handle_connection(stream, shared, exited, shutdown).await {
+                    let connection = ClientConnection::new(stream, &writers);
+                    if let Err(error) = handle_connection(connection, shared, exited, shutdown).await {
                         tracing::debug!(%error, "client connection ended");
                     }
                 });
@@ -1137,6 +1143,13 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     })
     .await;
     connections.shutdown().await;
+    // Handlers only enqueue outbound frames; wait for the writer tasks to
+    // actually deliver what remains before the process exits mid-frame.
+    let mut writers = std::mem::take(&mut *writers.lock().expect("writer registry lock poisoned"));
+    let _ = timeout(CONNECTION_GRACE_PERIOD, async {
+        while writers.join_next().await.is_some() {}
+    })
+    .await;
     Ok(())
 }
 
@@ -1302,14 +1315,196 @@ impl Drop for OwnedSocket {
     }
 }
 
+/// One client connection: a read half plus a writer task fed by an outbound
+/// queue.
+///
+/// Reads and writes must never share one loop: a scroll flood answers every
+/// wheel event with a full snapshot, and once both socket buffers fill, a
+/// loop that blocks on writing stops reading and deadlocks against a client
+/// doing the same. Enqueueing never blocks, and while the writer lags,
+/// pending snapshots coalesce so only the newest screen per terminal is
+/// kept. All other messages are delivered verbatim in order.
+struct ClientConnection {
+    reader: SplitStream<Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>>,
+    outbound: Arc<OutboundQueue>,
+}
+
+/// Writer tasks outlive their connection handlers so queued frames can still
+/// drain after a session ends. The daemon joins this registry on shutdown to
+/// deliver those frames before the process exits.
+type WriterTasks = Arc<std::sync::Mutex<JoinSet<()>>>;
+
+enum Outbound {
+    Frame(Bytes),
+    Snapshot {
+        terminal_id: TerminalId,
+        screen: ScreenSnapshot,
+    },
+}
+
+#[derive(Default)]
+struct OutboundState {
+    items: VecDeque<Outbound>,
+    finished: bool,
+    failed: bool,
+}
+
+#[derive(Default)]
+struct OutboundQueue {
+    state: std::sync::Mutex<OutboundState>,
+    ready: Notify,
+}
+
+impl ClientConnection {
+    fn new(stream: UnixStream, writers: &WriterTasks) -> Self {
+        let (sink, reader) = Framed::new(stream, codec()).split();
+        let outbound = Arc::new(OutboundQueue::default());
+        writers
+            .lock()
+            .expect("writer registry lock poisoned")
+            .spawn(write_outbound(sink, Arc::clone(&outbound)));
+        Self { reader, outbound }
+    }
+
+    async fn next(&mut self) -> Option<std::io::Result<bytes::BytesMut>> {
+        self.reader.next().await
+    }
+
+    fn enqueue(&self, item: Outbound) -> Result<()> {
+        self.outbound.push(item)
+    }
+}
+
+impl Drop for ClientConnection {
+    fn drop(&mut self) {
+        self.outbound.finish();
+    }
+}
+
+impl OutboundQueue {
+    fn push(&self, item: Outbound) -> Result<()> {
+        let mut state = self.state.lock().expect("outbound queue lock poisoned");
+        if state.failed {
+            bail!("client connection writer stopped");
+        }
+        match item {
+            Outbound::Snapshot {
+                terminal_id,
+                screen,
+            } => {
+                // Replace this terminal's pending snapshot in place, but never
+                // across an ordered frame: a snapshot enqueued after e.g. a
+                // copy-mode exit must not be delivered before it.
+                let pending = state
+                    .items
+                    .iter_mut()
+                    .rev()
+                    .take_while(|item| matches!(item, Outbound::Snapshot { .. }))
+                    .find_map(|item| match item {
+                        Outbound::Snapshot {
+                            terminal_id: pending_id,
+                            screen,
+                        } if *pending_id == terminal_id => Some(screen),
+                        _ => None,
+                    });
+                match pending {
+                    Some(slot) => *slot = screen,
+                    None => state.items.push_back(Outbound::Snapshot {
+                        terminal_id,
+                        screen,
+                    }),
+                }
+            }
+            frame => state.items.push_back(frame),
+        }
+        drop(state);
+        self.ready.notify_one();
+        Ok(())
+    }
+
+    fn pop(&self) -> Option<Outbound> {
+        self.state
+            .lock()
+            .expect("outbound queue lock poisoned")
+            .items
+            .pop_front()
+    }
+
+    fn finish(&self) {
+        self.state
+            .lock()
+            .expect("outbound queue lock poisoned")
+            .finished = true;
+        self.ready.notify_one();
+    }
+
+    fn is_finished(&self) -> bool {
+        self.state
+            .lock()
+            .expect("outbound queue lock poisoned")
+            .finished
+    }
+
+    fn fail(&self) {
+        let mut state = self.state.lock().expect("outbound queue lock poisoned");
+        state.failed = true;
+        state.items.clear();
+    }
+}
+
+/// Bound on flushing frames still queued after a connection's handler ends,
+/// so a client that stopped reading cannot pin its writer task forever.
+const OUTBOUND_FLUSH_DEADLINE: Duration = Duration::from_secs(10);
+
+async fn write_outbound(
+    mut sink: SplitSink<Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>, Bytes>,
+    queue: Arc<OutboundQueue>,
+) {
+    loop {
+        let Some(item) = queue.pop() else {
+            if queue.is_finished() {
+                return;
+            }
+            queue.ready.notified().await;
+            continue;
+        };
+        let payload = match item {
+            Outbound::Frame(bytes) => Ok(bytes),
+            Outbound::Snapshot {
+                terminal_id,
+                screen,
+            } => encode_payload(&Envelope {
+                request_id: None,
+                message: ServerMessage::Snapshot {
+                    terminal_id,
+                    screen,
+                },
+            })
+            .map(Bytes::from),
+        };
+        let sent = match payload {
+            Ok(bytes) if queue.is_finished() => timeout(OUTBOUND_FLUSH_DEADLINE, sink.send(bytes))
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result.map_err(Into::into)),
+            Ok(bytes) => sink.send(bytes).await.map_err(Into::into),
+            Err(error) => Err(error.into()),
+        };
+        if let Err(error) = sent {
+            tracing::debug!(%error, "client connection writer stopped");
+            queue.fail();
+            return;
+        }
+    }
+}
+
 async fn handle_connection(
-    stream: UnixStream,
+    mut connection: ClientConnection,
     shared: Shared,
     exited: mpsc::UnboundedSender<TerminalId>,
     shutdown: watch::Sender<bool>,
 ) -> Result<()> {
-    let mut framed = Framed::new(stream, codec());
-    let Some(frame) = timeout(Duration::from_secs(2), framed.next())
+    let Some(frame) = timeout(Duration::from_secs(2), connection.next())
         .await
         .context("client hello timed out")?
     else {
@@ -1320,7 +1515,7 @@ async fn handle_connection(
         ClientMessage::Hello { version, mode, .. } => (version, mode),
         _ => {
             send_error(
-                &mut framed,
+                &mut connection,
                 first.request_id,
                 "hello_required",
                 "first message must be hello",
@@ -1331,7 +1526,7 @@ async fn handle_connection(
     };
     if version != PROTOCOL_VERSION {
         send(
-            &mut framed,
+            &mut connection,
             first.request_id,
             ServerMessage::IncompatibleProtocol {
                 client: version,
@@ -1346,7 +1541,7 @@ async fn handle_connection(
         ClientMode::Interactive { size, selector } => {
             if let Err(error) = size.validate() {
                 send_error(
-                    &mut framed,
+                    &mut connection,
                     first.request_id,
                     "invalid_size",
                     &error.to_string(),
@@ -1357,12 +1552,24 @@ async fn handle_connection(
             let attachment = match lease_view(&shared, selector, None, client).await {
                 Ok(attachment) => attachment,
                 Err(error) => {
-                    send_error(&mut framed, first.request_id, error.code, &error.message).await?;
+                    send_error(
+                        &mut connection,
+                        first.request_id,
+                        error.code,
+                        &error.message,
+                    )
+                    .await?;
                     return Ok(());
                 }
             };
             if let Err(error) = attachment.all_running() {
-                send_error(&mut framed, first.request_id, error.code, &error.message).await?;
+                send_error(
+                    &mut connection,
+                    first.request_id,
+                    error.code,
+                    &error.message,
+                )
+                .await?;
                 return Ok(());
             }
             (Some(attachment), Some(size))
@@ -1370,7 +1577,7 @@ async fn handle_connection(
         ClientMode::Control => (None, None),
     };
     send(
-        &mut framed,
+        &mut connection,
         first.request_id,
         ServerMessage::Welcome {
             version: PROTOCOL_VERSION,
@@ -1381,19 +1588,19 @@ async fn handle_connection(
     .await?;
 
     let Some(spawn_size) = interactive_size else {
-        return control_loop(&mut framed, shared, exited, shutdown).await;
+        return control_loop(&mut connection, shared, exited, shutdown).await;
     };
     let mut attachment = leased.expect("interactive connection selected a tab view");
 
     let connection_result: Result<()> = async {
         loop {
             tokio::select! {
-            frame = framed.next() => {
+            frame = connection.next() => {
                 let Some(frame) = frame else { break };
                 let envelope: Envelope<ClientMessage> = decode_payload(&frame?)?;
                 if let Some(operation) = fire_and_forget_operation(&envelope.message)
                     && reject_fire_and_forget_request_id(
-                        &mut framed,
+                        &mut connection,
                         envelope.request_id,
                         operation,
                     ).await?
@@ -1404,14 +1611,14 @@ async fn handle_connection(
                     ClientMessage::Input { bytes } => {
                         if attachment.copy_mode_active() {
                             send_error(
-                                &mut framed,
+                                &mut connection,
                                 envelope.request_id,
                                 "copy_mode_active",
                                 "terminal input is disabled while copy mode is active",
                             ).await?;
                         } else {
                             focused_input_response(
-                                &mut framed,
+                                &mut connection,
                                 &mut attachment,
                                 envelope.request_id,
                                 AcknowledgedCommand::Input,
@@ -1422,14 +1629,14 @@ async fn handle_connection(
                     ClientMessage::Paste { text } => {
                         if attachment.copy_mode_active() {
                             send_error(
-                                &mut framed,
+                                &mut connection,
                                 envelope.request_id,
                                 "copy_mode_active",
                                 "terminal paste is disabled while copy mode is active",
                             ).await?;
                         } else {
                             focused_input_response(
-                                &mut framed,
+                                &mut connection,
                                 &mut attachment,
                                 envelope.request_id,
                                 AcknowledgedCommand::Paste,
@@ -1440,7 +1647,7 @@ async fn handle_connection(
                     ClientMessage::CopyMode { terminal_id, action } => {
                         if envelope.request_id.is_none() {
                             send_error(
-                                &mut framed,
+                                &mut connection,
                                 None,
                                 "request_id_required",
                                 "copy-mode commands require a request ID",
@@ -1449,7 +1656,7 @@ async fn handle_connection(
                         }
                         if terminal_id != attachment.focused.selected.terminal_id {
                             send_error(
-                                &mut framed,
+                                &mut connection,
                                 envelope.request_id,
                                 "not_focused",
                                 "copy mode requires the focused terminal",
@@ -1459,7 +1666,7 @@ async fn handle_connection(
                         match attachment.copy_mode(action).await {
                             Ok(CopyModeOutcome::Active(viewport)) => {
                                 send(
-                                    &mut framed,
+                                    &mut connection,
                                     envelope.request_id,
                                     ServerMessage::CopyModeSnapshot {
                                         terminal_id,
@@ -1469,7 +1676,7 @@ async fn handle_connection(
                             }
                             Ok(CopyModeOutcome::Prepared { copy_id, text }) => {
                                 send(
-                                    &mut framed,
+                                    &mut connection,
                                     envelope.request_id,
                                     ServerMessage::CopyModePrepared {
                                         terminal_id,
@@ -1480,7 +1687,7 @@ async fn handle_connection(
                             }
                             Ok(CopyModeOutcome::Finalized { screen }) => {
                                 send(
-                                    &mut framed,
+                                    &mut connection,
                                     envelope.request_id,
                                     ServerMessage::CopyModeFinalized {
                                         terminal_id,
@@ -1490,7 +1697,7 @@ async fn handle_connection(
                             }
                             Ok(CopyModeOutcome::Cancelled { screen }) => {
                                 send(
-                                    &mut framed,
+                                    &mut connection,
                                     envelope.request_id,
                                     ServerMessage::CopyModeCancelled {
                                         terminal_id,
@@ -1500,7 +1707,7 @@ async fn handle_connection(
                             }
                             Err(CommandError::CopyMode(error)) => {
                                 send(
-                                    &mut framed,
+                                    &mut connection,
                                     envelope.request_id,
                                     ServerMessage::CopyModeError {
                                         terminal_id,
@@ -1509,7 +1716,7 @@ async fn handle_connection(
                                 ).await?;
                             }
                             Err(error) => {
-                                send_command_error(&mut framed, envelope.request_id, error).await?;
+                                send_command_error(&mut connection, envelope.request_id, error).await?;
                             }
                         }
                     }
@@ -1528,16 +1735,12 @@ async fn handle_connection(
                         }
                         match attachment.mouse_input(terminal_id, event).await {
                             Ok(Some(screen)) => {
-                                send(
-                                    &mut framed,
-                                    None,
-                                    ServerMessage::Snapshot { terminal_id, screen },
-                                ).await?;
+                                send_snapshot(&mut connection, terminal_id, screen).await?;
                             }
                             Ok(None) => {}
                             Err(error) => {
                                 respond_to_ui_event_error(
-                                    &mut framed,
+                                    &mut connection,
                                     envelope.request_id,
                                     "mouse input",
                                     error,
@@ -1552,16 +1755,12 @@ async fn handle_connection(
                         }
                         match attachment.return_focused_to_bottom().await {
                             Ok(Some(screen)) => {
-                                send(
-                                    &mut framed,
-                                    None,
-                                    ServerMessage::Snapshot { terminal_id, screen },
-                                ).await?;
+                                send_snapshot(&mut connection, terminal_id, screen).await?;
                             }
                             Ok(None) => {}
                             Err(error) => {
                                 respond_to_ui_event_error(
-                                    &mut framed,
+                                    &mut connection,
                                     envelope.request_id,
                                     "reset viewport",
                                     error,
@@ -1572,11 +1771,11 @@ async fn handle_connection(
                     }
                     ClientMessage::Resize { terminal_id, size } => {
                         if let Err(error) = size.validate() {
-                            send_error(&mut framed, envelope.request_id, "invalid_size", &error.to_string()).await?;
+                            send_error(&mut connection, envelope.request_id, "invalid_size", &error.to_string()).await?;
                         } else if terminal_id == attachment.focused.selected.terminal_id {
                             attachment.viewport_offsets.remove(&terminal_id);
                             command_response(
-                                &mut framed,
+                                &mut connection,
                                 envelope.request_id,
                                 AcknowledgedCommand::Resize,
                                 attachment.focused_terminal().resize(size).await,
@@ -1587,7 +1786,7 @@ async fn handle_connection(
                         // fire-and-forget; correlated callers keep the semantic error.
                         } else if should_report_unfocused_resize(envelope.request_id) {
                             send_error(
-                                &mut framed,
+                                &mut connection,
                                 envelope.request_id,
                                 "not_focused",
                                 "only the focused terminal may be resized",
@@ -1603,7 +1802,7 @@ async fn handle_connection(
                         ).await {
                             Ok(selection) => selection,
                             Err(error) => {
-                                send_error(&mut framed, envelope.request_id, error.code, &error.message).await?;
+                                send_error(&mut connection, envelope.request_id, error.code, &error.message).await?;
                                 continue;
                             }
                         };
@@ -1623,7 +1822,7 @@ async fn handle_connection(
                                 resource_revision,
                             );
                             send(
-                                &mut framed,
+                                &mut connection,
                                 envelope.request_id,
                                 ServerMessage::TargetSelected { selected: attachment.selected() },
                             ).await?;
@@ -1632,22 +1831,22 @@ async fn handle_connection(
                         match switch_candidate(&shared, selector, expected.as_ref(), client).await {
                             Ok(candidate) => {
                                 if let Err(error) = attachment.close().await {
-                                    send_command_error(&mut framed, envelope.request_id, error).await?;
+                                    send_command_error(&mut connection, envelope.request_id, error).await?;
                                     continue;
                                 }
                                 attachment = candidate;
                                 send(
-                                    &mut framed,
+                                    &mut connection,
                                     envelope.request_id,
                                     ServerMessage::TargetSelected { selected: attachment.selected() },
                                 ).await?;
                             }
-                            Err(error) => send_error(&mut framed, envelope.request_id, error.code, &error.message).await?,
+                            Err(error) => send_error(&mut connection, envelope.request_id, error.code, &error.message).await?,
                         }
                     }
                     ClientMessage::CreateWorkspace { session_id, name, cwd, program, argv } => {
                         if session_id != attachment.focused.selected.session_id {
-                            send_error(&mut framed, envelope.request_id, "outside_session", "workspace must be created in the attached session").await?;
+                            send_error(&mut connection, envelope.request_id, "outside_session", "workspace must be created in the attached session").await?;
                             continue;
                         }
                         let inherited_cwd = if cwd.is_none() {
@@ -1675,15 +1874,15 @@ async fn handle_connection(
                                 let selected = target.selected.clone();
                                 match focus_leased_attachment(&shared, &mut attachment, target).await {
                                     Ok(()) => {
-                                        send(&mut framed, envelope.request_id, ServerMessage::WorkspaceCreated { selected }).await?;
+                                        send(&mut connection, envelope.request_id, ServerMessage::WorkspaceCreated { selected }).await?;
                                         send(
-                                            &mut framed,
+                                            &mut connection,
                                             envelope.request_id,
                                             ServerMessage::TargetSelected { selected: attachment.selected() },
                                         ).await?;
                                     }
                                     Err(error) => send_error(
-                                        &mut framed,
+                                        &mut connection,
                                         envelope.request_id,
                                         error.code,
                                         &error.message,
@@ -1691,7 +1890,7 @@ async fn handle_connection(
                                 }
                             }
                             Ok(CreatedTerminal::Detached(_)) => unreachable!("attached creation acquires a lease"),
-                            Err(error) => send_error(&mut framed, envelope.request_id, error.code, &error.message).await?,
+                            Err(error) => send_error(&mut connection, envelope.request_id, error.code, &error.message).await?,
                         }
                     }
                     ClientMessage::CreateTab { workspace_id, name, cwd, program, argv } => {
@@ -1720,15 +1919,15 @@ async fn handle_connection(
                                 let selected = target.selected.clone();
                                 match focus_leased_attachment(&shared, &mut attachment, target).await {
                                     Ok(()) => {
-                                        send(&mut framed, envelope.request_id, ServerMessage::TabCreated { selected }).await?;
+                                        send(&mut connection, envelope.request_id, ServerMessage::TabCreated { selected }).await?;
                                         send(
-                                            &mut framed,
+                                            &mut connection,
                                             envelope.request_id,
                                             ServerMessage::TargetSelected { selected: attachment.selected() },
                                         ).await?;
                                     }
                                     Err(error) => send_error(
-                                        &mut framed,
+                                        &mut connection,
                                         envelope.request_id,
                                         error.code,
                                         &error.message,
@@ -1736,13 +1935,13 @@ async fn handle_connection(
                                 }
                             }
                             Ok(CreatedTerminal::Detached(_)) => unreachable!("attached creation returns a lease"),
-                            Err(error) => send_error(&mut framed, envelope.request_id, error.code, &error.message).await?,
+                            Err(error) => send_error(&mut connection, envelope.request_id, error.code, &error.message).await?,
                         }
                     }
                     ClientMessage::CreatePane { tab_id, cwd, program, argv } => {
                         if tab_id != attachment.tab_id() {
                             send_error(
-                                &mut framed,
+                                &mut connection,
                                 envelope.request_id,
                                 "different_tab",
                                 "interactive pane creation requires the currently selected tab",
@@ -1761,15 +1960,15 @@ async fn handle_connection(
                                 let selected = target.selected.clone();
                                 match focus_leased_attachment(&shared, &mut attachment, target).await {
                                     Ok(()) => {
-                                        send(&mut framed, envelope.request_id, ServerMessage::PaneCreated { selected }).await?;
+                                        send(&mut connection, envelope.request_id, ServerMessage::PaneCreated { selected }).await?;
                                         send(
-                                            &mut framed,
+                                            &mut connection,
                                             envelope.request_id,
                                             ServerMessage::TargetSelected { selected: attachment.selected() },
                                         ).await?;
                                     }
                                     Err(error) => send_error(
-                                        &mut framed,
+                                        &mut connection,
                                         envelope.request_id,
                                         error.code,
                                         &error.message,
@@ -1777,13 +1976,13 @@ async fn handle_connection(
                                 }
                             }
                             Ok(CreatedTerminal::Detached(_)) => unreachable!("attached creation returns a lease"),
-                            Err(error) => send_error(&mut framed, envelope.request_id, error.code, &error.message).await?,
+                            Err(error) => send_error(&mut connection, envelope.request_id, error.code, &error.message).await?,
                         }
                     }
                     ClientMessage::SplitPane { pane_id, direction, cwd, program, argv } => {
                         if pane_id != attachment.focused.selected.pane_id {
                             send_error(
-                                &mut framed,
+                                &mut connection,
                                 envelope.request_id,
                                 "not_focused",
                                 "interactive splitting requires the focused pane",
@@ -1802,36 +2001,36 @@ async fn handle_connection(
                                 let selected = target.selected.clone();
                                 match focus_leased_attachment(&shared, &mut attachment, target).await {
                                     Ok(()) => {
-                                        send(&mut framed, envelope.request_id, ServerMessage::PaneCreated { selected }).await?;
+                                        send(&mut connection, envelope.request_id, ServerMessage::PaneCreated { selected }).await?;
                                         send(
-                                            &mut framed,
+                                            &mut connection,
                                             envelope.request_id,
                                             ServerMessage::TargetSelected { selected: attachment.selected() },
                                         ).await?;
                                     }
-                                    Err(error) => send_error(&mut framed, envelope.request_id, error.code, &error.message).await?,
+                                    Err(error) => send_error(&mut connection, envelope.request_id, error.code, &error.message).await?,
                                 }
                             }
                             Ok(CreatedTerminal::Detached(_)) => unreachable!("attached split returns a lease"),
-                            Err(error) => send_error(&mut framed, envelope.request_id, error.code, &error.message).await?,
+                            Err(error) => send_error(&mut connection, envelope.request_id, error.code, &error.message).await?,
                         }
                     }
                     ClientMessage::ListResources => {
                         let snapshot = shared.lock().await.resources.snapshot();
-                        send(&mut framed, envelope.request_id, ServerMessage::Resources { snapshot }).await?;
+                        send(&mut connection, envelope.request_id, ServerMessage::Resources { snapshot }).await?;
                     }
                     ClientMessage::Detach => {
                         match attachment.close().await {
                             Ok(()) => {
-                                send(&mut framed, envelope.request_id, ServerMessage::Detached).await?;
+                                send(&mut connection, envelope.request_id, ServerMessage::Detached).await?;
                                 return Ok(());
                             }
                             Err(error) => {
-                                send_command_error(&mut framed, envelope.request_id, error).await?;
+                                send_command_error(&mut connection, envelope.request_id, error).await?;
                             }
                         }
                     }
-                    ClientMessage::Ping => send(&mut framed, envelope.request_id, ServerMessage::Pong { daemon_pid: std::process::id() }).await?,
+                    ClientMessage::Ping => send(&mut connection, envelope.request_id, ServerMessage::Pong { daemon_pid: std::process::id() }).await?,
                     ClientMessage::RenameTarget { selector, name } => {
                         let result = {
                             let mut state = shared.lock().await;
@@ -1851,15 +2050,15 @@ async fn handle_connection(
                         };
                         match result {
                             Ok(resource_revision) => send(
-                                &mut framed,
+                                &mut connection,
                                 envelope.request_id,
                                 ServerMessage::TargetRenamed { resource_revision },
                             ).await?,
-                            Err(error) => send_error(&mut framed, envelope.request_id, error.code, &error.message).await?,
+                            Err(error) => send_error(&mut connection, envelope.request_id, error.code, &error.message).await?,
                         }
                     }
-                    ClientMessage::OpenLocation { .. } | ClientMessage::MovePane { .. } | ClientMessage::CloseTarget { .. } | ClientMessage::ReportAgent { .. } | ClientMessage::Shutdown => send_error(&mut framed, envelope.request_id, "control_only", "command requires a control connection").await?,
-                    ClientMessage::Hello { .. } => send_error(&mut framed, envelope.request_id, "already_hello", "hello was already received").await?,
+                    ClientMessage::OpenLocation { .. } | ClientMessage::MovePane { .. } | ClientMessage::CloseTarget { .. } | ClientMessage::ReportAgent { .. } | ClientMessage::Shutdown => send_error(&mut connection, envelope.request_id, "control_only", "command requires a control connection").await?,
+                    ClientMessage::Hello { .. } => send_error(&mut connection, envelope.request_id, "already_hello", "hello was already received").await?,
                 }
             },
             changed = attachment.resource_changes.changed() => {
@@ -1869,13 +2068,13 @@ async fn handle_connection(
                 if let Some(reconciled) = reconcile_attachment(&shared, &mut attachment).await? {
                     if reconciled.view_changed {
                         send(
-                            &mut framed,
+                            &mut connection,
                             None,
                             ServerMessage::TargetSelected { selected: attachment.selected() },
                         ).await?;
                     }
                     send(
-                        &mut framed,
+                        &mut connection,
                         None,
                         ServerMessage::ResourcesChanged {
                             snapshot: reconciled.snapshot,
@@ -1887,7 +2086,7 @@ async fn handle_connection(
                 Some(AttachmentUpdate::Snapshot { terminal_id, generation, screen }) => {
                     match attachment.snapshot_for_update(terminal_id, generation, screen).await {
                         Ok(Some(screen)) => {
-                            send(&mut framed, None, ServerMessage::Snapshot { terminal_id, screen }).await?;
+                            send_snapshot(&mut connection, terminal_id, screen).await?;
                         }
                         Ok(None) => {}
                         Err(CommandError::CopyMode(error)) => {
@@ -1896,7 +2095,7 @@ async fn handle_connection(
                             // so an interactive client cannot retain local copy
                             // mode while accepting that normal screen.
                             send(
-                                &mut framed,
+                                &mut connection,
                                 None,
                                 ServerMessage::CopyModeError {
                                     terminal_id,
@@ -1906,7 +2105,7 @@ async fn handle_connection(
                         }
                         Err(error) => {
                             respond_to_ui_event_error(
-                                &mut framed,
+                                &mut connection,
                                 None,
                                 "render historical viewport",
                                 error,
@@ -1917,7 +2116,7 @@ async fn handle_connection(
                 }
                 Some(AttachmentUpdate::Error { terminal_id, generation, message }) => {
                     if attachment.accepts(terminal_id, generation) {
-                        send_error(&mut framed, None, "terminal", &message).await?;
+                        send_error(&mut connection, None, "terminal", &message).await?;
                     }
                 }
                 Some(AttachmentUpdate::Exited { terminal_id, generation, exit_code }) => {
@@ -1932,7 +2131,7 @@ async fn handle_connection(
                         Vec::new()
                     };
                     send(
-                        &mut framed,
+                        &mut connection,
                         None,
                         ServerMessage::TerminalExited { terminal_id, exit_code },
                     ).await?;
@@ -1956,7 +2155,7 @@ async fn handle_connection(
                         };
                         if let Err(error) = attachment.close().await {
                             respond_to_ui_event_error(
-                                &mut framed,
+                                &mut connection,
                                 None,
                                 "clean up exited attachment",
                                 error,
@@ -1969,13 +2168,13 @@ async fn handle_connection(
                         attachment.remove(terminal_id);
                     }
                     send(
-                        &mut framed,
+                        &mut connection,
                         None,
                         ServerMessage::TargetSelected { selected: attachment.selected() },
                     ).await?;
                     let snapshot = shared.lock().await.resources.snapshot();
                     send(
-                        &mut framed,
+                        &mut connection,
                         None,
                         ServerMessage::ResourcesChanged { snapshot },
                     ).await?;
@@ -2001,22 +2200,22 @@ async fn handle_connection(
 }
 
 async fn control_loop(
-    framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    connection: &mut ClientConnection,
     shared: Shared,
     exited: mpsc::UnboundedSender<TerminalId>,
     shutdown: watch::Sender<bool>,
 ) -> Result<()> {
-    while let Some(frame) = framed.next().await {
+    while let Some(frame) = connection.next().await {
         let envelope: Envelope<ClientMessage> = decode_payload(&frame?)?;
         if let Some(operation) = fire_and_forget_operation(&envelope.message)
-            && reject_fire_and_forget_request_id(framed, envelope.request_id, operation).await?
+            && reject_fire_and_forget_request_id(connection, envelope.request_id, operation).await?
         {
             continue;
         }
         match envelope.message {
             ClientMessage::Ping => {
                 send(
-                    framed,
+                    connection,
                     envelope.request_id,
                     ServerMessage::Pong {
                         daemon_pid: std::process::id(),
@@ -2032,7 +2231,7 @@ async fn control_loop(
             } => match open_location(&shared, &exited, name, cwd, program, argv).await {
                 Ok((selected, disposition)) => {
                     send(
-                        framed,
+                        connection,
                         envelope.request_id,
                         ServerMessage::LocationOpened {
                             selected,
@@ -2042,7 +2241,7 @@ async fn control_loop(
                     .await?
                 }
                 Err(error) => {
-                    send_error(framed, envelope.request_id, error.code, &error.message).await?
+                    send_error(connection, envelope.request_id, error.code, &error.message).await?
                 }
             },
             ClientMessage::CreateTab {
@@ -2072,7 +2271,7 @@ async fn control_loop(
             {
                 Ok(CreatedTerminal::Detached(selected)) => {
                     send(
-                        framed,
+                        connection,
                         envelope.request_id,
                         ServerMessage::TabCreated { selected },
                     )
@@ -2082,7 +2281,7 @@ async fn control_loop(
                     unreachable!("detached creation does not acquire a lease")
                 }
                 Err(error) => {
-                    send_error(framed, envelope.request_id, error.code, &error.message).await?
+                    send_error(connection, envelope.request_id, error.code, &error.message).await?
                 }
             },
             ClientMessage::CreatePane {
@@ -2109,7 +2308,7 @@ async fn control_loop(
             {
                 Ok(CreatedTerminal::Detached(selected)) => {
                     send(
-                        framed,
+                        connection,
                         envelope.request_id,
                         ServerMessage::PaneCreated { selected },
                     )
@@ -2119,7 +2318,7 @@ async fn control_loop(
                     unreachable!("detached creation does not acquire a lease")
                 }
                 Err(error) => {
-                    send_error(framed, envelope.request_id, error.code, &error.message).await?
+                    send_error(connection, envelope.request_id, error.code, &error.message).await?
                 }
             },
             ClientMessage::SplitPane {
@@ -2154,14 +2353,14 @@ async fn control_loop(
                         CreatedTerminal::Attached(_) => unreachable!("control split is detached"),
                     };
                     send(
-                        framed,
+                        connection,
                         envelope.request_id,
                         ServerMessage::PaneCreated { selected },
                     )
                     .await?
                 }
                 Err(error) => {
-                    send_error(framed, envelope.request_id, error.code, &error.message).await?
+                    send_error(connection, envelope.request_id, error.code, &error.message).await?
                 }
             },
             ClientMessage::MovePane {
@@ -2172,7 +2371,7 @@ async fn control_loop(
                 match result {
                     Ok(moved) => {
                         send(
-                            framed,
+                            connection,
                             envelope.request_id,
                             ServerMessage::PaneMoved {
                                 source_tab_id: moved.source_tab_id,
@@ -2184,14 +2383,14 @@ async fn control_loop(
                         .await?
                     }
                     Err(error) => {
-                        send_error(framed, envelope.request_id, error.code, &error.message).await?
+                        send_error(connection, envelope.request_id, error.code, &error.message).await?
                     }
                 }
             }
             ClientMessage::ListResources => {
                 let snapshot = shared.lock().await.resources.snapshot();
                 send(
-                    framed,
+                    connection,
                     envelope.request_id,
                     ServerMessage::Resources { snapshot },
                 )
@@ -2201,7 +2400,7 @@ async fn control_loop(
                 match close_target(&shared, selector).await {
                     Ok(_) => {
                         send(
-                            framed,
+                            connection,
                             envelope.request_id,
                             ServerMessage::CommandCompleted {
                                 command: AcknowledgedCommand::CloseTarget,
@@ -2210,7 +2409,7 @@ async fn control_loop(
                         .await?
                     }
                     Err(error) => {
-                        send_error(framed, envelope.request_id, error.code, &error.message).await?
+                        send_error(connection, envelope.request_id, error.code, &error.message).await?
                     }
                 }
             }
@@ -2219,7 +2418,7 @@ async fn control_loop(
                 match result {
                     Ok(_) => {
                         send(
-                            framed,
+                            connection,
                             envelope.request_id,
                             ServerMessage::CommandCompleted {
                                 command: AcknowledgedCommand::RenameTarget,
@@ -2228,7 +2427,7 @@ async fn control_loop(
                         .await?
                     }
                     Err(error) => {
-                        send_error(framed, envelope.request_id, error.code, &error.message).await?
+                        send_error(connection, envelope.request_id, error.code, &error.message).await?
                     }
                 }
             }
@@ -2240,7 +2439,7 @@ async fn control_loop(
                 match result {
                     Ok(()) => {
                         send(
-                            framed,
+                            connection,
                             envelope.request_id,
                             ServerMessage::CommandCompleted {
                                 command: AcknowledgedCommand::ReportAgent,
@@ -2249,7 +2448,7 @@ async fn control_loop(
                         .await?
                     }
                     Err(error) => {
-                        send_error(framed, envelope.request_id, error.code, &error.message).await?
+                        send_error(connection, envelope.request_id, error.code, &error.message).await?
                     }
                 }
             }
@@ -2259,7 +2458,7 @@ async fn control_loop(
                     state.accepting = false;
                 }
                 let response = send(
-                    framed,
+                    connection,
                     envelope.request_id,
                     ServerMessage::CommandCompleted {
                         command: AcknowledgedCommand::Shutdown,
@@ -2271,7 +2470,7 @@ async fn control_loop(
                 break;
             }
             ClientMessage::Detach => {
-                send(framed, envelope.request_id, ServerMessage::Detached).await?;
+                send(connection, envelope.request_id, ServerMessage::Detached).await?;
                 break;
             }
             ClientMessage::MouseInput { .. } | ClientMessage::ResetViewport { .. } => {}
@@ -2282,7 +2481,7 @@ async fn control_loop(
             | ClientMessage::Resize { .. }
             | ClientMessage::SelectTarget { .. } => {
                 send_error(
-                    framed,
+                    connection,
                     envelope.request_id,
                     "interactive_only",
                     "workspace creation, input, paste, resize, and target selection require an interactive connection",
@@ -2291,7 +2490,7 @@ async fn control_loop(
             }
             ClientMessage::Hello { .. } => {
                 send_error(
-                    framed,
+                    connection,
                     envelope.request_id,
                     "already_hello",
                     "hello was already received",
@@ -3413,7 +3612,7 @@ async fn close_target(shared: &Shared, selector: TargetSelector) -> Result<(), D
 }
 
 async fn command_response(
-    framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    connection: &mut ClientConnection,
     request_id: Option<uuid::Uuid>,
     command: AcknowledgedCommand,
     result: Result<(), CommandError>,
@@ -3421,7 +3620,7 @@ async fn command_response(
 ) -> Result<()> {
     if let Err(error) = result {
         respond_to_ui_event_error(
-            framed,
+            connection,
             request_id,
             "terminal input or resize",
             error,
@@ -3430,7 +3629,7 @@ async fn command_response(
         .await?;
     } else if request_id.is_some() {
         send(
-            framed,
+            connection,
             request_id,
             ServerMessage::CommandCompleted { command },
         )
@@ -3445,7 +3644,7 @@ enum FocusedInput {
 }
 
 async fn focused_input_response(
-    framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    connection: &mut ClientConnection,
     attachment: &mut Attachment,
     request_id: Option<uuid::Uuid>,
     command: AcknowledgedCommand,
@@ -3462,15 +3661,7 @@ async fn focused_input_response(
 
     match (input_succeeded, reset_result) {
         (true, Ok(Some(screen))) => {
-            send(
-                framed,
-                None,
-                ServerMessage::Snapshot {
-                    terminal_id: attachment.focused.selected.terminal_id,
-                    screen,
-                },
-            )
-            .await?;
+            send_snapshot(connection, attachment.focused.selected.terminal_id, screen).await?;
         }
         (true, Ok(None)) | (false, Ok(_)) => {}
         (_, Err(error)) => {
@@ -3482,7 +3673,7 @@ async fn focused_input_response(
         }
     }
     command_response(
-        framed,
+        connection,
         request_id,
         command,
         input_result,
@@ -3530,7 +3721,7 @@ fn should_report_unfocused_resize(request_id: Option<uuid::Uuid>) -> bool {
 }
 
 async fn respond_to_ui_event_error(
-    framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    connection: &mut ClientConnection,
     request_id: Option<uuid::Uuid>,
     operation: &'static str,
     error: CommandError,
@@ -3542,14 +3733,14 @@ async fn respond_to_ui_event_error(
             tracing::warn!(%error, operation, "uncorrelated UI event failed");
         }
         UiEventErrorDisposition::Reply => {
-            send_command_error(framed, request_id, error).await?;
+            send_command_error(connection, request_id, error).await?;
         }
     }
     Ok(())
 }
 
 async fn reject_fire_and_forget_request_id(
-    framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    connection: &mut ClientConnection,
     request_id: Option<uuid::Uuid>,
     operation: &'static str,
 ) -> Result<bool> {
@@ -3557,7 +3748,7 @@ async fn reject_fire_and_forget_request_id(
         return Ok(false);
     };
     send_error(
-        framed,
+        connection,
         Some(request_id),
         "request_id_not_allowed",
         &format!("{operation} is fire-and-forget and must not include a request ID"),
@@ -3575,12 +3766,12 @@ fn fire_and_forget_operation(message: &ClientMessage) -> Option<&'static str> {
 }
 
 async fn send_command_error(
-    framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    connection: &mut ClientConnection,
     request_id: Option<uuid::Uuid>,
     error: CommandError,
 ) -> Result<()> {
     send_error(
-        framed,
+        connection,
         request_id,
         command_error_code(&error),
         &error.to_string(),
@@ -3598,13 +3789,13 @@ fn command_error_code(error: &CommandError) -> &'static str {
 }
 
 async fn send_error(
-    framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    connection: &mut ClientConnection,
     request_id: Option<uuid::Uuid>,
     code: &str,
     message: &str,
 ) -> Result<()> {
     send(
-        framed,
+        connection,
         request_id,
         ServerMessage::Error {
             code: code.into(),
@@ -3615,17 +3806,28 @@ async fn send_error(
 }
 
 async fn send(
-    framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    connection: &mut ClientConnection,
     request_id: Option<uuid::Uuid>,
     message: ServerMessage,
 ) -> Result<()> {
-    framed
-        .send(Bytes::from(encode_payload(&Envelope {
-            request_id,
-            message,
-        })?))
-        .await?;
-    Ok(())
+    connection.enqueue(Outbound::Frame(Bytes::from(encode_payload(&Envelope {
+        request_id,
+        message,
+    })?)))
+}
+
+/// Publish a screen snapshot. Unlike [`send`], pending snapshots for the
+/// same terminal are replaced rather than queued, so a burst of updates to a
+/// slow client delivers only the newest screen.
+async fn send_snapshot(
+    connection: &mut ClientConnection,
+    terminal_id: TerminalId,
+    screen: ScreenSnapshot,
+) -> Result<()> {
+    connection.enqueue(Outbound::Snapshot {
+        terminal_id,
+        screen,
+    })
 }
 
 #[cfg(test)]

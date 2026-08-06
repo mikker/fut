@@ -2279,6 +2279,100 @@ async fn scrollback_is_attachment_local_survives_output_and_paste_returns_only_f
 }
 
 #[tokio::test]
+async fn wheel_flood_from_a_slow_reading_client_does_not_stall_the_daemon() {
+    // Reproduces the interactive scroll freeze: every wheel event is answered
+    // with a full snapshot, so a scroll burst fills the daemon->client socket
+    // buffer faster than a busy client drains it. The daemon's send must not
+    // block its read path, or input processing stops and the session freezes.
+    let mut harness = Harness::start(
+        "i=0; while [ $i -le 200 ]; do printf 'HIST_%03d\\r\\n' \"$i\"; i=$((i + 1)); done; while IFS= read -r line; do printf '%s\\n' \"$line\" >> input.log; done",
+    )
+    .await;
+    let (mut connection, terminal_id, _) = harness.interactive().await;
+    let log = harness.root.path().join("cwd/input.log");
+
+    // Sanity: input reaches the terminal while the connection is drained.
+    snapshot_containing(&mut connection, terminal_id, "HIST_200").await;
+    send(
+        &mut connection,
+        ClientMessage::Input {
+            bytes: b"alive\n".to_vec(),
+        },
+    )
+    .await;
+    wait_for(DEADLINE, || {
+        fs::read_to_string(&log).is_ok_and(|text| text.contains("alive"))
+    })
+    .await;
+
+    // Scroll flood without reading anything back. A send that cannot complete
+    // means both socket buffers are full and the daemon has stopped reading.
+    let mut sent = 0;
+    let mut jammed = false;
+    for _ in 0..5000 {
+        let wheel = time::timeout(
+            Duration::from_millis(200),
+            send_uncorrelated(&mut connection, mouse_wheel_message(terminal_id)),
+        )
+        .await;
+        if wheel.is_err() {
+            jammed = true;
+            break;
+        }
+        sent += 1;
+    }
+
+    // The daemon must keep consuming client input regardless of how far
+    // behind this client's reads are: wheel frames still buffered by the
+    // timed-out sends above can only flush if the daemon is draining them.
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        match time::timeout(POLL_INTERVAL, connection.flush()).await {
+            Ok(result) => {
+                result.expect("flush wheel backlog");
+                break;
+            }
+            Err(_) => assert!(
+                Instant::now() < deadline,
+                "daemon never drained the wheel backlog \
+                 (write-blocked read loop); wheels sent={sent}, socket jammed={jammed}\n{}",
+                harness.logs()
+            ),
+        }
+    }
+    send(
+        &mut connection,
+        ClientMessage::Input {
+            bytes: b"done\n".to_vec(),
+        },
+    )
+    .await;
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        if fs::read_to_string(&log).is_ok_and(|text| text.contains("done")) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon stopped processing input after a wheel flood \
+             (write-blocked read loop); wheels sent={sent}, socket jammed={jammed}\n{}",
+            harness.logs()
+        );
+        time::sleep(POLL_INTERVAL).await;
+    }
+
+    // The stream must still be coherent once the client resumes reading.
+    send_uncorrelated(
+        &mut connection,
+        ClientMessage::ResetViewport { terminal_id },
+    )
+    .await;
+    snapshot_containing(&mut connection, terminal_id, "done").await;
+    harness.detach(&mut connection).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn focused_application_mouse_returns_only_its_attachment_viewport_to_bottom() {
     let expected = b"\x1b[<0;2;2M";
     let script = format!(

@@ -58,7 +58,13 @@ use ratatui::{
     widgets::Widget,
 };
 use rename::{RenameAction, RenameState};
-use tokio::{io::AsyncWriteExt, net::UnixStream, sync::mpsc, time};
+use tokio::{
+    io::AsyncWriteExt,
+    net::UnixStream,
+    signal::unix::{Signal, SignalKind, signal},
+    sync::mpsc,
+    time,
+};
 use tokio_util::codec::Framed;
 use uuid::Uuid;
 
@@ -190,6 +196,7 @@ async fn run(
     ui: UiConfig,
 ) -> anyhow::Result<()> {
     let mut events = EventStream::new();
+    let mut termination = TerminationSignals::subscribe()?;
     let mut prefix = PrefixState::new(ui.bindings.clone());
     let mut mouse_input = MouseInputState::default();
     let mut view = ViewState::new(selected)?;
@@ -217,6 +224,11 @@ async fn run(
 
     loop {
         tokio::select! {
+            name = termination.recv() => {
+                // Returning unwinds through TerminalGuard, restoring the host
+                // terminal (mouse tracking off, cooked mode) before exit.
+                bail!("terminated by {name}");
+            }
             frame = framed.next() => {
                 let Some(frame) = frame else {
                     if let Some(Some(code)) = pending_focused_exit {
@@ -2707,6 +2719,33 @@ impl From<CellColor> for Color {
         match color {
             CellColor::Indexed(index) => Self::Indexed(index),
             CellColor::Rgb(color) => Self::Rgb(color.red, color.green, color.blue),
+        }
+    }
+}
+
+/// Termination signals the interactive client intercepts so the host
+/// terminal is restored before exit. Without this, `kill` leaves the host in
+/// raw mode with mouse tracking on, spewing SGR mouse reports as text.
+struct TerminationSignals {
+    terminate: Signal,
+    hangup: Signal,
+    quit: Signal,
+}
+
+impl TerminationSignals {
+    fn subscribe() -> io::Result<Self> {
+        Ok(Self {
+            terminate: signal(SignalKind::terminate())?,
+            hangup: signal(SignalKind::hangup())?,
+            quit: signal(SignalKind::quit())?,
+        })
+    }
+
+    async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.terminate.recv() => "SIGTERM",
+            _ = self.hangup.recv() => "SIGHUP",
+            _ = self.quit.recv() => "SIGQUIT",
         }
     }
 }
