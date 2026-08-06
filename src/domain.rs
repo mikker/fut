@@ -59,6 +59,30 @@ id_type!(TabId);
 id_type!(PaneId);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MouseModifiers {
+    pub shift: bool,
+    pub control: bool,
+    pub alt: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MouseWheelDirection {
+    Up,
+    Down,
+}
+
+/// A wheel event normalized to zero-based terminal cell coordinates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MouseWheelEvent {
+    pub direction: MouseWheelDirection,
+    pub column: u16,
+    pub row: u16,
+    #[serde(default)]
+    pub modifiers: MouseModifiers,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentState {
     #[default]

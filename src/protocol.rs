@@ -9,8 +9,8 @@ use std::path::PathBuf;
 
 use crate::{
     domain::{
-        AgentReport, PaneId, ScreenSnapshot, SessionId, TabId, TerminalId, TerminalSize,
-        WorkspaceId,
+        AgentReport, MouseWheelEvent, PaneId, ScreenSnapshot, SessionId, TabId, TerminalId,
+        TerminalSize, WorkspaceId,
     },
     resources::{ResourceSnapshot, SessionSelector, TargetSelector},
     splits::{SplitDirection, SplitTree},
@@ -108,6 +108,13 @@ pub enum ClientMessage {
     },
     Input {
         bytes: Vec<u8>,
+    },
+    MouseWheel {
+        terminal_id: TerminalId,
+        event: MouseWheelEvent,
+    },
+    ResetViewport {
+        terminal_id: TerminalId,
     },
     Resize {
         terminal_id: TerminalId,
@@ -303,7 +310,9 @@ mod tests {
     use tokio_util::codec::{Decoder, Encoder};
 
     use super::*;
-    use crate::domain::{Cell, Cursor, MAX_VISIBLE_CELLS};
+    use crate::domain::{
+        Cell, Cursor, MAX_VISIBLE_CELLS, MouseModifiers, MouseWheelDirection, MouseWheelEvent,
+    };
 
     fn ping(request_id: Option<Uuid>) -> Envelope<ClientMessage> {
         Envelope {
@@ -524,6 +533,28 @@ mod tests {
     #[test]
     fn resize_and_selected_view_round_trip() {
         let terminal_id = TerminalId::new();
+        let wheel = ClientMessage::MouseWheel {
+            terminal_id,
+            event: MouseWheelEvent {
+                direction: MouseWheelDirection::Up,
+                column: 12,
+                row: 4,
+                modifiers: MouseModifiers {
+                    shift: true,
+                    control: false,
+                    alt: true,
+                },
+            },
+        };
+        assert_eq!(
+            decode_payload::<ClientMessage>(&encode_payload(&wheel).unwrap()).unwrap(),
+            wheel
+        );
+        let reset = ClientMessage::ResetViewport { terminal_id };
+        assert_eq!(
+            decode_payload::<ClientMessage>(&encode_payload(&reset).unwrap()).unwrap(),
+            reset
+        );
         let resize = ClientMessage::Resize {
             terminal_id,
             size: TerminalSize {

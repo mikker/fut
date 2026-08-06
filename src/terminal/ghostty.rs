@@ -6,16 +6,30 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use libghostty_vt::{
-    RenderState, Terminal, TerminalOptions,
+    RenderState, Terminal, TerminalOptions, key, mouse,
     render::{CellIterator, RowIterator},
     screen::CellContentTag,
     style::{StyleColor, Underline},
-    terminal::Mode,
+    terminal::{Mode, ScrollViewport},
 };
 
-use crate::domain::{Cell, CellColor, CellStyle, Cursor, Rgb, ScreenSnapshot, TerminalSize};
+use crate::domain::{
+    Cell, CellColor, CellStyle, Cursor, MouseModifiers, MouseWheelDirection, MouseWheelEvent, Rgb,
+    ScreenSnapshot, TerminalSize,
+};
 
 const SYNCHRONIZED_OUTPUT_TIMEOUT: Duration = Duration::from_secs(1);
+const MOUSE_WHEEL_LINES: isize = 3;
+
+pub(crate) enum MouseWheelOutcome {
+    Forwarded,
+    Scrolled(ViewportSnapshot),
+}
+
+pub(crate) struct ViewportSnapshot {
+    pub(crate) offset: Option<usize>,
+    pub(crate) screen: ScreenSnapshot,
+}
 
 /// The complete libghostty boundary. This value must never leave its runtime thread.
 pub(super) struct GhosttyTerminal {
@@ -23,6 +37,9 @@ pub(super) struct GhosttyTerminal {
     render_state: RenderState<'static>,
     rows: RowIterator<'static>,
     cells: CellIterator<'static>,
+    mouse_encoder: mouse::Encoder<'static>,
+    mouse_event: mouse::Event<'static>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     size: TerminalSize,
     revision: u64,
     synchronized_output_started: Option<Instant>,
@@ -39,8 +56,9 @@ impl GhosttyTerminal {
             rows: size.rows,
             max_scrollback: 10_000,
         })?;
+        let callback_writer = Arc::clone(&writer);
         terminal.on_pty_write(move |_, bytes| {
-            if let Ok(mut writer) = writer.lock() {
+            if let Ok(mut writer) = callback_writer.lock() {
                 let _ = writer.write_all(bytes);
                 let _ = writer.flush();
             }
@@ -51,6 +69,9 @@ impl GhosttyTerminal {
             render_state: RenderState::new()?,
             rows: RowIterator::new()?,
             cells: CellIterator::new()?,
+            mouse_encoder: mouse::Encoder::new()?,
+            mouse_event: mouse::Event::new()?,
+            writer,
             size,
             revision: 0,
             synchronized_output_started: None,
@@ -86,6 +107,102 @@ impl GhosttyTerminal {
         self.size = size;
         self.synchronized_output_started = None;
         self.snapshot()
+    }
+
+    /// Render one client-owned historical viewport, restoring the shared
+    /// terminal to its canonical bottom before returning.
+    pub(super) fn viewport_snapshot(&mut self, offset: Option<usize>) -> Result<ViewportSnapshot> {
+        self.terminal.scroll_viewport(match offset {
+            Some(offset) => ScrollViewport::Row(offset),
+            None => ScrollViewport::Bottom,
+        });
+        self.snapshot_viewport_and_restore_bottom()
+    }
+
+    pub(super) fn mouse_wheel(
+        &mut self,
+        event: MouseWheelEvent,
+        offset: Option<usize>,
+        pty_input_allowed: bool,
+    ) -> Result<MouseWheelOutcome> {
+        if self.terminal.is_mouse_tracking()? {
+            if pty_input_allowed {
+                self.forward_mouse_wheel(event)?;
+            }
+            return Ok(MouseWheelOutcome::Forwarded);
+        }
+
+        self.terminal.scroll_viewport(match offset {
+            Some(offset) => ScrollViewport::Row(offset),
+            None => ScrollViewport::Bottom,
+        });
+        let delta = match event.direction {
+            MouseWheelDirection::Up => -MOUSE_WHEEL_LINES,
+            MouseWheelDirection::Down => MOUSE_WHEEL_LINES,
+        };
+        self.terminal.scroll_viewport(ScrollViewport::Delta(delta));
+        self.snapshot_viewport_and_restore_bottom()
+            .map(MouseWheelOutcome::Scrolled)
+    }
+
+    fn snapshot_viewport_and_restore_bottom(&mut self) -> Result<ViewportSnapshot> {
+        let result = (|| {
+            let scrollbar = self.terminal.scrollbar()?;
+            let bottom = scrollbar.total.saturating_sub(scrollbar.len);
+            let offset = (scrollbar.offset < bottom)
+                .then(|| usize::try_from(scrollbar.offset))
+                .transpose()
+                .context("converting Ghostty viewport offset")?;
+            Ok(ViewportSnapshot {
+                offset,
+                screen: self.snapshot()?,
+            })
+        })();
+        self.terminal.scroll_viewport(ScrollViewport::Bottom);
+        result
+    }
+
+    fn forward_mouse_wheel(&mut self, event: MouseWheelEvent) -> Result<()> {
+        let column = event.column.min(self.size.columns - 1);
+        let row = event.row.min(self.size.rows - 1);
+        self.mouse_event
+            .set_mods(mouse_modifiers(event.modifiers))
+            .set_position(mouse::Position {
+                x: f32::from(column) + 0.5,
+                y: f32::from(row) + 0.5,
+            })
+            .set_button(Some(match event.direction {
+                MouseWheelDirection::Up => mouse::Button::Four,
+                MouseWheelDirection::Down => mouse::Button::Five,
+            }));
+        self.mouse_encoder
+            .set_options_from_terminal(&self.terminal)
+            .set_size(mouse::EncoderSize {
+                screen_width: u32::from(self.size.columns),
+                screen_height: u32::from(self.size.rows),
+                cell_width: 1,
+                cell_height: 1,
+                padding_top: 0,
+                padding_bottom: 0,
+                padding_right: 0,
+                padding_left: 0,
+            })
+            .set_any_button_pressed(false);
+
+        let mut response = Vec::new();
+        self.mouse_event.set_action(mouse::Action::Press);
+        self.mouse_encoder
+            .encode_to_vec(&self.mouse_event, &mut response)?;
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("PTY writer lock poisoned"))?;
+        writer
+            .write_all(&response)
+            .context("writing encoded mouse wheel to PTY")?;
+        writer
+            .flush()
+            .context("flushing encoded mouse wheel to PTY")
     }
 
     fn present_synchronized_output(&mut self) -> Result<Option<ScreenSnapshot>> {
@@ -159,6 +276,14 @@ impl GhosttyTerminal {
     }
 }
 
+fn mouse_modifiers(modifiers: MouseModifiers) -> key::Mods {
+    let mut result = key::Mods::empty();
+    result.set(key::Mods::SHIFT, modifiers.shift);
+    result.set(key::Mods::CTRL, modifiers.control);
+    result.set(key::Mods::ALT, modifiers.alt);
+    result
+}
+
 fn validate_size(size: TerminalSize) -> Result<()> {
     ensure!(
         size.columns > 0 && size.rows > 0,
@@ -189,12 +314,36 @@ mod tests {
 
     use super::*;
 
+    #[derive(Clone)]
+    struct RecordingWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     fn terminal(columns: u16, rows: u16) -> GhosttyTerminal {
         GhosttyTerminal::new(
             TerminalSize { columns, rows },
             Arc::new(Mutex::new(Box::new(io::sink()))),
         )
         .unwrap()
+    }
+
+    fn recording_terminal(columns: u16, rows: u16) -> (GhosttyTerminal, Arc<Mutex<Vec<u8>>>) {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let terminal = GhosttyTerminal::new(
+            TerminalSize { columns, rows },
+            Arc::new(Mutex::new(Box::new(RecordingWriter(Arc::clone(&output))))),
+        )
+        .unwrap();
+        (terminal, output)
     }
 
     fn text(snapshot: &ScreenSnapshot) -> String {
@@ -293,6 +442,86 @@ mod tests {
         assert_eq!(after.cells.len(), 9);
         assert_eq!(after.size.columns, 3);
         assert!(after.revision > before.revision);
+    }
+
+    #[test]
+    fn temporary_history_view_restores_bottom_and_keeps_revisions_monotonic() {
+        let mut terminal = terminal(8, 3);
+        let bottom = terminal
+            .feed(b"00\r\n01\r\n02\r\n03\r\n04\r\n05")
+            .unwrap()
+            .unwrap();
+        assert!(text(&bottom).contains("05"));
+
+        let MouseWheelOutcome::Scrolled(history) = terminal
+            .mouse_wheel(
+                MouseWheelEvent {
+                    direction: MouseWheelDirection::Up,
+                    column: 0,
+                    row: 0,
+                    modifiers: MouseModifiers::default(),
+                },
+                None,
+                true,
+            )
+            .unwrap()
+        else {
+            panic!("wheel was unexpectedly forwarded");
+        };
+        assert!(history.offset.is_some());
+        assert!(!text(&history.screen).contains("05"));
+        assert!(terminal.terminal.viewport_active().unwrap());
+
+        let after = terminal.feed(b"\r\n06").unwrap().unwrap();
+        assert!(text(&after).contains("06"));
+        assert!(after.revision > history.screen.revision);
+        assert!(history.screen.revision > bottom.revision);
+        assert!(terminal.terminal.viewport_active().unwrap());
+    }
+
+    #[test]
+    fn tracked_wheel_uses_ghostty_modes_and_is_forwarded_to_the_pty() {
+        let (mut terminal, output) = recording_terminal(10, 4);
+        terminal.feed(b"\x1b[?1000h\x1b[?1006h").unwrap().unwrap();
+        output.lock().unwrap().clear();
+
+        let outcome = terminal
+            .mouse_wheel(
+                MouseWheelEvent {
+                    direction: MouseWheelDirection::Up,
+                    column: 2,
+                    row: 1,
+                    modifiers: MouseModifiers {
+                        shift: true,
+                        control: false,
+                        alt: false,
+                    },
+                },
+                None,
+                true,
+            )
+            .unwrap();
+        assert!(matches!(outcome, MouseWheelOutcome::Forwarded));
+        assert_eq!(
+            String::from_utf8(output.lock().unwrap().clone()).unwrap(),
+            "\x1b[<68;3;2M"
+        );
+        output.lock().unwrap().clear();
+        let outcome = terminal
+            .mouse_wheel(
+                MouseWheelEvent {
+                    direction: MouseWheelDirection::Down,
+                    column: 2,
+                    row: 1,
+                    modifiers: MouseModifiers::default(),
+                },
+                None,
+                false,
+            )
+            .unwrap();
+        assert!(matches!(outcome, MouseWheelOutcome::Forwarded));
+        assert!(output.lock().unwrap().is_empty());
+        assert!(terminal.terminal.viewport_active().unwrap());
     }
 
     #[test]

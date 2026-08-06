@@ -25,7 +25,10 @@ use config::{PaneLayoutPolicy, UiConfig};
 use crossterm::{
     SynchronizedUpdate,
     cursor::{Hide, Show},
-    event::{DisableBracketedPaste, EnableBracketedPaste, Event, EventStream},
+    event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, EventStream, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{
         DisableLineWrap, EnableLineWrap, EnterAlternateScreen, LeaveAlternateScreen,
@@ -58,7 +61,10 @@ use sidebar::{WorkspaceSidebarAction, WorkspaceSidebarState, render_workspace_si
 use tab_bar::{TabBarAction, TabBarState};
 
 use crate::{
-    domain::{CellColor, CellStyle, ScreenSnapshot, TerminalId, TerminalSize},
+    domain::{
+        CellColor, CellStyle, MouseModifiers, MouseWheelDirection, MouseWheelEvent, ScreenSnapshot,
+        TerminalId, TerminalSize,
+    },
     protocol::{
         ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, SelectedTarget, SelectedView,
         SelectionExpectation, ServerMessage, codec, decode_payload, encode_payload,
@@ -73,6 +79,15 @@ enum ClientSurface {
     WorkspaceSidebar(WorkspaceSidebarState),
     TabBar(TabBarState),
     CommandBar(CommandBarState),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum PaneMouseAction {
+    Wheel {
+        terminal_id: TerminalId,
+        event: MouseWheelEvent,
+    },
+    Focus(crate::domain::PaneId),
 }
 
 /// Attach an interactive full-screen client to an already-running daemon.
@@ -695,11 +710,60 @@ async fn run(
                             force_draw = true;
                         }
                     }
+                    Event::Mouse(mouse) if surface.is_none() && rename.is_none() => {
+                        let terminal_area = client_layout(
+                            terminal.size()?.into(),
+                            &ui,
+                            resources.workspace_count(view.focused()),
+                        ).terminal;
+                        if let Some(action) =
+                            pane_mouse_action(&view, terminal_area, ui.pane_layout, mouse)
+                        {
+                            match action {
+                                PaneMouseAction::Wheel { terminal_id, event } => {
+                                    send(
+                                        framed,
+                                        ClientMessage::MouseWheel {
+                                            terminal_id,
+                                            event,
+                                        },
+                                    ).await?;
+                                }
+                                PaneMouseAction::Focus(pane_id) => {
+                                    if let Some(request) = focus.begin(FocusOrigin::Pane) {
+                                        send_request(
+                                            framed,
+                                            Some(request),
+                                            ClientMessage::SelectTarget {
+                                                selector: TargetSelector::Pane(pane_id),
+                                                expected: Some(SelectionExpectation::Tab(
+                                                    view.focused().tab_id,
+                                                )),
+                                            },
+                                        ).await?;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     Event::Key(key) if surface.is_none() => if let Some(bytes) = encode_key(key) {
                         notice = None;
                         match prefix.feed(bytes) {
-                            PrefixAction::Wait => {}
+                            PrefixAction::Wait => {
+                                send(
+                                    framed,
+                                    ClientMessage::ResetViewport {
+                                        terminal_id: view.focused().terminal_id,
+                                    },
+                                ).await?;
+                            }
                             PrefixAction::Dispatch(action) => {
+                                send(
+                                    framed,
+                                    ClientMessage::ResetViewport {
+                                        terminal_id: view.focused().terminal_id,
+                                    },
+                                ).await?;
                                 notice = dispatch_client_action(
                                     action,
                                     framed,
@@ -720,6 +784,12 @@ async fn run(
                     },
                     Event::Paste(text) if surface.is_none() => send(framed, ClientMessage::Input { bytes: text.into_bytes() }).await?,
                     Event::Resize(columns, rows) if columns > 0 && rows > 0 => {
+                        send(
+                            framed,
+                            ClientMessage::ResetViewport {
+                                terminal_id: view.focused().terminal_id,
+                            },
+                        ).await?;
                         resize_view(
                             framed,
                             Rect::new(0, 0, columns, rows),
@@ -930,6 +1000,44 @@ fn accepts_client_input(
         && !create_tab.blocks_input()
         && !split_pane.blocks_input()
         && pending_focused_exit.is_none()
+}
+
+fn mouse_wheel_event(mouse: MouseEvent, column: u16, row: u16) -> MouseWheelEvent {
+    MouseWheelEvent {
+        direction: match mouse.kind {
+            MouseEventKind::ScrollUp => MouseWheelDirection::Up,
+            MouseEventKind::ScrollDown => MouseWheelDirection::Down,
+            _ => unreachable!("wheel conversion requires a vertical wheel event"),
+        },
+        column,
+        row,
+        modifiers: MouseModifiers {
+            shift: mouse.modifiers.contains(KeyModifiers::SHIFT),
+            control: mouse.modifiers.contains(KeyModifiers::CONTROL),
+            alt: mouse.modifiers.contains(KeyModifiers::ALT),
+        },
+    }
+}
+
+fn pane_mouse_action(
+    view: &ViewState,
+    area: Rect,
+    policy: PaneLayoutPolicy,
+    mouse: MouseEvent,
+) -> Option<PaneMouseAction> {
+    let (target, column, row) = view.pane_at(area, policy, mouse.column, mouse.row)?;
+    match mouse.kind {
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => Some(PaneMouseAction::Wheel {
+            terminal_id: target.terminal_id,
+            event: mouse_wheel_event(mouse, column, row),
+        }),
+        MouseEventKind::Down(MouseButton::Left)
+            if target.terminal_id != view.focused().terminal_id =>
+        {
+            Some(PaneMouseAction::Focus(target.pane_id))
+        }
+        _ => None,
+    }
 }
 
 #[allow(
@@ -1699,6 +1807,24 @@ impl ViewState {
         }
     }
 
+    fn pane_at(
+        &self,
+        area: Rect,
+        policy: PaneLayoutPolicy,
+        column: u16,
+        row: u16,
+    ) -> Option<(SelectedTarget, u16, u16)> {
+        let layouts = self.pane_layouts(area, policy).0;
+        self.panes.iter().find_map(|pane| {
+            let content = layouts.get(&pane.target.terminal_id)?.content;
+            (column >= content.x
+                && column < content.x.saturating_add(content.width)
+                && row >= content.y
+                && row < content.y.saturating_add(content.height))
+            .then(|| (pane.target.clone(), column - content.x, row - content.y))
+        })
+    }
+
     fn resize_requests(
         &mut self,
         area: Rect,
@@ -1871,6 +1997,7 @@ struct TerminalGuard {
     raw: bool,
     alternate_screen: bool,
     bracketed_paste: bool,
+    mouse_capture: bool,
     cursor_hidden: bool,
     line_wrap_disabled: bool,
 }
@@ -1881,6 +2008,7 @@ impl TerminalGuard {
             raw: false,
             alternate_screen: false,
             bracketed_paste: false,
+            mouse_capture: false,
             cursor_hidden: false,
             line_wrap_disabled: false,
         };
@@ -1890,6 +2018,8 @@ impl TerminalGuard {
         guard.alternate_screen = true;
         execute!(io::stdout(), EnableBracketedPaste)?;
         guard.bracketed_paste = true;
+        execute!(io::stdout(), EnableMouseCapture)?;
+        guard.mouse_capture = true;
         execute!(io::stdout(), Hide)?;
         guard.cursor_hidden = true;
         execute!(io::stdout(), DisableLineWrap)?;
@@ -1901,14 +2031,17 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut stdout = io::stdout();
-        if self.bracketed_paste {
-            let _ = execute!(stdout, DisableBracketedPaste);
-        }
         if self.line_wrap_disabled {
             let _ = execute!(stdout, EnableLineWrap);
         }
         if self.cursor_hidden {
             let _ = execute!(stdout, Show);
+        }
+        if self.mouse_capture {
+            let _ = execute!(stdout, DisableMouseCapture);
+        }
+        if self.bracketed_paste {
+            let _ = execute!(stdout, DisableBracketedPaste);
         }
         if self.alternate_screen {
             let _ = execute!(stdout, LeaveAlternateScreen);
@@ -2168,6 +2301,74 @@ mod tests {
                 }
             )]
         );
+    }
+
+    #[test]
+    fn pane_hit_testing_returns_the_typed_target_and_terminal_local_cell() {
+        let panes = targets(2);
+        let state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
+        let area = Rect::new(7, 3, 49, 8);
+        let layouts = state.pane_layouts(area, PaneLayoutPolicy::Splits).0;
+
+        for pane in &panes {
+            let content = layouts[&pane.terminal_id].content;
+            let column = content.x + content.width / 2;
+            let row = content.y + content.height / 2;
+            assert_eq!(
+                state.pane_at(area, PaneLayoutPolicy::Splits, column, row),
+                Some((pane.clone(), column - content.x, row - content.y,))
+            );
+        }
+        assert!(
+            state
+                .pane_at(area, PaneLayoutPolicy::Splits, 0, 0)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn crossterm_wheel_is_normalized_for_the_terminal_protocol() {
+        let event = mouse_wheel_event(
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 30,
+                row: 12,
+                modifiers: KeyModifiers::SHIFT | KeyModifiers::ALT,
+            },
+            4,
+            2,
+        );
+        assert_eq!(event.direction, MouseWheelDirection::Down);
+        assert_eq!((event.column, event.row), (4, 2));
+        assert_eq!(
+            event.modifiers,
+            MouseModifiers {
+                shift: true,
+                control: false,
+                alt: true,
+            }
+        );
+    }
+
+    #[test]
+    fn left_click_on_an_unfocused_pane_chooses_typed_pane_focus() {
+        let panes = targets(2);
+        let state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
+        let area = Rect::new(0, 0, 49, 8);
+        let content =
+            state.pane_layouts(area, PaneLayoutPolicy::Splits).0[&panes[1].terminal_id].content;
+        let action = pane_mouse_action(
+            &state,
+            area,
+            PaneLayoutPolicy::Splits,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: content.x,
+                row: content.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(action, Some(PaneMouseAction::Focus(panes[1].pane_id)));
     }
 
     #[test]

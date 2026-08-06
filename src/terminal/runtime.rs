@@ -11,9 +11,9 @@ use anyhow::{Context, Result, anyhow};
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::{broadcast, mpsc as async_mpsc, oneshot, watch};
 
-use crate::domain::{ScreenSnapshot, TerminalId, TerminalSize};
+use crate::domain::{MouseWheelEvent, ScreenSnapshot, TerminalId, TerminalSize};
 
-use super::ghostty::GhosttyTerminal;
+use super::{MouseWheelOutcome, ViewportSnapshot, ghostty::GhosttyTerminal};
 
 const QUEUE_CAPACITY: usize = 64;
 const OUTPUT_QUEUE_CAPACITY: usize = 16;
@@ -46,6 +46,8 @@ pub enum CommandError {
     Busy,
     #[error("terminal runtime has stopped")]
     Stopped,
+    #[error("terminal emulator operation failed: {0}")]
+    Emulator(String),
 }
 
 #[derive(Clone)]
@@ -81,6 +83,34 @@ impl TerminalHandle {
 
     pub async fn resize(&self, size: TerminalSize) -> Result<(), CommandError> {
         self.send(RuntimeMessage::Resize(size))
+    }
+
+    pub(crate) async fn mouse_wheel(
+        &self,
+        event: MouseWheelEvent,
+        viewport_offset: Option<usize>,
+        pty_input_allowed: bool,
+    ) -> Result<MouseWheelOutcome, CommandError> {
+        let (completion, completed) = oneshot::channel();
+        self.send(RuntimeMessage::MouseWheel {
+            event,
+            viewport_offset,
+            pty_input_allowed,
+            completion,
+        })?;
+        completed.await.unwrap_or(Err(CommandError::Stopped))
+    }
+
+    pub(crate) async fn viewport_snapshot(
+        &self,
+        viewport_offset: Option<usize>,
+    ) -> Result<ViewportSnapshot, CommandError> {
+        let (completion, completed) = oneshot::channel();
+        self.send(RuntimeMessage::ViewportSnapshot {
+            viewport_offset,
+            completion,
+        })?;
+        completed.await.unwrap_or(Err(CommandError::Stopped))
     }
 
     pub async fn close(&self) -> Result<(), CommandError> {
@@ -147,6 +177,16 @@ impl TerminalHandle {
 enum RuntimeMessage {
     Input(Vec<u8>),
     Resize(TerminalSize),
+    MouseWheel {
+        event: MouseWheelEvent,
+        viewport_offset: Option<usize>,
+        pty_input_allowed: bool,
+        completion: oneshot::Sender<Result<MouseWheelOutcome, CommandError>>,
+    },
+    ViewportSnapshot {
+        viewport_offset: Option<usize>,
+        completion: oneshot::Sender<Result<ViewportSnapshot, CommandError>>,
+    },
     Close(oneshot::Sender<Result<(), CommandError>>),
 }
 
@@ -335,6 +375,26 @@ fn run(
                             publishers.events,
                         );
                     }
+                }
+                RuntimeMessage::MouseWheel {
+                    event,
+                    viewport_offset,
+                    pty_input_allowed,
+                    completion,
+                } => {
+                    let result = terminal
+                        .mouse_wheel(event, viewport_offset, pty_input_allowed)
+                        .map_err(|error| CommandError::Emulator(error.to_string()));
+                    let _ = completion.send(result);
+                }
+                RuntimeMessage::ViewportSnapshot {
+                    viewport_offset,
+                    completion,
+                } => {
+                    let result = terminal
+                        .viewport_snapshot(viewport_offset)
+                        .map_err(|error| CommandError::Emulator(error.to_string()));
+                    let _ = completion.send(result);
                 }
                 RuntimeMessage::Close(completion) => {
                     kill_terminal_processes(&*master, child_pid);

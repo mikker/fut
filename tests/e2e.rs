@@ -18,8 +18,8 @@ use std::{
 use bytes::Bytes;
 use fut::{
     domain::{
-        AgentReport, AgentState, AttentionKind, PaneId, ScreenSnapshot, TabId, TerminalId,
-        TerminalSize,
+        AgentReport, AgentState, AttentionKind, MouseModifiers, MouseWheelDirection,
+        MouseWheelEvent, PaneId, ScreenSnapshot, TabId, TerminalId, TerminalSize,
     },
     protocol::{
         ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, RenameSelector, SelectedTarget,
@@ -2162,6 +2162,104 @@ async fn public_pane_new_rejections_are_pre_spawn_and_atomic() {
         assert_eq!(harness.resources().await, before);
         assert!(!marker.exists());
     }
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn scrollback_is_attachment_local_survives_output_and_keyboard_returns_only_focus_to_bottom()
+{
+    let mut harness = Harness::start(
+        "i=0; while [ $i -le 40 ]; do printf 'HIST_%02d\\r\\n' \"$i\"; i=$((i + 1)); done; while IFS= read -r line; do printf 'BOTTOM_%s\\r\\n' \"$line\"; done",
+    )
+    .await;
+    let resources = harness.resources().await;
+    let tab_id = resources.sessions[0].workspaces[0].tabs[0].id;
+    let terminal_a = resources.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
+    let ServerMessage::PaneCreated { selected: pane_b } = harness
+        .control_command(ClientMessage::CreatePane {
+            tab_id,
+            cwd: None,
+            program: Some("/bin/sh".into()),
+            argv: vec![
+                "-c".into(),
+                "printf 'PANE_B_READY\\r\\n'; while IFS= read -r line; do :; done".into(),
+            ],
+        })
+        .await
+    else {
+        panic!("failed to create second pane")
+    };
+
+    let (mut client_a, selected_a, _) = harness
+        .interactive_for(Some(TargetSelector::Terminal(terminal_a)))
+        .await;
+    assert_eq!(selected_a, terminal_a);
+    let (mut client_b, selected_b) =
+        attach_once(&harness, TargetSelector::Terminal(pane_b.terminal_id)).await;
+    assert_eq!(selected_b, pane_b);
+    snapshot_containing(&mut client_a, terminal_a, "HIST_40").await;
+    snapshot_containing(&mut client_b, terminal_a, "HIST_40").await;
+
+    let wheel = ClientMessage::MouseWheel {
+        terminal_id: terminal_a,
+        event: MouseWheelEvent {
+            direction: MouseWheelDirection::Up,
+            column: 0,
+            row: 0,
+            modifiers: MouseModifiers::default(),
+        },
+    };
+    send(&mut client_b, wheel.clone()).await;
+    let ServerMessage::Snapshot {
+        screen: history_b, ..
+    } = receive_matching(&mut client_b, |message| {
+        matches!(message, ServerMessage::Snapshot { terminal_id, screen }
+            if *terminal_id == terminal_a && !snapshot_text(screen).contains("HIST_40"))
+    })
+    .await
+    else {
+        unreachable!()
+    };
+
+    send(&mut client_a, wheel).await;
+    let ServerMessage::Snapshot {
+        screen: history_a, ..
+    } = receive_matching(&mut client_a, |message| {
+        matches!(message, ServerMessage::Snapshot { terminal_id, screen }
+            if *terminal_id == terminal_a && !snapshot_text(screen).contains("HIST_40"))
+    })
+    .await
+    else {
+        unreachable!()
+    };
+
+    send(
+        &mut client_a,
+        ClientMessage::Input {
+            bytes: b"NEW\n".to_vec(),
+        },
+    )
+    .await;
+    let bottom_a = snapshot_containing(&mut client_a, terminal_a, "BOTTOM_NEW").await;
+    assert!(bottom_a.revision > history_a.revision);
+
+    let ServerMessage::Snapshot {
+        screen: history_b_after_output,
+        ..
+    } = receive_matching(&mut client_b, |message| {
+        matches!(message, ServerMessage::Snapshot { terminal_id, screen }
+            if *terminal_id == terminal_a && screen.revision > history_b.revision)
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    let history_text = snapshot_text(&history_b_after_output);
+    assert!(!history_text.contains("BOTTOM_NEW"), "{history_text:?}");
+    assert!(!history_text.contains("HIST_40"), "{history_text:?}");
+
+    harness.detach(&mut client_a).await;
+    harness.detach(&mut client_b).await;
     harness.shutdown().await;
 }
 

@@ -43,7 +43,8 @@ use crate::{
     },
     splits::{SplitDirection, SplitTree},
     terminal::{
-        CommandError, SpawnSpec, TerminalEvent, TerminalHandle, TerminalLifecycle, spawn_terminal,
+        CommandError, MouseWheelOutcome, SpawnSpec, TerminalEvent, TerminalHandle,
+        TerminalLifecycle, spawn_terminal,
     },
 };
 
@@ -493,6 +494,8 @@ struct Attachment {
     updates: mpsc::Receiver<AttachmentUpdate>,
     update_sender: mpsc::Sender<AttachmentUpdate>,
     watchers: HashMap<TerminalId, (u64, JoinHandle<()>)>,
+    viewport_offsets: HashMap<TerminalId, usize>,
+    snapshot_revisions: HashMap<TerminalId, u64>,
     next_watcher_generation: u64,
 }
 
@@ -517,6 +520,8 @@ impl Attachment {
             updates,
             update_sender,
             watchers: HashMap::new(),
+            viewport_offsets: HashMap::new(),
+            snapshot_revisions: HashMap::new(),
             next_watcher_generation: 0,
         };
         attachment.reconcile_watchers();
@@ -538,6 +543,90 @@ impl Attachment {
 
     fn focused_terminal(&self) -> &Arc<TerminalHandle> {
         &self.focused.terminal
+    }
+
+    fn terminal(&self, terminal_id: TerminalId) -> Option<Arc<TerminalHandle>> {
+        self.panes
+            .iter()
+            .find(|pane| pane.selected.terminal_id == terminal_id)
+            .map(|pane| Arc::clone(&pane.terminal))
+    }
+
+    async fn mouse_wheel(
+        &mut self,
+        terminal_id: TerminalId,
+        event: crate::domain::MouseWheelEvent,
+    ) -> Result<Option<crate::domain::ScreenSnapshot>, CommandError> {
+        let Some(terminal) = self.terminal(terminal_id) else {
+            return Ok(None);
+        };
+        let offset = self.viewport_offsets.get(&terminal_id).copied();
+        let pty_input_allowed = terminal_id == self.focused.selected.terminal_id;
+        match terminal
+            .mouse_wheel(event, offset, pty_input_allowed)
+            .await?
+        {
+            MouseWheelOutcome::Forwarded => Ok(None),
+            MouseWheelOutcome::Scrolled(viewport) => {
+                self.set_viewport_offset(terminal_id, viewport.offset);
+                Ok(self.accept_snapshot(terminal_id, viewport.screen))
+            }
+        }
+    }
+
+    async fn return_focused_to_bottom(
+        &mut self,
+    ) -> Result<Option<crate::domain::ScreenSnapshot>, CommandError> {
+        let terminal_id = self.focused.selected.terminal_id;
+        if self.viewport_offsets.remove(&terminal_id).is_none() {
+            return Ok(None);
+        }
+        let viewport = self.focused.terminal.viewport_snapshot(None).await?;
+        debug_assert!(viewport.offset.is_none());
+        Ok(self.accept_snapshot(terminal_id, viewport.screen))
+    }
+
+    async fn snapshot_for_update(
+        &mut self,
+        terminal_id: TerminalId,
+        generation: u64,
+        canonical: crate::domain::ScreenSnapshot,
+    ) -> Result<Option<crate::domain::ScreenSnapshot>, CommandError> {
+        if !self.accepts(terminal_id, generation) {
+            return Ok(None);
+        }
+        let screen = if let Some(offset) = self.viewport_offsets.get(&terminal_id).copied() {
+            let Some(terminal) = self.terminal(terminal_id) else {
+                return Ok(None);
+            };
+            let viewport = terminal.viewport_snapshot(Some(offset)).await?;
+            self.set_viewport_offset(terminal_id, viewport.offset);
+            viewport.screen
+        } else {
+            canonical
+        };
+        Ok(self.accept_snapshot(terminal_id, screen))
+    }
+
+    fn set_viewport_offset(&mut self, terminal_id: TerminalId, offset: Option<usize>) {
+        if let Some(offset) = offset {
+            self.viewport_offsets.insert(terminal_id, offset);
+        } else {
+            self.viewport_offsets.remove(&terminal_id);
+        }
+    }
+
+    fn accept_snapshot(
+        &mut self,
+        terminal_id: TerminalId,
+        screen: crate::domain::ScreenSnapshot,
+    ) -> Option<crate::domain::ScreenSnapshot> {
+        let revision = self.snapshot_revisions.entry(terminal_id).or_default();
+        if screen.revision <= *revision {
+            return None;
+        }
+        *revision = screen.revision;
+        Some(screen)
     }
 
     fn reconcile(
@@ -618,6 +707,8 @@ impl Attachment {
             if let Some((_, task)) = self.watchers.remove(&terminal_id) {
                 task.abort();
             }
+            self.viewport_offsets.remove(&terminal_id);
+            self.snapshot_revisions.remove(&terminal_id);
         }
         for pane in &self.panes {
             let terminal_id = pane.selected.terminal_id;
@@ -1097,16 +1188,86 @@ async fn handle_connection(
                 let Some(frame) = frame else { break };
                 let envelope: Envelope<ClientMessage> = decode_payload(&frame?)?;
                 match envelope.message {
-                    ClientMessage::Input { bytes } => command_response(
-                        &mut framed,
-                        envelope.request_id,
-                        AcknowledgedCommand::Input,
-                        attachment.focused_terminal().input(bytes).await,
-                    ).await?,
+                    ClientMessage::Input { bytes } => {
+                        match attachment.return_focused_to_bottom().await {
+                            Ok(Some(screen)) => {
+                                send(
+                                    &mut framed,
+                                    None,
+                                    ServerMessage::Snapshot {
+                                        terminal_id: attachment.focused.selected.terminal_id,
+                                        screen,
+                                    },
+                                ).await?;
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                send_command_error(&mut framed, envelope.request_id, error).await?;
+                                continue;
+                            }
+                        }
+                        command_response(
+                            &mut framed,
+                            envelope.request_id,
+                            AcknowledgedCommand::Input,
+                            attachment.focused_terminal().input(bytes).await,
+                        ).await?;
+                    }
+                    ClientMessage::MouseWheel { terminal_id, event } => {
+                        if attachment.terminal(terminal_id).is_none() {
+                            send_error(
+                                &mut framed,
+                                envelope.request_id,
+                                "outside_view",
+                                "mouse target is not in the attached pane view",
+                            ).await?;
+                            continue;
+                        }
+                        match attachment.mouse_wheel(terminal_id, event).await {
+                            Ok(Some(screen)) => {
+                                send(
+                                    &mut framed,
+                                    None,
+                                    ServerMessage::Snapshot { terminal_id, screen },
+                                ).await?;
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                send_command_error(&mut framed, envelope.request_id, error).await?;
+                            }
+                        }
+                    }
+                    ClientMessage::ResetViewport { terminal_id } => {
+                        if terminal_id != attachment.focused.selected.terminal_id {
+                            if envelope.request_id.is_some() {
+                                send_error(
+                                    &mut framed,
+                                    envelope.request_id,
+                                    "not_focused",
+                                    "only the focused terminal viewport may be reset",
+                                ).await?;
+                            }
+                            continue;
+                        }
+                        match attachment.return_focused_to_bottom().await {
+                            Ok(Some(screen)) => {
+                                send(
+                                    &mut framed,
+                                    None,
+                                    ServerMessage::Snapshot { terminal_id, screen },
+                                ).await?;
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                send_command_error(&mut framed, envelope.request_id, error).await?;
+                            }
+                        }
+                    }
                     ClientMessage::Resize { terminal_id, size } => {
                         if let Err(error) = size.validate() {
                             send_error(&mut framed, envelope.request_id, "invalid_size", &error.to_string()).await?;
                         } else if terminal_id == attachment.focused.selected.terminal_id {
+                            attachment.viewport_offsets.remove(&terminal_id);
                             command_response(
                                 &mut framed,
                                 envelope.request_id,
@@ -1407,8 +1568,14 @@ async fn handle_connection(
             }
             update = attachment.updates.recv() => match update {
                 Some(AttachmentUpdate::Snapshot { terminal_id, generation, screen }) => {
-                    if attachment.accepts(terminal_id, generation) {
-                        send(&mut framed, None, ServerMessage::Snapshot { terminal_id, screen }).await?;
+                    match attachment.snapshot_for_update(terminal_id, generation, screen).await {
+                        Ok(Some(screen)) => {
+                            send(&mut framed, None, ServerMessage::Snapshot { terminal_id, screen }).await?;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            send_command_error(&mut framed, None, error).await?;
+                        }
                     }
                 }
                 Some(AttachmentUpdate::Error { terminal_id, generation, message }) => {
@@ -1743,6 +1910,8 @@ async fn control_loop(
             }
             ClientMessage::CreateWorkspace { .. }
             | ClientMessage::Input { .. }
+            | ClientMessage::MouseWheel { .. }
+            | ClientMessage::ResetViewport { .. }
             | ClientMessage::Resize { .. }
             | ClientMessage::SelectTarget { .. } => {
                 send_error(
@@ -2916,6 +3085,7 @@ async fn send_command_error(
     let code = match error {
         CommandError::Busy => "busy",
         CommandError::Stopped => "terminal_stopped",
+        CommandError::Emulator(_) => "terminal_emulator",
     };
     send_error(framed, request_id, code, &error.to_string()).await
 }
