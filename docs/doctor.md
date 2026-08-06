@@ -29,7 +29,7 @@ Doctor reports:
 - a bounded Fut protocol handshake when a safe socket exists;
 - the configured icon preset and a visual glyph probe.
 
-Protocol epoch `0` is a development epoch. A successful handshake does not promise compatibility between different development builds.
+Protocol `1`, planned for Fut 0.2, requires an exact client/daemon match. A successful handshake reports a compatible protocol-`1` daemon; any other protocol version is incompatible.
 
 ## Nerd Fonts
 

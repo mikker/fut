@@ -25,9 +25,9 @@ The Milestone 0–1 spike and the current daemon-integrated Milestone 2 slice ar
 
 The public grammar is now `open`, `session`, `workspace`, `tab`, `pane`, `terminal`, `list`, `doctor`, and `daemon`. Noun-first applies to resource operations; top-level `open`, `list`, read-only `doctor`, and the `daemon` lifecycle are intentional non-resource entry points. Resource mutations take raw IDs only; attach operations do too, except that `session attach` permits an exact name. UUID-shaped session attach values have ID precedence. Session, workspace, and tab attachment succeeds only when the ancestor identifies exactly one open terminal; pane and terminal IDs are exact, and the navigator handles interactive selection, including sibling panes. The public CLI has no typed-prefix or selector mini-language. Child commands require a literal `--` and are passed as direct argv. Bare `fut` opens the current directory and then attaches to its returned terminal. `fut open`, `fut tab new`, and `fut pane new TAB_ID [--cwd PATH] [-- COMMAND...]` are control-only; each returns complete selected ancestry and terminal identity, while resource attachment remains separate. Pane creation defaults to the shell, and its cwd defaults to the workspace root with relative paths resolved against that root. The CLI makes no atomic create-and-attach guarantee. The TUI consumes typed protocol IDs directly rather than constructing CLI arguments.
 
-This validates logical workspace, tab, and pane creation, same-workspace pane movement, authored right/down split topology, multi-pane lifecycle, proper tab close, session, workspace, and tab rename, structured control output, live completion, revisioned resource streaming, and responsive simultaneous-pane UI end-to-end. Workspaces are user-defined collections of tabs with CWD context: Git checkouts fit naturally, but Fut does not prescribe or create them, and multiple workspaces in one session may share a root. `Ctrl-b w` and `Ctrl-b t` activate their respective resource lists, where `c` creates and `r` renames the selection. The client/daemon wire format remains on reserved development epoch `0`; compatibility is not maintained between rapid-development builds, and stable versioning is deferred until the format settles. Successful `--json` responses use a `version: 1` envelope and dotted command name. Failures preserve daemon codes and classify local argument and command errors. Shell completion remains bounded and read-only. Tabs own shared split trees whose validated leaf order matches pane order; clients default to recursively rendered splits and may select the accordion policy without rewriting topology. Focused-only degradation, client-local zoom, exact resize authority, directional and cyclic pane focus, mouse-wheel scrollback, pane click focus, wrapping, numbered and last-resource navigation, interactive workspace/tab CWD inheritance, host-native indexed ANSI colors, and complete command-launcher coverage are implemented. Revisioned resource and selected views reconcile creation, movement, closure, lifecycle, and topology changes; focused exit remains inside its session and publishes the fresh resource snapshot needed to remove closed tab chrome. The baseline still lacks ratio editing, titles, focused-application click forwarding, richer input, and trusted recipes.
+This validates logical workspace, tab, and pane creation, same-workspace pane movement, authored right/down split topology, multi-pane lifecycle, proper tab close, session, workspace, and tab rename, structured control output, live completion, revisioned resource streaming, and responsive simultaneous-pane UI end-to-end. Workspaces are user-defined collections of tabs with CWD context: Git checkouts fit naturally, but Fut does not prescribe or create them, and multiple workspaces in one session may share a root. `Ctrl-b w` and `Ctrl-b t` activate their respective resource lists, where `c` creates and `r` renames the selection. Protocol `1`, planned for Fut 0.2, requires exact client/daemon matching; `daemon shutdown` can still contact a Fut 0.1 protocol-`0` daemon during upgrade. Successful `--json` responses use a `version: 1` envelope and dotted command name. Failures preserve daemon codes and classify local argument and command errors. Shell completion remains bounded and read-only. Tabs own shared split trees whose validated leaf order matches pane order; clients default to recursively rendered splits and may select the accordion policy without rewriting topology. Focused-only degradation, client-local zoom, exact resize authority, directional and cyclic pane focus, mouse-wheel scrollback, pane click focus, wrapping, numbered and last-resource navigation, interactive workspace/tab CWD inheritance, host-native indexed ANSI colors, complete command-launcher coverage, and the semantic agent POC are implemented. Revisioned resource and selected views reconcile creation, movement, closure, lifecycle, and topology changes; focused exit remains inside its session and publishes the fresh resource snapshot needed to remove closed tab chrome. The baseline still lacks ratio editing, titles, focused-application click forwarding, richer input, trusted recipes, and terminal-native alerts.
 
-The initial navigation and action-discovery surfaces, explicit client-local pane zoom, shared authored split tree, alternate accordion policy, right/down splits, directional and cyclic pane focus, wrapping, numbered and last-resource navigation, interactive tab CWD inheritance, and complete command-bar action coverage are implemented. The narrow Pi-backed agent-status proof of concept is next.
+The semantic POC provides explicit `idle`, `working`, `blocked`, and `completed` reports, a Pi integration, inline rollups, and per-client unseen attention navigation. BEL, output-unread, and silence alerts remain unstarted and separate from this POC.
 
 ## Strategy
 
@@ -37,8 +37,8 @@ Each milestone should leave a runnable `fut` binary. New abstractions are earned
 
 Milestone numbers group capabilities; they do not force implementation order. The current execution order is:
 
-1. prove Milestone 5's agent activity and attention model in a narrow Pi-backed spike; Milestone 4's authored splits, directional and cyclic pane navigation, wrapping, numbered and last-resource navigation, CWD inheritance, complete command coverage, initial chrome, accordion policy, and pane zoom are implemented;
-2. refine remaining daily-driver terminal behavior around the agent spike as dogfooding exposes it;
+1. refine remaining daily-driver terminal behavior and the implemented semantic POC through dogfooding;
+2. add terminal-native BEL, output-unread, and silence alerts without conflating them with semantic activity;
 3. return to Milestone 3's trusted project definitions and workspace recipes;
 4. harden the resulting product through Milestone 6.
 
@@ -59,7 +59,7 @@ The default tab layout is a shared authored split tree rather than the former ac
 - Interactive new tabs inherit CWD through the same fresh process lookup, recorded spawn-directory fallback, and workspace-root fallback as anchored splits. Control-plane tab creation without an explicit CWD remains rooted in its workspace.
 - The command bar includes every dispatchable `ClientAction` except `OpenCommandBar` itself. A reverse catalog test fails if any direct binding or action lacks a launcher definition. Direct bindings and launcher choices continue through one typed dispatcher.
 
-Validation covers pure split-tree mutation and collapse, directional geometry, per-client history, wire-format round trips, lifecycle reconciliation, CWD inheritance, direct and launcher dispatch for tab/split/navigation actions, responsive degradation, alternate accordion behavior, host-native indexed ANSI colors, and real PTY geometry and resize authority. Stable protocol versioning remains intentionally deferred.
+Validation covers pure split-tree mutation and collapse, directional geometry, per-client history, exact protocol matching and upgrade shutdown, wire-format round trips, lifecycle reconciliation, CWD inheritance, direct and launcher dispatch for tab/split/navigation actions, responsive degradation, alternate accordion behavior, host-native indexed ANSI colors, and real PTY geometry and resize authority.
 
 ## Guardrails
 
@@ -236,13 +236,11 @@ Reach the minimum tmux replacement level suggested by the current dotfiles, with
 - The current workspace and tab remain legible during normal terminal use, and available client actions are discoverable without consulting documentation.
 - Focus-biased layout works as a first-class policy rather than a resize hook.
 
-## Milestone 5: Agent activity and attention spike
+## Milestone 5: Semantic agent activity POC; terminal alerts deferred
 
-Add agent awareness as metadata on the established resource tree.
+Agent awareness is metadata on the established resource tree. The semantic POC is implemented: explicit terminal reports, the first-party Pi integration, inline rollups, and direct navigation to per-client unseen attention. Process heuristics and a generic integration framework remain deferred.
 
-Start this milestone as a proof-of-concept against the now-usable UI: one explicit reporting protocol, one first-party Pi integration, inline rollups, and direct navigation to attention. Do not begin with process heuristics or a generic integration framework.
-
-### Terminal-native alert foundation
+### Terminal-native alert foundation (unstarted)
 
 Keep terminal alerts separate from semantic agent state, but let both feed the same discoverable attention surfaces.
 
@@ -256,17 +254,18 @@ Keep terminal alerts separate from semantic agent state, but let both feed the s
 
 Terminal-alert tests must cover BEL adjacent to fragmented terminal sequences, multiple bells before observation, output while focused and unfocused, detach/reattach, multiple clients with different seen cursors, silence timer reset and expiry, process exit ordering, rollup precedence, and bounded snapshot state.
 
-### Work
+### Semantic POC completed
 
-- Expose terminal, pane, workspace, session, and socket identity through scoped `FUT_*` environment variables.
-- Define a generic activity-report command and protocol.
-- Store source, lifecycle state, timestamp, authority, and expiry for each observation.
-- Reduce observations into effective idle, working, blocked, or unknown activity.
-- Represent completion as an attention event with per-client seen cursors.
-- Roll status up from terminals through tabs, workspaces, and sessions.
-- Show compact inline status in the ordinary hierarchy.
-- Add navigator filters and jumps for blocked and unseen-completion resources.
-- Build a first-party Pi integration.
+- Scoped `FUT_SESSION_ID`, `FUT_WORKSPACE_ID`, `FUT_TAB_ID`, `FUT_PANE_ID`, and `FUT_TERMINAL_ID` identify the running terminal.
+- `fut terminal report` accepts `idle`, `working`, `blocked`, and `completed`; blocked and completed create bounded attention revisions.
+- Clients derive inline tab/workspace/navigator indicators and retain independent seen cursors. `Ctrl-b u` lists unseen attention and `Ctrl-b .` selects the next waiting terminal.
+- The first-party Pi extension reports its lifecycle transitions.
+
+### Remaining semantic work
+
+- Store source, lifecycle state, authority, and expiry for observations.
+- Reduce conflicting or stale observations into effective idle, working, blocked, or unknown activity.
+- Add navigator filters for blocked and unseen-completion resources.
 - Add process inspection and screen/OSC evidence only after explicit reports work reliably.
 
 ### Tests

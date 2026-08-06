@@ -32,6 +32,8 @@ These may appear in groups under `ui.tab_bar.left`, `center`, or `right`.
 | `tab.pane_count` | Number of panes in the current tab |
 | `client.zoom` | Configured zoom icon while zoomed; otherwise empty |
 | `client.help` | Contextual create/rename/close help while the tab bar is keyboard-active |
+| `client.waiting` | `●` and this client's count of terminals with unseen blocked or completed attention across Fut; empty when zero |
+| `session.waiting` | `●` and this client's count of terminals with unseen blocked or completed attention in the current session; empty when zero |
 
 The special `{ component = "tabs" }` segment renders the focus-aware repeated tab collection. At most one may occur in a tab bar.
 
@@ -48,6 +50,7 @@ These may appear only under `ui.tab_bar.item.segments`.
 | `tab.closing` | Closing icon while closing; otherwise empty |
 | `tab.pane_count` | Number of panes in the tab |
 | `tab.icon` | Tab icon from the selected preset |
+| `tab.activity` | A spinner for working, `!` for blocked, or `●` for unseen completion; empty when inactive |
 
 Current, closing, and keyboard-selected styles are composed over every item segment.
 
@@ -66,6 +69,7 @@ These may appear in `ui.workspace_sidebar.row.left`, `body`, `right`, or `detail
 | `workspace.closing` | Closing icon while closing; otherwise empty |
 | `workspace.tab_count` | Number of tabs in the workspace |
 | `workspace.icon` | Workspace icon from the selected preset |
+| `workspace.activity` | A spinner for working, `!` for blocked, or `●` for unseen completion; empty when inactive |
 
 Current, closing, and keyboard-selected styles compose over each workspace row.
 
@@ -83,7 +87,7 @@ These may appear in `ui.workspace_sidebar.header` and `footer`:
 
 ## Future dynamic tokens
 
-Process titles, Git state, clocks, agent activity, and custom providers are intentionally absent from the synchronous renderer. Dynamic token providers should be asynchronous, bounded, cached, explicitly trusted where executable, and publish typed values into the same pure rendering context.
+Process titles, Git state, clocks, and custom providers are intentionally absent from the synchronous renderer. Implemented semantic activity comes from explicit reports already present in the resource snapshot. Future dynamic providers should be asynchronous, bounded, cached, explicitly trusted where executable, and publish typed values into the same pure rendering context.
 
 ## Related
 

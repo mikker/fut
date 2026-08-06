@@ -27,9 +27,10 @@
     <div class="shell">
       <aside aria-label="Documentation sections">
         <a {% if page.url == '/' %}aria-current="page"{% endif %} href="{{ '/' | relative_url }}">00 / Introduction</a>
-        <a {% if page.url contains '/configuration/' %}aria-current="page"{% endif %} href="{{ '/configuration/' | relative_url }}">01 / Configuration</a>
-        <a {% if page.url contains '/tokens/' %}aria-current="page"{% endif %} href="{{ '/tokens/' | relative_url }}">02 / Tokens</a>
-        <a {% if page.url contains '/doctor/' %}aria-current="page"{% endif %} href="{{ '/doctor/' | relative_url }}">03 / Doctor</a>
+        <a {% if page.url contains '/agents/' %}aria-current="page"{% endif %} href="{{ '/agents/' | relative_url }}">01 / Agent activity</a>
+        <a {% if page.url contains '/configuration/' %}aria-current="page"{% endif %} href="{{ '/configuration/' | relative_url }}">02 / Configuration</a>
+        <a {% if page.url contains '/tokens/' %}aria-current="page"{% endif %} href="{{ '/tokens/' | relative_url }}">03 / Tokens</a>
+        <a {% if page.url contains '/doctor/' %}aria-current="page"{% endif %} href="{{ '/doctor/' | relative_url }}">04 / Doctor</a>
       </aside>
 
       <main id="content">

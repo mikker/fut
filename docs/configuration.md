@@ -58,6 +58,9 @@ foreground = "dark_gray"
 foreground = "yellow"
 add_modifiers = ["bold"]
 
+[ui.styles.activity]
+foreground = "light_cyan"
+
 [ui.tab_bar]
 position = "top" # "top" or "bottom"
 left = [
@@ -96,7 +99,9 @@ detail = [{ token = "workspace.root", style = "muted" }]
 
 Omitted fields use defaults. An explicitly empty array hides that lane or format.
 
-Bindings are suffixes after the fixed `Ctrl-b` prefix. Override any action under `ui.bindings`; accepted values are one printable character or the names `space`, `enter`, `tab`, and `esc`. Keys must remain unique. Action names are `open_command_bar`, `open_navigator`, `open_workspace_sidebar`, `open_tab_bar`, `create_tab`, `focus_next_tab`, `focus_previous_tab`, `split_pane_right`, `split_pane_down`, `focus_next_pane`, `focus_previous_pane`, `focus_pane_left`, `focus_pane_down`, `focus_pane_up`, `focus_pane_right`, `focus_last_pane`, `focus_last_tab`, `focus_last_workspace`, `focus_last_session`, `focus_tab_1` through `focus_tab_10`, `toggle_pane_zoom`, and `detach`. The command bar displays and searches the configured bindings.
+Bindings are suffixes after the fixed `Ctrl-b` prefix. Override any action under `ui.bindings`; accepted values are one printable character or the names `space`, `enter`, `tab`, and `esc`. Keys must remain unique. Action names are `open_command_bar`, `open_navigator`, `open_workspace_sidebar`, `open_tab_bar`, `open_notifications`, `focus_next_notification`, `create_tab`, `focus_next_tab`, `focus_previous_tab`, `split_pane_right`, `split_pane_down`, `focus_next_pane`, `focus_previous_pane`, `focus_pane_left`, `focus_pane_down`, `focus_pane_up`, `focus_pane_right`, `focus_last_pane`, `focus_last_tab`, `focus_last_workspace`, `focus_last_session`, `focus_tab_1` through `focus_tab_10`, `toggle_pane_zoom`, and `detach`. The command bar displays and searches the configured bindings.
+
+`open_notifications` (default `Ctrl-b u`) opens the per-client list of terminals with unseen blocked or completed reports. `focus_next_notification` (default `Ctrl-b .`) switches to the next such terminal in resource order. Selecting or viewing that terminal marks its current attention seen only for that client.
 
 Sidebar width is 4 through 80 cells and includes its one-cell divider. By default, it collapses when the current session has only one workspace; set `hide_when_single = false` to keep it docked. Otherwise it docks when the host is at least `width + 96` columns wide, so the default width retains the 120-column breakpoint. When collapsed or below that threshold it remains available as an edge drawer without reducing terminal geometry. `vertical_divider` must be exactly one grapheme and one display cell.
 
@@ -127,6 +132,7 @@ The fixed semantic roles are:
 - `current`
 - `selected`
 - `closing`
+- `activity`
 - `attention`
 - `error`
 - `divider`
@@ -144,7 +150,7 @@ Modifiers are `bold`, `dim`, `italic`, `underlined`, `reversed`, and `crossed_ou
 
 Colors may be `default`, ANSI names such as `red`, `blue`, `gray`, `dark_gray`, or `light_cyan`, an indexed color such as `index:123`, or exact RGB such as `#12abef`. Indexed colors remain references to the containing terminal's palette; RGB colors remain exact.
 
-Styles compose in this order: normal, group/segment style, current, attention, closing, selected. Later foreground/background values replace earlier ones; modifiers are added or removed in sequence.
+Styles compose in this order: normal, group style, token style (`activity` or `attention` when supplied), segment style, current, attention, closing, selected. Later foreground/background values replace earlier ones; modifiers are added or removed in sequence.
 
 ## Icons
 

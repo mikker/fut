@@ -9,7 +9,7 @@ permalink: /
 
 <pre class="resource-tree"><code>$ fut <span class="cursor">█</span>                     (just one)
 └── session[name]           (this is the project)
-    └── workspace[name]     (this is the worktree)
+    └── workspace[name]     (a user-defined context)
         └── tab             (this is the agent/vim/you do you)
             └── pane        (same as above)</code></pre>
 

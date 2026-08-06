@@ -2,7 +2,7 @@
 
 ## Mental model
 
-Fut is one terminal multiplexer containing live project sessions. Each session contains one or more checkouts, each checkout contains tabs, and each tab contains panes. Agent activity is metadata on this tree rather than a separate navigation hierarchy.
+Fut is one terminal multiplexer containing live project sessions. Each session contains one or more logical workspaces, each workspace contains tabs, and each tab contains panes. A workspace is user-defined: it may represent a checkout or worktree, but is not equated with either. Agent activity is metadata on this tree rather than a separate navigation hierarchy.
 
 ```text
 Fut
@@ -24,9 +24,7 @@ The single running environment that owns all live sessions. Sessions are resourc
 
 ### Project
 
-A durable filesystem identity and optional configuration from which a session can be created. A Git repository and all of its worktrees are one project. A non-Git directory may also be a project.
-
-A project is not necessarily live. Its definition may remain after its session has closed.
+The planned durable filesystem identity and optional configuration from which a session can be created. A Git repository and its worktrees would share one project; a non-Git directory could also be a project. Project definitions and persistence are not implemented: current sessions and workspaces are live only.
 
 ### Session
 
@@ -52,7 +50,7 @@ A placement and viewport for one terminal within a tab layout. Moving or rearran
 
 ### Terminal
 
-The stable, process-bearing resource behind a pane. A terminal owns the pseudoterminal, child process, terminal state, scrollback, current directory, title, and activity observations. Terminal identity survives pane movement and client detachment.
+The stable, process-bearing resource behind a pane. A terminal owns the pseudoterminal, child process, terminal state, scrollback, current directory, and activity observations. Terminal identity survives pane movement and client detachment. Pane and terminal titles are not implemented.
 
 ### Layout
 
@@ -88,27 +86,27 @@ Attaching connects a client to the live multiplexer. Detaching removes that clie
 
 Removing a live resource and, where applicable, terminating its process. Closure cascades upward when a parent becomes empty: the last pane closes its tab, the last tab closes its workspace, the last workspace closes its session, and the last session closes Fut.
 
-### Project definition
+### Project definition (planned)
 
 The durable declarative configuration associated with a project. It describes how a new session or workspace should initially be created. It is a creation recipe, not a continuously reconciled desired state.
 
-### Workspace recipe
+### Workspace recipe (planned)
 
 The portion of a project definition applied when a workspace is first created. It may declare initial tabs, pane layouts, commands, environment, and working directories. The same recipe can initialize the main checkout and newly discovered worktrees.
 
-### Project trust
+### Project trust (planned)
 
 The user's approval for a project's executable configuration. Reading safe metadata does not imply permission to run project-provided commands, hooks, or plugins.
 
 ### Activity
 
-Current work state associated with a terminal, such as idle, working, blocked, or unknown. Activity can be reported by an integration or inferred from process and terminal evidence.
+Current semantic work state associated with a terminal: idle, working, or blocked. It is reported explicitly by an integration or `fut terminal report`; process and terminal inference are planned.
 
 Activity describes a terminal; it is not itself a pane, tab, workspace, session, or separate navigation area.
 
 ### Attention event
 
-A noteworthy transition, such as an agent completing work or becoming blocked. Attention is event-based rather than a permanent activity state.
+A noteworthy explicit transition: an agent becoming blocked or completing work. Attention is event-based rather than a permanent activity state.
 
 ### Seen
 
@@ -120,7 +118,7 @@ The presentation of an idle terminal with an unseen completion event. Done is de
 
 ### Status rollup
 
-The derived summary shown on a tab, workspace, or session from the activity and attention of its descendants. Rollups make background work visible in the normal project tree.
+The client-derived summary shown on tabs, workspaces, and navigator rows from descendant activity and attention. Rollups make background work visible in the normal project tree.
 
 ### Presentation token
 
