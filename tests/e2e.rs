@@ -2170,8 +2170,7 @@ async fn public_pane_new_rejections_are_pre_spawn_and_atomic() {
 }
 
 #[tokio::test]
-async fn scrollback_is_attachment_local_survives_output_and_keyboard_returns_only_focus_to_bottom()
-{
+async fn scrollback_is_attachment_local_survives_output_and_paste_returns_only_focus_to_bottom() {
     let mut harness = Harness::start(
         "i=0; while [ $i -le 40 ]; do printf 'HIST_%02d\\r\\n' \"$i\"; i=$((i + 1)); done; while IFS= read -r line; do printf 'BOTTOM_%s\\r\\n' \"$line\"; done",
     )
@@ -2248,8 +2247,8 @@ async fn scrollback_is_attachment_local_survives_output_and_keyboard_returns_onl
 
     send(
         &mut client_a,
-        ClientMessage::Input {
-            bytes: b"NEW\n".to_vec(),
+        ClientMessage::Paste {
+            text: "NEW\n".into(),
         },
     )
     .await;
@@ -5337,6 +5336,86 @@ async fn public_command_bar_filters_labels_actions_and_matches_direct_dispatch()
 }
 
 #[tokio::test]
+async fn public_client_paste_is_mode_aware_focused_literal_and_not_a_fut_prefix() {
+    let harness = Harness::start("while :; do sleep 1; done").await;
+    let snapshot = harness.resources().await;
+    let tab_id = snapshot.sessions[0].workspaces[0].tabs[0].id;
+    let capture_a = harness.root.path().join("paste-a.bin");
+    let capture_b = harness.root.path().join("paste-b.bin");
+    let evaluated = harness.root.path().join("paste-was-evaluated");
+    let payload = format!("alpha 雪\n\x02d; touch '{}'", evaluated.display());
+    let expected = [b"\x1b[200~".as_slice(), payload.as_bytes(), b"\x1b[201~"].concat();
+    let capture_script = |name: &str, path: &std::path::Path| {
+        format!(
+            ": > '{}'; stty raw -echo; printf '\\033[?2004hPUBLIC_{name}_READY\\r\\n'; dd bs=1 count={} of='{}' 2>/dev/null; printf '\\033[?2004lPUBLIC_{name}_CAPTURED\\r\\n'; while :; do sleep 1; done",
+            path.display(),
+            expected.len(),
+            path.display()
+        )
+    };
+    let create = |script: String| ClientMessage::CreatePane {
+        tab_id,
+        cwd: None,
+        program: Some("/bin/sh".into()),
+        argv: vec!["-c".into(), script],
+    };
+    let ServerMessage::PaneCreated { selected: pane_a } = harness
+        .control_command(create(capture_script("A", &capture_a)))
+        .await
+    else {
+        panic!("failed to create focused paste pane")
+    };
+    let ServerMessage::PaneCreated { selected: pane_b } = harness
+        .control_command(create(capture_script("B", &capture_b)))
+        .await
+    else {
+        panic!("failed to create unfocused paste pane")
+    };
+
+    let mut command = Command::new("/usr/bin/script");
+    command
+        .env_clear()
+        .env("HOME", harness.root.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", harness.root.path().join("runtime"))
+        .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+        .env("TERM", "xterm-256color")
+        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .arg(format!(
+            "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {}",
+            env!("CARGO_BIN_EXE_fut"),
+            harness.socket.display(),
+            pane_a.pane_id,
+        ));
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("PUBLIC_A_READY").await;
+    client.wait_for("PUBLIC_B_READY").await;
+
+    client.send(
+        [b"\x1b[200~".as_slice(), payload.as_bytes(), b"\x1b[201~"]
+            .concat()
+            .as_slice(),
+    );
+    client.wait_for("PUBLIC_A_CAPTURED").await;
+
+    assert_eq!(fs::read(&capture_a).unwrap(), expected);
+    assert!(
+        fs::read(&capture_b).unwrap().is_empty(),
+        "paste reached the unfocused terminal"
+    );
+    assert!(
+        !evaluated.exists(),
+        "paste content was evaluated by a shell"
+    );
+    assert!(process_alive(pane_a.child_pid));
+    assert!(process_alive(pane_b.child_pid));
+
+    client.send(b"\x02d");
+    client.wait_success().await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn command_bar_create_failure_releases_input_to_the_original_terminal() {
     let harness = Harness::start_with_shell(
         "printf 'CREATE_FAILURE_READY\\r\\n'; while IFS= read -r line; do [ \"$line\" = after ] && printf 'CREATE_FAILURE_RECOVERED\\r\\n'; done",
@@ -5578,7 +5657,10 @@ async fn public_doctor_probes_a_running_daemon_without_mutating_resources() {
         .find(|check| check["id"] == "protocol")
         .unwrap();
     assert_eq!(protocol["status"], "ok");
-    assert_eq!(protocol["details"]["client_protocol"], 1);
+    assert_eq!(
+        protocol["details"]["client_protocol"],
+        serde_json::json!(PROTOCOL_VERSION)
+    );
     let after = harness.resources().await;
     assert_eq!(after, before);
     harness.shutdown().await;
@@ -6196,7 +6278,7 @@ fn protocol_0_daemon_rejects_current_client_and_accepts_shutdown() {
     let current_error = String::from_utf8_lossy(&current.stderr);
     assert!(current_error.contains("uses protocol 0"), "{current_error}");
     assert!(
-        current_error.contains("requires protocol 1"),
+        current_error.contains(&format!("requires protocol {PROTOCOL_VERSION}")),
         "{current_error}"
     );
     assert!(socket.exists());

@@ -29,7 +29,7 @@ Doctor reports:
 - a bounded Fut protocol handshake when a safe socket exists;
 - the configured icon preset and a visual glyph probe.
 
-Protocol `1`, planned for Fut 0.2, requires an exact client/daemon match. A successful handshake reports a compatible protocol-`1` daemon; any other protocol version is incompatible.
+The current development protocol is `2` and requires an exact client/daemon match. A successful handshake reports a compatible protocol-`2` daemon; any other protocol version is incompatible.
 
 ## Nerd Fonts
 

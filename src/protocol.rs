@@ -18,8 +18,10 @@ use crate::{
 
 /// Protocol version used by released Fut 0.1 builds.
 pub const PROTOCOL_VERSION_0_1: u16 = 0;
+/// Protocol used by unreleased development builds before mode-aware paste.
+pub(crate) const PROTOCOL_VERSION_PREVIOUS_DEV: u16 = 1;
 /// Current clients and daemons require an exact protocol match.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 /// Enough for 50,000 individually styled JSON cells while remaining a firm
 /// pre-allocation bound for the length-delimited transport.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
@@ -46,6 +48,7 @@ pub enum ClientMode {
 #[serde(rename_all = "snake_case")]
 pub enum AcknowledgedCommand {
     Input,
+    Paste,
     Resize,
     ReportAgent,
     CloseTarget,
@@ -109,6 +112,9 @@ pub enum ClientMessage {
     },
     Input {
         bytes: Vec<u8>,
+    },
+    Paste {
+        text: String,
     },
     /// Fire-and-forget; its envelope must not carry a request ID.
     MouseWheel {
@@ -336,6 +342,18 @@ mod tests {
     }
 
     #[test]
+    fn typed_unicode_paste_round_trips() {
+        let message = ClientMessage::Paste {
+            text: "first λ 雪\nsecond\0\x1b[201~".into(),
+        };
+
+        assert_eq!(
+            decode_payload::<ClientMessage>(&encode_payload(&message).unwrap()).unwrap(),
+            message
+        );
+    }
+
+    #[test]
     fn payload_rejects_empty_oversized_invalid_and_trailing_data() {
         assert!(matches!(
             decode_payload::<ClientMessage>(&[]),
@@ -531,7 +549,8 @@ mod tests {
             switched
         );
         assert_eq!(PROTOCOL_VERSION_0_1, 0);
-        assert_eq!(PROTOCOL_VERSION, 1);
+        assert_eq!(PROTOCOL_VERSION_PREVIOUS_DEV, 1);
+        assert_eq!(PROTOCOL_VERSION, 2);
     }
 
     #[test]

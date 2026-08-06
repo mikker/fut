@@ -90,7 +90,7 @@ A workspace is a logical user context and collection of tabs. Its root supplies 
 
 ## Automation and interaction
 
-Protocol `1` requires an exact match between clients and daemons and is planned for Fut 0.2. After upgrading from Fut 0.1, `fut daemon shutdown` can still stop its protocol-`0` daemon; otherwise stop the running daemon before retrying. Global `--json` is available only for noninteractive control commands. Successful output has a versioned envelope and dotted command name:
+The current development protocol is `2` and requires an exact match between clients and daemons. After upgrading from Fut 0.1, `fut daemon shutdown` can still stop its protocol-`0` daemon; otherwise stop the running daemon before retrying. Global `--json` is available only for noninteractive control commands. Successful output has a versioned envelope and dotted command name:
 
 ```json
 {"version":1,"command":"workspace.rename","result":{"workspace_id":"…","name":"api"}}

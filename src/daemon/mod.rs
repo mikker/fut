@@ -1234,38 +1234,21 @@ async fn handle_connection(
                 }
                 match envelope.message {
                     ClientMessage::Input { bytes } => {
-                        let viewport_before_input = attachment.focused_viewport_state();
-                        let reset_result = attachment.return_focused_to_bottom().await;
-                        let input_result = attachment.focused_terminal().input(bytes).await;
-                        let input_succeeded = input_result.is_ok();
-                        attachment.finish_focused_input(viewport_before_input, input_succeeded);
-
-                        match (input_succeeded, reset_result) {
-                            (true, Ok(Some(screen))) => {
-                                send(
-                                    &mut framed,
-                                    None,
-                                    ServerMessage::Snapshot {
-                                        terminal_id: attachment.focused.selected.terminal_id,
-                                        screen,
-                                    },
-                                ).await?;
-                            }
-                            (true, Ok(None)) | (false, Ok(_)) => {}
-                            (_, Err(error)) => {
-                                tracing::warn!(
-                                    %error,
-                                    operation = "reset historical viewport before input",
-                                    "viewport reset failed during terminal input"
-                                );
-                            }
-                        }
-                        command_response(
+                        focused_input_response(
                             &mut framed,
+                            &mut attachment,
                             envelope.request_id,
                             AcknowledgedCommand::Input,
-                            input_result,
-                            UiEventPolicy::Input,
+                            FocusedInput::Bytes(bytes),
+                        ).await?;
+                    }
+                    ClientMessage::Paste { text } => {
+                        focused_input_response(
+                            &mut framed,
+                            &mut attachment,
+                            envelope.request_id,
+                            AcknowledgedCommand::Paste,
+                            FocusedInput::Paste(text),
                         ).await?;
                     }
                     ClientMessage::MouseWheel { terminal_id, event } => {
@@ -1975,13 +1958,14 @@ async fn control_loop(
             ClientMessage::MouseWheel { .. } | ClientMessage::ResetViewport { .. } => {}
             ClientMessage::CreateWorkspace { .. }
             | ClientMessage::Input { .. }
+            | ClientMessage::Paste { .. }
             | ClientMessage::Resize { .. }
             | ClientMessage::SelectTarget { .. } => {
                 send_error(
                     framed,
                     envelope.request_id,
                     "interactive_only",
-                    "workspace creation, input, resize, and target selection require an interactive connection",
+                    "workspace creation, input, paste, resize, and target selection require an interactive connection",
                 )
                 .await?
             }
@@ -3128,6 +3112,58 @@ async fn command_response(
         .await?;
     }
     Ok(())
+}
+
+enum FocusedInput {
+    Bytes(Vec<u8>),
+    Paste(String),
+}
+
+async fn focused_input_response(
+    framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    attachment: &mut Attachment,
+    request_id: Option<uuid::Uuid>,
+    command: AcknowledgedCommand,
+    input: FocusedInput,
+) -> Result<()> {
+    let viewport_before_input = attachment.focused_viewport_state();
+    let reset_result = attachment.return_focused_to_bottom().await;
+    let input_result = match input {
+        FocusedInput::Bytes(bytes) => attachment.focused_terminal().input(bytes).await,
+        FocusedInput::Paste(text) => attachment.focused_terminal().paste(text).await,
+    };
+    let input_succeeded = input_result.is_ok();
+    attachment.finish_focused_input(viewport_before_input, input_succeeded);
+
+    match (input_succeeded, reset_result) {
+        (true, Ok(Some(screen))) => {
+            send(
+                framed,
+                None,
+                ServerMessage::Snapshot {
+                    terminal_id: attachment.focused.selected.terminal_id,
+                    screen,
+                },
+            )
+            .await?;
+        }
+        (true, Ok(None)) | (false, Ok(_)) => {}
+        (_, Err(error)) => {
+            tracing::warn!(
+                %error,
+                operation = "reset historical viewport before terminal input",
+                "viewport reset failed during terminal input"
+            );
+        }
+    }
+    command_response(
+        framed,
+        request_id,
+        command,
+        input_result,
+        UiEventPolicy::Input,
+    )
+    .await
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

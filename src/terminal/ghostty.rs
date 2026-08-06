@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use libghostty_vt::{
-    RenderState, Terminal, TerminalOptions, key, mouse,
+    RenderState, Terminal, TerminalOptions, key, mouse, paste,
     render::{CellIterator, RowIterator},
     screen::CellContentTag,
     style::{StyleColor, Underline},
@@ -143,6 +143,27 @@ impl GhosttyTerminal {
         self.terminal.scroll_viewport(ScrollViewport::Delta(delta));
         self.snapshot_viewport_and_restore_bottom()
             .map(MouseWheelOutcome::Scrolled)
+    }
+
+    pub(super) fn paste(&mut self, text: String) -> Result<()> {
+        let mut data = text.into_bytes();
+        let capacity = data
+            .len()
+            .checked_add(12)
+            .context("sizing encoded terminal paste")?;
+        let mut response = vec![0; capacity];
+        let bracketed = self.terminal.mode(Mode::BRACKETED_PASTE)?;
+        let written = paste::encode(&mut data, bracketed, &mut response)
+            .context("encoding terminal paste with Ghostty")?;
+
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("PTY writer lock poisoned"))?;
+        writer
+            .write_all(&response[..written])
+            .context("writing encoded paste to PTY")?;
+        writer.flush().context("flushing encoded paste to PTY")
     }
 
     fn snapshot_viewport_and_restore_bottom(&mut self) -> Result<ViewportSnapshot> {
@@ -522,6 +543,35 @@ mod tests {
         assert!(matches!(outcome, MouseWheelOutcome::Forwarded));
         assert!(output.lock().unwrap().is_empty());
         assert!(terminal.terminal.viewport_active().unwrap());
+    }
+
+    #[test]
+    fn paste_without_bracketed_mode_uses_ghostty_encoding_exactly() {
+        let (mut terminal, output) = recording_terminal(10, 4);
+
+        terminal
+            .paste("héllo 雪\nnext\r\t\0\x1b[201~\x07\x02\x7f".into())
+            .unwrap();
+
+        assert_eq!(
+            *output.lock().unwrap(),
+            b"h\xc3\xa9llo \xe9\x9b\xaa\rnext\r\t  [201~\x07\x02 ".to_vec()
+        );
+    }
+
+    #[test]
+    fn paste_with_bracketed_mode_uses_ghostty_encoding_exactly() {
+        let (mut terminal, output) = recording_terminal(10, 4);
+        terminal.feed(b"\x1b[?2004h").unwrap().unwrap();
+
+        terminal
+            .paste("héllo 雪\nnext\r\t\0\x1b[201~\x07\x02\x7f".into())
+            .unwrap();
+
+        assert_eq!(
+            *output.lock().unwrap(),
+            b"\x1b[200~h\xc3\xa9llo \xe9\x9b\xaa\nnext\r\t  [201~\x07\x02 \x1b[201~".to_vec()
+        );
     }
 
     #[test]

@@ -782,7 +782,9 @@ async fn run(
                             PrefixAction::Send(bytes) => send(framed, ClientMessage::Input { bytes }).await?,
                         }
                     },
-                    Event::Paste(text) if surface.is_none() => send(framed, ClientMessage::Input { bytes: text.into_bytes() }).await?,
+                    Event::Paste(text) if surface.is_none() => {
+                        send(framed, ClientMessage::Paste { text }).await?
+                    }
                     Event::Resize(columns, rows) if columns > 0 && rows > 0 => {
                         send(
                             framed,

@@ -4,8 +4,9 @@
 
 - Added agent activity indicators, per-client completion notifications, waiting-terminal navigation, and Pi integration.
 - Added mouse-wheel scrollback, pane click focus, and application mouse-wheel forwarding.
+- Added mode-aware terminal paste with bracketed-paste handling and Ghostty control-byte sanitization.
 - Fixed input loss under terminal queue pressure and stale mouse or viewport events disconnecting clients during pane transitions.
-- Added exact protocol-1 compatibility checks, with shutdown support for Fut 0.1 daemons.
+- Added exact protocol compatibility checks, with shutdown support for Fut 0.1 and prior development daemons.
 
 ## 0.1
 

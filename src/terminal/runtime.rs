@@ -2,7 +2,11 @@ use std::{
     collections::HashMap,
     io::{Read, Write},
     path::PathBuf,
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     thread,
     time::Duration,
 };
@@ -78,7 +82,11 @@ impl TerminalHandle {
     }
 
     pub async fn input(&self, bytes: Vec<u8>) -> Result<(), CommandError> {
-        send_input_with_backpressure(&self.commands, bytes).await
+        send_with_backpressure(&self.commands, RuntimeMessage::Input(bytes)).await
+    }
+
+    pub async fn paste(&self, text: String) -> Result<(), CommandError> {
+        send_paste_with_backpressure(&self.commands, text).await
     }
 
     pub async fn resize(&self, size: TerminalSize) -> Result<(), CommandError> {
@@ -174,18 +182,31 @@ impl TerminalHandle {
     }
 }
 
-async fn send_input_with_backpressure(
+async fn send_paste_with_backpressure(
     commands: &async_mpsc::Sender<RuntimeMessage>,
-    bytes: Vec<u8>,
+    text: String,
+) -> Result<(), CommandError> {
+    let (completion, completed) = oneshot::channel();
+    send_with_backpressure(commands, RuntimeMessage::Paste { text, completion }).await?;
+    completed.await.unwrap_or(Err(CommandError::Stopped))
+}
+
+async fn send_with_backpressure(
+    commands: &async_mpsc::Sender<RuntimeMessage>,
+    message: RuntimeMessage,
 ) -> Result<(), CommandError> {
     commands
-        .send(RuntimeMessage::Input(bytes))
+        .send(message)
         .await
         .map_err(|_| CommandError::Stopped)
 }
 
 enum RuntimeMessage {
     Input(Vec<u8>),
+    Paste {
+        text: String,
+        completion: oneshot::Sender<Result<(), CommandError>>,
+    },
     Resize(TerminalSize),
     MouseWheel {
         event: MouseWheelEvent,
@@ -209,9 +230,47 @@ enum OutputMessage {
     },
 }
 
+struct OutputProducer {
+    sender: mpsc::SyncSender<OutputMessage>,
+    produced: Arc<AtomicU64>,
+}
+
+impl OutputProducer {
+    fn send(&self, message: OutputMessage) -> Result<(), mpsc::SendError<OutputMessage>> {
+        // Publish the sequence before the bounded send can block. An acquire
+        // snapshot can therefore include this message even while it is still
+        // waiting for the runtime to free a queue slot.
+        self.produced
+            .fetch_update(Ordering::Release, Ordering::Relaxed, |produced| {
+                produced.checked_add(1)
+            })
+            .expect("PTY output sequence overflow");
+        self.sender.send(message)
+    }
+}
+
+struct OutputQueue {
+    receiver: mpsc::Receiver<OutputMessage>,
+    produced: Arc<AtomicU64>,
+    consumed: u64,
+}
+
+impl OutputQueue {
+    fn barrier_target(&self) -> u64 {
+        self.produced.load(Ordering::Acquire)
+    }
+
+    fn record_consumed(&mut self) {
+        self.consumed = self
+            .consumed
+            .checked_add(1)
+            .expect("PTY output consumption sequence overflow");
+    }
+}
+
 struct RuntimeQueues {
     control: async_mpsc::Receiver<RuntimeMessage>,
-    output: mpsc::Receiver<OutputMessage>,
+    output: OutputQueue,
 }
 
 struct RuntimePublishers<'a> {
@@ -242,7 +301,7 @@ pub fn spawn_terminal(spec: SpawnSpec) -> Result<TerminalHandle> {
     let reader = pair.master.try_clone_reader()?;
     let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
     let (commands, receiver) = async_mpsc::channel(QUEUE_CAPACITY);
-    let (output, output_receiver) = mpsc::sync_channel(OUTPUT_QUEUE_CAPACITY);
+    let (output, output_queue) = output_queue();
     let (events, _) = broadcast::channel(16);
     let (lifecycle, _) = watch::channel(TerminalLifecycle::Running);
     let id = spec.id;
@@ -285,7 +344,7 @@ pub fn spawn_terminal(spec: SpawnSpec) -> Result<TerminalHandle> {
             run(
                 RuntimeQueues {
                     control: receiver,
-                    output: output_receiver,
+                    output: output_queue,
                 },
                 RuntimePublishers {
                     snapshots: &runtime_snapshots,
@@ -371,6 +430,16 @@ fn run(
                         send_error(publishers.events, error);
                     }
                 }
+                RuntimeMessage::Paste { text, completion } => {
+                    let result = paste_after_output_barrier(
+                        &mut queues.output,
+                        terminal,
+                        &publishers,
+                        &mut reader_complete,
+                        text,
+                    );
+                    let _ = completion.send(result);
+                }
                 RuntimeMessage::Resize(size) => {
                     if let Err(error) = size
                         .validate()
@@ -421,7 +490,7 @@ fn run(
                         Ok(status) => {
                             let code = Some(status.exit_code() as i32);
                             drain_output_until(
-                                &queues.output,
+                                &mut queues.output,
                                 terminal,
                                 &publishers,
                                 Duration::from_millis(100),
@@ -434,7 +503,7 @@ fn run(
                         Err(error) => {
                             send_error(publishers.events, anyhow!(error.to_string()));
                             drain_output_until(
-                                &queues.output,
+                                &mut queues.output,
                                 terminal,
                                 &publishers,
                                 Duration::from_millis(100),
@@ -454,27 +523,16 @@ fn run(
         if reader_complete {
             thread::sleep(Duration::from_millis(20));
         } else {
-            match queues.output.recv_timeout(Duration::from_millis(20)) {
-                Ok(OutputMessage::Bytes(bytes)) => publish_optional(
-                    terminal.feed(&bytes),
-                    publishers.snapshots,
-                    publishers.events,
-                ),
-                Ok(OutputMessage::ReaderError {
-                    message,
-                    raw_os_error,
-                }) => {
-                    reader_complete = true;
-                    if raw_os_error != Some(libc::EIO) {
-                        let _ = publishers.events.send(TerminalEvent::Error { message });
-                    }
-                    publish_optional(
-                        terminal.finish_synchronized_output(),
-                        publishers.snapshots,
-                        publishers.events,
-                    );
+            match queues
+                .output
+                .receiver
+                .recv_timeout(Duration::from_millis(20))
+            {
+                Ok(message) => {
+                    reader_complete =
+                        consume_output_message(&mut queues.output, message, terminal, &publishers);
                 }
-                Ok(OutputMessage::ReaderEof) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
                     reader_complete = true;
                     publish_optional(
                         terminal.finish_synchronized_output(),
@@ -508,30 +566,107 @@ fn run(
     }
 }
 
+fn paste_after_output_barrier(
+    output: &mut OutputQueue,
+    terminal: &mut GhosttyTerminal,
+    publishers: &RuntimePublishers<'_>,
+    reader_complete: &mut bool,
+    text: String,
+) -> Result<(), CommandError> {
+    if !*reader_complete {
+        let target = output.barrier_target();
+        while output.consumed < target {
+            match output.receiver.recv() {
+                Ok(message) => {
+                    if consume_output_message(output, message, terminal, publishers) {
+                        *reader_complete = true;
+                    }
+                }
+                Err(_) => {
+                    // A failed producer send is only observable here as a
+                    // disconnected queue. Stop waiting rather than hanging on
+                    // a sequence for which no message can arrive.
+                    *reader_complete = true;
+                    publish_optional(
+                        terminal.finish_synchronized_output(),
+                        publishers.snapshots,
+                        publishers.events,
+                    );
+                    break;
+                }
+            }
+        }
+    }
+    terminal
+        .paste(text)
+        .map_err(|error| CommandError::Emulator(error.to_string()))
+}
+
+fn consume_output_message(
+    output: &mut OutputQueue,
+    message: OutputMessage,
+    terminal: &mut GhosttyTerminal,
+    publishers: &RuntimePublishers<'_>,
+) -> bool {
+    let reader_complete = process_output_message(message, terminal, publishers);
+    output.record_consumed();
+    reader_complete
+}
+
+fn process_output_message(
+    message: OutputMessage,
+    terminal: &mut GhosttyTerminal,
+    publishers: &RuntimePublishers<'_>,
+) -> bool {
+    match message {
+        OutputMessage::Bytes(bytes) => {
+            publish_optional(
+                terminal.feed(&bytes),
+                publishers.snapshots,
+                publishers.events,
+            );
+            false
+        }
+        OutputMessage::ReaderError {
+            message,
+            raw_os_error,
+        } => {
+            if raw_os_error != Some(libc::EIO) {
+                let _ = publishers.events.send(TerminalEvent::Error { message });
+            }
+            publish_optional(
+                terminal.finish_synchronized_output(),
+                publishers.snapshots,
+                publishers.events,
+            );
+            true
+        }
+        OutputMessage::ReaderEof => {
+            publish_optional(
+                terminal.finish_synchronized_output(),
+                publishers.snapshots,
+                publishers.events,
+            );
+            true
+        }
+    }
+}
+
 fn drain_output_until(
-    output: &mpsc::Receiver<OutputMessage>,
+    output: &mut OutputQueue,
     terminal: &mut GhosttyTerminal,
     publishers: &RuntimePublishers<'_>,
     timeout: Duration,
 ) {
     let deadline = std::time::Instant::now() + timeout;
     while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
-        match output.recv_timeout(remaining) {
-            Ok(OutputMessage::Bytes(bytes)) => publish_optional(
-                terminal.feed(&bytes),
-                publishers.snapshots,
-                publishers.events,
-            ),
-            Ok(OutputMessage::ReaderEof) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Ok(OutputMessage::ReaderError {
-                message,
-                raw_os_error,
-            }) => {
-                if raw_os_error != Some(libc::EIO) {
-                    let _ = publishers.events.send(TerminalEvent::Error { message });
+        match output.receiver.recv_timeout(remaining) {
+            Ok(message) => {
+                if consume_output_message(output, message, terminal, publishers) {
+                    break;
                 }
-                break;
             }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => break,
         }
     }
@@ -577,7 +712,23 @@ fn acknowledge_pending_closes(receiver: &mut async_mpsc::Receiver<RuntimeMessage
     }
 }
 
-fn read_pty(mut reader: Box<dyn Read + Send>, output: mpsc::SyncSender<OutputMessage>) {
+fn output_queue() -> (OutputProducer, OutputQueue) {
+    let (sender, receiver) = mpsc::sync_channel(OUTPUT_QUEUE_CAPACITY);
+    let produced = Arc::new(AtomicU64::new(0));
+    (
+        OutputProducer {
+            sender,
+            produced: Arc::clone(&produced),
+        },
+        OutputQueue {
+            receiver,
+            produced,
+            consumed: 0,
+        },
+    )
+}
+
+fn read_pty(mut reader: Box<dyn Read + Send>, output: OutputProducer) {
     // Keep parser work per runtime turn bounded so control latency does not
     // depend on how much output a single PTY read happened to return.
     let mut buffer = vec![0; 1024];
@@ -656,6 +807,45 @@ fn pty_size(size: TerminalSize) -> PtySize {
 mod tests {
     use super::*;
 
+    struct RecordingWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for RecordingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FailingWriter;
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "test PTY write failure",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn test_terminal(writer: Box<dyn Write + Send>) -> GhosttyTerminal {
+        GhosttyTerminal::new(
+            TerminalSize {
+                columns: 30,
+                rows: 5,
+            },
+            Arc::new(Mutex::new(writer)),
+        )
+        .unwrap()
+    }
+
     fn shell(script: &str, env: HashMap<String, String>) -> SpawnSpec {
         SpawnSpec {
             id: TerminalId::new(),
@@ -721,6 +911,202 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    async fn assert_runtime_paste(bracketed: bool, expected: &[u8]) {
+        let temporary = tempfile::tempdir().unwrap();
+        let capture = temporary.path().join("paste.bin");
+        let enable = if bracketed { "\\033[?2004h" } else { "" };
+        let script = format!(
+            "stty raw -echo; printf '{enable}PASTE_READY\\r\\n'; dd bs=1 count={} of='{}' 2>/dev/null",
+            expected.len(),
+            capture.display()
+        );
+        let handle = spawn_terminal(shell(&script, HashMap::new())).unwrap();
+        let mut snapshots = handle.subscribe_snapshots();
+        wait_for_text(&mut snapshots, "PASTE_READY").await;
+
+        handle
+            .paste("héllo 雪\nnext\0\x1b[201~".into())
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if std::fs::read(&capture).is_ok_and(|bytes| bytes.len() == expected.len()) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(capture).unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn runtime_paste_uses_current_child_terminal_mode() {
+        assert_runtime_paste(false, b"h\xc3\xa9llo \xe9\x9b\xaa\rnext  [201~").await;
+        assert_runtime_paste(
+            true,
+            b"\x1b[200~h\xc3\xa9llo \xe9\x9b\xaa\nnext  [201~\x1b[201~",
+        )
+        .await;
+    }
+
+    #[test]
+    fn queued_mode_transitions_are_processed_before_each_paste() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut terminal = test_terminal(Box::new(RecordingWriter(Arc::clone(&captured))));
+        let initial = terminal.snapshot().unwrap();
+        let (snapshots, _) = watch::channel(initial);
+        let (events, mut event_receiver) = broadcast::channel(4);
+        let (lifecycle, _) = watch::channel(TerminalLifecycle::Running);
+        let publishers = RuntimePublishers {
+            snapshots: &snapshots,
+            events: &events,
+            lifecycle: &lifecycle,
+        };
+        let (output, mut queued_output) = output_queue();
+        let mut reader_complete = false;
+
+        output
+            .send(OutputMessage::Bytes(b"\x1b[?2004h".to_vec()))
+            .unwrap();
+        paste_after_output_barrier(
+            &mut queued_output,
+            &mut terminal,
+            &publishers,
+            &mut reader_complete,
+            "enabled\n".into(),
+        )
+        .unwrap();
+
+        output
+            .send(OutputMessage::Bytes(b"\x1b[?2004l".to_vec()))
+            .unwrap();
+        paste_after_output_barrier(
+            &mut queued_output,
+            &mut terminal,
+            &publishers,
+            &mut reader_complete,
+            "disabled\n".into(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            *captured.lock().unwrap(),
+            b"\x1b[200~enabled\n\x1b[201~disabled\r".to_vec()
+        );
+        assert!(!reader_complete);
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn paste_barrier_includes_blocked_seventeenth_output_and_stops_at_its_target() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut terminal = test_terminal(Box::new(RecordingWriter(Arc::clone(&captured))));
+        let initial = terminal.snapshot().unwrap();
+        let (snapshots, _) = watch::channel(initial);
+        let (events, _) = broadcast::channel(4);
+        let (lifecycle, _) = watch::channel(TerminalLifecycle::Running);
+        let publishers = RuntimePublishers {
+            snapshots: &snapshots,
+            events: &events,
+            lifecycle: &lifecycle,
+        };
+        let (output, mut queued_output) = output_queue();
+        let mut reader_complete = false;
+
+        for _ in 0..OUTPUT_QUEUE_CAPACITY {
+            output.send(OutputMessage::Bytes(b"x".to_vec())).unwrap();
+        }
+
+        let producer = thread::spawn(move || {
+            output
+                .send(OutputMessage::Bytes(b"\x1b[?2004h".to_vec()))
+                .unwrap();
+            output
+                .send(OutputMessage::Bytes(b"\x1b[?2004l".to_vec()))
+                .unwrap();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while queued_output.barrier_target() != 17 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "seventeenth output was not produced"
+            );
+            thread::yield_now();
+        }
+
+        paste_after_output_barrier(
+            &mut queued_output,
+            &mut terminal,
+            &publishers,
+            &mut reader_complete,
+            "barrier\n".into(),
+        )
+        .unwrap();
+        producer.join().unwrap();
+
+        assert_eq!(queued_output.consumed, 17);
+        assert_eq!(queued_output.barrier_target(), 18);
+        assert_eq!(
+            *captured.lock().unwrap(),
+            b"\x1b[200~barrier\n\x1b[201~".to_vec()
+        );
+
+        paste_after_output_barrier(
+            &mut queued_output,
+            &mut terminal,
+            &publishers,
+            &mut reader_complete,
+            "after\n".into(),
+        )
+        .unwrap();
+        assert_eq!(queued_output.consumed, 18);
+        assert_eq!(
+            *captured.lock().unwrap(),
+            b"\x1b[200~barrier\n\x1b[201~after\r".to_vec()
+        );
+        assert!(!reader_complete);
+    }
+
+    #[test]
+    fn paste_write_failure_is_correlated_without_an_unsolicited_runtime_error() {
+        let mut terminal = test_terminal(Box::new(FailingWriter));
+        let initial = terminal.snapshot().unwrap();
+        let (snapshots, _) = watch::channel(initial);
+        let (events, mut event_receiver) = broadcast::channel(4);
+        let (lifecycle, _) = watch::channel(TerminalLifecycle::Running);
+        let publishers = RuntimePublishers {
+            snapshots: &snapshots,
+            events: &events,
+            lifecycle: &lifecycle,
+        };
+        let (_output, mut queued_output) = output_queue();
+        let mut reader_complete = false;
+
+        let error = paste_after_output_barrier(
+            &mut queued_output,
+            &mut terminal,
+            &publishers,
+            &mut reader_complete,
+            "paste".into(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CommandError::Emulator(message) if message.contains("writing encoded paste to PTY")
+        ));
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]
@@ -936,7 +1322,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn input_waits_for_bounded_queue_capacity_without_losing_bytes() {
+    async fn paste_waits_for_bounded_queue_capacity_and_runtime_completion() {
         let (commands, mut receiver) = async_mpsc::channel(1);
         commands
             .try_send(RuntimeMessage::Input(b"first".to_vec()))
@@ -944,7 +1330,7 @@ mod tests {
 
         let waiting = tokio::spawn({
             let commands = commands.clone();
-            async move { send_input_with_backpressure(&commands, b"second".to_vec()).await }
+            async move { send_paste_with_backpressure(&commands, "second λ".into()).await }
         });
         tokio::time::sleep(Duration::from_millis(25)).await;
         assert!(!waiting.is_finished());
@@ -953,11 +1339,22 @@ mod tests {
             panic!("queued command was not input")
         };
         assert_eq!(first, b"first");
-        waiting.await.unwrap().unwrap();
-        let RuntimeMessage::Input(second) = receiver.recv().await.unwrap() else {
-            panic!("backpressured command was not input")
+        let RuntimeMessage::Paste {
+            text: second,
+            completion,
+        } = receiver.recv().await.unwrap()
+        else {
+            panic!("backpressured command was not paste")
         };
-        assert_eq!(second, b"second");
+        assert_eq!(second, "second λ");
+        assert!(!waiting.is_finished());
+        completion
+            .send(Err(CommandError::Emulator("write failed".into())))
+            .unwrap();
+        assert!(matches!(
+            waiting.await.unwrap(),
+            Err(CommandError::Emulator(message)) if message == "write failed"
+        ));
     }
 
     #[tokio::test]
@@ -969,7 +1366,9 @@ mod tests {
 
         let waiting = tokio::spawn({
             let commands = commands.clone();
-            async move { send_input_with_backpressure(&commands, b"second".to_vec()).await }
+            async move {
+                send_with_backpressure(&commands, RuntimeMessage::Input(b"second".to_vec())).await
+            }
         });
         tokio::time::sleep(Duration::from_millis(25)).await;
         assert!(!waiting.is_finished());

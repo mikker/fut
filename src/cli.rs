@@ -25,7 +25,8 @@ use crate::{
     domain::{AgentReport, PaneId, SessionId, TabId, TerminalId, WorkspaceId},
     protocol::{
         AcknowledgedCommand, ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION,
-        PROTOCOL_VERSION_0_1, RenameSelector, ServerMessage, codec, decode_payload, encode_payload,
+        PROTOCOL_VERSION_0_1, PROTOCOL_VERSION_PREVIOUS_DEV, RenameSelector, ServerMessage, codec,
+        decode_payload, encode_payload,
     },
     resources::{ResourceSnapshot, SessionSelector, TargetSelector},
 };
@@ -897,7 +898,8 @@ async fn shutdown_control(socket: &std::path::Path) -> Result<ServerMessage> {
             },
             None => bail!(
                 "daemon at {} uses protocol {server}, but this Fut client can only shut down \
-                 protocol {PROTOCOL_VERSION} or Fut 0.1 protocol {PROTOCOL_VERSION_0_1}",
+                 current protocol {PROTOCOL_VERSION}, prior development protocol \
+                 {PROTOCOL_VERSION_PREVIOUS_DEV}, or Fut 0.1 protocol {PROTOCOL_VERSION_0_1}",
                 socket.display()
             ),
         },
@@ -905,7 +907,7 @@ async fn shutdown_control(socket: &std::path::Path) -> Result<ServerMessage> {
 }
 
 fn shutdown_downgrade_version(server: u16) -> Option<u16> {
-    (server == PROTOCOL_VERSION_0_1).then_some(PROTOCOL_VERSION_0_1)
+    matches!(server, PROTOCOL_VERSION_PREVIOUS_DEV | PROTOCOL_VERSION_0_1).then_some(server)
 }
 
 enum ControlAttempt {
@@ -1097,7 +1099,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_reconnects_with_the_0_1_daemon_protocol() {
+    async fn shutdown_reconnects_with_known_compatible_daemon_protocols() {
+        assert_shutdown_reconnects_with(PROTOCOL_VERSION_PREVIOUS_DEV).await;
+        assert_shutdown_reconnects_with(PROTOCOL_VERSION_0_1).await;
+    }
+
+    async fn assert_shutdown_reconnects_with(compatible_version: u16) {
         let temporary = tempfile::tempdir().unwrap();
         let socket = temporary.path().join("fut.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
@@ -1119,7 +1126,7 @@ mod tests {
                         request_id: first.request_id,
                         message: ServerMessage::IncompatibleProtocol {
                             client: PROTOCOL_VERSION,
-                            server: PROTOCOL_VERSION_0_1,
+                            server: compatible_version,
                         },
                     })
                     .unwrap(),
@@ -1135,16 +1142,16 @@ mod tests {
             assert!(matches!(
                 second.message,
                 ClientMessage::Hello {
-                    version: PROTOCOL_VERSION_0_1,
+                    version,
                     ..
-                }
+                } if version == compatible_version
             ));
             framed
                 .send(Bytes::from(
                     encode_payload(&Envelope {
                         request_id: second.request_id,
                         message: ServerMessage::Welcome {
-                            version: PROTOCOL_VERSION_0_1,
+                            version: compatible_version,
                             server_version: "old".into(),
                             selected: None,
                         },
@@ -1217,7 +1224,11 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_downgrade_is_restricted_to_fut_0_1() {
+    fn shutdown_downgrade_is_restricted_to_known_compatible_protocols() {
+        assert_eq!(
+            shutdown_downgrade_version(PROTOCOL_VERSION_PREVIOUS_DEV),
+            Some(PROTOCOL_VERSION_PREVIOUS_DEV)
+        );
         assert_eq!(
             shutdown_downgrade_version(PROTOCOL_VERSION_0_1),
             Some(PROTOCOL_VERSION_0_1)
