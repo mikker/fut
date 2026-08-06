@@ -17,7 +17,10 @@ use std::{
 
 use bytes::Bytes;
 use fut::{
-    domain::{PaneId, ScreenSnapshot, TabId, TerminalId, TerminalSize},
+    domain::{
+        AgentReport, AgentState, AttentionKind, PaneId, ScreenSnapshot, TabId, TerminalId,
+        TerminalSize,
+    },
     protocol::{
         ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, RenameSelector, SelectedTarget,
         ServerMessage, codec, decode_payload, encode_payload,
@@ -169,6 +172,10 @@ impl PtyChild {
 
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.output.lock().unwrap()).into_owned()
+    }
+
+    fn clear_output(&mut self) {
+        self.output.lock().unwrap().clear();
     }
 }
 
@@ -491,6 +498,66 @@ impl Drop for Harness {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn agent_reports_flow_from_scoped_cli_into_authoritative_snapshots() {
+    let harness = Harness::start("env > fut-env; while IFS= read -r line; do :; done").await;
+    let initial = harness.resources().await;
+    let session = &initial.sessions[0];
+    let workspace = &session.workspaces[0];
+    let tab = &workspace.tabs[0];
+    let pane = tab.panes[0];
+    let terminal_id = pane.terminal_id;
+    let env_path = harness.root.path().join("cwd/fut-env");
+    wait_for(DEADLINE, || {
+        fs::read_to_string(&env_path).is_ok_and(|contents| contents.contains("FUT_TERMINAL_ID="))
+    })
+    .await;
+    let child_env = fs::read_to_string(env_path).unwrap();
+    for expected in [
+        format!("FUT_SESSION_ID={}", session.id),
+        format!("FUT_WORKSPACE_ID={}", workspace.id),
+        format!("FUT_TAB_ID={}", tab.id),
+        format!("FUT_PANE_ID={}", pane.id),
+        format!("FUT_TERMINAL_ID={terminal_id}"),
+        format!("FUT_SOCKET={}", harness.socket.display()),
+    ] {
+        assert!(child_env.lines().any(|line| line == expected), "{expected}");
+    }
+
+    let working = harness
+        .cli()
+        .env("FUT_TERMINAL_ID", terminal_id.to_string())
+        .args(["terminal", "report", "working"])
+        .output()
+        .unwrap();
+    assert!(
+        working.status.success(),
+        "{}",
+        String::from_utf8_lossy(&working.stderr)
+    );
+    let snapshot = harness.resources().await;
+    assert_eq!(
+        snapshot.sessions[0].workspaces[0].tabs[0].panes[0]
+            .activity
+            .state,
+        AgentState::Working
+    );
+
+    let completed = harness
+        .cli()
+        .env("FUT_TERMINAL_ID", terminal_id.to_string())
+        .args(["terminal", "report", "completed"])
+        .output()
+        .unwrap();
+    assert!(completed.status.success());
+    let snapshot = harness.resources().await;
+    let activity = snapshot.sessions[0].workspaces[0].tabs[0].panes[0].activity;
+    assert_eq!(activity.state, AgentState::Idle);
+    assert_eq!(activity.attention.unwrap().kind, AttentionKind::Completed);
+
+    harness.shutdown().await;
 }
 
 #[tokio::test]
@@ -3467,6 +3534,96 @@ async fn public_client_navigator_switches_live_pty_and_preserves_terminal_isolat
     assert!(!snapshot_text(&screen_b).contains("PUBLIC_A_READY"));
     harness.detach(&mut raw_b).await;
     drop(raw_b);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn public_agent_activity_spins_lists_waiting_terminals_and_navigates_unread() {
+    let harness =
+        Harness::start("printf 'AGENT_A_READY\r\n'; while IFS= read -r line; do :; done").await;
+    let resources = harness.resources().await;
+    let a = resources.sessions[0].workspaces[0].tabs[0].panes[0];
+    let cwd_b = harness.root.path().join("agent-b");
+    fs::create_dir(&cwd_b).unwrap();
+    let ServerMessage::LocationOpened { selected: b, .. } = harness
+        .control_command(ClientMessage::OpenLocation {
+            name: Some("waiting-b".into()),
+            cwd: cwd_b,
+            program: Some("/bin/sh".into()),
+            argv: vec![
+                "-c".into(),
+                "printf 'WAITING_TERMINAL_B\\r\\n'; while IFS= read -r line; do :; done".into(),
+            ],
+        })
+        .await
+    else {
+        panic!("failed to create agent B")
+    };
+
+    let mut command = Command::new("/usr/bin/script");
+    command
+        .env_clear()
+        .env("HOME", harness.root.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", harness.root.path().join("runtime"))
+        .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+        .env("TERM", "xterm-256color")
+        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .arg(format!(
+            "stty rows 24 cols 80; exec '{}' --socket '{}' terminal attach {}",
+            env!("CARGO_BIN_EXE_fut"),
+            harness.socket.display(),
+            a.terminal_id
+        ));
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("AGENT_A").await;
+
+    assert_eq!(
+        harness
+            .control_command(ClientMessage::ReportAgent {
+                terminal_id: a.terminal_id,
+                report: AgentReport::Working,
+            })
+            .await,
+        ServerMessage::CommandCompleted {
+            command: fut::protocol::AcknowledgedCommand::ReportAgent,
+        }
+    );
+    client.wait_for("⠋").await;
+
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::ReportAgent {
+                terminal_id: b.terminal_id,
+                report: AgentReport::Completed,
+            })
+            .await,
+        ServerMessage::CommandCompleted { .. }
+    ));
+    client.wait_for("● 1").await;
+    client.send(b"\x02u");
+    client.wait_for("fut · terminals waiting").await;
+    client.wait_for("waiting-b").await;
+    client.send(b"\r");
+    client.wait_for("WAITING").await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    client.clear_output();
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::ReportAgent {
+                terminal_id: a.terminal_id,
+                report: AgentReport::Completed,
+            })
+            .await,
+        ServerMessage::CommandCompleted { .. }
+    ));
+    client.wait_for("● 1").await;
+    client.clear_output();
+    client.send(b"\x02.");
+    client.wait_for("AGENT_A").await;
+    client.send(b"\x02d");
+    client.wait_success().await;
     harness.shutdown().await;
 }
 

@@ -12,7 +12,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    domain::{PaneId, SessionId, TabId, TerminalId, WorkspaceId},
+    domain::{
+        AgentActivity, AgentAttention, AgentReport, AgentState, AttentionKind, PaneId, SessionId,
+        TabId, TerminalId, WorkspaceId,
+    },
     splits::{SplitDirection, SplitTree},
 };
 
@@ -141,6 +144,7 @@ pub struct PaneSnapshot {
     pub id: PaneId,
     pub terminal_id: TerminalId,
     pub closing: bool,
+    pub activity: AgentActivity,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -294,6 +298,7 @@ struct Pane {
     tab_id: TabId,
     terminal_id: TerminalId,
     closing: bool,
+    activity: AgentActivity,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -535,6 +540,44 @@ impl ResourceTree {
                 .map(|id| self.session_snapshot(*id))
                 .collect(),
         }
+    }
+
+    pub fn report_agent(
+        &mut self,
+        terminal_id: TerminalId,
+        report: AgentReport,
+        now_ms: u64,
+    ) -> Result<u64, ResourceError> {
+        let pane_id = *self
+            .terminals
+            .get(&terminal_id)
+            .ok_or(ResourceError::NotFound("terminal"))?;
+        self.revision += 1;
+        let revision = self.revision;
+        let activity = &mut self
+            .panes
+            .get_mut(&pane_id)
+            .ok_or_else(|| ResourceError::Invariant("terminal pane is missing".into()))?
+            .activity;
+        activity.state = match report {
+            AgentReport::Idle | AgentReport::Completed => AgentState::Idle,
+            AgentReport::Working => AgentState::Working,
+            AgentReport::Blocked => AgentState::Blocked,
+        };
+        activity.revision = revision;
+        activity.updated_at_ms = now_ms;
+        if let Some(kind) = match report {
+            AgentReport::Blocked => Some(AttentionKind::Blocked),
+            AgentReport::Completed => Some(AttentionKind::Completed),
+            AgentReport::Idle | AgentReport::Working => None,
+        } {
+            activity.attention = Some(AgentAttention {
+                revision,
+                kind,
+                occurred_at_ms: now_ms,
+            });
+        }
+        Ok(revision)
     }
 
     pub fn create_session(&mut self, path: InitialPath) -> Result<Mutation, ResourceError> {
@@ -1542,6 +1585,7 @@ impl ResourceTree {
                 tab_id,
                 terminal_id,
                 closing: false,
+                activity: AgentActivity::default(),
             },
         );
         self.terminals.insert(terminal_id, pane_id);
@@ -1607,6 +1651,7 @@ impl ResourceTree {
             id,
             terminal_id: p.terminal_id,
             closing: p.closing,
+            activity: p.activity,
         }
     }
     fn session_for_workspace(&self, workspace_id: WorkspaceId) -> &Session {
@@ -1816,6 +1861,42 @@ mod tests {
             pane_id: PaneId::new(),
             terminal_id: TerminalId::new(),
         }
+    }
+
+    #[test]
+    fn agent_reports_are_revisioned_and_completion_remains_bounded() {
+        let mut tree = ResourceTree::default();
+        let path = initial("agent", "/agent");
+        let terminal_id = path.terminal_id;
+        tree.create_session(path).unwrap();
+
+        let working_revision = tree
+            .report_agent(terminal_id, AgentReport::Working, 10)
+            .unwrap();
+        let working = tree.snapshot().sessions[0].workspaces[0].tabs[0].panes[0].activity;
+        assert_eq!(working.state, AgentState::Working);
+        assert_eq!(working.revision, working_revision);
+        assert_eq!(working.attention, None);
+
+        let completed_revision = tree
+            .report_agent(terminal_id, AgentReport::Completed, 20)
+            .unwrap();
+        let completed = tree.snapshot().sessions[0].workspaces[0].tabs[0].panes[0].activity;
+        assert_eq!(completed.state, AgentState::Idle);
+        assert_eq!(
+            completed.attention,
+            Some(AgentAttention {
+                revision: completed_revision,
+                kind: AttentionKind::Completed,
+                occurred_at_ms: 20,
+            })
+        );
+
+        tree.report_agent(terminal_id, AgentReport::Blocked, 30)
+            .unwrap();
+        let blocked = tree.snapshot().sessions[0].workspaces[0].tabs[0].panes[0].activity;
+        assert_eq!(blocked.state, AgentState::Blocked);
+        assert_eq!(blocked.attention.unwrap().kind, AttentionKind::Blocked);
     }
     fn assert_valid<T>(tree: &ResourceTree, result: &Result<T, ResourceError>) {
         tree.validate().unwrap();

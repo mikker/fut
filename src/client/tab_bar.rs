@@ -8,7 +8,9 @@ use crate::{
 };
 
 use super::config::UiConfig;
-use super::{chrome::render_tab_bar, navigation::NavigationHistory};
+use super::{
+    chrome::render_tab_bar, navigation::NavigationHistory, notifications::NotificationState,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TabItem {
@@ -140,16 +142,32 @@ impl TabBarState {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the active tab bar forwards the complete passive renderer context"
+    )]
     pub fn render(
         &self,
         snapshot: Option<&ResourceSnapshot>,
         focused: &SelectedTarget,
         zoomed: bool,
         ui: &UiConfig,
+        notifications: &NotificationState,
+        spinner_frame: usize,
         area: Rect,
         buffer: &mut Buffer,
     ) {
-        render_tab_bar(snapshot, focused, zoomed, self.selected, ui, area, buffer);
+        render_tab_bar(
+            snapshot,
+            focused,
+            zoomed,
+            self.selected,
+            notifications,
+            spinner_frame,
+            ui,
+            area,
+            buffer,
+        );
     }
 
     fn selectable(&self, id: TabId) -> bool {
@@ -264,6 +282,7 @@ mod tests {
                     id: first_pane,
                     terminal_id: first_terminal,
                     closing: false,
+                    activity: Default::default(),
                 }],
             },
             TabSnapshot {
@@ -275,6 +294,7 @@ mod tests {
                     id: second_pane,
                     terminal_id: second_terminal,
                     closing: false,
+                    activity: Default::default(),
                 }],
             },
         ];
@@ -350,6 +370,8 @@ mod tests {
             &focused,
             false,
             &UiConfig::default(),
+            &NotificationState::default(),
+            0,
             area,
             &mut buffer,
         );
@@ -371,6 +393,8 @@ mod tests {
             &focused,
             false,
             &UiConfig::default(),
+            &NotificationState::default(),
+            0,
             tiny,
             &mut tiny_buffer,
         );

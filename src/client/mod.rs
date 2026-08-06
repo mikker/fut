@@ -8,6 +8,7 @@ mod input;
 mod layout;
 mod navigation;
 mod navigator;
+mod notifications;
 mod presentation;
 mod rename;
 mod sidebar;
@@ -39,6 +40,7 @@ use layout::{
 };
 use navigation::NavigationHistory;
 use navigator::{NavigatorAction, NavigatorState};
+use notifications::{NotificationsAction, NotificationsDialog};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -67,6 +69,7 @@ use crate::{
 
 enum ClientSurface {
     Navigator(NavigatorState),
+    Notifications(NotificationsDialog),
     WorkspaceSidebar(WorkspaceSidebarState),
     TabBar(TabBarState),
     CommandBar(CommandBarState),
@@ -155,8 +158,11 @@ async fn run(
     let mut notice: Option<String> = None;
     let mut pending_focused_exit: Option<Option<i32>> = None;
     let mut force_draw = false;
+    let mut spinner_frame = 0usize;
     let mut redraw = time::interval(Duration::from_millis(16));
     redraw.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut spinner = time::interval(Duration::from_millis(100));
+    spinner.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     send_request(framed, Some(Uuid::new_v4()), ClientMessage::ListResources).await?;
     resize_view(framed, terminal.size()?.into(), &mut view, &resources, &ui).await?;
 
@@ -193,6 +199,7 @@ async fn run(
                                 snapshot,
                                 view.focused(),
                                 &workspace_history,
+                                resources.notifications(),
                             );
                             reconcile_resource_barriers(
                                 snapshot,
@@ -219,6 +226,7 @@ async fn run(
                                 snapshot,
                                 view.focused(),
                                 &workspace_history,
+                                resources.notifications(),
                             );
                             reconcile_resource_barriers(
                                 snapshot,
@@ -247,6 +255,8 @@ async fn run(
                         let focus_origin = focus.complete(request_id);
                         let workspace_selected = matches!(focus_origin, Some(FocusOrigin::Workspace));
                         let tab_selected = matches!(focus_origin, Some(FocusOrigin::Tab));
+                        let notification_selected =
+                            matches!(focus_origin, Some(FocusOrigin::Notification));
                         let observed_revision = resources.snapshot().map(|snapshot| snapshot.revision);
                         let workspace_created_selected = create_workspace.selected(
                             request_id,
@@ -289,6 +299,7 @@ async fn run(
                                 snapshot,
                                 view.focused(),
                                 &workspace_history,
+                                resources.notifications(),
                             );
                         }
                         if navigator_selected && view.focused().terminal_id == old_terminal {
@@ -305,6 +316,9 @@ async fn run(
                         }
                         if tab_selected {
                             surface = None;
+                            view.invalidate_drawn();
+                        }
+                        if notification_selected {
                             view.invalidate_drawn();
                         }
                         if workspace_created_selected || create_selected || split_selected {
@@ -413,6 +427,10 @@ async fn run(
                                     notice = Some(format!("session unavailable · {message}"));
                                     force_draw = true;
                                 }
+                                Some(FocusOrigin::Notification) => {
+                                    notice = Some(format!("notification unavailable · {message}"));
+                                    force_draw = true;
+                                }
                                 None => bail!("daemon error ({code}): {message}"),
                             }
                         }
@@ -453,6 +471,37 @@ async fn run(
                     Event::Paste(text) if rename.is_some() => {
                         rename.as_mut().expect("rename exists").paste(&text);
                         force_draw = true;
+                    }
+                    Event::Key(key) if matches!(surface.as_ref(), Some(ClientSurface::Notifications(_))) => {
+                        notice = None;
+                        let visible = terminal.size()?.height.saturating_sub(2) as usize;
+                        let action = match surface.as_mut().expect("notifications exist") {
+                            ClientSurface::Notifications(dialog) => dialog.key(key, visible),
+                            _ => unreachable!("surface guard ensures notifications"),
+                        };
+                        match action {
+                            NotificationsAction::Stay => force_draw = true,
+                            NotificationsAction::Close => {
+                                surface = None;
+                                view.invalidate_drawn();
+                                force_draw = true;
+                            }
+                            NotificationsAction::Select(pane_id) => {
+                                surface = None;
+                                view.invalidate_drawn();
+                                if let Some(request) = focus.begin(FocusOrigin::Notification) {
+                                    send_request(
+                                        framed,
+                                        Some(request),
+                                        ClientMessage::SelectTarget {
+                                            selector: TargetSelector::Pane(pane_id),
+                                            expected: None,
+                                        },
+                                    ).await?;
+                                }
+                                force_draw = true;
+                            }
+                        }
                     }
                     Event::Key(key) if matches!(surface.as_ref(), Some(ClientSurface::Navigator(_))) => {
                         notice = None;
@@ -683,7 +732,21 @@ async fn run(
                     _ => {}
                 }
             }
+            _ = spinner.tick(), if resources.has_working() => {
+                spinner_frame = spinner_frame.wrapping_add(1);
+                force_draw = true;
+            }
             _ = redraw.tick(), if force_draw || view.needs_draw() => {
+                let focused_terminal_id = view.focused().terminal_id;
+                let rendered_attention = matches!(
+                    surface.as_ref(),
+                    None
+                        | Some(ClientSurface::WorkspaceSidebar(_))
+                        | Some(ClientSurface::TabBar(_))
+                )
+                .then(|| resources.attention_revision(focused_terminal_id))
+                .flatten()
+                .filter(|_| rename.is_none() && notice.is_none());
                 io::stdout().sync_update(|_| {
                     terminal.draw(|frame| {
                         let area = frame.area();
@@ -706,6 +769,8 @@ async fn run(
                                     view.focused(),
                                     view.is_zoomed(),
                                     &ui,
+                                    resources.notifications(),
+                                    spinner_frame,
                                     tab_bar,
                                     frame.buffer_mut(),
                                 );
@@ -715,6 +780,8 @@ async fn run(
                                     view.focused(),
                                     view.is_zoomed(),
                                     None,
+                                    resources.notifications(),
+                                    spinner_frame,
                                     &ui,
                                     tab_bar,
                                     frame.buffer_mut(),
@@ -729,6 +796,7 @@ async fn run(
                                     sidebar_area,
                                     ui.workspace_sidebar.position,
                                     &ui,
+                                    spinner_frame,
                                     frame.buffer_mut(),
                                 );
                             }
@@ -739,6 +807,8 @@ async fn run(
                                 resources.snapshot(),
                                 view.focused(),
                                 &workspace_history,
+                                resources.notifications(),
+                                spinner_frame,
                                 sidebar_area,
                                 ui.workspace_sidebar.position,
                                 &ui,
@@ -747,7 +817,10 @@ async fn run(
                         }
                         match surface.as_mut() {
                             Some(ClientSurface::Navigator(nav)) => {
-                                nav.render(area, frame.buffer_mut());
+                                nav.render(area, spinner_frame, frame.buffer_mut());
+                            }
+                            Some(ClientSurface::Notifications(dialog)) => {
+                                dialog.render(area, frame.buffer_mut());
                             }
                             Some(ClientSurface::CommandBar(command_bar)) => {
                                 command_bar.render(layout.terminal, frame.buffer_mut());
@@ -772,7 +845,8 @@ async fn run(
                     })
                 })??;
                 view.mark_drawn();
-                force_draw = false;
+                force_draw = rendered_attention
+                    .is_some_and(|revision| resources.observe(focused_terminal_id, revision));
             }
         }
     }
@@ -784,16 +858,20 @@ fn refresh_surface_resources(
     snapshot: &crate::resources::ResourceSnapshot,
     focused: &SelectedTarget,
     workspace_history: &NavigationHistory,
+    notifications: &notifications::NotificationState,
 ) {
     match surface.as_mut() {
         Some(ClientSurface::Navigator(nav)) => {
-            nav.accept_resources(snapshot, focused);
+            nav.accept_resources_with_notifications(snapshot, focused, notifications);
         }
         Some(ClientSurface::WorkspaceSidebar(sidebar)) => {
-            sidebar.accept_resources(snapshot, focused, workspace_history);
+            sidebar.accept_resources(snapshot, focused, workspace_history, notifications);
         }
         Some(ClientSurface::TabBar(tab_bar)) => {
             tab_bar.accept_resources(snapshot, focused, workspace_history);
+        }
+        Some(ClientSurface::Notifications(dialog)) => {
+            dialog.accept_resources(snapshot, notifications);
         }
         Some(ClientSurface::CommandBar(_)) | None => {}
     }
@@ -880,7 +958,11 @@ async fn dispatch_client_action(
         ClientAction::OpenNavigator => {
             let mut navigator = NavigatorState::open(view.focused());
             if let Some(snapshot) = resources.snapshot() {
-                navigator.accept_resources(snapshot, view.focused());
+                navigator.accept_resources_with_notifications(
+                    snapshot,
+                    view.focused(),
+                    resources.notifications(),
+                );
             }
             *surface = Some(ClientSurface::Navigator(navigator));
         }
@@ -891,9 +973,12 @@ async fn dispatch_client_action(
             if !view.resources_are_current(snapshot) {
                 return Ok(Some("navigation is syncing".into()));
             }
-            let Some(sidebar) =
-                WorkspaceSidebarState::open(snapshot, view.focused(), workspace_history)
-            else {
+            let Some(sidebar) = WorkspaceSidebarState::open(
+                snapshot,
+                view.focused(),
+                workspace_history,
+                resources.notifications(),
+            ) else {
                 return Ok(Some("no workspace available".into()));
             };
             *surface = Some(ClientSurface::WorkspaceSidebar(sidebar));
@@ -916,6 +1001,40 @@ async fn dispatch_client_action(
                 return Ok(Some("no tab available".into()));
             };
             *surface = Some(ClientSurface::TabBar(tab_bar));
+        }
+        ClientAction::OpenNotifications => {
+            let Some(snapshot) = resources.snapshot() else {
+                return Ok(Some("notifications are still loading".into()));
+            };
+            *surface = Some(ClientSurface::Notifications(NotificationsDialog::open(
+                snapshot,
+                resources.notifications(),
+            )));
+        }
+        ClientAction::FocusNextNotification => {
+            let Some(snapshot) = resources.snapshot() else {
+                return Ok(Some("notifications are still loading".into()));
+            };
+            if !view.resources_are_current(snapshot) {
+                return Ok(Some("navigation is syncing".into()));
+            }
+            let Some(pane_id) = resources
+                .notifications()
+                .next(snapshot, view.focused().terminal_id)
+            else {
+                return Ok(Some("no terminals waiting".into()));
+            };
+            if let Some(request) = focus.begin(FocusOrigin::Notification) {
+                send_request(
+                    framed,
+                    Some(request),
+                    ClientMessage::SelectTarget {
+                        selector: TargetSelector::Pane(pane_id),
+                        expected: None,
+                    },
+                )
+                .await?;
+            }
         }
         ClientAction::CreateTab => {
             if let Some(request) = create_tab.begin() {
@@ -1222,6 +1341,7 @@ enum FocusOrigin {
     Tab,
     Workspace,
     Session,
+    Notification,
 }
 
 impl FocusOrigin {

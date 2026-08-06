@@ -15,6 +15,7 @@ use std::{
     },
     path::{Path, PathBuf},
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -60,13 +61,16 @@ impl DaemonConfig {
         let program = std::env::var_os("SHELL")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/bin/sh"));
+        let mut env = std::env::vars().collect::<HashMap<_, _>>();
+        env.insert("FUT_SOCKET".into(), socket_path.display().to_string());
         Self {
             socket_path,
             spawn: SpawnSpec {
+                id: TerminalId::new(),
                 program,
                 argv: Vec::new(),
                 cwd,
-                env: std::env::vars().collect::<HashMap<_, _>>(),
+                env,
                 size: TerminalSize {
                     columns: 80,
                     rows: 24,
@@ -88,6 +92,7 @@ struct SharedState {
     runtimes: HashMap<TerminalId, RuntimeEntry>,
     expected_finalizations: HashSet<TerminalId>,
     resource_changes: watch::Sender<u64>,
+    child_env: HashMap<String, String>,
     accepting: bool,
 }
 
@@ -145,6 +150,22 @@ impl SharedState {
         if revision > *self.resource_changes.borrow() {
             self.resource_changes.send_replace(revision);
         }
+    }
+
+    fn report_agent(
+        &mut self,
+        terminal_id: TerminalId,
+        report: crate::domain::AgentReport,
+    ) -> Result<(), DaemonError> {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        let revision = self.resources.report_agent(terminal_id, report, now_ms)?;
+        self.publish_resource_change(revision);
+        Ok(())
     }
 
     fn register_session(
@@ -737,18 +758,28 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     let socket = bind_socket(&config.socket_path).await?;
     let mut initial_spawn = config.spawn;
     initial_spawn.cwd = resolved.cwd.clone();
-    let terminal = Arc::new(spawn_terminal(initial_spawn)?);
     let initial = initial_path(
         &resolved,
         resolved.suggested_session_name.clone(),
-        terminal.id(),
+        initial_spawn.id,
     );
+    let initial_target = crate::resources::ResolvedTerminalPath {
+        session_id: initial.session_id,
+        workspace_id: initial.workspace_id,
+        tab_id: initial.tab_id,
+        pane_id: initial.pane_id,
+        terminal_id: initial.terminal_id,
+    };
+    let child_env = initial_spawn.env.clone();
+    initial_spawn.env = terminal_env(&child_env, initial_target);
+    let terminal = Arc::new(spawn_terminal(initial_spawn)?);
     let (resource_changes, _) = watch::channel(0);
     let mut state = SharedState {
         resources: ResourceTree::default(),
         runtimes: HashMap::new(),
         expected_finalizations: HashSet::new(),
         resource_changes,
+        child_env,
         accepting: true,
     };
     if let Err(error) = state.register_session(initial, Arc::clone(&terminal)) {
@@ -828,6 +859,23 @@ fn initial_path(resolved: &ResolvedLocation, name: String, terminal_id: Terminal
         pane_id: PaneId::new(),
         terminal_id,
     }
+}
+
+fn terminal_env(
+    base: &HashMap<String, String>,
+    target: crate::resources::ResolvedTerminalPath,
+) -> HashMap<String, String> {
+    let mut env = base.clone();
+    for (key, value) in [
+        ("FUT_SESSION_ID", target.session_id.to_string()),
+        ("FUT_WORKSPACE_ID", target.workspace_id.to_string()),
+        ("FUT_TAB_ID", target.tab_id.to_string()),
+        ("FUT_PANE_ID", target.pane_id.to_string()),
+        ("FUT_TERMINAL_ID", target.terminal_id.to_string()),
+    ] {
+        env.insert(key.into(), value);
+    }
+    env
 }
 
 fn watch_terminal(terminal: Arc<TerminalHandle>, exited: mpsc::UnboundedSender<TerminalId>) {
@@ -1332,7 +1380,7 @@ async fn handle_connection(
                             Err(error) => send_error(&mut framed, envelope.request_id, error.code, &error.message).await?,
                         }
                     }
-                    ClientMessage::OpenLocation { .. } | ClientMessage::MovePane { .. } | ClientMessage::CloseTarget { .. } | ClientMessage::Shutdown => send_error(&mut framed, envelope.request_id, "control_only", "command requires a control connection").await?,
+                    ClientMessage::OpenLocation { .. } | ClientMessage::MovePane { .. } | ClientMessage::CloseTarget { .. } | ClientMessage::ReportAgent { .. } | ClientMessage::Shutdown => send_error(&mut framed, envelope.request_id, "control_only", "command requires a control connection").await?,
                     ClientMessage::Hello { .. } => send_error(&mut framed, envelope.request_id, "already_hello", "hello was already received").await?,
                 }
             },
@@ -1642,6 +1690,27 @@ async fn control_loop(
                             envelope.request_id,
                             ServerMessage::CommandCompleted {
                                 command: AcknowledgedCommand::RenameTarget,
+                            },
+                        )
+                        .await?
+                    }
+                    Err(error) => {
+                        send_error(framed, envelope.request_id, error.code, &error.message).await?
+                    }
+                }
+            }
+            ClientMessage::ReportAgent {
+                terminal_id,
+                report,
+            } => {
+                let result = shared.lock().await.report_agent(terminal_id, report);
+                match result {
+                    Ok(()) => {
+                        send(
+                            framed,
+                            envelope.request_id,
+                            ServerMessage::CommandCompleted {
+                                command: AcknowledgedCommand::ReportAgent,
                             },
                         )
                         .await?
@@ -2149,12 +2218,32 @@ async fn open_location(
             }
             CheckoutDestination::Existing(_) => unreachable!(),
         }
+        let spawn_target = match destination {
+            CheckoutDestination::CreateSession => crate::resources::ResolvedTerminalPath {
+                session_id: proposed_session.session_id,
+                workspace_id: proposed_session.workspace_id,
+                tab_id: proposed_session.tab_id,
+                pane_id: proposed_session.pane_id,
+                terminal_id: proposed_session.terminal_id,
+            },
+            CheckoutDestination::AddWorkspace { session_id } => {
+                crate::resources::ResolvedTerminalPath {
+                    session_id,
+                    workspace_id: proposed_workspace.workspace_id,
+                    tab_id: proposed_workspace.tab_id,
+                    pane_id: proposed_workspace.pane_id,
+                    terminal_id: proposed_workspace.terminal_id,
+                }
+            }
+            CheckoutDestination::Existing(_) => unreachable!(),
+        };
         let terminal = Arc::new(
             spawn_terminal(SpawnSpec {
+                id: spawn_target.terminal_id,
                 program,
                 argv,
                 cwd: resolved.cwd.clone(),
-                env: std::env::vars().collect(),
+                env: terminal_env(&state.child_env, spawn_target),
                 size: TerminalSize {
                     columns: 80,
                     rows: 24,
@@ -2164,8 +2253,7 @@ async fn open_location(
         );
         let (path, disposition, insertion) = match destination {
             CheckoutDestination::CreateSession => {
-                let mut path = proposed_session;
-                path.terminal_id = terminal.id();
+                let path = proposed_session;
                 let selected = crate::resources::ResolvedTerminalPath {
                     session_id: path.session_id,
                     workspace_id: path.workspace_id,
@@ -2177,8 +2265,7 @@ async fn open_location(
                 (selected, OpenDisposition::SessionCreated, insertion)
             }
             CheckoutDestination::AddWorkspace { session_id } => {
-                let mut path = proposed_workspace;
-                path.terminal_id = terminal.id();
+                let path = proposed_workspace;
                 let selected = crate::resources::ResolvedTerminalPath {
                     session_id,
                     workspace_id: path.workspace_id,
@@ -2350,25 +2437,26 @@ async fn create_workspace(
         let mut validated = state.resources.clone();
         validated.add_workspace(session_id, proposed.clone())?;
 
+        let resolved = crate::resources::ResolvedTerminalPath {
+            session_id,
+            workspace_id: proposed.workspace_id,
+            tab_id: proposed.tab_id,
+            pane_id: proposed.pane_id,
+            terminal_id: proposed.terminal_id,
+        };
+
         let terminal = Arc::new(
             spawn_terminal(SpawnSpec {
+                id: proposed.terminal_id,
                 program,
                 argv,
                 cwd,
-                env: std::env::vars().collect(),
+                env: terminal_env(&state.child_env, resolved),
                 size,
             })
             .map_err(|error| DaemonError::new("spawn_failed", error.to_string()))?,
         );
-        let mut path = proposed;
-        path.terminal_id = terminal.id();
-        let resolved = crate::resources::ResolvedTerminalPath {
-            session_id,
-            workspace_id: path.workspace_id,
-            tab_id: path.tab_id,
-            pane_id: path.pane_id,
-            terminal_id: path.terminal_id,
-        };
+        let path = proposed;
         let selected = selected_target(resolved, &terminal);
         let insertion = state.register_workspace(session_id, path, Arc::clone(&terminal));
         let creation = match insertion {
@@ -2453,25 +2541,26 @@ async fn create_tab(
         let mut validated = state.resources.clone();
         validated.add_tab(workspace_id, proposed.clone())?;
 
+        let resolved = crate::resources::ResolvedTerminalPath {
+            session_id,
+            workspace_id,
+            tab_id: proposed.tab_id,
+            pane_id: proposed.pane_id,
+            terminal_id: proposed.terminal_id,
+        };
+
         let terminal = Arc::new(
             spawn_terminal(SpawnSpec {
+                id: proposed.terminal_id,
                 program,
                 argv,
                 cwd,
-                env: std::env::vars().collect(),
+                env: terminal_env(&state.child_env, resolved),
                 size,
             })
             .map_err(|error| DaemonError::new("spawn_failed", error.to_string()))?,
         );
-        let mut path = proposed;
-        path.terminal_id = terminal.id();
-        let resolved = crate::resources::ResolvedTerminalPath {
-            session_id,
-            workspace_id,
-            tab_id: path.tab_id,
-            pane_id: path.pane_id,
-            terminal_id: path.terminal_id,
-        };
+        let path = proposed;
         let selected = selected_target(resolved, &terminal);
         let insertion = state.register_tab(workspace_id, path, Arc::clone(&terminal));
         let creation = match insertion {
@@ -2600,33 +2689,36 @@ async fn create_pane(
         };
         state.resources.workspace_id_for_tab(tab_id)?;
         let pane_id = PaneId::new();
+        let terminal_id = TerminalId::new();
         let mut validated = state.resources.clone();
         match target {
             PaneCreationTarget::Append(_) => {
-                validated.add_pane(tab_id, pane_id, TerminalId::new())?;
+                validated.add_pane(tab_id, pane_id, terminal_id)?;
             }
             PaneCreationTarget::Split { anchor, direction } => {
-                validated.split_pane(anchor, direction, pane_id, TerminalId::new())?;
+                validated.split_pane(anchor, direction, pane_id, terminal_id)?;
             }
         }
 
-        let terminal = Arc::new(
-            spawn_terminal(SpawnSpec {
-                program,
-                argv,
-                cwd,
-                env: std::env::vars().collect(),
-                size,
-            })
-            .map_err(|error| DaemonError::new("spawn_failed", error.to_string()))?,
-        );
         let resolved = crate::resources::ResolvedTerminalPath {
             session_id,
             workspace_id,
             tab_id,
             pane_id,
-            terminal_id: terminal.id(),
+            terminal_id,
         };
+
+        let terminal = Arc::new(
+            spawn_terminal(SpawnSpec {
+                id: terminal_id,
+                program,
+                argv,
+                cwd,
+                env: terminal_env(&state.child_env, resolved),
+                size,
+            })
+            .map_err(|error| DaemonError::new("spawn_failed", error.to_string()))?,
+        );
         let selected = selected_target(resolved, &terminal);
         let insertion = match target {
             PaneCreationTarget::Append(_) => {
@@ -2995,6 +3087,7 @@ mod tests {
                 runtimes: HashMap::new(),
                 expected_finalizations: HashSet::new(),
                 resource_changes: watch::channel(1).0,
+                child_env: HashMap::new(),
                 accepting: true,
             },
             path,
@@ -3065,6 +3158,7 @@ mod tests {
         let (mut state, path) = inconsistent_state();
         let terminal = Arc::new(
             spawn_terminal(SpawnSpec {
+                id: TerminalId::new(),
                 program: "/bin/sh".into(),
                 argv: vec!["-c".into(), "exit".into()],
                 cwd: "/".into(),
@@ -3099,6 +3193,7 @@ mod tests {
         let (mut state, path) = inconsistent_state();
         let terminal = Arc::new(
             spawn_terminal(SpawnSpec {
+                id: TerminalId::new(),
                 program: "/bin/sh".into(),
                 argv: vec!["-c".into(), "sleep 10".into()],
                 cwd: "/".into(),
@@ -3140,6 +3235,7 @@ mod tests {
         let spawn = || {
             Arc::new(
                 spawn_terminal(SpawnSpec {
+                    id: TerminalId::new(),
                     program: "/bin/sh".into(),
                     argv: vec!["-c".into(), "sleep 10".into()],
                     cwd: "/".into(),
@@ -3172,6 +3268,7 @@ mod tests {
             runtimes: HashMap::new(),
             expected_finalizations: HashSet::new(),
             resource_changes,
+            child_env: HashMap::new(),
             accepting: true,
         };
         state

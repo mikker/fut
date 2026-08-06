@@ -1,0 +1,11 @@
+{
+  "name": "fut-pi",
+  "private": true,
+  "keywords": ["pi-package"],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": ["./integrations/pi/fut.ts"]
+  }
+}

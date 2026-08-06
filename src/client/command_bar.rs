@@ -542,7 +542,7 @@ mod tests {
         let prompt = (0..narrow.width)
             .map(|column| narrow_buffer[(column, 0)].symbol())
             .collect::<String>();
-        assert!(prompt.contains("1/30"));
+        assert!(prompt.contains("1/32"));
         assert!(!prompt.contains("command1/29"));
     }
 

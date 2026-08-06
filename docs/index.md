@@ -15,6 +15,7 @@ permalink: /
 
 ## Docs
 
+- [Agent activity](agents.md)
 - [Configuration](configuration.md)
 - [Presentation tokens](tokens.md)
 - [Diagnostics](doctor.md)

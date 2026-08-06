@@ -20,6 +20,7 @@ const OUTPUT_QUEUE_CAPACITY: usize = 16;
 
 #[derive(Clone, Debug)]
 pub struct SpawnSpec {
+    pub id: TerminalId,
     pub program: PathBuf,
     pub argv: Vec<String>,
     pub cwd: PathBuf,
@@ -194,7 +195,7 @@ pub fn spawn_terminal(spec: SpawnSpec) -> Result<TerminalHandle> {
     let (output, output_receiver) = mpsc::sync_channel(OUTPUT_QUEUE_CAPACITY);
     let (events, _) = broadcast::channel(16);
     let (lifecycle, _) = watch::channel(TerminalLifecycle::Running);
-    let id = TerminalId::new();
+    let id = spec.id;
     let initial = ScreenSnapshot::new(
         0,
         spec.size,
@@ -587,6 +588,7 @@ mod tests {
 
     fn shell(script: &str, env: HashMap<String, String>) -> SpawnSpec {
         SpawnSpec {
+            id: TerminalId::new(),
             program: "/bin/sh".into(),
             argv: vec!["-c".into(), script.into()],
             cwd: "/".into(),

@@ -8,7 +8,10 @@ use uuid::Uuid;
 use std::path::PathBuf;
 
 use crate::{
-    domain::{PaneId, ScreenSnapshot, SessionId, TabId, TerminalId, TerminalSize, WorkspaceId},
+    domain::{
+        AgentReport, PaneId, ScreenSnapshot, SessionId, TabId, TerminalId, TerminalSize,
+        WorkspaceId,
+    },
     resources::{ResourceSnapshot, SessionSelector, TargetSelector},
     splits::{SplitDirection, SplitTree},
 };
@@ -43,6 +46,7 @@ pub enum ClientMode {
 pub enum AcknowledgedCommand {
     Input,
     Resize,
+    ReportAgent,
     CloseTarget,
     RenameTarget,
     Shutdown,
@@ -176,6 +180,10 @@ pub enum ClientMessage {
     RenameTarget {
         selector: RenameSelector,
         name: String,
+    },
+    ReportAgent {
+        terminal_id: TerminalId,
+        report: AgentReport,
     },
     Ping,
     Shutdown,

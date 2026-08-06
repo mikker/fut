@@ -375,6 +375,7 @@ mod tests {
             id: PaneId::new(),
             terminal_id: TerminalId::new(),
             closing,
+            activity: Default::default(),
         };
         let first_pane = pane(false);
         let second_pane = pane(true);
@@ -777,6 +778,7 @@ mod tests {
             id: PaneId::new(),
             terminal_id: TerminalId::new(),
             closing: false,
+            activity: Default::default(),
         };
         snapshot.sessions[0].workspaces[0].tabs[0]
             .panes

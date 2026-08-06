@@ -12,6 +12,8 @@ use crate::{
     resources::{ResourceSnapshot, TargetSelector},
 };
 
+use super::notifications::{ActivityIndicator, NotificationState};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ResourceKey {
     Session(SessionId),
@@ -28,6 +30,7 @@ pub(super) struct NavigatorRow {
     pub current: bool,
     pub closing: bool,
     pub destination: Option<PaneId>,
+    pub activity: Option<ActivityIndicator>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,10 +69,20 @@ impl NavigatorState {
         }
     }
 
+    #[cfg(test)]
     pub fn accept_resources(
         &mut self,
         snapshot: &ResourceSnapshot,
         current: &SelectedTarget,
+    ) -> bool {
+        self.accept_resources_with_notifications(snapshot, current, &NotificationState::default())
+    }
+
+    pub fn accept_resources_with_notifications(
+        &mut self,
+        snapshot: &ResourceSnapshot,
+        current: &SelectedTarget,
+        notifications: &NotificationState,
     ) -> bool {
         if self
             .resource_revision
@@ -80,7 +93,7 @@ impl NavigatorState {
         let old_key = self.rows.get(self.selected).map(|row| row.key);
         let old_index = self.selected;
         let previous_status = self.status.clone();
-        self.rows = flatten(snapshot, current);
+        self.rows = flatten_with_notifications(snapshot, current, notifications);
         self.resource_revision = Some(snapshot.revision);
         self.status = match previous_status {
             status @ (NavigatorStatus::Switching | NavigatorStatus::Error { .. }) => status,
@@ -184,7 +197,7 @@ impl NavigatorState {
         }
     }
 
-    pub fn render(&mut self, area: Rect, buffer: &mut Buffer) {
+    pub fn render(&mut self, area: Rect, spinner_frame: usize, buffer: &mut Buffer) {
         if area.width == 0 || area.height == 0 {
             return;
         }
@@ -271,6 +284,8 @@ impl NavigatorState {
                 {
                     let marker = if row.closing {
                         "×"
+                    } else if let Some(activity) = row.activity {
+                        activity.marker(spinner_frame)
                     } else if row.current && matches!(row.key, ResourceKey::Pane(_)) {
                         "•"
                     } else {
@@ -310,7 +325,16 @@ fn matches_request(pending: Option<Uuid>, response: Option<Uuid>) -> bool {
     pending.is_some() && pending == response
 }
 
+#[cfg(test)]
 pub(super) fn flatten(snapshot: &ResourceSnapshot, current: &SelectedTarget) -> Vec<NavigatorRow> {
+    flatten_with_notifications(snapshot, current, &NotificationState::default())
+}
+
+fn flatten_with_notifications(
+    snapshot: &ResourceSnapshot,
+    current: &SelectedTarget,
+    notifications: &NotificationState,
+) -> Vec<NavigatorRow> {
     let current_ancestry = snapshot.sessions.iter().find_map(|session| {
         session.workspaces.iter().find_map(|workspace| {
             workspace.tabs.iter().find_map(|tab| {
@@ -340,6 +364,15 @@ pub(super) fn flatten(snapshot: &ResourceSnapshot, current: &SelectedTarget) -> 
             current: session_current,
             closing: session.closing,
             destination: (!session.closing).then_some(session_target).flatten(),
+            activity: notifications.indicator(
+                &session
+                    .workspaces
+                    .iter()
+                    .flat_map(|workspace| &workspace.tabs)
+                    .flat_map(|tab| &tab.panes)
+                    .copied()
+                    .collect::<Vec<_>>(),
+            ),
         });
         for workspace in &session.workspaces {
             let closing = session.closing || workspace.closing;
@@ -358,6 +391,14 @@ pub(super) fn flatten(snapshot: &ResourceSnapshot, current: &SelectedTarget) -> 
                 current: workspace_current,
                 closing,
                 destination: (!closing).then_some(target).flatten(),
+                activity: notifications.indicator(
+                    &workspace
+                        .tabs
+                        .iter()
+                        .flat_map(|tab| &tab.panes)
+                        .copied()
+                        .collect::<Vec<_>>(),
+                ),
             });
             for tab in &workspace.tabs {
                 let tab_current = workspace_current && tab.id == current_tab_id;
@@ -383,6 +424,7 @@ pub(super) fn flatten(snapshot: &ResourceSnapshot, current: &SelectedTarget) -> 
                     current: tab_current,
                     closing: tab_closing,
                     destination: (!tab_closing).then_some(target).flatten(),
+                    activity: notifications.indicator(&tab.panes),
                 });
                 for (index, pane) in tab.panes.iter().enumerate() {
                     let pane_closing = tab_closing || pane.closing;
@@ -393,6 +435,7 @@ pub(super) fn flatten(snapshot: &ResourceSnapshot, current: &SelectedTarget) -> 
                         current: pane.id == current.pane_id,
                         closing: pane_closing,
                         destination: (!pane_closing).then_some(pane.id),
+                        activity: notifications.indicator(std::slice::from_ref(pane)),
                     });
                 }
             }
@@ -510,11 +553,13 @@ mod tests {
                                     id: current_pane,
                                     terminal_id: current_terminal,
                                     closing: false,
+                                    activity: Default::default(),
                                 },
                                 PaneSnapshot {
                                     id: other_pane,
                                     terminal_id: TerminalId::new(),
                                     closing: true,
+                                    activity: Default::default(),
                                 },
                             ],
                         }],
@@ -536,7 +581,7 @@ mod tests {
     fn rendered(nav: &mut NavigatorState, width: u16, height: u16) -> (String, Buffer) {
         let area = Rect::new(0, 0, width, height);
         let mut buffer = Buffer::empty(area);
-        nav.render(area, &mut buffer);
+        nav.render(area, 0, &mut buffer);
         let text = (0..height)
             .map(|y| {
                 (0..width)
@@ -784,7 +829,7 @@ mod tests {
             nav.selected = nav.rows.len() - 1;
             let area = Rect::new(0, 0, width, height);
             let mut buffer = Buffer::empty(area);
-            nav.render(area, &mut buffer);
+            nav.render(area, 0, &mut buffer);
             assert!(nav.scroll <= nav.selected);
         }
     }

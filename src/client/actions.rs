@@ -62,6 +62,8 @@ pub(super) enum ClientAction {
     OpenNavigator,
     OpenWorkspaceSidebar,
     OpenTabBar,
+    OpenNotifications,
+    FocusNextNotification,
     CreateTab,
     FocusNextTab,
     FocusPreviousTab,
@@ -89,11 +91,13 @@ pub(super) struct DirectBinding {
     pub action: ClientAction,
 }
 
-pub(super) const ALL_ACTIONS: [ClientAction; 31] = [
+pub(super) const ALL_ACTIONS: [ClientAction; 33] = [
     ClientAction::OpenCommandBar,
     ClientAction::OpenNavigator,
     ClientAction::OpenWorkspaceSidebar,
     ClientAction::OpenTabBar,
+    ClientAction::OpenNotifications,
+    ClientAction::FocusNextNotification,
     ClientAction::CreateTab,
     ClientAction::FocusNextTab,
     ClientAction::FocusPreviousTab,
@@ -123,7 +127,7 @@ pub(super) const ALL_ACTIONS: [ClientAction; 31] = [
     ClientAction::Detach,
 ];
 
-pub(super) const COMMANDS: [ActionDefinition; 30] = [
+pub(super) const COMMANDS: [ActionDefinition; 32] = [
     ActionDefinition {
         action: ClientAction::OpenNavigator,
         title: "Open global navigator",
@@ -138,6 +142,16 @@ pub(super) const COMMANDS: [ActionDefinition; 30] = [
         action: ClientAction::OpenTabBar,
         title: "Focus tab bar",
         keywords: "tab bar list switch navigation",
+    },
+    ActionDefinition {
+        action: ClientAction::OpenNotifications,
+        title: "Open terminals waiting",
+        keywords: "notifications unread waiting agents completed blocked",
+    },
+    ActionDefinition {
+        action: ClientAction::FocusNextNotification,
+        title: "Switch to next waiting terminal",
+        keywords: "notifications unread next waiting agents completed blocked",
     },
     ActionDefinition {
         action: ClientAction::CreateTab,
@@ -276,7 +290,7 @@ pub(super) const COMMANDS: [ActionDefinition; 30] = [
     },
 ];
 
-pub(super) const DIRECT_BINDINGS: [DirectBinding; 31] = [
+pub(super) const DIRECT_BINDINGS: [DirectBinding; 33] = [
     DirectBinding {
         suffix: b" ",
         action: ClientAction::OpenCommandBar,
@@ -292,6 +306,14 @@ pub(super) const DIRECT_BINDINGS: [DirectBinding; 31] = [
     DirectBinding {
         suffix: b"t",
         action: ClientAction::OpenTabBar,
+    },
+    DirectBinding {
+        suffix: b"u",
+        action: ClientAction::OpenNotifications,
+    },
+    DirectBinding {
+        suffix: b".",
+        action: ClientAction::FocusNextNotification,
     },
     DirectBinding {
         suffix: b"c",
@@ -415,6 +437,8 @@ pub(super) fn config_key(action: ClientAction) -> &'static str {
         ClientAction::OpenNavigator => "open_navigator",
         ClientAction::OpenWorkspaceSidebar => "open_workspace_sidebar",
         ClientAction::OpenTabBar => "open_tab_bar",
+        ClientAction::OpenNotifications => "open_notifications",
+        ClientAction::FocusNextNotification => "focus_next_notification",
         ClientAction::CreateTab => "create_tab",
         ClientAction::FocusNextTab => "focus_next_tab",
         ClientAction::FocusPreviousTab => "focus_previous_tab",
@@ -474,6 +498,8 @@ const fn requires_launcher(action: ClientAction) -> bool {
         ClientAction::OpenNavigator
         | ClientAction::OpenWorkspaceSidebar
         | ClientAction::OpenTabBar
+        | ClientAction::OpenNotifications
+        | ClientAction::FocusNextNotification
         | ClientAction::CreateTab
         | ClientAction::FocusNextTab
         | ClientAction::FocusPreviousTab

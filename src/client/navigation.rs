@@ -264,6 +264,7 @@ mod tests {
             id: PaneId::new(),
             terminal_id: TerminalId::new(),
             closing: false,
+            activity: Default::default(),
         }
     }
 

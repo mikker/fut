@@ -7,14 +7,11 @@ use ratatui::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::{
-    domain::TabId,
-    protocol::SelectedTarget,
-    resources::{ResourceSnapshot, TabSnapshot},
-};
+use crate::{domain::TabId, protocol::SelectedTarget, resources::ResourceSnapshot};
 
 use super::{
     config::{GroupConfig, SemanticStyle, TabBarPosition, UiConfig, WorkspaceSidebarPosition},
+    notifications::{ActivityIndicator, NotificationState},
     presentation::{ItemState, TokenValue, apply_item_state, render_token_segments, truncate_line},
 };
 
@@ -147,6 +144,7 @@ fn sidebar_rect(
 #[derive(Default)]
 pub(super) struct ResourceState {
     snapshot: Option<ResourceSnapshot>,
+    notifications: NotificationState,
 }
 
 impl ResourceState {
@@ -166,6 +164,34 @@ impl ResourceState {
         self.snapshot.as_ref()
     }
 
+    pub fn notifications(&self) -> &NotificationState {
+        &self.notifications
+    }
+
+    pub fn attention_revision(&self, terminal_id: crate::domain::TerminalId) -> Option<u64> {
+        self.snapshot
+            .as_ref()?
+            .sessions
+            .iter()
+            .flat_map(|session| &session.workspaces)
+            .flat_map(|workspace| &workspace.tabs)
+            .flat_map(|tab| &tab.panes)
+            .find(|pane| pane.terminal_id == terminal_id)?
+            .activity
+            .attention
+            .map(|attention| attention.revision)
+    }
+
+    pub fn observe(&mut self, terminal_id: crate::domain::TerminalId, revision: u64) -> bool {
+        self.notifications.observe(terminal_id, revision)
+    }
+
+    pub fn has_working(&self) -> bool {
+        self.snapshot
+            .as_ref()
+            .is_some_and(|snapshot| self.notifications.has_working(snapshot))
+    }
+
     pub fn workspace_count(&self, focused: &SelectedTarget) -> Option<usize> {
         self.snapshot.as_ref().and_then(|snapshot| {
             snapshot
@@ -183,6 +209,7 @@ struct TabItem {
     name: String,
     closing: bool,
     pane_count: usize,
+    activity: Option<ActivityIndicator>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -191,10 +218,16 @@ struct TabBarModel {
     workspace_name: String,
     tabs: Vec<TabItem>,
     active: usize,
+    client_waiting: usize,
+    session_waiting: usize,
 }
 
 impl TabBarModel {
-    fn from_snapshot(snapshot: &ResourceSnapshot, focused: &SelectedTarget) -> Option<Self> {
+    fn from_snapshot(
+        snapshot: &ResourceSnapshot,
+        focused: &SelectedTarget,
+        notifications: &NotificationState,
+    ) -> Option<Self> {
         let session = snapshot
             .sessions
             .iter()
@@ -210,20 +243,21 @@ impl TabBarModel {
         Some(Self {
             session_name: sanitize(&session.name),
             workspace_name: sanitize(&workspace.name),
-            tabs: workspace.tabs.iter().map(TabItem::from).collect(),
+            tabs: workspace
+                .tabs
+                .iter()
+                .map(|tab| TabItem {
+                    id: tab.id,
+                    name: sanitize(&tab.name),
+                    closing: tab.closing,
+                    pane_count: tab.panes.len(),
+                    activity: notifications.indicator(&tab.panes),
+                })
+                .collect(),
             active,
+            client_waiting: notifications.waiting_count(snapshot),
+            session_waiting: notifications.session_waiting_count(snapshot, focused.session_id),
         })
-    }
-}
-
-impl From<&TabSnapshot> for TabItem {
-    fn from(tab: &TabSnapshot) -> Self {
-        Self {
-            id: tab.id,
-            name: sanitize(&tab.name),
-            closing: tab.closing,
-            pane_count: tab.panes.len(),
-        }
     }
 }
 
@@ -243,11 +277,17 @@ struct ResolvedGroup {
     allocation: usize,
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the renderer keeps resource, client, configuration, and target inputs explicit"
+)]
 pub(super) fn render_tab_bar(
     snapshot: Option<&ResourceSnapshot>,
     focused: &SelectedTarget,
     zoomed: bool,
     selected: Option<TabId>,
+    notifications: &NotificationState,
+    spinner_frame: usize,
     ui: &UiConfig,
     area: Rect,
     buffer: &mut Buffer,
@@ -262,7 +302,7 @@ pub(super) fn render_tab_bar(
     );
     let width = usize::from(area.width);
     let model = snapshot
-        .and_then(|snapshot| TabBarModel::from_snapshot(snapshot, focused))
+        .and_then(|snapshot| TabBarModel::from_snapshot(snapshot, focused, notifications))
         .unwrap_or_else(|| TabBarModel {
             session_name: "session".into(),
             workspace_name: "workspace".into(),
@@ -271,8 +311,11 @@ pub(super) fn render_tab_bar(
                 name: "tab".into(),
                 closing: false,
                 pane_count: 1,
+                activity: None,
             }],
             active: 0,
+            client_waiting: 0,
+            session_waiting: 0,
         });
     let mut groups = Vec::new();
     for (lane, configured) in [
@@ -286,9 +329,17 @@ pub(super) fn render_tab_bar(
                 .iter()
                 .any(|segment| segment.component.as_deref() == Some("tabs"));
             let line = if tabs {
-                selected_line(&model, selected, 0, model.tabs.len() - 1, group.style, ui)
+                selected_line(
+                    &model,
+                    selected,
+                    0,
+                    model.tabs.len() - 1,
+                    group.style,
+                    spinner_frame,
+                    ui,
+                )
             } else {
-                render_bar_group(group, &model, zoomed, selected, ui)
+                render_bar_group(group, &model, zoomed, selected, spinner_frame, ui)
             };
             if tabs || line.width() > 0 {
                 groups.push(ResolvedGroup {
@@ -328,7 +379,15 @@ pub(super) fn render_tab_bar(
                 continue;
             }
             let line = if group.tabs {
-                visible_tabs(&model, selected, group.allocation, group.style, ui).0
+                visible_tabs(
+                    &model,
+                    selected,
+                    group.allocation,
+                    group.style,
+                    spinner_frame,
+                    ui,
+                )
+                .0
             } else {
                 truncate_line(&group.line, group.allocation)
             };
@@ -348,6 +407,7 @@ fn render_bar_group(
     model: &TabBarModel,
     zoomed: bool,
     selected: Option<TabId>,
+    spinner_frame: usize,
     ui: &UiConfig,
 ) -> Line<'static> {
     let icons = ui.icons.resolve();
@@ -367,6 +427,18 @@ fn render_bar_group(
             "tab.pane_count" => TokenValue::plain(active.pane_count.to_string()),
             "client.zoom" if zoomed => TokenValue::plain(icons.zoom.clone()),
             "client.help" if selected.is_some() => TokenValue::plain("c new · r rename · esc "),
+            "client.waiting" if model.client_waiting > 0 => TokenValue::styled(
+                format!("● {}", model.client_waiting),
+                SemanticStyle::Attention,
+            ),
+            "session.waiting" if model.session_waiting > 0 => TokenValue::styled(
+                format!("● {}", model.session_waiting),
+                SemanticStyle::Attention,
+            ),
+            "tab.activity" => active.activity.map_or_else(
+                || TokenValue::plain(""),
+                |activity| activity_token(activity, spinner_frame),
+            ),
             _ => TokenValue::plain(""),
         },
     )
@@ -422,6 +494,7 @@ fn visible_tabs(
     selected: Option<TabId>,
     width: usize,
     component_style: Option<SemanticStyle>,
+    spinner_frame: usize,
     ui: &UiConfig,
 ) -> (Line<'static>, bool) {
     if width == 0 {
@@ -432,10 +505,25 @@ fn visible_tabs(
         .unwrap_or(model.active);
     let mut first = anchor;
     let mut last = anchor;
-    let mut line = selected_line(model, selected, first, last, component_style, ui);
+    let mut line = selected_line(
+        model,
+        selected,
+        first,
+        last,
+        component_style,
+        spinner_frame,
+        ui,
+    );
     if line.width() > width {
-        let fallback = render_tab_item_content(model, anchor, selected, component_style, ui);
-        let marker = tab_token(model, anchor, "tab.index", &ui.icons.resolve());
+        let fallback =
+            render_tab_item_content(model, anchor, selected, component_style, spinner_frame, ui);
+        let marker = tab_token(
+            model,
+            anchor,
+            "tab.index",
+            spinner_frame,
+            &ui.icons.resolve(),
+        );
         if width <= UnicodeWidthStr::width(marker.text.as_str()).saturating_add(2) {
             let mut style = ui.styles.apply(SemanticStyle::Normal, Style::default());
             if let Some(role) = component_style {
@@ -462,7 +550,15 @@ fn visible_tabs(
     loop {
         let mut changed = false;
         if first > 0 {
-            let candidate = selected_line(model, selected, first - 1, last, component_style, ui);
+            let candidate = selected_line(
+                model,
+                selected,
+                first - 1,
+                last,
+                component_style,
+                spinner_frame,
+                ui,
+            );
             if candidate.width() <= width {
                 first -= 1;
                 line = candidate;
@@ -470,7 +566,15 @@ fn visible_tabs(
             }
         }
         if last + 1 < model.tabs.len() {
-            let candidate = selected_line(model, selected, first, last + 1, component_style, ui);
+            let candidate = selected_line(
+                model,
+                selected,
+                first,
+                last + 1,
+                component_style,
+                spinner_frame,
+                ui,
+            );
             if candidate.width() <= width {
                 last += 1;
                 line = candidate;
@@ -490,6 +594,7 @@ fn selected_line(
     first: usize,
     last: usize,
     component_style: Option<SemanticStyle>,
+    spinner_frame: usize,
     ui: &UiConfig,
 ) -> Line<'static> {
     let mut spans = Vec::new();
@@ -505,7 +610,9 @@ fn selected_line(
         ));
     }
     for index in first..=last {
-        spans.extend(render_tab_item(model, index, selected, component_style, ui).spans);
+        spans.extend(
+            render_tab_item(model, index, selected, component_style, spinner_frame, ui).spans,
+        );
     }
     if last + 1 < model.tabs.len() {
         let mut style = ui.styles.apply(SemanticStyle::Normal, Style::default());
@@ -525,9 +632,10 @@ fn render_tab_item(
     index: usize,
     selected: Option<TabId>,
     component_style: Option<SemanticStyle>,
+    spinner_frame: usize,
     ui: &UiConfig,
 ) -> Line<'static> {
-    let line = render_tab_item_content(model, index, selected, component_style, ui);
+    let line = render_tab_item_content(model, index, selected, component_style, spinner_frame, ui);
     let minimum = usize::from(ui.tab_bar.item.min_width);
     let padding = minimum.saturating_sub(line.width());
     if padding == 0 {
@@ -545,6 +653,7 @@ fn render_tab_item_content(
     index: usize,
     selected: Option<TabId>,
     component_style: Option<SemanticStyle>,
+    spinner_frame: usize,
     ui: &UiConfig,
 ) -> Line<'static> {
     let tab = &model.tabs[index];
@@ -556,10 +665,13 @@ fn render_tab_item_content(
             current: index == model.active,
             selected: selected == Some(tab.id),
             closing: tab.closing,
-            attention: false,
+            attention: matches!(
+                tab.activity,
+                Some(ActivityIndicator::Blocked | ActivityIndicator::Completed)
+            ),
         },
         &ui.styles,
-        |token| tab_token(model, index, token, &icons),
+        |token| tab_token(model, index, token, spinner_frame, &icons),
     )
 }
 
@@ -581,7 +693,10 @@ fn tab_item_style(
             current: index == model.active,
             selected: selected == Some(tab.id),
             closing: tab.closing,
-            attention: false,
+            attention: matches!(
+                tab.activity,
+                Some(ActivityIndicator::Blocked | ActivityIndicator::Completed)
+            ),
         },
         style,
     )
@@ -591,6 +706,7 @@ fn tab_token(
     model: &TabBarModel,
     index: usize,
     token: &str,
+    spinner_frame: usize,
     icons: &super::config::IconSet,
 ) -> TokenValue {
     let tab = &model.tabs[index];
@@ -605,8 +721,20 @@ fn tab_token(
         }
         "tab.pane_count" => TokenValue::plain(tab.pane_count.to_string()),
         "tab.icon" => TokenValue::plain(icons.tab.clone()),
+        "tab.activity" => tab.activity.map_or_else(
+            || TokenValue::plain(""),
+            |activity| activity_token(activity, spinner_frame),
+        ),
         _ => TokenValue::plain(""),
     }
+}
+
+fn activity_token(activity: ActivityIndicator, frame: usize) -> TokenValue {
+    let style = match activity {
+        ActivityIndicator::Working => SemanticStyle::Activity,
+        ActivityIndicator::Blocked | ActivityIndicator::Completed => SemanticStyle::Attention,
+    };
+    TokenValue::styled(activity.marker(frame), style)
 }
 
 pub(super) fn truncate(value: &str, width: usize) -> String {
@@ -672,7 +800,9 @@ mod tests {
     use super::*;
     use crate::{
         domain::{PaneId, SessionId, TabId, TerminalId, WorkspaceId},
-        resources::{PaneSnapshot, Project, ProjectIdentity, SessionSnapshot, WorkspaceSnapshot},
+        resources::{
+            PaneSnapshot, Project, ProjectIdentity, SessionSnapshot, TabSnapshot, WorkspaceSnapshot,
+        },
     };
     use ratatui::style::Modifier;
 
@@ -692,6 +822,7 @@ mod tests {
                         id: pane_id,
                         terminal_id: TerminalId::new(),
                         closing: false,
+                        activity: Default::default(),
                     }],
                 }
             })
@@ -738,6 +869,8 @@ mod tests {
             &focused,
             false,
             None,
+            &NotificationState::default(),
+            0,
             &UiConfig::default(),
             area,
             &mut buffer,
@@ -886,6 +1019,8 @@ mod tests {
             &focused,
             false,
             None,
+            &NotificationState::default(),
+            0,
             &ui,
             area,
             &mut buffer,
@@ -918,6 +1053,8 @@ mod tests {
             &focused,
             false,
             Some(snapshot.sessions[0].workspaces[0].tabs[2].id),
+            &NotificationState::default(),
+            0,
             &UiConfig::default(),
             area,
             &mut selected,
@@ -976,6 +1113,8 @@ mod tests {
             &focused,
             false,
             None,
+            &NotificationState::default(),
+            0,
             &UiConfig::default(),
             area,
             &mut buffer,
@@ -993,6 +1132,8 @@ mod tests {
             &missing,
             false,
             None,
+            &NotificationState::default(),
+            0,
             &UiConfig::default(),
             area,
             &mut fallback,
@@ -1010,6 +1151,8 @@ mod tests {
             &focused,
             true,
             None,
+            &NotificationState::default(),
+            0,
             &UiConfig::default(),
             area,
             &mut buffer,
@@ -1029,6 +1172,8 @@ mod tests {
                 &focused,
                 true,
                 None,
+                &NotificationState::default(),
+                0,
                 &UiConfig::default(),
                 area,
                 &mut buffer,

@@ -2,7 +2,7 @@ use std::{ffi::OsString, path::PathBuf, process::ExitCode, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
-use clap::{Parser, Subcommand, ValueHint};
+use clap::{Parser, Subcommand, ValueEnum, ValueHint};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::json;
@@ -22,7 +22,7 @@ use crate::{
         path::socket_path,
         run_daemon,
     },
-    domain::{PaneId, SessionId, TabId, TerminalId, WorkspaceId},
+    domain::{AgentReport, PaneId, SessionId, TabId, TerminalId, WorkspaceId},
     protocol::{
         AcknowledgedCommand, ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, RenameSelector,
         ServerMessage, codec, decode_payload, encode_payload,
@@ -237,6 +237,34 @@ enum TerminalCommand {
         #[arg(add = ArgValueCompleter::new(completion::terminal_attach))]
         terminal_id: TerminalId,
     },
+    /// Report explicit agent state for a terminal.
+    Report {
+        /// Agent state or completion event.
+        #[arg(value_enum)]
+        state: AgentReportArg,
+        /// Terminal UUID; defaults to FUT_TERMINAL_ID inside Fut.
+        #[arg(long)]
+        terminal_id: Option<TerminalId>,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum AgentReportArg {
+    Idle,
+    Working,
+    Blocked,
+    Completed,
+}
+
+impl From<AgentReportArg> for AgentReport {
+    fn from(value: AgentReportArg) -> Self {
+        match value {
+            AgentReportArg::Idle => Self::Idle,
+            AgentReportArg::Working => Self::Working,
+            AgentReportArg::Blocked => Self::Blocked,
+            AgentReportArg::Completed => Self::Completed,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -468,6 +496,37 @@ async fn execute(cli: Cli) -> Result<()> {
         Some(Command::Terminal {
             command: TerminalCommand::Attach { terminal_id },
         }) => client::attach(&socket, Some(TargetSelector::Terminal(terminal_id))).await,
+        Some(Command::Terminal {
+            command: TerminalCommand::Report { state, terminal_id },
+        }) => {
+            let terminal_id = match terminal_id {
+                Some(terminal_id) => terminal_id,
+                None => std::env::var("FUT_TERMINAL_ID")
+                    .context("FUT_TERMINAL_ID is unavailable; pass --terminal-id")?
+                    .parse()
+                    .context("FUT_TERMINAL_ID is invalid")?,
+            };
+            response_ok(
+                control(
+                    &socket,
+                    ClientMessage::ReportAgent {
+                        terminal_id,
+                        report: state.into(),
+                    },
+                )
+                .await?,
+                AcknowledgedCommand::ReportAgent,
+            )?;
+            output(
+                cli.json,
+                "terminal.report",
+                json!({ "terminal_id": terminal_id, "state": AgentReport::from(state) }),
+                format!(
+                    "terminal={terminal_id} state={}",
+                    state.to_possible_value().expect("value enum").get_name()
+                ),
+            )
+        }
         Some(Command::Tab {
             command:
                 TabCommand::New {

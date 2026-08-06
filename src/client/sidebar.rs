@@ -11,6 +11,7 @@ use super::{
     chrome::sanitize,
     config::{SemanticStyle, UiConfig, WorkspaceSidebarPosition},
     navigation::NavigationHistory,
+    notifications::{ActivityIndicator, NotificationState},
     presentation::{ItemState, TokenValue, apply_item_state, render_token_segments, truncate_line},
 };
 
@@ -24,6 +25,7 @@ struct WorkspaceItem {
     current: bool,
     closing: bool,
     destination: Option<PaneId>,
+    activity: Option<ActivityIndicator>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -37,6 +39,7 @@ impl WorkspaceModel {
         snapshot: &ResourceSnapshot,
         focused: &SelectedTarget,
         history: &NavigationHistory,
+        notifications: &NotificationState,
     ) -> Self {
         let (session_id, workspace_id) = focused_ancestry(snapshot, focused);
         let Some(session) = snapshot
@@ -66,6 +69,14 @@ impl WorkspaceModel {
                         destination: (!closing)
                             .then(|| history.workspace_destination(workspace))
                             .flatten(),
+                        activity: notifications.indicator(
+                            &workspace
+                                .tabs
+                                .iter()
+                                .flat_map(|tab| &tab.panes)
+                                .copied()
+                                .collect::<Vec<_>>(),
+                        ),
                     }
                 })
                 .collect(),
@@ -120,8 +131,9 @@ impl WorkspaceSidebarState {
         snapshot: &ResourceSnapshot,
         focused: &SelectedTarget,
         history: &NavigationHistory,
+        notifications: &NotificationState,
     ) -> Option<Self> {
-        let model = WorkspaceModel::from_snapshot(snapshot, focused, history);
+        let model = WorkspaceModel::from_snapshot(snapshot, focused, history, notifications);
         let selected = model
             .items
             .iter()
@@ -140,6 +152,7 @@ impl WorkspaceSidebarState {
         snapshot: &ResourceSnapshot,
         focused: &SelectedTarget,
         history: &NavigationHistory,
+        notifications: &NotificationState,
     ) {
         let previous = self.selected;
         let previous_current = self
@@ -148,7 +161,7 @@ impl WorkspaceSidebarState {
             .iter()
             .find(|item| item.current)
             .map(|item| item.id);
-        self.model = WorkspaceModel::from_snapshot(snapshot, focused, history);
+        self.model = WorkspaceModel::from_snapshot(snapshot, focused, history, notifications);
         let current = self
             .model
             .items
@@ -250,12 +263,14 @@ impl WorkspaceSidebarState {
         area: Rect,
         position: WorkspaceSidebarPosition,
         ui: &UiConfig,
+        spinner_frame: usize,
         buffer: &mut Buffer,
     ) {
         render_model(
             &self.model,
             self.selected,
             Some(&self.status),
+            spinner_frame,
             area,
             position,
             ui,
@@ -304,25 +319,45 @@ impl WorkspaceSidebarState {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the renderer keeps resource, client, configuration, and target inputs explicit"
+)]
 pub(super) fn render_workspace_sidebar(
     snapshot: Option<&ResourceSnapshot>,
     focused: &SelectedTarget,
     history: &NavigationHistory,
+    notifications: &NotificationState,
+    spinner_frame: usize,
     area: Rect,
     position: WorkspaceSidebarPosition,
     ui: &UiConfig,
     buffer: &mut Buffer,
 ) {
     let model = snapshot
-        .map(|snapshot| WorkspaceModel::from_snapshot(snapshot, focused, history))
+        .map(|snapshot| WorkspaceModel::from_snapshot(snapshot, focused, history, notifications))
         .unwrap_or_default();
-    render_model(&model, None, None, area, position, ui, buffer);
+    render_model(
+        &model,
+        None,
+        None,
+        spinner_frame,
+        area,
+        position,
+        ui,
+        buffer,
+    );
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "passive and interactive sidebar rendering share one explicit model renderer"
+)]
 fn render_model(
     model: &WorkspaceModel,
     selected: Option<WorkspaceId>,
     status: Option<&WorkspaceStatus>,
+    spinner_frame: usize,
     area: Rect,
     position: WorkspaceSidebarPosition,
     ui: &UiConfig,
@@ -403,10 +438,12 @@ fn render_model(
             current: true,
             closing: false,
             destination: None,
+            activity: None,
         };
         render_workspace_row(
             &item,
             false,
+            spinner_frame,
             Rect::new(content.x, row_y, content.width, row_height.min(2)),
             ui,
             buffer,
@@ -448,6 +485,7 @@ fn render_model(
                     render_workspace_row(
                         item,
                         selected == Some(item.id),
+                        spinner_frame,
                         Rect::new(
                             content.x,
                             y,
@@ -511,6 +549,7 @@ fn render_sidebar_chrome(
 fn render_workspace_row(
     item: &WorkspaceItem,
     selected: bool,
+    spinner_frame: usize,
     area: Rect,
     ui: &UiConfig,
     buffer: &mut Buffer,
@@ -525,7 +564,10 @@ fn render_workspace_row(
         current: false,
         selected,
         closing: item.closing,
-        attention: false,
+        attention: matches!(
+            item.activity,
+            Some(ActivityIndicator::Blocked | ActivityIndicator::Completed)
+        ),
     };
     clear(
         area,
@@ -554,6 +596,18 @@ fn render_workspace_row(
         }
         "workspace.tab_count" => TokenValue::plain(item.tab_count.to_string()),
         "workspace.icon" => TokenValue::plain(icons.workspace.clone()),
+        "workspace.activity" => item.activity.map_or_else(
+            || TokenValue::plain(""),
+            |activity| {
+                let style = match activity {
+                    ActivityIndicator::Working => SemanticStyle::Activity,
+                    ActivityIndicator::Blocked | ActivityIndicator::Completed => {
+                        SemanticStyle::Attention
+                    }
+                };
+                TokenValue::styled(activity.marker(spinner_frame), style)
+            },
+        ),
         _ => TokenValue::plain(""),
     };
     let left = render_token_segments(
@@ -729,6 +783,7 @@ mod tests {
                             id: pane_id,
                             terminal_id: TerminalId::new(),
                             closing: false,
+                            activity: Default::default(),
                         }],
                     }],
                 }
@@ -779,6 +834,7 @@ mod tests {
             model,
             selected,
             status,
+            0,
             area,
             position,
             &UiConfig::default(),
@@ -804,6 +860,7 @@ mod tests {
             id: PaneId::new(),
             terminal_id: TerminalId::new(),
             closing: false,
+            activity: Default::default(),
         };
         feature.tabs.push(TabSnapshot {
             id: TabId::new(),
@@ -820,13 +877,23 @@ mod tests {
         remembered_target.terminal_id = remembered.terminal_id;
         history.record(&remembered_target);
 
-        let model = WorkspaceModel::from_snapshot(&snapshot, &focused, &history);
+        let model = WorkspaceModel::from_snapshot(
+            &snapshot,
+            &focused,
+            &history,
+            &NotificationState::default(),
+        );
         assert!(!model.items[0].current);
         assert!(model.items[1].current);
         assert_eq!(model.items[1].destination, Some(remembered.id));
 
         snapshot.sessions[0].workspaces[1].tabs[1].panes[0].closing = true;
-        let fallback = WorkspaceModel::from_snapshot(&snapshot, &focused, &history);
+        let fallback = WorkspaceModel::from_snapshot(
+            &snapshot,
+            &focused,
+            &history,
+            &NotificationState::default(),
+        );
         assert_eq!(
             fallback.items[1].destination,
             Some(snapshot.sessions[0].workspaces[1].tabs[0].panes[0].id)
@@ -838,7 +905,13 @@ mod tests {
         let (mut snapshot, focused) = fixture(&["main", "retiring", "feature"], 0);
         snapshot.sessions[0].workspaces[1].closing = true;
         let history = NavigationHistory::default();
-        let mut state = WorkspaceSidebarState::open(&snapshot, &focused, &history).unwrap();
+        let mut state = WorkspaceSidebarState::open(
+            &snapshot,
+            &focused,
+            &history,
+            &NotificationState::default(),
+        )
+        .unwrap();
         assert_eq!(
             state.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
             WorkspaceSidebarAction::Create
@@ -869,7 +942,7 @@ mod tests {
         );
 
         snapshot.sessions[0].workspaces.pop();
-        state.accept_resources(&snapshot, &focused, &history);
+        state.accept_resources(&snapshot, &focused, &history, &NotificationState::default());
         assert_eq!(
             state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             WorkspaceSidebarAction::Close
@@ -880,8 +953,12 @@ mod tests {
     fn passive_render_is_borderless_ordered_and_mirrors_its_divider() {
         let (mut snapshot, focused) = fixture(&["main", "bad\nname", "closing"], 0);
         snapshot.sessions[0].workspaces[2].closing = true;
-        let model =
-            WorkspaceModel::from_snapshot(&snapshot, &focused, &NavigationHistory::default());
+        let model = WorkspaceModel::from_snapshot(
+            &snapshot,
+            &focused,
+            &NavigationHistory::default(),
+            &NotificationState::default(),
+        );
         let (left, left_buffer) =
             rendered(&model, None, None, 24, 6, WorkspaceSidebarPosition::Left);
         assert!(left.contains("main"));
@@ -918,8 +995,12 @@ mod tests {
             &["one", "two", "three", "👩🏽‍💻 very long workspace", "five"],
             3,
         );
-        let model =
-            WorkspaceModel::from_snapshot(&snapshot, &focused, &NavigationHistory::default());
+        let model = WorkspaceModel::from_snapshot(
+            &snapshot,
+            &focused,
+            &NavigationHistory::default(),
+            &NotificationState::default(),
+        );
         for width in 1..24 {
             let (text, _) = rendered(&model, None, None, width, 3, WorkspaceSidebarPosition::Left);
             assert!(text.contains('●'), "width {width}: {text:?}");
@@ -930,7 +1011,13 @@ mod tests {
     fn active_render_marks_selection_and_exposes_compact_help() {
         let (snapshot, focused) = fixture(&["main", "feature"], 0);
         let history = NavigationHistory::default();
-        let mut state = WorkspaceSidebarState::open(&snapshot, &focused, &history).unwrap();
+        let mut state = WorkspaceSidebarState::open(
+            &snapshot,
+            &focused,
+            &history,
+            &NotificationState::default(),
+        )
+        .unwrap();
         state.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         let (ready, buffer) = rendered(
             &state.model,
@@ -970,8 +1057,12 @@ mod tests {
     #[test]
     fn passive_static_footer_never_replaces_the_only_workspace_row() {
         let (snapshot, focused) = fixture(&["main"], 0);
-        let model =
-            WorkspaceModel::from_snapshot(&snapshot, &focused, &NavigationHistory::default());
+        let model = WorkspaceModel::from_snapshot(
+            &snapshot,
+            &focused,
+            &NavigationHistory::default(),
+            &NotificationState::default(),
+        );
         let ui: UiConfig =
             toml::from_str("[workspace_sidebar]\nfooter = [{ text = 'FOOTER' }]\n").unwrap();
         let area = Rect::new(0, 0, 24, 1);
@@ -980,6 +1071,7 @@ mod tests {
             &model,
             None,
             None,
+            0,
             area,
             WorkspaceSidebarPosition::Left,
             &ui,

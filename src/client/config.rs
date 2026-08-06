@@ -60,6 +60,7 @@ pub(super) enum SemanticStyle {
     Current,
     Selected,
     Closing,
+    Activity,
     Attention,
     Error,
     Divider,
@@ -255,6 +256,7 @@ pub(super) struct StylesConfig {
     current: StyleConfig,
     selected: StyleConfig,
     closing: StyleConfig,
+    activity: StyleConfig,
     attention: StyleConfig,
     error: StyleConfig,
     divider: StyleConfig,
@@ -294,6 +296,7 @@ struct StylesPatch {
     current: Option<StylePatch>,
     selected: Option<StylePatch>,
     closing: Option<StylePatch>,
+    activity: Option<StylePatch>,
     attention: Option<StylePatch>,
     error: Option<StylePatch>,
     divider: Option<StylePatch>,
@@ -312,6 +315,7 @@ impl<'de> Deserialize<'de> for StylesConfig {
             (patch.current, &mut styles.current),
             (patch.selected, &mut styles.selected),
             (patch.closing, &mut styles.closing),
+            (patch.activity, &mut styles.activity),
             (patch.attention, &mut styles.attention),
             (patch.error, &mut styles.error),
             (patch.divider, &mut styles.divider),
@@ -345,6 +349,10 @@ impl Default for StylesConfig {
                 ..StyleConfig::default()
             },
             closing: with(ModifierName::Dim),
+            activity: StyleConfig {
+                foreground: Some(UiColor::LightCyan),
+                ..StyleConfig::default()
+            },
             attention: StyleConfig {
                 foreground: Some(UiColor::Yellow),
                 add_modifiers: vec![ModifierName::Bold],
@@ -371,6 +379,7 @@ impl StylesConfig {
             SemanticStyle::Current => &self.current,
             SemanticStyle::Selected => &self.selected,
             SemanticStyle::Closing => &self.closing,
+            SemanticStyle::Activity => &self.activity,
             SemanticStyle::Attention => &self.attention,
             SemanticStyle::Error => &self.error,
             SemanticStyle::Divider => &self.divider,
@@ -521,6 +530,11 @@ impl Default for ItemFormat {
                     prefix: " ".into(),
                     ..SegmentConfig::default()
                 },
+                SegmentConfig {
+                    token: Some("tab.activity".into()),
+                    prefix: " ".into(),
+                    ..SegmentConfig::default()
+                },
                 SegmentConfig::text(" "),
             ],
             min_width: default_tab_min_width(),
@@ -568,6 +582,16 @@ impl Default for TabBarConfig {
                     style: Some(SemanticStyle::Muted),
                     priority: 0,
                 },
+                GroupConfig {
+                    segments: vec![SegmentConfig {
+                        token: Some("client.waiting".into()),
+                        prefix: " ".into(),
+                        suffix: " ".into(),
+                        ..SegmentConfig::default()
+                    }],
+                    style: Some(SemanticStyle::Attention),
+                    priority: 255,
+                },
             ],
             item: ItemFormat::default(),
         }
@@ -595,11 +619,18 @@ impl Default for SidebarRowConfig {
                 SegmentConfig::text(" "),
             ],
             body: vec![SegmentConfig::token("workspace.name")],
-            right: vec![SegmentConfig {
-                token: Some("workspace.closing".into()),
-                prefix: " ".into(),
-                ..SegmentConfig::default()
-            }],
+            right: vec![
+                SegmentConfig {
+                    token: Some("workspace.activity".into()),
+                    prefix: " ".into(),
+                    ..SegmentConfig::default()
+                },
+                SegmentConfig {
+                    token: Some("workspace.closing".into()),
+                    prefix: " ".into(),
+                    ..SegmentConfig::default()
+                },
+            ],
             detail: vec![SegmentConfig {
                 token: Some("workspace.root".into()),
                 style: Some(SemanticStyle::Muted),
@@ -1015,6 +1046,8 @@ fn token_allowed(scope: TokenScope, token: &str) -> bool {
                 | "tab.pane_count"
                 | "client.zoom"
                 | "client.help"
+                | "client.waiting"
+                | "session.waiting"
         ),
         TokenScope::Tab => matches!(
             token,
@@ -1025,6 +1058,7 @@ fn token_allowed(scope: TokenScope, token: &str) -> bool {
                 | "tab.closing"
                 | "tab.pane_count"
                 | "tab.icon"
+                | "tab.activity"
         ),
         TokenScope::Workspace => matches!(
             token,
@@ -1037,6 +1071,7 @@ fn token_allowed(scope: TokenScope, token: &str) -> bool {
                 | "workspace.closing"
                 | "workspace.tab_count"
                 | "workspace.icon"
+                | "workspace.activity"
         ),
         TokenScope::Sidebar => matches!(
             token,
