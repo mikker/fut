@@ -762,6 +762,10 @@ async fn public_cli_lists_creates_and_closes_resources() {
         .split_whitespace()
         .find_map(|field| field.strip_prefix("workspace="))
         .unwrap();
+    let tab_pane = created
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("pane="))
+        .unwrap();
     let terminal_pid: u32 = created
         .split_whitespace()
         .find_map(|field| field.strip_prefix("pid="))
@@ -776,6 +780,51 @@ async fn public_cli_lists_creates_and_closes_resources() {
     assert!(listed.contains(workspace));
     assert!(listed.contains(cwd.to_str().unwrap()));
     assert!(listed.contains("session "));
+
+    let tabs = harness
+        .cli()
+        .args(["tab", "list", workspace])
+        .output()
+        .unwrap();
+    assert!(
+        tabs.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tabs.stderr)
+    );
+    let tabs = String::from_utf8(tabs.stdout).unwrap();
+    assert!(tabs.contains("revision="));
+    let tab = tabs
+        .lines()
+        .find_map(|line| line.strip_prefix("tab "))
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    assert!(tabs.contains(&format!("layout={tab_pane}")), "{tabs}");
+
+    let panes: Value = serde_json::from_slice(
+        &harness
+            .cli()
+            .args(["pane", "list", &tab, "--json"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(panes["command"], "pane.list");
+    assert_eq!(panes["result"]["tab_id"], tab);
+    assert_eq!(panes["result"]["layout"]["pane_id"], tab_pane);
+    assert_eq!(panes["result"]["panes"][0]["id"], tab_pane);
+
+    let missing = harness
+        .cli()
+        .args(["pane", "list", &Uuid::new_v4().to_string(), "--json"])
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    let missing: Value = serde_json::from_slice(&missing.stderr).unwrap();
+    assert_eq!(missing["error"]["code"], "not_found");
 
     let closed = harness
         .cli()

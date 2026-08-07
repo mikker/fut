@@ -27,7 +27,8 @@ use crate::{
         AcknowledgedCommand, ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION,
         PROTOCOL_VERSION_0_1, RenameSelector, ServerMessage, codec, decode_payload, encode_payload,
     },
-    resources::{ResourceSnapshot, SessionSelector, TargetSelector},
+    resources::{ResourceSnapshot, SessionSelector, TabSnapshot, TargetSelector},
+    splits::{SplitAxis, SplitTree},
 };
 
 #[derive(Parser)]
@@ -75,13 +76,13 @@ enum Command {
         #[command(subcommand)]
         command: WorkspaceCommand,
     },
-    /// Create, attach, rename, or close a tab.
+    /// Create, list, attach, rename, or close a tab.
     Tab {
         /// Tab operation to perform.
         #[command(subcommand)]
         command: TabCommand,
     },
-    /// Create, attach, move, or close a pane.
+    /// Create, list, attach, move, or close a pane.
     Pane {
         /// Pane operation to perform.
         #[command(subcommand)]
@@ -170,6 +171,12 @@ enum TabCommand {
         #[arg(last = true, value_hint = ValueHint::CommandWithArguments)]
         command: Vec<String>,
     },
+    /// List the tabs of a workspace, including each tab's split layout.
+    List {
+        /// Raw UUID of the workspace that owns the tabs.
+        #[arg(add = ArgValueCompleter::new(completion::tab_new))]
+        workspace_id: WorkspaceId,
+    },
     /// Attach to a tab on the existing daemon.
     Attach {
         /// Raw tab UUID; the tab must contain exactly one open terminal.
@@ -205,6 +212,12 @@ enum PaneCommand {
         /// Child program and its direct argv, following `--`; defaults to the shell.
         #[arg(last = true, value_hint = ValueHint::CommandWithArguments)]
         command: Vec<String>,
+    },
+    /// List the panes of a tab, including the tab's split layout.
+    List {
+        /// Raw UUID of the tab that owns the panes.
+        #[arg(add = ArgValueCompleter::new(completion::pane_new))]
+        tab_id: TabId,
     },
     /// Attach to a pane on the existing daemon.
     Attach {
@@ -566,17 +579,61 @@ async fn execute(cli: Cli) -> Result<()> {
                 other => unexpected(other),
             }
         }
-        Some(Command::List) => match control(&socket, ClientMessage::ListResources).await? {
-            ServerMessage::Resources { snapshot } => {
-                if cli.json {
-                    output(true, "list", &snapshot, String::new())
-                } else {
-                    print_resources(&snapshot);
-                    Ok(())
-                }
+        Some(Command::List) => {
+            let snapshot = list_resources(&socket).await?;
+            if cli.json {
+                output(true, "list", &snapshot, String::new())
+            } else {
+                print_resources(&snapshot);
+                Ok(())
             }
-            other => unexpected(other),
-        },
+        }
+        Some(Command::Tab {
+            command: TabCommand::List { workspace_id },
+        }) => {
+            let snapshot = list_resources(&socket).await?;
+            let workspace = snapshot
+                .sessions
+                .iter()
+                .flat_map(|session| &session.workspaces)
+                .find(|workspace| workspace.id == workspace_id)
+                .ok_or_else(|| {
+                    CliError::new("not_found", format!("workspace {workspace_id} not found"))
+                })?;
+            output(
+                cli.json,
+                "tab.list",
+                json!({
+                    "revision": snapshot.revision,
+                    "workspace_id": workspace_id,
+                    "tabs": workspace.tabs,
+                }),
+                render_tabs(snapshot.revision, &workspace.tabs),
+            )
+        }
+        Some(Command::Pane {
+            command: PaneCommand::List { tab_id },
+        }) => {
+            let snapshot = list_resources(&socket).await?;
+            let tab = snapshot
+                .sessions
+                .iter()
+                .flat_map(|session| &session.workspaces)
+                .flat_map(|workspace| &workspace.tabs)
+                .find(|tab| tab.id == tab_id)
+                .ok_or_else(|| CliError::new("not_found", format!("tab {tab_id} not found")))?;
+            output(
+                cli.json,
+                "pane.list",
+                json!({
+                    "revision": snapshot.revision,
+                    "tab_id": tab_id,
+                    "layout": tab.layout,
+                    "panes": tab.panes,
+                }),
+                render_tabs(snapshot.revision, std::slice::from_ref(tab)),
+            )
+        }
         Some(Command::Daemon {
             command: DaemonCommand::Run { cwd, command },
         }) => {
@@ -967,6 +1024,55 @@ fn session_selector(value: &str) -> SessionSelector {
         .unwrap_or_else(|_| SessionSelector::Name(value.into()))
 }
 
+async fn list_resources(socket: &std::path::Path) -> Result<ResourceSnapshot> {
+    match control(socket, ClientMessage::ListResources).await? {
+        ServerMessage::Resources { snapshot } => Ok(snapshot),
+        other => unexpected(other),
+    }
+}
+
+fn render_tabs(revision: u64, tabs: &[TabSnapshot]) -> String {
+    let mut lines = vec![format!("revision={revision}")];
+    for tab in tabs {
+        lines.push(format!(
+            "tab {} {:?}{} layout={}",
+            tab.id,
+            tab.name,
+            if tab.closing { " closing" } else { "" },
+            render_layout(&tab.layout)
+        ));
+        for pane in &tab.panes {
+            lines.push(format!(
+                "  pane {} terminal={}{}",
+                pane.id,
+                pane.terminal_id,
+                if pane.closing { " closing" } else { "" }
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
+fn render_layout(layout: &SplitTree) -> String {
+    match layout {
+        SplitTree::Leaf { pane_id } => pane_id.to_string(),
+        SplitTree::Branch {
+            axis,
+            first_basis_points,
+            first,
+            second,
+        } => format!(
+            "{}({first_basis_points},{},{})",
+            match axis {
+                SplitAxis::Horizontal => "horizontal",
+                SplitAxis::Vertical => "vertical",
+            },
+            render_layout(first),
+            render_layout(second)
+        ),
+    }
+}
+
 fn print_resources(snapshot: &ResourceSnapshot) {
     println!("revision={}", snapshot.revision);
     for session in &snapshot.sessions {
@@ -1264,6 +1370,8 @@ mod tests {
             vec!["fut", "workspace", "rename", &workspace, "new"],
             vec!["fut", "workspace", "close", &workspace],
             vec!["fut", "tab", "new", &workspace],
+            vec!["fut", "tab", "list", &workspace],
+            vec!["fut", "pane", "list", &tab],
             vec!["fut", "tab", "attach", &tab],
             vec!["fut", "tab", "rename", &tab, "new"],
             vec!["fut", "tab", "close", &tab],
@@ -1278,6 +1386,47 @@ mod tests {
         ] {
             Cli::try_parse_from(args).unwrap();
         }
+    }
+
+    #[test]
+    fn layout_listings_render_panes_in_leaf_order_with_the_split_tree() {
+        use crate::{
+            resources::PaneSnapshot,
+            splits::{HALF_RATIO, SplitDirection},
+        };
+
+        let first = PaneId::new();
+        let second = PaneId::new();
+        let mut layout = SplitTree::leaf(first);
+        assert!(layout.split(first, SplitDirection::Down, second));
+        let pane = |id| PaneSnapshot {
+            id,
+            terminal_id: TerminalId::new(),
+            closing: false,
+            activity: Default::default(),
+        };
+        let tab = TabSnapshot {
+            id: TabId::new(),
+            name: "agent".into(),
+            closing: false,
+            layout,
+            panes: vec![pane(first), pane(second)],
+        };
+
+        let rendered = render_tabs(7, std::slice::from_ref(&tab));
+        let lines: Vec<_> = rendered.lines().collect();
+        assert_eq!(lines[0], "revision=7");
+        assert_eq!(
+            lines[1],
+            format!(
+                "tab {} \"agent\" layout=vertical({HALF_RATIO},{first},{second})",
+                tab.id
+            )
+        );
+        assert!(lines[2].starts_with(&format!("  pane {first} terminal=")));
+        assert!(lines[3].starts_with(&format!("  pane {second} terminal=")));
+
+        assert_eq!(render_tabs(3, &[]), "revision=3");
     }
 
     #[test]
