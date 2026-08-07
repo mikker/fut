@@ -30,5 +30,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 assert_cmd = "2"
+criterion = "0.5"
 predicates = "3"
 tempfile = "3"
+
+[[bench]]
+name = "render"
+harness = false

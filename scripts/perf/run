@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Render-performance harness. Starts a disposable daemon with a plain /bin/sh
+# pane, then drives it with the headless perf client (examples/perf_client.rs)
+# and prints throughput/latency reports.
+#
+#   scripts/perf/run [flood|styled|latency|all]   (default: all)
+#
+# Each scenario gets a fresh daemon so measurements are independent.
+# FUT_PERF_COUNT overrides the flood line count (default 100000).
+
+PROJECT_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+PERF_ROOT="$PROJECT_ROOT/target/fut-perf"
+RUNTIME_DIR="$PERF_ROOT/runtime"
+SOCKET="$RUNTIME_DIR/fut.sock"
+DAEMON_LOG="$PERF_ROOT/daemon.log"
+FUT_BIN="$PROJECT_ROOT/target/release/fut"
+PERF_CLIENT="$PROJECT_ROOT/target/release/examples/perf_client"
+COUNT=${FUT_PERF_COUNT:-100000}
+DAEMON_PID=""
+
+build() {
+  (cd "$PROJECT_ROOT" && cargo build --release --quiet --bin fut --example perf_client)
+}
+
+stop_daemon() {
+  if [[ -S "$SOCKET" ]]; then
+    "$FUT_BIN" --socket "$SOCKET" daemon shutdown >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$DAEMON_PID" ]] && kill -0 "$DAEMON_PID" 2>/dev/null; then
+    for _ in $(seq 40); do
+      kill -0 "$DAEMON_PID" 2>/dev/null || break
+      sleep 0.05
+    done
+    kill "$DAEMON_PID" 2>/dev/null || true
+  fi
+  DAEMON_PID=""
+}
+
+start_daemon() {
+  stop_daemon
+  rm -rf "$PERF_ROOT"
+  mkdir -p "$RUNTIME_DIR" "$PERF_ROOT/cwd"
+  chmod 700 "$RUNTIME_DIR"
+  "$FUT_BIN" --socket "$SOCKET" daemon run --cwd "$PERF_ROOT/cwd" -- /bin/sh \
+    >"$DAEMON_LOG" 2>&1 &
+  DAEMON_PID=$!
+  for _ in $(seq 100); do
+    if "$FUT_BIN" --socket "$SOCKET" daemon ping >/dev/null 2>&1; then
+      return
+    fi
+    if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+      echo "perf daemon exited during startup:" >&2
+      cat "$DAEMON_LOG" >&2 || true
+      exit 1
+    fi
+    sleep 0.05
+  done
+  echo "Timed out waiting for the perf daemon. See $DAEMON_LOG" >&2
+  exit 1
+}
+
+scenario() {
+  local name=$1
+  start_daemon
+  "$PERF_CLIENT" --socket "$SOCKET" --count "$COUNT" "$name"
+  echo
+}
+
+trap 'stop_daemon' EXIT INT TERM
+
+build
+case ${1:-all} in
+  flood | styled | latency)
+    scenario "$1"
+    ;;
+  all)
+    scenario flood
+    scenario styled
+    scenario latency
+    ;;
+  *)
+    echo "Usage: scripts/perf/run [flood|styled|latency|all]" >&2
+    exit 2
+    ;;
+esac

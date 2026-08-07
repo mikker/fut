@@ -14,6 +14,7 @@ mod layout;
 mod navigation;
 mod navigator;
 mod notifications;
+mod perf;
 mod presentation;
 mod rename;
 mod sidebar;
@@ -227,6 +228,7 @@ async fn run(
     let mut cheatsheet_at: Option<time::Instant> = None;
     let mut cheatsheet_visible = false;
     let mut spinner_frame = 0usize;
+    let mut perf = perf::PerfLog::from_env();
     let mut redraw = time::interval(Duration::from_millis(16));
     redraw.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut spinner = time::interval(Duration::from_millis(100));
@@ -251,7 +253,12 @@ async fn run(
                     }
                     break;
                 };
-                let envelope: Envelope<ServerMessage> = decode_payload(&frame?)?;
+                let frame = frame?;
+                let decode_started = std::time::Instant::now();
+                let envelope: Envelope<ServerMessage> = decode_payload(&frame)?;
+                if let Some(perf) = perf.as_mut() {
+                    perf.record("decode", decode_started.elapsed(), frame.len());
+                }
                 let request_id = envelope.request_id;
                 match envelope.message {
                     ServerMessage::Snapshot { terminal_id, screen } => {
@@ -1226,6 +1233,7 @@ async fn run(
                 .then(|| resources.attention_revision(focused_terminal_id))
                 .flatten()
                 .filter(|_| rename.is_none() && notice.is_none());
+                let draw_started = std::time::Instant::now();
                 io::stdout().sync_update(|_| {
                     terminal.draw(|frame| {
                         let area = frame.area();
@@ -1341,6 +1349,9 @@ async fn run(
                         }
                     })
                 })??;
+                if let Some(perf) = perf.as_mut() {
+                    perf.record("draw", draw_started.elapsed(), 0);
+                }
                 view.mark_drawn();
                 force_draw = rendered_attention
                     .is_some_and(|revision| resources.observe(focused_terminal_id, revision));

@@ -45,6 +45,14 @@ run = "bash scripts/demo attach"
 description = "Stop and remove the Fut demo"
 run = "bash scripts/demo clean"
 
+[tasks."perf:bench"]
+description = "Run render-pipeline microbenchmarks (feed/encode/decode/clone)"
+run = "cargo bench --bench render"
+
+[tasks."perf:e2e"]
+description = "Measure end-to-end snapshot throughput and input latency against a disposable daemon"
+run = "bash scripts/perf/run"
+
 [tasks."docs:setup"]
 description = "Install local documentation dependencies"
 run = "bundle config set --local path .bundle && bundle install"

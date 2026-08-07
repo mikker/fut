@@ -1,0 +1,45 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Summarizes a FUT_PERF_LOG CSV produced by the real client
+# (src/client/perf.rs). Usage:
+#
+#   FUT_PERF_LOG=/tmp/fut-frames.csv fut attach ...   # exercise the UI
+#   scripts/perf/report /tmp/fut-frames.csv
+
+path = ARGV[0] or abort "Usage: scripts/perf/report FRAME_LOG.csv"
+
+events = Hash.new { |hash, key| hash[key] = [] }
+bytes = Hash.new(0)
+timestamps = []
+
+File.foreach(path).drop(1).each do |line|
+  ts, event, dur, size = line.strip.split(",")
+  next unless dur
+  events[event] << Integer(dur)
+  bytes[event] += Integer(size)
+  timestamps << Integer(ts)
+end
+
+abort "No events in #{path}" if timestamps.empty?
+
+def percentile(sorted, fraction)
+  sorted[[(sorted.size * fraction).ceil - 1, 0].max]
+end
+
+wall_s = (timestamps.last - timestamps.first) / 1_000_000.0
+puts format("window: %.1f s", wall_s)
+
+events.sort.each do |event, durations|
+  sorted = durations.sort
+  total_ms = durations.sum / 1000.0
+  row = format(
+    "%-8s n=%-6d rate=%6.1f/s  avg=%6.0fus  p95=%6.0fus  max=%6.0fus  busy=%4.1f%%",
+    event, durations.size, durations.size / wall_s,
+    durations.sum.to_f / durations.size,
+    percentile(sorted, 0.95), sorted.last,
+    100.0 * total_ms / (wall_s * 1000.0)
+  )
+  row += format("  wire=%.1fMiB", bytes[event] / 1024.0 / 1024.0) if bytes[event].positive?
+  puts row
+end
