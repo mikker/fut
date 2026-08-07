@@ -162,7 +162,7 @@ impl NavigatorState {
             (KeyCode::Char('['), _) => self.jump_back(2),
             (KeyCode::Char(']'), _) => self.jump_forward(2),
             (KeyCode::Left, _) => self.select_parent(),
-            (KeyCode::Right, _) => self.select_next_sibling(),
+            (KeyCode::Right, _) => self.select_first_child(),
             (KeyCode::Enter, _)
                 if matches!(
                     self.status,
@@ -271,19 +271,18 @@ impl NavigatorState {
         }
     }
 
-    fn select_next_sibling(&mut self) {
+    fn select_first_child(&mut self) {
+        // Pre-order: a row's first child is the row right after it, one level
+        // deeper.
         let Some(current) = self.rows.get(self.selected) else {
             return;
         };
-        let depth = current.depth;
-        for index in self.selected + 1..self.rows.len() {
-            if self.rows[index].depth < depth {
-                break;
-            }
-            if self.rows[index].depth == depth {
-                self.selected = index;
-                break;
-            }
+        if self
+            .rows
+            .get(self.selected + 1)
+            .is_some_and(|next| next.depth == current.depth + 1)
+        {
+            self.selected += 1;
         }
     }
 
@@ -978,7 +977,7 @@ mod tests {
     }
 
     #[test]
-    fn arrows_walk_to_parent_and_next_sibling() {
+    fn arrows_walk_to_parent_and_first_child() {
         let mut nav = tree();
         nav.selected = 4;
         press(&mut nav, KeyCode::Left);
@@ -986,12 +985,11 @@ mod tests {
         press(&mut nav, KeyCode::Left);
         assert_eq!(nav.selected, 1, "T1 up to W1");
         press(&mut nav, KeyCode::Right);
-        assert_eq!(nav.selected, 7, "W1 across to W2");
+        assert_eq!(nav.selected, 2, "W1 down to T1");
         press(&mut nav, KeyCode::Right);
-        assert_eq!(nav.selected, 7, "W2 has no next sibling in S1");
-        nav.selected = 4;
+        assert_eq!(nav.selected, 3, "T1 down to P1");
         press(&mut nav, KeyCode::Right);
-        assert_eq!(nav.selected, 4, "P2 has no next sibling in T1");
+        assert_eq!(nav.selected, 3, "panes have no children");
         nav.selected = 0;
         press(&mut nav, KeyCode::Left);
         assert_eq!(nav.selected, 0, "sessions have no parent");
