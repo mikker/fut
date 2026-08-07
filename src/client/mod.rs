@@ -2873,6 +2873,10 @@ struct Screen<'a>(&'a ScreenSnapshot);
 impl Widget for Screen<'_> {
     fn render(self, area: Rect, buffer: &mut Buffer) {
         let screen = self.0;
+        // Adjacent cells frequently share the same style (runs of plain
+        // text, whole-line backgrounds, ...), so remember the last resolved
+        // `Style` and reuse it instead of rebuilding one per cell.
+        let mut resolved: Option<(CellStyle, bool, Style)> = None;
         for row in 0..screen.size.rows.min(area.height) {
             for column in 0..screen.size.columns.min(area.width) {
                 let index =
@@ -2880,10 +2884,20 @@ impl Widget for Screen<'_> {
                 let Some(cell) = screen.cells.get(index) else {
                     continue;
                 };
+                let cell_style = match resolved {
+                    Some((style, selected, cell_style))
+                        if style == cell.style && selected == cell.selected =>
+                    {
+                        cell_style
+                    }
+                    _ => {
+                        let cell_style = style(cell.style, cell.selected);
+                        resolved = Some((cell.style, cell.selected, cell_style));
+                        cell_style
+                    }
+                };
                 if let Some(target) = buffer.cell_mut((area.x + column, area.y + row)) {
-                    target
-                        .set_symbol(&cell.contents)
-                        .set_style(style(cell.style, cell.selected));
+                    target.set_symbol(&cell.contents).set_style(cell_style);
                 }
             }
         }
