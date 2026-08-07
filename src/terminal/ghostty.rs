@@ -160,7 +160,20 @@ impl GhosttyTerminal {
     }
 
     pub(super) fn feed(&mut self, bytes: &[u8]) -> Result<Option<ScreenSnapshot>> {
+        self.vt_write(bytes);
+        self.snapshot_after_feed()
+    }
+
+    /// Parse-only half of `feed`, so a caller can push several PTY chunks
+    /// through the parser and pay for one snapshot at the end of the batch.
+    pub(super) fn vt_write(&mut self, bytes: &[u8]) {
         self.terminal.vt_write(bytes);
+    }
+
+    /// Snapshot half of `feed`. Respects synchronized-output suppression the
+    /// same way `feed` always has, whether called once per chunk or once per
+    /// drained batch of chunks.
+    pub(super) fn snapshot_after_feed(&mut self) -> Result<Option<ScreenSnapshot>> {
         if self.holds_synchronized_output()? {
             return Ok(None);
         }

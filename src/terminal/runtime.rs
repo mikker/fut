@@ -29,6 +29,9 @@ use super::{
 const QUEUE_CAPACITY: usize = 64;
 const OUTPUT_QUEUE_CAPACITY: usize = 16;
 const DROP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+// Bound how much PTY output one drain pass parses before it snapshots, so a
+// very chatty PTY still lets control messages (keystrokes) interleave promptly.
+const OUTPUT_DRAIN_BYTE_BUDGET: usize = 2 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct SpawnSpec {
@@ -767,7 +770,7 @@ fn run(
             channel::select! {
                 recv(queues.output.receiver) -> message => match message {
                     Ok(message) => {
-                        reader_complete = consume_output_message(
+                        reader_complete = drain_output_batch(
                             &mut queues.output,
                             message,
                             terminal,
@@ -903,6 +906,56 @@ fn publish_copy_exit(
     }
 }
 
+/// Parse every `Bytes` message already sitting in the output queue behind
+/// `first` and build a single snapshot at the end, instead of snapshotting
+/// after every PTY read. A non-`Bytes` message ends the drain immediately
+/// and is handled exactly as `consume_output_message` would handle it on its
+/// own, after any pending bytes are snapshotted so its state is up to date.
+fn drain_output_batch(
+    output: &mut OutputQueue,
+    first: OutputMessage,
+    terminal: &mut GhosttyTerminal,
+    publishers: &RuntimePublishers<'_>,
+) -> bool {
+    let mut budget = OUTPUT_DRAIN_BYTE_BUDGET;
+    let mut fed_any = false;
+    let mut pending = Some(first);
+    loop {
+        let message = match pending.take() {
+            Some(message) => message,
+            None => match output.receiver.try_recv() {
+                Ok(message) => message,
+                Err(_) => break,
+            },
+        };
+        let OutputMessage::Bytes(bytes) = message else {
+            if fed_any {
+                publish_optional(
+                    terminal.snapshot_after_feed(),
+                    publishers.snapshots,
+                    publishers.events,
+                );
+            }
+            return consume_output_message(output, message, terminal, publishers);
+        };
+        fed_any = true;
+        budget = budget.saturating_sub(bytes.len());
+        terminal.vt_write(&bytes);
+        output.record_consumed();
+        if budget == 0 {
+            break;
+        }
+    }
+    if fed_any {
+        publish_optional(
+            terminal.snapshot_after_feed(),
+            publishers.snapshots,
+            publishers.events,
+        );
+    }
+    false
+}
+
 fn consume_output_message(
     output: &mut OutputQueue,
     message: OutputMessage,
@@ -1031,9 +1084,11 @@ fn output_queue() -> (OutputProducer, OutputQueue) {
 }
 
 fn read_pty(mut reader: Box<dyn Read + Send>, output: OutputProducer) {
-    // Keep parser work per runtime turn bounded so control latency does not
-    // depend on how much output a single PTY read happened to return.
-    let mut buffer = vec![0; 1024];
+    // The VT thread now drains and batches everything already queued before
+    // it snapshots (see `drain_output_batch`), so a large read buffer here
+    // just means fewer, bigger chunks to hand off rather than more parser
+    // turns — control latency is bounded by the drain's byte budget instead.
+    let mut buffer = vec![0; 64 * 1024];
     loop {
         match reader.read(&mut buffer) {
             Ok(0) => {
