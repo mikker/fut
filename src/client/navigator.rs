@@ -153,6 +153,16 @@ impl NavigatorState {
             (KeyCode::Char('d'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.selected = (self.selected + page).min(last)
             }
+            (KeyCode::Char('s'), _) => self.cycle_depth(0),
+            (KeyCode::Char('w'), _) => self.cycle_depth(1),
+            (KeyCode::Char('t'), _) => self.cycle_depth(2),
+            (KeyCode::Char('p'), _) => self.cycle_depth(3),
+            (KeyCode::Char('K'), _) => self.jump_back(1),
+            (KeyCode::Char('J'), _) => self.jump_forward(1),
+            (KeyCode::Char('['), _) => self.jump_back(2),
+            (KeyCode::Char(']'), _) => self.jump_forward(2),
+            (KeyCode::Left, _) => self.select_parent(),
+            (KeyCode::Right, _) => self.select_next_sibling(),
             (KeyCode::Enter, _)
                 if matches!(
                     self.status,
@@ -194,6 +204,97 @@ impl NavigatorState {
         true
     }
 
+    /// Cycle through rows of one kind within the selection's enclosing scope:
+    /// `s` through sessions, `w` through workspaces of the current session,
+    /// `t` through tabs of the current workspace, `p` through panes of the
+    /// current tab. From a shallower row, descend to the first such row inside
+    /// its subtree.
+    fn cycle_depth(&mut self, depth: u16) {
+        let Some(current) = self.rows.get(self.selected) else {
+            return;
+        };
+        if current.depth < depth {
+            let end = self.subtree_end(self.selected);
+            if let Some(index) =
+                (self.selected + 1..end).find(|&index| self.rows[index].depth == depth)
+            {
+                self.selected = index;
+            }
+            return;
+        }
+        // Siblings of this kind live between the enclosing ancestor and the
+        // next row that is at least as shallow as that ancestor.
+        let start = (0..self.selected)
+            .rev()
+            .find(|&index| self.rows[index].depth < depth)
+            .map_or(0, |index| index + 1);
+        let end = (start..self.rows.len())
+            .find(|&index| self.rows[index].depth < depth)
+            .unwrap_or(self.rows.len());
+        let mut candidates = (start..end).filter(|&index| self.rows[index].depth == depth);
+        let next = candidates
+            .clone()
+            .find(|&index| index > self.selected)
+            .or_else(|| candidates.next());
+        if let Some(index) = next {
+            self.selected = index;
+        }
+    }
+
+    fn jump_forward(&mut self, depth: u16) {
+        if let Some(index) =
+            (self.selected + 1..self.rows.len()).find(|&index| self.rows[index].depth == depth)
+        {
+            self.selected = index;
+        }
+    }
+
+    fn jump_back(&mut self, depth: u16) {
+        if let Some(index) = (0..self.selected)
+            .rev()
+            .find(|&index| self.rows[index].depth == depth)
+        {
+            self.selected = index;
+        }
+    }
+
+    fn select_parent(&mut self) {
+        let Some(current) = self.rows.get(self.selected) else {
+            return;
+        };
+        let depth = current.depth;
+        if let Some(index) = (0..self.selected)
+            .rev()
+            .find(|&index| self.rows[index].depth < depth)
+        {
+            self.selected = index;
+        }
+    }
+
+    fn select_next_sibling(&mut self) {
+        let Some(current) = self.rows.get(self.selected) else {
+            return;
+        };
+        let depth = current.depth;
+        for index in self.selected + 1..self.rows.len() {
+            if self.rows[index].depth < depth {
+                break;
+            }
+            if self.rows[index].depth == depth {
+                self.selected = index;
+                break;
+            }
+        }
+    }
+
+    /// One past the last row of the subtree rooted at `index`.
+    fn subtree_end(&self, index: usize) -> usize {
+        let depth = self.rows[index].depth;
+        (index + 1..self.rows.len())
+            .find(|&next| self.rows[next].depth <= depth)
+            .unwrap_or(self.rows.len())
+    }
+
     fn keep_visible(&mut self, height: usize) {
         let height = height.max(1);
         if self.selected < self.scroll {
@@ -225,7 +326,7 @@ impl NavigatorState {
                 }
                 NavigatorStatus::Ready => match self.rows.get(self.selected) {
                     Some(row) if row.closing => "Closing…  ↑↓/jk move  esc cancel".to_owned(),
-                    _ => "↑↓/jk move  enter switch  esc cancel".to_owned(),
+                    _ => "↑↓/jk move  s/w/t/p cycle  ←→ tree  enter switch  esc cancel".to_owned(),
                 },
             };
             render_footer(area, &format!(" {footer}"), buffer);
@@ -802,6 +903,98 @@ mod tests {
         let (text, _) = rendered(&mut nav, 40, 6);
         assert!(!text.contains("navigator"));
         assert_eq!(text.lines().filter(|line| line.contains("move")).count(), 1);
+    }
+
+    /// Two sessions: S1(W1(T1(P1 P2) T2(P3)) W2(T3(P4))) S2(W3(T4(P5))).
+    fn tree() -> NavigatorState {
+        let row = |depth: u16| NavigatorRow {
+            key: ResourceKey::Pane(PaneId::new()),
+            depth,
+            label: String::new(),
+            current: false,
+            closing: false,
+            destination: None,
+            activity: None,
+        };
+        let mut nav = NavigatorState::open(&fixture().1);
+        nav.rows = [0, 1, 2, 3, 3, 2, 3, 1, 2, 3, 0, 1, 2, 3]
+            .into_iter()
+            .map(row)
+            .collect();
+        nav.status = NavigatorStatus::Ready;
+        nav
+    }
+
+    fn press(nav: &mut NavigatorState, code: KeyCode) {
+        nav.key(KeyEvent::new(code, KeyModifiers::NONE), 10);
+    }
+
+    #[test]
+    fn kind_keys_cycle_within_the_enclosing_scope_and_descend_from_above() {
+        let mut nav = tree();
+        // From P1 (3): panes wrap within T1, tabs and workspaces and sessions
+        // cycle within their own parents.
+        nav.selected = 3;
+        press(&mut nav, KeyCode::Char('p'));
+        assert_eq!(nav.selected, 4);
+        press(&mut nav, KeyCode::Char('p'));
+        assert_eq!(nav.selected, 3, "pane cycle wraps inside T1");
+        press(&mut nav, KeyCode::Char('t'));
+        assert_eq!(nav.selected, 5, "next tab in W1");
+        press(&mut nav, KeyCode::Char('t'));
+        assert_eq!(nav.selected, 2, "tab cycle wraps inside W1");
+        press(&mut nav, KeyCode::Char('w'));
+        assert_eq!(nav.selected, 7, "next workspace in S1");
+        press(&mut nav, KeyCode::Char('w'));
+        assert_eq!(nav.selected, 1, "workspace cycle wraps inside S1");
+        press(&mut nav, KeyCode::Char('s'));
+        assert_eq!(nav.selected, 10);
+        press(&mut nav, KeyCode::Char('s'));
+        assert_eq!(nav.selected, 0, "session cycle wraps globally");
+        // From a session, kind keys descend into its subtree.
+        press(&mut nav, KeyCode::Char('p'));
+        assert_eq!(nav.selected, 3, "first pane inside S1");
+    }
+
+    #[test]
+    fn workspace_and_tab_jumps_cross_scopes_without_wrapping() {
+        let mut nav = tree();
+        nav.selected = 0;
+        press(&mut nav, KeyCode::Char('J'));
+        assert_eq!(nav.selected, 1);
+        press(&mut nav, KeyCode::Char('J'));
+        assert_eq!(nav.selected, 7);
+        press(&mut nav, KeyCode::Char('J'));
+        assert_eq!(nav.selected, 11, "workspace jump crosses into S2");
+        press(&mut nav, KeyCode::Char('J'));
+        assert_eq!(nav.selected, 11, "no wrap at the end");
+        press(&mut nav, KeyCode::Char('K'));
+        assert_eq!(nav.selected, 7);
+        nav.selected = 5;
+        press(&mut nav, KeyCode::Char(']'));
+        assert_eq!(nav.selected, 8, "tab jump crosses into W2");
+        press(&mut nav, KeyCode::Char('['));
+        assert_eq!(nav.selected, 5);
+    }
+
+    #[test]
+    fn arrows_walk_to_parent_and_next_sibling() {
+        let mut nav = tree();
+        nav.selected = 4;
+        press(&mut nav, KeyCode::Left);
+        assert_eq!(nav.selected, 2, "P2 up to T1");
+        press(&mut nav, KeyCode::Left);
+        assert_eq!(nav.selected, 1, "T1 up to W1");
+        press(&mut nav, KeyCode::Right);
+        assert_eq!(nav.selected, 7, "W1 across to W2");
+        press(&mut nav, KeyCode::Right);
+        assert_eq!(nav.selected, 7, "W2 has no next sibling in S1");
+        nav.selected = 4;
+        press(&mut nav, KeyCode::Right);
+        assert_eq!(nav.selected, 4, "P2 has no next sibling in T1");
+        nav.selected = 0;
+        press(&mut nav, KeyCode::Left);
+        assert_eq!(nav.selected, 0, "sessions have no parent");
     }
 
     #[test]
