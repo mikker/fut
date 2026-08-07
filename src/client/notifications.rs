@@ -14,7 +14,7 @@ use crate::{
 use super::chrome::truncate;
 use super::dialog::{
     dialog_area, fill_row, frame_inner, render_footer, render_frame, render_list_scrollbar,
-    row_style, title_style,
+    render_title, row_style,
 };
 
 const MAX_WIDTH: u16 = 80;
@@ -252,25 +252,16 @@ impl NotificationsDialog {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let header = usize::from(area.height >= 2);
-        let footer = usize::from(area.height >= 3);
-        let body_height = usize::from(area.height).saturating_sub(header + footer);
+        let (header, footer) = chrome_rows(area.height);
+        let body_height = usize::from(area.height.saturating_sub(header + footer));
         if header == 1 {
-            let title_row = Rect::new(area.x, area.y, area.width, 1);
-            fill_row(title_row, title_style(), buffer);
-            buffer.set_stringn(
-                area.x,
-                area.y,
-                " terminals waiting",
-                usize::from(area.width),
-                title_style(),
-            );
+            render_title(area, " terminals waiting", buffer);
         }
         if self.rows.is_empty() {
             if body_height > 0 {
                 buffer.set_string(
                     area.x,
-                    area.y + header as u16,
+                    area.y + header,
                     " No terminals waiting",
                     Style::default(),
                 );
@@ -301,14 +292,14 @@ impl NotificationsDialog {
                     row.session, row.workspace, row.tab
                 );
                 let text = truncate(&text, usize::from(area.width));
-                let y = area.y + header as u16 + line as u16;
+                let y = area.y + header + line as u16;
                 let row_area = Rect::new(area.x, y, area.width, 1);
                 fill_row(row_area, style, buffer);
                 buffer.set_stringn(area.x, y, text, usize::from(area.width), style);
             }
             let body = Rect::new(
                 area.x,
-                area.y + header as u16,
+                area.y + header,
                 area.width,
                 u16::try_from(body_height).expect("body height fits u16"),
             );
@@ -320,13 +311,16 @@ impl NotificationsDialog {
     }
 }
 
+fn chrome_rows(height: u16) -> (u16, u16) {
+    (u16::from(height >= 2), u16::from(height >= 3))
+}
+
 /// Rows the dialog body can show inside `host`, so key handling scrolls in
 /// step with rendering.
 pub(super) fn dialog_body_rows(host: Rect) -> usize {
     let area = frame_inner(dialog_area(host, MAX_WIDTH, MAX_HEIGHT));
-    let header = usize::from(area.height >= 2);
-    let footer = usize::from(area.height >= 3);
-    usize::from(area.height).saturating_sub(header + footer)
+    let (header, footer) = chrome_rows(area.height);
+    usize::from(area.height.saturating_sub(header + footer))
 }
 
 fn age(timestamp_ms: u64) -> String {

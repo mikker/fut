@@ -14,7 +14,7 @@ use crate::{
 
 use super::dialog::{
     dialog_area, fill_row, frame_inner, render_footer, render_frame, render_list_scrollbar,
-    title_style,
+    render_title,
 };
 use super::notifications::{ActivityIndicator, NotificationState};
 
@@ -317,9 +317,7 @@ impl NavigatorState {
         }
         let (header, footer) = chrome_rows(area.height);
         if header == 1 {
-            let title_row = Rect::new(area.x, area.y, area.width, 1);
-            fill_row(title_row, title_style(), buffer);
-            put(buffer, area.x, area.y, area.width, " navigator", title_style());
+            render_title(area, " navigator", buffer);
         }
         if footer == 1 {
             let footer = match &self.status {

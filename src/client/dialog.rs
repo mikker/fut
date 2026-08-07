@@ -92,7 +92,14 @@ fn render_shadow(area: Rect, buffer: &mut Buffer) {
     }
 }
 
-pub(super) fn clear(area: Rect, buffer: &mut Buffer) {
+/// Reversed-bold title row across the top of the dialog.
+pub(super) fn render_title(area: Rect, text: &str, buffer: &mut Buffer) {
+    let row = Rect::new(area.x, area.y, area.width, 1);
+    fill_row(row, title_style(), buffer);
+    buffer.set_stringn(area.x, area.y, text, usize::from(area.width), title_style());
+}
+
+fn clear(area: Rect, buffer: &mut Buffer) {
     for row in area.y..area.y.saturating_add(area.height) {
         for column in area.x..area.x.saturating_add(area.width) {
             if let Some(cell) = buffer.cell_mut((column, row)) {

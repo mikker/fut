@@ -13,7 +13,7 @@ use super::{
     actions::{ALL_ACTIONS, ClientAction, definition},
     chrome::truncate,
     config::BindingsConfig,
-    dialog::{dialog_area, fill_row, render_frame, title_style},
+    dialog::{dialog_area, render_frame, render_title},
 };
 
 const MAX_WIDTH: u16 = 80;
@@ -28,14 +28,7 @@ pub(super) fn render(bindings: &BindingsConfig, host: Rect, buffer: &mut Buffer)
     }
     let header = usize::from(area.height >= 2);
     if header == 1 {
-        fill_row(Rect::new(area.x, area.y, area.width, 1), title_style(), buffer);
-        buffer.set_stringn(
-            area.x,
-            area.y,
-            " Ctrl-b …",
-            usize::from(area.width),
-            title_style(),
-        );
+        render_title(area, " Ctrl-b …", buffer);
     }
     let body_rows = usize::from(area.height).saturating_sub(header).max(1);
     let columns = entries.len().div_ceil(body_rows).max(1);

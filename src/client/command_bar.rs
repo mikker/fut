@@ -2,7 +2,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Modifier, Style},
+    style::Modifier,
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -94,11 +94,11 @@ impl CommandBarState {
                 CommandBarAction::Stay
             }
             KeyCode::PageUp => {
-                self.page_selection(-5);
+                self.move_selection(-5);
                 CommandBarAction::Stay
             }
             KeyCode::PageDown => {
-                self.page_selection(5);
+                self.move_selection(5);
                 CommandBarAction::Stay
             }
             KeyCode::Backspace | KeyCode::Delete => {
@@ -281,10 +281,6 @@ impl CommandBarState {
         );
     }
 
-    fn page_selection(&mut self, delta: isize) {
-        self.move_selection(delta);
-    }
-
     fn keep_selected_visible(&mut self, height: usize) {
         let Some(selected) = self.selected else {
             self.scroll = 0;
@@ -313,13 +309,13 @@ impl CommandBarState {
         } else {
             format!("› {} · {detail}", self.query)
         };
-        fill_row(area, prompt_style(), buffer);
+        fill_row(area, title_style(), buffer);
         buffer.set_stringn(
             area.x,
             area.y,
             truncate(&text, usize::from(area.width)),
             usize::from(area.width),
-            prompt_style(),
+            title_style(),
         );
     }
 }
@@ -330,7 +326,7 @@ pub(super) fn command_bar_area(host: Rect) -> Rect {
 
 fn render_prompt(area: Rect, query: &str, position: Option<(usize, usize)>, buffer: &mut Buffer) {
     let row = Rect::new(area.x, area.y, area.width, 1);
-    fill_row(row, prompt_style(), buffer);
+    fill_row(row, title_style(), buffer);
     let text = if query.is_empty() {
         "› Search commands…".to_owned()
     } else {
@@ -348,7 +344,7 @@ fn render_prompt(area: Rect, query: &str, position: Option<(usize, usize)>, buff
         area.y,
         truncate(&text, prompt_width),
         prompt_width,
-        prompt_style(),
+        title_style(),
     );
     if let Some((count, count_width)) = count {
         buffer.set_stringn(
@@ -356,7 +352,7 @@ fn render_prompt(area: Rect, query: &str, position: Option<(usize, usize)>, buff
             area.y,
             count,
             count_width,
-            prompt_style().add_modifier(Modifier::DIM),
+            title_style().add_modifier(Modifier::DIM),
         );
     }
 }
@@ -399,9 +395,6 @@ fn render_result(
     }
 }
 
-fn prompt_style() -> Style {
-    title_style()
-}
 
 #[cfg(test)]
 mod tests {
