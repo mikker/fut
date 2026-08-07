@@ -1,10 +1,12 @@
 //! Interactive terminal client for a running Fut daemon.
 
 mod actions;
+mod cheatsheet;
 mod chrome;
 mod command_bar;
 pub(crate) mod config;
 mod copy_mode;
+mod dialog;
 mod input;
 mod layout;
 mod navigation;
@@ -125,6 +127,9 @@ enum ClipboardResult {
     Failed { request_id: Uuid, message: String },
 }
 
+/// Hesitation after the prefix before the which-key cheatsheet appears.
+const CHEATSHEET_DELAY: Duration = Duration::from_millis(700);
+
 const PBCOPY_TIMEOUT: Duration = Duration::from_secs(2);
 const PBCOPY_REAP_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -214,6 +219,8 @@ async fn run(
     let mut notice: Option<String> = None;
     let mut pending_focused_exit: Option<Option<i32>> = None;
     let mut force_draw = false;
+    let mut cheatsheet_at: Option<time::Instant> = None;
+    let mut cheatsheet_visible = false;
     let mut spinner_frame = 0usize;
     let mut redraw = time::interval(Duration::from_millis(16));
     redraw.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -715,7 +722,8 @@ async fn run(
                     }
                     Event::Key(key) if matches!(surface.as_ref(), Some(ClientSurface::Notifications(_))) => {
                         notice = None;
-                        let visible = terminal.size()?.height.saturating_sub(2) as usize;
+                        let size = terminal.size()?;
+                        let visible = notifications::dialog_body_rows(Rect::new(0, 0, size.width, size.height));
                         let action = match surface.as_mut().expect("notifications exist") {
                             ClientSurface::Notifications(dialog) => dialog.key(key, visible),
                             _ => unreachable!("surface guard ensures notifications"),
@@ -1012,8 +1020,16 @@ async fn run(
                     Event::Mouse(mouse) => mouse_input.discard(mouse),
                     Event::Key(key) if surface.is_none() && copy_mode.is_none() => if let Some(bytes) = encode_key(key) {
                         notice = None;
+                        let was_visible = cheatsheet_visible;
+                        cheatsheet_at = None;
+                        cheatsheet_visible = false;
+                        if was_visible {
+                            view.invalidate_drawn();
+                            force_draw = true;
+                        }
                         match prefix.feed(bytes) {
                             PrefixAction::Wait => {
+                                cheatsheet_at = Some(time::Instant::now() + CHEATSHEET_DELAY);
                                 send(
                                     framed,
                                     ClientMessage::ResetViewport {
@@ -1117,6 +1133,11 @@ async fn run(
                     }
                 }
             }
+            _ = async { time::sleep_until(cheatsheet_at.expect("deadline is set")).await }, if cheatsheet_at.is_some() => {
+                cheatsheet_at = None;
+                cheatsheet_visible = true;
+                force_draw = true;
+            }
             _ = spinner.tick(), if resources.has_working() => {
                 spinner_frame = spinner_frame.wrapping_add(1);
                 force_draw = true;
@@ -1213,6 +1234,9 @@ async fn run(
                             Some(ClientSurface::WorkspaceSidebar(_))
                             | Some(ClientSurface::TabBar(_))
                             | None => {}
+                        }
+                        if cheatsheet_visible {
+                            cheatsheet::render(&ui.bindings, layout.terminal, frame.buffer_mut());
                         }
                         if let Some(rename) = rename.as_ref() {
                             rename.render(layout.terminal, frame.buffer_mut());
@@ -2691,7 +2715,12 @@ fn render_scrollbar(
     if scroll.offset_from_bottom == 0 || area.width == 0 {
         return;
     }
-    let Some((top, len)) = scrollbar_thumb(scroll, area.height) else {
+    let scrolled_from_top = scroll
+        .max_offset_from_bottom
+        .saturating_sub(scroll.offset_from_bottom);
+    let Some((top, len)) =
+        dialog::scrollbar_thumb(scrolled_from_top, scroll.max_offset_from_bottom, area.height)
+    else {
         return;
     };
     let column = area.x + area.width - 1;
@@ -2707,25 +2736,6 @@ fn render_scrollbar(
             cell.set_symbol(symbol).set_style(style);
         }
     }
-}
-
-/// Thumb placement within a track of `height` rows: `(top, len)` with the
-/// thumb sized proportionally to how much of the scrollback the viewport
-/// shows and positioned by how far back it is scrolled.
-fn scrollbar_thumb(scroll: ScrollPosition, height: u16) -> Option<(u16, u16)> {
-    if scroll.max_offset_from_bottom == 0 || height == 0 {
-        return None;
-    }
-    let track = usize::from(height);
-    let total = scroll.max_offset_from_bottom + track;
-    let len = (track * track).div_ceil(total).clamp(1, track);
-    let max_top = track - len;
-    let scrolled_from_top = scroll
-        .max_offset_from_bottom
-        .saturating_sub(scroll.offset_from_bottom);
-    let top = (scrolled_from_top * max_top + scroll.max_offset_from_bottom / 2)
-        / scroll.max_offset_from_bottom;
-    Some((top as u16, len as u16))
 }
 
 struct Screen<'a>(&'a ScreenSnapshot);
@@ -2872,38 +2882,6 @@ impl Drop for TerminalGuard {
 mod tests {
     use super::*;
     use crate::domain::{Cell, Cursor, PaneId, Rgb, SessionId, TabId, WorkspaceId};
-
-    fn scroll(offset_from_bottom: usize, max_offset_from_bottom: usize) -> ScrollPosition {
-        ScrollPosition {
-            offset_from_bottom,
-            max_offset_from_bottom,
-        }
-    }
-
-    #[test]
-    fn scrollbar_thumb_requires_scrollback_and_a_track() {
-        assert_eq!(scrollbar_thumb(scroll(0, 0), 10), None);
-        assert_eq!(scrollbar_thumb(scroll(5, 10), 0), None);
-    }
-
-    #[test]
-    fn scrollbar_thumb_is_proportional_to_visible_share() {
-        // Ten visible rows over ten rows of history: half the content is
-        // visible, so the thumb covers half the track.
-        assert_eq!(scrollbar_thumb(scroll(10, 10), 10), Some((0, 5)));
-        // Deep history still leaves a grabbable one-cell thumb.
-        assert_eq!(scrollbar_thumb(scroll(10_000, 10_000), 10), Some((0, 1)));
-    }
-
-    #[test]
-    fn scrollbar_thumb_tracks_the_viewport_position() {
-        let position = |offset| scrollbar_thumb(scroll(offset, 30), 10).unwrap();
-        assert_eq!(position(30), (0, 3), "scrolled to the top");
-        assert_eq!(position(15), (4, 3), "midway through history");
-        assert_eq!(position(1), (7, 3), "one row above the bottom");
-        let (top, len) = position(1);
-        assert!(top + len <= 10, "thumb stays inside the track");
-    }
 
     fn targets(count: usize) -> Vec<SelectedTarget> {
         let session_id = SessionId::new();

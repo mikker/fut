@@ -4,11 +4,7 @@ use std::{
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
-use ratatui::{
-    buffer::Buffer,
-    layout::Rect,
-    style::{Modifier, Style},
-};
+use ratatui::{buffer::Buffer, layout::Rect, style::Style};
 
 use crate::{
     domain::{AgentState, AttentionKind, PaneId, SessionId, TerminalId},
@@ -16,6 +12,13 @@ use crate::{
 };
 
 use super::chrome::truncate;
+use super::dialog::{
+    dialog_area, fill_row, frame_inner, render_footer, render_frame, render_list_scrollbar,
+    row_style, title_style,
+};
+
+const MAX_WIDTH: u16 = 80;
+const MAX_HEIGHT: u16 = 16;
 
 const BRAILLE_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -244,24 +247,23 @@ impl NotificationsDialog {
         NotificationsAction::Stay
     }
 
-    pub(super) fn render(&mut self, area: Rect, buffer: &mut Buffer) {
+    pub(super) fn render(&mut self, host: Rect, buffer: &mut Buffer) {
+        let area = render_frame(dialog_area(host, MAX_WIDTH, MAX_HEIGHT), buffer);
         if area.width == 0 || area.height == 0 {
             return;
-        }
-        for y in area.y..area.y.saturating_add(area.height) {
-            for x in area.x..area.x.saturating_add(area.width) {
-                buffer[(x, y)].reset();
-            }
         }
         let header = usize::from(area.height >= 2);
         let footer = usize::from(area.height >= 3);
         let body_height = usize::from(area.height).saturating_sub(header + footer);
         if header == 1 {
-            buffer.set_string(
+            let title_row = Rect::new(area.x, area.y, area.width, 1);
+            fill_row(title_row, title_style(), buffer);
+            buffer.set_stringn(
                 area.x,
                 area.y,
-                "fut · terminals waiting",
-                Style::default().add_modifier(Modifier::BOLD),
+                " terminals waiting",
+                usize::from(area.width),
+                title_style(),
             );
         }
         if self.rows.is_empty() {
@@ -269,7 +271,7 @@ impl NotificationsDialog {
                 buffer.set_string(
                     area.x,
                     area.y + header as u16,
-                    "No terminals waiting",
+                    " No terminals waiting",
                     Style::default(),
                 );
             }
@@ -284,12 +286,7 @@ impl NotificationsDialog {
                 .take(body_height)
                 .enumerate()
             {
-                let selected = index == self.selected;
-                let style = if selected {
-                    Style::default().add_modifier(Modifier::REVERSED)
-                } else {
-                    Style::default()
-                };
+                let style = row_style(index == self.selected);
                 let marker = match row.kind {
                     AttentionKind::Blocked => "!",
                     AttentionKind::Completed => "●",
@@ -305,22 +302,31 @@ impl NotificationsDialog {
                 );
                 let text = truncate(&text, usize::from(area.width));
                 let y = area.y + header as u16 + line as u16;
-                for x in area.x..area.x.saturating_add(area.width) {
-                    buffer[(x, y)].set_style(style);
-                }
+                let row_area = Rect::new(area.x, y, area.width, 1);
+                fill_row(row_area, style, buffer);
                 buffer.set_stringn(area.x, y, text, usize::from(area.width), style);
             }
+            let body = Rect::new(
+                area.x,
+                area.y + header as u16,
+                area.width,
+                u16::try_from(body_height).expect("body height fits u16"),
+            );
+            render_list_scrollbar(self.scroll, self.rows.len(), body, buffer);
         }
         if footer == 1 {
-            buffer.set_stringn(
-                area.x,
-                area.y + area.height - 1,
-                "↑↓/jk move  enter switch  esc cancel",
-                usize::from(area.width),
-                Style::default().add_modifier(Modifier::DIM),
-            );
+            render_footer(area, " ↑↓/jk move  enter switch  esc cancel", buffer);
         }
     }
+}
+
+/// Rows the dialog body can show inside `host`, so key handling scrolls in
+/// step with rendering.
+pub(super) fn dialog_body_rows(host: Rect) -> usize {
+    let area = frame_inner(dialog_area(host, MAX_WIDTH, MAX_HEIGHT));
+    let header = usize::from(area.height >= 2);
+    let footer = usize::from(area.height >= 3);
+    usize::from(area.height).saturating_sub(header + footer)
 }
 
 fn age(timestamp_ms: u64) -> String {

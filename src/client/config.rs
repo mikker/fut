@@ -80,8 +80,8 @@ impl BindingsConfig {
             .map_or_else(|| default_suffix(action).to_vec(), |(bytes, _)| bytes)
     }
 
-    pub(super) fn label(&self, action: ClientAction) -> String {
-        let suffix = self.values.get(config_key(action)).map_or_else(
+    pub(super) fn suffix_label(&self, action: ClientAction) -> String {
+        self.values.get(config_key(action)).map_or_else(
             || {
                 if default_suffix(action) == b" " {
                     "Space".into()
@@ -90,8 +90,11 @@ impl BindingsConfig {
                 }
             },
             |value| parse_suffix(value).expect("bindings are validated").1,
-        );
-        format!("Ctrl-b {suffix}")
+        )
+    }
+
+    pub(super) fn label(&self, action: ClientAction) -> String {
+        format!("Ctrl-b {}", self.suffix_label(action))
     }
 
     pub(super) fn action_for_suffix(&self, suffix: &[u8]) -> Option<ClientAction> {

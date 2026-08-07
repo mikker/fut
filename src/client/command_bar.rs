@@ -11,11 +11,15 @@ use super::{
     actions::{COMMANDS, ClientAction, definition},
     chrome::{sanitize, truncate},
     config::BindingsConfig,
+    dialog::{
+        dialog_area, fill_row, muted_style, render_frame, render_list_scrollbar, row_style,
+        title_style,
+    },
 };
 
 const MAX_QUERY_BYTES: usize = 512;
-const MAX_WIDTH: u16 = 72;
-const MAX_HEIGHT: u16 = 8;
+const MAX_WIDTH: u16 = 80;
+const MAX_HEIGHT: u16 = 16;
 
 pub(super) struct CommandBarState {
     bindings: BindingsConfig,
@@ -143,11 +147,10 @@ impl CommandBarState {
     }
 
     pub fn render(&mut self, host: Rect, buffer: &mut Buffer) {
-        let area = command_bar_area(host);
+        let area = render_frame(command_bar_area(host), buffer);
         if area.width == 0 || area.height == 0 {
             return;
         }
-        clear(area, buffer);
         if area.height == 1 {
             self.render_tiny(area, buffer);
             return;
@@ -156,6 +159,12 @@ impl CommandBarState {
         render_prompt(area, &self.query, self.selected_position(), buffer);
         let footer = (area.height >= 4).then_some(area.y + area.height - 1);
         let body_height = usize::from(area.height - 1 - u16::from(footer.is_some()));
+        let body = Rect::new(
+            area.x,
+            area.y + 1,
+            area.width,
+            u16::try_from(body_height).expect("body height fits u16"),
+        );
         self.keep_selected_visible(body_height);
         if self.filtered.is_empty() {
             buffer.set_stringn(
@@ -188,6 +197,7 @@ impl CommandBarState {
                     buffer,
                 );
             }
+            render_list_scrollbar(self.scroll, self.filtered.len(), body, buffer);
         }
         if let Some(row) = footer {
             buffer.set_stringn(
@@ -315,14 +325,7 @@ impl CommandBarState {
 }
 
 pub(super) fn command_bar_area(host: Rect) -> Rect {
-    let width = host.width.min(MAX_WIDTH);
-    let height = host.height.min(MAX_HEIGHT);
-    Rect::new(
-        host.x.saturating_add((host.width - width) / 2),
-        host.y.saturating_add((host.height - height) / 3),
-        width,
-        height,
-    )
+    dialog_area(host, MAX_WIDTH, MAX_HEIGHT)
 }
 
 fn render_prompt(area: Rect, query: &str, position: Option<(usize, usize)>, buffer: &mut Buffer) {
@@ -365,11 +368,7 @@ fn render_result(
     area: Rect,
     buffer: &mut Buffer,
 ) {
-    let style = if selected {
-        Style::default().add_modifier(Modifier::REVERSED)
-    } else {
-        Style::default()
-    };
+    let style = row_style(selected);
     fill_row(area, style, buffer);
     let definition = definition(action).expect("command bar actions have definitions");
     let full_binding = bindings.label(action);
@@ -400,30 +399,8 @@ fn render_result(
     }
 }
 
-fn clear(area: Rect, buffer: &mut Buffer) {
-    for row in area.y..area.y.saturating_add(area.height) {
-        for column in area.x..area.x.saturating_add(area.width) {
-            if let Some(cell) = buffer.cell_mut((column, row)) {
-                cell.reset();
-            }
-        }
-    }
-}
-
-fn fill_row(area: Rect, style: Style, buffer: &mut Buffer) {
-    for column in area.x..area.x.saturating_add(area.width) {
-        if let Some(cell) = buffer.cell_mut((column, area.y)) {
-            cell.set_symbol(" ").set_style(style);
-        }
-    }
-}
-
 fn prompt_style() -> Style {
-    Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
-}
-
-fn muted_style() -> Style {
-    Style::default().add_modifier(Modifier::DIM)
+    title_style()
 }
 
 #[cfg(test)]
@@ -532,14 +509,16 @@ mod tests {
         assert!(rendered.contains("Open global navigator"));
         assert!(rendered.contains("Ctrl-b g"));
         assert!(rendered.contains("type to filter"));
+        // Prompt and first result sit inside the border.
         let area = command_bar_area(host);
+        assert_eq!(buffer[(area.x, area.y)].symbol(), "╭");
         assert!(
-            buffer[(area.x, area.y)]
+            buffer[(area.x + 1, area.y + 1)]
                 .modifier
                 .contains(Modifier::REVERSED)
         );
         assert!(
-            buffer[(area.x, area.y + 1)]
+            buffer[(area.x + 1, area.y + 2)]
                 .modifier
                 .contains(Modifier::REVERSED)
         );
@@ -548,7 +527,7 @@ mod tests {
         let mut narrow_buffer = Buffer::empty(narrow);
         bar.render(narrow, &mut narrow_buffer);
         let prompt = (0..narrow.width)
-            .map(|column| narrow_buffer[(column, 0)].symbol())
+            .map(|column| narrow_buffer[(column, 1)].symbol())
             .collect::<String>();
         assert!(prompt.contains(&format!("1/{}", COMMANDS.len())));
         assert!(!prompt.contains("command1/29"));
@@ -568,7 +547,7 @@ mod tests {
             }
         }
 
-        let host = Rect::new(0, 0, 30, 3);
+        let host = Rect::new(0, 0, 30, 5);
         let mut buffer = Buffer::empty(host);
         let mut bar = CommandBarState::open();
         bar.paste("nothing matches this");
@@ -580,7 +559,7 @@ mod tests {
     fn geometry_is_centered_bounded_and_zero_safe() {
         assert_eq!(
             command_bar_area(Rect::new(4, 5, 100, 20)),
-            Rect::new(18, 9, 72, 8)
+            Rect::new(14, 6, 80, 16)
         );
         assert_eq!(
             command_bar_area(Rect::new(4, 5, 20, 3)),
