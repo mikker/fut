@@ -69,6 +69,8 @@ pub(super) enum ClientAction {
     CreateTab,
     FocusNextTab,
     FocusPreviousTab,
+    FocusNextWorkspace,
+    FocusPreviousWorkspace,
     SplitPaneRight,
     SplitPaneDown,
     FocusNextPane,
@@ -93,7 +95,7 @@ pub(super) struct DirectBinding {
     pub action: ClientAction,
 }
 
-pub(super) const ALL_ACTIONS: [ClientAction; 35] = [
+pub(super) const ALL_ACTIONS: [ClientAction; 37] = [
     ClientAction::OpenCommandBar,
     ClientAction::EnterCopyMode,
     ClientAction::OpenNavigator,
@@ -105,6 +107,8 @@ pub(super) const ALL_ACTIONS: [ClientAction; 35] = [
     ClientAction::CreateTab,
     ClientAction::FocusNextTab,
     ClientAction::FocusPreviousTab,
+    ClientAction::FocusNextWorkspace,
+    ClientAction::FocusPreviousWorkspace,
     ClientAction::SplitPaneRight,
     ClientAction::SplitPaneDown,
     ClientAction::FocusNextPane,
@@ -131,7 +135,7 @@ pub(super) const ALL_ACTIONS: [ClientAction; 35] = [
     ClientAction::Detach,
 ];
 
-pub(super) const COMMANDS: [ActionDefinition; 34] = [
+pub(super) const COMMANDS: [ActionDefinition; 36] = [
     ActionDefinition {
         action: ClientAction::OpenNavigator,
         title: "Open global navigator",
@@ -176,6 +180,16 @@ pub(super) const COMMANDS: [ActionDefinition; 34] = [
         action: ClientAction::FocusPreviousTab,
         title: "Switch to previous tab",
         keywords: "tab previous back backward cycle switch",
+    },
+    ActionDefinition {
+        action: ClientAction::FocusNextWorkspace,
+        title: "Switch to next workspace",
+        keywords: "workspace worktree next forward cycle switch",
+    },
+    ActionDefinition {
+        action: ClientAction::FocusPreviousWorkspace,
+        title: "Switch to previous workspace",
+        keywords: "workspace worktree previous back backward cycle switch",
     },
     ActionDefinition {
         action: ClientAction::SplitPaneRight,
@@ -304,7 +318,10 @@ pub(super) const COMMANDS: [ActionDefinition; 34] = [
     },
 ];
 
-pub(super) const DIRECT_BINDINGS: [DirectBinding; 35] = [
+const UP: &[u8] = b"\x1b[A";
+const DOWN: &[u8] = b"\x1b[B";
+
+pub(super) const DIRECT_BINDINGS: [DirectBinding; 37] = [
     DirectBinding {
         suffix: b" ",
         action: ClientAction::OpenCommandBar,
@@ -348,6 +365,14 @@ pub(super) const DIRECT_BINDINGS: [DirectBinding; 35] = [
     DirectBinding {
         suffix: b"p",
         action: ClientAction::FocusPreviousTab,
+    },
+    DirectBinding {
+        suffix: DOWN,
+        action: ClientAction::FocusNextWorkspace,
+    },
+    DirectBinding {
+        suffix: UP,
+        action: ClientAction::FocusPreviousWorkspace,
     },
     DirectBinding {
         suffix: b"|",
@@ -466,6 +491,8 @@ pub(super) fn config_key(action: ClientAction) -> &'static str {
         ClientAction::CreateTab => "create_tab",
         ClientAction::FocusNextTab => "focus_next_tab",
         ClientAction::FocusPreviousTab => "focus_previous_tab",
+        ClientAction::FocusNextWorkspace => "focus_next_workspace",
+        ClientAction::FocusPreviousWorkspace => "focus_previous_workspace",
         ClientAction::SplitPaneRight => "split_pane_right",
         ClientAction::SplitPaneDown => "split_pane_down",
         ClientAction::FocusNextPane => "focus_next_pane",
@@ -502,17 +529,32 @@ pub(super) fn default_suffix(action: ClientAction) -> &'static [u8] {
 }
 
 pub(super) fn parse_suffix(value: &str) -> Option<(Vec<u8>, String)> {
-    let (bytes, label) = match value {
-        "space" => (b" ".to_vec(), "Space".into()),
-        "enter" => (b"\r".to_vec(), "Enter".into()),
-        "tab" => (b"\t".to_vec(), "Tab".into()),
-        "escape" | "esc" => (b"\x1b".to_vec(), "Esc".into()),
+    let bytes = match value {
+        "space" => b" ".to_vec(),
+        "enter" => b"\r".to_vec(),
+        "tab" => b"\t".to_vec(),
+        "escape" | "esc" => b"\x1b".to_vec(),
+        "up" => UP.to_vec(),
+        "down" => DOWN.to_vec(),
         _ if value.chars().count() == 1 && !value.chars().next()?.is_control() => {
-            (value.as_bytes().to_vec(), value.into())
+            value.as_bytes().to_vec()
         }
         _ => return None,
     };
+    let label = suffix_name(&bytes);
     Some((bytes, label))
+}
+
+pub(super) fn suffix_name(suffix: &[u8]) -> String {
+    match suffix {
+        b" " => "Space".into(),
+        b"\r" => "Enter".into(),
+        b"\t" => "Tab".into(),
+        b"\x1b" => "Esc".into(),
+        _ if suffix == UP => "Up".into(),
+        _ if suffix == DOWN => "Down".into(),
+        _ => String::from_utf8_lossy(suffix).into_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -529,6 +571,8 @@ const fn requires_launcher(action: ClientAction) -> bool {
         | ClientAction::CreateTab
         | ClientAction::FocusNextTab
         | ClientAction::FocusPreviousTab
+        | ClientAction::FocusNextWorkspace
+        | ClientAction::FocusPreviousWorkspace
         | ClientAction::SplitPaneRight
         | ClientAction::SplitPaneDown
         | ClientAction::FocusNextPane
@@ -577,8 +621,7 @@ mod tests {
                     bindings.action_for_suffix(binding.suffix),
                     Some(command.action)
                 );
-                let suffix = std::str::from_utf8(binding.suffix).unwrap();
-                let expected = if suffix == " " { "Space" } else { suffix };
+                let expected = suffix_name(binding.suffix);
                 assert!(label.contains(&format!("Ctrl-b {expected}")));
             }
         }

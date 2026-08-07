@@ -202,7 +202,7 @@ async fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     selected: SelectedView,
-    ui: UiConfig,
+    mut ui: UiConfig,
 ) -> anyhow::Result<()> {
     let mut events = EventStream::new();
     let mut termination = TerminationSignals::subscribe()?;
@@ -866,6 +866,18 @@ async fn run(
                                         },
                                     ).await?;
                                 }
+                                force_draw = true;
+                            }
+                            WorkspaceSidebarAction::ToggleAutoHide => {
+                                ui.workspace_sidebar.auto_hide = !ui.workspace_sidebar.auto_hide;
+                                resize_view(
+                                    framed,
+                                    terminal.size()?.into(),
+                                    &mut view,
+                                    &resources,
+                                    &ui,
+                                ).await?;
+                                view.invalidate_drawn();
                                 force_draw = true;
                             }
                             WorkspaceSidebarAction::Rename(workspace_id, name) => {
@@ -1874,6 +1886,33 @@ async fn dispatch_client_action(
                     ClientMessage::SelectTarget {
                         selector: TargetSelector::Pane(pane_id),
                         expected: selection_expectation(snapshot, pane_id, NavigationScope::Tab),
+                    },
+                )
+                .await?;
+            }
+        }
+        ClientAction::FocusNextWorkspace | ClientAction::FocusPreviousWorkspace => {
+            let Some(snapshot) = resources.snapshot() else {
+                return Ok(Some("workspaces are still loading".into()));
+            };
+            if !view.resources_are_current(snapshot) {
+                return Ok(Some("navigation is syncing".into()));
+            }
+            let forward = action == ClientAction::FocusNextWorkspace;
+            if let Some(pane_id) =
+                workspace_history.adjacent_workspace(snapshot, view.focused(), forward)
+                && let Some(request) = focus.begin(FocusOrigin::Workspace)
+            {
+                send_request(
+                    framed,
+                    Some(request),
+                    ClientMessage::SelectTarget {
+                        selector: TargetSelector::Pane(pane_id),
+                        expected: selection_expectation(
+                            snapshot,
+                            pane_id,
+                            NavigationScope::Workspace,
+                        ),
                     },
                 )
                 .await?;

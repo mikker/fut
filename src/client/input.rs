@@ -234,6 +234,16 @@ mod tests {
             PrefixAction::Dispatch(ClientAction::OpenCommandBar)
         );
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
+        assert_eq!(
+            prefix.feed(b"\x1b[B".to_vec()),
+            PrefixAction::Dispatch(ClientAction::FocusNextWorkspace)
+        );
+        assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
+        assert_eq!(
+            prefix.feed(b"\x1b[A".to_vec()),
+            PrefixAction::Dispatch(ClientAction::FocusPreviousWorkspace)
+        );
+        assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Send(vec![2]));
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
         assert_eq!(

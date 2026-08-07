@@ -84,6 +84,16 @@ impl WorkspaceModel {
     }
 }
 
+fn switch_to(item: &WorkspaceItem) -> WorkspaceSidebarAction {
+    if item.current {
+        WorkspaceSidebarAction::Close
+    } else if let Some(destination) = item.destination {
+        WorkspaceSidebarAction::Select(destination)
+    } else {
+        WorkspaceSidebarAction::Stay
+    }
+}
+
 fn focused_ancestry(
     snapshot: &ResourceSnapshot,
     focused: &SelectedTarget,
@@ -122,6 +132,7 @@ pub(super) enum WorkspaceSidebarAction {
     Stay,
     Close,
     Create,
+    ToggleAutoHide,
     Rename(WorkspaceId, String),
     Select(PaneId),
 }
@@ -202,6 +213,23 @@ impl WorkspaceSidebarState {
                 .selected_item()
                 .map(|item| WorkspaceSidebarAction::Rename(item.id, item.name.clone()))
                 .unwrap_or(WorkspaceSidebarAction::Stay),
+            KeyCode::Char('h') if key.modifiers == KeyModifiers::NONE => {
+                WorkspaceSidebarAction::ToggleAutoHide
+            }
+            KeyCode::Char(digit)
+                if digit.is_ascii_digit() && key.modifiers == KeyModifiers::NONE =>
+            {
+                let index = if digit == '0' {
+                    9
+                } else {
+                    usize::from(digit as u8 - b'1')
+                };
+                self.model
+                    .items
+                    .get(index)
+                    .map(switch_to)
+                    .unwrap_or(WorkspaceSidebarAction::Stay)
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.move_selection(false);
                 WorkspaceSidebarAction::Stay
@@ -231,21 +259,11 @@ impl WorkspaceSidebarState {
                 self.status = WorkspaceStatus::Ready;
                 WorkspaceSidebarAction::Stay
             }
-            KeyCode::Enter => {
-                let Some(item) = self
-                    .selected
-                    .and_then(|id| self.model.items.iter().find(|item| item.id == id))
-                else {
-                    return WorkspaceSidebarAction::Stay;
-                };
-                if item.current {
-                    WorkspaceSidebarAction::Close
-                } else if let Some(destination) = item.destination {
-                    WorkspaceSidebarAction::Select(destination)
-                } else {
-                    WorkspaceSidebarAction::Stay
-                }
-            }
+            KeyCode::Enter => self
+                .selected
+                .and_then(|id| self.model.items.iter().find(|item| item.id == id))
+                .map(switch_to)
+                .unwrap_or(WorkspaceSidebarAction::Stay),
             _ => WorkspaceSidebarAction::Stay,
         }
     }
@@ -534,7 +552,9 @@ fn render_sidebar_chrome(
             }
             "workspace.icon" => TokenValue::plain(icons.workspace.clone()),
             "sidebar.status" => match status {
-                Some(WorkspaceStatus::Ready) => TokenValue::plain(" ↑↓ ↵ c new · r rename"),
+                Some(WorkspaceStatus::Ready) => {
+                    TokenValue::plain(" ↑↓ ↵ c new · r rename · h hide · 1-9 pick")
+                }
                 Some(WorkspaceStatus::Switching) => TokenValue::plain(" switching…"),
                 Some(WorkspaceStatus::Error(message)) => {
                     TokenValue::styled(format!(" {message} · retry"), SemanticStyle::Error)
@@ -921,10 +941,32 @@ mod tests {
             WorkspaceSidebarAction::Rename(_, ref name) if name == "main"
         ));
         assert_eq!(
+            state.key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)),
+            WorkspaceSidebarAction::ToggleAutoHide
+        );
+        let feature_pane = snapshot.sessions[0].workspaces[2].tabs[0].panes[0].id;
+        assert_eq!(
+            state.key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE)),
+            WorkspaceSidebarAction::Select(feature_pane)
+        );
+        assert_eq!(
+            state.key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE)),
+            WorkspaceSidebarAction::Stay,
+            "a closing workspace has no destination"
+        );
+        assert_eq!(
+            state.key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)),
+            WorkspaceSidebarAction::Close,
+            "the current workspace closes the sidebar"
+        );
+        assert_eq!(
+            state.key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE)),
+            WorkspaceSidebarAction::Stay
+        );
+        assert_eq!(
             state.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
             WorkspaceSidebarAction::Stay
         );
-        let feature_pane = snapshot.sessions[0].workspaces[2].tabs[0].panes[0].id;
         assert_eq!(
             state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             WorkspaceSidebarAction::Select(feature_pane)

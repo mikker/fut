@@ -90,6 +90,36 @@ impl NavigationHistory {
             .flatten()
     }
 
+    pub fn adjacent_workspace(
+        &self,
+        snapshot: &ResourceSnapshot,
+        focused: &SelectedTarget,
+        forward: bool,
+    ) -> Option<PaneId> {
+        let path = focused_path(snapshot, focused.pane_id)?;
+        let workspaces = &path.session.workspaces;
+        if workspaces.len() < 2 {
+            return None;
+        }
+        let current = workspaces
+            .iter()
+            .position(|workspace| workspace.id == path.workspace.id)?;
+        for offset in 1..workspaces.len() {
+            let index = if forward {
+                (current + offset) % workspaces.len()
+            } else {
+                (current + workspaces.len() - offset) % workspaces.len()
+            };
+            let workspace = &workspaces[index];
+            if !workspace.closing
+                && let Some(pane_id) = self.workspace_destination(workspace)
+            {
+                return Some(pane_id);
+            }
+        }
+        None
+    }
+
     pub fn last_pane(
         &self,
         snapshot: &ResourceSnapshot,
@@ -438,5 +468,32 @@ mod tests {
         snapshot.sessions[0].workspaces[0].tabs[1].closing = true;
         assert_eq!(history.numbered_tab(&snapshot, &focused, 2), None);
         assert_eq!(history.adjacent_tab(&snapshot, &focused, true), None);
+    }
+
+    #[test]
+    fn adjacent_workspaces_wrap_within_the_focused_session() {
+        let mut snapshot = fixture();
+        let session = &snapshot.sessions[0];
+        let workspace = &session.workspaces[0];
+        let focused = target(
+            session,
+            workspace,
+            &workspace.tabs[0],
+            workspace.tabs[0].panes[0],
+        );
+        let feature = session.workspaces[1].tabs[0].panes[0].id;
+        let history = NavigationHistory::default();
+
+        assert_eq!(
+            history.adjacent_workspace(&snapshot, &focused, true),
+            Some(feature)
+        );
+        assert_eq!(
+            history.adjacent_workspace(&snapshot, &focused, false),
+            Some(feature)
+        );
+
+        snapshot.sessions[0].workspaces[1].closing = true;
+        assert_eq!(history.adjacent_workspace(&snapshot, &focused, true), None);
     }
 }

@@ -12,7 +12,9 @@ use serde::{Deserialize, Deserializer};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use super::actions::{ALL_ACTIONS, ClientAction, config_key, default_suffix, parse_suffix};
+use super::actions::{
+    ALL_ACTIONS, ClientAction, config_key, default_suffix, parse_suffix, suffix_name,
+};
 
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_SEGMENTS: usize = 64;
@@ -82,13 +84,7 @@ impl BindingsConfig {
 
     pub(super) fn suffix_label(&self, action: ClientAction) -> String {
         self.values.get(config_key(action)).map_or_else(
-            || {
-                if default_suffix(action) == b" " {
-                    "Space".into()
-                } else {
-                    String::from_utf8_lossy(default_suffix(action)).into_owned()
-                }
-            },
+            || suffix_name(default_suffix(action)),
             |value| parse_suffix(value).expect("bindings are validated").1,
         )
     }
@@ -579,6 +575,17 @@ impl Default for TabBarConfig {
             right: vec![
                 GroupConfig {
                     segments: vec![SegmentConfig {
+                        token: Some("workspace.name".into()),
+                        prefix: " ".into(),
+                        suffix: " ".into(),
+                        max_width: Some(20),
+                        ..SegmentConfig::default()
+                    }],
+                    style: Some(SemanticStyle::Muted),
+                    priority: 200,
+                },
+                GroupConfig {
+                    segments: vec![SegmentConfig {
                         token: Some("client.zoom".into()),
                         suffix: " ".into(),
                         ..SegmentConfig::default()
@@ -666,6 +673,7 @@ pub(super) struct WorkspaceSidebarConfig {
     pub width: u16,
     #[serde(default = "default_true")]
     pub hide_when_single: bool,
+    pub auto_hide: bool,
     pub header: Vec<SegmentConfig>,
     pub footer: Vec<SegmentConfig>,
     pub row: SidebarRowConfig,
@@ -677,6 +685,7 @@ impl Default for WorkspaceSidebarConfig {
             position: WorkspaceSidebarPosition::Left,
             width: default_sidebar_width(),
             hide_when_single: true,
+            auto_hide: false,
             header: Vec::new(),
             footer: vec![SegmentConfig {
                 token: Some("sidebar.status".into()),

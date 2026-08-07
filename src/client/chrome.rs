@@ -64,8 +64,9 @@ pub(super) fn client_layout(
     }
 
     let sidebar_width = ui.workspace_sidebar.width;
-    let sidebar_needed =
-        !ui.workspace_sidebar.hide_when_single || workspace_count.is_none_or(|count| count > 1);
+    let sidebar_needed = !ui.workspace_sidebar.auto_hide
+        && (!ui.workspace_sidebar.hide_when_single
+            || workspace_count.is_none_or(|count| count > 1));
     let docked =
         sidebar_needed && host.width >= sidebar_width.saturating_add(MIN_DOCKED_TERMINAL_WIDTH);
     let (workspace, docked_sidebar) = if docked {
@@ -947,6 +948,29 @@ mod tests {
             client_layout(Rect::new(0, 0, 120, 24), &always_visible, Some(1)).workspace_sidebar,
             Some(WorkspaceSidebarLayout::Docked(_))
         ));
+    }
+
+    #[test]
+    fn auto_hide_leaves_the_sidebar_as_a_focus_only_drawer() {
+        let mut ui = UiConfig::default();
+        ui.workspace_sidebar.auto_hide = true;
+        let layout = client_layout(Rect::new(0, 0, 120, 24), &ui, Some(3));
+        assert_eq!(layout.terminal, Rect::new(0, 1, 120, 23));
+        assert_eq!(
+            layout.workspace_sidebar,
+            Some(WorkspaceSidebarLayout::Drawer(Rect::new(0, 0, 24, 24)))
+        );
+    }
+
+    #[test]
+    fn the_right_lane_names_the_current_workspace_before_optional_chrome() {
+        let (wide, _) = render(&["shell", "editor"], 0, 60);
+        assert!(wide.ends_with("fut "));
+        assert!(wide.find("main").unwrap() > wide.find('2').unwrap());
+
+        let (narrow, _) = render(&["shell", "editor"], 0, 30);
+        assert!(narrow.contains("main"));
+        assert!(!narrow.contains("fut"));
     }
 
     #[test]
