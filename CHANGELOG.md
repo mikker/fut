@@ -1,7 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.2
 
+- Fixed heavy terminal output making the whole UI lag or hang (e.g. animated TUIs like amp's orb): the daemon now batches PTY output and publishes at most one screen frame per 8 ms per terminal, instead of rebuilding and shipping the full screen for every kilobyte read.
+- Switched the client/daemon wire protocol to MessagePack with a compact cell-style encoding (protocol 5), making heavily styled frames ~4x smaller and ~5x faster to decode.
+- Faster screen-snapshot construction in the daemon and cheaper styled-cell drawing in the client.
+- Added a render-performance harness: `mise run perf:bench` (microbenchmarks incl. a vtebench-style dense-cells workload), `mise run perf:e2e` (headless flood, styled, dense, and latency scenarios against a disposable daemon), and `FUT_PERF_LOG` client frame logging with `scripts/perf/report`. Findings live in `PERF.md`.
 - Tabs are now created unnamed and the tab bar shows each tab's name beside its number.
 - Restyled the workspace sidebar: wider rows, a bullet marker for the current workspace, underline-free selection, and a Git branch and diff summary under each workspace.
 - Added a jump dialog (`Ctrl-b f`): type to filter all sessions, workspaces, tabs, and panes, Enter switches.
