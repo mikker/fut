@@ -46,25 +46,47 @@ output). The costs are upstream, ranked:
    `sidebar.rs:388`), and `pane_layouts` allocating per call including
    mouse-move paths (`client/mod.rs:2617`).
 
-## Techniques from similar projects, in likely order of application
+## Results log
 
-1. **Batch before parsing, snapshot after draining** (Zellij PR #229, foot):
-   drain the PTY queue, feed it all, then snapshot once — "buffer empty or
-   deadline elapsed" (Zellij used 30 ms; 16 ms fits a 60 fps target). Raise
-   the 1 KiB read buffer (64 KiB typical).
-2. **Pace snapshot production, not just delivery** (Ghostty): the VT thread
-   should produce at most one snapshot per ~16 ms while dirty, instead of one
-   per chunk that downstream channels discard after the work is done.
-3. **Dirty-row deltas on the wire, snapshot fallback** (Ghostty row damage,
+### Round 1 (2026-08-07), commits b4accd3..345daa2
+
+| Metric (200x50 flood of `seq 1 100000`) | before | after |
+| --- | --- | --- |
+| snapshots built + sent | 600 (plain) / 1628 (styled) | 30 / 38 |
+| wire volume | 11.1 MiB / 41.1 MiB | 0.6 MiB / 1.0 MiB |
+| styled flood wall time | 0.61 s | 0.30 s |
+| snapshot build (feed/plain_200x50) | 629 µs | 498 µs |
+| echo latency, typing cadence | p50 0.5 ms | p50 0.7 ms |
+| echo latency, back-to-back burst | p50 0.5 ms | p50 8.4 ms (pacing floor) |
+
+- `b4accd3` batch PTY output before snapshotting (drain queue, 64 KiB reads).
+- `eee1e1f` client: reuse resolved styles across same-styled cell runs.
+- `6de608e` pace snapshot production to ≥8 ms apart per terminal
+  (`SNAPSHOT_MIN_INTERVAL`); this is what collapsed the flood numbers.
+- `345daa2` trusted snapshot constructor (skip per-cell revalidation),
+  per-row selection lookup, skip style fetch for unstyled cells.
+
+Investigated and rejected: `Arc<ScreenSnapshot>` through the fan-out
+(clone cost only mattered at pre-pacing frame rates); caching
+`pane_layouts`/chrome models client-side (already event-gated, or no clean
+invalidation key — see eee1e1f's commit discussion).
+
+Observed but unexplained: occasional 7–14 ms outliers in typed-cadence echo
+latency (p95); p50 unaffected. Worth a look if input feel is ever off.
+
+## Remaining hypotheses
+
+1. **Dirty-row deltas on the wire, snapshot fallback** (Ghostty row damage,
    mosh diff-against-acked): send changed rows + cursor; full snapshot on
-   attach/resize/fall-behind. libghostty-vt tracks row dirty state.
-4. **Latest-wins everywhere with bounded channels** (Zellij #525, tmux):
-   already mostly true here (watch + outbound queue + client pending);
-   keep it true for whatever replaces full snapshots.
-5. **`Arc` the snapshot through the fan-out** — removes clone-per-client.
-6. **Cheaper cell representation** — inline small strings (or `char` +
-   overflow map) instead of `String` per cell; skip revalidation of
-   daemon-built grids; consider a binary encoding once deltas land.
+   attach/resize/fall-behind. The one big-ticket item left — cuts wire and
+   decode by ~10–50x during scrolling, but it's a protocol change that
+   ripples into the e2e suite's snapshot expectations. At the paced ~125
+   frames/s the absolute cost is already modest, so weigh against dogfood
+   feel first.
+2. **Cheaper cell representation / binary encoding** — `String` per cell
+   still allocates ~10k times per snapshot build and JSON decode costs
+   ~1.4 ms at 200x50; only worth touching together with the delta protocol.
+3. The typed-cadence p95 echo outliers above.
 
 ## Baseline (2026-08-07, M-series laptop, release build)
 
