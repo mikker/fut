@@ -3737,7 +3737,9 @@ async fn public_last_session_navigation_toggles_after_global_selection() {
     client.send(b"\x02g");
     client.wait_for("second-project").await;
     client.send(b"\x1b[F\r");
-    client.wait_for("LAST_SESSION_B_READY").await;
+    // The diff renderer may reuse the stale "LAST_" cells from marker A on
+    // the same row, so only the differing suffix reliably reaches the PTY.
+    client.wait_for("SESSION_B_READY").await;
     client.send(b"b\n");
     wait_for(DEADLINE, || second_input.exists()).await;
     client.send(b"\x02Sa\n");
@@ -4038,7 +4040,7 @@ async fn public_client_navigator_switches_live_pty_and_preserves_terminal_isolat
     let mut client = PtyChild::spawn(command);
     client.wait_for("PUBLIC_A_READY").await;
     client.send(b"\x02g");
-    client.wait_for("fut · navigator").await;
+    client.wait_for(" navigator").await;
     client.wait_for("public-b").await;
     client.send(b"\x1b[F\r");
     client.wait_for("PUBLIC_B_READY").await;
@@ -4137,7 +4139,7 @@ async fn public_agent_activity_spins_lists_waiting_terminals_and_navigates_unrea
     ));
     client.wait_for("● 1").await;
     client.send(b"\x02u");
-    client.wait_for("fut · terminals waiting").await;
+    client.wait_for(" terminals waiting").await;
     client.wait_for("waiting-b").await;
     client.send(b"\r");
     client.wait_for("WAITING").await;
@@ -7052,7 +7054,7 @@ async fn public_client_ctrl_b_c_creates_routes_and_navigates_back() {
     client.send(b"printf 'CTRL_C_NEW_INPUT\\r\\n'\n");
     client.wait_for("CTRL_C_NEW_INPUT").await;
     client.send(b"\x02g");
-    client.wait_for("fut · navigator").await;
+    client.wait_for(" navigator").await;
     client.send(b"gjjj\r");
     client.wait_for_count("CTRL_C_A_READY", 2).await;
     client.send(b"a\n");
