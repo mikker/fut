@@ -1,6 +1,6 @@
 ---
 id: fut-cey2
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-08-07T08:32:37Z

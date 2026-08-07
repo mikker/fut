@@ -1,6 +1,6 @@
 ---
 id: fut-yc5y
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-08-07T08:56:04Z

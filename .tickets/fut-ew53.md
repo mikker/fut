@@ -1,6 +1,6 @@
 ---
 id: fut-ew53
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-08-07T07:27:15Z
