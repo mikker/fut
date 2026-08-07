@@ -1,4 +1,5 @@
-//! Versioned messages and bounded JSON framing for the local Fut protocol.
+//! Versioned messages and bounded MessagePack framing for the local Fut
+//! protocol.
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
@@ -19,9 +20,9 @@ use crate::{
 /// Protocol version used by released Fut 0.1 builds.
 pub const PROTOCOL_VERSION_0_1: u16 = 0;
 /// Current clients and daemons require an exact protocol match.
-pub const PROTOCOL_VERSION: u16 = 4;
-/// Enough for 50,000 individually styled JSON cells while remaining a firm
-/// pre-allocation bound for the length-delimited transport.
+pub const PROTOCOL_VERSION: u16 = 5;
+/// Enough for 50,000 individually styled MessagePack-encoded cells while
+/// remaining a firm pre-allocation bound for the length-delimited transport.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -298,8 +299,10 @@ pub enum FrameError {
     Empty,
     #[error("frame payload is {actual} bytes; maximum is {maximum}")]
     TooLarge { actual: usize, maximum: usize },
-    #[error("invalid JSON payload: {0}")]
-    InvalidJson(#[from] serde_json::Error),
+    #[error("invalid MessagePack payload: {0}")]
+    InvalidEncoding(#[from] rmp_serde::encode::Error),
+    #[error("invalid MessagePack payload: {0}")]
+    InvalidDecoding(#[from] rmp_serde::decode::Error),
 }
 
 pub fn codec() -> LengthDelimitedCodec {
@@ -311,17 +314,23 @@ pub fn codec() -> LengthDelimitedCodec {
         .new_codec()
 }
 
+/// MessagePack with named struct maps (not the positional/compact array
+/// form): required so the derived `skip_serializing_if`/`default` field
+/// attributes still line up correctly on decode.
 pub fn encode_payload<T: Serialize>(value: &T) -> Result<Vec<u8>, FrameError> {
-    let payload = serde_json::to_vec(value)?;
+    let payload = rmp_serde::to_vec_named(value)?;
     validate_payload_len(payload.len())?;
     Ok(payload)
 }
 
+/// Trailing bytes after a valid value are not rejected: the transport frame
+/// (see [`codec`]) already carries an exact length, so a conforming encoder
+/// never produces any, and detecting them would require giving up
+/// `rmp_serde`'s zero-copy slice reader for one that copies every string and
+/// byte payload — the dominant cost of decoding a densely styled frame.
 pub fn decode_payload<T: DeserializeOwned>(payload: &[u8]) -> Result<T, FrameError> {
     validate_payload_len(payload.len())?;
-    let mut deserializer = serde_json::Deserializer::from_slice(payload);
-    let value = T::deserialize(&mut deserializer)?;
-    deserializer.end()?;
+    let value = rmp_serde::from_slice(payload)?;
     Ok(value)
 }
 
@@ -352,6 +361,47 @@ mod tests {
             request_id,
             message: ClientMessage::Ping,
         }
+    }
+
+    #[test]
+    fn wire_pins_a_styled_cells_exact_messagepack_bytes() {
+        // Pins the on-the-wire MessagePack encoding of one styled cell, so a
+        // future format change (e.g. switching to compact/positional struct
+        // encoding, or unpacking CellStyle back into a field map) is caught
+        // deliberately rather than silently.
+        let cell = Cell {
+            contents: "o".into(),
+            style: crate::domain::CellStyle {
+                foreground: Some(crate::domain::CellColor::Rgb(crate::domain::Rgb {
+                    red: 10,
+                    green: 20,
+                    blue: 30,
+                })),
+                background: None,
+                bold: true,
+                italic: false,
+                underline: false,
+                inverse: false,
+            },
+            selected: false,
+        };
+        let payload = encode_payload(&cell).unwrap();
+        assert_eq!(decode_payload::<Cell>(&payload).unwrap(), cell);
+
+        // fixmap{2}: "c" -> "o", "s" -> fixarray[fg, bg, flags]. fg packs the
+        // RGB tag (0x0200_0000) with the r/g/b bytes; bg is 0 (no color);
+        // flags is 0b0001 (bold only). "x" is omitted (selected is false).
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            0x82, // fixmap, 2 entries
+            0xa1, b'c', 0xa1, b'o', // "c": "o"
+            0xa1, b's', // "s":
+                0x93, // fixarray, 3 elements
+                0xce, 0x02, 0x0a, 0x14, 0x1e, // fg: u32 0x02_0a141e
+                0x00, // bg: 0
+                0x01, // flags: 1 (bold)
+        ];
+        assert_eq!(payload, expected, "payload: {payload:02x?}");
     }
 
     #[test]
@@ -430,8 +480,8 @@ mod tests {
             message: ServerMessage::CopyModePrepared {
                 terminal_id,
                 copy_id: Uuid::new_v4(),
-                // NUL forces JSON's six-byte escaping, the exact worst case
-                // for one UTF-8 input byte.
+                // MAX_COPY_BYTES of raw text, with no escaping overhead in
+                // MessagePack's binary encoding.
                 text: "\0".repeat(crate::domain::MAX_COPY_BYTES),
             },
         };
@@ -439,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn payload_rejects_empty_oversized_invalid_and_trailing_data() {
+    fn payload_rejects_empty_oversized_and_invalid_data_but_ignores_trailing_bytes() {
         assert!(matches!(
             decode_payload::<ClientMessage>(&[]),
             Err(FrameError::Empty)
@@ -449,16 +499,19 @@ mod tests {
             Err(FrameError::TooLarge { .. })
         ));
         assert!(matches!(
-            decode_payload::<ClientMessage>(b"not json"),
-            Err(FrameError::InvalidJson(_))
+            decode_payload::<ClientMessage>(b"not msgpack"),
+            Err(FrameError::InvalidDecoding(_))
         ));
 
+        // A conforming encoder never produces trailing bytes (the transport
+        // frame already carries an exact length), so decoding tolerates and
+        // ignores them rather than paying for an explicit check.
         let mut payload = encode_payload(&ClientMessage::Ping).unwrap();
         payload.extend_from_slice(b" {}");
-        assert!(matches!(
-            decode_payload::<ClientMessage>(&payload),
-            Err(FrameError::InvalidJson(_))
-        ));
+        assert_eq!(
+            decode_payload::<ClientMessage>(&payload).unwrap(),
+            ClientMessage::Ping
+        );
     }
 
     #[test]
@@ -698,7 +751,7 @@ mod tests {
             switched
         );
         assert_eq!(PROTOCOL_VERSION_0_1, 0);
-        assert_eq!(PROTOCOL_VERSION, 4);
+        assert_eq!(PROTOCOL_VERSION, 5);
     }
 
     #[test]

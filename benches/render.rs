@@ -2,7 +2,8 @@
 //!
 //! - `feed`: VT parse + full-grid snapshot per PTY chunk (the daemon's cost
 //!   for every chunk of PTY output, today once per 1 KiB read)
-//! - `encode`/`decode`: JSON wire cost of a full `ScreenSnapshot` per frame
+//! - `encode`/`decode`: MessagePack wire cost of a full `ScreenSnapshot` per
+//!   frame
 //! - `clone`: the per-attached-client grid clone in the daemon fan-out
 //!
 //! Run with `mise run perf:bench` (or `cargo bench --bench render`).
@@ -154,10 +155,21 @@ fn bench_feed(c: &mut Criterion) {
     group.finish();
 }
 
+fn dense_snapshot(size: TerminalSize, phase: u32) -> ScreenSnapshot {
+    let mut vt = filled_terminal(size, &dense_frame(size, phase));
+    vt.feed(b"x")
+        .expect("snapshot bench terminal")
+        .expect("snapshot is published")
+}
+
 fn bench_wire(c: &mut Criterion) {
     let mut group = c.benchmark_group("wire");
-    for (name, size) in [("80x24", SMALL), ("200x50", LARGE)] {
-        let snapshot = styled_snapshot(size);
+    let cases: Vec<(&str, ScreenSnapshot)> = vec![
+        ("styled_80x24", styled_snapshot(SMALL)),
+        ("styled_200x50", styled_snapshot(LARGE)),
+        ("dense_200x50", dense_snapshot(LARGE, 1)),
+    ];
+    for (name, snapshot) in cases {
         let terminal_id = fut::domain::TerminalId::new();
         let envelope = Envelope {
             request_id: None,

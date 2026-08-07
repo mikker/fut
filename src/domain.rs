@@ -16,15 +16,16 @@ use uuid::Uuid;
 pub const MAX_VISIBLE_CELLS: usize = 50_000;
 /// Maximum UTF-8 bytes retained for one serialized terminal cell.
 ///
-/// Cell contents are also constrained to one control-free grapheme, so JSON
-/// can add at most one short quote/backslash escape. At 32 bytes, 50,000 fully
-/// styled and selected cells still fit below the protocol's eight-MiB limit,
-/// while ordinary emoji clusters remain exact. Pathological combining
-/// sequences are represented by a fixed marker.
+/// Cell contents are also constrained to one control-free grapheme, and the
+/// wire format (MessagePack) stores strings as raw length-prefixed bytes
+/// with no escaping overhead. At 32 bytes, 50,000 fully styled and selected
+/// cells still fit below the protocol's eight-MiB limit, while ordinary
+/// emoji clusters remain exact. Pathological combining sequences are
+/// represented by a fixed marker.
 pub const MAX_CELL_CONTENT_BYTES: usize = 32;
 pub const OVERSIZED_CELL_CONTENT_MARKER: &str = "�";
 /// Maximum plain-text payload returned by a copy-mode request. At one MiB,
-/// even worst-case JSON escaping remains below the eight-MiB frame limit.
+/// this remains well below the eight-MiB frame limit.
 pub const MAX_COPY_BYTES: usize = 1024 * 1024;
 /// Maximum physical cells traversed while formatting one selection.
 ///
@@ -357,25 +358,133 @@ pub enum CellColor {
     Rgb(Rgb),
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CellStyle {
-    #[serde(rename = "f", skip_serializing_if = "Option::is_none")]
     pub foreground: Option<CellColor>,
-    #[serde(rename = "b", skip_serializing_if = "Option::is_none")]
     pub background: Option<CellColor>,
-    #[serde(rename = "B", skip_serializing_if = "is_false")]
     pub bold: bool,
-    #[serde(rename = "i", skip_serializing_if = "is_false")]
     pub italic: bool,
-    #[serde(rename = "u", skip_serializing_if = "is_false")]
     pub underline: bool,
-    #[serde(rename = "v", skip_serializing_if = "is_false")]
     pub inverse: bool,
 }
 
 fn is_false(value: &bool) -> bool {
     !value
+}
+
+/// Wire tags packed into a color's top byte, keeping "no color" (0) distinct
+/// from `Indexed(0)`.
+const COLOR_TAG_INDEXED: u32 = 0x0100_0000;
+const COLOR_TAG_RGB: u32 = 0x0200_0000;
+
+const FLAG_BOLD: u8 = 1 << 0;
+const FLAG_ITALIC: u8 = 1 << 1;
+const FLAG_UNDERLINE: u8 = 1 << 2;
+const FLAG_INVERSE: u8 = 1 << 3;
+
+fn pack_color(color: Option<CellColor>) -> u32 {
+    match color {
+        None => 0,
+        Some(CellColor::Indexed(index)) => COLOR_TAG_INDEXED | u32::from(index),
+        Some(CellColor::Rgb(Rgb { red, green, blue })) => {
+            COLOR_TAG_RGB | (u32::from(red) << 16) | (u32::from(green) << 8) | u32::from(blue)
+        }
+    }
+}
+
+fn unpack_color(packed: u32) -> Option<CellColor> {
+    match packed & 0xff00_0000 {
+        0 => None,
+        COLOR_TAG_INDEXED => Some(CellColor::Indexed(packed as u8)),
+        _ => Some(CellColor::Rgb(Rgb {
+            red: (packed >> 16) as u8,
+            green: (packed >> 8) as u8,
+            blue: packed as u8,
+        })),
+    }
+}
+
+impl CellStyle {
+    fn pack_flags(self) -> u8 {
+        let mut flags = 0;
+        if self.bold {
+            flags |= FLAG_BOLD;
+        }
+        if self.italic {
+            flags |= FLAG_ITALIC;
+        }
+        if self.underline {
+            flags |= FLAG_UNDERLINE;
+        }
+        if self.inverse {
+            flags |= FLAG_INVERSE;
+        }
+        flags
+    }
+
+    fn unpack_flags(flags: u8) -> (bool, bool, bool, bool) {
+        (
+            flags & FLAG_BOLD != 0,
+            flags & FLAG_ITALIC != 0,
+            flags & FLAG_UNDERLINE != 0,
+            flags & FLAG_INVERSE != 0,
+        )
+    }
+}
+
+/// Wire form of [`CellStyle`]: a flat `[fg, bg, flags]` array instead of a
+/// field-name map, avoiding per-cell key strings and nested color objects
+/// for the common case of a fully (and often uniquely) styled frame.
+impl Serialize for CellStyle {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+
+        let mut tuple = serializer.serialize_tuple(3)?;
+        tuple.serialize_element(&pack_color(self.foreground))?;
+        tuple.serialize_element(&pack_color(self.background))?;
+        tuple.serialize_element(&self.pack_flags())?;
+        tuple.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for CellStyle {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct CellStyleVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for CellStyleVisitor {
+            type Value = CellStyle;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a [fg, bg, flags] array")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let foreground: u32 = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let background: u32 = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                let flags: u8 = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
+                let (bold, italic, underline, inverse) = CellStyle::unpack_flags(flags);
+                Ok(CellStyle {
+                    foreground: unpack_color(foreground),
+                    background: unpack_color(background),
+                    bold,
+                    italic,
+                    underline,
+                    inverse,
+                })
+            }
+        }
+
+        deserializer.deserialize_tuple(3, CellStyleVisitor)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -716,11 +825,16 @@ mod tests {
             },
             selected: true,
         };
+        // Pins CellStyle's Serialize/Deserialize shape (format-agnostic: the
+        // wire protocol itself uses MessagePack, see
+        // protocol::tests::wire_pins_a_styled_cells_exact_messagepack_bytes).
+        // Style is a flat [fg, bg, flags] array: fg packs the indexed-color
+        // tag (0x0100_0000) with the palette index, bg packs the RGB tag
+        // (0x0200_0000) with the r/g/b bytes, and flags is a bitfield
+        // (bold|italic|underline|inverse = 0b1111).
         let json = serde_json::to_string(&cell).unwrap();
         assert_eq!(serde_json::from_str::<Cell>(&json).unwrap(), cell);
-        assert!(json.contains("\"f\":1"));
-        assert!(json.contains("\"b\":{\"r\":250,\"g\":240,\"b\":230}"));
-        assert!(json.contains("\"x\":true"));
+        assert_eq!(json, r#"{"c":"λ","s":[16777217,50000102,15],"x":true}"#);
         assert_eq!(
             serde_json::to_string(&Cell::default()).unwrap(),
             r#"{"c":" "}"#
