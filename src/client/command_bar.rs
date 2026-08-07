@@ -1,9 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::{
-    buffer::Buffer,
-    layout::Rect,
-    style::Modifier,
-};
+use ratatui::{buffer::Buffer, layout::Rect, style::Modifier};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -395,7 +391,6 @@ fn render_result(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,7 +445,7 @@ mod tests {
         bar.key(key(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(
             bar.key(key(KeyCode::Enter, KeyModifiers::NONE)),
-            CommandBarAction::Dispatch(ClientAction::OpenWorkspaceSidebar)
+            CommandBarAction::Dispatch(ClientAction::OpenJump)
         );
         bar.key(key(KeyCode::End, KeyModifiers::NONE));
         assert_eq!(bar.selected_action(), Some(ClientAction::Detach));

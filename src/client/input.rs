@@ -185,6 +185,11 @@ mod tests {
         );
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
         assert_eq!(
+            prefix.feed(b"f".to_vec()),
+            PrefixAction::Dispatch(ClientAction::OpenJump)
+        );
+        assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
+        assert_eq!(
             prefix.feed(b"w".to_vec()),
             PrefixAction::Dispatch(ClientAction::OpenWorkspaceSidebar)
         );
