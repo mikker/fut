@@ -14,7 +14,7 @@ use libghostty_vt::{
     render::{CellIterator, RowIterator},
     screen::{CellContentTag, CellWide, GridRef, Screen, TrackedGridRef},
     selection::{FormatOptions, Selection},
-    style::{StyleColor, Underline},
+    style::{Style, StyleColor, Underline},
     terminal::{Mode, Point, PointCoordinate, PointSpace, ScrollViewport},
 };
 use uuid::Uuid;
@@ -1064,15 +1064,27 @@ impl GhosttyTerminal {
         let mut widths = Vec::with_capacity(expected);
         let mut rows = self.rows.update(&snapshot)?;
         while let Some(row) = rows.next() {
+            // Row-local selection range, fetched once per row instead of
+            // once per cell (see `CellIteration::is_selected`'s docs).
+            let selection = row.selection()?;
             let mut cells = self.cells.update(row)?;
+            let mut column: u16 = 0;
             while let Some(cell) = cells.next() {
                 let mut contents = String::new();
                 cell.graphemes_utf8(&mut contents)?;
                 if contents.is_empty() {
                     contents.push(' ');
                 }
-                let ghostty_style = cell.style()?;
                 let raw_cell = cell.raw_cell()?;
+                // `has_styling` is false exactly when the cell's style is
+                // the default one, so we can skip fetching the full style
+                // (a comparatively expensive lookup) for the common case
+                // of unstyled cells.
+                let ghostty_style = if raw_cell.has_styling()? {
+                    cell.style()?
+                } else {
+                    Style::default()
+                };
                 let background = match raw_cell.content_tag()? {
                     CellContentTag::BgColorPalette => {
                         Some(CellColor::Indexed(raw_cell.bg_color_palette()?.0))
@@ -1083,6 +1095,8 @@ impl GhosttyTerminal {
                     _ => color(ghostty_style.bg_color),
                 };
                 widths.push(raw_cell.wide()?);
+                let selected =
+                    selection.is_some_and(|range| column >= range.start_x && column <= range.end_x);
                 result.push(Cell {
                     contents,
                     style: CellStyle {
@@ -1093,8 +1107,9 @@ impl GhosttyTerminal {
                         underline: ghostty_style.underline != Underline::None,
                         inverse: ghostty_style.inverse,
                     },
-                    selected: cell.is_selected()?,
+                    selected,
                 });
+                column += 1;
             }
         }
         normalize_wide_selection(&mut result, &widths, self.size.columns);
@@ -1104,7 +1119,11 @@ impl GhosttyTerminal {
             .revision
             .checked_add(1)
             .context("terminal snapshot revision exhausted")?;
-        let mut snapshot = ScreenSnapshot::new(revision, self.size, result, cursor)?;
+        // Cells above come straight from libghostty state: each is at most
+        // one grapheme cluster (or a single space fallback), with no
+        // control characters, so the untrusted-input revalidation that
+        // `ScreenSnapshot::new` does is unnecessary here.
+        let mut snapshot = ScreenSnapshot::from_terminal(revision, self.size, result, cursor)?;
         snapshot.scroll = self.scroll_position()?;
         self.revision = revision;
         Ok(snapshot)

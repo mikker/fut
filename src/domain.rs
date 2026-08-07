@@ -413,6 +413,20 @@ impl Cell {
             self.contents = OVERSIZED_CELL_CONTENT_MARKER.into();
         }
     }
+
+    /// Cheap guard for cells already known to be a single trusted grapheme
+    /// cluster with no control characters (built straight from libghostty
+    /// state). libghostty never stores control characters as cell content
+    /// and `graphemes_utf8` always yields one grapheme cluster per cell, so
+    /// only the byte-length cap from [`Self::bound_contents`] still applies:
+    /// libghostty can in principle attach an unbounded run of combining
+    /// codepoints to a single base character, so length is the one thing
+    /// still worth capping here.
+    pub(crate) fn cap_length(&mut self) {
+        if self.contents.len() > MAX_CELL_CONTENT_BYTES {
+            self.contents = OVERSIZED_CELL_CONTENT_MARKER.into();
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -467,6 +481,40 @@ impl ScreenSnapshot {
         mut cells: Vec<Cell>,
         cursor: Cursor,
     ) -> Result<Self, SnapshotError> {
+        Self::check_bounds(size, &cells, cursor)?;
+        for cell in &mut cells {
+            cell.bound_contents();
+        }
+        Ok(Self::new_unchecked(revision, size, cells, cursor))
+    }
+
+    /// Build a snapshot from cells the caller has already produced in a
+    /// trusted, well-formed shape (e.g. straight from libghostty state).
+    /// Size and cursor bounds are still checked, and each cell still gets
+    /// the cheap byte-length cap (see [`Cell::cap_length`]), but the
+    /// expensive control-character scan and grapheme-cluster count that
+    /// [`Self::new`] performs for untrusted callers are skipped.
+    ///
+    /// Only use this for cells that are known by construction to already
+    /// be a single grapheme cluster with no control characters.
+    pub(crate) fn from_terminal(
+        revision: u64,
+        size: TerminalSize,
+        mut cells: Vec<Cell>,
+        cursor: Cursor,
+    ) -> Result<Self, SnapshotError> {
+        Self::check_bounds(size, &cells, cursor)?;
+        for cell in &mut cells {
+            cell.cap_length();
+        }
+        Ok(Self::new_unchecked(revision, size, cells, cursor))
+    }
+
+    fn check_bounds(
+        size: TerminalSize,
+        cells: &[Cell],
+        cursor: Cursor,
+    ) -> Result<(), SnapshotError> {
         let expected = size.cell_count()?;
         if cells.len() != expected {
             return Err(SnapshotError::CellCount {
@@ -480,17 +528,17 @@ impl ScreenSnapshot {
                 row: cursor.row,
             });
         }
-        for cell in &mut cells {
-            cell.bound_contents();
-        }
+        Ok(())
+    }
 
-        Ok(Self {
+    fn new_unchecked(revision: u64, size: TerminalSize, cells: Vec<Cell>, cursor: Cursor) -> Self {
+        Self {
             revision,
             size,
             cells,
             cursor,
             scroll: ScrollPosition::default(),
-        })
+        }
     }
 }
 
