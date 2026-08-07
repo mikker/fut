@@ -74,6 +74,31 @@ invalidation key — see eee1e1f's commit discussion).
 Observed but unexplained: occasional 7–14 ms outliers in typed-cadence echo
 latency (p95); p50 unaffected. Worth a look if input feel is ever off.
 
+### Round 2 (2026-08-07): the amp/orb halt, commit 6f76458
+
+Animated full-screen TUIs (amp's glowing orb) are the dense-cells case:
+every frame restyles every cell with fresh truecolor values. Added a
+vtebench-style `dense` workload (240 frames ≈ 4 s of animation at 200x50,
+~90 MiB of escapes; `scripts/perf/run dense`, plus `feed/dense*` benches).
+
+| 240 orb frames | main | perf-rendering |
+| --- | --- | --- |
+| wall time | 14.6 s (falls behind forever) | 4.9 s (real time) |
+| grid rebuilds | 88,856 | 597 |
+| frames to client | 7,495 (514/s) | 597 (122/s) |
+| wire | 949 MiB | 76 MiB |
+
+On main the client needs >100% of a core just to decode+draw the frame
+stream, so it stalls and stops responding — that is the reported halt.
+On this branch the real client renders the same animation at ~30 fps
+effective using ~41% of a core (decode 8.2 ms + draw 4.2 ms per frame;
+dense frames are ~650 KiB of JSON).
+
+Diagnosis notes: VT feed handles dense input at ~100–140 MiB/s
+(`feed/dense_anim_200x50` 3.6 ms/frame); macOS ptys deliver ~16 MiB/s in
+1 KiB reads, so ingest is never the limit — snapshot pacing is what keeps
+production at 122/s regardless of input rate.
+
 ## Remaining hypotheses
 
 1. **Dirty-row deltas on the wire, snapshot fallback** (Ghostty row damage,
@@ -84,8 +109,10 @@ latency (p95); p50 unaffected. Worth a look if input feel is ever off.
    frames/s the absolute cost is already modest, so weigh against dogfood
    feel first.
 2. **Cheaper cell representation / binary encoding** — `String` per cell
-   still allocates ~10k times per snapshot build and JSON decode costs
-   ~1.4 ms at 200x50; only worth touching together with the delta protocol.
+   still allocates ~10k times per snapshot build, and JSON decode costs
+   1.4 ms at 200x50 (8.2 ms for fully-styled dense frames, the dominant
+   client cost during animations); only worth touching together with the
+   delta protocol.
 3. The typed-cadence p95 echo outliers above.
 
 ## Baseline (2026-08-07, M-series laptop, release build)
