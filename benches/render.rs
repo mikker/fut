@@ -81,6 +81,32 @@ fn tui_frame(size: TerminalSize) -> Vec<u8> {
     out.into_bytes()
 }
 
+/// vtebench dense_cells / animated-orb workload: one full-screen repaint
+/// with a unique truecolor fg+bg pair per cell, no scrolling. The `phase`
+/// shifts every color, the way an animation introduces new styles each
+/// frame instead of reusing interned ones.
+fn dense_frame(size: TerminalSize, phase: u32) -> Vec<u8> {
+    let mut out = String::new();
+    for row in 0..size.rows {
+        write!(out, "\x1b[{};1H", row + 1).unwrap();
+        for column in 0..size.columns {
+            let (r, c, f) = (u32::from(row), u32::from(column), phase);
+            write!(
+                out,
+                "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}mo",
+                (r * 5 + f * 7) % 256,
+                (c * 3 + f * 11) % 256,
+                (r + c + f * 13) % 256,
+                (255 - r * 5 % 256),
+                (255 - c * 3 % 256),
+                (r * c + f * 17) % 256
+            )
+            .unwrap();
+        }
+    }
+    out.into_bytes()
+}
+
 fn filled_terminal(size: TerminalSize, chunk: &[u8]) -> VtBench {
     let mut vt = VtBench::new(size).expect("create bench terminal");
     // Warm the grid so every benched feed works on a fully populated screen.
@@ -102,6 +128,7 @@ fn bench_feed(c: &mut Criterion) {
         ("styled_200x50", LARGE, styled_chunk(1024)),
         ("plain_64k_200x50", LARGE, plain_chunk(64 * 1024)),
         ("tui_frame_200x50", LARGE, tui_frame(LARGE)),
+        ("dense_200x50", LARGE, dense_frame(LARGE, 0)),
     ];
     let mut group = c.benchmark_group("feed");
     for (name, size, chunk) in cases {
@@ -111,6 +138,19 @@ fn bench_feed(c: &mut Criterion) {
             b.iter(|| vt.feed(&chunk).expect("feed bench terminal"))
         });
     }
+    // Animated variant: every frame carries fresh colors, so ghostty's
+    // interned style table sees new styles per frame instead of cache hits.
+    let frames: Vec<Vec<u8>> = (0..64).map(|phase| dense_frame(LARGE, phase)).collect();
+    let bytes_per_frame = frames[0].len() as u64;
+    group.throughput(Throughput::Bytes(bytes_per_frame));
+    let mut vt = filled_terminal(LARGE, &frames[0]);
+    let mut next = 0usize;
+    group.bench_function("dense_anim_200x50", |b| {
+        b.iter(|| {
+            next = (next + 1) % frames.len();
+            vt.feed(&frames[next]).expect("feed bench terminal")
+        })
+    });
     group.finish();
 }
 

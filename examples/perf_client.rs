@@ -38,7 +38,7 @@ struct Args {
     scenario: String,
     columns: u16,
     rows: u16,
-    count: u64,
+    count: Option<u64>,
 }
 
 fn parse_args() -> anyhow::Result<Args> {
@@ -47,7 +47,7 @@ fn parse_args() -> anyhow::Result<Args> {
         scenario: String::new(),
         columns: 200,
         rows: 50,
-        count: 100_000,
+        count: None,
     };
     let mut raw = std::env::args().skip(1);
     while let Some(arg) = raw.next() {
@@ -56,14 +56,14 @@ fn parse_args() -> anyhow::Result<Args> {
             "--socket" => args.socket = value("--socket")?,
             "--columns" => args.columns = value("--columns")?.parse()?,
             "--rows" => args.rows = value("--rows")?.parse()?,
-            "--count" => args.count = value("--count")?.parse()?,
+            "--count" => args.count = Some(value("--count")?.parse()?),
             scenario if !scenario.starts_with('-') => args.scenario = scenario.into(),
             other => bail!("unknown argument {other}"),
         }
     }
     if args.socket.is_empty() || args.scenario.is_empty() {
         bail!(
-            "usage: perf_client --socket PATH [--columns N] [--rows N] [--count N] flood|styled|latency"
+            "usage: perf_client --socket PATH [--columns N] [--rows N] [--count N] flood|styled|dense|latency"
         );
     }
     Ok(args)
@@ -321,15 +321,26 @@ async fn main() -> anyhow::Result<()> {
 
     match args.scenario.as_str() {
         "flood" => {
-            let command = format!("seq 1 {}", args.count);
+            let command = format!("seq 1 {}", args.count.unwrap_or(100_000));
             flood(&mut connection, terminal_id, "flood (plain)", &command).await?;
         }
         "styled" => {
             let command = format!(
                 "awk 'BEGIN{{for(i=0;i<{};i++)printf \"\\033[3%dm%8d styled\\033[1m words\\033[0m here\\n\", i%8, i}}'",
-                args.count
+                args.count.unwrap_or(100_000)
             );
             flood(&mut connection, terminal_id, "flood (styled)", &command).await?;
+        }
+        "dense" => {
+            // vtebench dense_cells / animated-orb workload: full-screen
+            // repaints with a unique truecolor fg+bg per cell, no scrolling.
+            // `--count` is the number of frames here (default 240).
+            let frames = args.count.unwrap_or(240).min(10_000);
+            let command = format!(
+                "awk -v cols={} -v rows={} -v frames={frames} 'BEGIN{{for(f=0;f<frames;f++){{for(r=0;r<rows;r++){{s=sprintf(\"\\033[%d;1H\",r+1);for(c=0;c<cols;c++){{s=s sprintf(\"\\033[38;2;%d;%d;%dm\\033[48;2;%d;%d;%dmo\",(r*5+f*7)%256,(c*3+f*11)%256,(r+c+f*13)%256,(255-r*5)%256,(255-c*3)%256,(255-f*13)%256)}}printf \"%s\",s}}}}printf \"\\033[0m\\033[2J\\033[H\"}}'",
+                args.columns, args.rows
+            );
+            flood(&mut connection, terminal_id, "dense (orb-like)", &command).await?;
         }
         "latency" => latency(&mut connection, terminal_id).await?,
         other => bail!("unknown scenario {other}"),
