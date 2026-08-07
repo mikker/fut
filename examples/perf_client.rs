@@ -206,13 +206,32 @@ async fn flood(
 }
 
 /// Keystroke echo latency: send one character, wait for the snapshot in which
-/// it appears.
+/// it appears. Runs twice — spaced like human typing, and back-to-back like
+/// key repeat, which is bounded by the daemon's snapshot pacing.
 async fn latency(connection: &mut Connection, terminal_id: TerminalId) -> anyhow::Result<()> {
+    let mut expected = 0usize;
+    for (label, gap) in [
+        ("latency (typing, 30ms gaps)", Duration::from_millis(30)),
+        ("latency (burst, back-to-back)", Duration::ZERO),
+    ] {
+        latency_round(connection, terminal_id, label, gap, &mut expected).await?;
+    }
+    Ok(())
+}
+
+async fn latency_round(
+    connection: &mut Connection,
+    terminal_id: TerminalId,
+    label: &str,
+    gap: Duration,
+    expected: &mut usize,
+) -> anyhow::Result<()> {
     let iterations = 40;
     let mut samples = Vec::with_capacity(iterations);
-    let mut expected = 0usize;
     for _ in 0..iterations {
-        expected += 1;
+        time::sleep(gap).await;
+        *expected += 1;
+        let expected = *expected;
         let started = Instant::now();
         send(
             connection,
@@ -247,7 +266,7 @@ async fn latency(connection: &mut Connection, terminal_id: TerminalId) -> anyhow
     }
     samples.sort();
     let at = |fraction: f64| samples[(samples.len() as f64 * fraction) as usize - 1];
-    println!("== latency ==");
+    println!("== {label} ==");
     println!("iterations           {:>10}", samples.len());
     println!(
         "echo p50             {:>10.1} ms",
