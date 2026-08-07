@@ -145,7 +145,12 @@ pub(super) fn render_footer(area: Rect, text: &str, buffer: &mut Buffer) {
 
 /// Scrollbar on the right edge of a list body scrolled by whole rows, shown
 /// only when the list overflows.
-pub(super) fn render_list_scrollbar(scroll: usize, total_rows: usize, body: Rect, buffer: &mut Buffer) {
+pub(super) fn render_list_scrollbar(
+    scroll: usize,
+    total_rows: usize,
+    body: Rect,
+    buffer: &mut Buffer,
+) {
     if body.width == 0 {
         return;
     }
@@ -161,7 +166,8 @@ pub(super) fn render_list_scrollbar(scroll: usize, total_rows: usize, body: Rect
     }
     for row in top..top.saturating_add(len).min(body.height) {
         if let Some(cell) = buffer.cell_mut((column, body.y + row)) {
-            cell.set_symbol("▐").set_style(muted_style().add_modifier(Modifier::BOLD));
+            cell.set_symbol("▐")
+                .set_style(muted_style().add_modifier(Modifier::BOLD));
         }
     }
 }
@@ -257,6 +263,9 @@ mod tests {
             dialog_area(Rect::new(4, 5, 20, 3), 80, 14),
             Rect::new(4, 5, 20, 3)
         );
-        assert_eq!(dialog_area(Rect::new(4, 5, 0, 0), 80, 14), Rect::new(4, 5, 0, 0));
+        assert_eq!(
+            dialog_area(Rect::new(4, 5, 0, 0), 80, 14),
+            Rect::new(4, 5, 0, 0)
+        );
     }
 }
