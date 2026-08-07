@@ -402,6 +402,8 @@ pub(super) struct IconsConfig {
     pub tab: Option<String>,
     pub zoom: Option<String>,
     pub vertical_divider: Option<String>,
+    pub pill_left: Option<String>,
+    pub pill_right: Option<String>,
 }
 
 impl Default for IconsConfig {
@@ -415,6 +417,8 @@ impl Default for IconsConfig {
             tab: None,
             zoom: None,
             vertical_divider: None,
+            pill_left: None,
+            pill_right: None,
         }
     }
 }
@@ -428,14 +432,16 @@ pub(super) struct IconSet {
     pub tab: String,
     pub zoom: String,
     pub vertical_divider: String,
+    pub pill_left: String,
+    pub pill_right: String,
 }
 
 impl IconsConfig {
     pub fn resolve(&self) -> IconSet {
         let defaults = match self.preset {
-            IconPreset::Ascii => ["*", "x", "...", "", "", "zoom", "|"],
-            IconPreset::Unicode => ["●", "×", "…", "", "", "zoom", "│"],
-            IconPreset::NerdFont => ["󰄬", "󰅖", "…", "󰉋", "󰓩", "󰍉", "│"],
+            IconPreset::Ascii => ["*", "x", "...", "", "", "zoom", "|", "", ""],
+            IconPreset::Unicode => ["●", "×", "…", "", "", "zoom", "│", "", ""],
+            IconPreset::NerdFont => ["󰄬", "󰅖", "…", "󰉋", "󰓩", "󰍉", "│", "\u{e0b6}", "\u{e0b4}"],
         };
         IconSet {
             current: self.current.clone().unwrap_or_else(|| defaults[0].into()),
@@ -448,6 +454,11 @@ impl IconsConfig {
                 .vertical_divider
                 .clone()
                 .unwrap_or_else(|| defaults[6].into()),
+            pill_left: self.pill_left.clone().unwrap_or_else(|| defaults[7].into()),
+            pill_right: self
+                .pill_right
+                .clone()
+                .unwrap_or_else(|| defaults[8].into()),
         }
     }
 }
@@ -720,6 +731,8 @@ impl UiConfig {
             icons.tab,
             icons.zoom,
             icons.vertical_divider,
+            icons.pill_left,
+            icons.pill_right,
         ]
         .into_iter()
         .filter(|icon| !icon.is_empty())
@@ -1173,6 +1186,9 @@ right = [{ token = "workspace.tab_count" }]
         assert_eq!(config.workspace_sidebar.width, 30);
         assert_eq!(config.tab_bar.item.min_width, 12);
         assert_eq!(config.icons.resolve().workspace, "W");
+        assert_eq!(config.icons.resolve().pill_left, "\u{e0b6}");
+        assert_eq!(config.icons.resolve().pill_right, "\u{e0b4}");
+        assert_eq!(UiConfig::default().icons.resolve().pill_left, "");
         assert_eq!(
             config.styles.attention.foreground,
             Some(UiColor::Rgb(0x12, 0xab, 0xef))

@@ -638,14 +638,32 @@ fn render_tab_item(
     let line = render_tab_item_content(model, index, selected, component_style, spinner_frame, ui);
     let minimum = usize::from(ui.tab_bar.item.min_width);
     let padding = minimum.saturating_sub(line.width());
-    if padding == 0 {
-        return line;
-    }
     let style = tab_item_style(model, index, selected, component_style, ui);
-    let mut spans = Vec::with_capacity(line.spans.len() + 1);
+    let mut spans = Vec::with_capacity(line.spans.len() + 3);
     spans.extend(line.spans);
-    spans.push(Span::styled(" ".repeat(padding), style));
+    if padding > 0 {
+        spans.push(Span::styled(" ".repeat(padding), style));
+    }
+    let icons = ui.icons.resolve();
+    if index == model.active && !icons.pill_left.is_empty() && !icons.pill_right.is_empty() {
+        let cap = pill_cap_style(style, component_style, ui);
+        spans.insert(0, Span::styled(icons.pill_left, cap));
+        spans.push(Span::styled(icons.pill_right, cap));
+    }
     Line::from(spans)
+}
+
+/// Caps are drawn as the pill's own background on the bar background so they read as round ends.
+fn pill_cap_style(item: Style, component_style: Option<SemanticStyle>, ui: &UiConfig) -> Style {
+    let mut bar = ui.styles.apply(SemanticStyle::Normal, Style::default());
+    if let Some(role) = component_style {
+        bar = ui.styles.apply(role, bar);
+    }
+    Style {
+        fg: item.bg,
+        bg: bar.bg,
+        ..Style::default()
+    }
 }
 
 fn render_tab_item_content(
@@ -1076,6 +1094,44 @@ mod tests {
                     .contains(Modifier::UNDERLINED)
                 && !selected[(column, 0)].modifier.contains(Modifier::REVERSED)
         }));
+    }
+
+    #[test]
+    fn nerd_font_preset_draws_the_active_tab_as_a_pill() {
+        let ui: UiConfig = toml::from_str("[icons]\npreset = 'nerd_font'\n").unwrap();
+        let (snapshot, focused) = fixture(&["shell", "editor", "tests"], 1);
+        let area = Rect::new(0, 0, 60, 1);
+        let mut buffer = Buffer::empty(area);
+        render_tab_bar(
+            Some(&snapshot),
+            &focused,
+            false,
+            None,
+            &NotificationState::default(),
+            0,
+            &ui,
+            area,
+            &mut buffer,
+        );
+        let column_of = |symbol: &str| {
+            (0..area.width)
+                .find(|column| buffer[(*column, 0)].symbol() == symbol)
+                .unwrap()
+        };
+        let left = column_of("\u{e0b6}");
+        let right = column_of("\u{e0b4}");
+        assert_eq!(right - left, ui.tab_bar.item.min_width + 1);
+        for cap in [left, right] {
+            assert_eq!(buffer[(cap, 0)].fg, ratatui::style::Color::DarkGray);
+            assert_eq!(buffer[(cap, 0)].bg, ratatui::style::Color::Reset);
+        }
+        assert!(
+            (left + 1..right)
+                .all(|column| buffer[(column, 0)].bg == ratatui::style::Color::DarkGray)
+        );
+
+        let (plain, _) = render(&["shell", "editor", "tests"], 1, 60);
+        assert!(!plain.contains('\u{e0b6}') && !plain.contains('\u{e0b4}'));
     }
 
     #[test]
