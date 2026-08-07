@@ -99,6 +99,18 @@ Diagnosis notes: VT feed handles dense input at ~100–140 MiB/s
 1 KiB reads, so ingest is never the limit — snapshot pacing is what keeps
 production at 122/s regardless of input rate.
 
+### Round 3 (2026-08-07): MessagePack wire, commit af7a720
+
+JSON decode was the client's bottleneck during dense animations (8.4 ms
+per 200x50 fully-styled frame — caps the client near 30fps). Benchmarked
+packed-styles-in-JSON (2.2 ms), msgpack struct maps (5.1 ms), and both
+combined (1.6 ms); shipped the combination. Protocol v5.
+
+Real client during the orb: decode 8.2 ms → 1.5 ms (busy 28.7% → 8.2%),
+dense frames 143 KB → 37 KB, and the client now draws at the 16 ms pacing
+ceiling (~60fps) instead of decode-starving. Draw (4.5 ms full-grid blit)
+is now the largest per-frame client cost.
+
 ## Remaining hypotheses
 
 1. **Dirty-row deltas on the wire, snapshot fallback** (Ghostty row damage,
@@ -108,11 +120,9 @@ production at 122/s regardless of input rate.
    ripples into the e2e suite's snapshot expectations. At the paced ~125
    frames/s the absolute cost is already modest, so weigh against dogfood
    feel first.
-2. **Cheaper cell representation / binary encoding** — `String` per cell
-   still allocates ~10k times per snapshot build, and JSON decode costs
-   1.4 ms at 200x50 (8.2 ms for fully-styled dense frames, the dominant
-   client cost during animations); only worth touching together with the
-   delta protocol.
+2. **Skip blitting unchanged rows in `Screen::render`** — pairs with
+   deltas: once the client knows which rows changed, the 4.5 ms full-grid
+   blit shrinks proportionally to the damage.
 3. The typed-cadence p95 echo outliers above.
 
 ## Baseline (2026-08-07, M-series laptop, release build)
