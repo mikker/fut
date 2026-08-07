@@ -32,6 +32,12 @@ const DROP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 // Bound how much PTY output one drain pass parses before it snapshots, so a
 // very chatty PTY still lets control messages (keystrokes) interleave promptly.
 const OUTPUT_DRAIN_BYTE_BUDGET: usize = 2 * 1024 * 1024;
+// Cap snapshot production to at most once per this interval per terminal. A
+// flood delivers many small PTY reads well within a frame time, and clients
+// render at most 60fps, so snapshotting on every drain wastes most of the
+// ~630µs a 200x50 snapshot costs. Interactive echo latency is unaffected: a
+// keystroke's response typically lands well after the previous snapshot.
+const SNAPSHOT_MIN_INTERVAL: Duration = Duration::from_millis(8);
 
 #[derive(Clone, Debug)]
 pub struct SpawnSpec {
@@ -601,6 +607,9 @@ fn run(
 ) {
     let mut exit_code = None;
     let mut reader_complete = false;
+    // Bytes have been fed to the parser since the last published snapshot.
+    let mut dirty = false;
+    let mut last_snapshot = Instant::now();
     'runtime: loop {
         // Output has its own bounded queue, so PTY backpressure can never make
         // control commands Busy. Bound this drain to ensure output still moves.
@@ -717,6 +726,21 @@ fn run(
                     let _ = completion.send(result);
                 }
                 RuntimeMessage::Close(completion) => {
+                    // The throttle may be holding an unpublished snapshot for
+                    // bytes already fed to the parser; shutdown reads state
+                    // through `drain_output_until`'s own barrier, which only
+                    // republishes messages still queued, not those already
+                    // folded into the terminal. Flush it now so the last
+                    // frame observed before exit is never stale.
+                    if dirty {
+                        publish_optional(
+                            terminal.snapshot_after_feed(),
+                            publishers.snapshots,
+                            publishers.events,
+                        );
+                        last_snapshot = Instant::now();
+                        dirty = false;
+                    }
                     kill_terminal_processes(&*master, child_pid);
                     if exit_code.is_none()
                         && let Err(error) = child.kill()
@@ -767,18 +791,46 @@ fn run(
         if reader_complete {
             let _ = queues.doorbell.recv_timeout(Duration::from_millis(20));
         } else {
+            // Shrink the wait toward the moment a throttled snapshot comes
+            // due, so a trailing edge (flood stops mid-interval) still
+            // publishes promptly instead of waiting out the full 20ms
+            // synchronized-output flush tick.
+            let default_timeout = if dirty {
+                let due = last_snapshot + SNAPSHOT_MIN_INTERVAL;
+                due.saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(20))
+            } else {
+                Duration::from_millis(20)
+            };
             channel::select! {
                 recv(queues.output.receiver) -> message => match message {
-                    Ok(message) => {
-                        reader_complete = drain_output_batch(
-                            &mut queues.output,
-                            message,
-                            terminal,
-                            &publishers,
-                        );
-                    }
+                    Ok(message) => match drain_output_batch(
+                        &mut queues.output,
+                        message,
+                        terminal,
+                        &publishers,
+                    ) {
+                        DrainOutcome::ReaderComplete => {
+                            reader_complete = true;
+                            dirty = false;
+                        }
+                        DrainOutcome::Fed => {
+                            if last_snapshot.elapsed() >= SNAPSHOT_MIN_INTERVAL {
+                                publish_optional(
+                                    terminal.snapshot_after_feed(),
+                                    publishers.snapshots,
+                                    publishers.events,
+                                );
+                                last_snapshot = Instant::now();
+                                dirty = false;
+                            } else {
+                                dirty = true;
+                            }
+                        }
+                    },
                     Err(channel::RecvError) => {
                         reader_complete = true;
+                        dirty = false;
                         publish_optional(
                             terminal.finish_synchronized_output(),
                             publishers.snapshots,
@@ -787,11 +839,22 @@ fn run(
                     }
                 },
                 recv(queues.doorbell) -> _ => {}
-                default(Duration::from_millis(20)) => publish_optional(
-                    terminal.flush_synchronized_output(),
-                    publishers.snapshots,
-                    publishers.events,
-                ),
+                default(default_timeout) => {
+                    if dirty && last_snapshot.elapsed() >= SNAPSHOT_MIN_INTERVAL {
+                        publish_optional(
+                            terminal.snapshot_after_feed(),
+                            publishers.snapshots,
+                            publishers.events,
+                        );
+                        last_snapshot = Instant::now();
+                        dirty = false;
+                    }
+                    publish_optional(
+                        terminal.flush_synchronized_output(),
+                        publishers.snapshots,
+                        publishers.events,
+                    );
+                }
             }
         }
         if exit_code.is_none() {
@@ -906,19 +969,29 @@ fn publish_copy_exit(
     }
 }
 
+/// Result of [`drain_output_batch`]: either PTY bytes were parsed and the
+/// caller now owns deciding when to publish a snapshot (see
+/// `SNAPSHOT_MIN_INTERVAL`), or the reader is done and a final snapshot has
+/// already been published unconditionally.
+enum DrainOutcome {
+    ReaderComplete,
+    Fed,
+}
+
 /// Parse every `Bytes` message already sitting in the output queue behind
-/// `first` and build a single snapshot at the end, instead of snapshotting
-/// after every PTY read. A non-`Bytes` message ends the drain immediately
-/// and is handled exactly as `consume_output_message` would handle it on its
-/// own, after any pending bytes are snapshotted so its state is up to date.
+/// `first`, without snapshotting: the caller paces snapshot production
+/// against the terminal's throttle instead. A non-`Bytes` message ends the
+/// drain immediately: it always snapshots first, whether or not this call
+/// itself fed any bytes, because an earlier call may have left a
+/// not-yet-published snapshot pending, and is then handled exactly as
+/// `consume_output_message` would handle it on its own.
 fn drain_output_batch(
     output: &mut OutputQueue,
     first: OutputMessage,
     terminal: &mut GhosttyTerminal,
     publishers: &RuntimePublishers<'_>,
-) -> bool {
+) -> DrainOutcome {
     let mut budget = OUTPUT_DRAIN_BYTE_BUDGET;
-    let mut fed_any = false;
     let mut pending = Some(first);
     loop {
         let message = match pending.take() {
@@ -929,16 +1002,14 @@ fn drain_output_batch(
             },
         };
         let OutputMessage::Bytes(bytes) = message else {
-            if fed_any {
-                publish_optional(
-                    terminal.snapshot_after_feed(),
-                    publishers.snapshots,
-                    publishers.events,
-                );
-            }
-            return consume_output_message(output, message, terminal, publishers);
+            publish_optional(
+                terminal.snapshot_after_feed(),
+                publishers.snapshots,
+                publishers.events,
+            );
+            consume_output_message(output, message, terminal, publishers);
+            return DrainOutcome::ReaderComplete;
         };
-        fed_any = true;
         budget = budget.saturating_sub(bytes.len());
         terminal.vt_write(&bytes);
         output.record_consumed();
@@ -946,14 +1017,7 @@ fn drain_output_batch(
             break;
         }
     }
-    if fed_any {
-        publish_optional(
-            terminal.snapshot_after_feed(),
-            publishers.snapshots,
-            publishers.events,
-        );
-    }
-    false
+    DrainOutcome::Fed
 }
 
 fn consume_output_message(
@@ -1253,6 +1317,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn flood_output_still_lands_the_final_frame_after_throttled_snapshots() {
+        // A tight, uninterrupted burst exercises the throttle's steady
+        // state, and the trailing "DONE" only appears once the burst is
+        // over, so seeing it proves the trailing-edge flush (dirty +
+        // shrunk select timeout) still publishes after bursts stop instead
+        // of leaving the last few throttled bytes unpublished forever.
+        let handle = spawn_terminal(shell("seq 1 2000; printf DONE", HashMap::new())).unwrap();
+        let mut snapshots = handle.subscribe_snapshots();
+        wait_for_text(&mut snapshots, "DONE").await;
+        handle.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn passes_explicit_args_env_and_input_then_reports_exit_once() {
         let mut env = HashMap::new();
         env.insert("FUT_TEST".into(), "works".into());
@@ -1367,6 +1444,55 @@ mod tests {
             event_receiver.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn drain_output_batch_defers_snapshotting_to_the_caller_but_keeps_state_current() {
+        let mut terminal =
+            test_terminal(Box::new(RecordingWriter(Arc::new(Mutex::new(Vec::new())))));
+        let initial = terminal.snapshot().unwrap();
+        let (snapshots, mut snapshot_receiver) = watch::channel(initial);
+        let (events, _) = broadcast::channel(4);
+        let (lifecycle, _) = watch::channel(TerminalLifecycle::Running);
+        let publishers = RuntimePublishers {
+            snapshots: &snapshots,
+            events: &events,
+            lifecycle: &lifecycle,
+        };
+        let (_output, mut queued_output) = output_queue();
+
+        // Five rapid "PTY reads" arrive back-to-back, as a flood would
+        // deliver well within the snapshot throttle interval.
+        for chunk in ["a", "b", "c", "d", "e"] {
+            let outcome = drain_output_batch(
+                &mut queued_output,
+                OutputMessage::Bytes(chunk.as_bytes().to_vec()),
+                &mut terminal,
+                &publishers,
+            );
+            assert!(matches!(outcome, DrainOutcome::Fed));
+        }
+        // None of the five drains published a snapshot: producing far fewer
+        // snapshots than messages is the whole point of the throttle, and
+        // `drain_output_batch` leaves pacing entirely to its caller.
+        assert!(!snapshot_receiver.has_changed().unwrap());
+
+        // The caller's trailing-edge flush (fired once the throttle interval
+        // elapses, or immediately for the first byte after a quiet spell)
+        // publishes a single snapshot reflecting every byte fed so far.
+        publish_optional(
+            terminal.snapshot_after_feed(),
+            publishers.snapshots,
+            publishers.events,
+        );
+        assert!(snapshot_receiver.has_changed().unwrap());
+        let text: String = snapshot_receiver
+            .borrow_and_update()
+            .cells
+            .iter()
+            .map(|cell| cell.contents.as_str())
+            .collect();
+        assert!(text.contains("abcde"), "missing fed bytes: {text:?}");
     }
 
     #[test]
