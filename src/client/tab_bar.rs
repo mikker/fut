@@ -379,11 +379,12 @@ mod tests {
             .map(|column| buffer[(column, 0)].symbol())
             .collect::<String>();
         assert!(text.contains("c new · r rename · esc"));
-        assert_eq!(buffer[(17, 0)].bg, ratatui::style::Color::DarkGray);
+        assert_eq!(buffer[(13, 0)].bg, ratatui::style::Color::DarkGray);
         assert!(
-            buffer[(17, 0)]
+            !buffer[(13, 0)]
                 .modifier
-                .contains(ratatui::style::Modifier::UNDERLINED)
+                .contains(ratatui::style::Modifier::UNDERLINED),
+            "selection reads as a background, never an underline"
         );
 
         let tiny = Rect::new(0, 0, 4, 1);
@@ -401,7 +402,7 @@ mod tests {
         assert_eq!(tiny_buffer[(1, 0)].symbol(), "2");
         assert_eq!(tiny_buffer[(1, 0)].bg, ratatui::style::Color::DarkGray);
         assert!(
-            tiny_buffer[(1, 0)]
+            !tiny_buffer[(1, 0)]
                 .modifier
                 .contains(ratatui::style::Modifier::UNDERLINED)
         );

@@ -1,7 +1,7 @@
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::Style,
+    style::{Modifier, Style},
     text::{Line, Span},
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -646,10 +646,16 @@ fn render_tab_item(
         spans.push(Span::styled(" ".repeat(padding), style));
     }
     let icons = ui.icons.resolve();
-    if index == model.active && !icons.pill_left.is_empty() && !icons.pill_right.is_empty() {
+    if !icons.pill_left.is_empty() && !icons.pill_right.is_empty() {
         let cap = pill_cap_style(style, component_style, ui);
-        spans.insert(0, Span::styled(icons.pill_left, cap));
-        spans.push(Span::styled(icons.pill_right, cap));
+        if index == model.active {
+            spans.insert(0, Span::styled(icons.pill_left, cap));
+            spans.push(Span::styled(icons.pill_right, cap));
+        } else {
+            // Inactive tabs pad by the cap width so items keep a stable width.
+            spans.insert(0, Span::styled(" ", cap));
+            spans.push(Span::styled(" ", cap));
+        }
     }
     Line::from(spans)
 }
@@ -660,8 +666,13 @@ fn pill_cap_style(item: Style, component_style: Option<SemanticStyle>, ui: &UiCo
     if let Some(role) = component_style {
         bar = ui.styles.apply(role, bar);
     }
+    let fill = if item.add_modifier.contains(Modifier::REVERSED) {
+        item.fg
+    } else {
+        item.bg
+    };
     Style {
-        fg: item.bg,
+        fg: fill,
         bg: bar.bg,
         ..Style::default()
     }
@@ -904,30 +915,30 @@ mod tests {
     fn chrome_layout_composes_tab_and_sidebar_positions_at_the_exact_breakpoint() {
         let top_left = UiConfig::default();
         assert_eq!(
-            client_layout(Rect::new(3, 4, 119, 24), &top_left, Some(2)),
+            client_layout(Rect::new(3, 4, 123, 24), &top_left, Some(2)),
             ClientLayout {
-                tab_bar: Some(Rect::new(3, 4, 119, 1)),
-                terminal: Rect::new(3, 5, 119, 23),
-                workspace_sidebar: Some(WorkspaceSidebarLayout::Drawer(Rect::new(3, 4, 24, 24,))),
+                tab_bar: Some(Rect::new(3, 4, 123, 1)),
+                terminal: Rect::new(3, 5, 123, 23),
+                workspace_sidebar: Some(WorkspaceSidebarLayout::Drawer(Rect::new(3, 4, 28, 24,))),
             }
         );
         assert_eq!(
-            client_layout(Rect::new(3, 4, 120, 24), &top_left, Some(2)),
+            client_layout(Rect::new(3, 4, 124, 24), &top_left, Some(2)),
             ClientLayout {
-                tab_bar: Some(Rect::new(27, 4, 96, 1)),
-                terminal: Rect::new(27, 5, 96, 23),
-                workspace_sidebar: Some(WorkspaceSidebarLayout::Docked(Rect::new(3, 4, 24, 24,))),
+                tab_bar: Some(Rect::new(31, 4, 96, 1)),
+                terminal: Rect::new(31, 5, 96, 23),
+                workspace_sidebar: Some(WorkspaceSidebarLayout::Docked(Rect::new(3, 4, 28, 24,))),
             }
         );
         let mut bottom_right = UiConfig::default();
         bottom_right.tab_bar.position = TabBarPosition::Bottom;
         bottom_right.workspace_sidebar.position = WorkspaceSidebarPosition::Right;
         assert_eq!(
-            client_layout(Rect::new(3, 4, 120, 24), &bottom_right, Some(2)),
+            client_layout(Rect::new(3, 4, 124, 24), &bottom_right, Some(2)),
             ClientLayout {
                 tab_bar: Some(Rect::new(3, 27, 96, 1)),
                 terminal: Rect::new(3, 4, 96, 23),
-                workspace_sidebar: Some(WorkspaceSidebarLayout::Docked(Rect::new(99, 4, 24, 24,))),
+                workspace_sidebar: Some(WorkspaceSidebarLayout::Docked(Rect::new(99, 4, 28, 24,))),
             }
         );
     }
@@ -935,17 +946,17 @@ mod tests {
     #[test]
     fn single_workspace_hides_only_the_docked_sidebar() {
         let ui = UiConfig::default();
-        let layout = client_layout(Rect::new(0, 0, 120, 24), &ui, Some(1));
-        assert_eq!(layout.terminal, Rect::new(0, 1, 120, 23));
+        let layout = client_layout(Rect::new(0, 0, 124, 24), &ui, Some(1));
+        assert_eq!(layout.terminal, Rect::new(0, 1, 124, 23));
         assert_eq!(
             layout.workspace_sidebar,
-            Some(WorkspaceSidebarLayout::Drawer(Rect::new(0, 0, 24, 24)))
+            Some(WorkspaceSidebarLayout::Drawer(Rect::new(0, 0, 28, 24)))
         );
 
         let mut always_visible = UiConfig::default();
         always_visible.workspace_sidebar.hide_when_single = false;
         assert!(matches!(
-            client_layout(Rect::new(0, 0, 120, 24), &always_visible, Some(1)).workspace_sidebar,
+            client_layout(Rect::new(0, 0, 124, 24), &always_visible, Some(1)).workspace_sidebar,
             Some(WorkspaceSidebarLayout::Docked(_))
         ));
     }
@@ -954,11 +965,11 @@ mod tests {
     fn auto_hide_leaves_the_sidebar_as_a_focus_only_drawer() {
         let mut ui = UiConfig::default();
         ui.workspace_sidebar.auto_hide = true;
-        let layout = client_layout(Rect::new(0, 0, 120, 24), &ui, Some(3));
-        assert_eq!(layout.terminal, Rect::new(0, 1, 120, 23));
+        let layout = client_layout(Rect::new(0, 0, 124, 24), &ui, Some(3));
+        assert_eq!(layout.terminal, Rect::new(0, 1, 124, 23));
         assert_eq!(
             layout.workspace_sidebar,
-            Some(WorkspaceSidebarLayout::Drawer(Rect::new(0, 0, 24, 24)))
+            Some(WorkspaceSidebarLayout::Drawer(Rect::new(0, 0, 28, 24)))
         );
     }
 
@@ -968,7 +979,7 @@ mod tests {
         assert!(wide.ends_with("fut "));
         assert!(wide.find("main").unwrap() > wide.find('2').unwrap());
 
-        let (narrow, _) = render(&["shell", "editor"], 0, 30);
+        let (narrow, _) = render(&["shell", "editor"], 0, 22);
         assert!(narrow.contains("main"));
         assert!(!narrow.contains("fut"));
     }
@@ -984,11 +995,11 @@ mod tests {
             }
         );
         assert_eq!(
-            client_layout(Rect::new(3, 4, 120, 1), &UiConfig::default(), Some(2)),
+            client_layout(Rect::new(3, 4, 124, 1), &UiConfig::default(), Some(2)),
             ClientLayout {
                 tab_bar: None,
-                terminal: Rect::new(3, 4, 120, 1),
-                workspace_sidebar: Some(WorkspaceSidebarLayout::Drawer(Rect::new(3, 4, 24, 1,))),
+                terminal: Rect::new(3, 4, 124, 1),
+                workspace_sidebar: Some(WorkspaceSidebarLayout::Drawer(Rect::new(3, 4, 28, 1,))),
             }
         );
     }
@@ -1076,14 +1087,14 @@ mod tests {
     fn tab_bar_defaults_to_stable_numbered_items_and_theme_native_selection() {
         let (text, buffer) = render(&["shell", "editor", "tests"], 1, 60);
         assert_eq!(text.chars().nth(1), Some('1'));
-        assert_eq!(text.chars().nth(13), Some('2'));
-        assert_eq!(text.chars().nth(25), Some('3'));
-        assert!(!text.contains("shell"));
-        assert!(!text.contains("editor"));
+        assert_eq!(text.chars().nth(10), Some('2'));
+        assert_eq!(text.chars().nth(20), Some('3'));
+        assert!(text.contains("1 shell"));
+        assert!(text.contains("2 editor"));
         assert!(text.ends_with("fut "));
-        let active = 17;
-        assert_eq!(buffer[(active, 0)].bg, ratatui::style::Color::DarkGray);
-        assert!(!buffer[(active, 0)].modifier.contains(Modifier::REVERSED));
+        let active = 13;
+        assert_eq!(buffer[(active, 0)].fg, ratatui::style::Color::Blue);
+        assert!(buffer[(active, 0)].modifier.contains(Modifier::REVERSED));
         assert!(!buffer[(active, 0)].modifier.contains(Modifier::UNDERLINED));
         assert!(!buffer[(active, 0)].modifier.contains(Modifier::BOLD));
 
@@ -1111,9 +1122,9 @@ mod tests {
                 "selection styling must not move tab {number:?}"
             );
         }
-        assert!((24..36).all(|column| {
+        assert!((19..28).all(|column| {
             selected[(column, 0)].bg == ratatui::style::Color::DarkGray
-                && selected[(column, 0)]
+                && !selected[(column, 0)]
                     .modifier
                     .contains(Modifier::UNDERLINED)
                 && !selected[(column, 0)].modifier.contains(Modifier::REVERSED)
@@ -1144,15 +1155,15 @@ mod tests {
         };
         let left = column_of("\u{e0b6}");
         let right = column_of("\u{e0b4}");
-        assert_eq!(right - left, ui.tab_bar.item.min_width + 1);
+        assert_eq!(right - left, " 2 editor ".len() as u16 + 1);
         for cap in [left, right] {
-            assert_eq!(buffer[(cap, 0)].fg, ratatui::style::Color::DarkGray);
+            assert_eq!(buffer[(cap, 0)].fg, ratatui::style::Color::Blue);
             assert_eq!(buffer[(cap, 0)].bg, ratatui::style::Color::Reset);
         }
-        assert!(
-            (left + 1..right)
-                .all(|column| buffer[(column, 0)].bg == ratatui::style::Color::DarkGray)
-        );
+        assert!((left + 1..right).all(|column| {
+            buffer[(column, 0)].fg == ratatui::style::Color::Blue
+                && buffer[(column, 0)].modifier.contains(Modifier::REVERSED)
+        }));
 
         let (plain, _) = render(&["shell", "editor", "tests"], 1, 60);
         assert!(!plain.contains('\u{e0b6}') && !plain.contains('\u{e0b4}'));
@@ -1202,7 +1213,7 @@ mod tests {
         let text = (0..area.width)
             .map(|column| buffer[(column, 0)].symbol())
             .collect::<String>();
-        assert!(text.contains("2 ×"));
+        assert!(text.contains("2 closing ×"));
 
         let mut missing = focused.clone();
         missing.workspace_id = WorkspaceId::new();

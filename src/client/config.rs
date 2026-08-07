@@ -66,6 +66,8 @@ pub(super) enum SemanticStyle {
     Attention,
     Error,
     Divider,
+    Added,
+    Deleted,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize)]
@@ -259,6 +261,8 @@ pub(super) struct StylesConfig {
     attention: StyleConfig,
     error: StyleConfig,
     divider: StyleConfig,
+    added: StyleConfig,
+    deleted: StyleConfig,
 }
 
 #[derive(Default, Deserialize)]
@@ -299,6 +303,8 @@ struct StylesPatch {
     attention: Option<StylePatch>,
     error: Option<StylePatch>,
     divider: Option<StylePatch>,
+    added: Option<StylePatch>,
+    deleted: Option<StylePatch>,
 }
 
 impl<'de> Deserialize<'de> for StylesConfig {
@@ -318,6 +324,8 @@ impl<'de> Deserialize<'de> for StylesConfig {
             (patch.attention, &mut styles.attention),
             (patch.error, &mut styles.error),
             (patch.divider, &mut styles.divider),
+            (patch.added, &mut styles.added),
+            (patch.deleted, &mut styles.deleted),
         ] {
             if let Some(patch) = patch {
                 patch.apply(style);
@@ -336,14 +344,16 @@ impl Default for StylesConfig {
         Self {
             normal: StyleConfig::default(),
             muted: with(ModifierName::Dim),
+            // Reversed blue: the background renders blue and the text renders in
+            // the terminal's own background color, whatever the theme.
             current: StyleConfig {
-                background: Some(UiColor::DarkGray),
-                remove_modifiers: vec![ModifierName::Reversed, ModifierName::Underlined],
+                foreground: Some(UiColor::Blue),
+                add_modifiers: vec![ModifierName::Reversed],
+                remove_modifiers: vec![ModifierName::Underlined],
                 ..StyleConfig::default()
             },
             selected: StyleConfig {
                 background: Some(UiColor::DarkGray),
-                add_modifiers: vec![ModifierName::Underlined],
                 remove_modifiers: vec![ModifierName::Reversed],
                 ..StyleConfig::default()
             },
@@ -366,6 +376,14 @@ impl Default for StylesConfig {
                 foreground: Some(UiColor::DarkGray),
                 ..StyleConfig::default()
             },
+            added: StyleConfig {
+                foreground: Some(UiColor::Green),
+                ..StyleConfig::default()
+            },
+            deleted: StyleConfig {
+                foreground: Some(UiColor::Red),
+                ..StyleConfig::default()
+            },
         }
     }
 }
@@ -382,6 +400,8 @@ impl StylesConfig {
             SemanticStyle::Attention => &self.attention,
             SemanticStyle::Error => &self.error,
             SemanticStyle::Divider => &self.divider,
+            SemanticStyle::Added => &self.added,
+            SemanticStyle::Deleted => &self.deleted,
         }
         .apply(style)
     }
@@ -518,7 +538,7 @@ impl Default for GroupConfig {
 }
 
 fn default_tab_min_width() -> u16 {
-    12
+    8
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
@@ -535,6 +555,11 @@ impl Default for ItemFormat {
             segments: vec![
                 SegmentConfig::text(" "),
                 SegmentConfig::token("tab.index"),
+                SegmentConfig {
+                    token: Some("tab.name".into()),
+                    prefix: " ".into(),
+                    ..SegmentConfig::default()
+                },
                 SegmentConfig {
                     token: Some("tab.closing".into()),
                     prefix: " ".into(),
@@ -620,7 +645,7 @@ impl Default for TabBarConfig {
 }
 
 fn default_sidebar_width() -> u16 {
-    24
+    28
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
@@ -652,11 +677,24 @@ impl Default for SidebarRowConfig {
                     ..SegmentConfig::default()
                 },
             ],
-            detail: vec![SegmentConfig {
-                token: Some("workspace.root".into()),
-                style: Some(SemanticStyle::Muted),
-                ..SegmentConfig::default()
-            }],
+            detail: vec![
+                SegmentConfig::text("  "),
+                SegmentConfig {
+                    token: Some("workspace.git_branch".into()),
+                    style: Some(SemanticStyle::Muted),
+                    ..SegmentConfig::default()
+                },
+                SegmentConfig {
+                    token: Some("workspace.git_added".into()),
+                    prefix: " ".into(),
+                    ..SegmentConfig::default()
+                },
+                SegmentConfig {
+                    token: Some("workspace.git_deleted".into()),
+                    prefix: " ".into(),
+                    ..SegmentConfig::default()
+                },
+            ],
         }
     }
 }
@@ -1097,6 +1135,9 @@ fn token_allowed(scope: TokenScope, token: &str) -> bool {
                 | "workspace.tab_count"
                 | "workspace.icon"
                 | "workspace.activity"
+                | "workspace.git_branch"
+                | "workspace.git_added"
+                | "workspace.git_deleted"
         ),
         TokenScope::Sidebar => matches!(
             token,
@@ -1193,7 +1234,7 @@ right = [{ token = "workspace.tab_count" }]
             WorkspaceSidebarPosition::Right
         );
         assert_eq!(config.workspace_sidebar.width, 30);
-        assert_eq!(config.tab_bar.item.min_width, 12);
+        assert_eq!(config.tab_bar.item.min_width, 8);
         assert_eq!(config.icons.resolve().workspace, "W");
         assert_eq!(config.icons.resolve().pill_left, "\u{e0b6}");
         assert_eq!(config.icons.resolve().pill_right, "\u{e0b4}");
@@ -1226,17 +1267,21 @@ right = [{ token = "workspace.tab_count" }]
             "Ctrl-b :"
         );
         assert_eq!(config.tab_bar.position, TabBarPosition::Bottom);
-        assert_eq!(config.tab_bar.item.min_width, 12);
+        assert_eq!(config.tab_bar.item.min_width, 8);
         assert!(config.tab_bar.left.iter().any(|group| {
             group
                 .segments
                 .iter()
                 .any(|segment| segment.component.as_deref() == Some("tabs"))
         }));
-        assert_eq!(config.styles.current.background, Some(UiColor::DarkGray));
+        assert_eq!(config.styles.current.background, None);
+        assert_eq!(
+            config.styles.current.add_modifiers,
+            vec![ModifierName::Reversed]
+        );
         assert_eq!(
             config.styles.current.remove_modifiers,
-            vec![ModifierName::Reversed, ModifierName::Underlined]
+            vec![ModifierName::Underlined]
         );
         assert_eq!(config.styles.current.foreground, Some(UiColor::Red));
         assert_eq!(config.styles.attention.foreground, Some(UiColor::Blue));

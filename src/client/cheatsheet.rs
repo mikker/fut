@@ -109,11 +109,11 @@ mod tests {
             let mut buffer = Buffer::empty(host);
             render(&BindingsConfig::default(), host, &mut buffer);
         }
-        // Four columns on a 12-row host: titles truncate but stay present.
+        // Five columns on a 12-row host: titles truncate but stay present.
         let host = Rect::new(0, 0, 90, 12);
         let mut buffer = Buffer::empty(host);
         render(&BindingsConfig::default(), host, &mut buffer);
         assert!(text(&buffer).contains("Space"));
-        assert!(text(&buffer).contains("Open comm"));
+        assert!(text(&buffer).contains("Open c…"));
     }
 }
