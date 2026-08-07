@@ -9,6 +9,7 @@ anyhow = "1"
 bytes = "1"
 clap = { version = "~4.6", features = ["derive"] }
 clap_complete = { version = "~4.6", features = ["unstable-dynamic"] }
+crossbeam-channel = "0.5"
 crossterm = { version = "0.29", features = ["event-stream"] }
 futures-util = { version = "0.3", features = ["sink"] }
 libc = "0.2"

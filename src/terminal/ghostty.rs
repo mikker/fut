@@ -242,6 +242,20 @@ impl GhosttyTerminal {
             return self.finish_application_mouse_input(offset);
         }
 
+        // Overscroll cannot move the viewport; drop it before it costs a
+        // snapshot build so a fling that hits either end queues no work.
+        let scrollbar = self.terminal.scrollbar()?;
+        let bottom_row = usize::try_from(scrollbar.total.saturating_sub(scrollbar.len))
+            .context("converting Ghostty scrollback size")?;
+        let position = offset.unwrap_or(bottom_row);
+        let overscroll = match direction {
+            MouseWheelDirection::Up => position == 0,
+            MouseWheelDirection::Down => position >= bottom_row,
+        };
+        if overscroll {
+            return Ok(MouseInputOutcome::Handled);
+        }
+
         self.terminal.set_selection(None)?;
         self.terminal.scroll_viewport(match offset {
             Some(offset) => ScrollViewport::Row(offset),
@@ -1077,9 +1091,21 @@ impl GhosttyTerminal {
             .revision
             .checked_add(1)
             .context("terminal snapshot revision exhausted")?;
-        let snapshot = ScreenSnapshot::new(revision, self.size, result, cursor)?;
+        let mut snapshot = ScreenSnapshot::new(revision, self.size, result, cursor)?;
+        snapshot.scroll = self.scroll_position()?;
         self.revision = revision;
         Ok(snapshot)
+    }
+
+    fn scroll_position(&mut self) -> Result<crate::domain::ScrollPosition> {
+        let scrollbar = self.terminal.scrollbar()?;
+        let bottom = scrollbar.total.saturating_sub(scrollbar.len);
+        Ok(crate::domain::ScrollPosition {
+            offset_from_bottom: usize::try_from(bottom.saturating_sub(scrollbar.offset))
+                .context("converting Ghostty scroll offset")?,
+            max_offset_from_bottom: usize::try_from(bottom)
+                .context("converting Ghostty scrollback size")?,
+        })
     }
 
     fn restore_canonical(&mut self) -> Result<()> {
@@ -1541,6 +1567,66 @@ mod tests {
     }
 
     #[test]
+    fn overscroll_wheels_are_dropped_without_building_snapshots() {
+        let mut terminal = terminal(8, 3);
+        let bottom = terminal
+            .feed(b"00\r\n01\r\n02\r\n03\r\n04\r\n05")
+            .unwrap()
+            .unwrap();
+
+        // Wheel down at the bottom has nowhere to go.
+        assert!(matches!(
+            terminal
+                .mouse_input(wheel(MouseWheelDirection::Down, 0, 0), None, true)
+                .unwrap(),
+            MouseInputOutcome::Handled
+        ));
+
+        // One wheel up from the bottom reaches the top of six lines.
+        let MouseInputOutcome::Scrolled(top) = terminal
+            .mouse_input(wheel(MouseWheelDirection::Up, 0, 0), None, true)
+            .unwrap()
+        else {
+            panic!("wheel up from the bottom must scroll");
+        };
+        assert_eq!(top.offset, Some(0));
+
+        // Wheel up at the top has nowhere to go either.
+        assert!(matches!(
+            terminal
+                .mouse_input(wheel(MouseWheelDirection::Up, 0, 0), Some(0), true)
+                .unwrap(),
+            MouseInputOutcome::Handled
+        ));
+
+        // Scrolling back down from the top still works.
+        assert!(matches!(
+            terminal
+                .mouse_input(wheel(MouseWheelDirection::Down, 0, 0), Some(0), true)
+                .unwrap(),
+            MouseInputOutcome::Scrolled(_)
+        ));
+
+        // Dropped wheels build no snapshots: only the two real scrolls and
+        // this canonical snapshot advance the revision.
+        assert_eq!(terminal.snapshot().unwrap().revision, bottom.revision + 3);
+    }
+
+    #[test]
+    fn wheel_without_scrollback_is_dropped_in_both_directions() {
+        let mut terminal = terminal(8, 3);
+        terminal.feed(b"hi").unwrap();
+        for direction in [MouseWheelDirection::Up, MouseWheelDirection::Down] {
+            assert!(matches!(
+                terminal
+                    .mouse_input(wheel(direction, 0, 0), None, true)
+                    .unwrap(),
+                MouseInputOutcome::Handled
+            ));
+        }
+    }
+
+    #[test]
     fn tracked_wheel_uses_ghostty_modes_and_is_forwarded_to_the_pty() {
         let (mut terminal, output) = recording_terminal(10, 4);
         terminal.feed(b"\x1b[?1000h\x1b[?1006h").unwrap().unwrap();
@@ -1829,11 +1915,13 @@ mod tests {
 
         terminal.feed(b"\x1b[?1000l\x1b[?1007l").unwrap().unwrap();
         take_output(&output);
+        // Without alternate scroll the wheel is consumed locally; at the
+        // bottom of the alternate screen that means dropping it outright.
         assert!(matches!(
             terminal
                 .mouse_input(wheel(MouseWheelDirection::Down, 2, 1), None, true)
                 .unwrap(),
-            MouseInputOutcome::Scrolled(_)
+            MouseInputOutcome::Handled
         ));
         assert!(take_output(&output).is_empty());
     }

@@ -2202,7 +2202,12 @@ async fn scrollback_is_attachment_local_survives_output_and_paste_returns_only_f
     let (mut client_b, selected_b) =
         attach_once(&harness, TargetSelector::Terminal(pane_b.terminal_id)).await;
     assert_eq!(selected_b, pane_b);
-    snapshot_containing(&mut client_a, terminal_a, "HIST_40").await;
+    let bottom = snapshot_containing(&mut client_a, terminal_a, "HIST_40").await;
+    assert_eq!(bottom.scroll.offset_from_bottom, 0);
+    assert!(
+        bottom.scroll.max_offset_from_bottom > 0,
+        "history beyond the viewport must report scrollback"
+    );
     snapshot_containing(&mut client_b, terminal_a, "HIST_40").await;
 
     let wheel = ClientMessage::MouseInput {
@@ -2227,6 +2232,10 @@ async fn scrollback_is_attachment_local_survives_output_and_paste_returns_only_f
     else {
         unreachable!()
     };
+    assert!(
+        history_b.scroll.offset_from_bottom > 0,
+        "scrolled viewport must report its offset for the scrollbar"
+    );
 
     assert_fire_and_forget_request_id_rejected(
         &mut client_b,

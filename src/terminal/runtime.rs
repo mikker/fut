@@ -12,6 +12,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
+use crossbeam_channel as channel;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::{broadcast, mpsc as async_mpsc, oneshot, watch};
 
@@ -68,10 +69,45 @@ pub struct TerminalHandle {
     id: TerminalId,
     child_pid: u32,
     spawn_cwd: PathBuf,
-    commands: async_mpsc::Sender<RuntimeMessage>,
+    commands: RuntimeCommands,
     snapshots: watch::Sender<ScreenSnapshot>,
     events: broadcast::Sender<TerminalEvent>,
     lifecycle: watch::Sender<TerminalLifecycle>,
+}
+
+/// Command sender paired with the runtime thread's doorbell. The runtime
+/// parks on PTY output between commands; ringing after every enqueue wakes
+/// it immediately instead of on its next 20ms output poll, which is the
+/// difference between wheel input applying instantly and piling up.
+#[derive(Clone)]
+struct RuntimeCommands {
+    channel: async_mpsc::Sender<RuntimeMessage>,
+    doorbell: channel::Sender<()>,
+}
+
+impl RuntimeCommands {
+    async fn send(&self, message: RuntimeMessage) -> Result<(), CommandError> {
+        self.channel
+            .send(message)
+            .await
+            .map_err(|_| CommandError::Stopped)?;
+        self.ring();
+        Ok(())
+    }
+
+    fn try_send(
+        &self,
+        message: RuntimeMessage,
+    ) -> Result<(), async_mpsc::error::TrySendError<RuntimeMessage>> {
+        self.channel.try_send(message)?;
+        self.ring();
+        Ok(())
+    }
+
+    fn ring(&self) {
+        // A full doorbell already has a pending wake; dropping this ring is fine.
+        let _ = self.doorbell.try_send(());
+    }
 }
 
 impl TerminalHandle {
@@ -91,7 +127,7 @@ impl TerminalHandle {
     }
 
     pub async fn input(&self, bytes: Vec<u8>) -> Result<(), CommandError> {
-        send_with_backpressure(&self.commands, RuntimeMessage::Input(bytes)).await
+        self.commands.send(RuntimeMessage::Input(bytes)).await
     }
 
     pub async fn paste(&self, text: String) -> Result<(), CommandError> {
@@ -130,16 +166,14 @@ impl TerminalHandle {
         viewport_offset: Option<usize>,
     ) -> Result<CopyModeOutcome, CommandError> {
         let (completion, completed) = oneshot::channel();
-        send_with_backpressure(
-            &self.commands,
-            RuntimeMessage::CopyMode {
+        self.commands
+            .send(RuntimeMessage::CopyMode {
                 owner,
                 action,
                 viewport_offset,
                 completion,
-            },
-        )
-        .await?;
+            })
+            .await?;
         completed.await.unwrap_or(Err(CommandError::Stopped))
     }
 
@@ -149,15 +183,13 @@ impl TerminalHandle {
         viewport_offset: Option<usize>,
     ) -> Result<ViewportSnapshot, CommandError> {
         let (completion, completed) = oneshot::channel();
-        send_with_backpressure(
-            &self.commands,
-            RuntimeMessage::CopyModeSnapshot {
+        self.commands
+            .send(RuntimeMessage::CopyModeSnapshot {
                 owner,
                 viewport_offset,
                 completion,
-            },
-        )
-        .await?;
+            })
+            .await?;
         completed.await.unwrap_or(Err(CommandError::Stopped))
     }
 
@@ -166,11 +198,10 @@ impl TerminalHandle {
         owner: ClientId,
     ) -> Result<Option<ScreenSnapshot>, CommandError> {
         let (completion, completed) = oneshot::channel();
-        let sent = send_with_backpressure(
-            &self.commands,
-            RuntimeMessage::ClearCopyMode { owner, completion },
-        )
-        .await;
+        let sent = self
+            .commands
+            .send(RuntimeMessage::ClearCopyMode { owner, completion })
+            .await;
         if matches!(sent, Err(CommandError::Stopped))
             && matches!(*self.lifecycle.borrow(), TerminalLifecycle::Exited { .. })
         {
@@ -211,8 +242,7 @@ impl TerminalHandle {
             self.commands.send(RuntimeMessage::Close(completion)),
         )
         .await
-        .map_err(|_| CommandError::Busy)
-        .and_then(|result| result.map_err(|_| CommandError::Stopped));
+        .unwrap_or(Err(CommandError::Busy));
         let result = match sent {
             Ok(()) => completed.await.unwrap_or(Err(CommandError::Stopped)),
             Err(error) => Err(error),
@@ -261,11 +291,7 @@ impl TerminalHandle {
     }
 }
 
-fn clear_client_before_deadline(
-    commands: &async_mpsc::Sender<RuntimeMessage>,
-    owner: ClientId,
-    deadline: Instant,
-) {
+fn clear_client_before_deadline(commands: &RuntimeCommands, owner: ClientId, deadline: Instant) {
     let (completion, mut completed) = oneshot::channel();
     let mut message = RuntimeMessage::ClearCopyMode { owner, completion };
     loop {
@@ -293,22 +319,14 @@ fn clear_client_before_deadline(
 }
 
 async fn send_paste_with_backpressure(
-    commands: &async_mpsc::Sender<RuntimeMessage>,
+    commands: &RuntimeCommands,
     text: String,
 ) -> Result<(), CommandError> {
     let (completion, completed) = oneshot::channel();
-    send_with_backpressure(commands, RuntimeMessage::Paste { text, completion }).await?;
-    completed.await.unwrap_or(Err(CommandError::Stopped))
-}
-
-async fn send_with_backpressure(
-    commands: &async_mpsc::Sender<RuntimeMessage>,
-    message: RuntimeMessage,
-) -> Result<(), CommandError> {
     commands
-        .send(message)
-        .await
-        .map_err(|_| CommandError::Stopped)
+        .send(RuntimeMessage::Paste { text, completion })
+        .await?;
+    completed.await.unwrap_or(Err(CommandError::Stopped))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -325,7 +343,7 @@ fn mouse_send_policy(kind: MouseEventKind) -> MouseSendPolicy {
 }
 
 async fn send_mouse_input(
-    commands: &async_mpsc::Sender<RuntimeMessage>,
+    commands: &RuntimeCommands,
     event: MouseEvent,
     viewport_offset: Option<usize>,
     pty_input_allowed: bool,
@@ -339,7 +357,7 @@ async fn send_mouse_input(
         completion,
     };
     match policy {
-        MouseSendPolicy::Lossless => send_with_backpressure(commands, message).await?,
+        MouseSendPolicy::Lossless => commands.send(message).await?,
         MouseSendPolicy::Disposable => commands.try_send(message).map_err(|error| match error {
             async_mpsc::error::TrySendError::Full(_) => CommandError::Busy,
             async_mpsc::error::TrySendError::Closed(_) => CommandError::Stopped,
@@ -393,12 +411,12 @@ enum OutputMessage {
 }
 
 struct OutputProducer {
-    sender: mpsc::SyncSender<OutputMessage>,
+    sender: channel::Sender<OutputMessage>,
     produced: Arc<AtomicU64>,
 }
 
 impl OutputProducer {
-    fn send(&self, message: OutputMessage) -> Result<(), mpsc::SendError<OutputMessage>> {
+    fn send(&self, message: OutputMessage) -> Result<(), channel::SendError<OutputMessage>> {
         // Publish the sequence before the bounded send can block. An acquire
         // snapshot can therefore include this message even while it is still
         // waiting for the runtime to free a queue slot.
@@ -412,7 +430,7 @@ impl OutputProducer {
 }
 
 struct OutputQueue {
-    receiver: mpsc::Receiver<OutputMessage>,
+    receiver: channel::Receiver<OutputMessage>,
     produced: Arc<AtomicU64>,
     consumed: u64,
 }
@@ -432,6 +450,7 @@ impl OutputQueue {
 
 struct RuntimeQueues {
     control: async_mpsc::Receiver<RuntimeMessage>,
+    doorbell: channel::Receiver<()>,
     output: OutputQueue,
 }
 
@@ -463,6 +482,11 @@ pub fn spawn_terminal(spec: SpawnSpec) -> Result<TerminalHandle> {
     let reader = pair.master.try_clone_reader()?;
     let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
     let (commands, receiver) = async_mpsc::channel(QUEUE_CAPACITY);
+    let (doorbell_sender, doorbell) = channel::bounded(1);
+    let commands = RuntimeCommands {
+        channel: commands,
+        doorbell: doorbell_sender,
+    };
     let (output, output_queue) = output_queue();
     let (events, _) = broadcast::channel(16);
     let (lifecycle, _) = watch::channel(TerminalLifecycle::Running);
@@ -506,6 +530,7 @@ pub fn spawn_terminal(spec: SpawnSpec) -> Result<TerminalHandle> {
             run(
                 RuntimeQueues {
                     control: receiver,
+                    doorbell,
                     output: output_queue,
                 },
                 RuntimePublishers {
@@ -733,27 +758,33 @@ fn run(
                 }
             }
         }
+        // Park until PTY output arrives, a command rings the doorbell, or the
+        // synchronized-output flush interval elapses. Commands must never wait
+        // out the full timeout: interactive latency depends on waking now.
         if reader_complete {
-            thread::sleep(Duration::from_millis(20));
+            let _ = queues.doorbell.recv_timeout(Duration::from_millis(20));
         } else {
-            match queues
-                .output
-                .receiver
-                .recv_timeout(Duration::from_millis(20))
-            {
-                Ok(message) => {
-                    reader_complete =
-                        consume_output_message(&mut queues.output, message, terminal, &publishers);
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    reader_complete = true;
-                    publish_optional(
-                        terminal.finish_synchronized_output(),
-                        publishers.snapshots,
-                        publishers.events,
-                    );
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => publish_optional(
+            channel::select! {
+                recv(queues.output.receiver) -> message => match message {
+                    Ok(message) => {
+                        reader_complete = consume_output_message(
+                            &mut queues.output,
+                            message,
+                            terminal,
+                            &publishers,
+                        );
+                    }
+                    Err(channel::RecvError) => {
+                        reader_complete = true;
+                        publish_optional(
+                            terminal.finish_synchronized_output(),
+                            publishers.snapshots,
+                            publishers.events,
+                        );
+                    }
+                },
+                recv(queues.doorbell) -> _ => {}
+                default(Duration::from_millis(20)) => publish_optional(
                     terminal.flush_synchronized_output(),
                     publishers.snapshots,
                     publishers.events,
@@ -936,8 +967,9 @@ fn drain_output_until(
                     break;
                 }
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(channel::RecvTimeoutError::Disconnected | channel::RecvTimeoutError::Timeout) => {
+                break;
+            }
         }
     }
     publish_optional(
@@ -983,7 +1015,7 @@ fn acknowledge_pending_closes(receiver: &mut async_mpsc::Receiver<RuntimeMessage
 }
 
 fn output_queue() -> (OutputProducer, OutputQueue) {
-    let (sender, receiver) = mpsc::sync_channel(OUTPUT_QUEUE_CAPACITY);
+    let (sender, receiver) = channel::bounded(OUTPUT_QUEUE_CAPACITY);
     let produced = Arc::new(AtomicU64::new(0));
     (
         OutputProducer {
@@ -1076,6 +1108,13 @@ fn pty_size(size: TerminalSize) -> PtySize {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    fn test_commands(sender: async_mpsc::Sender<RuntimeMessage>) -> RuntimeCommands {
+        RuntimeCommands {
+            channel: sender,
+            doorbell: channel::bounded(1).0,
+        }
+    }
 
     struct RecordingWriter(Arc<Mutex<Vec<u8>>>);
 
@@ -1373,6 +1412,8 @@ mod tests {
         output
             .send(OutputMessage::Bytes(b"\x1b[?1007l".to_vec()))
             .unwrap();
+        // With alternate scroll disabled the wheel is consumed locally; at
+        // the top of an empty history that means dropping it outright.
         assert!(matches!(
             mouse_input_after_output_barrier(
                 &mut queued_output,
@@ -1384,7 +1425,7 @@ mod tests {
                 true,
             )
             .unwrap(),
-            MouseInputOutcome::Scrolled(_)
+            MouseInputOutcome::Handled
         ));
         assert_eq!(queued_output.consumed, 19);
         assert_eq!(
@@ -1550,10 +1591,58 @@ mod tests {
         handle.close().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn queued_wheel_input_is_applied_promptly() {
+        let handle = spawn_terminal(shell(
+            "i=0; while [ $i -le 60 ]; do echo \"HIST_$i\"; i=$((i+1)); done; echo READY; while IFS= read -r line; do :; done",
+            HashMap::new(),
+        ))
+        .unwrap();
+        let mut snapshots = handle.subscribe_snapshots();
+        wait_for_text(&mut snapshots, "READY").await;
+
+        // A wheel round-trip must not wait out the runtime's 20ms output
+        // poll: trackpad flings queue hundreds of events, and per-event poll
+        // latency turns a burst into seconds of lag. 100 round-trips at poll
+        // latency would take ~2s; woken promptly they take milliseconds.
+        let started = Instant::now();
+        let mut offset = None;
+        for _ in 0..100 {
+            let outcome = handle
+                .mouse_input(
+                    MouseEvent {
+                        kind: MouseEventKind::Wheel {
+                            direction: crate::domain::MouseWheelDirection::Up,
+                        },
+                        column: 0,
+                        row: 0,
+                        modifiers: crate::domain::MouseModifiers::default(),
+                        buttons: crate::domain::MouseButtons::default(),
+                    },
+                    offset,
+                    true,
+                )
+                .await
+                .unwrap();
+            if let MouseInputOutcome::Scrolled(viewport)
+            | MouseInputOutcome::ReturnedToBottom(viewport) = outcome
+            {
+                offset = viewport.offset;
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "100 wheel round-trips took {:?}; runtime wake-up latency regressed",
+            started.elapsed()
+        );
+        handle.close().await.unwrap();
+    }
+
     #[test]
     fn drop_cleanup_is_bounded_when_the_command_queue_is_saturated_or_stalled() {
         for saturated in [true, false] {
             let (commands, _stalled_receiver) = async_mpsc::channel(1);
+            let commands = test_commands(commands);
             if saturated {
                 assert!(commands.try_send(RuntimeMessage::Input(Vec::new())).is_ok());
             }
@@ -1779,6 +1868,7 @@ mod tests {
     #[tokio::test]
     async fn paste_waits_for_bounded_queue_capacity_and_runtime_completion() {
         let (commands, mut receiver) = async_mpsc::channel(1);
+        let commands = test_commands(commands);
         commands
             .try_send(RuntimeMessage::Input(b"first".to_vec()))
             .unwrap();
@@ -1826,6 +1916,7 @@ mod tests {
         );
 
         let (commands, mut receiver) = async_mpsc::channel(1);
+        let commands = test_commands(commands);
         let (press_completion, _press_completed) = oneshot::channel();
         commands
             .try_send(RuntimeMessage::MouseInput {
@@ -1894,6 +1985,7 @@ mod tests {
     #[tokio::test]
     async fn input_waiting_for_capacity_reports_receiver_closure_as_stopped() {
         let (commands, mut receiver) = async_mpsc::channel(1);
+        let commands = test_commands(commands);
         commands
             .try_send(RuntimeMessage::Input(b"first".to_vec()))
             .unwrap();
@@ -1901,7 +1993,9 @@ mod tests {
         let waiting = tokio::spawn({
             let commands = commands.clone();
             async move {
-                send_with_backpressure(&commands, RuntimeMessage::Input(b"second".to_vec())).await
+                commands
+                    .send(RuntimeMessage::Input(b"second".to_vec()))
+                    .await
             }
         });
         tokio::time::sleep(Duration::from_millis(25)).await;

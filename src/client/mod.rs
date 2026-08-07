@@ -74,7 +74,8 @@ use tab_bar::{TabBarAction, TabBarState};
 use crate::{
     domain::{
         CellColor, CellStyle, MouseButton, MouseButtons, MouseEvent, MouseEventKind,
-        MouseModifiers, MouseWheelDirection, ScreenSnapshot, TerminalId, TerminalSize,
+        MouseModifiers, MouseWheelDirection, ScreenSnapshot, ScrollPosition, TerminalId,
+        TerminalSize,
     },
     protocol::{
         ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, SelectedTarget, SelectedView,
@@ -2643,6 +2644,13 @@ fn render_view(
             continue;
         };
         Screen(screen).render(*content, buffer);
+        render_scrollbar(
+            screen.scroll,
+            *content,
+            pane.target.terminal_id == view.focused,
+            divider_style,
+            buffer,
+        );
         if pane.target.terminal_id == view.focused
             && screen.cursor.visible
             && screen.cursor.column < content.width
@@ -2669,6 +2677,55 @@ fn render_notice(area: Rect, buffer: &mut Buffer, message: &str) {
         usize::from(area.width),
         Style::default().add_modifier(Modifier::REVERSED),
     );
+}
+
+/// Overlay scrollbar on a pane's right edge, shown only while the viewport
+/// is scrolled into history so the terminal never reflows for it.
+fn render_scrollbar(
+    scroll: ScrollPosition,
+    area: Rect,
+    focused: bool,
+    track_style: Style,
+    buffer: &mut Buffer,
+) {
+    if scroll.offset_from_bottom == 0 || area.width == 0 {
+        return;
+    }
+    let Some((top, len)) = scrollbar_thumb(scroll, area.height) else {
+        return;
+    };
+    let column = area.x + area.width - 1;
+    for row in 0..area.height {
+        if let Some(cell) = buffer.cell_mut((column, area.y + row)) {
+            cell.set_symbol("▕").set_style(track_style);
+        }
+    }
+    let symbol = if focused { "▐" } else { "▕" };
+    let style = track_style.add_modifier(Modifier::BOLD);
+    for row in top..top.saturating_add(len).min(area.height) {
+        if let Some(cell) = buffer.cell_mut((column, area.y + row)) {
+            cell.set_symbol(symbol).set_style(style);
+        }
+    }
+}
+
+/// Thumb placement within a track of `height` rows: `(top, len)` with the
+/// thumb sized proportionally to how much of the scrollback the viewport
+/// shows and positioned by how far back it is scrolled.
+fn scrollbar_thumb(scroll: ScrollPosition, height: u16) -> Option<(u16, u16)> {
+    if scroll.max_offset_from_bottom == 0 || height == 0 {
+        return None;
+    }
+    let track = usize::from(height);
+    let total = scroll.max_offset_from_bottom + track;
+    let len = (track * track).div_ceil(total).clamp(1, track);
+    let max_top = track - len;
+    let scrolled_from_top = scroll
+        .max_offset_from_bottom
+        .saturating_sub(scroll.offset_from_bottom);
+    let top = (scrolled_from_top * max_top + scroll.max_offset_from_bottom / 2)
+        / scroll.max_offset_from_bottom;
+    Some((top as u16, len as u16))
 }
 
 struct Screen<'a>(&'a ScreenSnapshot);
@@ -2815,6 +2872,38 @@ impl Drop for TerminalGuard {
 mod tests {
     use super::*;
     use crate::domain::{Cell, Cursor, PaneId, Rgb, SessionId, TabId, WorkspaceId};
+
+    fn scroll(offset_from_bottom: usize, max_offset_from_bottom: usize) -> ScrollPosition {
+        ScrollPosition {
+            offset_from_bottom,
+            max_offset_from_bottom,
+        }
+    }
+
+    #[test]
+    fn scrollbar_thumb_requires_scrollback_and_a_track() {
+        assert_eq!(scrollbar_thumb(scroll(0, 0), 10), None);
+        assert_eq!(scrollbar_thumb(scroll(5, 10), 0), None);
+    }
+
+    #[test]
+    fn scrollbar_thumb_is_proportional_to_visible_share() {
+        // Ten visible rows over ten rows of history: half the content is
+        // visible, so the thumb covers half the track.
+        assert_eq!(scrollbar_thumb(scroll(10, 10), 10), Some((0, 5)));
+        // Deep history still leaves a grabbable one-cell thumb.
+        assert_eq!(scrollbar_thumb(scroll(10_000, 10_000), 10), Some((0, 1)));
+    }
+
+    #[test]
+    fn scrollbar_thumb_tracks_the_viewport_position() {
+        let position = |offset| scrollbar_thumb(scroll(offset, 30), 10).unwrap();
+        assert_eq!(position(30), (0, 3), "scrolled to the top");
+        assert_eq!(position(15), (4, 3), "midway through history");
+        assert_eq!(position(1), (7, 3), "one row above the bottom");
+        let (top, len) = position(1);
+        assert!(top + len <= 10, "thumb stays inside the track");
+    }
 
     fn targets(count: usize) -> Vec<SelectedTarget> {
         let session_id = SessionId::new();

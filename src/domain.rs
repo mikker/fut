@@ -425,6 +425,16 @@ pub struct Cursor {
     pub visible: bool,
 }
 
+/// Where the snapshot's viewport sits within the terminal's scrollback.
+/// `max_offset_from_bottom` of zero means no scrollback exists yet.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScrollPosition {
+    #[serde(rename = "b")]
+    pub offset_from_bottom: usize,
+    #[serde(rename = "m")]
+    pub max_offset_from_bottom: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScreenSnapshot {
     #[serde(rename = "r")]
@@ -435,6 +445,9 @@ pub struct ScreenSnapshot {
     pub cells: Vec<Cell>,
     #[serde(rename = "p")]
     pub cursor: Cursor,
+    // Defaulted so snapshots from daemons predating scroll metrics decode.
+    #[serde(rename = "v", default)]
+    pub scroll: ScrollPosition,
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -476,6 +489,7 @@ impl ScreenSnapshot {
             size,
             cells,
             cursor,
+            scroll: ScrollPosition::default(),
         })
     }
 }
