@@ -1456,6 +1456,16 @@ async fn closing_a_multi_pane_tab_preserves_and_routes_its_sibling_tab() {
 #[tokio::test]
 async fn public_new_tab_rejections_are_pre_spawn_and_atomic() {
     let harness = Harness::start("while IFS= read -r line; do :; done").await;
+    let named = harness.resources().await.sessions[0].workspaces[0].tabs[0].id;
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::RenameTarget {
+                selector: RenameSelector::Tab(named),
+                name: "shell".into(),
+            })
+            .await,
+        ServerMessage::CommandCompleted { .. }
+    ));
     let before = harness.resources().await;
     let workspace_id = before.sessions[0].workspaces[0].id;
     let duplicate = before.sessions[0].workspaces[0].tabs[0].name.clone();
@@ -5677,13 +5687,13 @@ done
         PtyChild::spawn(command)
     };
 
-    let mut left = spawn_client(120, main_pane);
+    let mut left = spawn_client(124, main_pane);
     left.wait_for("ALPHA_READY").await;
     left.wait_for("feature").await;
     left.send(b"size-main\n");
     left.wait_for("ALPHA_SIZE_23_96").await;
     left.send(b"\x02w");
-    left.wait_for("c new · r rename").await;
+    left.wait_for("press ? for hotkeys").await;
     left.send(b"j\r");
     left.wait_for("ZETA_READY").await;
     left.send(b"linked\nsize-linked\n");
@@ -5715,7 +5725,7 @@ right = [{ text = "]" }, { token = "workspace.tab_count" }]
 "#,
     )
     .unwrap();
-    let mut right = spawn_client(120, linked_target.pane_id);
+    let mut right = spawn_client(124, linked_target.pane_id);
     right.wait_for("WORKSPACES").await;
     right.wait_for("WS[").await;
     right.wait_for("feature").await;
@@ -5734,20 +5744,20 @@ right = [{ text = "]" }, { token = "workspace.tab_count" }]
     right.send(b"\x02d");
     right.wait_success().await;
 
-    let mut narrow = spawn_client(119, main_pane);
+    let mut narrow = spawn_client(123, main_pane);
     narrow.wait_for("ALPHA_READY").await;
     narrow.send(b"size-narrow\n");
-    narrow.wait_for("NARROW_SIZE_23_119").await;
+    narrow.wait_for("NARROW_SIZE_23_123").await;
     narrow.send(b"\x02w");
     narrow.wait_for("feature").await;
     narrow.wait_for("λ").await;
     narrow.send(b"q");
     narrow.send(b"size-narrow\n");
-    narrow.wait_for_count("NARROW_SIZE_23_119", 2).await;
+    narrow.wait_for_count("NARROW_SIZE_23_123", 2).await;
     narrow.send(b"\x02d");
     narrow.wait_success().await;
 
-    let mut live_close = spawn_client(120, linked_target.pane_id);
+    let mut live_close = spawn_client(124, linked_target.pane_id);
     live_close.wait_for("feature").await;
     assert!(matches!(
         harness
@@ -5772,10 +5782,10 @@ right = [{ text = "]" }, { token = "workspace.tab_count" }]
     })
     .await;
     live_close.send(b"size-linked\n");
-    live_close.wait_for("ZETA_SIZE_23_120").await;
+    live_close.wait_for("ZETA_SIZE_23_124").await;
     live_close.send(b"\x02w");
     live_close.wait_for("done").await;
-    live_close.wait_for("c new · r rename").await;
+    live_close.wait_for("press ? for hotkeys").await;
     live_close.send(b"k\r");
     live_close.send(b"after-close\n");
     live_close.wait_for("OMEGA_ACK").await;
@@ -5817,7 +5827,7 @@ async fn workspace_and_tab_bars_create_and_rename_logical_contexts() {
     client.wait_for("CONTEXT_READY").await;
 
     client.send(b"\x02w");
-    client.wait_for("c new · r rename").await;
+    client.wait_for("press ? for hotkeys").await;
     client.send(b"c");
     let created_workspace = time::timeout(DEADLINE, async {
         loop {
@@ -5981,7 +5991,8 @@ async fn workspace_and_tab_bars_create_and_rename_logical_contexts() {
             .iter()
             .map(|tab| tab.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["first", "shell"]
+        vec!["first", ""],
+        "tabs created from the tab bar stay unnamed"
     );
 
     client.send(b"\x02d");

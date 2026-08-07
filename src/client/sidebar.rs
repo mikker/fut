@@ -10,10 +10,15 @@ use crate::{
 use super::{
     chrome::sanitize,
     config::{SemanticStyle, UiConfig, WorkspaceSidebarPosition},
+    git::GitStatusCache,
     navigation::NavigationHistory,
     notifications::{ActivityIndicator, NotificationState},
     presentation::{ItemState, TokenValue, apply_item_state, render_token_segments, truncate_line},
 };
+
+/// The current workspace is marked with a bullet instead of an icon so the
+/// sidebar reads the same at every icon preset.
+const CURRENT_MARKER: &str = "●";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct WorkspaceItem {
@@ -125,7 +130,18 @@ pub(super) struct WorkspaceSidebarState {
     model: WorkspaceModel,
     selected: Option<WorkspaceId>,
     status: WorkspaceStatus,
+    help: bool,
 }
+
+const HELP_KEYS: [(&str, &str); 7] = [
+    ("↵", "switch to workspace"),
+    ("↑↓ j k", "move selection"),
+    ("1-9 0", "pick by number"),
+    ("c", "new workspace"),
+    ("r", "rename"),
+    ("h", "toggle auto-hide"),
+    ("q esc", "close"),
+];
 
 #[derive(Debug, Eq, PartialEq)]
 pub(super) enum WorkspaceSidebarAction {
@@ -155,6 +171,7 @@ impl WorkspaceSidebarState {
             model,
             selected: Some(selected),
             status: WorkspaceStatus::Ready,
+            help: false,
         })
     }
 
@@ -204,7 +221,15 @@ impl WorkspaceSidebarState {
         {
             return WorkspaceSidebarAction::Stay;
         }
+        if self.help {
+            self.help = false;
+            return WorkspaceSidebarAction::Stay;
+        }
         match key.code {
+            KeyCode::Char('?') => {
+                self.help = true;
+                WorkspaceSidebarAction::Stay
+            }
             KeyCode::Esc | KeyCode::Char('q') => WorkspaceSidebarAction::Close,
             KeyCode::Char('c') if key.modifiers == KeyModifiers::NONE => {
                 WorkspaceSidebarAction::Create
@@ -276,11 +301,16 @@ impl WorkspaceSidebarState {
         self.status = WorkspaceStatus::Error(sanitize(&message));
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the renderer keeps geometry, configuration, and cached inputs explicit"
+    )]
     pub fn render(
         &self,
         area: Rect,
         position: WorkspaceSidebarPosition,
         ui: &UiConfig,
+        git: &GitStatusCache,
         spinner_frame: usize,
         buffer: &mut Buffer,
     ) {
@@ -288,10 +318,12 @@ impl WorkspaceSidebarState {
             &self.model,
             self.selected,
             Some(&self.status),
+            self.help,
             spinner_frame,
             area,
             position,
             ui,
+            git,
             buffer,
         );
     }
@@ -350,6 +382,7 @@ pub(super) fn render_workspace_sidebar(
     area: Rect,
     position: WorkspaceSidebarPosition,
     ui: &UiConfig,
+    git: &GitStatusCache,
     buffer: &mut Buffer,
 ) {
     let model = snapshot
@@ -359,10 +392,12 @@ pub(super) fn render_workspace_sidebar(
         &model,
         None,
         None,
+        false,
         spinner_frame,
         area,
         position,
         ui,
+        git,
         buffer,
     );
 }
@@ -375,10 +410,12 @@ fn render_model(
     model: &WorkspaceModel,
     selected: Option<WorkspaceId>,
     status: Option<&WorkspaceStatus>,
+    help: bool,
     spinner_frame: usize,
     area: Rect,
     position: WorkspaceSidebarPosition,
     ui: &UiConfig,
+    git: &GitStatusCache,
     buffer: &mut Buffer,
 ) {
     if area.width == 0 || area.height == 0 {
@@ -423,7 +460,17 @@ fn render_model(
     }
 
     let header_line = render_sidebar_chrome(&ui.workspace_sidebar.header, model, status, ui);
-    let footer_line = render_sidebar_chrome(&ui.workspace_sidebar.footer, model, status, ui);
+    let footer_line = if help {
+        ratatui::text::Line::from(ratatui::text::Span::styled(
+            " esc back",
+            ui.styles.apply(
+                SemanticStyle::Muted,
+                ui.styles.apply(SemanticStyle::Normal, Style::default()),
+            ),
+        ))
+    } else {
+        render_sidebar_chrome(&ui.workspace_sidebar.footer, model, status, ui)
+    };
     let header = (!header_line.spans.is_empty() && content.height >= 3).then_some(header_line);
     let footer_allowed = status
         .is_none_or(|status| content.height >= 5 || !matches!(status, WorkspaceStatus::Ready));
@@ -446,7 +493,13 @@ fn render_model(
             content.width,
         );
     }
-    if model.items.is_empty() {
+    if help {
+        render_help(
+            Rect::new(content.x, row_y, content.width, row_height),
+            ui,
+            buffer,
+        );
+    } else if model.items.is_empty() {
         let item = WorkspaceItem {
             id: WorkspaceId::new(),
             name: "workspace".into(),
@@ -464,6 +517,7 @@ fn render_model(
             spinner_frame,
             Rect::new(content.x, row_y, content.width, row_height.min(2)),
             ui,
+            git,
             buffer,
         );
     } else {
@@ -513,6 +567,7 @@ fn render_model(
                                 .min(row_bottom.saturating_sub(y)),
                         ),
                         ui,
+                        git,
                         buffer,
                     );
                     y = y.saturating_add(u16::try_from(item_height).unwrap_or(u16::MAX));
@@ -528,6 +583,37 @@ fn render_model(
             &truncate_line(footer, usize::from(content.width)),
             content.width,
         );
+    }
+}
+
+fn render_help(area: Rect, ui: &UiConfig, buffer: &mut Buffer) {
+    let normal = ui.styles.apply(SemanticStyle::Normal, Style::default());
+    let muted = ui.styles.apply(SemanticStyle::Muted, normal);
+    for (line, (keys, label)) in HELP_KEYS.iter().enumerate() {
+        let Ok(offset) = u16::try_from(line) else {
+            return;
+        };
+        if offset >= area.height {
+            return;
+        }
+        let y = area.y.saturating_add(offset);
+        buffer.set_stringn(
+            area.x,
+            y,
+            format!("  {keys}"),
+            usize::from(area.width),
+            normal,
+        );
+        let indent = 9;
+        if area.width > indent {
+            buffer.set_stringn(
+                area.x + indent,
+                y,
+                *label,
+                usize::from(area.width - indent),
+                muted,
+            );
+        }
     }
 }
 
@@ -552,9 +638,7 @@ fn render_sidebar_chrome(
             }
             "workspace.icon" => TokenValue::plain(icons.workspace.clone()),
             "sidebar.status" => match status {
-                Some(WorkspaceStatus::Ready) => {
-                    TokenValue::plain(" ↑↓ ↵ c new · r rename · h hide · 1-9 pick")
-                }
+                Some(WorkspaceStatus::Ready) => TokenValue::plain(" press ? for hotkeys"),
                 Some(WorkspaceStatus::Switching) => TokenValue::plain(" switching…"),
                 Some(WorkspaceStatus::Error(message)) => {
                     TokenValue::styled(format!(" {message} · retry"), SemanticStyle::Error)
@@ -572,12 +656,14 @@ fn render_workspace_row(
     spinner_frame: usize,
     area: Rect,
     ui: &UiConfig,
+    git: &GitStatusCache,
     buffer: &mut Buffer,
 ) {
     if area.width == 0 {
         return;
     }
     let icons = ui.icons.resolve();
+    let git_status = git.status(&item.root).unwrap_or_default();
     let state = ItemState {
         // The workspace marker carries active state so keyboard selection can own
         // the row background without making two rows look selected at once.
@@ -599,7 +685,7 @@ fn render_workspace_row(
         buffer,
     );
     let resolve = |token: &str| match token {
-        "workspace.marker" if item.current => TokenValue::plain(icons.current.clone()),
+        "workspace.marker" if item.current => TokenValue::plain(CURRENT_MARKER),
         "workspace.marker" => TokenValue::plain(" "),
         "workspace.index" => TokenValue::plain((item.index + 1).to_string()),
         "workspace.name" => TokenValue::plain(sanitize(&item.name)),
@@ -616,6 +702,13 @@ fn render_workspace_row(
         }
         "workspace.tab_count" => TokenValue::plain(item.tab_count.to_string()),
         "workspace.icon" => TokenValue::plain(icons.workspace.clone()),
+        "workspace.git_branch" => TokenValue::plain(sanitize(&git_status.branch)),
+        "workspace.git_added" if git_status.insertions > 0 => {
+            TokenValue::styled(format!("+{}", git_status.insertions), SemanticStyle::Added)
+        }
+        "workspace.git_deleted" if git_status.deletions > 0 => {
+            TokenValue::styled(format!("-{}", git_status.deletions), SemanticStyle::Deleted)
+        }
         "workspace.activity" => item.activity.map_or_else(
             || TokenValue::plain(""),
             |activity| {
@@ -854,10 +947,12 @@ mod tests {
             model,
             selected,
             status,
+            false,
             0,
             area,
             position,
             &UiConfig::default(),
+            &GitStatusCache::default(),
             &mut buffer,
         );
         let text = (0..height)
@@ -944,6 +1039,17 @@ mod tests {
             state.key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)),
             WorkspaceSidebarAction::ToggleAutoHide
         );
+        assert_eq!(
+            state.key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE)),
+            WorkspaceSidebarAction::Stay
+        );
+        assert!(state.help, "? opens the hotkey help");
+        assert_eq!(
+            state.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+            WorkspaceSidebarAction::Stay,
+            "any key leaves help without acting"
+        );
+        assert!(!state.help);
         let feature_pane = snapshot.sessions[0].workspaces[2].tabs[0].panes[0].id;
         assert_eq!(
             state.key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE)),
@@ -1002,23 +1108,26 @@ mod tests {
             &NotificationState::default(),
         );
         let (left, left_buffer) =
-            rendered(&model, None, None, 24, 6, WorkspaceSidebarPosition::Left);
+            rendered(&model, None, None, 24, 9, WorkspaceSidebarPosition::Left);
         assert!(left.contains("main"));
-        assert!(left.contains("/project/0"));
         assert!(left.contains("bad�name"));
         assert!(left.contains("closing"));
         assert!(left.contains('×'));
-        assert_eq!(left_buffer[(0, 0)].symbol(), "●");
+        assert_eq!(left_buffer[(0, 0)].symbol(), CURRENT_MARKER);
         assert!(!left_buffer[(0, 0)].modifier.contains(Modifier::REVERSED));
         assert!(left_buffer[(0, 0)].modifier.contains(Modifier::BOLD));
         assert_eq!(left_buffer[(23, 0)].symbol(), "│");
         assert_eq!(left_buffer[(23, 0)].fg, ratatui::style::Color::DarkGray);
+        assert!(
+            left.lines().nth(2).unwrap().contains("bad�name"),
+            "entries follow each other without spacing"
+        );
 
         let (right, right_buffer) =
-            rendered(&model, None, None, 24, 6, WorkspaceSidebarPosition::Right);
+            rendered(&model, None, None, 24, 9, WorkspaceSidebarPosition::Right);
         assert!(right.contains("main"));
         assert_eq!(right_buffer[(0, 0)].symbol(), "│");
-        assert_eq!(right_buffer[(1, 0)].symbol(), "●");
+        assert_eq!(right_buffer[(1, 0)].symbol(), CURRENT_MARKER);
     }
 
     #[test]
@@ -1045,7 +1154,7 @@ mod tests {
         );
         for width in 1..24 {
             let (text, _) = rendered(&model, None, None, width, 3, WorkspaceSidebarPosition::Left);
-            assert!(text.contains('●'), "width {width}: {text:?}");
+            assert!(text.contains(CURRENT_MARKER), "width {width}: {text:?}");
         }
     }
 
@@ -1066,12 +1175,20 @@ mod tests {
             state.selected,
             Some(&state.status),
             24,
-            6,
+            9,
             WorkspaceSidebarPosition::Left,
         );
-        assert!(ready.contains("c new · r rename"));
-        assert_eq!(buffer[(0, 2)].bg, ratatui::style::Color::DarkGray);
-        assert!(buffer[(0, 2)].modifier.contains(Modifier::UNDERLINED));
+        assert!(ready.contains("press ? for hotkeys"));
+        assert_eq!(buffer[(0, 3)].bg, ratatui::style::Color::DarkGray);
+        assert!(
+            !buffer[(0, 3)].modifier.contains(Modifier::UNDERLINED),
+            "selection reads as a background, never an underline"
+        );
+        assert_eq!(
+            buffer[(0, 5)].bg,
+            ratatui::style::Color::Reset,
+            "the spacing line keeps the plain bar background"
+        );
 
         state.begin_switch();
         let (switching, _) = rendered(
@@ -1113,10 +1230,12 @@ mod tests {
             &model,
             None,
             None,
+            false,
             0,
             area,
             WorkspaceSidebarPosition::Left,
             &ui,
+            &GitStatusCache::default(),
             &mut buffer,
         );
         let text = (0..area.width)

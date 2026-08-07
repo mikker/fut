@@ -7,6 +7,7 @@ mod command_bar;
 pub(crate) mod config;
 mod copy_mode;
 mod dialog;
+mod git;
 mod input;
 mod jump;
 mod layout;
@@ -44,6 +45,7 @@ use crossterm::{
     },
 };
 use futures_util::{SinkExt, StreamExt};
+use git::GitStatusCache;
 use input::{PrefixAction, PrefixState, encode_key};
 use jump::{JumpAction, JumpState};
 use layout::{
@@ -230,6 +232,8 @@ async fn run(
     let mut spinner = time::interval(Duration::from_millis(100));
     spinner.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let (clipboard_results, mut clipboard_result) = mpsc::channel(1);
+    let (git_updates, mut git_update) = mpsc::channel(1);
+    let git = GitStatusCache::new(git_updates);
     send_request(framed, Some(Uuid::new_v4()), ClientMessage::ListResources).await?;
     resize_view(framed, terminal.size()?.into(), &mut view, &resources, &ui).await?;
 
@@ -1195,11 +1199,23 @@ async fn run(
                 cheatsheet_visible = true;
                 force_draw = true;
             }
+            Some(()) = git_update.recv() => {
+                force_draw = true;
+            }
             _ = spinner.tick(), if resources.has_working() => {
                 spinner_frame = spinner_frame.wrapping_add(1);
                 force_draw = true;
             }
             _ = redraw.tick(), if force_draw || view.needs_draw() => {
+                if let Some(snapshot) = resources.snapshot() {
+                    git.refresh(
+                        snapshot
+                            .sessions
+                            .iter()
+                            .flat_map(|session| &session.workspaces)
+                            .map(|workspace| workspace.root.as_path()),
+                    );
+                }
                 let focused_terminal_id = view.focused().terminal_id;
                 let rendered_attention = matches!(
                     surface.as_ref(),
@@ -1259,6 +1275,7 @@ async fn run(
                                     sidebar_area,
                                     ui.workspace_sidebar.position,
                                     &ui,
+                                    &git,
                                     spinner_frame,
                                     frame.buffer_mut(),
                                 );
@@ -1275,6 +1292,7 @@ async fn run(
                                 sidebar_area,
                                 ui.workspace_sidebar.position,
                                 &ui,
+                                &git,
                                 frame.buffer_mut(),
                             );
                         }
