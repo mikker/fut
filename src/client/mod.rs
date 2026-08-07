@@ -759,7 +759,8 @@ async fn run(
                     }
                     Event::Key(key) if matches!(surface.as_ref(), Some(ClientSurface::Navigator(_))) => {
                         notice = None;
-                        let visible = terminal.size()?.height.saturating_sub(2) as usize;
+                        let size = terminal.size()?;
+                        let visible = navigator::dialog_body_rows(Rect::new(0, 0, size.width, size.height));
                         let action = match surface.as_mut().expect("navigator exists") {
                             ClientSurface::Navigator(nav) => nav.key(key, visible),
                             _ => unreachable!("surface guard ensures navigator"),

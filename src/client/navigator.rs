@@ -12,7 +12,14 @@ use crate::{
     resources::{ResourceSnapshot, TargetSelector},
 };
 
+use super::dialog::{
+    dialog_area, fill_row, frame_inner, render_footer, render_frame, render_list_scrollbar,
+    title_style,
+};
 use super::notifications::{ActivityIndicator, NotificationState};
+
+const MAX_WIDTH: u16 = 80;
+const MAX_HEIGHT: u16 = 20;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ResourceKey {
@@ -197,31 +204,16 @@ impl NavigatorState {
         }
     }
 
-    pub fn render(&mut self, area: Rect, spinner_frame: usize, buffer: &mut Buffer) {
+    pub fn render(&mut self, host: Rect, spinner_frame: usize, buffer: &mut Buffer) {
+        let area = render_frame(dialog_area(host, MAX_WIDTH, MAX_HEIGHT), buffer);
         if area.width == 0 || area.height == 0 {
             return;
         }
-        for y in area.y..area.bottom() {
-            for x in area.x..area.right() {
-                if let Some(cell) = buffer.cell_mut((x, y)) {
-                    cell.reset();
-                }
-            }
-        }
-        let (header, footer) = match area.height {
-            0..=2 => (0, 0),
-            3..=4 => (0, 1),
-            _ => (1, 1),
-        };
+        let (header, footer) = chrome_rows(area.height);
         if header == 1 {
-            put(
-                buffer,
-                area.x,
-                area.y,
-                area.width,
-                "fut · navigator",
-                Style::default().add_modifier(Modifier::BOLD),
-            );
+            let title_row = Rect::new(area.x, area.y, area.width, 1);
+            fill_row(title_row, title_style(), buffer);
+            put(buffer, area.x, area.y, area.width, " navigator", title_style());
         }
         if footer == 1 {
             let footer = match &self.status {
@@ -236,14 +228,7 @@ impl NavigatorState {
                     _ => "↑↓/jk move  enter switch  esc cancel".to_owned(),
                 },
             };
-            put(
-                buffer,
-                area.x,
-                area.bottom() - 1,
-                area.width,
-                &footer,
-                Style::default().add_modifier(Modifier::DIM),
-            );
+            render_footer(area, &format!(" {footer}"), buffer);
         }
         let body_y = area.y + header;
         let body_height = usize::from(area.height - header - footer);
@@ -307,18 +292,36 @@ impl NavigatorState {
                     if index == self.selected {
                         style = style.add_modifier(Modifier::REVERSED);
                     }
-                    put(
-                        buffer,
-                        area.x,
-                        body_y + line as u16,
-                        area.width,
-                        &text,
-                        style,
-                    );
+                    let y = body_y + line as u16;
+                    fill_row(Rect::new(area.x, y, area.width, 1), style, buffer);
+                    put(buffer, area.x, y, area.width, &text, style);
                 }
+                let body = Rect::new(
+                    area.x,
+                    body_y,
+                    area.width,
+                    u16::try_from(body_height).expect("body height fits u16"),
+                );
+                render_list_scrollbar(self.scroll, self.rows.len(), body, buffer);
             }
         }
     }
+}
+
+fn chrome_rows(height: u16) -> (u16, u16) {
+    match height {
+        0..=2 => (0, 0),
+        3..=4 => (0, 1),
+        _ => (1, 1),
+    }
+}
+
+/// Rows the dialog body can show inside `host`, so key handling scrolls in
+/// step with rendering.
+pub(super) fn dialog_body_rows(host: Rect) -> usize {
+    let area = frame_inner(dialog_area(host, MAX_WIDTH, MAX_HEIGHT));
+    let (header, footer) = chrome_rows(area.height);
+    usize::from(area.height.saturating_sub(header + footer))
 }
 
 fn matches_request(pending: Option<Uuid>, response: Option<Uuid>) -> bool {
@@ -765,14 +768,15 @@ mod tests {
         let mut nav = NavigatorState::open(&current);
         nav.accept_resources(&snapshot, &current);
         nav.selected = 0;
-        let (ready, buffer) = rendered(&mut nav, 50, 7);
-        assert!(ready.contains("fut · navigator"));
+        let (ready, buffer) = rendered(&mut nav, 50, 9);
+        assert!(ready.contains("navigator"));
         assert!(ready.contains("sessión 🛰"));
         assert!(ready.contains("pane 1"));
         assert_eq!(ready.matches('•').count(), 1);
+        // First body row sits inside the border, below the title.
         assert!(
             buffer
-                .cell((1, 1))
+                .cell((1, 2))
                 .unwrap()
                 .modifier
                 .contains(Modifier::BOLD)
@@ -790,14 +794,14 @@ mod tests {
     }
 
     #[test]
-    fn three_lines_reserve_only_one_line_for_chrome() {
+    fn small_hosts_drop_the_title_before_the_footer() {
         let (snapshot, current, _) = fixture();
         let mut nav = NavigatorState::open(&current);
         nav.accept_resources(&snapshot, &current);
-        let (text, _) = rendered(&mut nav, 40, 3);
-        assert!(!text.contains("fut · navigator"));
+        // Height 6 leaves a 4-row interior: footer but no title.
+        let (text, _) = rendered(&mut nav, 40, 6);
+        assert!(!text.contains("navigator"));
         assert_eq!(text.lines().filter(|line| line.contains("move")).count(), 1);
-        assert!(text.lines().take(2).all(|line| !line.is_empty()));
     }
 
     #[test]
