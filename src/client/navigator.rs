@@ -137,6 +137,12 @@ impl NavigatorState {
         let last = self.rows.len().saturating_sub(1);
         let page = visible_rows.max(1);
         match (key.code, key.modifiers) {
+            (KeyCode::Up, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
+                self.jump_back(1)
+            }
+            (KeyCode::Down, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
+                self.jump_forward(1)
+            }
             (KeyCode::Up | KeyCode::Char('k'), _) => {
                 self.selected = self.selected.saturating_sub(1)
             }
@@ -968,6 +974,11 @@ mod tests {
         press(&mut nav, KeyCode::Char('J'));
         assert_eq!(nav.selected, 11, "no wrap at the end");
         press(&mut nav, KeyCode::Char('K'));
+        assert_eq!(nav.selected, 7);
+        // Shift+arrows mirror J/K.
+        nav.key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT), 10);
+        assert_eq!(nav.selected, 11);
+        nav.key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT), 10);
         assert_eq!(nav.selected, 7);
         nav.selected = 5;
         press(&mut nav, KeyCode::Char(']'));
