@@ -19,6 +19,16 @@ use crate::{
     splits::{SplitDirection, SplitTree},
 };
 
+/// Tabs may be unnamed; any other name must carry visible characters and stay
+/// unique inside its workspace.
+fn check_tab_name(name: &str) -> Result<(), ResourceError> {
+    if name.is_empty() || !name.trim().is_empty() {
+        Ok(())
+    } else {
+        Err(ResourceError::EmptyName)
+    }
+}
+
 fn disambiguate(suggested: &str, exists: impl Fn(&str) -> bool) -> String {
     if !exists(suggested) {
         return suggested.to_owned();
@@ -581,7 +591,8 @@ impl ResourceTree {
     }
 
     pub fn create_session(&mut self, path: InitialPath) -> Result<Mutation, ResourceError> {
-        self.check_names([&path.session_name, &path.workspace_name, &path.tab_name])?;
+        self.check_names([&path.session_name, &path.workspace_name])?;
+        check_tab_name(&path.tab_name)?;
         if self.sessions.values().any(|s| s.name == path.session_name) {
             return Err(ResourceError::Duplicate("session name"));
         }
@@ -754,7 +765,7 @@ impl ResourceTree {
         tab_id: TabId,
         new_name: String,
     ) -> Result<Mutation, ResourceError> {
-        self.check_names([&new_name])?;
+        check_tab_name(&new_name)?;
         let tab = self
             .tabs
             .get(&tab_id)
@@ -773,10 +784,11 @@ impl ResourceTree {
         if tab.closing {
             return Err(ResourceError::Closing("tab"));
         }
-        if workspace
-            .tabs
-            .iter()
-            .any(|id| *id != tab_id && self.tabs[id].name == new_name)
+        if !new_name.is_empty()
+            && workspace
+                .tabs
+                .iter()
+                .any(|id| *id != tab_id && self.tabs[id].name == new_name)
         {
             return Err(ResourceError::Duplicate("tab name"));
         }
@@ -801,7 +813,8 @@ impl ResourceTree {
         session_id: SessionId,
         path: WorkspacePath,
     ) -> Result<Mutation, ResourceError> {
-        self.check_names([&path.workspace_name, &path.tab_name])?;
+        self.check_names([&path.workspace_name])?;
+        check_tab_name(&path.tab_name)?;
         let session = self
             .sessions
             .get(&session_id)
@@ -886,7 +899,7 @@ impl ResourceTree {
         workspace_id: WorkspaceId,
         path: TabPath,
     ) -> Result<Mutation, ResourceError> {
-        self.check_names([&path.tab_name])?;
+        check_tab_name(&path.tab_name)?;
         let workspace = self
             .workspaces
             .get(&workspace_id)
@@ -897,10 +910,11 @@ impl ResourceTree {
         if workspace.closing {
             return Err(ResourceError::Closing("workspace"));
         }
-        if workspace
-            .tabs
-            .iter()
-            .any(|id| self.tabs[id].name == path.tab_name)
+        if !path.tab_name.is_empty()
+            && workspace
+                .tabs
+                .iter()
+                .any(|id| self.tabs[id].name == path.tab_name)
         {
             return Err(ResourceError::Duplicate("tab name"));
         }
@@ -1487,11 +1501,11 @@ impl ResourceTree {
                         return self.invalid("missing tab");
                     };
                     if tab.workspace_id != *wid
-                        || tab.name.trim().is_empty()
+                        || check_tab_name(&tab.name).is_err()
                         || tab.panes.is_empty()
                         || !tab.layout.validate()
                         || tab.layout.leaf_ids() != tab.panes
-                        || !tab_names.insert(&tab.name)
+                        || (!tab.name.is_empty() && !tab_names.insert(&tab.name))
                         || !seen_tabs.insert(*tid)
                         || !unique(&tab.panes)
                     {

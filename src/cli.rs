@@ -161,7 +161,7 @@ enum TabCommand {
         /// Raw UUID of the workspace that will own the tab.
         #[arg(add = ArgValueCompleter::new(completion::tab_new))]
         workspace_id: WorkspaceId,
-        /// Name for the new tab; defaults to shell, shell-2, and so on.
+        /// Name for the new tab; unnamed by default.
         #[arg(long)]
         name: Option<String>,
         /// Working directory for the child; defaults to the workspace root.

@@ -1162,7 +1162,7 @@ fn initial_path(resolved: &ResolvedLocation, name: String, terminal_id: Terminal
         workspace_name: resolved.suggested_workspace_name.clone(),
         root: resolved.workspace_root.clone(),
         tab_id: TabId::new(),
-        tab_name: "shell".into(),
+        tab_name: String::new(),
         pane_id: PaneId::new(),
         terminal_id,
     }
@@ -2944,7 +2944,7 @@ async fn open_location(
             workspace_name,
             root: resolved.workspace_root.clone(),
             tab_id: TabId::new(),
-            tab_name: "shell".into(),
+            tab_name: String::new(),
             pane_id: PaneId::new(),
             terminal_id: TerminalId::new(),
         };
@@ -3170,7 +3170,7 @@ async fn create_workspace(
             workspace_name,
             root,
             tab_id: TabId::new(),
-            tab_name: "shell".into(),
+            tab_name: String::new(),
             pane_id: PaneId::new(),
             terminal_id: TerminalId::new(),
         };
@@ -3267,10 +3267,7 @@ async fn create_tab(
         if !state.accepting {
             return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
         }
-        let tab_name = match name {
-            Some(name) => name,
-            None => state.resources.available_tab_name(workspace_id, "shell")?,
-        };
+        let tab_name = name.unwrap_or_default();
         let proposed = TabPath {
             tab_id: TabId::new(),
             tab_name,
