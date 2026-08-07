@@ -4041,10 +4041,13 @@ mod tests {
             "echo $$ > '{}'; exec sleep 30",
             pid_file.display()
         ));
+        // The deadline must comfortably outlast shell startup: macOS can
+        // spend over 100ms scanning a freshly written script on first exec,
+        // and the pid file must exist by the time the timeout fires.
         let error = copy_to_clipboard(
             &timeout_script,
             "blocked".into(),
-            Duration::from_millis(100),
+            Duration::from_millis(1000),
         )
         .await
         .unwrap_err();
