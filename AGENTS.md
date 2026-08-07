@@ -1,5 +1,7 @@
 # Project notes
 
+This project uses a CLI ticket system for task management. Run `tk help` when you need to use it.
+
 ## Changelog
 
 - `CHANGELOG.md` is user-facing. Only note changes users will notice; omit internal work.
