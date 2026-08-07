@@ -66,11 +66,13 @@ fut workspace rename WORKSPACE_ID NAME
 fut workspace close WORKSPACE_ID
 
 fut tab new WORKSPACE_ID [--name NAME] [--cwd PATH] [-- COMMAND...]
+fut tab list WORKSPACE_ID
 fut tab attach TAB_ID
 fut tab rename TAB_ID NAME
 fut tab close TAB_ID
 
 fut pane new TAB_ID [--cwd PATH] [-- COMMAND...]
+fut pane list TAB_ID
 fut pane attach PANE_ID
 fut pane move PANE_ID DESTINATION_TAB_ID
 fut pane close PANE_ID
@@ -85,6 +87,8 @@ fut daemon shutdown
 Mutation commands accept raw IDs only. Attach commands also use raw IDs, except `session attach`, which additionally permits an exact session name as a convenience. A UUID-shaped session value always has ID precedence, even if it could be a session name. Attaching by session, workspace, or tab succeeds only when that ancestor identifies exactly one open terminal; multi-pane ancestors are ambiguous, so use an exact pane or terminal ID or choose through the navigator. Pane and terminal IDs identify their terminal exactly. There is no public `resource:<id>` or selector mini-language; the internal client/daemon protocol remains typed.
 
 `open`, `tab new`, and `pane new` are control-only and do not attach. Their results include the complete selected ancestry (`session_id`, `workspace_id`, `tab_id`, `pane_id`, and `terminal_id`, plus the child PID); attachment remains a separate operation. `pane new` takes a raw tab ID and passes argv following a literal `--` directly, without shell evaluation. With no command it starts the default shell. Like `tab new`, its working directory defaults to the workspace root, and a relative `--cwd` resolves against that root. `pane move` is also control-only. It moves a pane to another live tab in the same workspace, appends it after existing destination panes, and preserves its pane ID, terminal ID, process, terminal state, and attachment lease. Moving the final pane out of a tab removes that empty tab. Repeating the completed move is a successful no-op. Cross-workspace movement and explicit insertion positions remain deferred. Names are unique in their scope.
+
+`tab list WORKSPACE_ID` and `pane list TAB_ID` are read-only. They report the same daemon snapshot `fut list` uses, narrowed to one workspace or tab, and add the authored split layout: `tab list` prints one line per tab with its `layout=` tree and its panes, and `pane list` prints that tab's layout and panes. Under `--json` the results carry the snapshot `revision`, the requested ID, and the same `layout`, `tabs`, or `panes` values found in `fut list --json`. An unknown ID fails with the `not_found` code.
 
 A workspace is a logical user context and collection of tabs. Its root supplies working-directory defaults, but Fut does not require it to represent a checkout or manage Git on the user's behalf. Interactive workspace creation inherits the focused terminal's current directory, starts a shell, and permits another workspace in that session to use the same root. Worktrees remain a natural fit and are discovered only when explicitly opened; users and scripts decide how to create or arrange them.
 
@@ -123,7 +127,7 @@ The generated integration completes the static command, option, and path grammar
 
 Completion never starts a daemon or mutates resources. It honors `--socket` and the normal socket environment precedence, omits closing and guaranteed-invalid targets, and uses a short bounded query. If the daemon is absent, stale, incompatible, or slow, completion fails silently while static suggestions remain available.
 
-Inside the client, `Ctrl-b Space` opens the command bar, `Ctrl-b [` enters copy mode, `Ctrl-b c` creates and switches to a default shell tab, `Ctrl-b t` activates the tab bar, `Ctrl-b n`/`Ctrl-b p` wrap through tabs in the current workspace, `Ctrl-b 1` through `Ctrl-b 9` select those one-based tab-bar slots, and `Ctrl-b 0` selects tab 10. `Ctrl-b |` splits the focused pane right, `Ctrl-b _` splits it downward, `Ctrl-b g` opens the global navigator, `Ctrl-b w` activates workspace navigation, `Ctrl-b u` lists terminals with unseen blocked or completed reports, `Ctrl-b .` selects the next one, `Ctrl-b d` detaches, and `Ctrl-b Ctrl-b` sends a literal `Ctrl-b`. In a multi-pane tab, `Ctrl-b h/j/k/l` focuses left/down/up/right without wrapping, while `Ctrl-b o` and `Ctrl-b ;` cycle next and previous. `Ctrl-b P/T/W/S` toggles the last pane, tab, workspace, or session, and `Ctrl-b z` toggles pane zoom. Every action suffix can be overridden under `[ui.bindings]`. Focus and creation changes are acknowledged by the daemon before later input is read.
+Inside the client, `Ctrl-b Space` opens the command bar, `Ctrl-b [` enters copy mode, `Ctrl-b c` creates and switches to a default shell tab, `Ctrl-b t` activates the tab bar, `Ctrl-b n`/`Ctrl-b p` wrap through tabs in the current workspace, `Ctrl-b 1` through `Ctrl-b 9` select those one-based tab-bar slots, and `Ctrl-b 0` selects tab 10. `Ctrl-b |` splits the focused pane right, `Ctrl-b _` splits it downward, `Ctrl-b g` opens the global navigator, `Ctrl-b f` opens the jump dialog that filters every session, workspace, tab, and pane by a typed query, `Ctrl-b w` activates workspace navigation, `Ctrl-b u` lists terminals with unseen blocked or completed reports, `Ctrl-b .` selects the next one, `Ctrl-b d` detaches, and `Ctrl-b Ctrl-b` sends a literal `Ctrl-b`. In a multi-pane tab, `Ctrl-b h/j/k/l` focuses left/down/up/right without wrapping, while `Ctrl-b o` and `Ctrl-b ;` cycle next and previous. `Ctrl-b P/T/W/S` toggles the last pane, tab, workspace, or session, and `Ctrl-b z` toggles pane zoom. Every action suffix can be overridden under `[ui.bindings]`. Focus and creation changes are acknowledged by the daemon before later input is read.
 
 Copy mode is client-local. Move with arrows or `hjkl`, Home/End, and Page Up/Page Down; press Space to start or clear a selection. `/` searches literal scrollback text and `n`/`N` repeat forward or backward. `y` or Enter copies through bounded local `pbcopy`, while Escape or `q` cancels. Clipboard failures leave the selection active for retry, and copy/search work returns explicit errors rather than truncating oversized history.
 

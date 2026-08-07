@@ -60,7 +60,7 @@ These may appear in `ui.workspace_sidebar.row.left`, `body`, `right`, or `detail
 
 | Token | Value |
 | --- | --- |
-| `workspace.marker` | Current icon for the active workspace, otherwise one blank cell |
+| `workspace.marker` | A solid block (`█`) for the active workspace, otherwise one blank cell |
 | `workspace.index` | One-based workspace index |
 | `workspace.name` | Workspace name |
 | `workspace.id` | Full stable workspace UUID |
@@ -70,8 +70,13 @@ These may appear in `ui.workspace_sidebar.row.left`, `body`, `right`, or `detail
 | `workspace.tab_count` | Number of tabs in the workspace |
 | `workspace.icon` | Workspace icon from the selected preset |
 | `workspace.activity` | A spinner for working, `!` for blocked, or `●` for unseen completion; empty when inactive |
+| `workspace.git_branch` | Current branch of the workspace root; empty outside a Git work tree or until resolved |
+| `workspace.git_added` | `+N` inserted lines against `HEAD`, styled `added`; empty when none |
+| `workspace.git_deleted` | `-N` deleted lines against `HEAD`, styled `deleted`; empty when none |
 
 Current, closing, and keyboard-selected styles compose over each workspace row.
+
+The Git tokens are resolved by bounded background `git` processes, cached per workspace root and refreshed at most every five seconds. They never block rendering and stay empty for non-Git roots, errors, or timeouts.
 
 ## Sidebar header and footer tokens
 
@@ -87,7 +92,7 @@ These may appear in `ui.workspace_sidebar.header` and `footer`:
 
 ## Future dynamic tokens
 
-Process titles, Git state, clocks, and custom providers are intentionally absent from the synchronous renderer. Implemented semantic activity comes from explicit reports already present in the resource snapshot. Future dynamic providers should be asynchronous, bounded, cached, explicitly trusted where executable, and publish typed values into the same pure rendering context.
+Process titles, clocks, and custom providers are intentionally absent from the synchronous renderer. Implemented semantic activity comes from explicit reports already present in the resource snapshot. Future dynamic providers should be asynchronous, bounded, cached, explicitly trusted where executable, and publish typed values into the same pure rendering context.
 
 ## Related
 
