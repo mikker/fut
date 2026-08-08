@@ -111,19 +111,36 @@ dense frames 143 KB → 37 KB, and the client now draws at the 16 ms pacing
 ceiling (~60fps) instead of decode-starving. Draw (4.5 ms full-grid blit)
 is now the largest per-frame client cost.
 
+### Round 4 (2026-08-08): dirty-row deltas, branch row-deltas (fut-mjrz)
+
+The writer task now diffs each outgoing snapshot against the last frame
+actually sent per connection and ships only changed rows (full-snapshot
+fallback on attach/resize/size change/>60% rows changed; RefreshTerminal
+resync as safety net). Protocol v6. A/B on identical code (delta path
+toggled), true 200x50 sizing:
+
+| scenario | full-only | deltas | delta share |
+| --- | --- | --- | --- |
+| partial (40x10 orb, 600 frames) | 2.9 MiB | 0.8 MiB | 100% |
+| dense (full-screen anim) | 102 MiB | 46 MiB | 99.8% |
+| flood plain/styled | ~same | ~same | 3–6% (fallback, correct) |
+| typing echo p50 / p95 | 6.4 / 12.1 ms | 3.5 / 7.4 ms | one-row frames |
+
+Real client during the partial orb: decode 208 µs, draw 561 µs per frame
+(<1% busy). Dense stayed mostly-delta because the VT thread's intermediate
+snapshots each touch ~40% of rows — a genuine halving, found not predicted.
+
+Also fixed en route: the perf client never resized its pane (all previous
+scenarios silently ran at 80x24 — earlier rounds' absolute numbers are not
+comparable across that fix), and a client panic on malformed delta rows.
+
 ## Remaining hypotheses
 
-1. **Dirty-row deltas on the wire, snapshot fallback** (Ghostty row damage,
-   mosh diff-against-acked): send changed rows + cursor; full snapshot on
-   attach/resize/fall-behind. The one big-ticket item left — cuts wire and
-   decode by ~10–50x during scrolling, but it's a protocol change that
-   ripples into the e2e suite's snapshot expectations. At the paced ~125
-   frames/s the absolute cost is already modest, so weigh against dogfood
-   feel first.
-2. **Skip blitting unchanged rows in `Screen::render`** — pairs with
-   deltas: once the client knows which rows changed, the 4.5 ms full-grid
-   blit shrinks proportionally to the damage.
-3. The typed-cadence p95 echo outliers above.
+1. **Skip blitting unchanged rows in `Screen::render`** — deferred: ratatui
+   resets the draw buffer every frame, so row-skipping would blank rows; it
+   needs a retained-buffer approach. Draw is 0.6–4.5 ms depending on styled
+   area; revisit only if profiling demands.
+2. The typed-cadence p95 echo outliers above.
 
 ## Baseline (2026-08-07, M-series laptop, release build)
 
