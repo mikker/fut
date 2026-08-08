@@ -15,7 +15,9 @@ STATE_FILE="$DEMO_ROOT/demo.env"
 DAEMON_LOG="$DEMO_ROOT/daemon.log"
 DAEMON_PID_FILE="$DEMO_ROOT/daemon.pid"
 OWNERSHIP_FILE="$DEMO_ROOT/.fut-demo-owned"
-FUT_BIN=${FUT_BIN:-"$PROJECT_ROOT/target/debug/fut"}
+# Dogfood the optimized binary: the debug build renders animated TUIs at
+# under one frame per second, which reads as the app being frozen.
+FUT_BIN=${FUT_BIN:-"$PROJECT_ROOT/target/release/fut"}
 DEMO_SHELL=${SHELL:-/bin/sh}
 DEMO_DAEMON_PID=""
 
@@ -29,7 +31,7 @@ if [[ "$DEMO_ROOT" != /* || "$DEMO_ROOT" == / || "$DEMO_ROOT" == "$PROJECT_ROOT"
 fi
 
 build_binary() {
-  (cd "$PROJECT_ROOT" && cargo build --quiet)
+  (cd "$PROJECT_ROOT" && cargo build --release --quiet)
 }
 
 ensure_binary() {
