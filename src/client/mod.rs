@@ -81,8 +81,8 @@ use tab_bar::{TabBarAction, TabBarState};
 use crate::{
     domain::{
         CellColor, CellStyle, MouseButton, MouseButtons, MouseEvent, MouseEventKind,
-        MouseModifiers, MouseWheelDirection, ScreenSnapshot, ScrollPosition, TerminalId,
-        TerminalSize,
+        MouseModifiers, MouseWheelDirection, ScreenDelta, ScreenSnapshot, ScrollPosition,
+        TerminalId, TerminalSize,
     },
     protocol::{
         ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, SelectedTarget, SelectedView,
@@ -272,6 +272,26 @@ async fn run(
                             )
                         {
                             surface = None;
+                        }
+                    }
+                    ServerMessage::SnapshotDelta { terminal_id, delta } => {
+                        match view.accept_delta(terminal_id, delta) {
+                            DeltaApplyResult::Applied => {
+                                if terminal_id == view.focused().terminal_id
+                                    && matches!(
+                                        surface.as_ref(),
+                                        Some(ClientSurface::Navigator(nav))
+                                            if nav.switch_request.is_none()
+                                                && matches!(nav.status, navigator::NavigatorStatus::Switching)
+                                    )
+                                {
+                                    surface = None;
+                                }
+                            }
+                            DeltaApplyResult::NeedsRefresh => {
+                                send(framed, ClientMessage::RefreshTerminal { terminal_id }).await?;
+                            }
+                            DeltaApplyResult::Ignored => {}
                         }
                     }
                     ServerMessage::CopyModeSnapshot { terminal_id, screen } => {
@@ -2344,8 +2364,22 @@ struct PaneState {
     target: SelectedTarget,
     newest_revision: Option<u64>,
     drawn_revision: Option<u64>,
+    /// The materialized grid this pane renders: a full snapshot with
+    /// [`ScreenDelta`] rows spliced in as they arrive.
     pending: Option<ScreenSnapshot>,
     last_size: Option<TerminalSize>,
+    /// Set once a [`ClientMessage::RefreshTerminal`] has been sent for an
+    /// unapplicable delta, and cleared when a full snapshot arrives, so a
+    /// run of mismatched deltas sends at most one refresh request.
+    refresh_requested: bool,
+}
+
+/// Outcome of applying a [`ServerMessage::SnapshotDelta`] to a [`PaneState`].
+enum DeltaOutcome {
+    Applied,
+    /// The delta's base revision or size didn't match the pane's current
+    /// grid; the caller should drop it and request a full resync.
+    Mismatch,
 }
 
 impl PaneState {
@@ -2356,6 +2390,7 @@ impl PaneState {
             drawn_revision: None,
             pending: None,
             last_size: None,
+            refresh_requested: false,
         }
     }
 
@@ -2368,8 +2403,43 @@ impl PaneState {
         }
         self.newest_revision = Some(screen.revision);
         self.pending = Some(screen);
+        self.refresh_requested = false;
         true
     }
+
+    fn accept_delta(&mut self, delta: ScreenDelta) -> DeltaOutcome {
+        let Some(current) = self.pending.as_mut() else {
+            return DeltaOutcome::Mismatch;
+        };
+        if delta.base_revision != current.revision || delta.size != current.size {
+            return DeltaOutcome::Mismatch;
+        }
+        let columns = usize::from(current.size.columns);
+        for row in delta.rows {
+            let start = usize::from(row.index) * columns;
+            if row.cells.len() != columns {
+                return DeltaOutcome::Mismatch;
+            }
+            let Some(slice) = current.cells.get_mut(start..start + columns) else {
+                return DeltaOutcome::Mismatch;
+            };
+            slice.clone_from_slice(&row.cells);
+        }
+        current.revision = delta.revision;
+        current.cursor = delta.cursor;
+        current.scroll = delta.scroll;
+        self.newest_revision = Some(delta.revision);
+        DeltaOutcome::Applied
+    }
+}
+
+/// Result of [`ViewState::accept_delta`].
+enum DeltaApplyResult {
+    Applied,
+    /// The delta couldn't be applied; the pane needs a full resync.
+    NeedsRefresh,
+    /// No open pane matches, or a refresh is already outstanding.
+    Ignored,
 }
 
 struct ViewState {
@@ -2516,6 +2586,28 @@ impl ViewState {
             .iter_mut()
             .find(|pane| pane.target.terminal_id == terminal_id)
             .is_some_and(|pane| pane.accept(screen))
+    }
+
+    /// Applies a delta for `terminal_id`'s pane, if that pane is currently
+    /// open. Rate-limited per pane: [`DeltaApplyResult::NeedsRefresh`] is
+    /// returned at most once per run of unapplicable deltas, so a burst of
+    /// mismatches can't spam the daemon with refresh requests.
+    fn accept_delta(&mut self, terminal_id: TerminalId, delta: ScreenDelta) -> DeltaApplyResult {
+        let Some(pane) = self
+            .panes
+            .iter_mut()
+            .find(|pane| pane.target.terminal_id == terminal_id)
+        else {
+            return DeltaApplyResult::Ignored;
+        };
+        match pane.accept_delta(delta) {
+            DeltaOutcome::Applied => DeltaApplyResult::Applied,
+            DeltaOutcome::Mismatch if pane.refresh_requested => DeltaApplyResult::Ignored,
+            DeltaOutcome::Mismatch => {
+                pane.refresh_requested = true;
+                DeltaApplyResult::NeedsRefresh
+            }
+        }
     }
 
     fn needs_draw(&self) -> bool {

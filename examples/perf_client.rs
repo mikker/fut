@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use fut::{
-    domain::{ScreenSnapshot, TerminalId, TerminalSize},
+    domain::{ScreenDelta, ScreenSnapshot, TerminalId, TerminalSize},
     protocol::{
         ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, ServerMessage, codec,
         decode_payload, encode_payload,
@@ -115,10 +115,71 @@ fn screen_text(screen: &ScreenSnapshot) -> String {
     text
 }
 
+/// Standalone stand-in for the client's `PaneState`: materializes a grid from
+/// a full snapshot, then splices delta rows into it. Deliberately shares no
+/// code with the real client — this is a headless measurement tool, not a
+/// protocol conformance check.
+#[derive(Default)]
+struct MaterializedScreen {
+    screen: Option<ScreenSnapshot>,
+}
+
+impl MaterializedScreen {
+    fn apply_full(&mut self, screen: ScreenSnapshot) -> &ScreenSnapshot {
+        self.screen.insert(screen)
+    }
+
+    /// Splices `delta` into the current grid, or `None` if it doesn't apply
+    /// (no base grid yet, or a revision/size mismatch) — a real client would
+    /// send `RefreshTerminal` here; this harness just discards the frame.
+    fn apply_delta(&mut self, delta: ScreenDelta) -> Option<&ScreenSnapshot> {
+        let current = self.screen.as_mut()?;
+        if delta.base_revision != current.revision || delta.size != current.size {
+            return None;
+        }
+        let columns = usize::from(current.size.columns);
+        for row in delta.rows {
+            let start = usize::from(row.index) * columns;
+            current.cells[start..start + columns].clone_from_slice(&row.cells);
+        }
+        current.revision = delta.revision;
+        current.cursor = delta.cursor;
+        current.scroll = delta.scroll;
+        self.screen.as_ref()
+    }
+
+    /// Applies `message` if it's a `Snapshot`/`SnapshotDelta` for
+    /// `terminal_id`, returning the resulting grid. Must be called for every
+    /// frame received for that terminal — including ones a caller doesn't
+    /// otherwise care about — since a dropped delta desyncs the base every
+    /// later delta is diffed against.
+    fn apply(
+        &mut self,
+        terminal_id: TerminalId,
+        message: ServerMessage,
+    ) -> Option<&ScreenSnapshot> {
+        match message {
+            ServerMessage::Snapshot {
+                terminal_id: id,
+                screen,
+            } if id == terminal_id => Some(self.apply_full(screen)),
+            ServerMessage::SnapshotDelta {
+                terminal_id: id,
+                delta,
+            } if id == terminal_id => self.apply_delta(delta),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Default)]
 struct FloodStats {
     snapshots: u64,
+    full_snapshots: u64,
+    deltas: u64,
     wire_bytes: u64,
+    full_wire_bytes: u64,
+    delta_wire_bytes: u64,
     max_frame: usize,
     decode_total: Duration,
     first_revision: Option<u64>,
@@ -126,9 +187,16 @@ struct FloodStats {
 }
 
 impl FloodStats {
-    fn accept(&mut self, revision: u64, wire_bytes: usize, decode: Duration) {
+    fn accept(&mut self, revision: u64, wire_bytes: usize, decode: Duration, is_delta: bool) {
         self.snapshots += 1;
         self.wire_bytes += wire_bytes as u64;
+        if is_delta {
+            self.deltas += 1;
+            self.delta_wire_bytes += wire_bytes as u64;
+        } else {
+            self.full_snapshots += 1;
+            self.full_wire_bytes += wire_bytes as u64;
+        }
         self.max_frame = self.max_frame.max(wire_bytes);
         self.decode_total += decode;
         self.first_revision.get_or_insert(revision);
@@ -153,9 +221,23 @@ impl FloodStats {
             revisions.saturating_sub(self.snapshots)
         );
         println!(
+            "deltas / full        {:>10} / {}  ({:.1}% deltas)",
+            self.deltas,
+            self.full_snapshots,
+            100.0 * self.deltas as f64 / self.snapshots.max(1) as f64
+        );
+        println!(
             "wire received        {:>10.1} MiB  ({:.1} MiB/s)",
             self.wire_bytes as f64 / (1024.0 * 1024.0),
             self.wire_bytes as f64 / (1024.0 * 1024.0) / seconds
+        );
+        println!(
+            "  delta wire         {:>10.1} MiB",
+            self.delta_wire_bytes as f64 / (1024.0 * 1024.0)
+        );
+        println!(
+            "  full wire          {:>10.1} MiB",
+            self.full_wire_bytes as f64 / (1024.0 * 1024.0)
         );
         println!("largest frame        {:>10} bytes", self.max_frame);
         println!(
@@ -166,10 +248,15 @@ impl FloodStats {
 }
 
 /// Type a command into the pane's shell and measure until its sentinel shows
-/// up in a snapshot.
+/// up in a snapshot. `materialized` must already reflect this terminal's
+/// current grid (from [`settle`]) and keeps being fed every frame seen for
+/// it, including ones this scenario's `terminal_id` filter would otherwise
+/// skip — a delta applies only against the exact base revision the daemon
+/// sent it against, so missing even one desyncs every later delta.
 async fn flood(
     connection: &mut Connection,
     terminal_id: TerminalId,
+    materialized: &mut MaterializedScreen,
     label: &str,
     command: &str,
 ) -> anyhow::Result<()> {
@@ -186,18 +273,12 @@ async fn flood(
     let mut stats = FloodStats::default();
     loop {
         let frame = receive(connection).await?;
-        let ServerMessage::Snapshot {
-            terminal_id: id,
-            screen,
-        } = frame.envelope.message
-        else {
+        let is_delta = matches!(frame.envelope.message, ServerMessage::SnapshotDelta { .. });
+        let Some(screen) = materialized.apply(terminal_id, frame.envelope.message) else {
             continue;
         };
-        if id != terminal_id {
-            continue;
-        }
-        stats.accept(screen.revision, frame.wire_bytes, frame.decode);
-        if screen_text(&screen).contains("PERF_DONE") {
+        stats.accept(screen.revision, frame.wire_bytes, frame.decode, is_delta);
+        if screen_text(screen).contains("PERF_DONE") {
             break;
         }
     }
@@ -208,13 +289,25 @@ async fn flood(
 /// Keystroke echo latency: send one character, wait for the snapshot in which
 /// it appears. Runs twice — spaced like human typing, and back-to-back like
 /// key repeat, which is bounded by the daemon's snapshot pacing.
-async fn latency(connection: &mut Connection, terminal_id: TerminalId) -> anyhow::Result<()> {
+async fn latency(
+    connection: &mut Connection,
+    terminal_id: TerminalId,
+    materialized: &mut MaterializedScreen,
+) -> anyhow::Result<()> {
     let mut expected = 0usize;
     for (label, gap) in [
         ("latency (typing, 30ms gaps)", Duration::from_millis(30)),
         ("latency (burst, back-to-back)", Duration::ZERO),
     ] {
-        latency_round(connection, terminal_id, label, gap, &mut expected).await?;
+        latency_round(
+            connection,
+            terminal_id,
+            label,
+            gap,
+            &mut expected,
+            materialized,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -225,6 +318,7 @@ async fn latency_round(
     label: &str,
     gap: Duration,
     expected: &mut usize,
+    materialized: &mut MaterializedScreen,
 ) -> anyhow::Result<()> {
     let iterations = 40;
     let mut samples = Vec::with_capacity(iterations);
@@ -243,16 +337,9 @@ async fn latency_round(
         .await?;
         loop {
             let frame = receive(connection).await?;
-            let ServerMessage::Snapshot {
-                terminal_id: id,
-                screen,
-            } = frame.envelope.message
-            else {
+            let Some(screen) = materialized.apply(terminal_id, frame.envelope.message) else {
                 continue;
             };
-            if id != terminal_id {
-                continue;
-            }
             let count = screen
                 .cells
                 .iter()
@@ -315,21 +402,61 @@ async fn main() -> anyhow::Result<()> {
         other => bail!("expected a welcome with a focused terminal, received {other:?}"),
     };
 
-    // Let the initial attach snapshots settle before measuring.
+    // A real client resizes its focused pane to match its host terminal
+    // right after attaching; do the same so the pane actually matches
+    // --columns/--rows instead of staying at whatever size the daemon spawned
+    // it with.
+    send(
+        &mut connection,
+        Some(Uuid::new_v4()),
+        ClientMessage::Resize {
+            terminal_id,
+            size: TerminalSize {
+                columns: args.columns,
+                rows: args.rows,
+            },
+        },
+    )
+    .await?;
+
+    // Let the initial attach and resize snapshots settle before measuring,
+    // but keep applying them to `materialized` — the first thing a scenario
+    // sees afterward may well be a delta, which needs an already-current
+    // base grid to apply against.
+    let mut materialized = MaterializedScreen::default();
     time::sleep(Duration::from_millis(300)).await;
-    while let Ok(Some(_)) = time::timeout(Duration::from_millis(100), connection.next()).await {}
+    while let Ok(Some(Ok(frame))) =
+        time::timeout(Duration::from_millis(100), connection.next()).await
+    {
+        let envelope: Envelope<ServerMessage> = decode_payload(&frame)?;
+        materialized.apply(terminal_id, envelope.message);
+    }
 
     match args.scenario.as_str() {
         "flood" => {
             let command = format!("seq 1 {}", args.count.unwrap_or(100_000));
-            flood(&mut connection, terminal_id, "flood (plain)", &command).await?;
+            flood(
+                &mut connection,
+                terminal_id,
+                &mut materialized,
+                "flood (plain)",
+                &command,
+            )
+            .await?;
         }
         "styled" => {
             let command = format!(
                 "awk 'BEGIN{{for(i=0;i<{};i++)printf \"\\033[3%dm%8d styled\\033[1m words\\033[0m here\\n\", i%8, i}}'",
                 args.count.unwrap_or(100_000)
             );
-            flood(&mut connection, terminal_id, "flood (styled)", &command).await?;
+            flood(
+                &mut connection,
+                terminal_id,
+                &mut materialized,
+                "flood (styled)",
+                &command,
+            )
+            .await?;
         }
         "dense" => {
             // vtebench dense_cells / animated-orb workload: full-screen
@@ -340,7 +467,14 @@ async fn main() -> anyhow::Result<()> {
                 "awk -v cols={} -v rows={} -v frames={frames} 'BEGIN{{for(f=0;f<frames;f++){{for(r=0;r<rows;r++){{s=sprintf(\"\\033[%d;1H\",r+1);for(c=0;c<cols;c++){{s=s sprintf(\"\\033[38;2;%d;%d;%dm\\033[48;2;%d;%d;%dmo\",(r*5+f*7)%256,(c*3+f*11)%256,(r+c+f*13)%256,(255-r*5)%256,(255-c*3)%256,(255-f*13)%256)}}printf \"%s\",s}}}}printf \"\\033[0m\\033[2J\\033[H\"}}'",
                 args.columns, args.rows
             );
-            flood(&mut connection, terminal_id, "dense (orb-like)", &command).await?;
+            flood(
+                &mut connection,
+                terminal_id,
+                &mut materialized,
+                "dense (orb-like)",
+                &command,
+            )
+            .await?;
         }
         "partial" => {
             // A small animated region on an otherwise static screen — the
@@ -353,12 +487,13 @@ async fn main() -> anyhow::Result<()> {
             flood(
                 &mut connection,
                 terminal_id,
+                &mut materialized,
                 "partial (small orb)",
                 &command,
             )
             .await?;
         }
-        "latency" => latency(&mut connection, terminal_id).await?,
+        "latency" => latency(&mut connection, terminal_id, &mut materialized).await?,
         other => bail!("unknown scenario {other}"),
     }
     Ok(())

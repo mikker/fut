@@ -34,8 +34,8 @@ use tokio_util::codec::Framed;
 
 use crate::{
     domain::{
-        ClientId, CopyModeAction, CopyModeError, PaneId, ScreenSnapshot, SessionId, TabId,
-        TerminalId, TerminalSize, WorkspaceId,
+        ClientId, CopyModeAction, CopyModeError, DeltaRow, PaneId, ScreenDelta, ScreenSnapshot,
+        SessionId, TabId, TerminalId, TerminalSize, WorkspaceId,
     },
     project::{ProjectError, ProjectResolver, ResolvedLocation},
     protocol::{
@@ -652,7 +652,8 @@ impl Attachment {
         match outcome {
             CopyModeOutcome::Active(viewport) => {
                 self.set_viewport_offset(terminal_id, viewport.offset);
-                let Some(screen) = self.accept_snapshot(terminal_id, viewport.screen) else {
+                let Some((screen, _first)) = self.accept_snapshot(terminal_id, viewport.screen)
+                else {
                     self.clear_active_copy_mode().await?;
                     return Err(CommandError::Emulator(
                         "stale copy-mode snapshot revision".into(),
@@ -721,7 +722,9 @@ impl Attachment {
         let viewport = self.focused.terminal.viewport_snapshot(None).await?;
         debug_assert!(viewport.offset.is_none());
         self.set_viewport_offset(terminal_id, viewport.offset);
-        Ok(self.accept_snapshot(terminal_id, viewport.screen))
+        Ok(self
+            .accept_snapshot(terminal_id, viewport.screen)
+            .map(|(screen, _first)| screen))
     }
 
     async fn snapshot_for_update(
@@ -729,19 +732,50 @@ impl Attachment {
         terminal_id: TerminalId,
         generation: u64,
         canonical: crate::domain::ScreenSnapshot,
-    ) -> Result<Option<crate::domain::ScreenSnapshot>, CommandError> {
+    ) -> Result<Option<(crate::domain::ScreenSnapshot, bool)>, CommandError> {
         if !self.accepts(terminal_id, generation) {
             return Ok(None);
         }
-        let screen = if self.owns_copy_mode(terminal_id) {
+        let Some(screen) = self.resolve_screen(terminal_id, Some(canonical)).await? else {
+            return Ok(None);
+        };
+        Ok(self.accept_snapshot(terminal_id, screen))
+    }
+
+    /// Publish the terminal's current screen unconditionally, bypassing the
+    /// revision gate in [`Self::accept_snapshot`]. Used to answer
+    /// [`crate::protocol::ClientMessage::RefreshTerminal`], where the client
+    /// is explicitly out of sync and needs a resend even if this attachment
+    /// already considers the revision seen.
+    async fn refresh_snapshot(
+        &mut self,
+        terminal_id: TerminalId,
+    ) -> Result<Option<crate::domain::ScreenSnapshot>, CommandError> {
+        let Some(screen) = self.resolve_screen(terminal_id, None).await? else {
+            return Ok(None);
+        };
+        self.observe_snapshot_revision(terminal_id, screen.revision);
+        Ok(Some(screen))
+    }
+
+    /// Screen this attachment currently shows for `terminal_id`: the active
+    /// copy-mode viewport, a scrolled-back viewport, the caller-supplied
+    /// canonical screen if any, or otherwise the terminal's latest published
+    /// snapshot.
+    async fn resolve_screen(
+        &mut self,
+        terminal_id: TerminalId,
+        canonical: Option<crate::domain::ScreenSnapshot>,
+    ) -> Result<Option<crate::domain::ScreenSnapshot>, CommandError> {
+        if self.owns_copy_mode(terminal_id) {
             let Some(terminal) = self.terminal(terminal_id) else {
                 return Ok(None);
             };
             let offset = self.viewport_offsets.get(&terminal_id).copied();
-            match terminal.copy_mode_snapshot(self.owner, offset).await {
+            return match terminal.copy_mode_snapshot(self.owner, offset).await {
                 Ok(viewport) => {
                     self.set_viewport_offset(terminal_id, viewport.offset);
-                    viewport.screen
+                    Ok(Some(viewport.screen))
                 }
                 Err(
                     error @ CommandError::CopyMode(
@@ -749,21 +783,26 @@ impl Attachment {
                     ),
                 ) => {
                     self.forget_copy_mode(terminal_id);
-                    return Err(error);
+                    Err(error)
                 }
-                Err(error) => return Err(error),
-            }
-        } else if let Some(offset) = self.viewport_offsets.get(&terminal_id).copied() {
+                Err(error) => Err(error),
+            };
+        }
+        if let Some(offset) = self.viewport_offsets.get(&terminal_id).copied() {
             let Some(terminal) = self.terminal(terminal_id) else {
                 return Ok(None);
             };
             let viewport = terminal.viewport_snapshot(Some(offset)).await?;
             self.set_viewport_offset(terminal_id, viewport.offset);
-            viewport.screen
-        } else {
-            canonical
+            return Ok(Some(viewport.screen));
+        }
+        if let Some(canonical) = canonical {
+            return Ok(Some(canonical));
+        }
+        let Some(terminal) = self.terminal(terminal_id) else {
+            return Ok(None);
         };
-        Ok(self.accept_snapshot(terminal_id, screen))
+        Ok(Some(terminal.subscribe_snapshots().borrow().clone()))
     }
 
     fn set_viewport_offset(&mut self, terminal_id: TerminalId, offset: Option<usize>) {
@@ -807,17 +846,25 @@ impl Attachment {
         Ok(screen)
     }
 
+    /// Accepts `screen` if newer than the last revision seen for
+    /// `terminal_id`, returning it alongside whether this is the first
+    /// snapshot accepted for that terminal since it was last watched (a new
+    /// attachment or a newly selected pane, per [`Self::reconcile_watchers`]
+    /// clearing `snapshot_revisions` on removal) — the daemon writer must
+    /// send that one as a full snapshot rather than a delta, since it has no
+    /// guarantee the client still holds a matching base grid.
     fn accept_snapshot(
         &mut self,
         terminal_id: TerminalId,
         screen: crate::domain::ScreenSnapshot,
-    ) -> Option<crate::domain::ScreenSnapshot> {
+    ) -> Option<(crate::domain::ScreenSnapshot, bool)> {
+        let first = !self.snapshot_revisions.contains_key(&terminal_id);
         let revision = self.snapshot_revisions.entry(terminal_id).or_default();
         if screen.revision <= *revision {
             return None;
         }
         *revision = screen.revision;
-        Some(screen)
+        Some((screen, first))
     }
 
     fn observe_snapshot_revision(&mut self, terminal_id: TerminalId, revision: u64) {
@@ -1339,6 +1386,12 @@ enum Outbound {
     Snapshot {
         terminal_id: TerminalId,
         screen: ScreenSnapshot,
+        /// Send as a full snapshot even if the writer could otherwise diff
+        /// against the last screen it actually sent for this terminal. Set
+        /// for the first snapshot of a newly watched terminal (new
+        /// attachment or newly selected pane), where the client may not
+        /// hold a matching base grid to splice a delta into.
+        force_full: bool,
     },
 }
 
@@ -1391,6 +1444,7 @@ impl OutboundQueue {
             Outbound::Snapshot {
                 terminal_id,
                 screen,
+                force_full,
             } => {
                 // Replace this terminal's pending snapshot in place, but never
                 // across an ordered frame: a snapshot enqueued after e.g. a
@@ -1404,14 +1458,22 @@ impl OutboundQueue {
                         Outbound::Snapshot {
                             terminal_id: pending_id,
                             screen,
-                        } if *pending_id == terminal_id => Some(screen),
+                            force_full,
+                        } if *pending_id == terminal_id => Some((screen, force_full)),
                         _ => None,
                     });
                 match pending {
-                    Some(slot) => *slot = screen,
+                    // A coalesced-away update might have been the one that
+                    // needed a full resend (e.g. a resize); once forced,
+                    // stay forced.
+                    Some((slot, pending_force_full)) => {
+                        *slot = screen;
+                        *pending_force_full |= force_full;
+                    }
                     None => state.items.push_back(Outbound::Snapshot {
                         terminal_id,
                         screen,
+                        force_full,
                     }),
                 }
             }
@@ -1456,10 +1518,73 @@ impl OutboundQueue {
 /// so a client that stopped reading cannot pin its writer task forever.
 const OUTBOUND_FLUSH_DEADLINE: Duration = Duration::from_secs(10);
 
+/// Rows changed exceeding this fraction of the grid fall back to a full
+/// snapshot: past this point the delta's per-row framing overhead outweighs
+/// what it saves over just resending everything.
+const DELTA_ROW_FALLBACK_THRESHOLD: f64 = 0.6;
+
+/// Choose between a full snapshot and a delta against `last_sent`, the
+/// screen actually written to this connection last time — never against
+/// whatever the attachment layer last produced, since coalescing can drop
+/// frames the writer never sent. Updates `last_sent` to match what this call
+/// returns.
+fn snapshot_message(
+    terminal_id: TerminalId,
+    screen: ScreenSnapshot,
+    force_full: bool,
+    last_sent: &mut HashMap<TerminalId, ScreenSnapshot>,
+) -> ServerMessage {
+    if !force_full
+        && let Some(previous) = last_sent.get(&terminal_id)
+        && previous.size == screen.size
+        && let Some(rows) = diff_rows(previous, &screen)
+    {
+        let delta = ScreenDelta {
+            revision: screen.revision,
+            base_revision: previous.revision,
+            size: screen.size,
+            rows,
+            cursor: screen.cursor,
+            scroll: screen.scroll,
+        };
+        last_sent.insert(terminal_id, screen);
+        return ServerMessage::SnapshotDelta { terminal_id, delta };
+    }
+    last_sent.insert(terminal_id, screen.clone());
+    ServerMessage::Snapshot {
+        terminal_id,
+        screen,
+    }
+}
+
+/// Rows that differ between `previous` and `next`, or `None` if that's more
+/// than [`DELTA_ROW_FALLBACK_THRESHOLD`] of all rows. Callers must already
+/// know `previous.size == next.size`.
+fn diff_rows(previous: &ScreenSnapshot, next: &ScreenSnapshot) -> Option<Vec<DeltaRow>> {
+    let columns = usize::from(next.size.columns);
+    let rows = usize::from(next.size.rows);
+    let mut changed = Vec::new();
+    for row in 0..rows {
+        let start = row * columns;
+        let end = start + columns;
+        if previous.cells[start..end] != next.cells[start..end] {
+            changed.push(DeltaRow {
+                index: row as u16,
+                cells: next.cells[start..end].to_vec(),
+            });
+        }
+    }
+    if changed.len() as f64 > rows as f64 * DELTA_ROW_FALLBACK_THRESHOLD {
+        return None;
+    }
+    Some(changed)
+}
+
 async fn write_outbound(
     mut sink: SplitSink<Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>, Bytes>,
     queue: Arc<OutboundQueue>,
 ) {
+    let mut last_sent: HashMap<TerminalId, ScreenSnapshot> = HashMap::new();
     loop {
         let Some(item) = queue.pop() else {
             if queue.is_finished() {
@@ -1473,14 +1598,15 @@ async fn write_outbound(
             Outbound::Snapshot {
                 terminal_id,
                 screen,
-            } => encode_payload(&Envelope {
-                request_id: None,
-                message: ServerMessage::Snapshot {
-                    terminal_id,
-                    screen,
-                },
-            })
-            .map(Bytes::from),
+                force_full,
+            } => {
+                let message = snapshot_message(terminal_id, screen, force_full, &mut last_sent);
+                encode_payload(&Envelope {
+                    request_id: None,
+                    message,
+                })
+                .map(Bytes::from)
+            }
         };
         let sent = match payload {
             Ok(bytes) if queue.is_finished() => timeout(OUTBOUND_FLUSH_DEADLINE, sink.send(bytes))
@@ -1735,7 +1861,7 @@ async fn handle_connection(
                         }
                         match attachment.mouse_input(terminal_id, event).await {
                             Ok(Some(screen)) => {
-                                send_snapshot(&mut connection, terminal_id, screen).await?;
+                                send_snapshot(&mut connection, terminal_id, screen, false).await?;
                             }
                             Ok(None) => {}
                             Err(error) => {
@@ -1755,7 +1881,7 @@ async fn handle_connection(
                         }
                         match attachment.return_focused_to_bottom().await {
                             Ok(Some(screen)) => {
-                                send_snapshot(&mut connection, terminal_id, screen).await?;
+                                send_snapshot(&mut connection, terminal_id, screen, false).await?;
                             }
                             Ok(None) => {}
                             Err(error) => {
@@ -1763,6 +1889,26 @@ async fn handle_connection(
                                     &mut connection,
                                     envelope.request_id,
                                     "reset viewport",
+                                    error,
+                                    UiEventPolicy::Disposable,
+                                ).await?;
+                            }
+                        }
+                    }
+                    ClientMessage::RefreshTerminal { terminal_id } => {
+                        if attachment.terminal(terminal_id).is_none() {
+                            continue;
+                        }
+                        match attachment.refresh_snapshot(terminal_id).await {
+                            Ok(Some(screen)) => {
+                                send_snapshot(&mut connection, terminal_id, screen, true).await?;
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                respond_to_ui_event_error(
+                                    &mut connection,
+                                    envelope.request_id,
+                                    "refresh terminal",
                                     error,
                                     UiEventPolicy::Disposable,
                                 ).await?;
@@ -2085,8 +2231,8 @@ async fn handle_connection(
             update = attachment.updates.recv() => match update {
                 Some(AttachmentUpdate::Snapshot { terminal_id, generation, screen }) => {
                     match attachment.snapshot_for_update(terminal_id, generation, screen).await {
-                        Ok(Some(screen)) => {
-                            send_snapshot(&mut connection, terminal_id, screen).await?;
+                        Ok(Some((screen, first))) => {
+                            send_snapshot(&mut connection, terminal_id, screen, first).await?;
                         }
                         Ok(None) => {}
                         Err(CommandError::CopyMode(error)) => {
@@ -2473,7 +2619,9 @@ async fn control_loop(
                 send(connection, envelope.request_id, ServerMessage::Detached).await?;
                 break;
             }
-            ClientMessage::MouseInput { .. } | ClientMessage::ResetViewport { .. } => {}
+            ClientMessage::MouseInput { .. }
+            | ClientMessage::ResetViewport { .. }
+            | ClientMessage::RefreshTerminal { .. } => {}
             ClientMessage::CreateWorkspace { .. }
             | ClientMessage::Input { .. }
             | ClientMessage::Paste { .. }
@@ -3658,7 +3806,13 @@ async fn focused_input_response(
 
     match (input_succeeded, reset_result) {
         (true, Ok(Some(screen))) => {
-            send_snapshot(connection, attachment.focused.selected.terminal_id, screen).await?;
+            send_snapshot(
+                connection,
+                attachment.focused.selected.terminal_id,
+                screen,
+                false,
+            )
+            .await?;
         }
         (true, Ok(None)) | (false, Ok(_)) => {}
         (_, Err(error)) => {
@@ -3758,6 +3912,7 @@ fn fire_and_forget_operation(message: &ClientMessage) -> Option<&'static str> {
     match message {
         ClientMessage::MouseInput { .. } => Some("mouse input"),
         ClientMessage::ResetViewport { .. } => Some("reset viewport"),
+        ClientMessage::RefreshTerminal { .. } => Some("refresh terminal"),
         _ => None,
     }
 }
@@ -3815,21 +3970,51 @@ async fn send(
 
 /// Publish a screen snapshot. Unlike [`send`], pending snapshots for the
 /// same terminal are replaced rather than queued, so a burst of updates to a
-/// slow client delivers only the newest screen.
+/// slow client delivers only the newest screen. `force_full` requests a full
+/// snapshot on the wire rather than a delta against the last one actually
+/// sent; see [`Outbound::Snapshot`].
 async fn send_snapshot(
     connection: &mut ClientConnection,
     terminal_id: TerminalId,
     screen: ScreenSnapshot,
+    force_full: bool,
 ) -> Result<()> {
     connection.enqueue(Outbound::Snapshot {
         terminal_id,
         screen,
+        force_full,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_message_encodes_a_small_row_diff_as_a_delta() {
+        use crate::domain::{Cell, Cursor, TerminalSize};
+        let size = TerminalSize {
+            columns: 10,
+            rows: 5,
+        };
+        let cells = vec![Cell::default(); 50];
+        let cursor = Cursor {
+            column: 0,
+            row: 0,
+            visible: true,
+        };
+        let terminal_id = TerminalId::new();
+        let first = ScreenSnapshot::new(1, size, cells.clone(), cursor).unwrap();
+        let mut last_sent = HashMap::new();
+        let message = snapshot_message(terminal_id, first, false, &mut last_sent);
+        assert!(matches!(message, ServerMessage::Snapshot { .. }));
+
+        let mut second_cells = cells;
+        second_cells[0].contents = "x".into();
+        let second = ScreenSnapshot::new(2, size, second_cells, cursor).unwrap();
+        let message = snapshot_message(terminal_id, second, false, &mut last_sent);
+        assert!(matches!(message, ServerMessage::SnapshotDelta { .. }));
+    }
 
     #[tokio::test]
     async fn inherited_cwd_falls_back_through_spawn_directory_to_workspace_root() {

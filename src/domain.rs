@@ -651,6 +651,36 @@ impl ScreenSnapshot {
     }
 }
 
+/// One changed row of a [`ScreenDelta`]: its index within the grid plus a
+/// full replacement row of cells.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DeltaRow {
+    #[serde(rename = "i")]
+    pub index: u16,
+    #[serde(rename = "c")]
+    pub cells: Vec<Cell>,
+}
+
+/// Rows that changed since `base_revision`, in place of a full
+/// [`ScreenSnapshot`]. Only valid against a grid the receiver already has at
+/// exactly `base_revision` and `size`; anything else and the receiver must
+/// fall back to requesting a full snapshot.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScreenDelta {
+    #[serde(rename = "r")]
+    pub revision: u64,
+    #[serde(rename = "b")]
+    pub base_revision: u64,
+    #[serde(rename = "s")]
+    pub size: TerminalSize,
+    #[serde(rename = "d")]
+    pub rows: Vec<DeltaRow>,
+    #[serde(rename = "p")]
+    pub cursor: Cursor,
+    #[serde(rename = "v")]
+    pub scroll: ScrollPosition,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

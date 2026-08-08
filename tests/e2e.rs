@@ -58,7 +58,93 @@ impl ChaosRng {
     }
 }
 
-type Connection = Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>;
+type RawConnection = Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>;
+
+/// A client connection plus the materialized per-terminal grids it has
+/// received. [`receive_envelope`] folds `Snapshot`/`SnapshotDelta` frames
+/// into `grids` and hands callers back a synthesized `Snapshot` either way,
+/// so every existing assertion can keep matching on `ServerMessage::Snapshot`
+/// without knowing which one arrived on the wire.
+struct Connection {
+    raw: RawConnection,
+    grids: HashMap<TerminalId, ScreenSnapshot>,
+}
+
+impl Connection {
+    fn new(stream: UnixStream) -> Self {
+        Self {
+            raw: Framed::new(stream, codec()),
+            grids: HashMap::new(),
+        }
+    }
+}
+
+impl std::ops::Deref for Connection {
+    type Target = RawConnection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.raw
+    }
+}
+
+impl std::ops::DerefMut for Connection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.raw
+    }
+}
+
+/// Applies a delta on top of `grids`, panicking if it doesn't apply cleanly —
+/// the test harness talks to one well-behaved daemon with no competing
+/// clients, so an inapplicable delta means the protocol implementation
+/// itself is broken.
+fn apply_delta(
+    grids: &mut HashMap<TerminalId, ScreenSnapshot>,
+    terminal_id: TerminalId,
+    delta: fut::domain::ScreenDelta,
+) -> ScreenSnapshot {
+    let mut screen = grids
+        .remove(&terminal_id)
+        .filter(|screen| screen.revision == delta.base_revision && screen.size == delta.size)
+        .unwrap_or_else(|| {
+            panic!("test harness received a delta with no matching base grid for {terminal_id:?}")
+        });
+    let columns = usize::from(screen.size.columns);
+    for row in delta.rows {
+        let start = usize::from(row.index) * columns;
+        screen.cells[start..start + columns].clone_from_slice(&row.cells);
+    }
+    screen.revision = delta.revision;
+    screen.cursor = delta.cursor;
+    screen.scroll = delta.scroll;
+    screen
+}
+
+/// Folds `Snapshot`/`SnapshotDelta` messages into `connection.grids`,
+/// rewriting a delta into the equivalent full `Snapshot` so callers never
+/// need to distinguish the two on the wire.
+fn track_screen(connection: &mut Connection, message: ServerMessage) -> ServerMessage {
+    match message {
+        ServerMessage::Snapshot {
+            terminal_id,
+            screen,
+        } => {
+            connection.grids.insert(terminal_id, screen.clone());
+            ServerMessage::Snapshot {
+                terminal_id,
+                screen,
+            }
+        }
+        ServerMessage::SnapshotDelta { terminal_id, delta } => {
+            let screen = apply_delta(&mut connection.grids, terminal_id, delta);
+            connection.grids.insert(terminal_id, screen.clone());
+            ServerMessage::Snapshot {
+                terminal_id,
+                screen,
+            }
+        }
+        other => other,
+    }
+}
 
 struct Harness {
     root: TempDir,
@@ -295,9 +381,7 @@ impl Harness {
     }
 
     async fn connect(&self) -> std::io::Result<Connection> {
-        UnixStream::connect(&self.socket)
-            .await
-            .map(|stream| Framed::new(stream, codec()))
+        UnixStream::connect(&self.socket).await.map(Connection::new)
     }
 
     async fn interactive(&mut self) -> (Connection, TerminalId, u32) {
@@ -8235,7 +8319,11 @@ async fn receive_envelope(connection: &mut Connection) -> Option<Envelope<Server
         .expect("protocol receive timed out")?
         .expect("read server frame")
         .to_vec();
-    Some(decode_payload(&frame).expect("decode server frame"))
+    let envelope: Envelope<ServerMessage> = decode_payload(&frame).expect("decode server frame");
+    Some(Envelope {
+        request_id: envelope.request_id,
+        message: track_screen(connection, envelope.message),
+    })
 }
 
 async fn select_response(connection: &mut Connection, selector: TargetSelector) -> SelectedTarget {

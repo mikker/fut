@@ -10,8 +10,8 @@ use std::path::PathBuf;
 
 use crate::{
     domain::{
-        AgentReport, CopyModeAction, CopyModeError, MouseEvent, PaneId, ScreenSnapshot, SessionId,
-        TabId, TerminalId, TerminalSize, WorkspaceId,
+        AgentReport, CopyModeAction, CopyModeError, MouseEvent, PaneId, ScreenDelta,
+        ScreenSnapshot, SessionId, TabId, TerminalId, TerminalSize, WorkspaceId,
     },
     resources::{ResourceSnapshot, SessionSelector, TargetSelector},
     splits::{SplitDirection, SplitTree},
@@ -20,7 +20,7 @@ use crate::{
 /// Protocol version used by released Fut 0.1 builds.
 pub const PROTOCOL_VERSION_0_1: u16 = 0;
 /// Current clients and daemons require an exact protocol match.
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 /// Enough for 50,000 individually styled MessagePack-encoded cells while
 /// remaining a firm pre-allocation bound for the length-delimited transport.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
@@ -122,6 +122,12 @@ pub enum ClientMessage {
     },
     /// Fire-and-forget; its envelope must not carry a request ID.
     ResetViewport {
+        terminal_id: TerminalId,
+    },
+    /// Resync safety net: ask for a full snapshot after a
+    /// [`ServerMessage::SnapshotDelta`] the client could not apply.
+    /// Fire-and-forget; its envelope must not carry a request ID.
+    RefreshTerminal {
         terminal_id: TerminalId,
     },
     CopyMode {
@@ -250,6 +256,14 @@ pub enum ServerMessage {
     Snapshot {
         terminal_id: TerminalId,
         screen: ScreenSnapshot,
+    },
+    /// Rows changed since `delta.base_revision`, in place of a full
+    /// [`Self::Snapshot`]. The client must verify `base_revision` and `size`
+    /// against its current grid before applying; on mismatch it should
+    /// discard the delta and send [`ClientMessage::RefreshTerminal`].
+    SnapshotDelta {
+        terminal_id: TerminalId,
+        delta: ScreenDelta,
     },
     CopyModeSnapshot {
         terminal_id: TerminalId,
@@ -751,7 +765,7 @@ mod tests {
             switched
         );
         assert_eq!(PROTOCOL_VERSION_0_1, 0);
-        assert_eq!(PROTOCOL_VERSION, 5);
+        assert_eq!(PROTOCOL_VERSION, 6);
     }
 
     #[test]
