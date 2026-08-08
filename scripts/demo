@@ -130,6 +130,11 @@ clean_demo() {
       fi
     fi
   fi
+  if [[ -S "$SOCKET" ]] && { [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; }; then
+    # The recorded daemon is gone: the socket is a stale pathname left by a
+    # daemon that exited without unlinking it (SIGKILL, crash, or reboot).
+    rm -f "$SOCKET"
+  fi
   if [[ -S "$SOCKET" ]]; then
     echo "Refusing to remove a demo directory whose daemon could not be stopped: $SOCKET" >&2
     return 1
