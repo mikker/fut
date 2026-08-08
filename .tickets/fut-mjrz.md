@@ -1,6 +1,6 @@
 ---
 id: fut-mjrz
-status: in_progress
+status: closed
 deps: []
 links: []
 created: 2026-08-08T19:12:04Z
