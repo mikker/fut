@@ -63,7 +63,7 @@ fn parse_args() -> anyhow::Result<Args> {
     }
     if args.socket.is_empty() || args.scenario.is_empty() {
         bail!(
-            "usage: perf_client --socket PATH [--columns N] [--rows N] [--count N] flood|styled|dense|latency"
+            "usage: perf_client --socket PATH [--columns N] [--rows N] [--count N] flood|styled|dense|partial|latency"
         );
     }
     Ok(args)
@@ -341,6 +341,22 @@ async fn main() -> anyhow::Result<()> {
                 args.columns, args.rows
             );
             flood(&mut connection, terminal_id, "dense (orb-like)", &command).await?;
+        }
+        "partial" => {
+            // A small animated region on an otherwise static screen — the
+            // realistic amp-orb shape (the orb is a badge, not the whole
+            // pane). `--count` is the number of frames (default 600).
+            let frames = args.count.unwrap_or(600).min(20_000);
+            let command = format!(
+                "awk -v frames={frames} 'BEGIN{{for(f=0;f<frames;f++){{for(r=20;r<30;r++){{s=sprintf(\"\\033[%d;81H\",r+1);for(c=0;c<40;c++){{s=s sprintf(\"\\033[38;2;%d;%d;%dm\\033[48;2;%d;%d;%dmo\",(r*5+f*7)%256,(c*3+f*11)%256,(r+c+f*13)%256,(255-r*5)%256,(255-c*3)%256,(255-f*13)%256)}}printf \"%s\",s}}}}printf \"\\033[0m\\033[2J\\033[H\"}}'"
+            );
+            flood(
+                &mut connection,
+                terminal_id,
+                "partial (small orb)",
+                &command,
+            )
+            .await?;
         }
         "latency" => latency(&mut connection, terminal_id).await?,
         other => bail!("unknown scenario {other}"),

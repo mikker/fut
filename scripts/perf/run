@@ -78,17 +78,18 @@ trap 'stop_daemon' EXIT INT TERM
 
 build
 case ${1:-all} in
-  flood | styled | dense | latency)
+  flood | styled | dense | partial | latency)
     scenario "$1"
     ;;
   all)
     scenario flood
     scenario styled
     scenario dense
+    scenario partial
     scenario latency
     ;;
   *)
-    echo "Usage: scripts/perf/run [flood|styled|dense|latency|all]" >&2
+    echo "Usage: scripts/perf/run [flood|styled|dense|partial|latency|all]" >&2
     exit 2
     ;;
 esac
