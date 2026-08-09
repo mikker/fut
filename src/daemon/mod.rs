@@ -2203,7 +2203,7 @@ async fn handle_connection(
                             Err(error) => send_error(&mut connection, envelope.request_id, error.code, &error.message).await?,
                         }
                     }
-                    ClientMessage::OpenLocation { .. } | ClientMessage::MovePane { .. } | ClientMessage::CloseTarget { .. } | ClientMessage::ReportAgent { .. } | ClientMessage::Shutdown => send_error(&mut connection, envelope.request_id, "control_only", "command requires a control connection").await?,
+                    ClientMessage::OpenLocation { .. } | ClientMessage::MovePane { .. } | ClientMessage::CloseTarget { .. } | ClientMessage::ReportAgent { .. } | ClientMessage::WatchResources | ClientMessage::Shutdown => send_error(&mut connection, envelope.request_id, "control_only", "command requires a control connection").await?,
                     ClientMessage::Hello { .. } => send_error(&mut connection, envelope.request_id, "already_hello", "hello was already received").await?,
                 }
             },
@@ -2351,7 +2351,20 @@ async fn control_loop(
     exited: mpsc::UnboundedSender<TerminalId>,
     shutdown: watch::Sender<bool>,
 ) -> Result<()> {
-    while let Some(frame) = connection.next().await {
+    let mut watched_changes: Option<watch::Receiver<u64>> = None;
+    loop {
+        let frame = tokio::select! {
+            frame = connection.next() => frame,
+            changed = watched_resource_change(&mut watched_changes) => {
+                if changed.is_err() {
+                    break;
+                }
+                let snapshot = shared.lock().await.resources.snapshot();
+                send(connection, None, ServerMessage::ResourcesChanged { snapshot }).await?;
+                continue;
+            }
+        };
+        let Some(frame) = frame else { break };
         let envelope: Envelope<ClientMessage> = decode_payload(&frame?)?;
         if let Some(operation) = fire_and_forget_operation(&envelope.message)
             && reject_fire_and_forget_request_id(connection, envelope.request_id, operation).await?
@@ -2542,6 +2555,21 @@ async fn control_loop(
                 )
                 .await?;
             }
+            ClientMessage::WatchResources => {
+                // Subscribing and snapshotting under one lock leaves no gap in
+                // which a change could go unstreamed.
+                let snapshot = {
+                    let state = shared.lock().await;
+                    watched_changes = Some(state.resource_changes.subscribe());
+                    state.resources.snapshot()
+                };
+                send(
+                    connection,
+                    envelope.request_id,
+                    ServerMessage::Resources { snapshot },
+                )
+                .await?;
+            }
             ClientMessage::CloseTarget { selector } => {
                 match close_target(&shared, selector).await {
                     Ok(_) => {
@@ -2648,6 +2676,16 @@ async fn control_loop(
         }
     }
     Ok(())
+}
+
+/// Pends forever until [`ClientMessage::WatchResources`] installs a receiver.
+async fn watched_resource_change(
+    changes: &mut Option<watch::Receiver<u64>>,
+) -> Result<(), tokio::sync::watch::error::RecvError> {
+    match changes {
+        Some(changes) => changes.changed().await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn lease_view(

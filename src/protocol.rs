@@ -20,7 +20,7 @@ use crate::{
 /// Protocol version used by released Fut 0.1 builds.
 pub const PROTOCOL_VERSION_0_1: u16 = 0;
 /// Current clients and daemons require an exact protocol match.
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 /// Enough for 50,000 individually styled MessagePack-encoded cells while
 /// remaining a firm pre-allocation bound for the length-delimited transport.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
@@ -199,6 +199,11 @@ pub enum ClientMessage {
         destination_tab_id: TabId,
     },
     ListResources,
+    /// Ask a control connection to stream resource changes: the correlated
+    /// response is a [`ServerMessage::Resources`] snapshot of the current
+    /// state, followed by an unsolicited [`ServerMessage::ResourcesChanged`]
+    /// for every later change.
+    WatchResources,
     CloseTarget {
         selector: TargetSelector,
     },
@@ -765,7 +770,13 @@ mod tests {
             switched
         );
         assert_eq!(PROTOCOL_VERSION_0_1, 0);
-        assert_eq!(PROTOCOL_VERSION, 6);
+        assert_eq!(PROTOCOL_VERSION, 7);
+
+        let watch = ClientMessage::WatchResources;
+        assert_eq!(
+            decode_payload::<ClientMessage>(&encode_payload(&watch).unwrap()).unwrap(),
+            watch
+        );
     }
 
     #[test]

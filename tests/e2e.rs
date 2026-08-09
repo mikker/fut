@@ -3567,6 +3567,92 @@ async fn public_child_commands_require_the_delimiter_before_the_child_argv() {
 }
 
 #[tokio::test]
+async fn public_events_stream_emits_versioned_json_snapshots_on_change() {
+    let mut harness = Harness::start("while IFS= read -r line; do :; done").await;
+    let mut events = PtyChild::spawn({
+        let mut command = harness.cli();
+        command.arg("events");
+        command
+    });
+    events.wait_for("\"command\":\"events\"").await;
+    let first: Value = serde_json::from_str(events.text().lines().next().unwrap()).unwrap();
+    assert_eq!(first["version"], 1);
+    assert_eq!(first["command"], "events");
+    let first_revision = first["result"]["revision"].as_u64().unwrap();
+    let session_id = first["result"]["sessions"][0]["id"].as_str().unwrap();
+
+    // A mutation through any other client streams a new snapshot line.
+    assert_eq!(
+        harness
+            .control_command(ClientMessage::RenameTarget {
+                selector: RenameSelector::Session(SessionSelector::Id(session_id.parse().unwrap())),
+                name: "watched λ".into(),
+            })
+            .await,
+        ServerMessage::CommandCompleted {
+            command: fut::protocol::AcknowledgedCommand::RenameTarget,
+        }
+    );
+    events.wait_for("watched λ").await;
+    let last: Value = serde_json::from_str(events.text().lines().last().unwrap()).unwrap();
+    assert_eq!(last["version"], 1);
+    assert_eq!(last["command"], "events");
+    assert!(last["result"]["revision"].as_u64().unwrap() > first_revision);
+    assert_eq!(last["result"]["sessions"][0]["name"], "watched λ");
+
+    // Agent activity reports stream too.
+    let pane = &last["result"]["sessions"][0]["workspaces"][0]["tabs"][0]["panes"][0];
+    assert_eq!(pane["activity"]["state"], "idle");
+    let terminal_id: TerminalId = pane["terminal_id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(
+        harness
+            .control_command(ClientMessage::ReportAgent {
+                terminal_id,
+                report: AgentReport::Blocked,
+            })
+            .await,
+        ServerMessage::CommandCompleted {
+            command: fut::protocol::AcknowledgedCommand::ReportAgent,
+        }
+    );
+    events.wait_for("\"state\":\"blocked\"").await;
+    let last: Value = serde_json::from_str(events.text().lines().last().unwrap()).unwrap();
+    assert_eq!(
+        last["result"]["sessions"][0]["workspaces"][0]["tabs"][0]["panes"][0]["activity"]["state"],
+        "blocked"
+    );
+
+    // Interactive connections cannot subscribe; the stream is control-only.
+    let (mut interactive, _, _) = harness.interactive().await;
+    let rejected_request = Uuid::new_v4();
+    send_envelope(
+        &mut interactive,
+        Envelope {
+            request_id: Some(rejected_request),
+            message: ClientMessage::WatchResources,
+        },
+    )
+    .await;
+    loop {
+        let response = receive_envelope(&mut interactive)
+            .await
+            .expect("interactive connection closed during rejected watch");
+        if response.request_id == Some(rejected_request) {
+            assert!(matches!(
+                response.message,
+                ServerMessage::Error { ref code, .. } if code == "control_only"
+            ));
+            break;
+        }
+    }
+    harness.detach(&mut interactive).await;
+
+    // Daemon shutdown ends the stream cleanly.
+    harness.shutdown().await;
+    events.wait_success().await;
+}
+
+#[tokio::test]
 async fn public_json_control_mutations_use_dotted_commands_and_raw_ids() {
     let harness = Harness::start("while IFS= read -r line; do :; done").await;
     let json = |arguments: &[&str], command: &str| {

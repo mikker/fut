@@ -96,6 +96,11 @@ enum Command {
     },
     /// List resources from the existing daemon.
     List,
+    /// Stream resource changes from the existing daemon as JSON lines.
+    ///
+    /// The first line is the current state; every later line is the complete
+    /// state after a change. Output is always versioned JSON.
+    Events,
     /// Diagnose configuration, terminal capabilities, and daemon connectivity.
     Doctor,
     /// Run or control the daemon.
@@ -579,6 +584,7 @@ async fn execute(cli: Cli) -> Result<()> {
                 other => unexpected(other),
             }
         }
+        Some(Command::Events) => stream_events(&socket).await,
         Some(Command::List) => {
             let snapshot = list_resources(&socket).await?;
             if cli.json {
@@ -930,9 +936,16 @@ async fn wait_until_protocol_stops(socket: &std::path::Path) -> bool {
 }
 
 async fn control(socket: &std::path::Path, command: ClientMessage) -> Result<ServerMessage> {
-    match control_attempt(socket, command, PROTOCOL_VERSION).await? {
-        ControlAttempt::Response(response) => Ok(response),
-        ControlAttempt::Incompatible { server } => bail!(
+    request(connected_control(socket).await?, command).await
+}
+
+/// Connects at the current protocol version, failing on a mismatched daemon.
+async fn connected_control(
+    socket: &std::path::Path,
+) -> Result<Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>> {
+    match control_handshake(socket, PROTOCOL_VERSION).await? {
+        ControlHandshake::Connected(framed) => Ok(framed),
+        ControlHandshake::Incompatible { server } => bail!(
             "daemon at {} uses protocol {server}, but this Fut client requires protocol \
              {PROTOCOL_VERSION}",
             socket.display()
@@ -941,13 +954,14 @@ async fn control(socket: &std::path::Path, command: ClientMessage) -> Result<Ser
 }
 
 async fn shutdown_control(socket: &std::path::Path) -> Result<ServerMessage> {
-    match control_attempt(socket, ClientMessage::Shutdown, PROTOCOL_VERSION).await? {
-        ControlAttempt::Response(response) => Ok(response),
-        ControlAttempt::Incompatible { server } => match shutdown_downgrade_version(server) {
-            Some(version) => match control_attempt(socket, ClientMessage::Shutdown, version).await?
-            {
-                ControlAttempt::Response(response) => Ok(response),
-                ControlAttempt::Incompatible { server: changed } => bail!(
+    match control_handshake(socket, PROTOCOL_VERSION).await? {
+        ControlHandshake::Connected(framed) => request(framed, ClientMessage::Shutdown).await,
+        ControlHandshake::Incompatible { server } => match shutdown_downgrade_version(server) {
+            Some(version) => match control_handshake(socket, version).await? {
+                ControlHandshake::Connected(framed) => {
+                    request(framed, ClientMessage::Shutdown).await
+                }
+                ControlHandshake::Incompatible { server: changed } => bail!(
                     "daemon at {} changed protocol from {server} to {changed} during shutdown",
                     socket.display()
                 ),
@@ -966,16 +980,12 @@ fn shutdown_downgrade_version(server: u16) -> Option<u16> {
     (server == PROTOCOL_VERSION_0_1).then_some(server)
 }
 
-enum ControlAttempt {
-    Response(ServerMessage),
+enum ControlHandshake {
+    Connected(Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>),
     Incompatible { server: u16 },
 }
 
-async fn control_attempt(
-    socket: &std::path::Path,
-    command: ClientMessage,
-    version: u16,
-) -> Result<ControlAttempt> {
+async fn control_handshake(socket: &std::path::Path, version: u16) -> Result<ControlHandshake> {
     let stream = UnixStream::connect(socket)
         .await
         .with_context(|| format!("connect to {}", socket.display()))?;
@@ -999,22 +1009,54 @@ async fn control_attempt(
     {
         ServerMessage::Welcome {
             version: server, ..
-        } if server == version => {}
+        } if server == version => Ok(ControlHandshake::Connected(framed)),
         ServerMessage::IncompatibleProtocol { server, .. } => {
-            return Ok(ControlAttempt::Incompatible { server });
+            Ok(ControlHandshake::Incompatible { server })
         }
+        other => unexpected(other),
+    }
+}
+
+async fn request(
+    mut framed: Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    command: ClientMessage,
+) -> Result<ServerMessage> {
+    let request_id = send(&mut framed, command).await?;
+    receive(
+        &mut framed,
+        request_id,
+        Duration::from_secs(15),
+        "daemon response timed out",
+    )
+    .await
+}
+
+/// Streams the current resource snapshot and every later change as one
+/// versioned JSON line each, until the daemon exits.
+async fn stream_events(socket: &std::path::Path) -> Result<()> {
+    let mut framed = connected_control(socket).await?;
+    let request_id = send(&mut framed, ClientMessage::WatchResources).await?;
+    match receive(
+        &mut framed,
+        request_id,
+        Duration::from_secs(15),
+        "daemon response timed out",
+    )
+    .await?
+    {
+        ServerMessage::Resources { snapshot } => output(true, "events", &snapshot, "")?,
         other => return unexpected(other),
     }
-    let command_request_id = send(&mut framed, command).await?;
-    Ok(ControlAttempt::Response(
-        receive(
-            &mut framed,
-            command_request_id,
-            Duration::from_secs(15),
-            "daemon response timed out",
-        )
-        .await?,
-    ))
+    while let Some(frame) = framed.next().await {
+        let envelope: Envelope<ServerMessage> = decode_payload(&frame?)?;
+        match envelope.message {
+            ServerMessage::ResourcesChanged { snapshot } => {
+                output(true, "events", &snapshot, "")?;
+            }
+            other => return unexpected(other),
+        }
+    }
+    Ok(())
 }
 
 fn session_selector(value: &str) -> SessionSelector {
@@ -1363,6 +1405,7 @@ mod tests {
         for args in [
             vec!["fut", "open"],
             vec!["fut", "list"],
+            vec!["fut", "events"],
             vec!["fut", "session", "attach", "a name"],
             vec!["fut", "session", "rename", &session, "new"],
             vec!["fut", "session", "close", &session],
@@ -1531,6 +1574,7 @@ mod tests {
                 "pane",
                 "terminal",
                 "list",
+                "events",
                 "doctor",
                 "daemon"
             ]

@@ -12,6 +12,7 @@
 - Added `Ctrl-b ↑/↓` to cycle workspaces, digit keys in the workspace sidebar to pick one directly, and `h` there to toggle sidebar auto-hide.
 - Added the current workspace name to the tab bar's right side.
 - Added `fut tab list` and `fut pane list` for inspecting tabs, panes, and split layouts, with `--json` support.
+- Added `fut events`: subscribe to state changes as a stream of versioned JSON lines, one full resource snapshot now and after every change.
 - Added a pill-shaped focused tab when the `nerd_font` icon preset is active.
 - Added agent activity indicators, per-client completion notifications, waiting-terminal navigation, and Pi integration.
 - Added per-client mouse-wheel scrollback, click-to-focus, focused-application mouse reporting, alternate-screen wheel translation, and safe held-button cleanup across UI transitions.
