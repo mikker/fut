@@ -599,13 +599,18 @@ mod tests {
         ));
     }
 
+    /// Far above worst-case shell startup on a loaded machine: the resolver
+    /// must never kill the fake git before it records the descendant pid, or
+    /// [`assert_process_dies`] has no pid file to read.
+    #[cfg(unix)]
+    const KILL_TIMEOUT: Duration = Duration::from_millis(500);
+
     #[cfg(unix)]
     #[tokio::test]
     async fn slow_git_is_killed_at_the_timeout() {
         let temp = TempDir::new().unwrap();
         let (_scripts, fake) = script("#!/bin/sh\nsleep 10 &\necho $! > descendant.pid\nwait\n");
-        let resolver =
-            ProjectResolver::with_git_executable(fake).with_timeout(Duration::from_millis(50));
+        let resolver = ProjectResolver::with_git_executable(fake).with_timeout(KILL_TIMEOUT);
         assert!(matches!(
             resolver.resolve(temp.path()).await,
             Err(ProjectError::GitTimeout(_))
@@ -618,8 +623,7 @@ mod tests {
     async fn exited_git_with_inherited_pipe_is_killed_at_the_timeout() {
         let temp = TempDir::new().unwrap();
         let (_scripts, fake) = script("#!/bin/sh\nsleep 10 &\necho $! > descendant.pid\nexit 0\n");
-        let resolver =
-            ProjectResolver::with_git_executable(fake).with_timeout(Duration::from_millis(50));
+        let resolver = ProjectResolver::with_git_executable(fake).with_timeout(KILL_TIMEOUT);
         assert!(matches!(
             resolver.resolve(temp.path()).await,
             Err(ProjectError::GitTimeout(_))
