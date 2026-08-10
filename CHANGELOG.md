@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3
+
 - Added `-v` as the short form of `--version` (`-V` remains supported).
 - Pane and workspace-sidebar dividers can now be resized cell by cell with the mouse; pane splits persist and synchronize, while sidebar widths remain client-local.
 - Layout commands can now omit their current session, workspace, tab, or pane ID when run inside Fut.
