@@ -1,6 +1,6 @@
 ---
 id: mul-e66u
-status: in_progress
+status: closed
 deps: []
 links: []
 created: 2026-08-10T11:29:17Z
