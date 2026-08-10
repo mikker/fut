@@ -41,9 +41,11 @@ printf '%s\n' \
 fut --json context
 ```
 
-`context` validates all available `FUT_*` IDs as one live ancestry. Treat
-`missing_context` and `invalid_context` as typed failures; do not fill gaps from
-another client's focus.
+`context` treats `FUT_TERMINAL_ID` as the stable identity and resolves its
+current live ancestry from the daemon. Ancestor variables describe the spawn
+location and may be stale after a pane move. Treat `missing_context`,
+`invalid_context`, `stale_context`, and `closing_context` as typed failures;
+do not fill gaps from another client's focus.
 
 Look up any known resource UUID explicitly, including from outside Fut:
 
@@ -58,6 +60,12 @@ Read IDs from JSON responses. Creation commands put the new resource IDs under
 Pass those IDs explicitly to every later command. Check the exit status, parse
 successful JSON from stdout, and parse a structured JSON error from stderr on
 failure.
+
+For direct human use inside Fut, layout commands may omit the applicable
+current ID (`tab new`, `tab rename NAME`, `pane split right`, `pane close`, and
+similar forms). Automation should retain returned explicit IDs whenever it
+owns a particular resource; omitted-ID mutations are guarded against ancestry
+changes by the daemon.
 
 ## Create a background terminal
 

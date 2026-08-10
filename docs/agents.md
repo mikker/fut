@@ -8,12 +8,16 @@ description: Report semantic agent activity to Fut.
 
 Programs running inside Fut receive scoped `FUT_SESSION_ID`, `FUT_WORKSPACE_ID`,
 `FUT_TAB_ID`, `FUT_PANE_ID`, and `FUT_TERMINAL_ID` environment variables.
-Resolve and validate that complete ancestry, including the pane's current agent
-activity, with:
+Resolve the terminal's current live ancestry, including the pane's current
+agent activity, with:
 
 ```sh
 fut --json context
 ```
+
+`FUT_TERMINAL_ID` is stable. The ancestor variables describe the spawn
+location and may be stale after a pane move; `context` resolves their current
+replacements from a fresh daemon snapshot.
 
 Look up any session, workspace, tab, pane, or terminal outside that inherited
 context by its UUID without changing visual focus:
@@ -120,7 +124,7 @@ The terminal defaults to `FUT_TERMINAL_ID`; outside that environment pass
 accepts the same metadata.
 
 Completion and blocked reports create per-client attention. Use `Ctrl-b u` to list
-waiting terminals and `Ctrl-b .` to jump to the next one. Viewing a terminal marks
+waiting terminals and `Ctrl-b Ctrl-b` to jump to the next one. Viewing a terminal marks
 its current attention as seen only for that client.
 
 ## Event stream

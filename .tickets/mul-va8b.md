@@ -1,6 +1,6 @@
 ---
 id: mul-va8b
-status: in_progress
+status: closed
 deps: []
 links: []
 created: 2026-08-10T11:31:00Z

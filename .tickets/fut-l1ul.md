@@ -1,6 +1,6 @@
 ---
 id: fut-l1ul
-status: in_progress
+status: closed
 deps: []
 links: []
 created: 2026-08-07T11:40:22Z

@@ -1,6 +1,6 @@
 ---
 id: mul-k605
-status: in_progress
+status: closed
 deps: []
 links: []
 created: 2026-08-10T11:26:10Z
