@@ -3,6 +3,7 @@
 //! These types deliberately contain no PTY, terminal-emulator, transport, or
 //! presentation-library types.
 
+use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
@@ -658,7 +659,7 @@ impl<'de> Deserialize<'de> for CellStyle {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Cell {
     #[serde(rename = "c")]
-    pub contents: String,
+    pub contents: CompactString,
     #[serde(rename = "s", default, skip_serializing_if = "CellStyle::is_default")]
     pub style: CellStyle,
     #[serde(rename = "x", default, skip_serializing_if = "is_false")]
@@ -687,7 +688,7 @@ impl Cell {
             || self.contents.chars().any(char::is_control)
             || self.contents.graphemes(true).count() > 1
         {
-            self.contents = OVERSIZED_CELL_CONTENT_MARKER.into();
+            self.contents = CompactString::new(OVERSIZED_CELL_CONTENT_MARKER);
         }
     }
 
@@ -701,7 +702,7 @@ impl Cell {
     /// still worth capping here.
     pub(crate) fn cap_length(&mut self) {
         if self.contents.len() > MAX_CELL_CONTENT_BYTES {
-            self.contents = OVERSIZED_CELL_CONTENT_MARKER.into();
+            self.contents = CompactString::new(OVERSIZED_CELL_CONTENT_MARKER);
         }
     }
 }
@@ -963,7 +964,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         cells.push(Cell {
-            contents: format!("a{}", "\u{301}".repeat(MAX_CELL_CONTENT_BYTES)),
+            contents: format!("a{}", "\u{301}".repeat(MAX_CELL_CONTENT_BYTES)).into(),
             ..Cell::default()
         });
         let snapshot = ScreenSnapshot::new(

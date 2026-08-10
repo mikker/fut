@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
+use compact_str::CompactString;
 use libghostty_vt::{
     RenderState, Terminal, TerminalOptions,
     error::Error as GhosttyError,
@@ -1212,6 +1213,7 @@ impl GhosttyTerminal {
         let expected = usize::from(self.size.columns) * usize::from(self.size.rows);
         let mut result = Vec::with_capacity(expected);
         let mut widths = Vec::with_capacity(expected);
+        let mut contents_buffer = String::new();
         let mut rows = self.rows.update(&snapshot)?;
         while let Some(row) = rows.next() {
             // Row-local selection range, fetched once per row instead of
@@ -1220,11 +1222,12 @@ impl GhosttyTerminal {
             let mut cells = self.cells.update(row)?;
             let mut column: u16 = 0;
             while let Some(cell) = cells.next() {
-                let mut contents = String::new();
-                cell.graphemes_utf8(&mut contents)?;
-                if contents.is_empty() {
-                    contents.push(' ');
+                contents_buffer.clear();
+                cell.graphemes_utf8(&mut contents_buffer)?;
+                if contents_buffer.is_empty() {
+                    contents_buffer.push(' ');
                 }
+                let contents = CompactString::new(&contents_buffer);
                 let raw_cell = cell.raw_cell()?;
                 // `has_styling` is false exactly when the cell's style is
                 // the default one, so we can skip fetching the full style

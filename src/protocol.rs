@@ -805,7 +805,7 @@ mod tests {
         let maximum_content = format!("a{}\u{1ab0}", "\u{301}".repeat(14));
         assert_eq!(maximum_content.len(), MAX_CELL_CONTENT_BYTES);
         let cell = Cell {
-            contents: maximum_content,
+            contents: maximum_content.into(),
             style: crate::domain::CellStyle {
                 foreground: Some(crate::domain::CellColor::Rgb(crate::domain::Rgb {
                     red: 255,
