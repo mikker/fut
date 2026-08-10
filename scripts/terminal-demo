@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if [[ -n "${FUT_TERMINAL_ID:-}" ]]; then
+  echo "Run this script from a terminal outside Fut." >&2
+  exit 1
+fi
+
+FUT_BIN=${FUT_BIN:-fut}
+for command in "$FUT_BIN" python3 cmatrix pipes.sh htop genact; do
+  command -v "$command" >/dev/null || {
+    echo "Required command not found: $command" >&2
+    exit 1
+  }
+done
+
+DEMO_ROOT=${FUT_TERMINAL_DEMO_ROOT:-"${TMPDIR:-/tmp}/fut-terminal-demo-$$"}
+mkdir -p "$DEMO_ROOT"
+
+selected_field() {
+  python3 -c \
+    'import json, sys; print(json.load(sys.stdin)["result"]["selected"][sys.argv[1]])' \
+    "$1"
+}
+
+run_json() {
+  "$FUT_BIN" --json "$@"
+}
+
+if ! "$FUT_BIN" daemon ping >/dev/null 2>&1; then
+  nohup "$FUT_BIN" daemon run --cwd "$DEMO_ROOT" -- cmatrix -ab -u 3 \
+    >"$DEMO_ROOT/daemon.log" 2>&1 &
+  for _ in {1..100}; do
+    "$FUT_BIN" daemon ping >/dev/null 2>&1 && break
+    sleep 0.05
+  done
+  "$FUT_BIN" daemon ping >/dev/null
+fi
+
+initial=$(run_json open "$DEMO_ROOT" --name "terminal-demo-$$" -- cmatrix -ab -u 3)
+initial_pane=$(printf '%s' "$initial" | selected_field pane_id)
+
+right=$(run_json pane split "$initial_pane" right -- pipes.sh -p 5 -f 30 -R -K)
+right_pane=$(printf '%s' "$right" | selected_field pane_id)
+
+run_json pane split "$initial_pane" down -- htop >/dev/null
+run_json pane split "$right_pane" down -- \
+  /bin/sh -c 'while :; do genact --speed-factor 2 --modules botnet --modules bruteforce --modules cryptomining --modules memdump --modules weblog; done' \
+  >/dev/null
+
+exec "$FUT_BIN" pane attach "$initial_pane"

@@ -11,6 +11,7 @@
 - Added a lifecycle-only Claude Code plugin for reporting agent activity to Fut.
 - Updated the Pi integration to report ordered lifecycle state through `fut agent report`.
 - Agent activity snapshots now distinguish integrated terminals and retain the latest lifecycle event.
+- Improved animated-terminal performance with more compact cells, cheaper snapshots, and batched Ghostty field reads.
 - Fixed panes under heavy output getting stuck while closing and blocking attachment.
 
 ## 0.2
