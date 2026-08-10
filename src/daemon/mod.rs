@@ -32,25 +32,27 @@ use tokio::{
     time::{Duration, timeout},
 };
 use tokio_util::codec::Framed;
+use uuid::Uuid;
 
 use crate::{
     domain::{
         AgentActivity, AgentReport, ClientId, CopyModeAction, CopyModeError, DeltaRow,
         MAX_AGENT_PROMPT_BYTES, MAX_TERMINAL_OUTPUT_PATTERN_BYTES, MAX_TERMINAL_OUTPUT_ROWS,
-        PaneId, ScreenDelta, ScreenSnapshot, SessionId, TabId, TerminalId, TerminalOutput,
+        PaneId, ScreenDelta, ScreenSnapshot, SessionId, SplitId, TabId, TerminalId, TerminalOutput,
         TerminalOutputMatcher, TerminalOutputSource, TerminalSize, WorkspaceId,
     },
     project::{ProjectError, ProjectResolver, ResolvedLocation},
     protocol::{
-        AcknowledgedCommand, ClientMessage, ClientMode, Envelope, OpenDisposition,
-        PROTOCOL_VERSION, RenameSelector, SelectedTarget, SelectedView, SelectionExpectation,
-        ServerMessage, TerminalInputOperation, codec, decode_payload, encode_payload,
+        AcknowledgedCommand, ClientMessage, ClientMode, ContextScope, ContextualCommand, Envelope,
+        OpenDisposition, PROTOCOL_VERSION, RenameSelector, SelectedTarget, SelectedView,
+        SelectionExpectation, ServerMessage, TerminalContext, TerminalInputOperation, codec,
+        decode_payload, encode_payload,
     },
     resources::{
-        CheckoutDestination, InitialPath, ResourceError, ResourceTree, TabPath, TargetSelector,
-        WorkspacePath,
+        CheckoutDestination, InitialPath, ResourceError, ResourceTree, SessionSelector, TabPath,
+        TargetSelector, WorkspacePath,
     },
-    splits::{SplitDirection, SplitTree},
+    splits::{SplitDirection, SplitRatio, SplitTree},
     terminal::{
         CommandError, CopyModeOutcome, MouseInputOutcome, OutputCapture, OutputCaptureError,
         SpawnSpec, TerminalEvent, TerminalHandle, TerminalLifecycle, spawn_terminal,
@@ -167,6 +169,38 @@ impl From<ProjectError> for DaemonError {
 }
 
 impl SharedState {
+    fn validate_terminal_context(
+        &self,
+        context: TerminalContext,
+    ) -> Result<crate::resources::ResolvedTerminalPath, DaemonError> {
+        let path = self
+            .resources
+            .resolve_terminal_target(Some(TargetSelector::Terminal(context.terminal_id)))?;
+        if path.session_id != context.session_id
+            || path.workspace_id != context.workspace_id
+            || path.tab_id != context.tab_id
+            || path.pane_id != context.pane_id
+        {
+            return Err(DaemonError::new(
+                "context_changed",
+                "calling terminal ancestry changed before the operation could run",
+            ));
+        }
+        let runtime = self.runtimes.get(&context.terminal_id).ok_or_else(|| {
+            DaemonError::new("stale_context", "calling terminal runtime no longer exists")
+        })?;
+        if !matches!(
+            *runtime.handle.subscribe_lifecycle().borrow(),
+            TerminalLifecycle::Running
+        ) {
+            return Err(DaemonError::new(
+                "terminal_exited",
+                "calling terminal is no longer running",
+            ));
+        }
+        Ok(path)
+    }
+
     fn publish_resource_change(&self, revision: u64) {
         if revision > *self.resource_changes.borrow() {
             self.resource_changes.send_replace(revision);
@@ -296,6 +330,36 @@ impl SharedState {
         );
         self.publish_resource_change(mutation.revision);
         Ok(())
+    }
+
+    fn resize_split(
+        &mut self,
+        tab_id: TabId,
+        split_id: SplitId,
+        ratio: SplitRatio,
+    ) -> Result<(), DaemonError> {
+        let mutation = self.resources.resize_split(tab_id, split_id, ratio)?;
+        self.publish_resource_change(mutation.revision);
+        Ok(())
+    }
+
+    fn resize_split_for_attachment(
+        &mut self,
+        focused_terminal_id: TerminalId,
+        tab_id: TabId,
+        split_id: SplitId,
+        ratio: SplitRatio,
+    ) -> Result<(), DaemonError> {
+        let focused = self
+            .resources
+            .resolve_terminal_target(Some(TargetSelector::Terminal(focused_terminal_id)))?;
+        if focused.tab_id != tab_id {
+            return Err(DaemonError::new(
+                "context_changed",
+                "focused terminal moved to another tab before split resize",
+            ));
+        }
+        self.resize_split(tab_id, split_id, ratio)
     }
 
     fn finalize_terminal(&mut self, terminal_id: TerminalId) -> Result<bool, DaemonError> {
@@ -1984,6 +2048,30 @@ async fn handle_connection(
                             ).await?;
                         }
                     }
+                    ClientMessage::ResizeSplit {
+                        tab_id,
+                        split_id,
+                        ratio,
+                    } => {
+                        let result = shared
+                            .lock()
+                            .await
+                            .resize_split_for_attachment(
+                                attachment.focused.selected.terminal_id,
+                                tab_id,
+                                split_id,
+                                ratio,
+                            );
+                        if let Err(error) = result {
+                            tracing::debug!(
+                                code = error.code,
+                                message = error.message,
+                                %tab_id,
+                                %split_id,
+                                "discarding stale or invalid split resize"
+                            );
+                        }
+                    }
                     ClientMessage::SelectTarget { selector, expected } => {
                         let selection = match observe_selection(
                             &shared,
@@ -2098,6 +2186,7 @@ async fn handle_connection(
                         };
                         let request = CreateTabRequest {
                             workspace_id,
+                            context: None,
                             name,
                             cwd,
                             inherited_cwd,
@@ -2141,6 +2230,7 @@ async fn handle_connection(
                         }
                         let request = CreatePaneRequest {
                             target: PaneCreationTarget::Append(tab_id),
+                            context: None,
                             cwd,
                             program,
                             argv,
@@ -2182,6 +2272,7 @@ async fn handle_connection(
                         }
                         let request = CreatePaneRequest {
                             target: PaneCreationTarget::Split { anchor: pane_id, direction },
+                            context: None,
                             cwd,
                             program,
                             argv,
@@ -2248,7 +2339,7 @@ async fn handle_connection(
                             Err(error) => send_error(&mut connection, envelope.request_id, error.code, &error.message).await?,
                         }
                     }
-                    ClientMessage::OpenLocation { .. } | ClientMessage::MovePane { .. } | ClientMessage::CloseTarget { .. } | ClientMessage::ReportAgent { .. } | ClientMessage::TerminalInput { .. } | ClientMessage::ReadTerminalOutput { .. } | ClientMessage::WaitTerminalOutput { .. } | ClientMessage::PromptAgent { .. } | ClientMessage::WaitAgent { .. } | ClientMessage::WatchResources | ClientMessage::Shutdown => send_error(&mut connection, envelope.request_id, "control_only", "command requires a control connection").await?,
+                    ClientMessage::OpenLocation { .. } | ClientMessage::MovePane { .. } | ClientMessage::Contextual { .. } | ClientMessage::CloseTarget { .. } | ClientMessage::ReportAgent { .. } | ClientMessage::TerminalInput { .. } | ClientMessage::ReadTerminalOutput { .. } | ClientMessage::WaitTerminalOutput { .. } | ClientMessage::PromptAgent { .. } | ClientMessage::WaitAgent { .. } | ClientMessage::WatchResources | ClientMessage::Shutdown => send_error(&mut connection, envelope.request_id, "control_only", "command requires a control connection").await?,
                     ClientMessage::Hello { .. } => send_error(&mut connection, envelope.request_id, "already_hello", "hello was already received").await?,
                 }
             },
@@ -2459,6 +2550,7 @@ async fn control_loop(
                 &exited,
                 CreateTabRequest {
                     workspace_id,
+                    context: None,
                     name,
                     cwd,
                     inherited_cwd: None,
@@ -2498,6 +2590,7 @@ async fn control_loop(
                 &exited,
                 CreatePaneRequest {
                     target: PaneCreationTarget::Append(tab_id),
+                    context: None,
                     cwd,
                     program,
                     argv,
@@ -2539,6 +2632,7 @@ async fn control_loop(
                         anchor: pane_id,
                         direction,
                     },
+                    context: None,
                     cwd,
                     program,
                     argv,
@@ -2591,6 +2685,17 @@ async fn control_loop(
                     }
                 }
             }
+            ClientMessage::Contextual { context, command } => {
+                handle_contextual_command(
+                    connection,
+                    &shared,
+                    &exited,
+                    envelope.request_id,
+                    context,
+                    command,
+                )
+                .await?;
+            }
             ClientMessage::ListResources => {
                 let snapshot = shared.lock().await.resources.snapshot();
                 send(
@@ -2616,7 +2721,7 @@ async fn control_loop(
                 .await?;
             }
             ClientMessage::CloseTarget { selector } => {
-                match close_target(&shared, selector).await {
+                match close_target(&shared, selector, None).await {
                     Ok(_) => {
                         send(
                             connection,
@@ -2813,7 +2918,8 @@ async fn control_loop(
             }
             ClientMessage::MouseInput { .. }
             | ClientMessage::ResetViewport { .. }
-            | ClientMessage::RefreshTerminal { .. } => {}
+            | ClientMessage::RefreshTerminal { .. }
+            | ClientMessage::ResizeSplit { .. } => {}
             ClientMessage::CreateWorkspace { .. }
             | ClientMessage::Input { .. }
             | ClientMessage::Paste { .. }
@@ -2840,6 +2946,230 @@ async fn control_loop(
         }
     }
     Ok(())
+}
+
+async fn handle_contextual_command(
+    connection: &mut ClientConnection,
+    shared: &Shared,
+    exited: &mpsc::UnboundedSender<TerminalId>,
+    request_id: Option<Uuid>,
+    context: TerminalContext,
+    command: ContextualCommand,
+) -> Result<()> {
+    match command {
+        ContextualCommand::CreateTab {
+            name,
+            cwd,
+            program,
+            argv,
+        } => match create_tab(
+            shared,
+            exited,
+            CreateTabRequest {
+                workspace_id: context.workspace_id,
+                context: Some(context),
+                name,
+                cwd,
+                inherited_cwd: None,
+                program,
+                argv,
+                size: TerminalSize {
+                    columns: 80,
+                    rows: 24,
+                },
+            },
+            CreationMode::Detached,
+        )
+        .await
+        {
+            Ok(CreatedTerminal::Detached(selected)) => {
+                send(
+                    connection,
+                    request_id,
+                    ServerMessage::TabCreated { selected },
+                )
+                .await?
+            }
+            Ok(CreatedTerminal::Attached(_)) => {
+                unreachable!("contextual control creation is detached")
+            }
+            Err(error) => send_error(connection, request_id, error.code, &error.message).await?,
+        },
+        ContextualCommand::CreatePane { cwd, program, argv } => {
+            handle_contextual_pane_creation(
+                connection,
+                shared,
+                exited,
+                request_id,
+                context,
+                PaneCreationTarget::Append(context.tab_id),
+                cwd,
+                program,
+                argv,
+            )
+            .await?;
+        }
+        ContextualCommand::SplitPane {
+            cwd,
+            program,
+            argv,
+            direction,
+        } => {
+            handle_contextual_pane_creation(
+                connection,
+                shared,
+                exited,
+                request_id,
+                context,
+                PaneCreationTarget::Split {
+                    anchor: context.pane_id,
+                    direction,
+                },
+                cwd,
+                program,
+                argv,
+            )
+            .await?;
+        }
+        ContextualCommand::MovePane { destination_tab_id } => {
+            let result = {
+                let mut state = shared.lock().await;
+                (|| -> Result<_, DaemonError> {
+                    state.validate_terminal_context(context)?;
+                    state.move_pane(context.pane_id, destination_tab_id)
+                })()
+            };
+            match result {
+                Ok(moved) => {
+                    send(
+                        connection,
+                        request_id,
+                        ServerMessage::PaneMoved {
+                            source_tab_id: moved.source_tab_id,
+                            moved: moved.moved,
+                            source_tab_closed: moved.source_tab_closed,
+                            selected: moved.selected,
+                        },
+                    )
+                    .await?
+                }
+                Err(error) => {
+                    send_error(connection, request_id, error.code, &error.message).await?
+                }
+            }
+        }
+        ContextualCommand::Close { scope } => {
+            let selector = context_target(context, scope);
+            match close_target(shared, selector, Some(context)).await {
+                Ok(()) => {
+                    send(
+                        connection,
+                        request_id,
+                        ServerMessage::CommandCompleted {
+                            command: AcknowledgedCommand::CloseTarget,
+                        },
+                    )
+                    .await?
+                }
+                Err(error) => {
+                    send_error(connection, request_id, error.code, &error.message).await?
+                }
+            }
+        }
+        ContextualCommand::Rename { scope, name } => {
+            let result = {
+                let mut state = shared.lock().await;
+                (|| -> Result<_, DaemonError> {
+                    state.validate_terminal_context(context)?;
+                    let selector = match scope {
+                        ContextScope::Session => {
+                            RenameSelector::Session(SessionSelector::Id(context.session_id))
+                        }
+                        ContextScope::Workspace => RenameSelector::Workspace(context.workspace_id),
+                        ContextScope::Tab => RenameSelector::Tab(context.tab_id),
+                        ContextScope::Pane => {
+                            return Err(DaemonError::new(
+                                "invalid_context_command",
+                                "panes cannot be renamed",
+                            ));
+                        }
+                    };
+                    state.rename_target(selector, name)
+                })()
+            };
+            match result {
+                Ok(_) => {
+                    send(
+                        connection,
+                        request_id,
+                        ServerMessage::CommandCompleted {
+                            command: AcknowledgedCommand::RenameTarget,
+                        },
+                    )
+                    .await?
+                }
+                Err(error) => {
+                    send_error(connection, request_id, error.code, &error.message).await?
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_contextual_pane_creation(
+    connection: &mut ClientConnection,
+    shared: &Shared,
+    exited: &mpsc::UnboundedSender<TerminalId>,
+    request_id: Option<Uuid>,
+    context: TerminalContext,
+    target: PaneCreationTarget,
+    cwd: Option<PathBuf>,
+    program: Option<PathBuf>,
+    argv: Vec<String>,
+) -> Result<()> {
+    match create_pane(
+        shared,
+        exited,
+        CreatePaneRequest {
+            target,
+            context: Some(context),
+            cwd,
+            program,
+            argv,
+            size: TerminalSize {
+                columns: 80,
+                rows: 24,
+            },
+        },
+        CreationMode::Detached,
+    )
+    .await
+    {
+        Ok(CreatedTerminal::Detached(selected)) => {
+            send(
+                connection,
+                request_id,
+                ServerMessage::PaneCreated { selected },
+            )
+            .await?
+        }
+        Ok(CreatedTerminal::Attached(_)) => {
+            unreachable!("contextual control creation is detached")
+        }
+        Err(error) => send_error(connection, request_id, error.code, &error.message).await?,
+    }
+    Ok(())
+}
+
+fn context_target(context: TerminalContext, scope: ContextScope) -> TargetSelector {
+    match scope {
+        ContextScope::Session => TargetSelector::Session(SessionSelector::Id(context.session_id)),
+        ContextScope::Workspace => TargetSelector::Workspace(context.workspace_id),
+        ContextScope::Tab => TargetSelector::Tab(context.tab_id),
+        ContextScope::Pane => TargetSelector::Pane(context.pane_id),
+    }
 }
 
 /// Pends forever until [`ClientMessage::WatchResources`] installs a receiver.
@@ -3381,6 +3711,7 @@ async fn open_location(
 
 struct CreateTabRequest {
     workspace_id: WorkspaceId,
+    context: Option<TerminalContext>,
     name: Option<String>,
     cwd: Option<PathBuf>,
     inherited_cwd: Option<(u32, PathBuf)>,
@@ -3591,6 +3922,7 @@ async fn create_tab(
 ) -> Result<CreatedTerminal, DaemonError> {
     let CreateTabRequest {
         workspace_id,
+        context,
         name,
         cwd,
         inherited_cwd,
@@ -3602,6 +3934,15 @@ async fn create_tab(
         let state = shared.lock().await;
         if !state.accepting {
             return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
+        }
+        if let Some(context) = context {
+            state.validate_terminal_context(context)?;
+            if context.workspace_id != workspace_id {
+                return Err(DaemonError::new(
+                    "context_changed",
+                    "calling terminal moved outside the inferred workspace",
+                ));
+            }
         }
         state.resources.workspace_root(workspace_id)?.to_path_buf()
     };
@@ -3616,6 +3957,15 @@ async fn create_tab(
         let mut state = shared.lock().await;
         if !state.accepting {
             return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
+        }
+        if let Some(context) = context {
+            state.validate_terminal_context(context)?;
+            if context.workspace_id != workspace_id {
+                return Err(DaemonError::new(
+                    "context_changed",
+                    "calling terminal moved outside the inferred workspace",
+                ));
+            }
         }
         let tab_name = name.unwrap_or_default();
         let proposed = TabPath {
@@ -3687,6 +4037,7 @@ async fn create_tab(
 
 struct CreatePaneRequest {
     target: PaneCreationTarget,
+    context: Option<TerminalContext>,
     cwd: Option<PathBuf>,
     program: Option<PathBuf>,
     argv: Vec<String>,
@@ -3710,6 +4061,7 @@ async fn create_pane(
 ) -> Result<CreatedTerminal, DaemonError> {
     let CreatePaneRequest {
         target,
+        context,
         cwd,
         program,
         argv,
@@ -3719,6 +4071,9 @@ async fn create_pane(
         let state = shared.lock().await;
         if !state.accepting {
             return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
+        }
+        if let Some(context) = context {
+            state.validate_terminal_context(context)?;
         }
         let tab_id = match target {
             PaneCreationTarget::Append(tab_id) => tab_id,
@@ -3762,6 +4117,9 @@ async fn create_pane(
         let mut state = shared.lock().await;
         if !state.accepting {
             return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
+        }
+        if let Some(context) = context {
+            state.validate_terminal_context(context)?;
         }
         // Re-resolve the parent and validate a clone after the filesystem await,
         // so a close or shutdown cannot race creation into a stale tab.
@@ -3943,9 +4301,16 @@ fn selected_target(
     }
 }
 
-async fn close_target(shared: &Shared, selector: TargetSelector) -> Result<(), DaemonError> {
+async fn close_target(
+    shared: &Shared,
+    selector: TargetSelector,
+    context: Option<TerminalContext>,
+) -> Result<(), DaemonError> {
     let (scope, handles) = {
         let mut state = shared.lock().await;
+        if let Some(context) = context {
+            state.validate_terminal_context(context)?;
+        }
         state.begin_target_close(selector)?
     };
     for handle in handles {
@@ -4618,6 +4983,7 @@ fn fire_and_forget_operation(message: &ClientMessage) -> Option<&'static str> {
         ClientMessage::MouseInput { .. } => Some("mouse input"),
         ClientMessage::ResetViewport { .. } => Some("reset viewport"),
         ClientMessage::RefreshTerminal { .. } => Some("refresh terminal"),
+        ClientMessage::ResizeSplit { .. } => Some("split resize"),
         _ => None,
     }
 }
@@ -4699,7 +5065,7 @@ mod tests {
 
     #[test]
     fn snapshot_message_encodes_a_small_row_diff_as_a_delta() {
-        use crate::domain::{Cell, Cursor, TerminalSize};
+        use crate::domain::{Cell, Cursor, CursorShape, TerminalSize};
         let size = TerminalSize {
             columns: 10,
             rows: 5,
@@ -4709,6 +5075,8 @@ mod tests {
             column: 0,
             row: 0,
             visible: true,
+            shape: Default::default(),
+            blinking: false,
         };
         let terminal_id = TerminalId::new();
         let first = ScreenSnapshot::new(1, size, cells.clone(), cursor).unwrap();
@@ -4718,9 +5086,28 @@ mod tests {
 
         let mut second_cells = cells;
         second_cells[0].contents = "x".into();
-        let second = ScreenSnapshot::new(2, size, second_cells, cursor).unwrap();
+        let second = ScreenSnapshot::new(2, size, second_cells.clone(), cursor).unwrap();
         let message = snapshot_message(terminal_id, second, false, &mut last_sent);
         assert!(matches!(message, ServerMessage::SnapshotDelta { .. }));
+
+        let third = ScreenSnapshot::new(
+            3,
+            size,
+            second_cells,
+            Cursor {
+                shape: CursorShape::Bar,
+                blinking: true,
+                ..cursor
+            },
+        )
+        .unwrap();
+        let message = snapshot_message(terminal_id, third, false, &mut last_sent);
+        let ServerMessage::SnapshotDelta { delta, .. } = message else {
+            panic!("cursor-only change should produce a delta")
+        };
+        assert!(delta.rows.is_empty());
+        assert_eq!(delta.cursor.shape, CursorShape::Bar);
+        assert!(delta.cursor.blinking);
     }
 
     #[tokio::test]
@@ -5251,6 +5638,57 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn contextual_guards_reject_moved_and_closing_calling_terminals() {
+        let (mut state, path) = inconsistent_state();
+        let terminal = Arc::new(spawn_test_terminal("while :; do sleep 1; done"));
+        state.runtimes.insert(
+            path.terminal_id,
+            RuntimeEntry {
+                handle: Arc::clone(&terminal),
+                lease: AttachmentLease::default(),
+            },
+        );
+        let context = TerminalContext {
+            session_id: path.session_id,
+            workspace_id: path.workspace_id,
+            tab_id: path.tab_id,
+            pane_id: path.pane_id,
+            terminal_id: path.terminal_id,
+        };
+        assert!(state.validate_terminal_context(context).is_ok());
+
+        let destination = TabId::new();
+        state
+            .resources
+            .add_tab(
+                path.workspace_id,
+                TabPath {
+                    tab_id: destination,
+                    tab_name: "destination".into(),
+                    pane_id: PaneId::new(),
+                    terminal_id: TerminalId::new(),
+                },
+            )
+            .unwrap();
+        state
+            .resources
+            .move_pane(path.pane_id, destination)
+            .unwrap();
+        let moved = state.validate_terminal_context(context).unwrap_err();
+        assert_eq!(moved.code, "context_changed");
+
+        let fresh = TerminalContext {
+            tab_id: destination,
+            ..context
+        };
+        assert!(state.validate_terminal_context(fresh).is_ok());
+        state.resources.close_pane(path.pane_id).unwrap();
+        let closing = state.validate_terminal_context(fresh).unwrap_err();
+        assert_eq!(closing.code, "target_closing");
+        terminal.close().await.unwrap();
+    }
+
     #[test]
     fn missing_runtime_rolls_back_session_close_marker() {
         let (mut state, path) = inconsistent_state();
@@ -5308,6 +5746,93 @@ mod tests {
             )
             .unwrap();
         assert!(!changes.has_changed().unwrap());
+
+        state
+            .resources
+            .split_pane(
+                path.pane_id,
+                SplitDirection::Right,
+                PaneId::new(),
+                TerminalId::new(),
+            )
+            .unwrap();
+        let split_id = match state.resources.open_layout_for_tab(path.tab_id).unwrap() {
+            SplitTree::Branch { split_id, .. } => split_id,
+            _ => panic!("expected split branch"),
+        };
+        let ratio = SplitRatio::from_cells(37, 79).unwrap();
+        state.resize_split(path.tab_id, split_id, ratio).unwrap();
+        assert!(changes.has_changed().unwrap());
+        assert_eq!(*changes.borrow_and_update(), state.resources.revision());
+
+        state.resize_split(path.tab_id, split_id, ratio).unwrap();
+        assert!(!changes.has_changed().unwrap());
+    }
+
+    #[test]
+    fn stale_split_resize_after_focused_pane_move_cannot_mutate_the_old_tab() {
+        let (mut state, path) = inconsistent_state();
+        let pane_b = PaneId::new();
+        state
+            .resources
+            .split_pane(
+                path.pane_id,
+                SplitDirection::Right,
+                pane_b,
+                TerminalId::new(),
+            )
+            .unwrap();
+        state
+            .resources
+            .split_pane(
+                pane_b,
+                SplitDirection::Down,
+                PaneId::new(),
+                TerminalId::new(),
+            )
+            .unwrap();
+        let retained_split = match state.resources.open_layout_for_tab(path.tab_id).unwrap() {
+            SplitTree::Branch { second, .. } => match *second {
+                SplitTree::Branch { split_id, .. } => split_id,
+                other => panic!("expected nested retained split, got {other:?}"),
+            },
+            other => panic!("expected source split tree, got {other:?}"),
+        };
+        let destination = TabId::new();
+        state
+            .resources
+            .add_tab(
+                path.workspace_id,
+                TabPath {
+                    tab_id: destination,
+                    tab_name: "destination".into(),
+                    pane_id: PaneId::new(),
+                    terminal_id: TerminalId::new(),
+                },
+            )
+            .unwrap();
+        state
+            .resources
+            .move_pane(path.pane_id, destination)
+            .unwrap();
+        let revision = state.resources.revision();
+        let old_layout = state.resources.open_layout_for_tab(path.tab_id).unwrap();
+
+        let error = state
+            .resize_split_for_attachment(
+                path.terminal_id,
+                path.tab_id,
+                retained_split,
+                SplitRatio::from_cells(1, 3).unwrap(),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, "context_changed");
+        assert_eq!(state.resources.revision(), revision);
+        assert_eq!(
+            state.resources.open_layout_for_tab(path.tab_id).unwrap(),
+            old_layout
+        );
     }
 
     #[test]

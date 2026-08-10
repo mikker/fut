@@ -3,6 +3,12 @@
 ## Unreleased
 
 - Added `-v` as the short form of `--version` (`-V` remains supported).
+- Pane and workspace-sidebar dividers can now be resized cell by cell with the mouse; pane splits persist and synchronize, while sidebar widths remain client-local.
+- Layout commands can now omit their current session, workspace, tab, or pane ID when run inside Fut.
+- Added `fut attach` to choose a destination in the global navigator before acquiring a terminal attachment.
+- Terminal applications can now select block, bar, or underline cursors, including blinking styles.
+- Added atomic in-client configuration reload with `Ctrl-b Shift-R`.
+- `Ctrl-b Ctrl-b` now cycles to the next unread waiting terminal by default and remains configurable.
 - Added `fut agent skill` to print Fut's bundled agent instructions.
 - Added `fut pane split` for creating right or downward splits without attaching.
 - Added `fut context` and `fut get` for compact, focus-independent resource discovery.

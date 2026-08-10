@@ -59,6 +59,7 @@ impl NavigationScope {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum ClientAction {
     OpenCommandBar,
+    ReloadConfig,
     EnterCopyMode,
     OpenNavigator,
     OpenJump,
@@ -95,8 +96,9 @@ pub(super) struct DirectBinding {
     pub action: ClientAction,
 }
 
-pub(super) const ALL_ACTIONS: [ClientAction; 37] = [
+pub(super) const ALL_ACTIONS: [ClientAction; 38] = [
     ClientAction::OpenCommandBar,
+    ClientAction::ReloadConfig,
     ClientAction::EnterCopyMode,
     ClientAction::OpenNavigator,
     ClientAction::OpenJump,
@@ -135,7 +137,12 @@ pub(super) const ALL_ACTIONS: [ClientAction; 37] = [
     ClientAction::Detach,
 ];
 
-pub(super) const COMMANDS: [ActionDefinition; 36] = [
+pub(super) const COMMANDS: [ActionDefinition; 37] = [
+    ActionDefinition {
+        action: ClientAction::ReloadConfig,
+        title: "Reload configuration",
+        keywords: "reload config configuration refresh settings",
+    },
     ActionDefinition {
         action: ClientAction::OpenNavigator,
         title: "Open global navigator",
@@ -321,10 +328,14 @@ pub(super) const COMMANDS: [ActionDefinition; 36] = [
 const UP: &[u8] = b"\x1b[A";
 const DOWN: &[u8] = b"\x1b[B";
 
-pub(super) const DIRECT_BINDINGS: [DirectBinding; 37] = [
+pub(super) const DIRECT_BINDINGS: [DirectBinding; 38] = [
     DirectBinding {
         suffix: b" ",
         action: ClientAction::OpenCommandBar,
+    },
+    DirectBinding {
+        suffix: b"R",
+        action: ClientAction::ReloadConfig,
     },
     DirectBinding {
         suffix: b"[",
@@ -351,7 +362,7 @@ pub(super) const DIRECT_BINDINGS: [DirectBinding; 37] = [
         action: ClientAction::OpenNotifications,
     },
     DirectBinding {
-        suffix: b".",
+        suffix: b"\x02",
         action: ClientAction::FocusNextNotification,
     },
     DirectBinding {
@@ -481,6 +492,7 @@ pub(super) fn definition(action: ClientAction) -> Option<&'static ActionDefiniti
 pub(super) fn config_key(action: ClientAction) -> &'static str {
     match action {
         ClientAction::OpenCommandBar => "open_command_bar",
+        ClientAction::ReloadConfig => "reload_config",
         ClientAction::EnterCopyMode => "enter_copy_mode",
         ClientAction::OpenNavigator => "open_navigator",
         ClientAction::OpenJump => "open_jump",
@@ -530,6 +542,7 @@ pub(super) fn default_suffix(action: ClientAction) -> &'static [u8] {
 
 pub(super) fn parse_suffix(value: &str) -> Option<(Vec<u8>, String)> {
     let bytes = match value {
+        "prefix" => b"\x02".to_vec(),
         "space" => b" ".to_vec(),
         "enter" => b"\r".to_vec(),
         "tab" => b"\t".to_vec(),
@@ -547,6 +560,7 @@ pub(super) fn parse_suffix(value: &str) -> Option<(Vec<u8>, String)> {
 
 pub(super) fn suffix_name(suffix: &[u8]) -> String {
     match suffix {
+        b"\x02" => "Ctrl-b".into(),
         b" " => "Space".into(),
         b"\r" => "Enter".into(),
         b"\t" => "Tab".into(),
@@ -561,7 +575,8 @@ pub(super) fn suffix_name(suffix: &[u8]) -> String {
 const fn requires_launcher(action: ClientAction) -> bool {
     match action {
         ClientAction::OpenCommandBar => false,
-        ClientAction::EnterCopyMode
+        ClientAction::ReloadConfig
+        | ClientAction::EnterCopyMode
         | ClientAction::OpenNavigator
         | ClientAction::OpenJump
         | ClientAction::OpenWorkspaceSidebar

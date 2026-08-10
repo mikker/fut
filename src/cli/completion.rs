@@ -37,7 +37,6 @@ completer!(tab_close, TabClose);
 completer!(pane_new, PaneNew);
 completer!(pane_attach, PaneAttach);
 completer!(pane_close, PaneClose);
-completer!(pane_move_source, PaneMoveSource);
 completer!(terminal_attach, TerminalAttach);
 completer!(agent, Agent);
 completer!(get, Get);
@@ -47,6 +46,40 @@ pub(super) fn pane_move_destination(_: &OsStr) -> Vec<CompletionCandidate> {
         return vec![];
     };
     dynamic_candidates(Operation::PaneMoveDestination(source))
+}
+
+pub(super) fn pane_move_source(_: &OsStr) -> Vec<CompletionCandidate> {
+    let Some(snapshot) = fetch_snapshot() else {
+        return vec![];
+    };
+    let mut values = candidates(&snapshot, Operation::PaneMoveSource);
+    if let Ok(terminal_id) = std::env::var("FUT_TERMINAL_ID")
+        .and_then(|value| value.parse().map_err(|_| std::env::VarError::NotPresent))
+        && let Ok(path) = snapshot.live_terminal_path(terminal_id)
+    {
+        values.extend(candidates(
+            &snapshot,
+            Operation::PaneMoveDestination(path.pane_id),
+        ));
+    }
+    completion_candidates(values)
+}
+
+pub(super) fn pane_split_anchor_or_direction(_: &OsStr) -> Vec<CompletionCandidate> {
+    let mut candidates = dynamic_candidates(Operation::PaneAttach);
+    candidates.extend(split_directions());
+    candidates
+}
+
+pub(super) fn pane_split_direction(_: &OsStr) -> Vec<CompletionCandidate> {
+    split_directions()
+}
+
+fn split_directions() -> Vec<CompletionCandidate> {
+    ["right", "down"]
+        .into_iter()
+        .map(CompletionCandidate::new)
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,7 +108,11 @@ fn dynamic_candidates(operation: Operation) -> Vec<CompletionCandidate> {
     let Some(snapshot) = fetch_snapshot() else {
         return vec![];
     };
-    candidates(&snapshot, operation)
+    completion_candidates(candidates(&snapshot, operation))
+}
+
+fn completion_candidates(candidates: Vec<Candidate>) -> Vec<CompletionCandidate> {
+    candidates
         .into_iter()
         .enumerate()
         .map(|(order, candidate)| {

@@ -1,10 +1,87 @@
 use std::collections::BTreeSet;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::domain::PaneId;
+use crate::domain::{PaneId, SplitId};
 
-pub const HALF_RATIO: u16 = 5_000;
+pub const HALF_RATIO: SplitRatio = SplitRatio {
+    numerator: 1,
+    denominator: 2,
+};
+
+/// A durable split proportion. Cell-driven updates use the reduced
+/// `first_cells / available_cells` fraction, so laying the branch out at the
+/// same size always reproduces the exact requested cell.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct SplitRatio {
+    numerator: u16,
+    denominator: u16,
+}
+
+impl SplitRatio {
+    pub fn from_cells(first: u16, available: u16) -> Option<Self> {
+        if first == 0 || first >= available {
+            return None;
+        }
+        Some(Self::reduced(first, available))
+    }
+
+    fn reduced(numerator: u16, denominator: u16) -> Self {
+        let divisor = gcd(numerator, denominator);
+        Self {
+            numerator: numerator / divisor,
+            denominator: denominator / divisor,
+        }
+    }
+
+    pub fn first_cells(self, available: u16) -> u16 {
+        if !self.is_valid() {
+            return 0;
+        }
+        u16::try_from(
+            u32::from(available) * u32::from(self.numerator) / u32::from(self.denominator),
+        )
+        .unwrap_or(available)
+    }
+
+    pub fn is_valid(self) -> bool {
+        self.numerator > 0 && self.numerator < self.denominator
+    }
+}
+
+impl<'de> Deserialize<'de> for SplitRatio {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireRatio {
+            numerator: u16,
+            denominator: u16,
+        }
+
+        let ratio = WireRatio::deserialize(deserializer)?;
+        Self::from_cells(ratio.numerator, ratio.denominator).ok_or_else(|| {
+            serde::de::Error::custom(format_args!(
+                "invalid split ratio {}/{}",
+                ratio.numerator, ratio.denominator
+            ))
+        })
+    }
+}
+
+impl std::fmt::Display for SplitRatio {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}/{}", self.numerator, self.denominator)
+    }
+}
+
+fn gcd(mut left: u16, mut right: u16) -> u16 {
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    left
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,8 +113,9 @@ pub enum SplitTree {
         pane_id: PaneId,
     },
     Branch {
+        split_id: SplitId,
         axis: SplitAxis,
-        first_basis_points: u16,
+        ratio: SplitRatio,
         first: Box<SplitTree>,
         second: Box<SplitTree>,
     },
@@ -58,8 +136,9 @@ impl SplitTree {
         match self {
             Self::Leaf { pane_id: current } if *current == anchor => {
                 *self = Self::Branch {
+                    split_id: SplitId::new(),
                     axis: direction.axis(),
-                    first_basis_points: HALF_RATIO,
+                    ratio: HALF_RATIO,
                     first: Box::new(Self::leaf(anchor)),
                     second: Box::new(Self::leaf(pane_id)),
                 };
@@ -76,14 +155,16 @@ impl SplitTree {
         match self {
             Self::Leaf { pane_id: current } => (current != pane_id).then_some(Self::leaf(current)),
             Self::Branch {
+                split_id,
                 axis,
-                first_basis_points,
+                ratio,
                 first,
                 second,
             } => match ((*first).without(pane_id), (*second).without(pane_id)) {
                 (Some(first), Some(second)) => Some(Self::Branch {
+                    split_id,
                     axis,
-                    first_basis_points,
+                    ratio,
                     first: Box::new(first),
                     second: Box::new(second),
                 }),
@@ -97,14 +178,16 @@ impl SplitTree {
         match self {
             Self::Leaf { pane_id } => keep(*pane_id).then_some(Self::leaf(*pane_id)),
             Self::Branch {
+                split_id,
                 axis,
-                first_basis_points,
+                ratio,
                 first,
                 second,
             } => match (first.retained(keep), second.retained(keep)) {
                 (Some(first), Some(second)) => Some(Self::Branch {
+                    split_id: *split_id,
                     axis: *axis,
-                    first_basis_points: *first_basis_points,
+                    ratio: *ratio,
                     first: Box::new(first),
                     second: Box::new(second),
                 }),
@@ -116,7 +199,47 @@ impl SplitTree {
 
     pub fn validate(&self) -> bool {
         let mut seen = BTreeSet::new();
-        self.validate_into(&mut seen)
+        let mut splits = BTreeSet::new();
+        self.validate_into(&mut seen, &mut splits)
+    }
+
+    pub fn resize(&mut self, split_id: SplitId, ratio: SplitRatio) -> bool {
+        if !ratio.is_valid() {
+            return false;
+        }
+        match self {
+            Self::Leaf { .. } => false,
+            Self::Branch {
+                split_id: current,
+                ratio: current_ratio,
+                first,
+                second,
+                ..
+            } => {
+                if *current == split_id {
+                    *current_ratio = ratio;
+                    true
+                } else {
+                    first.resize(split_id, ratio) || second.resize(split_id, ratio)
+                }
+            }
+        }
+    }
+
+    pub fn ratio(&self, split_id: SplitId) -> Option<SplitRatio> {
+        match self {
+            Self::Leaf { .. } => None,
+            Self::Branch {
+                split_id: current,
+                ratio,
+                first,
+                second,
+                ..
+            } => (*current == split_id)
+                .then_some(*ratio)
+                .or_else(|| first.ratio(split_id))
+                .or_else(|| second.ratio(split_id)),
+        }
     }
 
     fn append_leaf_ids(&self, ids: &mut Vec<PaneId>) {
@@ -129,18 +252,20 @@ impl SplitTree {
         }
     }
 
-    fn validate_into(&self, seen: &mut BTreeSet<PaneId>) -> bool {
+    fn validate_into(&self, seen: &mut BTreeSet<PaneId>, splits: &mut BTreeSet<SplitId>) -> bool {
         match self {
             Self::Leaf { pane_id } => seen.insert(*pane_id),
             Self::Branch {
-                first_basis_points,
+                split_id,
+                ratio,
                 first,
                 second,
                 ..
             } => {
-                (1..10_000).contains(first_basis_points)
-                    && first.validate_into(seen)
-                    && second.validate_into(seen)
+                splits.insert(*split_id)
+                    && ratio.is_valid()
+                    && first.validate_into(seen, splits)
+                    && second.validate_into(seen, splits)
             }
         }
     }
@@ -166,5 +291,66 @@ mod tests {
         let tree = tree.without(c).unwrap();
         assert_eq!(tree, SplitTree::leaf(b));
         assert!(tree.without(b).is_none());
+    }
+
+    #[test]
+    fn cell_ratios_reduce_and_reproduce_exact_positions() {
+        let ratio = SplitRatio::from_cells(37, 79).unwrap();
+        assert_eq!(ratio.first_cells(79), 37);
+        assert_eq!(
+            SplitRatio::from_cells(25, 100),
+            SplitRatio::from_cells(1, 4)
+        );
+        assert!(SplitRatio::from_cells(0, 79).is_none());
+        assert!(SplitRatio::from_cells(79, 79).is_none());
+    }
+
+    #[test]
+    fn wire_ratios_are_validated_and_reduced_at_deserialization() {
+        let half = SplitRatio::from_cells(1, 2).unwrap();
+        assert_eq!(
+            serde_json::from_str::<SplitRatio>(r#"{"numerator":2,"denominator":4}"#).unwrap(),
+            half
+        );
+        for malformed in [
+            r#"{"numerator":0,"denominator":4}"#,
+            r#"{"numerator":4,"denominator":4}"#,
+            r#"{"numerator":1,"denominator":0}"#,
+            r#"{"numerator":5,"denominator":4}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<SplitRatio>(malformed).is_err(),
+                "accepted malformed ratio {malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn branches_have_stable_unique_resize_targets() {
+        let a = PaneId::new();
+        let b = PaneId::new();
+        let c = PaneId::new();
+        let mut tree = SplitTree::leaf(a);
+        assert!(tree.split(a, SplitDirection::Right, b));
+        assert!(tree.split(a, SplitDirection::Down, c));
+        let ids = match &tree {
+            SplitTree::Branch {
+                split_id: outer,
+                first,
+                ..
+            } => match first.as_ref() {
+                SplitTree::Branch {
+                    split_id: inner, ..
+                } => (*outer, *inner),
+                _ => panic!("expected nested split"),
+            },
+            _ => panic!("expected split"),
+        };
+        assert_ne!(ids.0, ids.1);
+        let ratio = SplitRatio::from_cells(2, 3).unwrap();
+        assert!(tree.resize(ids.1, ratio));
+        assert_eq!(tree.ratio(ids.1), Some(ratio));
+        assert_eq!(tree.ratio(ids.0), Some(HALF_RATIO));
+        assert!(tree.validate());
     }
 }

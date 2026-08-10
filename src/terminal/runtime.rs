@@ -562,6 +562,8 @@ pub fn spawn_terminal(spec: SpawnSpec) -> Result<TerminalHandle> {
             column: 0,
             row: 0,
             visible: true,
+            shape: Default::default(),
+            blinking: false,
         },
     )?;
     let (snapshots, _) = watch::channel(initial);

@@ -34,9 +34,9 @@ use crate::{
         TabId, TerminalId, TerminalOutputMatcher, TerminalOutputSource, WorkspaceId,
     },
     protocol::{
-        AcknowledgedCommand, ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION,
-        PROTOCOL_VERSION_0_1, RenameSelector, ServerMessage, TerminalInputOperation, codec,
-        decode_payload, encode_payload,
+        AcknowledgedCommand, ClientMessage, ClientMode, ContextScope, ContextualCommand, Envelope,
+        PROTOCOL_VERSION, PROTOCOL_VERSION_0_1, RenameSelector, ServerMessage, TerminalContext,
+        TerminalInputOperation, codec, decode_payload, encode_payload,
     },
     resources::{ResourceSnapshot, SessionSelector, TabSnapshot, TargetSelector},
     splits::{SplitAxis, SplitDirection, SplitTree},
@@ -83,6 +83,8 @@ where
 
 #[derive(Subcommand)]
 enum Command {
+    /// Attach to an existing daemon with the global navigator open.
+    Attach,
     /// Open a location through an existing daemon without attaching.
     Open {
         /// Directory to open; defaults to the current directory.
@@ -164,19 +166,19 @@ enum SessionCommand {
         #[arg(add = ArgValueCompleter::new(completion::session_attach))]
         session: String,
     },
-    /// Rename a session by raw UUID on the existing daemon.
+    /// Rename a session by raw UUID, or infer the caller's session.
     Rename {
-        /// Raw session UUID.
+        /// New name, or a raw session UUID when followed by NAME.
         #[arg(add = ArgValueCompleter::new(completion::session_rename))]
-        session_id: SessionId,
-        /// New session name.
-        name: String,
+        session_or_name: String,
+        /// New session name when SESSION_ID is provided.
+        name: Option<String>,
     },
-    /// Close a session by raw UUID on the existing daemon.
+    /// Close a session by raw UUID, or infer the caller's session.
     Close {
         /// Raw session UUID.
         #[arg(add = ArgValueCompleter::new(completion::session_close))]
-        session_id: SessionId,
+        session_id: Option<SessionId>,
     },
 }
 
@@ -188,19 +190,19 @@ enum WorkspaceCommand {
         #[arg(add = ArgValueCompleter::new(completion::workspace_attach))]
         workspace_id: WorkspaceId,
     },
-    /// Rename a workspace by raw UUID on the existing daemon.
+    /// Rename a workspace by raw UUID, or infer the caller's workspace.
     Rename {
-        /// Raw workspace UUID.
+        /// New name, or a raw workspace UUID when followed by NAME.
         #[arg(add = ArgValueCompleter::new(completion::workspace_rename))]
-        workspace_id: WorkspaceId,
-        /// New workspace name.
-        name: String,
+        workspace_or_name: String,
+        /// New workspace name when WORKSPACE_ID is provided.
+        name: Option<String>,
     },
-    /// Close a workspace by raw UUID on the existing daemon.
+    /// Close a workspace by raw UUID, or infer the caller's workspace.
     Close {
         /// Raw workspace UUID.
         #[arg(add = ArgValueCompleter::new(completion::workspace_close))]
-        workspace_id: WorkspaceId,
+        workspace_id: Option<WorkspaceId>,
     },
 }
 
@@ -208,9 +210,9 @@ enum WorkspaceCommand {
 enum TabCommand {
     /// Create a tab through an existing daemon without attaching.
     New {
-        /// Raw UUID of the workspace that will own the tab.
+        /// Raw owner workspace UUID; defaults to the caller's workspace.
         #[arg(add = ArgValueCompleter::new(completion::tab_new))]
-        workspace_id: WorkspaceId,
+        workspace_id: Option<WorkspaceId>,
         /// Name for the new tab; unnamed by default.
         #[arg(long)]
         name: Option<String>,
@@ -223,9 +225,9 @@ enum TabCommand {
     },
     /// List the tabs of a workspace, including each tab's split layout.
     List {
-        /// Raw UUID of the workspace that owns the tabs.
+        /// Raw owner workspace UUID; defaults to the caller's workspace.
         #[arg(add = ArgValueCompleter::new(completion::tab_new))]
-        workspace_id: WorkspaceId,
+        workspace_id: Option<WorkspaceId>,
     },
     /// Attach to a tab on the existing daemon.
     Attach {
@@ -233,19 +235,19 @@ enum TabCommand {
         #[arg(add = ArgValueCompleter::new(completion::tab_attach))]
         tab_id: TabId,
     },
-    /// Rename a tab by raw UUID on the existing daemon.
+    /// Rename a tab by raw UUID, or infer the caller's tab.
     Rename {
-        /// Raw tab UUID.
+        /// New name, or a raw tab UUID when followed by NAME.
         #[arg(add = ArgValueCompleter::new(completion::tab_rename))]
-        tab_id: TabId,
-        /// New tab name.
-        name: String,
+        tab_or_name: String,
+        /// New tab name when TAB_ID is provided.
+        name: Option<String>,
     },
-    /// Close a tab by raw UUID on the existing daemon.
+    /// Close a tab by raw UUID, or infer the caller's tab.
     Close {
         /// Raw tab UUID.
         #[arg(add = ArgValueCompleter::new(completion::tab_close))]
-        tab_id: TabId,
+        tab_id: Option<TabId>,
     },
 }
 
@@ -253,9 +255,9 @@ enum TabCommand {
 enum PaneCommand {
     /// Create a pane through an existing daemon without attaching.
     New {
-        /// Raw UUID of the tab that will own the pane.
+        /// Raw owner tab UUID; defaults to the caller's tab.
         #[arg(add = ArgValueCompleter::new(completion::pane_new))]
-        tab_id: TabId,
+        tab_id: Option<TabId>,
         /// Working directory for the child; defaults to the workspace root.
         #[arg(long, value_hint = ValueHint::DirPath)]
         cwd: Option<PathBuf>,
@@ -263,14 +265,14 @@ enum PaneCommand {
         #[arg(last = true, value_hint = ValueHint::CommandWithArguments)]
         command: Vec<String>,
     },
-    /// Split an explicit pane through an existing daemon without attaching.
+    /// Split a pane through an existing daemon without attaching.
     Split {
-        /// Raw UUID of the pane to split.
-        #[arg(add = ArgValueCompleter::new(completion::pane_attach))]
-        pane_id: PaneId,
-        /// Place the new pane to the right of or below the anchor pane.
-        #[arg(value_enum)]
-        direction: PaneSplitDirection,
+        /// Direction, or a raw pane UUID when followed by DIRECTION.
+        #[arg(add = ArgValueCompleter::new(completion::pane_split_anchor_or_direction))]
+        pane_or_direction: String,
+        /// Direction when PANE_ID is provided.
+        #[arg(value_enum, add = ArgValueCompleter::new(completion::pane_split_direction))]
+        direction: Option<PaneSplitDirection>,
         /// Working directory for the child; defaults to the anchor pane's directory.
         #[arg(long, value_hint = ValueHint::DirPath)]
         cwd: Option<PathBuf>,
@@ -280,9 +282,9 @@ enum PaneCommand {
     },
     /// List the panes of a tab, including the tab's split layout.
     List {
-        /// Raw UUID of the tab that owns the panes.
+        /// Raw owner tab UUID; defaults to the caller's tab.
         #[arg(add = ArgValueCompleter::new(completion::pane_new))]
-        tab_id: TabId,
+        tab_id: Option<TabId>,
     },
     /// Attach to a pane on the existing daemon.
     Attach {
@@ -292,18 +294,18 @@ enum PaneCommand {
     },
     /// Move a pane to another tab in the same workspace.
     Move {
-        /// Raw UUID of the pane to move.
+        /// Destination tab UUID, or source pane UUID when followed by DESTINATION_TAB_ID.
         #[arg(add = ArgValueCompleter::new(completion::pane_move_source))]
-        pane_id: PaneId,
-        /// Raw UUID of the destination tab.
+        pane_or_destination_id: String,
+        /// Destination tab UUID when PANE_ID is provided.
         #[arg(add = ArgValueCompleter::new(completion::pane_move_destination))]
-        destination_tab_id: TabId,
+        destination_tab_id: Option<TabId>,
     },
-    /// Close a pane by raw UUID on the existing daemon.
+    /// Close a pane by raw UUID, or infer the caller's pane.
     Close {
         /// Raw pane UUID.
         #[arg(add = ArgValueCompleter::new(completion::pane_close))]
-        pane_id: PaneId,
+        pane_id: Option<PaneId>,
     },
 }
 
@@ -774,6 +776,7 @@ async fn execute(cli: Cli) -> Result<()> {
             let cwd = std::env::current_dir().context("read current directory")?;
             open_and_attach(&socket, cwd).await
         }
+        Some(Command::Attach) => client::attach_navigator(&socket).await,
         Some(Command::Open {
             path,
             name,
@@ -839,17 +842,22 @@ async fn execute(cli: Cli) -> Result<()> {
                 },
         }) => {
             let (program, argv) = child_command(command);
-            match control(
-                &socket,
-                ClientMessage::CreatePane {
+            let message = match tab_id {
+                Some(tab_id) => ClientMessage::CreatePane {
                     tab_id,
                     cwd,
                     program,
                     argv,
                 },
-            )
-            .await?
-            {
+                None => {
+                    let context = live_context(&socket).await?;
+                    ClientMessage::Contextual {
+                        context,
+                        command: ContextualCommand::CreatePane { cwd, program, argv },
+                    }
+                }
+            };
+            match control(&socket, message).await? {
                 ServerMessage::PaneCreated { selected } => output(
                     cli.json,
                     "pane.new",
@@ -870,30 +878,59 @@ async fn execute(cli: Cli) -> Result<()> {
         Some(Command::Pane {
             command:
                 PaneCommand::Split {
-                    pane_id,
+                    pane_or_direction,
                     direction,
                     cwd,
                     command,
                 },
         }) => {
             let (program, argv) = child_command(command);
-            let direction = SplitDirection::from(direction);
+            let (pane_id, direction, message) = match direction {
+                Some(direction) => {
+                    let pane_id = parse_id::<PaneId>(&pane_or_direction, "pane")?;
+                    let direction = SplitDirection::from(direction);
+                    (
+                        pane_id,
+                        direction,
+                        ClientMessage::SplitPane {
+                            pane_id,
+                            direction,
+                            cwd,
+                            program,
+                            argv,
+                        },
+                    )
+                }
+                None => {
+                    let direction = PaneSplitDirection::from_str(&pane_or_direction, true)
+                        .map(SplitDirection::from)
+                        .map_err(|_| {
+                            CliError::new(
+                                "invalid_arguments",
+                                "inferred pane split requires `right` or `down`; explicit form is `pane split PANE_ID DIRECTION`",
+                            )
+                        })?;
+                    let context = live_context(&socket).await?;
+                    (
+                        context.pane_id,
+                        direction,
+                        ClientMessage::Contextual {
+                            context,
+                            command: ContextualCommand::SplitPane {
+                                direction,
+                                cwd,
+                                program,
+                                argv,
+                            },
+                        },
+                    )
+                }
+            };
             let direction_name = match direction {
                 SplitDirection::Right => "right",
                 SplitDirection::Down => "down",
             };
-            match control(
-                &socket,
-                ClientMessage::SplitPane {
-                    pane_id,
-                    direction,
-                    cwd,
-                    program,
-                    argv,
-                },
-            )
-            .await?
-            {
+            match control(&socket, message).await? {
                 ServerMessage::PaneCreated { selected } => output(
                     cli.json,
                     "pane.split",
@@ -919,44 +956,56 @@ async fn execute(cli: Cli) -> Result<()> {
         Some(Command::Pane {
             command:
                 PaneCommand::Move {
-                    pane_id,
+                    pane_or_destination_id,
                     destination_tab_id,
                 },
-        }) => match control(
-            &socket,
-            ClientMessage::MovePane {
-                pane_id,
-                destination_tab_id,
-            },
-        )
-        .await?
-        {
-            ServerMessage::PaneMoved {
-                source_tab_id,
-                moved,
-                source_tab_closed,
-                selected,
-            } => output(
-                cli.json,
-                "pane.move",
-                json!({
-                    "source_tab_id": source_tab_id,
-                    "moved": moved,
-                    "source_tab_closed": source_tab_closed,
-                    "selected": selected,
-                }),
-                format!(
-                    "source_tab_id={source_tab_id} moved={moved} source_tab_closed={source_tab_closed} session={} workspace={} tab={} pane={} terminal={} pid={}",
-                    selected.session_id,
-                    selected.workspace_id,
-                    selected.tab_id,
-                    selected.pane_id,
-                    selected.terminal_id,
-                    selected.child_pid
+        }) => {
+            let message = match destination_tab_id {
+                Some(destination_tab_id) => {
+                    let pane_id = parse_id::<PaneId>(&pane_or_destination_id, "pane")?;
+                    ClientMessage::MovePane {
+                        pane_id,
+                        destination_tab_id,
+                    }
+                }
+                None => {
+                    let destination_tab_id =
+                        parse_id::<TabId>(&pane_or_destination_id, "destination tab")?;
+                    let context = live_context(&socket).await?;
+                    ClientMessage::Contextual {
+                        context,
+                        command: ContextualCommand::MovePane { destination_tab_id },
+                    }
+                }
+            };
+            match control(&socket, message).await? {
+                ServerMessage::PaneMoved {
+                    source_tab_id,
+                    moved,
+                    source_tab_closed,
+                    selected,
+                } => output(
+                    cli.json,
+                    "pane.move",
+                    json!({
+                        "source_tab_id": source_tab_id,
+                        "moved": moved,
+                        "source_tab_closed": source_tab_closed,
+                        "selected": selected,
+                    }),
+                    format!(
+                        "source_tab_id={source_tab_id} moved={moved} source_tab_closed={source_tab_closed} session={} workspace={} tab={} pane={} terminal={} pid={}",
+                        selected.session_id,
+                        selected.workspace_id,
+                        selected.tab_id,
+                        selected.pane_id,
+                        selected.terminal_id,
+                        selected.child_pid
+                    ),
                 ),
-            ),
-            other => unexpected(other),
-        },
+                other => unexpected(other),
+            }
+        }
         Some(Command::Agent {
             command: AgentCommand::List,
         }) => {
@@ -1348,18 +1397,25 @@ async fn execute(cli: Cli) -> Result<()> {
                 },
         }) => {
             let (program, argv) = child_command(command);
-            match control(
-                &socket,
-                ClientMessage::CreateTab {
+            let message = match workspace_id {
+                Some(workspace_id) => ClientMessage::CreateTab {
                     workspace_id,
                     name,
                     cwd,
                     program,
                     argv,
                 },
-            )
-            .await?
-            {
+                None => ClientMessage::Contextual {
+                    context: live_context(&socket).await?,
+                    command: ContextualCommand::CreateTab {
+                        name,
+                        cwd,
+                        program,
+                        argv,
+                    },
+                },
+            };
+            match control(&socket, message).await? {
                 ServerMessage::TabCreated { selected } => output(
                     cli.json,
                     "tab.new",
@@ -1379,15 +1435,15 @@ async fn execute(cli: Cli) -> Result<()> {
         }
         Some(Command::Events) => stream_events(&socket).await,
         Some(Command::Context) => {
-            let environment = context_environment()?;
+            let terminal_id = terminal_context_id()?;
             let snapshot = list_resources(&socket).await?;
-            let terminal_uuid = environment
+            let context = context_for_terminal(&snapshot, terminal_id)?;
+            let terminal_uuid = context
                 .terminal_id
                 .to_string()
                 .parse()
                 .expect("typed Fut IDs contain UUIDs");
             let target = discover_target(&snapshot, terminal_uuid)?;
-            validate_context_target(&target, environment)?;
             output(
                 cli.json,
                 "context",
@@ -1418,6 +1474,10 @@ async fn execute(cli: Cli) -> Result<()> {
             command: TabCommand::List { workspace_id },
         }) => {
             let snapshot = list_resources(&socket).await?;
+            let workspace_id = match workspace_id {
+                Some(workspace_id) => workspace_id,
+                None => context_from_snapshot(&snapshot)?.workspace_id,
+            };
             let workspace = snapshot
                 .sessions
                 .iter()
@@ -1441,6 +1501,10 @@ async fn execute(cli: Cli) -> Result<()> {
             command: PaneCommand::List { tab_id },
         }) => {
             let snapshot = list_resources(&socket).await?;
+            let tab_id = match tab_id {
+                Some(tab_id) => tab_id,
+                None => context_from_snapshot(&snapshot)?.tab_id,
+            };
             let tab = snapshot
                 .sessions
                 .iter()
@@ -1647,6 +1711,7 @@ fn reject_interactive_json(cli: &Cli) -> Result<()> {
         return Ok(());
     }
     let interactive = cli.command.is_none()
+        || matches!(cli.command, Some(Command::Attach))
         || matches!(
             cli.command,
             Some(Command::Session {
@@ -1674,82 +1739,246 @@ fn reject_interactive_json(cli: &Cli) -> Result<()> {
 }
 
 async fn run_mutation(socket: &std::path::Path, json_output: bool, command: Command) -> Result<()> {
-    enum Mutation {
-        Close(TargetSelector),
-        Rename(RenameSelector, String),
-    }
-
-    let (mutation, command_name, result) = match command {
+    let (message, acknowledged, command_name, result, human) = match command {
         Command::Session {
-            command: SessionCommand::Rename { session_id, name },
-        } => (
-            Mutation::Rename(
-                RenameSelector::Session(SessionSelector::Id(session_id)),
-                name.clone(),
-            ),
-            "session.rename",
-            json!({"session_id": session_id, "name": name}),
-        ),
+            command:
+                SessionCommand::Rename {
+                    session_or_name,
+                    name,
+                },
+        } => {
+            let (target, name) = rename_arguments::<SessionId>(session_or_name, name, "session")?;
+            let (session_id, message) = match target {
+                Some(session_id) => (
+                    session_id,
+                    ClientMessage::RenameTarget {
+                        selector: RenameSelector::Session(SessionSelector::Id(session_id)),
+                        name: name.clone(),
+                    },
+                ),
+                None => {
+                    let context = live_context(socket).await?;
+                    (
+                        context.session_id,
+                        ClientMessage::Contextual {
+                            context,
+                            command: ContextualCommand::Rename {
+                                scope: ContextScope::Session,
+                                name: name.clone(),
+                            },
+                        },
+                    )
+                }
+            };
+            (
+                message,
+                AcknowledgedCommand::RenameTarget,
+                "session.rename",
+                json!({"session_id": session_id, "name": name}),
+                "renamed=true",
+            )
+        }
         Command::Session {
             command: SessionCommand::Close { session_id },
-        } => (
-            Mutation::Close(TargetSelector::Session(SessionSelector::Id(session_id))),
-            "session.close",
-            json!({"session_id": session_id}),
-        ),
+        } => {
+            let (session_id, message) = match session_id {
+                Some(session_id) => (
+                    session_id,
+                    ClientMessage::CloseTarget {
+                        selector: TargetSelector::Session(SessionSelector::Id(session_id)),
+                    },
+                ),
+                None => {
+                    let context = live_context(socket).await?;
+                    (
+                        context.session_id,
+                        ClientMessage::Contextual {
+                            context,
+                            command: ContextualCommand::Close {
+                                scope: ContextScope::Session,
+                            },
+                        },
+                    )
+                }
+            };
+            (
+                message,
+                AcknowledgedCommand::CloseTarget,
+                "session.close",
+                json!({"session_id": session_id}),
+                "closed=true",
+            )
+        }
         Command::Workspace {
-            command: WorkspaceCommand::Rename { workspace_id, name },
-        } => (
-            Mutation::Rename(RenameSelector::Workspace(workspace_id), name.clone()),
-            "workspace.rename",
-            json!({"workspace_id": workspace_id, "name": name}),
-        ),
+            command:
+                WorkspaceCommand::Rename {
+                    workspace_or_name,
+                    name,
+                },
+        } => {
+            let (target, name) =
+                rename_arguments::<WorkspaceId>(workspace_or_name, name, "workspace")?;
+            let (workspace_id, message) = match target {
+                Some(workspace_id) => (
+                    workspace_id,
+                    ClientMessage::RenameTarget {
+                        selector: RenameSelector::Workspace(workspace_id),
+                        name: name.clone(),
+                    },
+                ),
+                None => {
+                    let context = live_context(socket).await?;
+                    (
+                        context.workspace_id,
+                        ClientMessage::Contextual {
+                            context,
+                            command: ContextualCommand::Rename {
+                                scope: ContextScope::Workspace,
+                                name: name.clone(),
+                            },
+                        },
+                    )
+                }
+            };
+            (
+                message,
+                AcknowledgedCommand::RenameTarget,
+                "workspace.rename",
+                json!({"workspace_id": workspace_id, "name": name}),
+                "renamed=true",
+            )
+        }
         Command::Workspace {
             command: WorkspaceCommand::Close { workspace_id },
-        } => (
-            Mutation::Close(TargetSelector::Workspace(workspace_id)),
-            "workspace.close",
-            json!({"workspace_id": workspace_id}),
-        ),
+        } => {
+            let (workspace_id, message) = match workspace_id {
+                Some(workspace_id) => (
+                    workspace_id,
+                    ClientMessage::CloseTarget {
+                        selector: TargetSelector::Workspace(workspace_id),
+                    },
+                ),
+                None => {
+                    let context = live_context(socket).await?;
+                    (
+                        context.workspace_id,
+                        ClientMessage::Contextual {
+                            context,
+                            command: ContextualCommand::Close {
+                                scope: ContextScope::Workspace,
+                            },
+                        },
+                    )
+                }
+            };
+            (
+                message,
+                AcknowledgedCommand::CloseTarget,
+                "workspace.close",
+                json!({"workspace_id": workspace_id}),
+                "closed=true",
+            )
+        }
         Command::Tab {
-            command: TabCommand::Rename { tab_id, name },
-        } => (
-            Mutation::Rename(RenameSelector::Tab(tab_id), name.clone()),
-            "tab.rename",
-            json!({"tab_id": tab_id, "name": name}),
-        ),
+            command: TabCommand::Rename { tab_or_name, name },
+        } => {
+            let (target, name) = rename_arguments::<TabId>(tab_or_name, name, "tab")?;
+            let (tab_id, message) = match target {
+                Some(tab_id) => (
+                    tab_id,
+                    ClientMessage::RenameTarget {
+                        selector: RenameSelector::Tab(tab_id),
+                        name: name.clone(),
+                    },
+                ),
+                None => {
+                    let context = live_context(socket).await?;
+                    (
+                        context.tab_id,
+                        ClientMessage::Contextual {
+                            context,
+                            command: ContextualCommand::Rename {
+                                scope: ContextScope::Tab,
+                                name: name.clone(),
+                            },
+                        },
+                    )
+                }
+            };
+            (
+                message,
+                AcknowledgedCommand::RenameTarget,
+                "tab.rename",
+                json!({"tab_id": tab_id, "name": name}),
+                "renamed=true",
+            )
+        }
         Command::Tab {
             command: TabCommand::Close { tab_id },
-        } => (
-            Mutation::Close(TargetSelector::Tab(tab_id)),
-            "tab.close",
-            json!({"tab_id": tab_id}),
-        ),
+        } => {
+            let (tab_id, message) = match tab_id {
+                Some(tab_id) => (
+                    tab_id,
+                    ClientMessage::CloseTarget {
+                        selector: TargetSelector::Tab(tab_id),
+                    },
+                ),
+                None => {
+                    let context = live_context(socket).await?;
+                    (
+                        context.tab_id,
+                        ClientMessage::Contextual {
+                            context,
+                            command: ContextualCommand::Close {
+                                scope: ContextScope::Tab,
+                            },
+                        },
+                    )
+                }
+            };
+            (
+                message,
+                AcknowledgedCommand::CloseTarget,
+                "tab.close",
+                json!({"tab_id": tab_id}),
+                "closed=true",
+            )
+        }
         Command::Pane {
             command: PaneCommand::Close { pane_id },
-        } => (
-            Mutation::Close(TargetSelector::Pane(pane_id)),
-            "pane.close",
-            json!({"pane_id": pane_id}),
-        ),
+        } => {
+            let (pane_id, message) = match pane_id {
+                Some(pane_id) => (
+                    pane_id,
+                    ClientMessage::CloseTarget {
+                        selector: TargetSelector::Pane(pane_id),
+                    },
+                ),
+                None => {
+                    let context = live_context(socket).await?;
+                    (
+                        context.pane_id,
+                        ClientMessage::Contextual {
+                            context,
+                            command: ContextualCommand::Close {
+                                scope: ContextScope::Pane,
+                            },
+                        },
+                    )
+                }
+            };
+            (
+                message,
+                AcknowledgedCommand::CloseTarget,
+                "pane.close",
+                json!({"pane_id": pane_id}),
+                "closed=true",
+            )
+        }
         _ => unreachable!("all non-mutation commands handled by run"),
     };
-    match mutation {
-        Mutation::Rename(selector, name) => {
-            response_ok(
-                control(socket, ClientMessage::RenameTarget { selector, name }).await?,
-                AcknowledgedCommand::RenameTarget,
-            )?;
-            output(json_output, command_name, result, "renamed=true")
-        }
-        Mutation::Close(selector) => {
-            response_ok(
-                control(socket, ClientMessage::CloseTarget { selector }).await?,
-                AcknowledgedCommand::CloseTarget,
-            )?;
-            output(json_output, command_name, result, "closed=true")
-        }
-    }
+    response_ok(control(socket, message).await?, acknowledged)?;
+    output(json_output, command_name, result, human)
 }
 
 fn output(
@@ -2032,89 +2261,93 @@ async fn list_resources(socket: &std::path::Path) -> Result<ResourceSnapshot> {
     }
 }
 
-#[derive(Clone, Copy)]
-struct ContextEnvironment {
-    session_id: SessionId,
-    workspace_id: WorkspaceId,
-    tab_id: TabId,
-    pane_id: PaneId,
-    terminal_id: TerminalId,
+async fn live_context(socket: &std::path::Path) -> Result<TerminalContext> {
+    let terminal_id = terminal_context_id()?;
+    let snapshot = list_resources(socket).await?;
+    context_for_terminal(&snapshot, terminal_id)
 }
 
-fn context_environment() -> Result<ContextEnvironment> {
-    const NAMES: [&str; 5] = [
-        "FUT_SESSION_ID",
-        "FUT_WORKSPACE_ID",
-        "FUT_TAB_ID",
-        "FUT_PANE_ID",
-        "FUT_TERMINAL_ID",
-    ];
-    let present = NAMES
-        .iter()
-        .filter(|name| std::env::var_os(name).is_some())
-        .count();
-    if present == 0 {
-        return Err(CliError::new(
-            "missing_context",
-            "Fut context is unavailable; run inside Fut or use `fut get <UUID>`",
-        )
-        .into());
-    }
-    if present != NAMES.len() {
-        let missing = NAMES
-            .iter()
-            .filter(|name| std::env::var_os(name).is_none())
-            .copied()
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(CliError::new(
-            "invalid_context",
-            format!("Fut context is incomplete; missing {missing}"),
-        )
-        .into());
-    }
+fn context_from_snapshot(snapshot: &ResourceSnapshot) -> Result<TerminalContext> {
+    context_for_terminal(snapshot, terminal_context_id()?)
+}
 
-    Ok(ContextEnvironment {
-        session_id: context_id("FUT_SESSION_ID")?,
-        workspace_id: context_id("FUT_WORKSPACE_ID")?,
-        tab_id: context_id("FUT_TAB_ID")?,
-        pane_id: context_id("FUT_PANE_ID")?,
-        terminal_id: context_id("FUT_TERMINAL_ID")?,
+fn terminal_context_id() -> Result<TerminalId> {
+    match std::env::var("FUT_TERMINAL_ID") {
+        Ok(value) => value.parse().map_err(|_| {
+            CliError::new(
+                "invalid_context",
+                "FUT_TERMINAL_ID is not a valid terminal UUID",
+            )
+            .into()
+        }),
+        Err(std::env::VarError::NotPresent) => Err(CliError::new(
+            "missing_context",
+            "Fut terminal context is unavailable; run inside Fut or pass an explicit ID",
+        )
+        .into()),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(CliError::new("invalid_context", "FUT_TERMINAL_ID is not valid UTF-8").into())
+        }
+    }
+}
+
+fn context_for_terminal(
+    snapshot: &ResourceSnapshot,
+    terminal_id: TerminalId,
+) -> Result<TerminalContext> {
+    let path = snapshot.live_terminal_path(terminal_id).map_err(|error| {
+        let (code, message) = match error {
+            crate::resources::ResourceError::NotFound(_) => (
+                "stale_context",
+                format!("FUT_TERMINAL_ID {terminal_id} is not live on this daemon"),
+            ),
+            crate::resources::ResourceError::Closing(kind) => (
+                "closing_context",
+                format!("calling Fut terminal has a closing {kind} ancestor"),
+            ),
+            other => ("invalid_context", other.to_string()),
+        };
+        CliError::new(code, message)
+    })?;
+    Ok(TerminalContext {
+        session_id: path.session_id,
+        workspace_id: path.workspace_id,
+        tab_id: path.tab_id,
+        pane_id: path.pane_id,
+        terminal_id: path.terminal_id,
     })
 }
 
-fn context_id<T>(name: &'static str) -> Result<T>
+fn parse_id<T>(value: &str, kind: &str) -> Result<T>
 where
     T: std::str::FromStr,
 {
-    let value = std::env::var(name)
-        .map_err(|_| CliError::new("invalid_context", format!("{name} is not valid UTF-8")))?;
-    value
-        .parse()
-        .map_err(|_| CliError::new("invalid_context", format!("{name} is not a valid UUID")).into())
+    value.parse().map_err(|_| {
+        CliError::new(
+            "invalid_arguments",
+            format!("explicit {kind} target must be a raw UUID"),
+        )
+        .into()
+    })
 }
 
-fn validate_context_target(
-    target: &serde_json::Value,
-    environment: ContextEnvironment,
-) -> Result<()> {
-    let expected = [
-        ("/session/id", environment.session_id.to_string()),
-        ("/workspace/id", environment.workspace_id.to_string()),
-        ("/tab/id", environment.tab_id.to_string()),
-        ("/pane/id", environment.pane_id.to_string()),
-        ("/terminal/id", environment.terminal_id.to_string()),
-    ];
-    for (pointer, expected) in expected {
-        if target.pointer(pointer).and_then(serde_json::Value::as_str) != Some(expected.as_str()) {
-            return Err(CliError::new(
-                "invalid_context",
-                "Fut context IDs do not describe one live resource ancestry",
-            )
-            .into());
-        }
+fn rename_arguments<T>(
+    target_or_name: String,
+    name: Option<String>,
+    kind: &str,
+) -> Result<(Option<T>, String)>
+where
+    T: std::str::FromStr,
+{
+    match name {
+        Some(name) => Ok((Some(parse_id::<T>(&target_or_name, kind)?), name)),
+        None if Uuid::parse_str(&target_or_name).is_ok() => Err(CliError::new(
+            "invalid_arguments",
+            format!("missing NAME after {kind} UUID"),
+        )
+        .into()),
+        None => Ok((None, target_or_name)),
     }
-    Ok(())
 }
 
 fn discover_target(snapshot: &ResourceSnapshot, id: Uuid) -> Result<serde_json::Value> {
@@ -2249,11 +2482,12 @@ fn render_layout(layout: &SplitTree) -> String {
         SplitTree::Leaf { pane_id } => pane_id.to_string(),
         SplitTree::Branch {
             axis,
-            first_basis_points,
+            ratio,
             first,
             second,
+            ..
         } => format!(
-            "{}({first_basis_points},{},{})",
+            "{}({ratio},{},{})",
             match axis {
                 SplitAxis::Horizontal => "horizontal",
                 SplitAxis::Vertical => "vertical",
@@ -2559,6 +2793,7 @@ mod tests {
         let pane = PaneId::new().to_string();
         let terminal = TerminalId::new().to_string();
         for args in [
+            vec!["fut", "attach"],
             vec!["fut", "open"],
             vec!["fut", "list"],
             vec!["fut", "events"],
@@ -2579,6 +2814,19 @@ mod tests {
             vec!["fut", "pane", "attach", &pane],
             vec!["fut", "pane", "move", &pane, &tab],
             vec!["fut", "pane", "close", &pane],
+            vec!["fut", "session", "rename", "new"],
+            vec!["fut", "session", "close"],
+            vec!["fut", "workspace", "rename", "new"],
+            vec!["fut", "workspace", "close"],
+            vec!["fut", "tab", "new"],
+            vec!["fut", "tab", "list"],
+            vec!["fut", "tab", "rename", "new"],
+            vec!["fut", "tab", "close"],
+            vec!["fut", "pane", "new"],
+            vec!["fut", "pane", "split", "right"],
+            vec!["fut", "pane", "list"],
+            vec!["fut", "pane", "move", &tab],
+            vec!["fut", "pane", "close"],
             vec!["fut", "terminal", "attach", &terminal],
             vec!["fut", "terminal", "send-text", &terminal, "literal"],
             vec!["fut", "terminal", "send-keys", &terminal, "ctrl+c"],
@@ -2641,6 +2889,77 @@ mod tests {
             vec!["fut", "daemon", "shutdown"],
         ] {
             Cli::try_parse_from(args).unwrap();
+        }
+    }
+
+    #[test]
+    fn rename_parser_distinguishes_implicit_names_from_explicit_id_name_pairs() {
+        let session = SessionId::new().to_string();
+        let implicit =
+            Cli::try_parse_from(["fut", "session", "rename", "project UUID-ish"]).unwrap();
+        assert!(matches!(
+            implicit.command,
+            Some(Command::Session {
+                command: SessionCommand::Rename {
+                    session_or_name,
+                    name: None,
+                },
+            }) if session_or_name == "project UUID-ish"
+        ));
+
+        let explicit =
+            Cli::try_parse_from(["fut", "session", "rename", session.as_str(), "project"]).unwrap();
+        assert!(matches!(
+            explicit.command,
+            Some(Command::Session {
+                command: SessionCommand::Rename {
+                    session_or_name,
+                    name: Some(name),
+                },
+            }) if session_or_name == session && name == "project"
+        ));
+    }
+
+    #[tokio::test]
+    async fn rename_processing_rejects_a_sole_uuid_before_context_or_daemon_lookup() {
+        let missing_socket = tempfile::tempdir().unwrap().path().join("missing.sock");
+        let cases = [
+            (
+                "session",
+                Command::Session {
+                    command: SessionCommand::Rename {
+                        session_or_name: SessionId::new().to_string(),
+                        name: None,
+                    },
+                },
+            ),
+            (
+                "workspace",
+                Command::Workspace {
+                    command: WorkspaceCommand::Rename {
+                        workspace_or_name: WorkspaceId::new().to_string(),
+                        name: None,
+                    },
+                },
+            ),
+            (
+                "tab",
+                Command::Tab {
+                    command: TabCommand::Rename {
+                        tab_or_name: TabId::new().to_string(),
+                        name: None,
+                    },
+                },
+            ),
+        ];
+
+        for (kind, command) in cases {
+            let error = run_mutation(&missing_socket, false, command)
+                .await
+                .unwrap_err();
+            let error = error.downcast_ref::<CliError>().unwrap();
+            assert_eq!(error.code, "invalid_arguments");
+            assert_eq!(error.message, format!("missing NAME after {kind} UUID"));
         }
     }
 
@@ -2819,11 +3138,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_legacy_forms_typed_prefixes_and_bad_mutation_ids() {
+    fn rejects_legacy_forms_typed_prefixes_and_unambiguous_bad_ids() {
         for args in [
             ["fut", "new"],
             ["fut", "new-tab"],
-            ["fut", "attach"],
             ["fut", "rename"],
             ["fut", "close"],
             ["fut", "ping"],
@@ -2834,11 +3152,11 @@ mod tests {
         }
         assert!(Cli::try_parse_from(["fut", "session", "att"]).is_err());
         assert!(Cli::try_parse_from(["fut", "workspace", "attach", "workspace:abc"]).is_err());
-        assert!(Cli::try_parse_from(["fut", "session", "rename", "a-name", "new"]).is_err());
+        assert!(parse_id::<SessionId>("a-name", "session").is_err());
         assert!(Cli::try_parse_from(["fut", "move-pane"]).is_err());
         assert!(Cli::try_parse_from(["fut", "pane", "move", "bad", "also-bad"]).is_err());
         let pane = PaneId::new().to_string();
-        assert!(Cli::try_parse_from(["fut", "pane", "move", &pane]).is_err());
+        assert!(Cli::try_parse_from(["fut", "pane", "move", &pane]).is_ok());
     }
 
     #[test]
@@ -2846,6 +3164,7 @@ mod tests {
         let terminal = TerminalId::new().to_string();
         for args in [
             vec!["fut", "--json"],
+            vec!["fut", "--json", "attach"],
             vec!["fut", "--json", "terminal", "attach", &terminal],
             vec!["fut", "--json", "daemon", "run"],
         ] {
@@ -2878,6 +3197,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "attach",
                 "open",
                 "session",
                 "workspace",
@@ -2900,7 +3220,7 @@ mod tests {
         assert!(help.contains("versioned JSON for noninteractive commands only"));
         assert!(help.contains("existing daemon without attaching"));
 
-        let command = Cli::command();
+        let command = cli_command();
         let pane = command.find_subcommand("pane").unwrap();
         let movement = pane.find_subcommand("move").unwrap();
         let positional_names: Vec<_> = movement
@@ -2908,6 +3228,9 @@ mod tests {
             .map(clap::Arg::get_id)
             .map(ToString::to_string)
             .collect();
-        assert_eq!(positional_names, ["pane_id", "destination_tab_id"]);
+        assert_eq!(
+            positional_names,
+            ["pane_or_destination_id", "destination_tab_id"]
+        );
     }
 }

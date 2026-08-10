@@ -415,7 +415,7 @@ mod tests {
     fn filtering_is_stable_case_insensitive_multi_token_and_searches_bindings() {
         let mut bar = CommandBarState::open();
         assert_eq!(bar.filtered.len(), COMMANDS.len());
-        assert_eq!(bar.selected_action(), Some(ClientAction::OpenNavigator));
+        assert_eq!(bar.selected_action(), Some(ClientAction::ReloadConfig));
 
         bar.paste("CYCLE   pane");
         assert_eq!(
@@ -445,12 +445,12 @@ mod tests {
         bar.key(key(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(
             bar.key(key(KeyCode::Enter, KeyModifiers::NONE)),
-            CommandBarAction::Dispatch(ClientAction::OpenJump)
+            CommandBarAction::Dispatch(ClientAction::OpenNavigator)
         );
         bar.key(key(KeyCode::End, KeyModifiers::NONE));
         assert_eq!(bar.selected_action(), Some(ClientAction::Detach));
         bar.key(key(KeyCode::Home, KeyModifiers::NONE));
-        assert_eq!(bar.selected_action(), Some(ClientAction::OpenNavigator));
+        assert_eq!(bar.selected_action(), Some(ClientAction::ReloadConfig));
 
         bar.paste("frobnicate");
         assert!(bar.filtered.is_empty());

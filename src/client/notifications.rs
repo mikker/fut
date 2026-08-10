@@ -39,6 +39,21 @@ fn attention(activity: &AgentActivity) -> Option<AgentAttention> {
     })
 }
 
+fn open_panes(snapshot: &ResourceSnapshot) -> impl Iterator<Item = &PaneSnapshot> {
+    snapshot
+        .sessions
+        .iter()
+        .filter(|session| !session.closing)
+        .flat_map(|session| {
+            session
+                .workspaces
+                .iter()
+                .filter(|workspace| !workspace.closing)
+        })
+        .flat_map(|workspace| workspace.tabs.iter().filter(|tab| !tab.closing))
+        .flat_map(|tab| tab.panes.iter().filter(|pane| !pane.closing))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ActivityIndicator {
     Working,
@@ -107,8 +122,17 @@ impl NotificationState {
     pub(super) fn waiting(&self, snapshot: &ResourceSnapshot) -> Vec<WaitingTerminal> {
         let mut waiting = Vec::new();
         for session in &snapshot.sessions {
+            if session.closing {
+                continue;
+            }
             for workspace in &session.workspaces {
+                if workspace.closing {
+                    continue;
+                }
                 for tab in &workspace.tabs {
+                    if tab.closing {
+                        continue;
+                    }
                     for pane in &tab.panes {
                         let Some(attention) = attention(&pane.activity) else {
                             continue;
@@ -149,31 +173,19 @@ impl NotificationState {
     }
 
     pub(super) fn next(&self, snapshot: &ResourceSnapshot, current: TerminalId) -> Option<PaneId> {
-        let panes = snapshot
-            .sessions
-            .iter()
-            .flat_map(|session| &session.workspaces)
-            .flat_map(|workspace| &workspace.tabs)
-            .flat_map(|tab| &tab.panes)
-            .collect::<Vec<_>>();
+        let panes = open_panes(snapshot).collect::<Vec<_>>();
         let start = panes
             .iter()
             .position(|pane| pane.terminal_id == current)
             .map_or(0, |index| index + 1);
         (0..panes.len())
             .map(|offset| panes[(start + offset) % panes.len()])
-            .find(|pane| !pane.closing && self.is_unseen(pane))
+            .find(|pane| pane.terminal_id != current && self.is_unseen(pane))
             .map(|pane| pane.id)
     }
 
     pub(super) fn has_working(&self, snapshot: &ResourceSnapshot) -> bool {
-        snapshot
-            .sessions
-            .iter()
-            .flat_map(|session| &session.workspaces)
-            .flat_map(|workspace| &workspace.tabs)
-            .flat_map(|tab| &tab.panes)
-            .any(|pane| pane.activity.state == AgentState::Working)
+        open_panes(snapshot).any(|pane| pane.activity.state == AgentState::Working)
     }
 }
 
@@ -351,8 +363,34 @@ fn age(timestamp_ms: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
-    use crate::domain::{AgentEvent, AgentIntegration};
+    use crate::{
+        domain::{AgentEvent, AgentIntegration, TabId, WorkspaceId},
+        resources::{Project, ProjectIdentity, SessionSnapshot, TabSnapshot, WorkspaceSnapshot},
+        splits::SplitTree,
+    };
+
+    fn completed_pane(closing: bool) -> PaneSnapshot {
+        PaneSnapshot {
+            id: PaneId::new(),
+            terminal_id: TerminalId::new(),
+            closing,
+            activity: AgentActivity {
+                integration: Some(AgentIntegration::default()),
+                state: AgentState::Idle,
+                revision: 1,
+                updated_at_ms: 10,
+                last_event: Some(AgentEvent {
+                    revision: 1,
+                    kind: AgentReport::Completed,
+                    occurred_at_ms: 10,
+                    turn_id: None,
+                }),
+            },
+        }
+    }
 
     #[test]
     fn spinner_uses_braille_frames() {
@@ -410,5 +448,141 @@ mod tests {
 
         assert!(notifications.observe(terminal_id, 4));
         assert!(notifications.is_unseen(&pane));
+    }
+
+    #[test]
+    fn next_wraps_in_resource_order_and_skips_current_seen_and_closing_panes() {
+        let candidate = completed_pane(false);
+        let seen = completed_pane(false);
+        let current = completed_pane(false);
+        let closing = completed_pane(true);
+        let snapshot = ResourceSnapshot {
+            revision: 1,
+            sessions: vec![SessionSnapshot {
+                id: SessionId::new(),
+                name: "project".into(),
+                project: Project {
+                    identity: ProjectIdentity::CanonicalDirectory(PathBuf::from("/project")),
+                },
+                closing: false,
+                workspaces: vec![WorkspaceSnapshot {
+                    id: WorkspaceId::new(),
+                    name: "main".into(),
+                    root: PathBuf::from("/project"),
+                    closing: false,
+                    tabs: vec![TabSnapshot {
+                        id: TabId::new(),
+                        name: "agents".into(),
+                        closing: false,
+                        layout: SplitTree::leaf(candidate.id),
+                        panes: vec![candidate.clone(), seen.clone(), current.clone(), closing],
+                    }],
+                }],
+            }],
+        };
+        let mut notifications = NotificationState::default();
+        assert!(notifications.observe(seen.terminal_id, 1));
+
+        assert_eq!(
+            notifications.next(&snapshot, current.terminal_id),
+            Some(candidate.id)
+        );
+        assert!(notifications.observe(candidate.terminal_id, 1));
+        assert_eq!(notifications.next(&snapshot, current.terminal_id), None);
+    }
+
+    #[test]
+    fn notification_lists_and_next_skip_every_closing_ancestor() {
+        let closing_session = completed_pane(false);
+        let closing_workspace = completed_pane(false);
+        let closing_tab = completed_pane(false);
+        let closing_pane = completed_pane(true);
+        let candidate = completed_pane(false);
+        let current = completed_pane(false);
+        let open_session_id = SessionId::new();
+        let project = || Project {
+            identity: ProjectIdentity::CanonicalDirectory(PathBuf::from("/project")),
+        };
+        let tab = |name: &str, closing: bool, panes: Vec<PaneSnapshot>| TabSnapshot {
+            id: TabId::new(),
+            name: name.into(),
+            closing,
+            layout: SplitTree::leaf(panes[0].id),
+            panes,
+        };
+        let workspace = |name: &str, closing: bool, tabs: Vec<TabSnapshot>| WorkspaceSnapshot {
+            id: WorkspaceId::new(),
+            name: name.into(),
+            root: PathBuf::from("/project"),
+            closing,
+            tabs,
+        };
+        let snapshot = ResourceSnapshot {
+            revision: 1,
+            sessions: vec![
+                SessionSnapshot {
+                    id: SessionId::new(),
+                    name: "closing-session".into(),
+                    project: project(),
+                    closing: true,
+                    workspaces: vec![workspace(
+                        "main",
+                        false,
+                        vec![tab("tab", false, vec![closing_session.clone()])],
+                    )],
+                },
+                SessionSnapshot {
+                    id: SessionId::new(),
+                    name: "closing-workspace".into(),
+                    project: project(),
+                    closing: false,
+                    workspaces: vec![workspace(
+                        "main",
+                        true,
+                        vec![tab("tab", false, vec![closing_workspace.clone()])],
+                    )],
+                },
+                SessionSnapshot {
+                    id: open_session_id,
+                    name: "open".into(),
+                    project: project(),
+                    closing: false,
+                    workspaces: vec![workspace(
+                        "main",
+                        false,
+                        vec![
+                            tab("closing-tab", true, vec![closing_tab.clone()]),
+                            tab(
+                                "open-tab",
+                                false,
+                                vec![closing_pane, candidate.clone(), current.clone()],
+                            ),
+                        ],
+                    )],
+                },
+            ],
+        };
+        let mut notifications = NotificationState::default();
+        assert!(notifications.observe(current.terminal_id, 1));
+
+        let waiting = notifications.waiting(&snapshot);
+        assert_eq!(
+            waiting
+                .iter()
+                .map(|row| row.terminal_id)
+                .collect::<Vec<_>>(),
+            [candidate.terminal_id]
+        );
+        assert_eq!(notifications.waiting_count(&snapshot), 1);
+        assert_eq!(
+            notifications.session_waiting_count(&snapshot, open_session_id),
+            1
+        );
+        assert_eq!(
+            notifications.next(&snapshot, current.terminal_id),
+            Some(candidate.id)
+        );
+        assert!(notifications.observe(candidate.terminal_id, 1));
+        assert_eq!(notifications.next(&snapshot, current.terminal_id), None);
     }
 }

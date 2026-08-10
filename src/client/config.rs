@@ -648,6 +648,9 @@ fn default_sidebar_width() -> u16 {
     28
 }
 
+pub(super) const MIN_SIDEBAR_WIDTH: u16 = 4;
+pub(super) const MAX_SIDEBAR_WIDTH: u16 = 80;
+
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct SidebarRowConfig {
@@ -927,7 +930,9 @@ fn validate(ui: &UiConfig) -> Result<()> {
             bail!("unknown ui.bindings action {key:?}");
         }
         if parse_suffix(value).is_none() {
-            bail!("ui.bindings.{key} must be one character or space, enter, tab, or esc");
+            bail!(
+                "ui.bindings.{key} must be one character or prefix, space, enter, tab, esc, up, or down"
+            );
         }
     }
     for action in ALL_ACTIONS {
@@ -935,7 +940,7 @@ fn validate(ui: &UiConfig) -> Result<()> {
             bail!("ui.bindings must not assign the same key to multiple actions");
         }
     }
-    if !(4..=80).contains(&ui.workspace_sidebar.width) {
+    if !(MIN_SIDEBAR_WIDTH..=MAX_SIDEBAR_WIDTH).contains(&ui.workspace_sidebar.width) {
         bail!("ui.workspace_sidebar.width must be between 4 and 80");
     }
     if ui.tab_bar.item.min_width > 256 {
@@ -1293,6 +1298,46 @@ right = [{ token = "workspace.tab_count" }]
             config.workspace_sidebar.row.right,
             SidebarRowConfig::default().right
         );
+    }
+
+    #[test]
+    fn prefix_is_a_configurable_binding_suffix() {
+        use crate::client::input::{PrefixAction, PrefixState};
+
+        let defaults = UiConfig::default();
+        assert_eq!(
+            defaults.bindings.action_for_suffix(b"\x02"),
+            Some(ClientAction::FocusNextNotification)
+        );
+        assert_eq!(
+            defaults.bindings.label(ClientAction::FocusNextNotification),
+            "Ctrl-b Ctrl-b"
+        );
+        assert_eq!(
+            defaults.bindings.label(ClientAction::ReloadConfig),
+            "Ctrl-b R"
+        );
+
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("config.toml");
+        fs::write(
+            &path,
+            "[ui.bindings]\nfocus_next_notification = '.'\nreload_config = 'prefix'\n",
+        )
+        .unwrap();
+        let config = load_path(&path, true).unwrap();
+        let mut prefix = PrefixState::new(config.bindings);
+        assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
+        assert_eq!(
+            prefix.feed(vec![2]),
+            PrefixAction::Dispatch(ClientAction::ReloadConfig)
+        );
+
+        fs::write(&path, "[ui.bindings]\nfocus_next_notification = '.'\n").unwrap();
+        let config = load_path(&path, true).unwrap();
+        let mut prefix = PrefixState::new(config.bindings);
+        assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
+        assert_eq!(prefix.feed(vec![2]), PrefixAction::Send(vec![2]));
     }
 
     #[test]

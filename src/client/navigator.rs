@@ -66,6 +66,10 @@ pub(super) enum NavigatorAction {
 
 impl NavigatorState {
     pub fn open(_current: &SelectedTarget) -> Self {
+        Self::open_global()
+    }
+
+    pub fn open_global() -> Self {
         Self {
             rows: Vec::new(),
             selected: 0,
@@ -91,6 +95,19 @@ impl NavigatorState {
         current: &SelectedTarget,
         notifications: &NotificationState,
     ) -> bool {
+        self.accept_optional_resources(snapshot, Some(current), notifications)
+    }
+
+    pub fn accept_global_resources(&mut self, snapshot: &ResourceSnapshot) -> bool {
+        self.accept_optional_resources(snapshot, None, &NotificationState::default())
+    }
+
+    fn accept_optional_resources(
+        &mut self,
+        snapshot: &ResourceSnapshot,
+        current: Option<&SelectedTarget>,
+        notifications: &NotificationState,
+    ) -> bool {
         if self
             .resource_revision
             .is_some_and(|revision| snapshot.revision <= revision)
@@ -100,7 +117,7 @@ impl NavigatorState {
         let old_key = self.rows.get(self.selected).map(|row| row.key);
         let old_index = self.selected;
         let previous_status = self.status.clone();
-        self.rows = flatten_with_notifications(snapshot, current, notifications);
+        self.rows = flatten_optional(snapshot, current, notifications);
         self.resource_revision = Some(snapshot.revision);
         self.status = match previous_status {
             status @ (NavigatorStatus::Switching | NavigatorStatus::Error { .. }) => status,
@@ -111,6 +128,7 @@ impl NavigatorState {
             .and_then(|key| self.rows.iter().position(|row| row.key == key))
             .unwrap_or_else(|| old_index.min(self.rows.len().saturating_sub(1)));
         if old_key.is_none()
+            && let Some(current) = current
             && let Some(index) = self
                 .rows
                 .iter()
@@ -437,33 +455,55 @@ pub(super) fn flatten(snapshot: &ResourceSnapshot, current: &SelectedTarget) -> 
     flatten_with_notifications(snapshot, current, &NotificationState::default())
 }
 
+#[cfg(test)]
 fn flatten_with_notifications(
     snapshot: &ResourceSnapshot,
     current: &SelectedTarget,
     notifications: &NotificationState,
 ) -> Vec<NavigatorRow> {
-    let current_ancestry = snapshot.sessions.iter().find_map(|session| {
-        session.workspaces.iter().find_map(|workspace| {
-            workspace.tabs.iter().find_map(|tab| {
-                tab.panes
-                    .iter()
-                    .find(|pane| pane.id == current.pane_id)
-                    .map(|_| (session.id, workspace.id, tab.id))
+    flatten_optional(snapshot, Some(current), notifications)
+}
+
+fn flatten_optional(
+    snapshot: &ResourceSnapshot,
+    current: Option<&SelectedTarget>,
+    notifications: &NotificationState,
+) -> Vec<NavigatorRow> {
+    let current_ancestry = current.and_then(|current| {
+        snapshot.sessions.iter().find_map(|session| {
+            session.workspaces.iter().find_map(|workspace| {
+                workspace.tabs.iter().find_map(|tab| {
+                    tab.panes
+                        .iter()
+                        .find(|pane| pane.id == current.pane_id)
+                        .map(|_| (session.id, workspace.id, tab.id))
+                })
             })
         })
     });
-    let (current_session_id, current_workspace_id, current_tab_id) =
-        current_ancestry.unwrap_or((current.session_id, current.workspace_id, current.tab_id));
+    let (current_session_id, current_workspace_id, current_tab_id) = current_ancestry
+        .map(|(session, workspace, tab)| (Some(session), Some(workspace), Some(tab)))
+        .unwrap_or_else(|| {
+            current.map_or((None, None, None), |current| {
+                (
+                    Some(current.session_id),
+                    Some(current.workspace_id),
+                    Some(current.tab_id),
+                )
+            })
+        });
+    let current_pane_id = current.map(|current| current.pane_id);
 
     let mut rows = Vec::new();
     for session in &snapshot.sessions {
-        let session_current = session.id == current_session_id;
-        let session_target =
-            if session_current && pane_available_session(session, current.pane_id, false) {
-                Some(current.pane_id)
-            } else {
-                first_pane_session(session, false)
-            };
+        let session_current = Some(session.id) == current_session_id;
+        let session_target = if session_current
+            && current_pane_id.is_some_and(|pane| pane_available_session(session, pane, false))
+        {
+            current_pane_id
+        } else {
+            first_pane_session(session, false)
+        };
         rows.push(NavigatorRow {
             key: ResourceKey::Session(session.id),
             depth: 0,
@@ -483,11 +523,12 @@ fn flatten_with_notifications(
         });
         for workspace in &session.workspaces {
             let closing = session.closing || workspace.closing;
-            let workspace_current = session_current && workspace.id == current_workspace_id;
+            let workspace_current = session_current && Some(workspace.id) == current_workspace_id;
             let target = if workspace_current
-                && pane_available_workspace(workspace, current.pane_id, session.closing)
+                && current_pane_id
+                    .is_some_and(|pane| pane_available_workspace(workspace, pane, session.closing))
             {
-                Some(current.pane_id)
+                current_pane_id
             } else {
                 first_pane_workspace(workspace, closing)
             };
@@ -508,16 +549,16 @@ fn flatten_with_notifications(
                 ),
             });
             for tab in &workspace.tabs {
-                let tab_current = workspace_current && tab.id == current_tab_id;
+                let tab_current = workspace_current && Some(tab.id) == current_tab_id;
                 let tab_closing = closing || tab.closing;
                 let target = if tab_current
                     && tab
                         .panes
                         .iter()
-                        .any(|pane| pane.id == current.pane_id && !pane.closing)
+                        .any(|pane| Some(pane.id) == current_pane_id && !pane.closing)
                     && !tab_closing
                 {
-                    Some(current.pane_id)
+                    current_pane_id
                 } else {
                     tab.panes
                         .iter()
@@ -539,7 +580,7 @@ fn flatten_with_notifications(
                         key: ResourceKey::Pane(pane.id),
                         depth: 3,
                         label: format!("pane {}", index + 1),
-                        current: pane.id == current.pane_id,
+                        current: Some(pane.id) == current_pane_id,
                         closing: pane_closing,
                         destination: (!pane_closing).then_some(pane.id),
                         activity: notifications.indicator(std::slice::from_ref(pane)),
@@ -722,6 +763,20 @@ mod tests {
             .unwrap();
         assert!(closing.closing);
         assert_eq!(closing.destination, None);
+    }
+
+    #[test]
+    fn global_navigator_has_no_current_row_and_selects_a_live_destination() {
+        let (snapshot, current, _) = fixture();
+        let mut nav = NavigatorState::open_global();
+
+        assert!(nav.accept_global_resources(&snapshot));
+        assert!(nav.rows.iter().all(|row| !row.current));
+        assert_eq!(nav.selected, 0);
+        assert!(matches!(
+            nav.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 10),
+            NavigatorAction::Select(TargetSelector::Pane(pane_id)) if pane_id == current.pane_id
+        ));
     }
 
     #[test]

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use ratatui::layout::Rect;
 
-use crate::domain::TerminalId;
+use crate::domain::{SplitId, TerminalId};
 use crate::{
     domain::PaneId,
     splits::{SplitAxis, SplitTree},
@@ -23,7 +23,36 @@ pub(super) struct PaneLayout {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct AuthoredLayout {
     pub(super) panes: BTreeMap<PaneId, Rect>,
-    pub(super) dividers: Vec<Rect>,
+    pub(super) dividers: Vec<SplitDivider>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SplitDivider {
+    pub(super) split_id: SplitId,
+    pub(super) axis: SplitAxis,
+    pub(super) area: Rect,
+    pub(super) branch_area: Rect,
+    pub(super) available: u16,
+    pub(super) first_min: u16,
+    pub(super) first_max: u16,
+    pub(super) first_size: u16,
+}
+
+impl SplitDivider {
+    pub(super) fn contains(self, column: u16, row: u16) -> bool {
+        column >= self.area.x
+            && column < self.area.right()
+            && row >= self.area.y
+            && row < self.area.bottom()
+    }
+
+    pub(super) fn first_size_at(self, column: u16, row: u16) -> u16 {
+        let proposed = match self.axis {
+            SplitAxis::Horizontal => column.saturating_sub(self.branch_area.x),
+            SplitAxis::Vertical => row.saturating_sub(self.branch_area.y),
+        };
+        proposed.clamp(self.first_min, self.first_max)
+    }
 }
 
 pub(super) fn authored_layout(
@@ -198,8 +227,9 @@ fn place_split(tree: &SplitTree, focused: PaneId, area: Rect, layout: &mut Autho
             layout.panes.insert(*pane_id, area);
         }
         SplitTree::Branch {
+            split_id,
             axis,
-            first_basis_points,
+            ratio,
             first,
             second,
         } => {
@@ -208,31 +238,43 @@ fn place_split(tree: &SplitTree, focused: PaneId, area: Rect, layout: &mut Autho
             match axis {
                 SplitAxis::Horizontal => {
                     let available = area.width - 1;
-                    let proposed = u16::try_from(
-                        u32::from(available) * u32::from(*first_basis_points) / 10_000,
-                    )
-                    .unwrap_or(available);
-                    let first_width = proposed.clamp(first_min.0, available - second_min.0);
+                    let first_max = available - second_min.0;
+                    let first_width = ratio.first_cells(available).clamp(first_min.0, first_max);
                     let first_area = Rect::new(area.x, area.y, first_width, area.height);
                     let divider = Rect::new(area.x + first_width, area.y, 1, area.height);
                     let second_area =
                         Rect::new(divider.x + 1, area.y, available - first_width, area.height);
-                    layout.dividers.push(divider);
+                    layout.dividers.push(SplitDivider {
+                        split_id: *split_id,
+                        axis: *axis,
+                        area: divider,
+                        branch_area: area,
+                        available,
+                        first_min: first_min.0,
+                        first_max,
+                        first_size: first_width,
+                    });
                     place_split(first, focused, first_area, layout);
                     place_split(second, focused, second_area, layout);
                 }
                 SplitAxis::Vertical => {
                     let available = area.height - 1;
-                    let proposed = u16::try_from(
-                        u32::from(available) * u32::from(*first_basis_points) / 10_000,
-                    )
-                    .unwrap_or(available);
-                    let first_height = proposed.clamp(first_min.1, available - second_min.1);
+                    let first_max = available - second_min.1;
+                    let first_height = ratio.first_cells(available).clamp(first_min.1, first_max);
                     let first_area = Rect::new(area.x, area.y, area.width, first_height);
                     let divider = Rect::new(area.x, area.y + first_height, area.width, 1);
                     let second_area =
                         Rect::new(area.x, divider.y + 1, area.width, available - first_height);
-                    layout.dividers.push(divider);
+                    layout.dividers.push(SplitDivider {
+                        split_id: *split_id,
+                        axis: *axis,
+                        area: divider,
+                        branch_area: area,
+                        available,
+                        first_min: first_min.1,
+                        first_max,
+                        first_size: first_height,
+                    });
                     place_split(first, focused, first_area, layout);
                     place_split(second, focused, second_area, layout);
                 }
@@ -588,14 +630,31 @@ mod tests {
         assert!(horizontal.split(a, crate::splits::SplitDirection::Right, b));
         let layout = authored_layout(Rect::new(0, 0, 80, 23), &horizontal, a, false);
         assert_eq!(layout.panes[&a], Rect::new(0, 0, 39, 23));
-        assert_eq!(layout.dividers, [Rect::new(39, 0, 1, 23)]);
+        assert_eq!(layout.dividers.len(), 1);
+        assert_eq!(layout.dividers[0].area, Rect::new(39, 0, 1, 23));
+        assert_eq!(layout.dividers[0].branch_area, Rect::new(0, 0, 80, 23));
+        assert_eq!(layout.dividers[0].available, 79);
+        assert_eq!(layout.dividers[0].first_min, 24);
+        assert_eq!(layout.dividers[0].first_max, 67);
+        assert_eq!(layout.dividers[0].first_size, 39);
         assert_eq!(layout.panes[&b], Rect::new(40, 0, 40, 23));
+
+        let split_id = layout.dividers[0].split_id;
+        assert!(horizontal.resize(
+            split_id,
+            crate::splits::SplitRatio::from_cells(37, 79).unwrap()
+        ));
+        let exact = authored_layout(Rect::new(0, 0, 80, 23), &horizontal, a, false);
+        assert_eq!(exact.dividers[0].area, Rect::new(37, 0, 1, 23));
 
         let mut vertical = SplitTree::leaf(a);
         assert!(vertical.split(a, crate::splits::SplitDirection::Down, b));
         let layout = authored_layout(Rect::new(2, 3, 80, 23), &vertical, a, false);
         assert_eq!(layout.panes[&a], Rect::new(2, 3, 80, 11));
-        assert_eq!(layout.dividers, [Rect::new(2, 14, 80, 1)]);
+        assert_eq!(layout.dividers[0].area, Rect::new(2, 14, 80, 1));
+        assert_eq!(layout.dividers[0].available, 22);
+        assert_eq!(layout.dividers[0].first_min, 3);
+        assert_eq!(layout.dividers[0].first_max, 19);
         assert_eq!(layout.panes[&b], Rect::new(2, 15, 80, 11));
 
         let narrow = authored_layout(Rect::new(4, 5, 36, 6), &horizontal, a, false);

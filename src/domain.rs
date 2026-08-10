@@ -98,6 +98,7 @@ id_type!(SessionId);
 id_type!(WorkspaceId);
 id_type!(TabId);
 id_type!(PaneId);
+id_type!(SplitId);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -798,6 +799,24 @@ impl Cell {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CursorShape {
+    Bar,
+    Underline,
+    /// Unknown future shapes and unsupported emulator-specific shapes render
+    /// as the universally representable block cursor.
+    #[default]
+    #[serde(other)]
+    Block,
+}
+
+impl CursorShape {
+    fn is_block(&self) -> bool {
+        *self == Self::Block
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Cursor {
     #[serde(rename = "c")]
@@ -806,6 +825,12 @@ pub struct Cursor {
     pub row: u16,
     #[serde(rename = "v")]
     pub visible: bool,
+    // Named MessagePack fields are additive: old clients ignore these keys,
+    // while their defaults let new clients read snapshots from old daemons.
+    #[serde(rename = "s", default, skip_serializing_if = "CursorShape::is_block")]
+    pub shape: CursorShape,
+    #[serde(rename = "b", default, skip_serializing_if = "std::ops::Not::not")]
+    pub blinking: bool,
 }
 
 /// Where the snapshot's viewport sits within the terminal's scrollback.
@@ -1036,6 +1061,8 @@ mod tests {
                 column: 1,
                 row: 1,
                 visible: true,
+                shape: Default::default(),
+                blinking: false,
             },
         )
         .unwrap();
@@ -1069,6 +1096,8 @@ mod tests {
                 column: 0,
                 row: 0,
                 visible: true,
+                shape: Default::default(),
+                blinking: false,
             },
         )
         .unwrap();
@@ -1098,6 +1127,8 @@ mod tests {
             column: 0,
             row: 0,
             visible: true,
+            shape: Default::default(),
+            blinking: false,
         };
         assert_eq!(
             ScreenSnapshot::new(
@@ -1155,6 +1186,8 @@ mod tests {
                     column: 0,
                     row: 0,
                     visible: false,
+                    shape: Default::default(),
+                    blinking: false,
                 },
             ),
             Err(SnapshotError::InvalidSize(TerminalSizeError::TooLarge {

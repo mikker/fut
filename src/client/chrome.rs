@@ -19,7 +19,7 @@ use super::{
     presentation::{ItemState, TokenValue, apply_item_state, render_token_segments, truncate_line},
 };
 
-const MIN_DOCKED_TERMINAL_WIDTH: u16 = 96;
+pub(super) const MIN_DOCKED_TERMINAL_WIDTH: u16 = 96;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ClientLayout {

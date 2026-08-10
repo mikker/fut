@@ -12,7 +12,7 @@ use libghostty_vt::{
     error::Error as GhosttyError,
     fmt::Format,
     key, mouse, paste,
-    render::{CellIterator, RowIterator},
+    render::{CellIterator, CursorVisualStyle, RowIterator},
     screen::{CellContentTag, CellWide, GridRef, Screen, TrackedGridRef},
     selection::{FormatOptions, Selection},
     style::{StyleColor, Underline},
@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use crate::domain::{
     Cell, CellColor, CellStyle, ClientId, CopyModeAction, CopyModeError, CopyModeMovement, Cursor,
-    MAX_COPY_BYTES, MAX_COPY_CELLS, MAX_SEARCH_CELL_CODEPOINTS, MAX_SEARCH_CELLS,
+    CursorShape, MAX_COPY_BYTES, MAX_COPY_CELLS, MAX_SEARCH_CELL_CODEPOINTS, MAX_SEARCH_CELLS,
     MAX_SEARCH_QUERY_BYTES, MAX_SEARCH_TEXT_BYTES, MAX_TERMINAL_OUTPUT_BYTES,
     MAX_TERMINAL_OUTPUT_CELLS, MAX_TERMINAL_OUTPUT_ROWS, MouseButton, MouseEvent, MouseEventKind,
     MouseModifiers, MouseWheelDirection, Rgb, ScreenSnapshot, SearchDirection,
@@ -1208,6 +1208,8 @@ impl GhosttyTerminal {
             column: position.map_or(0, |cursor| cursor.x.min(self.size.columns - 1)),
             row: position.map_or(0, |cursor| cursor.y.min(self.size.rows - 1)),
             visible: visible && position.is_some(),
+            shape: cursor_shape(snapshot.cursor_visual_style()?),
+            blinking: snapshot.cursor_blinking()?,
         };
 
         let expected = usize::from(self.size.columns) * usize::from(self.size.rows);
@@ -1591,6 +1593,15 @@ fn color(color: StyleColor) -> Option<CellColor> {
     }
 }
 
+fn cursor_shape(style: CursorVisualStyle) -> CursorShape {
+    match style {
+        CursorVisualStyle::Bar => CursorShape::Bar,
+        CursorVisualStyle::Underline => CursorShape::Underline,
+        CursorVisualStyle::Block | CursorVisualStyle::BlockHollow => CursorShape::Block,
+        _ => CursorShape::Block,
+    }
+}
+
 fn rgb(color: libghostty_vt::style::RgbColor) -> Rgb {
     Rgb {
         red: color.r,
@@ -1789,6 +1800,29 @@ mod tests {
     fn tracks_cursor_movement() {
         let snapshot = terminal(8, 4).feed(b"\x1b[3;5H").unwrap().unwrap();
         assert_eq!((snapshot.cursor.column, snapshot.cursor.row), (4, 2));
+    }
+
+    #[test]
+    fn tracks_effective_cursor_shape_and_blinking() {
+        for (sequence, shape, blinking) in [
+            (b"\x1b[1 q".as_slice(), CursorShape::Block, true),
+            (b"\x1b[2 q".as_slice(), CursorShape::Block, false),
+            (b"\x1b[3 q".as_slice(), CursorShape::Underline, true),
+            (b"\x1b[4 q".as_slice(), CursorShape::Underline, false),
+            (b"\x1b[5 q".as_slice(), CursorShape::Bar, true),
+            (b"\x1b[6 q".as_slice(), CursorShape::Bar, false),
+        ] {
+            let snapshot = terminal(4, 1).feed(sequence).unwrap().unwrap();
+            assert_eq!(
+                (snapshot.cursor.shape, snapshot.cursor.blinking),
+                (shape, blinking)
+            );
+        }
+
+        assert_eq!(
+            cursor_shape(CursorVisualStyle::BlockHollow),
+            CursorShape::Block
+        );
     }
 
     #[test]

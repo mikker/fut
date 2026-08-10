@@ -20,8 +20,8 @@ use fut::{
     domain::{
         AgentReport, AgentState, CopyModeAction, CopyModeError, CopyModeMovement,
         MAX_SEARCH_QUERY_BYTES, MouseButton, MouseButtons, MouseEvent, MouseEventKind,
-        MouseModifiers, MouseWheelDirection, PaneId, ScreenSnapshot, SearchDirection, TabId,
-        TerminalId, TerminalSize,
+        MouseModifiers, MouseWheelDirection, PaneId, ScreenSnapshot, SearchDirection, SessionId,
+        TabId, TerminalId, TerminalSize, WorkspaceId,
     },
     protocol::{
         ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, PROTOCOL_VERSION_0_1,
@@ -4035,7 +4035,6 @@ async fn public_cli_rejects_removed_forms_and_malformed_raw_ids_locally() {
     for arguments in [
         vec!["new"],
         vec!["new-tab"],
-        vec!["attach"],
         vec!["rename"],
         vec!["close"],
         vec!["ping"],
@@ -4175,6 +4174,282 @@ async fn public_noun_first_attach_accepts_names_and_raw_typed_ids() {
         .unwrap();
     assert!(!ambiguous.status.success());
     assert!(String::from_utf8_lossy(&ambiguous.stderr).contains("target_required"));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn top_level_attach_is_navigator_only_until_selection_then_attaches_normally() {
+    let mut harness =
+        Harness::start("printf 'PRIMARY_READY\\r\\n'; while IFS= read -r line; do :; done").await;
+    let primary = harness.resources().await.sessions[0].workspaces[0].tabs[0].panes[0].clone();
+    let other = harness.root.path().join("other-session");
+    fs::create_dir(&other).unwrap();
+    let opened = harness
+        .cli()
+        .args([
+            "open",
+            other.to_str().unwrap(),
+            "--name",
+            "other-session",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf 'SECONDARY_READY\\r\\n'; while IFS= read -r line; do :; done",
+        ])
+        .output()
+        .unwrap();
+    assert!(opened.status.success());
+    let before = harness.resources().await;
+    assert_eq!(before.sessions.len(), 2);
+    let attach_home = harness.root.path().join("home");
+    let attach_runtime = harness.root.path().join("runtime");
+    let attach_socket = harness.socket.clone();
+
+    let spawn_attach = || {
+        let mut command = Command::new("/usr/bin/script");
+        command
+            .env_clear()
+            .env("HOME", &attach_home)
+            .env("PATH", "/usr/bin:/bin")
+            .env("TMPDIR", &attach_runtime)
+            .env("FUT_RUNTIME_DIR", &attach_runtime)
+            .env("TERM", "xterm-256color")
+            .args(["-q", "/dev/null", "/bin/sh", "-c"])
+            .arg(format!(
+                "stty rows 24 cols 80; exec '{}' --socket '{}' attach",
+                env!("CARGO_BIN_EXE_fut"),
+                attach_socket.display()
+            ));
+        PtyChild::spawn(command)
+    };
+
+    let mut cancelled = spawn_attach();
+    cancelled.wait_for("other-session").await;
+    let (mut contender, _, _) = harness
+        .interactive_for(Some(TargetSelector::Terminal(primary.terminal_id)))
+        .await;
+    harness.detach(&mut contender).await;
+    drop(contender);
+    cancelled.send(b"q");
+    cancelled.wait_success().await;
+    assert_eq!(harness.resources().await, before);
+
+    let mut selected = spawn_attach();
+    selected.wait_for("other-session").await;
+    selected.send(b"G\r");
+    selected.wait_for("SECONDARY_READY").await;
+    selected.send(b"\x02d");
+    selected.wait_success().await;
+    assert_eq!(harness.resources().await, before);
+
+    harness.shutdown().await;
+}
+
+#[test]
+fn top_level_attach_does_not_start_a_missing_daemon_or_create_cwd_resources() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = root.path().join("runtime");
+    let cwd = root.path().join("cwd");
+    fs::create_dir(&cwd).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_fut"))
+        .env_clear()
+        .env("HOME", root.path())
+        .env("FUT_RUNTIME_DIR", &runtime)
+        .env("TERM", "xterm-256color")
+        .current_dir(&cwd)
+        .args([
+            "--socket",
+            root.path().join("missing.sock").to_str().unwrap(),
+            "attach",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("connect to"));
+    assert!(!runtime.exists());
+    assert!(fs::read_dir(cwd).unwrap().next().is_none());
+}
+
+#[tokio::test]
+async fn location_aware_layout_commands_follow_live_terminal_ancestry_and_guard_races() {
+    let mut harness = Harness::start("while IFS= read -r line; do :; done").await;
+    let initial = harness.resources().await;
+    let session_id = initial.sessions[0].id;
+    let workspace_id = initial.sessions[0].workspaces[0].id;
+    let original_tab_id = initial.sessions[0].workspaces[0].tabs[0].id;
+    let anchor = initial.sessions[0].workspaces[0].tabs[0].panes[0].clone();
+    let original_context = fut::protocol::TerminalContext {
+        session_id,
+        workspace_id,
+        tab_id: original_tab_id,
+        pane_id: anchor.id,
+        terminal_id: anchor.terminal_id,
+    };
+    let run = |arguments: &[&str], terminal_id: TerminalId| {
+        harness
+            .cli()
+            .env("FUT_SESSION_ID", SessionId::new().to_string())
+            .env("FUT_WORKSPACE_ID", WorkspaceId::new().to_string())
+            .env("FUT_TAB_ID", TabId::new().to_string())
+            .env("FUT_PANE_ID", PaneId::new().to_string())
+            .env("FUT_TERMINAL_ID", terminal_id.to_string())
+            .args(arguments)
+            .output()
+            .unwrap()
+    };
+    let success_json = |output: std::process::Output| {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+
+    assert!(
+        run(&["session", "rename", "self-session"], anchor.terminal_id)
+            .status
+            .success()
+    );
+    assert!(
+        run(
+            &["workspace", "rename", "self-workspace"],
+            anchor.terminal_id
+        )
+        .status
+        .success()
+    );
+    let tabs = success_json(run(&["--json", "tab", "list"], anchor.terminal_id));
+    assert_eq!(tabs["result"]["workspace_id"], workspace_id.to_string());
+    let panes = success_json(run(&["--json", "pane", "list"], anchor.terminal_id));
+    assert_eq!(panes["result"]["tab_id"], original_tab_id.to_string());
+
+    let second_tab = success_json(run(
+        &["--json", "tab", "new", "--name", "destination"],
+        anchor.terminal_id,
+    ));
+    let second_tab_id: TabId = second_tab["result"]["selected"]["tab_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let second_terminal: TerminalId = second_tab["result"]["selected"]["terminal_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let appended = success_json(run(&["--json", "pane", "new"], anchor.terminal_id));
+    let appended_terminal: TerminalId = appended["result"]["selected"]["terminal_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let split = success_json(run(
+        &["--json", "pane", "split", "down"],
+        anchor.terminal_id,
+    ));
+    assert_eq!(split["result"]["direction"], "down");
+    assert!(
+        run(&["tab", "rename", "source-renamed"], anchor.terminal_id)
+            .status
+            .success()
+    );
+
+    let moved = success_json(run(
+        &["--json", "pane", "move", &second_tab_id.to_string()],
+        anchor.terminal_id,
+    ));
+    assert_eq!(
+        moved["result"]["selected"]["pane_id"],
+        anchor.id.to_string()
+    );
+    assert!(
+        run(
+            &["tab", "rename", "destination-renamed"],
+            anchor.terminal_id
+        )
+        .status
+        .success()
+    );
+    let moved_panes = success_json(run(&["--json", "pane", "list"], anchor.terminal_id));
+    assert_eq!(moved_panes["result"]["tab_id"], second_tab_id.to_string());
+
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::Contextual {
+                context: original_context,
+                command: fut::protocol::ContextualCommand::Rename {
+                    scope: fut::protocol::ContextScope::Tab,
+                    name: "wrong-old-tab".into(),
+                },
+            })
+            .await,
+        ServerMessage::Error { code, .. } if code == "context_changed"
+    ));
+    let snapshot = harness.resources().await;
+    assert_eq!(snapshot.sessions[0].name, "self-session");
+    assert_eq!(snapshot.sessions[0].workspaces[0].name, "self-workspace");
+    assert_eq!(
+        snapshot.sessions[0].workspaces[0].tabs[0].name,
+        "source-renamed"
+    );
+
+    assert!(run(&["pane", "close"], anchor.terminal_id).status.success());
+    assert!(run(&["tab", "close"], second_terminal).status.success());
+    assert!(
+        run(&["workspace", "close"], appended_terminal)
+            .status
+            .success()
+    );
+    harness.wait_until_exited().await;
+
+    let mut session_harness = Harness::start("while IFS= read -r line; do :; done").await;
+    let terminal_id =
+        session_harness.resources().await.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
+    let closed = session_harness
+        .cli()
+        .env("FUT_TERMINAL_ID", terminal_id.to_string())
+        .args(["session", "close"])
+        .output()
+        .unwrap();
+    assert!(closed.status.success());
+    session_harness.wait_until_exited().await;
+}
+
+#[tokio::test]
+async fn inferred_layout_commands_fail_typed_without_a_live_terminal_and_do_not_mutate() {
+    let harness = Harness::start("while IFS= read -r line; do :; done").await;
+    let before = harness.resources().await;
+    for (terminal, code) in [
+        (None, "missing_context"),
+        (Some("not-a-uuid".to_owned()), "invalid_context"),
+        (Some(TerminalId::new().to_string()), "stale_context"),
+    ] {
+        let mut command = harness.cli();
+        if let Some(terminal) = terminal {
+            command.env("FUT_TERMINAL_ID", terminal);
+        }
+        let output = command
+            .args(["--json", "tab", "rename", "must-not-apply"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error"]["code"], code);
+        assert_eq!(harness.resources().await, before);
+    }
+    let tab_id = before.sessions[0].workspaces[0].tabs[0].id;
+    let explicit = harness
+        .cli()
+        .env("FUT_TERMINAL_ID", "malformed-but-ignored")
+        .args(["tab", "rename", &tab_id.to_string(), "explicit-ok"])
+        .output()
+        .unwrap();
+    assert!(explicit.status.success());
+    assert_eq!(
+        harness.resources().await.sessions[0].workspaces[0].tabs[0].name,
+        "explicit-ok"
+    );
     harness.shutdown().await;
 }
 
@@ -4355,6 +4630,10 @@ async fn public_json_commands_emit_compact_canonical_envelopes() {
     );
     json_error(
         harness.cli().args(["--json"]).output().unwrap(),
+        "invalid_arguments",
+    );
+    json_error(
+        harness.cli().args(["--json", "attach"]).output().unwrap(),
         "invalid_arguments",
     );
 
@@ -5608,7 +5887,7 @@ async fn public_agent_activity_spins_lists_waiting_terminals_and_navigates_unrea
     ));
     client.wait_for("● 1").await;
     client.clear_output();
-    client.send(b"\x02.");
+    client.send(b"\x02\x02");
     client.wait_for("AGENT_A").await;
     client.send(b"\x02d");
     client.wait_success().await;
@@ -5716,7 +5995,7 @@ async fn public_held_mouse_releases_before_modal_focus_and_detach_transitions() 
     client.wait_for("HELD_B_READY").await;
 
     client.send(&[sgr_mouse(0, 8, 6, false), b"\x02 ".to_vec()].concat());
-    client.wait_for("Open global navigator").await;
+    client.wait_for("Search commands").await;
     wait_for(DEADLINE, || {
         fs::read(harness.root.path().join("cwd/held-modal.capture"))
             .is_ok_and(|bytes| bytes.len() == modal_expected.len())
@@ -5846,7 +6125,7 @@ async fn public_sgr_mouse_focuses_without_leaking_then_forwards_focused_app_inpu
     // Fut modal surfaces own mouse input. These gestures must not become the
     // first bytes captured by the focused application.
     client.send(b"\x02 ");
-    client.wait_for("Open global navigator").await;
+    client.wait_for("Search commands").await;
     client.send(
         &[
             sgr_mouse(0, 8, 6, false),
@@ -5920,6 +6199,225 @@ async fn public_sgr_mouse_focuses_without_leaking_then_forwards_focused_app_inpu
         "outer mouse capture was not disabled: {outer:?}"
     );
     assert!(process_alive(pane_b.child_pid));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn public_mouse_resizes_nested_shared_splits_without_stealing_application_drags() {
+    let expected = b"\x1b[<0;6;4M\x1b[<32;35;4M\x1b[<0;35;4m";
+    let harness = Harness::start(&format!(
+        "stty raw -echo; printf '\\033[?1003h\\033[?1006hPANE_DRAG_A_READY\\r\\n'; dd bs=1 count={} of=pane-drag.capture 2>/dev/null; printf 'PANE_DRAG_APP_CAPTURED\\r\\n'; while IFS= read -r line; do if [ \"$line\" = size ]; then set -- $(stty size); printf 'PANE_A_SIZE_%s_%s\\r\\n' \"$1\" \"$2\"; fi; done",
+        expected.len(),
+    ))
+    .await;
+    let snapshot = harness.resources().await;
+    let tab_id = snapshot.sessions[0].workspaces[0].tabs[0].id;
+    let pane_a = snapshot.sessions[0].workspaces[0].tabs[0].panes[0].id;
+    let ServerMessage::PaneCreated { selected: pane_b } = harness
+        .control_command(ClientMessage::SplitPane {
+            pane_id: pane_a,
+            direction: fut::splits::SplitDirection::Right,
+            cwd: None,
+            program: Some("/bin/sh".into()),
+            argv: vec![
+                "-c".into(),
+                "printf 'PANE_DRAG_B_READY\\r\\n'; while :; do sleep 1; done".into(),
+            ],
+        })
+        .await
+    else {
+        panic!("failed to create horizontal drag pane")
+    };
+    let ServerMessage::PaneCreated { selected: pane_c } = harness
+        .control_command(ClientMessage::SplitPane {
+            pane_id: pane_b.pane_id,
+            direction: fut::splits::SplitDirection::Down,
+            cwd: None,
+            program: Some("/bin/sh".into()),
+            argv: vec![
+                "-c".into(),
+                "printf 'PANE_DRAG_C_READY\\r\\n'; while :; do sleep 1; done".into(),
+            ],
+        })
+        .await
+    else {
+        panic!("failed to create vertical drag pane")
+    };
+    let layout = harness.resources().await.sessions[0].workspaces[0].tabs[0]
+        .layout
+        .clone();
+    let (horizontal, vertical) = match layout {
+        fut::splits::SplitTree::Branch {
+            split_id: horizontal,
+            axis: fut::splits::SplitAxis::Horizontal,
+            second,
+            ..
+        } => match *second {
+            fut::splits::SplitTree::Branch {
+                split_id: vertical,
+                axis: fut::splits::SplitAxis::Vertical,
+                ..
+            } => (horizontal, vertical),
+            other => panic!("expected nested vertical branch, got {other:?}"),
+        },
+        other => panic!("expected horizontal root branch, got {other:?}"),
+    };
+
+    let (mut observer, observed) =
+        attach_once(&harness, TargetSelector::Pane(pane_b.pane_id)).await;
+    assert_eq!(observed.tab_id, tab_id);
+    let mut command = Command::new("/usr/bin/script");
+    command
+        .env_clear()
+        .env("HOME", harness.root.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", harness.root.path().join("runtime"))
+        .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+        .env("TERM", "xterm-256color")
+        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .arg(format!(
+            "stty rows 30 cols 100; exec '{}' --socket '{}' pane attach {pane_a}",
+            env!("CARGO_BIN_EXE_fut"),
+            harness.socket.display(),
+        ));
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("PANE_DRAG_A_READY").await;
+    client.wait_for("PANE_DRAG_B_READY").await;
+    client.wait_for("PANE_DRAG_C_READY").await;
+
+    client.send(
+        &[
+            sgr_mouse(0, 50, 6, false),
+            sgr_mouse(32, 36, 6, false),
+            sgr_mouse(0, 36, 6, true),
+        ]
+        .concat(),
+    );
+    resources_when(&harness, |snapshot| {
+        snapshot.sessions[0].workspaces[0].tabs[0]
+            .layout
+            .ratio(horizontal)
+            .is_some_and(|ratio| ratio.first_cells(99) == 35)
+    })
+    .await;
+    receive_matching(&mut observer, |message| {
+        matches!(
+            message,
+            ServerMessage::TargetSelected { selected }
+                if selected.layout.ratio(horizontal)
+                    .is_some_and(|ratio| ratio.first_cells(99) == 35)
+        )
+    })
+    .await;
+
+    client.send(
+        &[
+            sgr_mouse(0, 61, 16, false),
+            sgr_mouse(32, 61, 12, false),
+            sgr_mouse(0, 61, 12, true),
+        ]
+        .concat(),
+    );
+    resources_when(&harness, |snapshot| {
+        let layout = &snapshot.sessions[0].workspaces[0].tabs[0].layout;
+        layout
+            .ratio(horizontal)
+            .is_some_and(|ratio| ratio.first_cells(99) == 35)
+            && layout
+                .ratio(vertical)
+                .is_some_and(|ratio| ratio.first_cells(28) == 10)
+    })
+    .await;
+    receive_matching(&mut observer, |message| {
+        matches!(
+            message,
+            ServerMessage::TargetSelected { selected }
+                if selected.layout.ratio(vertical)
+                    .is_some_and(|ratio| ratio.first_cells(28) == 10)
+        )
+    })
+    .await;
+
+    assert!(
+        fs::metadata(harness.root.path().join("cwd/pane-drag.capture"))
+            .is_ok_and(|metadata| metadata.len() == 0),
+        "divider gesture leaked into the all-motion application"
+    );
+    client.send(
+        &[
+            sgr_mouse(0, 6, 5, false),
+            sgr_mouse(32, 36, 5, false),
+            sgr_mouse(0, 36, 5, true),
+        ]
+        .concat(),
+    );
+    client.wait_for("PANE_DRAG_APP_CAPTURED").await;
+    assert_eq!(
+        fs::read(harness.root.path().join("cwd/pane-drag.capture")).unwrap(),
+        expected
+    );
+    client.send(b"size\n");
+    client.wait_for("PANE_A_SIZE_29_35").await;
+    let after_app_drag = harness.resources().await;
+    assert_eq!(
+        after_app_drag.sessions[0].workspaces[0].tabs[0]
+            .layout
+            .ratio(horizontal)
+            .unwrap()
+            .first_cells(99),
+        35,
+        "terminal-originated drag changed the Fut split"
+    );
+
+    client.send(
+        &[
+            sgr_mouse(0, 36, 5, false),
+            sgr_mouse(32, 1, 5, false),
+            sgr_mouse(0, 1, 5, true),
+        ]
+        .concat(),
+    );
+    resources_when(&harness, |snapshot| {
+        snapshot.sessions[0].workspaces[0].tabs[0]
+            .layout
+            .ratio(horizontal)
+            .is_some_and(|ratio| ratio.first_cells(99) == 24)
+    })
+    .await;
+    client.send(b"size\n");
+    client.wait_for("PANE_A_SIZE_29_24").await;
+
+    send_uncorrelated(
+        &mut observer,
+        ClientMessage::ResizeSplit {
+            tab_id,
+            split_id: fut::domain::SplitId::new(),
+            ratio: fut::splits::SplitRatio::from_cells(1, 2).unwrap(),
+        },
+    )
+    .await;
+    assert_no_error_before_pong(&mut observer).await;
+
+    client.send(b"\x02d");
+    client.wait_success().await;
+    let (mut reattached, selected) = attach_once(&harness, TargetSelector::Pane(pane_a)).await;
+    assert_eq!(selected.tab_id, tab_id);
+    send(&mut reattached, ClientMessage::ListResources).await;
+    let ServerMessage::Resources { snapshot } = receive_matching(&mut reattached, |message| {
+        matches!(message, ServerMessage::Resources { .. })
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    let persisted = &snapshot.sessions[0].workspaces[0].tabs[0].layout;
+    assert_eq!(persisted.ratio(horizontal).unwrap().first_cells(99), 24);
+    assert_eq!(persisted.ratio(vertical).unwrap().first_cells(28), 10);
+
+    harness.detach(&mut reattached).await;
+    harness.detach(&mut observer).await;
+    assert!(process_alive(pane_b.child_pid));
+    assert!(process_alive(pane_c.child_pid));
     harness.shutdown().await;
 }
 
@@ -6242,6 +6740,95 @@ async fn public_client_accordion_resizes_focus_and_falls_back_narrowly() {
     accordion.wait_for("B_SIZE_23_24").await;
     accordion.send(b"\x02d");
     accordion.wait_success().await;
+
+    assert!(process_alive(pane_b.child_pid));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn public_client_reloads_config_immediately_and_retains_it_after_an_error() {
+    let harness = Harness::start(
+        "printf 'RELOAD_A_READY\\r\\n'; while IFS= read -r line; do set -- $(stty size); case \"$line\" in before) printf 'RELOAD_BEFORE_%s_%s\\r\\n' \"$1\" \"$2\";; after) printf 'RELOAD_AFTER_%s_%s\\r\\n' \"$1\" \"$2\";; retained) printf 'RELOAD_RETAINED_%s_%s\\r\\n' \"$1\" \"$2\";; esac; done",
+    )
+    .await;
+    let resources = harness.resources().await;
+    let tab_id = resources.sessions[0].workspaces[0].tabs[0].id;
+    let pane_a = resources.sessions[0].workspaces[0].tabs[0].panes[0].id;
+    let ServerMessage::PaneCreated { selected: pane_b } = harness
+        .control_command(ClientMessage::CreatePane {
+            tab_id,
+            cwd: None,
+            program: Some("/bin/sh".into()),
+            argv: vec![
+                "-c".into(),
+                "printf 'RELOAD_B_READY\\r\\n'; while IFS= read -r line; do :; done".into(),
+            ],
+        })
+        .await
+    else {
+        panic!("failed to create reload sibling")
+    };
+
+    let config_directory = harness.root.path().join("home/.config/fut");
+    fs::create_dir_all(&config_directory).unwrap();
+    let config_path = config_directory.join("config.toml");
+    fs::write(&config_path, "").unwrap();
+
+    let mut command = Command::new("/usr/bin/script");
+    command
+        .env_clear()
+        .env("HOME", harness.root.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", harness.root.path().join("runtime"))
+        .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+        .env("TERM", "xterm-256color")
+        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .arg(format!(
+            "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {}",
+            env!("CARGO_BIN_EXE_fut"),
+            harness.socket.display(),
+            pane_a
+        ));
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("RELOAD_A_READY").await;
+    client.wait_for("RELOAD_B_READY").await;
+    client.send(b"before\n");
+    client.wait_for("RELOAD_BEFORE_23_39").await;
+
+    fs::write(
+        &config_path,
+        "[ui]\npane_layout = 'accordion'\n\n[ui.bindings]\nreload_config = 'r'\ndetach = 'y'\n",
+    )
+    .unwrap();
+    client.clear_output();
+    client.send(b"\x02R");
+    client.wait_for("config reloaded").await;
+    client.send(b"after\n");
+    client.wait_for("RELOAD_AFTER_23_").await;
+    assert!(
+        !client.text().contains("RELOAD_AFTER_23_39"),
+        "reloaded layout did not resize panes: {:?}",
+        client.text()
+    );
+
+    fs::write(
+        &config_path,
+        "[ui]\npane_layout = 'sideways'\n\n[ui.bindings]\ndetach = 'x'\n",
+    )
+    .unwrap();
+    client.clear_output();
+    client.send(b"\x02r");
+    client.wait_for("config reload failed").await;
+    client.wait_for("parse Fut config").await;
+    client.send(b"retained\n");
+    client.wait_for("RELOAD_RETAINED_23_").await;
+    assert!(
+        !client.text().contains("RELOAD_RETAINED_23_39"),
+        "failed reload replaced the prior layout: {:?}",
+        client.text()
+    );
+    client.send(b"\x02y");
+    client.wait_success().await;
 
     assert!(process_alive(pane_b.child_pid));
     harness.shutdown().await;
@@ -7159,8 +7746,25 @@ done
     left.wait_for_count("ZETA_INPUT", 2).await;
     left.send(b"\x02Wmain\n");
     left.wait_for_count("BRAVO_ACK", 2).await;
+    left.send(
+        &[
+            sgr_mouse(0, 28, 6, false),
+            sgr_mouse(32, 20, 6, false),
+            sgr_mouse(0, 20, 6, true),
+        ]
+        .concat(),
+    );
+    left.send(b"size-main\n");
+    left.wait_for("ALPHA_SIZE_23_104").await;
     left.send(b"\x02d");
     left.wait_success().await;
+
+    let mut left_reset = spawn_client(124, main_pane);
+    left_reset.wait_for("ALPHA_READY").await;
+    left_reset.send(b"size-main\n");
+    left_reset.wait_for("ALPHA_SIZE_23_96").await;
+    left_reset.send(b"\x02d");
+    left_reset.wait_success().await;
 
     let config_directory = harness.root.path().join("home/.config/fut");
     fs::create_dir_all(&config_directory).unwrap();
@@ -7194,8 +7798,25 @@ right = [{ text = "]" }, { token = "workspace.tab_count" }]
     right.wait_for("λ").await;
     right.send(b"size-linked\n");
     right.wait_for("ZETA_SIZE_23_96").await;
+    right.send(
+        &[
+            sgr_mouse(0, 97, 6, false),
+            sgr_mouse(32, 105, 6, false),
+            sgr_mouse(0, 105, 6, true),
+        ]
+        .concat(),
+    );
+    right.send(b"size-linked\n");
+    right.wait_for("ZETA_SIZE_23_104").await;
     right.send(b"\x02d");
     right.wait_success().await;
+
+    let mut right_reset = spawn_client(124, linked_target.pane_id);
+    right_reset.wait_for("ZETA_READY").await;
+    right_reset.send(b"size-linked\n");
+    right_reset.wait_for("ZETA_SIZE_23_96").await;
+    right_reset.send(b"\x02d");
+    right_reset.wait_success().await;
 
     let mut narrow = spawn_client(123, main_pane);
     narrow.wait_for("ALPHA_READY").await;
@@ -7204,11 +7825,26 @@ right = [{ text = "]" }, { token = "workspace.tab_count" }]
     narrow.send(b"\x02w");
     narrow.wait_for("feature").await;
     narrow.wait_for("λ").await;
+    narrow.send(
+        &[
+            sgr_mouse(0, 96, 6, false),
+            sgr_mouse(32, 104, 6, false),
+            sgr_mouse(0, 104, 6, true),
+        ]
+        .concat(),
+    );
     narrow.send(b"q");
     narrow.send(b"size-narrow\n");
-    narrow.wait_for_count("NARROW_SIZE_23_123", 2).await;
+    narrow.wait_for("NARROW_SIZE_23_103").await;
     narrow.send(b"\x02d");
     narrow.wait_success().await;
+
+    let mut narrow_reset = spawn_client(123, main_pane);
+    narrow_reset.wait_for("ALPHA_READY").await;
+    narrow_reset.send(b"size-narrow\n");
+    narrow_reset.wait_for("NARROW_SIZE_23_123").await;
+    narrow_reset.send(b"\x02d");
+    narrow_reset.wait_success().await;
 
     let mut live_close = spawn_client(124, linked_target.pane_id);
     live_close.wait_for("feature").await;
@@ -7496,7 +8132,7 @@ async fn public_command_bar_filters_labels_actions_and_matches_direct_dispatch()
     client.wait_for("COMMAND_ZETA_READY").await;
 
     client.send(b"\x02 ");
-    client.wait_for("Open global navigator").await;
+    client.wait_for("Search commands").await;
     client.wait_for("Ctrl-b g").await;
     client.send(b"\x1b[200~frobnicate\nzeta\x1b[201~");
     client.wait_for("No matching commands").await;
@@ -8847,8 +9483,9 @@ async fn unsupported_protocol_is_rejected_without_harming_daemon() {
 #[tokio::test]
 async fn control_connections_never_reply_to_fire_and_forget_ui_messages() {
     let harness = Harness::start("while IFS= read -r line; do :; done").await;
-    let terminal_id =
-        harness.resources().await.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
+    let resources = harness.resources().await;
+    let tab_id = resources.sessions[0].workspaces[0].tabs[0].id;
+    let terminal_id = resources.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
     let mut control = harness.connect().await.expect("connect control client");
     assert!(matches!(
         hello(&mut control, ClientMode::Control, PROTOCOL_VERSION)
@@ -8860,6 +9497,11 @@ async fn control_connections_never_reply_to_fire_and_forget_ui_messages() {
     for message in [
         mouse_wheel_message(terminal_id),
         ClientMessage::ResetViewport { terminal_id },
+        ClientMessage::ResizeSplit {
+            tab_id,
+            split_id: fut::domain::SplitId::new(),
+            ratio: fut::splits::SplitRatio::from_cells(1, 2).unwrap(),
+        },
     ] {
         send_uncorrelated(&mut control, message.clone()).await;
         let ping_request_id = Uuid::new_v4();
@@ -9471,6 +10113,13 @@ async fn public_rename_preserves_a_live_process_and_rejects_invalid_changes_atom
             Uuid::new_v4().to_string(),
             "no".into(),
         ],
+        vec!["session".into(), "rename".into(), session_id.to_string()],
+        vec![
+            "workspace".into(),
+            "rename".into(),
+            workspace_id.to_string(),
+        ],
+        vec!["tab".into(), "rename".into(), tab_id.to_string()],
         vec![
             "session".into(),
             "rename".into(),
@@ -9999,6 +10648,23 @@ impl CompletionEnv {
         self.complete_at(socket, words, words.len() + 2)
     }
 
+    fn complete_from(
+        &self,
+        socket: &std::path::Path,
+        words: &[&str],
+        terminal_id: TerminalId,
+    ) -> std::process::Output {
+        self.command()
+            .env("FUT_SOCKET", self.0.path().join("missing-env.sock"))
+            .env("FUT_TERMINAL_ID", terminal_id.to_string())
+            .env("_CLAP_COMPLETE_INDEX", (words.len() + 2).to_string())
+            .args(["--", "fut", "--socket"])
+            .arg(socket)
+            .args(words)
+            .output()
+            .unwrap()
+    }
+
     fn complete_at(
         &self,
         socket: &std::path::Path,
@@ -10085,7 +10751,7 @@ fn agent_skill_prints_the_bundled_skill_without_daemon_setup() {
 }
 
 #[tokio::test]
-async fn context_validates_environment_ancestry_and_get_resolves_explicit_ids() {
+async fn context_resolves_fresh_ancestry_from_terminal_identity_and_get_resolves_explicit_ids() {
     let harness = Harness::start("while IFS= read -r line; do :; done").await;
     let snapshot = harness.resources().await;
     let session = &snapshot.sessions[0];
@@ -10168,15 +10834,18 @@ async fn context_validates_environment_ancestry_and_get_resolves_explicit_ids() 
         .args(["--json", "context"])
         .output()
         .unwrap();
-    assert!(!mismatched.status.success());
-    let mismatched: Value = serde_json::from_slice(&mismatched.stderr).unwrap();
-    assert_eq!(mismatched["error"]["code"], "invalid_context");
+    assert!(mismatched.status.success());
+    let mismatched: Value = serde_json::from_slice(&mismatched.stdout).unwrap();
+    assert_eq!(
+        mismatched["result"]["target"]["pane"]["id"],
+        pane.id.to_string()
+    );
 
     harness.shutdown().await;
 }
 
 #[test]
-fn context_without_fut_environment_is_a_typed_error_before_daemon_connection() {
+fn context_without_terminal_identity_is_a_typed_error_before_daemon_connection() {
     let root = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_fut"))
         .env_clear()
@@ -10198,7 +10867,7 @@ fn context_without_fut_environment_is_a_typed_error_before_daemon_connection() {
         .unwrap();
     assert!(!incomplete.status.success());
     let error: Value = serde_json::from_slice(&incomplete.stderr).unwrap();
-    assert_eq!(error["error"]["code"], "invalid_context");
+    assert_eq!(error["error"]["code"], "command_failed");
 }
 
 #[tokio::test]
@@ -10340,6 +11009,18 @@ async fn process_completion_covers_live_resource_operations_and_refresh() {
         [first_pane.to_string(), second_tab_pane.to_string()]
     );
     assert_eq!(
+        completion_values(&env.complete_from(
+            &harness.socket,
+            &["pane", "move", ""],
+            workspace.tabs[0].panes[0].terminal_id,
+        )),
+        [
+            first_pane.to_string(),
+            second_tab_pane.to_string(),
+            second_tab.to_string(),
+        ]
+    );
+    assert_eq!(
         completion_values(&env.complete(
             &harness.socket,
             &["pane", "move", &first_pane.to_string(), ""],
@@ -10361,6 +11042,16 @@ async fn process_completion_covers_live_resource_operations_and_refresh() {
         .is_empty()
     );
     assert_eq!(harness.resources().await.revision, completion_revision);
+
+    let split = env.complete(&harness.socket, &["pane", "split", ""]);
+    let split_text = String::from_utf8(split.stdout).unwrap();
+    assert!(split_text.lines().any(|line| line.starts_with("right")));
+    assert!(split_text.lines().any(|line| line.starts_with("down")));
+    assert!(
+        split_text
+            .lines()
+            .any(|line| line.starts_with(&first_pane.to_string()))
+    );
 
     let ambiguous_tab = workspace.tabs[0].id;
     let second_pane = harness

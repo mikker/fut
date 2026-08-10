@@ -14,9 +14,9 @@ use thiserror::Error;
 use crate::{
     domain::{
         AgentActivity, AgentEvent, AgentIntegration, AgentReport, AgentReportMetadata, AgentState,
-        PaneId, SessionId, TabId, TerminalId, WorkspaceId,
+        PaneId, SessionId, SplitId, TabId, TerminalId, WorkspaceId,
     },
-    splits::{SplitDirection, SplitTree},
+    splits::{SplitDirection, SplitRatio, SplitTree},
 };
 
 /// Tabs may be unnamed; any other name must carry visible characters and stay
@@ -157,6 +157,54 @@ pub struct PaneSnapshot {
     pub activity: AgentActivity,
 }
 
+impl ResourceSnapshot {
+    /// Resolve a terminal's current live ancestry from this snapshot. Terminal
+    /// identity is stable across pane moves; ancestor IDs captured in a child
+    /// environment are not.
+    pub fn live_terminal_path(
+        &self,
+        terminal_id: TerminalId,
+    ) -> Result<ResolvedTerminalPath, ResourceError> {
+        let mut found = None;
+        for session in &self.sessions {
+            for workspace in &session.workspaces {
+                for tab in &workspace.tabs {
+                    for pane in &tab.panes {
+                        if pane.terminal_id != terminal_id {
+                            continue;
+                        }
+                        if found.is_some() {
+                            return Err(ResourceError::Invariant(
+                                "terminal appears more than once in resource snapshot".into(),
+                            ));
+                        }
+                        if session.closing {
+                            return Err(ResourceError::Closing("session"));
+                        }
+                        if workspace.closing {
+                            return Err(ResourceError::Closing("workspace"));
+                        }
+                        if tab.closing {
+                            return Err(ResourceError::Closing("tab"));
+                        }
+                        if pane.closing {
+                            return Err(ResourceError::Closing("pane"));
+                        }
+                        found = Some(ResolvedTerminalPath {
+                            session_id: session.id,
+                            workspace_id: workspace.id,
+                            tab_id: tab.id,
+                            pane_id: pane.id,
+                            terminal_id,
+                        });
+                    }
+                }
+            }
+        }
+        found.ok_or(ResourceError::NotFound("terminal"))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum CloseCause {
     Requested,
@@ -209,6 +257,11 @@ pub enum ResourceEvent {
         terminal_id: TerminalId,
         from: TabId,
         to: TabId,
+    },
+    SplitResized {
+        tab_id: TabId,
+        split_id: SplitId,
+        ratio: SplitRatio,
     },
     PaneCloseRequested {
         pane_id: PaneId,
@@ -278,6 +331,8 @@ pub enum ResourceError {
     AmbiguousTarget,
     #[error("invalid agent report: {0}")]
     InvalidAgentReport(&'static str),
+    #[error("invalid split ratio")]
+    InvalidSplitRatio,
     #[error("resource tree invariant violated: {0}")]
     Invariant(String),
 }
@@ -1066,6 +1121,52 @@ impl ResourceTree {
                 id: pane_id,
                 terminal_id,
                 closing: false,
+            }],
+            vec![],
+        ))
+    }
+
+    pub fn resize_split(
+        &mut self,
+        tab_id: TabId,
+        split_id: SplitId,
+        ratio: SplitRatio,
+    ) -> Result<Mutation, ResourceError> {
+        if !ratio.is_valid() {
+            return Err(ResourceError::InvalidSplitRatio);
+        }
+        let tab = self
+            .tabs
+            .get(&tab_id)
+            .ok_or(ResourceError::NotFound("tab"))?;
+        if self.session_for_workspace(tab.workspace_id).closing {
+            return Err(ResourceError::Closing("session"));
+        }
+        if self.workspaces[&tab.workspace_id].closing {
+            return Err(ResourceError::Closing("workspace"));
+        }
+        if tab.closing {
+            return Err(ResourceError::Closing("tab"));
+        }
+        let current = tab
+            .layout
+            .ratio(split_id)
+            .ok_or(ResourceError::NotFound("split"))?;
+        if current == ratio {
+            return Ok(self.unchanged());
+        }
+        assert!(
+            self.tabs
+                .get_mut(&tab_id)
+                .expect("validated tab exists")
+                .layout
+                .resize(split_id, ratio)
+        );
+        Ok(self.finish(
+            vec![ResourceEvent::SplitResized {
+                tab_id,
+                split_id,
+                ratio,
             }],
             vec![],
         ))
@@ -2127,6 +2228,60 @@ mod tests {
         tree.terminal_exited(terminal_b).unwrap();
         let tab = &tree.snapshot().sessions[0].workspaces[0].tabs[0];
         assert_eq!(tab.layout, SplitTree::leaf(pane_a));
+        tree.validate().unwrap();
+    }
+
+    #[test]
+    fn split_resize_is_revisioned_exact_persistent_and_no_ops_do_not_churn() {
+        let mut tree = ResourceTree::default();
+        let first = initial("resize-split", "/resize-split");
+        let tab_id = first.tab_id;
+        let pane_a = first.pane_id;
+        tree.create_session(first).unwrap();
+        tree.split_pane(
+            pane_a,
+            SplitDirection::Right,
+            PaneId::new(),
+            TerminalId::new(),
+        )
+        .unwrap();
+        let split_id = match tree.open_layout_for_tab(tab_id).unwrap() {
+            SplitTree::Branch { split_id, .. } => split_id,
+            _ => panic!("split operation did not create a branch"),
+        };
+        let before = tree.revision();
+        let ratio = SplitRatio::from_cells(37, 79).unwrap();
+        let mutation = tree.resize_split(tab_id, split_id, ratio).unwrap();
+        assert_eq!(mutation.revision, before + 1);
+        assert_eq!(
+            mutation.events,
+            [ResourceEvent::SplitResized {
+                tab_id,
+                split_id,
+                ratio,
+            }]
+        );
+        assert_eq!(
+            tree.snapshot().sessions[0].workspaces[0].tabs[0]
+                .layout
+                .ratio(split_id),
+            Some(ratio)
+        );
+
+        let no_op = tree.resize_split(tab_id, split_id, ratio).unwrap();
+        assert_eq!(no_op.revision, mutation.revision);
+        assert!(no_op.events.is_empty());
+        let equivalent =
+            serde_json::from_str::<SplitRatio>(r#"{"numerator":74,"denominator":158}"#).unwrap();
+        assert_eq!(equivalent, ratio);
+        let equivalent_no_op = tree.resize_split(tab_id, split_id, equivalent).unwrap();
+        assert_eq!(equivalent_no_op.revision, mutation.revision);
+        assert!(equivalent_no_op.events.is_empty());
+        assert_eq!(
+            tree.resize_split(tab_id, SplitId::new(), ratio),
+            Err(ResourceError::NotFound("split"))
+        );
+        assert_eq!(tree.revision(), mutation.revision);
         tree.validate().unwrap();
     }
 
@@ -3364,5 +3519,56 @@ mod tests {
 
         tree.tabs.get_mut(&tab_id).unwrap().closing = true;
         assert!(matches!(tree.validate(), Err(ResourceError::Invariant(_))));
+    }
+
+    #[test]
+    fn snapshots_resolve_live_ancestry_from_stable_terminal_identity() {
+        let mut tree = ResourceTree::default();
+        let path = initial("session", "/project");
+        let terminal_id = path.terminal_id;
+        let pane_id = path.pane_id;
+        let workspace_id = path.workspace_id;
+        let original_tab_id = path.tab_id;
+        tree.create_session(path).unwrap();
+        assert_eq!(
+            tree.snapshot().live_terminal_path(terminal_id).unwrap(),
+            ResolvedTerminalPath {
+                session_id: tree.snapshot().sessions[0].id,
+                workspace_id,
+                tab_id: original_tab_id,
+                pane_id,
+                terminal_id,
+            }
+        );
+
+        let destination = TabId::new();
+        tree.add_tab(
+            workspace_id,
+            TabPath {
+                tab_id: destination,
+                tab_name: "destination".into(),
+                pane_id: PaneId::new(),
+                terminal_id: TerminalId::new(),
+            },
+        )
+        .unwrap();
+        tree.move_pane(pane_id, destination).unwrap();
+        assert_eq!(
+            tree.snapshot()
+                .live_terminal_path(terminal_id)
+                .unwrap()
+                .tab_id,
+            destination
+        );
+
+        tree.close_pane(pane_id).unwrap();
+        assert_eq!(
+            tree.snapshot().live_terminal_path(terminal_id),
+            Err(ResourceError::Closing("pane"))
+        );
+        assert_eq!(
+            tree.snapshot().live_terminal_path(TerminalId::new()),
+            Err(ResourceError::NotFound("terminal"))
+        );
     }
 }

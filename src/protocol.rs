@@ -11,17 +11,17 @@ use std::path::PathBuf;
 use crate::{
     domain::{
         AgentActivity, AgentReport, AgentReportMetadata, CopyModeAction, CopyModeError, MouseEvent,
-        PaneId, ScreenDelta, ScreenSnapshot, SessionId, TabId, TerminalId, TerminalOutput,
+        PaneId, ScreenDelta, ScreenSnapshot, SessionId, SplitId, TabId, TerminalId, TerminalOutput,
         TerminalOutputMatcher, TerminalOutputSource, TerminalSize, WorkspaceId,
     },
     resources::{ResourceSnapshot, SessionSelector, TargetSelector},
-    splits::{SplitDirection, SplitTree},
+    splits::{SplitDirection, SplitRatio, SplitTree},
 };
 
 /// Protocol version used by released Fut 0.1 builds.
 pub const PROTOCOL_VERSION_0_1: u16 = 0;
 /// Current clients and daemons require an exact protocol match.
-pub const PROTOCOL_VERSION: u16 = 14;
+pub const PROTOCOL_VERSION: u16 = 16;
 /// Enough for 50,000 individually styled MessagePack-encoded cells while
 /// remaining a firm pre-allocation bound for the length-delimited transport.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
@@ -81,6 +81,69 @@ pub struct SelectedTarget {
     pub pane_id: PaneId,
     pub terminal_id: TerminalId,
     pub child_pid: u32,
+}
+
+/// The complete live ancestry resolved from a calling terminal. Contextual
+/// control operations carry this back to the daemon so it can reject a race
+/// that moved or began closing the terminal after the client's snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TerminalContext {
+    pub session_id: SessionId,
+    pub workspace_id: WorkspaceId,
+    pub tab_id: TabId,
+    pub pane_id: PaneId,
+    pub terminal_id: TerminalId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextScope {
+    Session,
+    Workspace,
+    Tab,
+    Pane,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContextualCommand {
+    CreateTab {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        program: Option<PathBuf>,
+        #[serde(default)]
+        argv: Vec<String>,
+    },
+    CreatePane {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        program: Option<PathBuf>,
+        #[serde(default)]
+        argv: Vec<String>,
+    },
+    SplitPane {
+        direction: SplitDirection,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        program: Option<PathBuf>,
+        #[serde(default)]
+        argv: Vec<String>,
+    },
+    MovePane {
+        destination_tab_id: TabId,
+    },
+    Close {
+        scope: ContextScope,
+    },
+    Rename {
+        scope: ContextScope,
+        name: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -176,6 +239,13 @@ pub enum ClientMessage {
         terminal_id: TerminalId,
         size: TerminalSize,
     },
+    /// Fire-and-forget shared authored-layout update. The split ID is scoped
+    /// to `tab_id`; stale disposable drag targets are ignored by the daemon.
+    ResizeSplit {
+        tab_id: TabId,
+        split_id: SplitId,
+        ratio: SplitRatio,
+    },
     SelectTarget {
         selector: TargetSelector,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -235,6 +305,10 @@ pub enum ClientMessage {
     MovePane {
         pane_id: PaneId,
         destination_tab_id: TabId,
+    },
+    Contextual {
+        context: TerminalContext,
+        command: ContextualCommand,
     },
     ListResources,
     /// Ask a control connection to stream resource changes: the correlated
@@ -431,8 +505,8 @@ mod tests {
 
     use super::*;
     use crate::domain::{
-        Cell, Cursor, MAX_CELL_CONTENT_BYTES, MAX_VISIBLE_CELLS, MouseButton, MouseButtons,
-        MouseEvent, MouseEventKind, MouseModifiers, MouseWheelDirection,
+        Cell, Cursor, CursorShape, MAX_CELL_CONTENT_BYTES, MAX_VISIBLE_CELLS, MouseButton,
+        MouseButtons, MouseEvent, MouseEventKind, MouseModifiers, MouseWheelDirection,
     };
 
     #[test]
@@ -506,6 +580,56 @@ mod tests {
             // style: fg RGB(10,20,30), no bg, bold
         ];
         assert_eq!(payload, expected, "payload: {payload:02x?}");
+    }
+
+    #[test]
+    fn cursor_shape_fields_are_additive_and_unknown_shapes_fall_back_to_block() {
+        #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+        struct LegacyCursor {
+            #[serde(rename = "c")]
+            column: u16,
+            #[serde(rename = "r")]
+            row: u16,
+            #[serde(rename = "v")]
+            visible: bool,
+        }
+
+        let legacy = LegacyCursor {
+            column: 3,
+            row: 4,
+            visible: true,
+        };
+        assert_eq!(
+            decode_payload::<Cursor>(&encode_payload(&legacy).unwrap()).unwrap(),
+            Cursor {
+                column: 3,
+                row: 4,
+                visible: true,
+                shape: CursorShape::Block,
+                blinking: false,
+            }
+        );
+
+        let current = Cursor {
+            column: 5,
+            row: 6,
+            visible: true,
+            shape: CursorShape::Bar,
+            blinking: true,
+        };
+        assert_eq!(
+            decode_payload::<LegacyCursor>(&encode_payload(&current).unwrap()).unwrap(),
+            LegacyCursor {
+                column: 5,
+                row: 6,
+                visible: true,
+            }
+        );
+
+        let unknown: Cursor =
+            serde_json::from_str(r#"{"c":1,"r":2,"v":true,"s":"future","b":true}"#).unwrap();
+        assert_eq!(unknown.shape, CursorShape::Block);
+        assert!(unknown.blinking);
     }
 
     #[test]
@@ -780,6 +904,8 @@ mod tests {
                 column: 249,
                 row: 199,
                 visible: true,
+                shape: Default::default(),
+                blinking: false,
             },
         )
         .unwrap();
@@ -827,6 +953,8 @@ mod tests {
                 column: 249,
                 row: 199,
                 visible: false,
+                shape: Default::default(),
+                blinking: false,
             },
         )
         .unwrap();
@@ -973,7 +1101,7 @@ mod tests {
             switched
         );
         assert_eq!(PROTOCOL_VERSION_0_1, 0);
-        assert_eq!(PROTOCOL_VERSION, 14);
+        assert_eq!(PROTOCOL_VERSION, 16);
 
         let watch = ClientMessage::WatchResources;
         assert_eq!(
@@ -1038,6 +1166,15 @@ mod tests {
         assert_eq!(
             decode_payload::<ClientMessage>(&encode_payload(&resize).unwrap()).unwrap(),
             resize
+        );
+        let resize_split = ClientMessage::ResizeSplit {
+            tab_id: TabId::new(),
+            split_id: SplitId::new(),
+            ratio: SplitRatio::from_cells(37, 79).unwrap(),
+        };
+        assert_eq!(
+            decode_payload::<ClientMessage>(&encode_payload(&resize_split).unwrap()).unwrap(),
+            resize_split
         );
 
         let focused = SelectedTarget {
@@ -1236,6 +1373,53 @@ mod tests {
             response
         );
         assert_eq!(response.request_id, request.request_id);
+    }
+
+    #[test]
+    fn contextual_layout_commands_round_trip_complete_terminal_ancestry() {
+        let context = TerminalContext {
+            session_id: SessionId::new(),
+            workspace_id: WorkspaceId::new(),
+            tab_id: TabId::new(),
+            pane_id: PaneId::new(),
+            terminal_id: TerminalId::new(),
+        };
+        let commands = [
+            ContextualCommand::CreateTab {
+                name: Some("fresh".into()),
+                cwd: Some("/tmp/project".into()),
+                program: Some("/bin/sh".into()),
+                argv: vec!["-l".into()],
+            },
+            ContextualCommand::CreatePane {
+                cwd: None,
+                program: None,
+                argv: Vec::new(),
+            },
+            ContextualCommand::SplitPane {
+                direction: SplitDirection::Down,
+                cwd: None,
+                program: None,
+                argv: Vec::new(),
+            },
+            ContextualCommand::MovePane {
+                destination_tab_id: TabId::new(),
+            },
+            ContextualCommand::Close {
+                scope: ContextScope::Workspace,
+            },
+            ContextualCommand::Rename {
+                scope: ContextScope::Tab,
+                name: "renamed".into(),
+            },
+        ];
+        for command in commands {
+            let message = ClientMessage::Contextual { context, command };
+            assert_eq!(
+                decode_payload::<ClientMessage>(&encode_payload(&message).unwrap()).unwrap(),
+                message
+            );
+        }
     }
 
     #[test]

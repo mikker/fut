@@ -25,15 +25,15 @@ use std::{io, path::Path, process::Stdio, time::Duration};
 use actions::{ClientAction, FocusDirection, NavigationScope};
 use anyhow::{Context, bail};
 use bytes::Bytes;
-use chrome::{ResourceState, client_layout, render_tab_bar};
+use chrome::{MIN_DOCKED_TERMINAL_WIDTH, ResourceState, client_layout, render_tab_bar, sanitize};
 use command_bar::{CommandBarAction, CommandBarState};
-use config::{PaneLayoutPolicy, UiConfig};
+use config::{MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH, PaneLayoutPolicy, UiConfig};
 use copy_mode::{
     CopyModeErrorDisposition, CopyModeInput, CopyModePaste, CopyModeReply, CopyModeState,
 };
 use crossterm::{
     SynchronizedUpdate,
-    cursor::{Hide, Show},
+    cursor::{Hide, SetCursorStyle, Show},
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
         Event, EventStream, KeyModifiers, MouseButton as HostMouseButton,
@@ -50,7 +50,7 @@ use git::GitStatusCache;
 use input::{PrefixAction, PrefixState, encode_key};
 use jump::{JumpAction, JumpState};
 use layout::{
-    PaneLayout, authored_layout, authored_navigation_layout, directional_neighbor,
+    PaneLayout, SplitDivider, authored_layout, authored_navigation_layout, directional_neighbor,
     navigation_pane_layouts, pane_layouts,
 };
 use navigation::NavigationHistory;
@@ -62,7 +62,7 @@ use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Color, Modifier, Style},
-    widgets::Widget,
+    widgets::{Clear, Widget},
 };
 use rename::{RenameAction, RenameState};
 use tokio::{
@@ -80,16 +80,16 @@ use tab_bar::{TabBarAction, TabBarState};
 
 use crate::{
     domain::{
-        CellColor, CellStyle, MouseButton, MouseButtons, MouseEvent, MouseEventKind,
-        MouseModifiers, MouseWheelDirection, ScreenDelta, ScreenSnapshot, ScrollPosition,
+        CellColor, CellStyle, CursorShape, MouseButton, MouseButtons, MouseEvent, MouseEventKind,
+        MouseModifiers, MouseWheelDirection, ScreenDelta, ScreenSnapshot, ScrollPosition, SplitId,
         TerminalId, TerminalSize,
     },
     protocol::{
         ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, SelectedTarget, SelectedView,
         SelectionExpectation, ServerMessage, codec, decode_payload, encode_payload,
     },
-    resources::TargetSelector,
-    splits::SplitTree,
+    resources::{ResourceSnapshot, TargetSelector},
+    splits::{SplitRatio, SplitTree},
 };
 
 enum ClientSurface {
@@ -126,6 +126,47 @@ enum MouseButtonState {
 #[derive(Default)]
 struct MouseInputState {
     buttons: [MouseButtonState; 3],
+    ui_drag: Option<UiDrag>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UiDrag {
+    Sidebar {
+        position: config::WorkspaceSidebarPosition,
+        last_width: u16,
+        max_width: u16,
+    },
+    Split {
+        tab_id: crate::domain::TabId,
+        split_id: SplitId,
+        last_cell: (u16, u16),
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UiResizeAction {
+    Sidebar {
+        width: u16,
+    },
+    Split {
+        tab_id: crate::domain::TabId,
+        split_id: SplitId,
+        ratio: SplitRatio,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UiMouseRoute {
+    NotOwned,
+    Owned(Option<UiResizeAction>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SidebarDivider {
+    position: config::WorkspaceSidebarPosition,
+    area: Rect,
+    current_width: u16,
+    max_width: u16,
 }
 
 enum ClipboardResult {
@@ -144,6 +185,39 @@ pub async fn attach(socket_path: &Path, selector: Option<TargetSelector>) -> any
     attach_with_ui(socket_path, selector, load_ui_config()?).await
 }
 
+/// Open a lease-free global navigator on an existing daemon, then attach only
+/// after the user chooses a destination.
+pub async fn attach_navigator(socket_path: &Path) -> anyhow::Result<()> {
+    let ui = load_ui_config()?;
+    let mut navigator_connection = connect_control_navigator(socket_path).await?;
+    let snapshot = match time::timeout(Duration::from_secs(2), receive(&mut navigator_connection))
+        .await
+        .context("daemon resource snapshot timed out")??
+    {
+        ServerMessage::Resources { snapshot } => snapshot,
+        ServerMessage::Error { code, message } => bail!("daemon error ({code}): {message}"),
+        message => bail!("expected resources from daemon, received {message:?}"),
+    };
+
+    let guard = TerminalGuard::enter()?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let selector = initial_navigator(&mut terminal, &mut navigator_connection, snapshot).await?;
+    drop(navigator_connection);
+    let Some(selector) = selector else {
+        drop(terminal);
+        drop(guard);
+        return Ok(());
+    };
+
+    let (columns, rows) = crossterm::terminal::size().context("read terminal size")?;
+    let size = TerminalSize { columns, rows };
+    let (mut framed, selected) = connect_interactive(socket_path, Some(selector), size).await?;
+    let result = run(&mut terminal, &mut framed, selected, ui).await;
+    drop(terminal);
+    drop(guard);
+    result
+}
+
 pub(crate) fn load_ui_config() -> anyhow::Result<UiConfig> {
     config::load()
 }
@@ -153,25 +227,40 @@ pub(crate) async fn attach_with_ui(
     selector: Option<TargetSelector>,
     ui: UiConfig,
 ) -> anyhow::Result<()> {
+    let (columns, rows) = crossterm::terminal::size().context("read terminal size")?;
+    let (mut framed, selected) =
+        connect_interactive(socket_path, selector, TerminalSize { columns, rows }).await?;
+
+    // Host terminal state is changed only after a successful handshake.
+    let guard = TerminalGuard::enter()?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let result = run(&mut terminal, &mut framed, selected, ui).await;
+    drop(terminal);
+    drop(guard);
+    result
+}
+
+async fn connect_interactive(
+    socket_path: &Path,
+    selector: Option<TargetSelector>,
+    size: TerminalSize,
+) -> anyhow::Result<(
+    Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    SelectedView,
+)> {
     let stream = UnixStream::connect(socket_path)
         .await
         .with_context(|| format!("connect to {}", socket_path.display()))?;
-    let (columns, rows) = crossterm::terminal::size().context("read terminal size")?;
     let mut framed = Framed::new(stream, codec());
-
     send(
         &mut framed,
         ClientMessage::Hello {
             version: PROTOCOL_VERSION,
             client_version: env!("CARGO_PKG_VERSION").into(),
-            mode: ClientMode::Interactive {
-                size: TerminalSize { columns, rows },
-                selector,
-            },
+            mode: ClientMode::Interactive { size, selector },
         },
     )
     .await?;
-
     let selected = match time::timeout(Duration::from_secs(2), receive(&mut framed))
         .await
         .context("daemon handshake timed out")??
@@ -191,14 +280,92 @@ pub(crate) async fn attach_with_ui(
         ServerMessage::Error { code, message } => bail!("daemon error ({code}): {message}"),
         message => bail!("expected welcome from daemon, received {message:?}"),
     };
+    Ok((framed, selected))
+}
 
-    // Host terminal state is changed only after a successful handshake.
-    let guard = TerminalGuard::enter()?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let result = run(&mut terminal, &mut framed, selected, ui).await;
-    drop(terminal);
-    drop(guard);
-    result
+async fn connect_control_navigator(
+    socket_path: &Path,
+) -> anyhow::Result<Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>> {
+    let stream = UnixStream::connect(socket_path)
+        .await
+        .with_context(|| format!("connect to {}", socket_path.display()))?;
+    let mut framed = Framed::new(stream, codec());
+    send(
+        &mut framed,
+        ClientMessage::Hello {
+            version: PROTOCOL_VERSION,
+            client_version: env!("CARGO_PKG_VERSION").into(),
+            mode: ClientMode::Control,
+        },
+    )
+    .await?;
+    match time::timeout(Duration::from_secs(2), receive(&mut framed))
+        .await
+        .context("daemon handshake timed out")??
+    {
+        ServerMessage::Welcome {
+            version,
+            selected: None,
+            ..
+        } if version == PROTOCOL_VERSION => {}
+        ServerMessage::IncompatibleProtocol { client, server } => {
+            bail!("incompatible protocol: client {client}, server {server}")
+        }
+        ServerMessage::Error { code, message } => bail!("daemon error ({code}): {message}"),
+        message => bail!("expected control welcome from daemon, received {message:?}"),
+    }
+    send_request(
+        &mut framed,
+        Some(Uuid::new_v4()),
+        ClientMessage::WatchResources,
+    )
+    .await?;
+    Ok(framed)
+}
+
+async fn initial_navigator(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    snapshot: ResourceSnapshot,
+) -> anyhow::Result<Option<TargetSelector>> {
+    let mut navigator = NavigatorState::open_global();
+    navigator.accept_global_resources(&snapshot);
+    let mut events = EventStream::new();
+    let mut termination = TerminationSignals::subscribe()?;
+    loop {
+        terminal.draw(|frame| {
+            let area = frame.area();
+            frame.render_widget(Clear, area);
+            navigator.render(area, 0, frame.buffer_mut());
+        })?;
+        tokio::select! {
+            name = termination.recv() => bail!("terminated by {name}"),
+            event = events.next() => match event.transpose()? {
+                Some(Event::Key(key)) => {
+                    let visible = navigator::dialog_body_rows(terminal.size()?.into());
+                    match navigator.key(key, visible) {
+                        NavigatorAction::Stay => {}
+                        NavigatorAction::Close => return Ok(None),
+                        NavigatorAction::Select(selector) => return Ok(Some(selector)),
+                    }
+                }
+                Some(Event::Resize(_, _)) => {}
+                Some(_) => {}
+                None => return Ok(None),
+            },
+            frame = framed.next() => {
+                let Some(frame) = frame else { bail!("daemon disconnected while navigator was open") };
+                let envelope: Envelope<ServerMessage> = decode_payload(&frame?)?;
+                match envelope.message {
+                    ServerMessage::ResourcesChanged { snapshot } | ServerMessage::Resources { snapshot } => {
+                        navigator.accept_global_resources(&snapshot);
+                    }
+                    ServerMessage::Error { code, message } => bail!("daemon error ({code}): {message}"),
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 async fn run(
@@ -228,6 +395,7 @@ async fn run(
     let mut cheatsheet_at: Option<time::Instant> = None;
     let mut cheatsheet_visible = false;
     let mut spinner_frame = 0usize;
+    let mut host_cursor = HostCursorState::default();
     let mut perf = perf::PerfLog::from_env();
     let mut redraw = time::interval(Duration::from_millis(16));
     redraw.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -488,6 +656,8 @@ async fn run(
                         }
                         if old_terminal != view.focused().terminal_id {
                             mouse_input.clear();
+                        } else {
+                            mouse_input.reconcile_ui_drag(view.focused().tab_id, &view.layout);
                         }
                         workspace_history.record_transition(&previous_target, view.focused());
                         if copy_mode.as_ref().is_some_and(|copy_mode| {
@@ -594,6 +764,7 @@ async fn run(
                             continue;
                         }
                         view.remove(terminal_id);
+                        mouse_input.reconcile_ui_drag(view.focused().tab_id, &view.layout);
                         force_draw = true;
                     }
                     ServerMessage::Detached => break,
@@ -703,7 +874,11 @@ async fn run(
                     ).await?;
                     break
                 };
-                match event? {
+                let event = event?;
+                if !matches!(&event, Event::Mouse(_)) {
+                    mouse_input.cancel_ui_drag();
+                }
+                match event {
                     Event::Key(key) if copy_mode.is_some() => {
                         notice = None;
                         let input = copy_mode.as_mut().expect("copy mode exists").key(key);
@@ -1051,8 +1226,9 @@ async fn run(
                                     &mut split_pane,
                                     &mut focus,
                                     &mut copy_mode,
+                                    &mut prefix,
                                     terminal.size()?.into(),
-                                    &ui,
+                                    &mut ui,
                                 ).await?;
                                 force_draw = true;
                             }
@@ -1064,54 +1240,119 @@ async fn run(
                             force_draw = true;
                         }
                     }
-                    Event::Mouse(mouse)
-                        if surface.is_none() && rename.is_none() && copy_mode.is_none() => {
-                        let terminal_area = client_layout(
-                            terminal.size()?.into(),
+                    Event::Mouse(mouse) => {
+                        let host = terminal.size()?.into();
+                        let layout = client_layout(
+                            host,
                             &ui,
                             resources.workspace_count(view.focused()),
-                        ).terminal;
-                        if let Some(action) = mouse_input.route(
-                            &view,
-                            terminal_area,
-                            ui.pane_layout,
+                        );
+                        let unobstructed = app_overlay_clear(
+                            surface.is_none(),
+                            rename.is_none(),
+                            copy_mode.is_none(),
+                            cheatsheet_visible,
+                        );
+                        let open_sidebar = rename.is_none()
+                            && copy_mode.is_none()
+                            && matches!(surface.as_ref(), Some(ClientSurface::WorkspaceSidebar(_)));
+                        let visible_sidebar = layout.workspace_sidebar.and_then(|sidebar| {
+                            (open_sidebar || (unobstructed && sidebar.docked().is_some()))
+                                .then(|| {
+                                    let max_width = if sidebar.docked().is_some() {
+                                        host.width
+                                            .saturating_sub(MIN_DOCKED_TERMINAL_WIDTH)
+                                            .clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH)
+                                    } else {
+                                        MAX_SIDEBAR_WIDTH
+                                    };
+                                    sidebar_divider(
+                                        sidebar.area(),
+                                        ui.workspace_sidebar.position,
+                                        max_width,
+                                    )
+                                })
+                                .flatten()
+                        });
+                        let split_dividers = if unobstructed {
+                            view.pane_layouts(layout.terminal, ui.pane_layout).1
+                        } else {
+                            Vec::new()
+                        };
+                        match mouse_input.route_ui(
                             mouse,
-                        )
-                        {
-                            match action {
-                                PaneMouseAction::Input { terminal_id, event } => {
-                                    send(
-                                        framed,
-                                        ClientMessage::MouseInput {
-                                            terminal_id,
-                                            event,
-                                        },
-                                    ).await?;
-                                    mouse_input.finish_release(terminal_id, event);
-                                }
-                                PaneMouseAction::Focus(pane_id) => {
-                                    if let Some(request) = focus.begin(FocusOrigin::Pane) {
-                                        release_captured_mouse_input(
-                                            framed,
-                                            &mut mouse_input,
-                                            view.focused().terminal_id,
-                                        ).await?;
-                                        send_request(
-                                            framed,
-                                            Some(request),
-                                            ClientMessage::SelectTarget {
-                                                selector: TargetSelector::Pane(pane_id),
-                                                expected: Some(SelectionExpectation::Tab(
-                                                    view.focused().tab_id,
-                                                )),
-                                            },
-                                        ).await?;
+                            host,
+                            visible_sidebar,
+                            view.focused().tab_id,
+                            &split_dividers,
+                        ) {
+                            UiMouseRoute::Owned(Some(UiResizeAction::Sidebar { width })) => {
+                                ui.workspace_sidebar.width = width;
+                                resize_view(framed, host, &mut view, &resources, &ui).await?;
+                                view.invalidate_drawn();
+                                force_draw = true;
+                            }
+                            UiMouseRoute::Owned(Some(UiResizeAction::Split {
+                                tab_id,
+                                split_id,
+                                ratio,
+                            })) => {
+                                view.resize_split(tab_id, split_id, ratio);
+                                send(
+                                    framed,
+                                    ClientMessage::ResizeSplit {
+                                        tab_id,
+                                        split_id,
+                                        ratio,
+                                    },
+                                ).await?;
+                                resize_view(framed, host, &mut view, &resources, &ui).await?;
+                                force_draw = true;
+                            }
+                            UiMouseRoute::Owned(None) => {}
+                            UiMouseRoute::NotOwned if unobstructed => {
+                                if let Some(action) = mouse_input.route(
+                                    &view,
+                                    layout.terminal,
+                                    ui.pane_layout,
+                                    mouse,
+                                ) {
+                                    match action {
+                                        PaneMouseAction::Input { terminal_id, event } => {
+                                            send(
+                                                framed,
+                                                ClientMessage::MouseInput {
+                                                    terminal_id,
+                                                    event,
+                                                },
+                                            ).await?;
+                                            mouse_input.finish_release(terminal_id, event);
+                                        }
+                                        PaneMouseAction::Focus(pane_id) => {
+                                            if let Some(request) = focus.begin(FocusOrigin::Pane) {
+                                                release_captured_mouse_input(
+                                                    framed,
+                                                    &mut mouse_input,
+                                                    view.focused().terminal_id,
+                                                ).await?;
+                                                send_request(
+                                                    framed,
+                                                    Some(request),
+                                                    ClientMessage::SelectTarget {
+                                                        selector: TargetSelector::Pane(pane_id),
+                                                        expected: Some(SelectionExpectation::Tab(
+                                                            view.focused().tab_id,
+                                                        )),
+                                                    },
+                                                ).await?;
+                                            }
+                                        }
                                     }
                                 }
                             }
+                            UiMouseRoute::NotOwned => mouse_input.discard(mouse),
+                            }
                         }
-                    }
-                    Event::Mouse(mouse) => mouse_input.discard(mouse),
                     Event::Key(key) if surface.is_none() && copy_mode.is_none() => if let Some(bytes) = encode_key(key) {
                         notice = None;
                         let was_visible = cheatsheet_visible;
@@ -1154,8 +1395,9 @@ async fn run(
                                     &mut split_pane,
                                     &mut focus,
                                     &mut copy_mode,
+                                    &mut prefix,
                                     terminal.size()?.into(),
-                                    &ui,
+                                    &mut ui,
                                 ).await?;
                                 force_draw = true;
                             }
@@ -1260,7 +1502,8 @@ async fn run(
                 .flatten()
                 .filter(|_| rename.is_none() && notice.is_none());
                 let draw_started = std::time::Instant::now();
-                io::stdout().sync_update(|_| {
+                io::stdout().sync_update(|stdout| -> io::Result<()> {
+                    let mut rendered_cursor = None;
                     terminal.draw(|frame| {
                         let area = frame.area();
                         let layout = client_layout(
@@ -1360,20 +1603,25 @@ async fn run(
                                 notice.as_deref(),
                             );
                         }
-                        if surface.is_none()
-                            && rename.is_none()
-                            && copy_mode.is_none()
+                        if app_overlay_clear(
+                            surface.is_none(),
+                            rename.is_none(),
+                            copy_mode.is_none(),
+                            cheatsheet_visible,
+                        )
                             && notice.is_none()
-                            && let Some((column, row)) = cursor
+                            && let Some(cursor) = cursor
                         {
-                            frame.set_cursor_position((column, row));
+                            frame.set_cursor_position((cursor.column, cursor.row));
+                            rendered_cursor = Some(cursor);
                         }
                         if copy_mode.is_none()
                             && let Some(message) = notice.as_deref()
                         {
                             render_notice(area, frame.buffer_mut(), message);
                         }
-                    })
+                    })?;
+                    host_cursor.apply(stdout, rendered_cursor)
                 })??;
                 if let Some(perf) = perf.as_mut() {
                     perf.record("draw", draw_started.elapsed(), 0);
@@ -1470,6 +1718,139 @@ fn accepts_client_input(
 }
 
 impl MouseInputState {
+    fn route_ui(
+        &mut self,
+        mouse: HostMouseEvent,
+        host: Rect,
+        sidebar: Option<SidebarDivider>,
+        tab_id: crate::domain::TabId,
+        split_dividers: &[SplitDivider],
+    ) -> UiMouseRoute {
+        if let Some(drag) = self.ui_drag {
+            let finish = matches!(mouse.kind, HostMouseEventKind::Up(HostMouseButton::Left));
+            let resize = match drag {
+                UiDrag::Sidebar {
+                    position,
+                    last_width,
+                    max_width,
+                } => matches!(
+                    mouse.kind,
+                    HostMouseEventKind::Drag(HostMouseButton::Left)
+                        | HostMouseEventKind::Moved
+                        | HostMouseEventKind::Up(HostMouseButton::Left)
+                )
+                .then(|| {
+                    let width = sidebar_width_at(host, position, mouse.column, max_width);
+                    (width != last_width).then_some(UiResizeAction::Sidebar { width })
+                })
+                .flatten(),
+                UiDrag::Split {
+                    tab_id,
+                    split_id,
+                    last_cell,
+                } => matches!(
+                    mouse.kind,
+                    HostMouseEventKind::Drag(HostMouseButton::Left)
+                        | HostMouseEventKind::Moved
+                        | HostMouseEventKind::Up(HostMouseButton::Left)
+                )
+                .then(|| {
+                    let divider = split_dividers
+                        .iter()
+                        .copied()
+                        .find(|divider| divider.split_id == split_id)?;
+                    let first = divider.first_size_at(mouse.column, mouse.row);
+                    (first != divider.first_size && (divider.available, first) != last_cell).then(
+                        || UiResizeAction::Split {
+                            tab_id,
+                            split_id,
+                            ratio: SplitRatio::from_cells(first, divider.available)
+                                .expect("layout minima keep both split children nonempty"),
+                        },
+                    )
+                })
+                .flatten(),
+            };
+            if let Some(resize) = resize {
+                match (&mut self.ui_drag, resize) {
+                    (
+                        Some(UiDrag::Sidebar { last_width, .. }),
+                        UiResizeAction::Sidebar { width },
+                    ) => {
+                        *last_width = width;
+                    }
+                    (
+                        Some(UiDrag::Split { last_cell, .. }),
+                        UiResizeAction::Split {
+                            split_id, ratio, ..
+                        },
+                    ) => {
+                        if let Some(divider) = split_dividers
+                            .iter()
+                            .find(|divider| divider.split_id == split_id)
+                        {
+                            *last_cell = (divider.available, ratio.first_cells(divider.available));
+                        }
+                    }
+                    _ => unreachable!("UI resize action matches its drag owner"),
+                }
+            }
+            if finish {
+                self.ui_drag = None;
+            }
+            return UiMouseRoute::Owned(resize);
+        }
+
+        if !matches!(mouse.kind, HostMouseEventKind::Down(HostMouseButton::Left))
+            || !self
+                .buttons
+                .iter()
+                .all(|button| matches!(button, MouseButtonState::Idle))
+        {
+            return UiMouseRoute::NotOwned;
+        }
+        if let Some(sidebar) = sidebar
+            && rect_contains(sidebar.area, mouse.column, mouse.row)
+        {
+            self.ui_drag = Some(UiDrag::Sidebar {
+                position: sidebar.position,
+                last_width: sidebar.current_width,
+                max_width: sidebar.max_width,
+            });
+            return UiMouseRoute::Owned(None);
+        }
+        if let Some(divider) = split_dividers
+            .iter()
+            .copied()
+            .find(|divider| divider.contains(mouse.column, mouse.row))
+        {
+            self.ui_drag = Some(UiDrag::Split {
+                tab_id,
+                split_id: divider.split_id,
+                last_cell: (divider.available, divider.first_size),
+            });
+            return UiMouseRoute::Owned(None);
+        }
+        UiMouseRoute::NotOwned
+    }
+
+    fn cancel_ui_drag(&mut self) {
+        self.ui_drag = None;
+    }
+
+    fn reconcile_ui_drag(&mut self, tab_id: crate::domain::TabId, layout: &SplitTree) {
+        if matches!(
+            self.ui_drag,
+            Some(UiDrag::Split {
+                tab_id: drag_tab,
+                split_id,
+                ..
+            }) if drag_tab != tab_id || layout.ratio(split_id).is_none()
+        ) {
+            self.ui_drag = None;
+        }
+    }
+
     fn route(
         &mut self,
         view: &ViewState,
@@ -1729,7 +2110,54 @@ impl MouseInputState {
 
     fn clear(&mut self) {
         self.buttons.fill(MouseButtonState::Idle);
+        self.ui_drag = None;
     }
+}
+
+fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x && column < area.right() && row >= area.y && row < area.bottom()
+}
+
+fn app_overlay_clear(
+    surface_clear: bool,
+    rename_clear: bool,
+    copy_mode_clear: bool,
+    cheatsheet_visible: bool,
+) -> bool {
+    surface_clear && rename_clear && copy_mode_clear && !cheatsheet_visible
+}
+
+fn sidebar_width_at(
+    host: Rect,
+    position: config::WorkspaceSidebarPosition,
+    column: u16,
+    max_width: u16,
+) -> u16 {
+    let width = match position {
+        config::WorkspaceSidebarPosition::Left => column.saturating_sub(host.x).saturating_add(1),
+        config::WorkspaceSidebarPosition::Right => host.right().saturating_sub(column),
+    };
+    width.clamp(MIN_SIDEBAR_WIDTH, max_width)
+}
+
+fn sidebar_divider(
+    sidebar: Rect,
+    position: config::WorkspaceSidebarPosition,
+    max_width: u16,
+) -> Option<SidebarDivider> {
+    if sidebar.width < MIN_SIDEBAR_WIDTH || sidebar.height == 0 {
+        return None;
+    }
+    let x = match position {
+        config::WorkspaceSidebarPosition::Left => sidebar.right() - 1,
+        config::WorkspaceSidebarPosition::Right => sidebar.x,
+    };
+    Some(SidebarDivider {
+        position,
+        area: Rect::new(x, sidebar.y, 1, sidebar.height),
+        current_width: sidebar.width,
+        max_width,
+    })
 }
 
 fn normalized_mouse_event(
@@ -1802,8 +2230,9 @@ async fn dispatch_client_action(
     split_pane: &mut CreateState,
     focus: &mut FocusState,
     copy_mode: &mut Option<CopyModeState>,
+    prefix: &mut PrefixState,
     host: Rect,
-    ui: &UiConfig,
+    ui: &mut UiConfig,
 ) -> anyhow::Result<Option<String>> {
     match action {
         ClientAction::OpenCommandBar => {
@@ -1811,6 +2240,21 @@ async fn dispatch_client_action(
                 CommandBarState::open_with_bindings(ui.bindings.clone()),
             ));
         }
+        ClientAction::ReloadConfig => match load_ui_config() {
+            Ok(reloaded) => {
+                prefix.replace_bindings(reloaded.bindings.clone());
+                *ui = reloaded;
+                resize_view(framed, host, view, resources, ui).await?;
+                view.invalidate_drawn();
+                return Ok(Some("config reloaded".into()));
+            }
+            Err(error) => {
+                return Ok(Some(format!(
+                    "config reload failed · {}",
+                    one_line_error(&error)
+                )));
+            }
+        },
         ClientAction::EnterCopyMode => {
             if copy_mode.is_none() {
                 let mut state = CopyModeState::enter(view.focused().terminal_id);
@@ -1894,7 +2338,7 @@ async fn dispatch_client_action(
                 .notifications()
                 .next(snapshot, view.focused().terminal_id)
             else {
-                return Ok(Some("no terminals waiting".into()));
+                return Ok(None);
             };
             if let Some(request) = focus.begin(FocusOrigin::Notification) {
                 send_request(
@@ -2508,6 +2952,9 @@ impl ViewState {
         {
             bail!("daemon pane view spans multiple tabs");
         }
+        if !selected.layout.validate() {
+            bail!("daemon pane view contains an invalid split layout");
+        }
         for (index, pane) in selected.panes.iter().enumerate() {
             if selected.panes[..index].iter().any(|previous| {
                 previous.terminal_id == pane.terminal_id || previous.pane_id == pane.pane_id
@@ -2729,7 +3176,7 @@ impl ViewState {
         policy: PaneLayoutPolicy,
     ) -> (
         std::collections::BTreeMap<TerminalId, PaneLayout>,
-        Vec<Rect>,
+        Vec<SplitDivider>,
     ) {
         match policy {
             PaneLayoutPolicy::Accordion => (
@@ -2759,6 +3206,12 @@ impl ViewState {
                     .collect();
                 (panes, authored.dividers)
             }
+        }
+    }
+
+    fn resize_split(&mut self, tab_id: crate::domain::TabId, split_id: SplitId, ratio: SplitRatio) {
+        if self.focused().tab_id == tab_id && self.layout.resize(split_id, ratio) {
+            self.invalidate_drawn();
         }
     }
 
@@ -2849,19 +3302,62 @@ async fn resize_view(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RenderedCursor {
+    column: u16,
+    row: u16,
+    shape: CursorShape,
+    blinking: bool,
+}
+
+impl RenderedCursor {
+    fn host_style(self) -> SetCursorStyle {
+        match (self.shape, self.blinking) {
+            (CursorShape::Block, true) => SetCursorStyle::BlinkingBlock,
+            (CursorShape::Block, false) => SetCursorStyle::SteadyBlock,
+            (CursorShape::Underline, true) => SetCursorStyle::BlinkingUnderScore,
+            (CursorShape::Underline, false) => SetCursorStyle::SteadyUnderScore,
+            (CursorShape::Bar, true) => SetCursorStyle::BlinkingBar,
+            (CursorShape::Bar, false) => SetCursorStyle::SteadyBar,
+        }
+    }
+}
+
+#[derive(Default)]
+struct HostCursorState {
+    applied: Option<SetCursorStyle>,
+}
+
+impl HostCursorState {
+    fn apply(
+        &mut self,
+        writer: &mut impl io::Write,
+        cursor: Option<RenderedCursor>,
+    ) -> io::Result<()> {
+        let style = cursor.map_or(SetCursorStyle::DefaultUserShape, RenderedCursor::host_style);
+        if self.applied == Some(style) {
+            return Ok(());
+        }
+        execute!(writer, style)?;
+        self.applied = Some(style);
+        Ok(())
+    }
+}
+
 fn render_view(
     view: &ViewState,
     area: Rect,
     policy: PaneLayoutPolicy,
     styles: &config::StylesConfig,
     buffer: &mut Buffer,
-) -> Option<(u16, u16)> {
+) -> Option<RenderedCursor> {
     let (layouts, dividers) = view.pane_layouts(area, policy);
     let divider_style = styles.apply(
         config::SemanticStyle::Divider,
         styles.apply(config::SemanticStyle::Normal, Style::default()),
     );
     for divider in dividers {
+        let divider = divider.area;
         let symbol = if divider.width == 1 { "│" } else { "─" };
         for row in divider.y..divider.y + divider.height {
             for column in divider.x..divider.x + divider.width {
@@ -2906,10 +3402,12 @@ fn render_view(
             && screen.cursor.column < content.width
             && screen.cursor.row < content.height
         {
-            cursor = Some((
-                content.x + screen.cursor.column,
-                content.y + screen.cursor.row,
-            ));
+            cursor = Some(RenderedCursor {
+                column: content.x + screen.cursor.column,
+                row: content.y + screen.cursor.row,
+                shape: screen.cursor.shape,
+                blinking: screen.cursor.blinking,
+            });
         }
     }
     cursor
@@ -2927,6 +3425,14 @@ fn render_notice(area: Rect, buffer: &mut Buffer, message: &str) {
         usize::from(area.width),
         Style::default().add_modifier(Modifier::REVERSED),
     );
+}
+
+fn one_line_error(error: &anyhow::Error) -> String {
+    let collapsed = format!("{error:#}")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    sanitize(&collapsed)
 }
 
 /// Overlay scrollbar on a pane's right edge, shown only while the viewport
@@ -3103,7 +3609,7 @@ impl Drop for TerminalGuard {
             let _ = execute!(stdout, EnableLineWrap);
         }
         if self.cursor_hidden {
-            let _ = execute!(stdout, Show);
+            let _ = restore_host_cursor(&mut stdout);
         }
         if self.mouse_capture {
             let _ = execute!(stdout, DisableMouseCapture);
@@ -3118,6 +3624,10 @@ impl Drop for TerminalGuard {
             let _ = disable_raw_mode();
         }
     }
+}
+
+fn restore_host_cursor(writer: &mut impl io::Write) -> io::Result<()> {
+    execute!(writer, SetCursorStyle::DefaultUserShape, Show)
 }
 
 #[cfg(test)]
@@ -3234,6 +3744,8 @@ mod tests {
                     column: 0,
                     row: 0,
                     visible: true,
+                    shape: Default::default(),
+                    blinking: false,
                 },
             )
             .unwrap()
@@ -3273,6 +3785,59 @@ mod tests {
         state.invalidate_drawn();
         assert!(state.needs_draw());
         assert!(!state.accept(TerminalId::new(), snapshot(100)));
+    }
+
+    #[test]
+    fn cursor_only_delta_updates_the_interactive_cursor_style() {
+        let target = targets(1).remove(0);
+        let terminal_id = target.terminal_id;
+        let mut state = ViewState::new(selected_view(1, target.clone(), vec![target])).unwrap();
+        let size = TerminalSize {
+            columns: 1,
+            rows: 1,
+        };
+        assert!(
+            state.accept(
+                terminal_id,
+                ScreenSnapshot::new(
+                    1,
+                    size,
+                    vec![Cell::default()],
+                    Cursor {
+                        column: 0,
+                        row: 0,
+                        visible: true,
+                        shape: CursorShape::Block,
+                        blinking: false,
+                    },
+                )
+                .unwrap(),
+            )
+        );
+
+        assert!(matches!(
+            state.accept_delta(
+                terminal_id,
+                ScreenDelta {
+                    revision: 2,
+                    base_revision: 1,
+                    size,
+                    rows: Vec::new(),
+                    cursor: Cursor {
+                        column: 0,
+                        row: 0,
+                        visible: true,
+                        shape: CursorShape::Underline,
+                        blinking: true,
+                    },
+                    scroll: ScrollPosition::default(),
+                },
+            ),
+            DeltaApplyResult::Applied
+        ));
+        let cursor = state.panes[0].pending.as_ref().unwrap().cursor;
+        assert_eq!(cursor.shape, CursorShape::Underline);
+        assert!(cursor.blinking);
     }
 
     #[test]
@@ -3903,6 +4468,288 @@ mod tests {
     }
 
     #[test]
+    fn ui_drag_ownership_is_left_only_stable_and_release_uses_the_final_cell() {
+        let panes = targets(3);
+        let state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
+        let host = Rect::new(0, 0, 100, 30);
+        let dividers = state.pane_layouts(host, PaneLayoutPolicy::Splits).1;
+        let divider = dividers[0];
+        let mut input = MouseInputState::default();
+
+        assert_eq!(
+            input.route_ui(
+                HostMouseEvent {
+                    kind: HostMouseEventKind::Down(HostMouseButton::Right),
+                    column: divider.area.x,
+                    row: divider.area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                host,
+                None,
+                panes[0].tab_id,
+                &dividers,
+            ),
+            UiMouseRoute::NotOwned
+        );
+        assert_eq!(
+            input.route_ui(
+                HostMouseEvent {
+                    kind: HostMouseEventKind::Down(HostMouseButton::Left),
+                    column: divider.area.x,
+                    row: divider.area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                host,
+                None,
+                panes[0].tab_id,
+                &dividers,
+            ),
+            UiMouseRoute::Owned(None)
+        );
+        assert!(input.synthetic_releases(panes[0].terminal_id).is_empty());
+
+        let final_column = divider.branch_area.x + divider.first_max;
+        assert_eq!(
+            input.route_ui(
+                HostMouseEvent {
+                    kind: HostMouseEventKind::Up(HostMouseButton::Left),
+                    column: final_column,
+                    row: u16::MAX,
+                    modifiers: KeyModifiers::NONE,
+                },
+                host,
+                None,
+                panes[0].tab_id,
+                &dividers,
+            ),
+            UiMouseRoute::Owned(Some(UiResizeAction::Split {
+                tab_id: panes[0].tab_id,
+                split_id: divider.split_id,
+                ratio: SplitRatio::from_cells(divider.first_max, divider.available).unwrap(),
+            }))
+        );
+        assert!(input.ui_drag.is_none());
+    }
+
+    #[test]
+    fn ui_drag_waits_until_every_application_mouse_button_is_idle() {
+        let panes = targets(2);
+        let state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
+        let host = Rect::new(0, 0, 80, 23);
+        let (layouts, dividers) = state.pane_layouts(host, PaneLayoutPolicy::Splits);
+        let content = layouts[&panes[0].terminal_id].content;
+        let divider = dividers[0];
+        let mut input = MouseInputState::default();
+
+        assert!(matches!(
+            input.route(
+                &state,
+                host,
+                PaneLayoutPolicy::Splits,
+                HostMouseEvent {
+                    kind: HostMouseEventKind::Down(HostMouseButton::Right),
+                    column: content.x,
+                    row: content.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+            ),
+            Some(PaneMouseAction::Input {
+                event: MouseEvent {
+                    kind: MouseEventKind::Press {
+                        button: MouseButton::Right
+                    },
+                    ..
+                },
+                ..
+            })
+        ));
+        assert_eq!(
+            input.route_ui(
+                HostMouseEvent {
+                    kind: HostMouseEventKind::Down(HostMouseButton::Left),
+                    column: divider.area.x,
+                    row: divider.area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                host,
+                None,
+                panes[0].tab_id,
+                &dividers,
+            ),
+            UiMouseRoute::NotOwned
+        );
+        assert!(input.ui_drag.is_none());
+        assert!(matches!(
+            input.route(
+                &state,
+                host,
+                PaneLayoutPolicy::Splits,
+                HostMouseEvent {
+                    kind: HostMouseEventKind::Up(HostMouseButton::Right),
+                    column: content.x,
+                    row: content.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+            ),
+            Some(PaneMouseAction::Input {
+                event: MouseEvent {
+                    kind: MouseEventKind::Release {
+                        button: MouseButton::Right
+                    },
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn sidebar_precedes_panes_and_both_sidebar_edges_resize_without_app_capture() {
+        let panes = targets(2);
+        let state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
+        let host = Rect::new(0, 0, 140, 24);
+        let dividers = state.pane_layouts(host, PaneLayoutPolicy::Splits).1;
+        let pane_divider = dividers[0];
+        let sidebar = SidebarDivider {
+            position: config::WorkspaceSidebarPosition::Left,
+            area: pane_divider.area,
+            current_width: 28,
+            max_width: 44,
+        };
+        let mut input = MouseInputState::default();
+        assert_eq!(
+            input.route_ui(
+                HostMouseEvent {
+                    kind: HostMouseEventKind::Down(HostMouseButton::Left),
+                    column: sidebar.area.x,
+                    row: sidebar.area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                host,
+                Some(sidebar),
+                panes[0].tab_id,
+                &dividers,
+            ),
+            UiMouseRoute::Owned(None)
+        );
+        assert!(matches!(input.ui_drag, Some(UiDrag::Sidebar { .. })));
+        assert_eq!(
+            input.route_ui(
+                HostMouseEvent {
+                    kind: HostMouseEventKind::Drag(HostMouseButton::Left),
+                    column: 60,
+                    row: 23,
+                    modifiers: KeyModifiers::NONE,
+                },
+                host,
+                None,
+                panes[0].tab_id,
+                &[],
+            ),
+            UiMouseRoute::Owned(Some(UiResizeAction::Sidebar { width: 44 }))
+        );
+        input.clear();
+
+        let right = SidebarDivider {
+            position: config::WorkspaceSidebarPosition::Right,
+            area: Rect::new(112, 0, 1, 24),
+            current_width: 28,
+            max_width: 80,
+        };
+        input.route_ui(
+            HostMouseEvent {
+                kind: HostMouseEventKind::Down(HostMouseButton::Left),
+                column: right.area.x,
+                row: 3,
+                modifiers: KeyModifiers::NONE,
+            },
+            host,
+            Some(right),
+            panes[0].tab_id,
+            &dividers,
+        );
+        assert_eq!(
+            input.route_ui(
+                HostMouseEvent {
+                    kind: HostMouseEventKind::Up(HostMouseButton::Left),
+                    column: 119,
+                    row: 3,
+                    modifiers: KeyModifiers::NONE,
+                },
+                host,
+                None,
+                panes[0].tab_id,
+                &dividers,
+            ),
+            UiMouseRoute::Owned(Some(UiResizeAction::Sidebar { width: 21 }))
+        );
+        assert!(input.synthetic_releases(panes[0].terminal_id).is_empty());
+
+        assert_eq!(
+            sidebar_divider(
+                Rect::new(0, 0, MIN_SIDEBAR_WIDTH - 1, 24),
+                config::WorkspaceSidebarPosition::Left,
+                MAX_SIDEBAR_WIDTH,
+            ),
+            None,
+            "a host-clipped drawer cannot replace the configured width on click"
+        );
+    }
+
+    #[test]
+    fn cheatsheet_obstructs_application_mouse_and_cursor_routing() {
+        assert!(app_overlay_clear(true, true, true, false));
+        assert!(!app_overlay_clear(true, true, true, true));
+    }
+
+    #[test]
+    fn terminal_originated_drag_never_turns_into_a_divider_drag() {
+        let panes = targets(2);
+        let state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
+        let host = Rect::new(0, 0, 80, 23);
+        let (layouts, dividers) = state.pane_layouts(host, PaneLayoutPolicy::Splits);
+        let content = layouts[&panes[0].terminal_id].content;
+        let mut input = MouseInputState::default();
+        assert!(matches!(
+            input.route(
+                &state,
+                host,
+                PaneLayoutPolicy::Splits,
+                HostMouseEvent {
+                    kind: HostMouseEventKind::Down(HostMouseButton::Left),
+                    column: content.x,
+                    row: content.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+            ),
+            Some(PaneMouseAction::Input { .. })
+        ));
+        let divider = dividers[0];
+        let drag = HostMouseEvent {
+            kind: HostMouseEventKind::Drag(HostMouseButton::Left),
+            column: divider.area.x,
+            row: divider.area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            input.route_ui(drag, host, None, panes[0].tab_id, &dividers),
+            UiMouseRoute::NotOwned
+        );
+        assert!(matches!(
+            input.route(&state, host, PaneLayoutPolicy::Splits, drag),
+            Some(PaneMouseAction::Input {
+                event: MouseEvent {
+                    kind: MouseEventKind::Motion {
+                        button: Some(MouseButton::Left)
+                    },
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn pane_zoom_is_explicit_tracks_focus_and_resets_across_tabs() {
         let panes = targets(2);
         let first = panes[0].terminal_id;
@@ -3987,6 +4834,8 @@ mod tests {
                     column: 0,
                     row: 0,
                     visible: true,
+                    shape: CursorShape::Bar,
+                    blinking: true,
                 },
             )
             .unwrap()
@@ -4005,7 +4854,12 @@ mod tests {
                 &UiConfig::default().styles,
                 &mut buffer,
             ),
-            Some((1, 0))
+            Some(RenderedCursor {
+                column: 1,
+                row: 0,
+                shape: CursorShape::Bar,
+                blinking: true,
+            })
         );
         assert_eq!(buffer[(0, 0)].symbol(), "┃");
         assert!(buffer[(0, 0)].modifier.contains(Modifier::BOLD));
@@ -4028,7 +4882,12 @@ mod tests {
                 &UiConfig::default().styles,
                 &mut moved,
             ),
-            Some((14, 0))
+            Some(RenderedCursor {
+                column: 14,
+                row: 0,
+                shape: CursorShape::Bar,
+                blinking: true,
+            })
         );
         assert_eq!(moved[(0, 0)].fg, Color::DarkGray);
         assert!(moved[(13, 0)].modifier.contains(Modifier::BOLD));
@@ -4043,10 +4902,65 @@ mod tests {
                 &UiConfig::default().styles,
                 &mut tiny_buffer,
             ),
-            Some((0, 0))
+            Some(RenderedCursor {
+                column: 0,
+                row: 0,
+                shape: CursorShape::Bar,
+                blinking: true,
+            })
         );
         assert_eq!(tiny_buffer[(0, 0)].symbol(), "B");
         assert!((0..tiny.width).all(|column| tiny_buffer[(column, 0)].symbol() != "┃"));
+    }
+
+    #[test]
+    fn host_cursor_styles_cover_shapes_blinking_caching_and_modal_reset() {
+        let mut state = HostCursorState::default();
+        let mut output = Vec::new();
+        let cursor = |shape, blinking| {
+            Some(RenderedCursor {
+                column: 0,
+                row: 0,
+                shape,
+                blinking,
+            })
+        };
+
+        state
+            .apply(&mut output, cursor(CursorShape::Block, true))
+            .unwrap();
+        state
+            .apply(&mut output, cursor(CursorShape::Block, true))
+            .unwrap();
+        state
+            .apply(&mut output, cursor(CursorShape::Block, false))
+            .unwrap();
+        state
+            .apply(&mut output, cursor(CursorShape::Underline, true))
+            .unwrap();
+        state
+            .apply(&mut output, cursor(CursorShape::Underline, false))
+            .unwrap();
+        state
+            .apply(&mut output, cursor(CursorShape::Bar, true))
+            .unwrap();
+        state
+            .apply(&mut output, cursor(CursorShape::Bar, false))
+            .unwrap();
+        state.apply(&mut output, None).unwrap();
+        state.apply(&mut output, None).unwrap();
+        state
+            .apply(&mut output, cursor(CursorShape::Bar, false))
+            .unwrap();
+
+        assert_eq!(
+            output,
+            b"\x1b[1 q\x1b[2 q\x1b[3 q\x1b[4 q\x1b[5 q\x1b[6 q\x1b[0 q\x1b[6 q"
+        );
+
+        let mut cleanup = Vec::new();
+        restore_host_cursor(&mut cleanup).unwrap();
+        assert_eq!(cleanup, b"\x1b[0 q\x1b[?25h");
     }
 
     #[test]

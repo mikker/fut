@@ -101,6 +101,10 @@ impl PrefixState {
         }
     }
 
+    pub(super) fn replace_bindings(&mut self, bindings: BindingsConfig) {
+        self.bindings = bindings;
+    }
+
     pub(super) fn feed(&mut self, bytes: Vec<u8>) -> PrefixAction {
         if !self.waiting {
             if bytes == [2] {
@@ -111,10 +115,10 @@ impl PrefixState {
             }
         } else {
             self.waiting = false;
-            if bytes == [2] {
-                PrefixAction::Send(vec![2])
-            } else if let Some(action) = self.bindings.action_for_suffix(&bytes) {
+            if let Some(action) = self.bindings.action_for_suffix(&bytes) {
                 PrefixAction::Dispatch(action)
+            } else if bytes == [2] {
+                PrefixAction::Send(vec![2])
             } else {
                 PrefixAction::Send([vec![2], bytes].concat())
             }
@@ -166,7 +170,7 @@ mod tests {
     }
 
     #[test]
-    fn prefix_detaches_escapes_itself_and_preserves_other_sequences() {
+    fn prefix_dispatches_itself_and_preserves_other_sequences() {
         let mut prefix = PrefixState::default();
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
         assert_eq!(
@@ -244,7 +248,10 @@ mod tests {
             PrefixAction::Dispatch(ClientAction::FocusPreviousWorkspace)
         );
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
-        assert_eq!(prefix.feed(vec![2]), PrefixAction::Send(vec![2]));
+        assert_eq!(
+            prefix.feed(vec![2]),
+            PrefixAction::Dispatch(ClientAction::FocusNextNotification)
+        );
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
         assert_eq!(
             prefix.feed(b"x".to_vec()),
