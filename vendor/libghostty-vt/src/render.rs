@@ -974,9 +974,13 @@ impl CellIteration<'_, '_> {
 /// Cell fields needed by renderers for every grid position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CellBasicData {
+    /// The complete underlying cell value.
     pub raw_cell: Cell,
+    /// The kind of content stored in the cell.
     pub content_tag: CellContentTag,
+    /// The cell's Unicode code point.
     pub codepoint: u32,
+    /// Whether the cell has any explicit styling.
     pub has_styling: bool,
 }
 

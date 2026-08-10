@@ -34,6 +34,8 @@ impl Allocator<'_> {
     pub(crate) fn to_raw(&self) -> *const ffi::Allocator {
         std::ptr::from_ref(&self.inner)
     }
+
+    #[cfg(feature = "kitty-graphics")]
     pub(crate) unsafe fn from_raw(raw: *const ffi::Allocator) -> Self {
         Self {
             inner: unsafe { *raw },
@@ -65,11 +67,13 @@ impl<T> Object<'_, T> {
 
 /// Borrowed version of `Object`.
 #[derive(Debug)]
+#[cfg(feature = "kitty-graphics")]
 pub(crate) struct Ref<'a, T> {
     pub(crate) ptr: NonNull<T>,
     _phan: PhantomData<&'a ()>,
 }
 
+#[cfg(feature = "kitty-graphics")]
 impl<T> Ref<'_, T> {
     pub(crate) fn new(raw: *mut T) -> Result<Self> {
         let ptr = NonNull::new(raw).ok_or(Error::OutOfMemory)?;
