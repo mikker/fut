@@ -1211,14 +1211,19 @@ impl GhosttyTerminal {
         };
 
         let expected = usize::from(self.size.columns) * usize::from(self.size.rows);
+        let has_selection = self.terminal.selection()?.is_some();
         let mut result = Vec::with_capacity(expected);
-        let mut widths = Vec::with_capacity(expected);
+        let mut widths = has_selection.then(|| Vec::with_capacity(expected));
         let mut contents_buffer = String::new();
         let mut rows = self.rows.update(&snapshot)?;
         while let Some(row) = rows.next() {
             // Row-local selection range, fetched once per row instead of
             // once per cell (see `CellIteration::is_selected`'s docs).
-            let selection = row.selection()?;
+            let selection = if has_selection {
+                row.selection()?
+            } else {
+                None
+            };
             let mut cells = self.cells.update(row)?;
             let mut column: u16 = 0;
             while let Some(cell) = cells.next() {
@@ -1247,7 +1252,9 @@ impl GhosttyTerminal {
                     }
                     _ => color(ghostty_style.bg_color),
                 };
-                widths.push(raw_cell.wide()?);
+                if let Some(widths) = &mut widths {
+                    widths.push(raw_cell.wide()?);
+                }
                 let selected =
                     selection.is_some_and(|range| column >= range.start_x && column <= range.end_x);
                 result.push(Cell {
@@ -1265,7 +1272,9 @@ impl GhosttyTerminal {
                 column += 1;
             }
         }
-        normalize_wide_selection(&mut result, &widths, self.size.columns);
+        if let Some(widths) = widths {
+            normalize_wide_selection(&mut result, &widths, self.size.columns);
+        }
         result.resize(expected, Cell::default());
         result.truncate(expected);
         let revision = self
