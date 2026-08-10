@@ -131,6 +131,66 @@ Also fixed en route: the perf client never resized its pane (all previous
 scenarios silently ran at 80x24 — earlier rounds' absolute numbers are not
 comparable across that fix), and a client panic on malformed delta rows.
 
+### Round 5 (2026-08-10): cell capture and representation, commits f7f8d38..a6376d8
+
+An autoresearch pass used an aggregate of eleven feed, encode, decode, and
+clone operations across plain, styled, TUI, and dense 200x50 workloads. The
+benchmark definition was frozen before the baseline and every kept change
+passed formatting, clippy, unit, and E2E checks.
+
+| Aggregate metric | before | after | change |
+| --- | ---: | ---: | ---: |
+| `render_ns` | 9,476,861 ns | 5,639,872 ns | **-40.5%** |
+| `feed_ns` | 5,858,699 ns | 4,415,960 ns | -24.6% |
+| `wire_ns` | 3,618,161 ns | 1,223,912 ns | -66.2% |
+
+Proven changes, in application order:
+
+- Store short cell contents inline with `CompactString` and reuse Ghostty's
+  extraction buffer. Terminal cells are overwhelmingly short graphemes, so
+  this removes heap work from capture, cloning, and decode without changing
+  the string wire semantics.
+- Skip per-cell width extraction and wide-selection normalization whenever
+  Ghostty has no active selection. Selection and wide-cell behavior retain
+  their original path.
+- Specialize the protocol representation: plain cells are strings; styled
+  cells are tuples whose two colors and four flags occupy one packed `u64`.
+  Keep that packed style word as the in-memory representation too. Protocol
+  v14 pins the exact JSON and MessagePack shapes.
+- Extract ordinary cells from Ghostty's raw codepoint, reserving the string
+  grapheme API for actual multi-codepoint clusters. Background-only cells and
+  empty cells remain spaces.
+- Construct Fut's zero style directly for unstyled cells rather than invoking
+  Ghostty's FFI-backed `Style::default` for every blank/plain grid position.
+- Expose Ghostty's existing multi-get API through the vendored safe wrapper.
+  Snapshot capture now batches raw cell, styling, content-tag, and codepoint
+  reads, removing roughly 20,000 FFI calls per 200x50 full-grid capture.
+
+The faster wire path exposed a timing-sensitive copy-mode burst test. Its
+retained-screen observation was made timing-independent before the protocol
+change was accepted; this was a correctness prerequisite, not a benchmark
+shortcut.
+
+#### Rejected or inconclusive approaches
+
+Do not repeat these experiments unchanged:
+
+| Approach | Result | What a materially new attempt requires |
+| --- | --- | --- |
+| Retain a canonical snapshot inside `GhosttyTerminal` and patch dirty rows | Correct but 1.8% slower: returning an owned complete snapshot required a full-grid clone, which erased the extraction saving. | Publish a full-or-row-patch event and mutate the runtime's retained snapshot in place, or otherwise eliminate the ownership clone. |
+| Store each snapshot row in `Arc<[Cell]>` | About 10% slower even when cells were moved rather than cloned. Fifty allocations and nested-row serde outweighed cheap snapshot clones. | Introduce sharing atomically with dirty-row publication and measure partial production workloads; Arc rows alone are not useful. |
+| Gate cell styling queries with Ghostty's row-level styled flag | 1.8% slower. Per-row queries and false-positive styled rows cost more than they saved. | Use a genuinely batched accessor rather than another layer of row gating. |
+| `Arc<ScreenSnapshot>` fan-out | Previously rejected: clone cost stopped being material after publication pacing. | Reprofile a demonstrated fan-out bottleneck first. |
+| Skip canonical viewport restoration before every normal snapshot | Full correctness suite passed, but benchmark runs occurred during a noisy period and did not beat the best score. | Re-establish the invariant explicitly in the terminal state model, then rerun under stable host conditions; do not assume this is a proven win. |
+| Move the trusted-cell length cap into grapheme extraction | Two stable benchmark runs were positive (0.3–1.2%), but formatting/E2E timeout failures prevented a clean keep; an earlier noisy run was strongly negative. | Retry only with a clean check environment and require a full successful run; this remains inconclusive. |
+
+Dirty-row extraction itself remains promising—Herdr proves the underlying
+Ghostty damage API works—but only after Fut's publication boundary can carry
+partial state without recreating or cloning a complete grid. Full-screen dense
+animations will still dirty every row, so this is primarily a typing and
+partial-update production win, not a universal replacement for faster
+full-grid extraction.
+
 ### External multiplexer baseline (2026-08-10)
 
 This is the aspirational whole-system comparison. All three multiplexers ran

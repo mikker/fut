@@ -12,11 +12,6 @@
   allocation and nested serde overhead regress full-grid workloads by 10%.
   Revisit row sharing only atomically with dirty-row publication and validate
   against a partial-update production workload.
-- Consider an upstreamable libghostty-rs addition exposing the existing
-  `ghostty_cell_get_multi` API. Snapshot extraction still makes separate FFI
-  calls for raw cell, content tag, codepoint, and styling; one batched safe
-  accessor could directly reduce dense full-grid capture without changing
-  rendering semantics.
 - Evaluate a server-side retained composed frame/direct-ANSI client mode after
   dirty snapshot capture. Herdr and tmux avoid Fut's duplicated semantic-grid
   materialization plus client ratatui full-buffer rebuild, but this is a larger
