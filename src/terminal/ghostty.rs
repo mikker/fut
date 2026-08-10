@@ -1227,11 +1227,12 @@ impl GhosttyTerminal {
             let mut cells = self.cells.update(row)?;
             let mut column: u16 = 0;
             while let Some(cell) = cells.next() {
-                let raw_cell = cell.raw_cell()?;
-                let content_tag = raw_cell.content_tag()?;
+                let basic = cell.basic_data()?;
+                let raw_cell = basic.raw_cell;
+                let content_tag = basic.content_tag;
                 let contents = match content_tag {
                     CellContentTag::Codepoint => {
-                        let codepoint = raw_cell.codepoint()?;
+                        let codepoint = basic.codepoint;
                         let character = if codepoint == 0 {
                             ' '
                         } else {
@@ -1254,7 +1255,7 @@ impl GhosttyTerminal {
                 // default. Build Fut's zero-cost default directly instead of
                 // asking Ghostty to materialize its larger default style.
                 let (foreground, mut background, bold, italic, underline, inverse) =
-                    if raw_cell.has_styling()? {
+                    if basic.has_styling {
                         let ghostty_style = cell.style()?;
                         (
                             color(ghostty_style.fg_color),

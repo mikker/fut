@@ -1,0 +1,32 @@
+[package]
+name = "libghostty-vt"
+description = "Safe Rust API for libghostty-vt, the Ghostty terminal emulation library"
+version = "0.2.1"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/uzaaft/libghostty-rs"
+rust-version = "1.85"
+
+[features]
+default = ["kitty-graphics"]
+allocator_api = ["dep:allocator-api2"]
+kitty-graphics = ["libghostty-vt-sys/kitty-graphics"]
+png = ["dep:png"]
+log = ["dep:log"]
+link-dynamic = ["libghostty-vt-sys/link-dynamic"]
+tracing = ["dep:tracing"]
+
+[dependencies]
+allocator-api2 = { version = "0.4.0", optional = true }
+bitflags = "2.11.0"
+libghostty-vt-sys = { git = "https://github.com/uzaaft/libghostty-rs", rev = "72ac98f292879bf9f788fcbb11238c562a1eebe6" }
+int-enum = "1.2.0"
+png = { version = "0.18.1", optional = true }
+log = { version = "0.4.29", optional = true }
+tracing = { version = "0.1.44", optional = true }
+
+[dev-dependencies]
+libghostty-vt-sys = { git = "https://github.com/uzaaft/libghostty-rs", rev = "72ac98f292879bf9f788fcbb11238c562a1eebe6" }
+
+[package.metadata.docs.rs]
+all-features = true
