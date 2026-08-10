@@ -3004,17 +3004,17 @@ impl Widget for Screen<'_> {
 
 fn style(source: CellStyle, selected: bool) -> Style {
     let mut target = Style::default();
-    if let Some(color) = source.foreground {
+    if let Some(color) = source.foreground() {
         target = target.fg(color.into());
     }
-    if let Some(color) = source.background {
+    if let Some(color) = source.background() {
         target = target.bg(color.into());
     }
     for (enabled, modifier) in [
-        (source.bold, Modifier::BOLD),
-        (source.italic, Modifier::ITALIC),
-        (source.underline, Modifier::UNDERLINED),
-        (source.inverse ^ selected, Modifier::REVERSED),
+        (source.bold(), Modifier::BOLD),
+        (source.italic(), Modifier::ITALIC),
+        (source.underline(), Modifier::UNDERLINED),
+        (source.inverse() ^ selected, Modifier::REVERSED),
     ] {
         if enabled {
             target = target.add_modifier(modifier);
@@ -4052,18 +4052,18 @@ mod tests {
     #[test]
     fn style_conversion_preserves_indexed_rgb_and_modifiers() {
         let converted = style(
-            CellStyle {
-                foreground: Some(CellColor::Indexed(1)),
-                background: Some(CellColor::Rgb(Rgb {
+            CellStyle::new(
+                Some(CellColor::Indexed(1)),
+                Some(CellColor::Rgb(Rgb {
                     red: 4,
                     green: 5,
                     blue: 6,
                 })),
-                bold: true,
-                italic: true,
-                underline: true,
-                inverse: true,
-            },
+                true,
+                true,
+                true,
+                true,
+            ),
             false,
         );
         assert_eq!(converted.fg, Some(Color::Indexed(1)));
@@ -4087,15 +4087,9 @@ mod tests {
                 .contains(Modifier::REVERSED)
         );
         assert!(
-            !style(
-                CellStyle {
-                    inverse: true,
-                    ..CellStyle::default()
-                },
-                true,
-            )
-            .add_modifier
-            .contains(Modifier::REVERSED)
+            !style(CellStyle::new(None, None, false, false, false, true), true,)
+                .add_modifier
+                .contains(Modifier::REVERSED)
         );
     }
 

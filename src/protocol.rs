@@ -480,18 +480,18 @@ mod tests {
         // deliberately rather than silently.
         let cell = Cell {
             contents: "o".into(),
-            style: crate::domain::CellStyle {
-                foreground: Some(crate::domain::CellColor::Rgb(crate::domain::Rgb {
+            style: crate::domain::CellStyle::new(
+                Some(crate::domain::CellColor::Rgb(crate::domain::Rgb {
                     red: 10,
                     green: 20,
                     blue: 30,
                 })),
-                background: None,
-                bold: true,
-                italic: false,
-                underline: false,
-                inverse: false,
-            },
+                None,
+                true,
+                false,
+                false,
+                false,
+            ),
             selected: false,
         };
         let payload = encode_payload(&cell).unwrap();
@@ -801,22 +801,22 @@ mod tests {
         assert_eq!(maximum_content.len(), MAX_CELL_CONTENT_BYTES);
         let cell = Cell {
             contents: maximum_content.into(),
-            style: crate::domain::CellStyle {
-                foreground: Some(crate::domain::CellColor::Rgb(crate::domain::Rgb {
+            style: crate::domain::CellStyle::new(
+                Some(crate::domain::CellColor::Rgb(crate::domain::Rgb {
                     red: 255,
                     green: 255,
                     blue: 255,
                 })),
-                background: Some(crate::domain::CellColor::Rgb(crate::domain::Rgb {
+                Some(crate::domain::CellColor::Rgb(crate::domain::Rgb {
                     red: 255,
                     green: 255,
                     blue: 255,
                 })),
-                bold: true,
-                italic: true,
-                underline: true,
-                inverse: true,
-            },
+                true,
+                true,
+                true,
+                true,
+            ),
             selected: true,
         };
         let screen = ScreenSnapshot::new(

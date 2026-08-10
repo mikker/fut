@@ -527,16 +527,6 @@ pub enum CellColor {
     Rgb(Rgb),
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct CellStyle {
-    pub foreground: Option<CellColor>,
-    pub background: Option<CellColor>,
-    pub bold: bool,
-    pub italic: bool,
-    pub underline: bool,
-    pub inverse: bool,
-}
-
 /// Wire tags packed into a color's top byte, keeping "no color" (0) distinct
 /// from `Indexed(0)`.
 const COLOR_TAG_INDEXED: u32 = 0x0100_0000;
@@ -548,6 +538,11 @@ const FLAG_UNDERLINE: u8 = 1 << 2;
 const FLAG_INVERSE: u8 = 1 << 3;
 const PACKED_COLOR_BITS: u32 = 26;
 const PACKED_COLOR_MASK: u64 = (1 << PACKED_COLOR_BITS) - 1;
+
+/// Compact in-memory and wire representation of terminal cell colors and
+/// modifiers. Both 26-bit colors and four flags fit losslessly in one word.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CellStyle(u64);
 
 fn pack_color(color: Option<CellColor>) -> u32 {
     match color {
@@ -572,51 +567,67 @@ fn unpack_color(packed: u32) -> Option<CellColor> {
 }
 
 impl CellStyle {
-    fn pack_flags(self) -> u8 {
+    #[must_use]
+    pub fn new(
+        foreground: Option<CellColor>,
+        background: Option<CellColor>,
+        bold: bool,
+        italic: bool,
+        underline: bool,
+        inverse: bool,
+    ) -> Self {
         let mut flags = 0;
-        if self.bold {
+        if bold {
             flags |= FLAG_BOLD;
         }
-        if self.italic {
+        if italic {
             flags |= FLAG_ITALIC;
         }
-        if self.underline {
+        if underline {
             flags |= FLAG_UNDERLINE;
         }
-        if self.inverse {
+        if inverse {
             flags |= FLAG_INVERSE;
         }
-        flags
-    }
-
-    fn unpack_flags(flags: u8) -> (bool, bool, bool, bool) {
-        (
-            flags & FLAG_BOLD != 0,
-            flags & FLAG_ITALIC != 0,
-            flags & FLAG_UNDERLINE != 0,
-            flags & FLAG_INVERSE != 0,
+        Self(
+            u64::from(pack_color(foreground))
+                | (u64::from(pack_color(background)) << PACKED_COLOR_BITS)
+                | (u64::from(flags) << (PACKED_COLOR_BITS * 2)),
         )
     }
 
-    fn pack(self) -> u64 {
-        u64::from(pack_color(self.foreground))
-            | (u64::from(pack_color(self.background)) << PACKED_COLOR_BITS)
-            | (u64::from(self.pack_flags()) << (PACKED_COLOR_BITS * 2))
+    #[must_use]
+    pub fn foreground(self) -> Option<CellColor> {
+        unpack_color((self.0 & PACKED_COLOR_MASK) as u32)
     }
 
-    fn unpack(packed: u64) -> Self {
-        let foreground = packed & PACKED_COLOR_MASK;
-        let background = (packed >> PACKED_COLOR_BITS) & PACKED_COLOR_MASK;
-        let flags = (packed >> (PACKED_COLOR_BITS * 2)) as u8;
-        let (bold, italic, underline, inverse) = Self::unpack_flags(flags);
-        Self {
-            foreground: unpack_color(foreground as u32),
-            background: unpack_color(background as u32),
-            bold,
-            italic,
-            underline,
-            inverse,
-        }
+    #[must_use]
+    pub fn background(self) -> Option<CellColor> {
+        unpack_color(((self.0 >> PACKED_COLOR_BITS) & PACKED_COLOR_MASK) as u32)
+    }
+
+    #[must_use]
+    pub fn bold(self) -> bool {
+        self.flags() & FLAG_BOLD != 0
+    }
+
+    #[must_use]
+    pub fn italic(self) -> bool {
+        self.flags() & FLAG_ITALIC != 0
+    }
+
+    #[must_use]
+    pub fn underline(self) -> bool {
+        self.flags() & FLAG_UNDERLINE != 0
+    }
+
+    #[must_use]
+    pub fn inverse(self) -> bool {
+        self.flags() & FLAG_INVERSE != 0
+    }
+
+    fn flags(self) -> u8 {
+        (self.0 >> (PACKED_COLOR_BITS * 2)) as u8
     }
 }
 
@@ -628,9 +639,9 @@ impl Serialize for CellStyle {
         use serde::ser::SerializeTuple;
 
         let mut tuple = serializer.serialize_tuple(3)?;
-        tuple.serialize_element(&pack_color(self.foreground))?;
-        tuple.serialize_element(&pack_color(self.background))?;
-        tuple.serialize_element(&self.pack_flags())?;
+        tuple.serialize_element(&pack_color(self.foreground()))?;
+        tuple.serialize_element(&pack_color(self.background()))?;
+        tuple.serialize_element(&self.flags())?;
         tuple.end()
     }
 }
@@ -659,15 +670,14 @@ impl<'de> Deserialize<'de> for CellStyle {
                 let flags: u8 = seq
                     .next_element()?
                     .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
-                let (bold, italic, underline, inverse) = CellStyle::unpack_flags(flags);
-                Ok(CellStyle {
-                    foreground: unpack_color(foreground),
-                    background: unpack_color(background),
-                    bold,
-                    italic,
-                    underline,
-                    inverse,
-                })
+                Ok(CellStyle::new(
+                    unpack_color(foreground),
+                    unpack_color(background),
+                    flags & FLAG_BOLD != 0,
+                    flags & FLAG_ITALIC != 0,
+                    flags & FLAG_UNDERLINE != 0,
+                    flags & FLAG_INVERSE != 0,
+                ))
             }
         }
 
@@ -694,7 +704,7 @@ impl Serialize for Cell {
         use serde::ser::SerializeTuple;
         let mut tuple = serializer.serialize_tuple(if self.selected { 3 } else { 2 })?;
         tuple.serialize_element(&self.contents)?;
-        tuple.serialize_element(&self.style.pack())?;
+        tuple.serialize_element(&self.style.0)?;
         if self.selected {
             tuple.serialize_element(&true)?;
         }
@@ -738,7 +748,7 @@ impl<'de> Deserialize<'de> for Cell {
                 let selected = seq.next_element()?.unwrap_or(false);
                 Ok(Cell {
                     contents,
-                    style: CellStyle::unpack(packed_style),
+                    style: CellStyle(packed_style),
                     selected,
                 })
             }
@@ -1158,18 +1168,18 @@ mod tests {
     fn compact_cell_style_round_trips_non_defaults() {
         let cell = Cell {
             contents: "λ".into(),
-            style: CellStyle {
-                foreground: Some(CellColor::Indexed(1)),
-                background: Some(CellColor::Rgb(Rgb {
+            style: CellStyle::new(
+                Some(CellColor::Indexed(1)),
+                Some(CellColor::Rgb(Rgb {
                     red: 250,
                     green: 240,
                     blue: 230,
                 })),
-                bold: true,
-                italic: true,
-                underline: true,
-                inverse: true,
-            },
+                true,
+                true,
+                true,
+                true,
+            ),
             selected: true,
         };
         // Pins Cell and CellStyle's Serialize/Deserialize shapes (format-agnostic: the

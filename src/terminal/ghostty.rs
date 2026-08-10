@@ -1253,28 +1253,31 @@ impl GhosttyTerminal {
                 // `has_styling` is false exactly when the cell's style is
                 // default. Build Fut's zero-cost default directly instead of
                 // asking Ghostty to materialize its larger default style.
-                let mut style = if raw_cell.has_styling()? {
-                    let ghostty_style = cell.style()?;
-                    CellStyle {
-                        foreground: color(ghostty_style.fg_color),
-                        background: color(ghostty_style.bg_color),
-                        bold: ghostty_style.bold,
-                        italic: ghostty_style.italic,
-                        underline: ghostty_style.underline != Underline::None,
-                        inverse: ghostty_style.inverse,
-                    }
-                } else {
-                    CellStyle::default()
-                };
-                style.background = match content_tag {
+                let (foreground, mut background, bold, italic, underline, inverse) =
+                    if raw_cell.has_styling()? {
+                        let ghostty_style = cell.style()?;
+                        (
+                            color(ghostty_style.fg_color),
+                            color(ghostty_style.bg_color),
+                            ghostty_style.bold,
+                            ghostty_style.italic,
+                            ghostty_style.underline != Underline::None,
+                            ghostty_style.inverse,
+                        )
+                    } else {
+                        (None, None, false, false, false, false)
+                    };
+                background = match content_tag {
                     CellContentTag::BgColorPalette => {
                         Some(CellColor::Indexed(raw_cell.bg_color_palette()?.0))
                     }
                     CellContentTag::BgColorRgb => {
                         Some(CellColor::Rgb(rgb(raw_cell.bg_color_rgb()?)))
                     }
-                    _ => style.background,
+                    _ => background,
                 };
+                let style =
+                    CellStyle::new(foreground, background, bold, italic, underline, inverse);
                 if let Some(widths) = &mut widths {
                     widths.push(raw_cell.wide()?);
                 }
@@ -1749,13 +1752,13 @@ mod tests {
             .unwrap();
         let snapshot = snapshot.unwrap();
         let indexed = snapshot.cells[0].style;
-        assert_eq!(indexed.foreground, Some(CellColor::Indexed(1)));
-        assert_eq!(indexed.background, Some(CellColor::Indexed(120)));
-        assert!(indexed.bold && indexed.italic && indexed.underline);
+        assert_eq!(indexed.foreground(), Some(CellColor::Indexed(1)));
+        assert_eq!(indexed.background(), Some(CellColor::Indexed(120)));
+        assert!(indexed.bold() && indexed.italic() && indexed.underline());
 
         let truecolor = snapshot.cells[1].style;
         assert_eq!(
-            truecolor.foreground,
+            truecolor.foreground(),
             Some(CellColor::Rgb(Rgb {
                 red: 1,
                 green: 2,
@@ -1763,7 +1766,7 @@ mod tests {
             }))
         );
         assert_eq!(
-            truecolor.background,
+            truecolor.background(),
             Some(CellColor::Rgb(Rgb {
                 red: 4,
                 green: 5,
@@ -1776,7 +1779,8 @@ mod tests {
     fn preserves_indexed_background_on_erased_cells() {
         let snapshot = terminal(4, 1).feed(b"\x1b[41m\x1b[2K").unwrap().unwrap();
         assert!(snapshot.cells.iter().all(|cell| {
-            cell.style.background == Some(CellColor::Indexed(1)) && cell.style.foreground.is_none()
+            cell.style.background() == Some(CellColor::Indexed(1))
+                && cell.style.foreground().is_none()
         }));
     }
 
