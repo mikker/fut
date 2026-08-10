@@ -1227,13 +1227,29 @@ impl GhosttyTerminal {
             let mut cells = self.cells.update(row)?;
             let mut column: u16 = 0;
             while let Some(cell) = cells.next() {
-                contents_buffer.clear();
-                cell.graphemes_utf8(&mut contents_buffer)?;
-                if contents_buffer.is_empty() {
-                    contents_buffer.push(' ');
-                }
-                let contents = CompactString::new(&contents_buffer);
                 let raw_cell = cell.raw_cell()?;
+                let content_tag = raw_cell.content_tag()?;
+                let contents = match content_tag {
+                    CellContentTag::Codepoint => {
+                        let codepoint = raw_cell.codepoint()?;
+                        let character = if codepoint == 0 {
+                            ' '
+                        } else {
+                            char::from_u32(codepoint).context("invalid Ghostty cell codepoint")?
+                        };
+                        let mut encoded = [0; 4];
+                        CompactString::new(character.encode_utf8(&mut encoded))
+                    }
+                    CellContentTag::CodepointGrapheme => {
+                        contents_buffer.clear();
+                        cell.graphemes_utf8(&mut contents_buffer)?;
+                        if contents_buffer.is_empty() {
+                            contents_buffer.push(' ');
+                        }
+                        CompactString::new(&contents_buffer)
+                    }
+                    CellContentTag::BgColorPalette | CellContentTag::BgColorRgb => " ".into(),
+                };
                 // `has_styling` is false exactly when the cell's style is
                 // the default one, so we can skip fetching the full style
                 // (a comparatively expensive lookup) for the common case
@@ -1243,7 +1259,7 @@ impl GhosttyTerminal {
                 } else {
                     Style::default()
                 };
-                let background = match raw_cell.content_tag()? {
+                let background = match content_tag {
                     CellContentTag::BgColorPalette => {
                         Some(CellColor::Indexed(raw_cell.bg_color_palette()?.0))
                     }
