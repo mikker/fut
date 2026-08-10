@@ -7,7 +7,11 @@ use ratatui::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::{domain::TabId, protocol::SelectedTarget, resources::ResourceSnapshot};
+use crate::{
+    domain::{AgentReport, TabId},
+    protocol::SelectedTarget,
+    resources::ResourceSnapshot,
+};
 
 use super::{
     config::{GroupConfig, SemanticStyle, TabBarPosition, UiConfig, WorkspaceSidebarPosition},
@@ -179,8 +183,10 @@ impl ResourceState {
             .flat_map(|tab| &tab.panes)
             .find(|pane| pane.terminal_id == terminal_id)?
             .activity
-            .attention
-            .map(|attention| attention.revision)
+            .last_event
+            .as_ref()
+            .filter(|event| matches!(event.kind, AgentReport::Blocked | AgentReport::Completed))
+            .map(|event| event.revision)
     }
 
     pub fn observe(&mut self, terminal_id: crate::domain::TerminalId, revision: u64) -> bool {
@@ -858,7 +864,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let selected_tab = &tabs[active];
-        let selected_pane = selected_tab.panes[0];
+        let selected_pane = selected_tab.panes[0].clone();
         let target = SelectedTarget {
             session_id,
             workspace_id,

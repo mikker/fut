@@ -7,7 +7,7 @@ by similar projects (Zellij, tmux, Ghostty, mosh).
 ## Measuring
 
 - `mise run perf:bench` — criterion microbenchmarks (`benches/render.rs`) for
-  the hot spots: VT feed → full-grid snapshot, snapshot JSON encode/decode,
+  the hot spots: VT feed → full-grid snapshot, snapshot MessagePack encode/decode,
   and the per-client grid clone. Baseline diffing:
   `cargo bench --bench render -- --save-baseline before` … `-- --baseline before`.
 - `mise run perf:e2e` — end-to-end scenarios (`scripts/perf/run`) against a
@@ -21,30 +21,27 @@ by similar projects (Zellij, tmux, Ghostty, mosh).
 
 ## The pipeline today
 
-PTY bytes → 1 KiB `read()` (`runtime.rs:1033`) → crossbeam bounded(16) →
-VT thread `feed()` (`ghostty.rs:162`) which parses **and rebuilds the entire
-grid** (`snapshot_current`, `ghostty.rs:1039`) → tokio `watch` (drops stale) →
-per-client clone (`daemon/mod.rs:1017`) → outbound queue (coalesces to newest)
-→ full-grid JSON (`protocol.rs:314`) → client decode → 16 ms paced draw with
-per-pane dirty revisions and CSI 2026 (`client/mod.rs`).
+PTY bytes → 64 KiB `read()` (`runtime.rs:1361`) → crossbeam bounded(16) →
+VT thread drains up to 2 MiB per pass (`drain_output_batch`) and publishes at
+most once per 8 ms per terminal → full-grid snapshot (`snapshot_current`) →
+tokio `watch` (drops stale) → per-client clone and row diff → compact
+MessagePack full snapshot or dirty-row delta → client apply → 16 ms paced draw
+with per-pane dirty revisions and CSI 2026 (`client/mod.rs`).
 
 The client loop is already shaped right (paced, dirty-gated, synchronized
 output). The costs are upstream, ranked:
 
-1. **One full-grid rebuild per 1 KiB of PTY output.** `snapshot_current`
-   allocates a `String` per cell and makes ~6 FFI calls per cell; a 200x50
-   pane is 10k allocations + 60k FFI calls per KiB. Then
-   `ScreenSnapshot::new` (`domain.rs:463`) re-walks every cell with grapheme
-   segmentation the daemon's own output doesn't need.
-2. **Full-grid JSON per frame per client** (~100–300 KiB at 200x50), encoded
-   in the daemon and decoded on the client (~1 ms per frame measured).
-   Snapshots that get coalesced away downstream are still fully built and
-   often fully serialized first.
-3. **Full-grid `clone()` per attached client per revision** in
-   `watch_attachment`; an `Arc<ScreenSnapshot>` would remove it.
-4. Client chrome rebuilt from scratch every frame (`chrome.rs:227`,
-   `sidebar.rs:388`), and `pane_layouts` allocating per call including
-   mouse-move paths (`client/mod.rs:2617`).
+1. **A full-grid rebuild for every published terminal revision.** Pacing caps
+   this at 125/s per terminal, but four independently animated panes can keep
+   paying it continuously even when their workspace is not visible.
+2. **The daemon builds and clones a full snapshot before deriving a row
+   delta.** Deltas save wire/decode work but do not make upstream capture or
+   per-client diffing proportional to the changed area.
+3. **The client redraw path remains materially size-dependent.** At 300x65,
+   an attached release client doing four-pane animation uses about 5–6% of a
+   core by itself; debug builds are dramatically worse.
+4. Client chrome is rebuilt each frame (`chrome.rs`, `sidebar.rs`), and pane
+   layout is recomputed in several input/render paths (`client/mod.rs`).
 
 ## Results log
 
@@ -133,6 +130,53 @@ snapshots each touch ~40% of rows — a genuine halving, found not predicted.
 Also fixed en route: the perf client never resized its pane (all previous
 scenarios silently ran at 80x24 — earlier rounds' absolute numbers are not
 comparable across that fix), and a client panic on malformed delta rows.
+
+### External multiplexer baseline (2026-08-10)
+
+This is the aspirational whole-system comparison. All three multiplexers ran
+optimized release binaries on the same machine, at a 300x65 host viewport,
+with the same 2x2 layout and child commands:
+
+- `cmatrix -ab -u 3`
+- `pipes.sh -p 5 -f 30 -R -K`
+- `htop`
+- looping `genact --speed-factor 2` with repeated `--modules` arguments for
+  `botnet`, `bruteforce`, `cryptomining`, `memdump`, and `weblog`
+
+CPU is steady-state process CPU from repeated one-second `top` samples and
+excludes the identical child workloads. “Background” leaves the animated
+workspace running but displays a quiet workspace. tmux's server also owned
+unrelated existing sessions, so its number is a conservative upper bound for
+this workload's overhead.
+
+| Multiplexer | background CPU | visible/attached CPU | relevant memory |
+| --- | ---: | ---: | ---: |
+| tmux 3.7b | 1.3–1.4% server | 1.6–2.1% server; client ~0% | 54–59 MiB shared server + 2 MiB client |
+| Herdr 0.8.0 | 2.0–2.5% combined process | 7.1–9.1% combined process | 26–27 MiB |
+| Fut 0.2 release | 1.9–2.8% daemon | 5.7–8.3% daemon + 4.7–6.4% client; **10–15% total** | 16–18 MiB daemon + 14 MiB client |
+
+Control surfaces were already comparable; these timings include CLI process
+startup:
+
+| Operation | tmux | Herdr | Fut release |
+| --- | ---: | ---: | ---: |
+| 50 server/control queries | 0.30 s | 0.33 s | 0.32 s |
+| 20 visible-pane reads | 0.12 s | 0.15 s | 0.15 s |
+
+Performance budgets derived from this comparison:
+
+- **Primary:** keep the four-pane 300x65 visible workload below 10% total CPU
+  in release builds (Herdr-class), without regressing control latency.
+- **Stretch:** below 5% total visible CPU, moving toward tmux's ~2% class.
+- **Background:** at most 2.5% daemon CPU, with 1.5% as the stretch target.
+- **Control:** 50 control queries in at most 0.40 s and 20 visible reads in at
+  most 0.20 s on this machine.
+
+Debug Fut measured 51–72% total CPU while attached and 14–20% detached under
+the same workload. That explains development-build lag but is not an honest
+cross-product baseline. Always use an optimized build for external
+comparisons; retain debug results only as a warning against evaluating UI
+smoothness from `target/debug/fut`.
 
 ## Remaining hypotheses
 

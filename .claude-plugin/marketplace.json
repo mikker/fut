@@ -1,0 +1,14 @@
+{
+  "name": "fut-integrations",
+  "owner": {
+    "name": "Mikkel Malmberg"
+  },
+  "description": "Agent lifecycle integrations for Fut",
+  "plugins": [
+    {
+      "name": "fut",
+      "source": "./integrations/claude-code",
+      "description": "Report Claude Code lifecycle activity to Fut"
+    }
+  ]
+}

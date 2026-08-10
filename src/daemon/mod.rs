@@ -24,9 +24,10 @@ use futures_util::{
     SinkExt, StreamExt,
     stream::{SplitSink, SplitStream},
 };
+use regex::Regex;
 use tokio::{
     net::{UnixListener, UnixStream},
-    sync::{Mutex, Notify, mpsc, watch},
+    sync::{Mutex, Notify, broadcast, mpsc, watch},
     task::{JoinHandle, JoinSet},
     time::{Duration, timeout},
 };
@@ -34,14 +35,16 @@ use tokio_util::codec::Framed;
 
 use crate::{
     domain::{
-        ClientId, CopyModeAction, CopyModeError, DeltaRow, PaneId, ScreenDelta, ScreenSnapshot,
-        SessionId, TabId, TerminalId, TerminalSize, WorkspaceId,
+        AgentActivity, AgentReport, ClientId, CopyModeAction, CopyModeError, DeltaRow,
+        MAX_AGENT_PROMPT_BYTES, MAX_TERMINAL_OUTPUT_PATTERN_BYTES, MAX_TERMINAL_OUTPUT_ROWS,
+        PaneId, ScreenDelta, ScreenSnapshot, SessionId, TabId, TerminalId, TerminalOutput,
+        TerminalOutputMatcher, TerminalOutputSource, TerminalSize, WorkspaceId,
     },
     project::{ProjectError, ProjectResolver, ResolvedLocation},
     protocol::{
         AcknowledgedCommand, ClientMessage, ClientMode, Envelope, OpenDisposition,
         PROTOCOL_VERSION, RenameSelector, SelectedTarget, SelectedView, SelectionExpectation,
-        ServerMessage, codec, decode_payload, encode_payload,
+        ServerMessage, TerminalInputOperation, codec, decode_payload, encode_payload,
     },
     resources::{
         CheckoutDestination, InitialPath, ResourceError, ResourceTree, TabPath, TargetSelector,
@@ -49,8 +52,8 @@ use crate::{
     },
     splits::{SplitDirection, SplitTree},
     terminal::{
-        CommandError, CopyModeOutcome, MouseInputOutcome, SpawnSpec, TerminalEvent, TerminalHandle,
-        TerminalLifecycle, spawn_terminal,
+        CommandError, CopyModeOutcome, MouseInputOutcome, OutputCapture, OutputCaptureError,
+        SpawnSpec, TerminalEvent, TerminalHandle, TerminalLifecycle, spawn_terminal,
     },
 };
 
@@ -98,9 +101,19 @@ struct SharedState {
     resources: ResourceTree,
     runtimes: HashMap<TerminalId, RuntimeEntry>,
     expected_finalizations: HashSet<TerminalId>,
+    exited_terminals: VecDeque<(TerminalId, Option<i32>)>,
     resource_changes: watch::Sender<u64>,
+    agent_events: broadcast::Sender<AgentLifecycleUpdate>,
     child_env: HashMap<String, String>,
     accepting: bool,
+}
+
+const AGENT_EVENT_CAPACITY: usize = 256;
+
+#[derive(Clone, Debug)]
+struct AgentLifecycleUpdate {
+    terminal_id: TerminalId,
+    activity: AgentActivity,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -132,6 +145,7 @@ impl From<ResourceError> for DaemonError {
             ResourceError::DifferentWorkspace => "different_workspace",
             ResourceError::TargetRequired | ResourceError::AmbiguousTarget => "target_required",
             ResourceError::EmptyName => "invalid_name",
+            ResourceError::InvalidAgentReport(_) => "invalid_agent_report",
             _ => "resource_error",
         };
         Self::new(code, error.to_string())
@@ -162,7 +176,8 @@ impl SharedState {
     fn report_agent(
         &mut self,
         terminal_id: TerminalId,
-        report: crate::domain::AgentReport,
+        report: AgentReport,
+        metadata: crate::domain::AgentReportMetadata,
     ) -> Result<(), DaemonError> {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -170,8 +185,15 @@ impl SharedState {
             .as_millis()
             .try_into()
             .unwrap_or(u64::MAX);
-        let revision = self.resources.report_agent(terminal_id, report, now_ms)?;
+        let revision =
+            self.resources
+                .report_agent_with_metadata(terminal_id, report, metadata, now_ms)?;
+        let activity = self.resources.agent_activity(terminal_id)?.clone();
         self.publish_resource_change(revision);
+        let _ = self.agent_events.send(AgentLifecycleUpdate {
+            terminal_id,
+            activity,
+        });
         Ok(())
     }
 
@@ -182,6 +204,7 @@ impl SharedState {
     ) -> Result<(), DaemonError> {
         let mutation = self.resources.create_session(path)?;
         self.expected_finalizations.remove(&terminal.id());
+        self.exited_terminals.retain(|(id, _)| *id != terminal.id());
         self.runtimes.insert(
             terminal.id(),
             RuntimeEntry {
@@ -201,6 +224,7 @@ impl SharedState {
     ) -> Result<(), DaemonError> {
         let mutation = self.resources.add_workspace(session_id, path)?;
         self.expected_finalizations.remove(&terminal.id());
+        self.exited_terminals.retain(|(id, _)| *id != terminal.id());
         self.runtimes.insert(
             terminal.id(),
             RuntimeEntry {
@@ -220,6 +244,7 @@ impl SharedState {
     ) -> Result<(), DaemonError> {
         let mutation = self.resources.add_tab(workspace_id, path)?;
         self.expected_finalizations.remove(&terminal.id());
+        self.exited_terminals.retain(|(id, _)| *id != terminal.id());
         self.runtimes.insert(
             terminal.id(),
             RuntimeEntry {
@@ -239,6 +264,7 @@ impl SharedState {
     ) -> Result<(), DaemonError> {
         let mutation = self.resources.add_pane(tab_id, pane_id, terminal.id())?;
         self.expected_finalizations.remove(&terminal.id());
+        self.exited_terminals.retain(|(id, _)| *id != terminal.id());
         self.runtimes.insert(
             terminal.id(),
             RuntimeEntry {
@@ -282,8 +308,24 @@ impl SharedState {
                 "terminal runtime missing during finalization",
             ));
         }
+        let exit_code = match self
+            .runtimes
+            .get(&terminal_id)
+            .expect("runtime presence checked above")
+            .handle
+            .subscribe_lifecycle()
+            .borrow()
+            .clone()
+        {
+            TerminalLifecycle::Running => None,
+            TerminalLifecycle::Exited { exit_code } => exit_code,
+        };
         let mutation = self.resources.terminal_exited(terminal_id)?;
         self.runtimes.remove(&terminal_id);
+        self.exited_terminals.push_back((terminal_id, exit_code));
+        if self.exited_terminals.len() > 256 {
+            self.exited_terminals.pop_front();
+        }
         self.publish_resource_change(mutation.revision);
         if mutation.multiplexer_empty {
             self.accepting = false;
@@ -1118,11 +1160,14 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     initial_spawn.env = terminal_env(&child_env, initial_target);
     let terminal = Arc::new(spawn_terminal(initial_spawn)?);
     let (resource_changes, _) = watch::channel(0);
+    let (agent_events, _) = broadcast::channel(AGENT_EVENT_CAPACITY);
     let mut state = SharedState {
         resources: ResourceTree::default(),
         runtimes: HashMap::new(),
         expected_finalizations: HashSet::new(),
+        exited_terminals: VecDeque::new(),
         resource_changes,
+        agent_events,
         child_env,
         accepting: true,
     };
@@ -2203,7 +2248,7 @@ async fn handle_connection(
                             Err(error) => send_error(&mut connection, envelope.request_id, error.code, &error.message).await?,
                         }
                     }
-                    ClientMessage::OpenLocation { .. } | ClientMessage::MovePane { .. } | ClientMessage::CloseTarget { .. } | ClientMessage::ReportAgent { .. } | ClientMessage::WatchResources | ClientMessage::Shutdown => send_error(&mut connection, envelope.request_id, "control_only", "command requires a control connection").await?,
+                    ClientMessage::OpenLocation { .. } | ClientMessage::MovePane { .. } | ClientMessage::CloseTarget { .. } | ClientMessage::ReportAgent { .. } | ClientMessage::TerminalInput { .. } | ClientMessage::ReadTerminalOutput { .. } | ClientMessage::WaitTerminalOutput { .. } | ClientMessage::PromptAgent { .. } | ClientMessage::WaitAgent { .. } | ClientMessage::WatchResources | ClientMessage::Shutdown => send_error(&mut connection, envelope.request_id, "control_only", "command requires a control connection").await?,
                     ClientMessage::Hello { .. } => send_error(&mut connection, envelope.request_id, "already_hello", "hello was already received").await?,
                 }
             },
@@ -2608,8 +2653,12 @@ async fn control_loop(
             ClientMessage::ReportAgent {
                 terminal_id,
                 report,
+                metadata,
             } => {
-                let result = shared.lock().await.report_agent(terminal_id, report);
+                let result = shared
+                    .lock()
+                    .await
+                    .report_agent(terminal_id, report, metadata);
                 match result {
                     Ok(()) => {
                         send(
@@ -2626,6 +2675,121 @@ async fn control_loop(
                     }
                 }
             }
+            ClientMessage::TerminalInput {
+                terminal_id,
+                operation,
+            } => match targeted_terminal_input(&shared, terminal_id, operation).await {
+                Ok(()) => {
+                    send(
+                        connection,
+                        envelope.request_id,
+                        ServerMessage::CommandCompleted {
+                            command: AcknowledgedCommand::TerminalInput,
+                        },
+                    )
+                    .await?
+                }
+                Err(error) => {
+                    send_error(connection, envelope.request_id, error.code, &error.message).await?
+                }
+            },
+            ClientMessage::ReadTerminalOutput {
+                terminal_id,
+                source,
+                rows,
+                ansi,
+            } => match read_terminal_output(&shared, terminal_id, source, rows, ansi).await {
+                Ok(output) => {
+                    send(
+                        connection,
+                        envelope.request_id,
+                        ServerMessage::TerminalOutput { output },
+                    )
+                    .await?
+                }
+                Err(error) => {
+                    send_error(connection, envelope.request_id, error.code, &error.message).await?
+                }
+            },
+            ClientMessage::WaitTerminalOutput {
+                terminal_id,
+                source,
+                rows,
+                matcher,
+                timeout_ms,
+            } => match wait_terminal_output(
+                &shared,
+                terminal_id,
+                source,
+                rows,
+                matcher,
+                timeout_ms,
+            )
+            .await
+            {
+                Ok((output, start, end, matched)) => {
+                    send(
+                        connection,
+                        envelope.request_id,
+                        ServerMessage::TerminalOutputMatched {
+                            output,
+                            start,
+                            end,
+                            matched,
+                        },
+                    )
+                    .await?
+                }
+                Err(error) => {
+                    send_error(connection, envelope.request_id, error.code, &error.message).await?
+                }
+            },
+            ClientMessage::PromptAgent {
+                terminal_id,
+                text,
+                wait,
+                timeout_ms,
+            } => match prompt_agent(&shared, terminal_id, text, wait, timeout_ms).await {
+                Ok(result) => {
+                    let message = match result.activity {
+                        Some(activity) => ServerMessage::AgentSettled {
+                            terminal_id,
+                            barrier_revision: result.barrier_revision,
+                            working_revision: result.working_revision,
+                            activity,
+                        },
+                        None => ServerMessage::AgentPrompted {
+                            terminal_id,
+                            barrier_revision: result.barrier_revision,
+                        },
+                    };
+                    send(connection, envelope.request_id, message).await?
+                }
+                Err(error) => {
+                    send_error(connection, envelope.request_id, error.code, &error.message).await?
+                }
+            },
+            ClientMessage::WaitAgent {
+                terminal_id,
+                timeout_ms,
+            } => match wait_agent(&shared, terminal_id, timeout_ms).await {
+                Ok(result) => {
+                    send(
+                        connection,
+                        envelope.request_id,
+                        ServerMessage::AgentSettled {
+                            terminal_id,
+                            barrier_revision: result.barrier_revision,
+                            working_revision: result.working_revision,
+                            activity: result.activity.expect("agent wait always returns activity"),
+                        },
+                    )
+                    .await?
+                }
+                Err(error) => {
+                    send_error(connection, envelope.request_id, error.code, &error.message).await?
+                }
+            },
             ClientMessage::Shutdown => {
                 {
                     let mut state = shared.lock().await;
@@ -3826,6 +3990,507 @@ enum FocusedInput {
     Paste(String),
 }
 
+enum OutputMatcher {
+    Literal(String),
+    Regex(Regex),
+}
+
+impl OutputMatcher {
+    fn find(&self, text: &str) -> Option<(usize, usize)> {
+        match self {
+            Self::Literal(value) => text.find(value).map(|start| (start, start + value.len())),
+            Self::Regex(regex) => regex.find(text).map(|found| (found.start(), found.end())),
+        }
+    }
+}
+
+async fn output_terminal(
+    shared: &Shared,
+    terminal_id: TerminalId,
+) -> Result<Arc<TerminalHandle>, DaemonError> {
+    let state = shared.lock().await;
+    if !state.accepting {
+        return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
+    }
+    if let Err(error) = state
+        .resources
+        .resolve_terminal_target(Some(TargetSelector::Terminal(terminal_id)))
+    {
+        if let Some((_, exit_code)) = state
+            .exited_terminals
+            .iter()
+            .find(|(exited, _)| *exited == terminal_id)
+        {
+            return Err(DaemonError::new(
+                "terminal_exited",
+                format!("terminal already exited with status {exit_code:?}"),
+            ));
+        }
+        return Err(error.into());
+    }
+    state
+        .runtimes
+        .get(&terminal_id)
+        .map(|runtime| Arc::clone(&runtime.handle))
+        .ok_or_else(|| DaemonError::new("terminal_exited", "terminal is not running"))
+}
+
+fn output_error(error: CommandError) -> DaemonError {
+    let code = match &error {
+        CommandError::Output(OutputCaptureError::InvalidRows) => "invalid_output_rows",
+        CommandError::Output(
+            OutputCaptureError::TooManyCells { .. } | OutputCaptureError::TooManyBytes { .. },
+        ) => "output_too_large",
+        CommandError::Output(OutputCaptureError::AlternateScreen) => "alternate_screen",
+        CommandError::Output(OutputCaptureError::Emulator(_)) | CommandError::Emulator(_) => {
+            "terminal_emulator"
+        }
+        CommandError::Stopped => "terminal_exited",
+        _ => command_error_code(&error),
+    };
+    DaemonError::new(code, error.to_string())
+}
+
+fn terminal_output(terminal_id: TerminalId, capture: OutputCapture) -> TerminalOutput {
+    TerminalOutput {
+        version: 1,
+        terminal_id,
+        revision: capture.revision,
+        source: capture.source,
+        requested_rows: capture.requested_rows,
+        returned_rows: capture.returned_rows,
+        truncated: capture.truncated,
+        starts_mid_logical_line: capture.starts_mid_logical_line,
+        ansi: capture.ansi,
+        text: capture.text,
+    }
+}
+
+async fn read_terminal_output(
+    shared: &Shared,
+    terminal_id: TerminalId,
+    source: TerminalOutputSource,
+    rows: usize,
+    ansi: bool,
+) -> Result<TerminalOutput, DaemonError> {
+    let terminal = output_terminal(shared, terminal_id).await?;
+    terminal
+        .read_output(source, rows, ansi)
+        .await
+        .map(|capture| terminal_output(terminal_id, capture))
+        .map_err(output_error)
+}
+
+fn compile_output_matcher(matcher: TerminalOutputMatcher) -> Result<OutputMatcher, DaemonError> {
+    let value = matcher.value();
+    if value.is_empty() {
+        return Err(DaemonError::new(
+            "invalid_pattern",
+            "output match pattern must not be empty",
+        ));
+    }
+    if value.len() > MAX_TERMINAL_OUTPUT_PATTERN_BYTES {
+        return Err(DaemonError::new(
+            "invalid_pattern",
+            format!(
+                "output match pattern is {} bytes; maximum is {MAX_TERMINAL_OUTPUT_PATTERN_BYTES}",
+                value.len()
+            ),
+        ));
+    }
+    match matcher {
+        TerminalOutputMatcher::Literal(value) => Ok(OutputMatcher::Literal(value)),
+        TerminalOutputMatcher::Regex(value) => Regex::new(&value)
+            .map(OutputMatcher::Regex)
+            .map_err(|error| DaemonError::new("invalid_regex", error.to_string())),
+    }
+}
+
+async fn wait_terminal_output(
+    shared: &Shared,
+    terminal_id: TerminalId,
+    source: TerminalOutputSource,
+    rows: usize,
+    matcher: TerminalOutputMatcher,
+    timeout_ms: u64,
+) -> Result<(TerminalOutput, usize, usize, String), DaemonError> {
+    if timeout_ms == 0 || timeout_ms > 3_600_000 {
+        return Err(DaemonError::new(
+            "invalid_timeout",
+            "output wait timeout must be between 1ms and 1h",
+        ));
+    }
+    if rows == 0 || rows > MAX_TERMINAL_OUTPUT_ROWS {
+        return Err(DaemonError::new(
+            "invalid_output_rows",
+            format!("terminal output rows must be between 1 and {MAX_TERMINAL_OUTPUT_ROWS}"),
+        ));
+    }
+    let matcher = compile_output_matcher(matcher)?;
+    let terminal = output_terminal(shared, terminal_id).await?;
+    // Subscribe before the initial read. A snapshot or exit racing that read
+    // remains pending on these receivers and is checked on the next loop.
+    let mut snapshots = terminal.subscribe_snapshots();
+    let mut lifecycle = terminal.subscribe_lifecycle();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+
+    loop {
+        let output = tokio::time::timeout_at(deadline, terminal.read_output(source, rows, false))
+            .await
+            .map_err(|_| {
+                DaemonError::new(
+                    "output_timeout",
+                    format!("terminal output did not match within {timeout_ms}ms"),
+                )
+            })?
+            .map(|capture| terminal_output(terminal_id, capture))
+            .map_err(output_error)?;
+        if let Some((start, end)) = matcher.find(&output.text) {
+            let matched = output.text[start..end].to_owned();
+            return Ok((output, start, end, matched));
+        }
+        if let TerminalLifecycle::Exited { exit_code } = lifecycle.borrow().clone() {
+            return Err(DaemonError::new(
+                "terminal_exited",
+                format!("terminal exited with status {exit_code:?} before output matched"),
+            ));
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(DaemonError::new(
+                    "output_timeout",
+                    format!("terminal output did not match within {timeout_ms}ms"),
+                ));
+            }
+            changed = snapshots.changed() => {
+                if changed.is_err() {
+                    return Err(DaemonError::new("terminal_exited", "terminal output stream closed"));
+                }
+            }
+            changed = lifecycle.changed() => {
+                if changed.is_err() {
+                    return Err(DaemonError::new("terminal_exited", "terminal lifecycle stream closed"));
+                }
+                // Loop once more to inspect the final emulator state before
+                // reporting terminal_exited.
+            }
+        }
+    }
+}
+
+struct AgentCommandResult {
+    barrier_revision: u64,
+    working_revision: Option<u64>,
+    activity: Option<AgentActivity>,
+}
+
+fn validate_agent_timeout(timeout_ms: u64) -> Result<(), DaemonError> {
+    if timeout_ms == 0 || timeout_ms > 3_600_000 {
+        return Err(DaemonError::new(
+            "invalid_timeout",
+            "agent wait timeout must be between 1ms and 1h",
+        ));
+    }
+    Ok(())
+}
+
+fn agent_input_error(error: CommandError) -> DaemonError {
+    let code = if matches!(error, CommandError::Stopped) {
+        "terminal_exited"
+    } else {
+        command_error_code(&error)
+    };
+    DaemonError::new(code, error.to_string())
+}
+
+async fn prompt_agent(
+    shared: &Shared,
+    terminal_id: TerminalId,
+    text: String,
+    wait: bool,
+    timeout_ms: Option<u64>,
+) -> Result<AgentCommandResult, DaemonError> {
+    if text.len() > MAX_AGENT_PROMPT_BYTES {
+        return Err(DaemonError::new(
+            "prompt_too_large",
+            format!(
+                "agent prompt is {} bytes; maximum is {MAX_AGENT_PROMPT_BYTES}",
+                text.len()
+            ),
+        ));
+    }
+    if wait {
+        validate_agent_timeout(
+            timeout_ms
+                .ok_or_else(|| DaemonError::new("invalid_timeout", "--wait requires a timeout"))?,
+        )?;
+    } else if timeout_ms.is_some() {
+        return Err(DaemonError::new(
+            "invalid_timeout",
+            "a prompt timeout requires wait=true",
+        ));
+    }
+
+    // Subscribe and capture the barrier under one lock. Reports racing the
+    // terminal write are retained even if Working and Completed arrive before
+    // the write acknowledgement.
+    let (terminal, mut lifecycle, events, barrier_revision) = {
+        let state = shared.lock().await;
+        if !state.accepting {
+            return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
+        }
+        state
+            .resources
+            .resolve_terminal_target(Some(TargetSelector::Terminal(terminal_id)))?;
+        let activity = state.resources.agent_activity(terminal_id)?;
+        if activity.integration.is_none() {
+            return Err(DaemonError::new(
+                "not_an_agent",
+                format!("terminal {terminal_id} has no agent integration"),
+            ));
+        }
+        if activity.state == crate::domain::AgentState::Working {
+            return Err(DaemonError::new(
+                "agent_busy",
+                format!("agent {terminal_id} is currently working"),
+            ));
+        }
+        let runtime = state
+            .runtimes
+            .get(&terminal_id)
+            .ok_or_else(|| DaemonError::new("terminal_exited", "terminal is not running"))?;
+        let lifecycle = runtime.handle.subscribe_lifecycle();
+        if let TerminalLifecycle::Exited { exit_code } = lifecycle.borrow().clone() {
+            return Err(DaemonError::new(
+                "terminal_exited",
+                format!("terminal already exited with status {exit_code:?}"),
+            ));
+        }
+        (
+            Arc::clone(&runtime.handle),
+            lifecycle,
+            state.agent_events.subscribe(),
+            activity.revision,
+        )
+    };
+
+    terminal
+        .paste_and_input(text, vec![b'\r'])
+        .await
+        .map_err(agent_input_error)?;
+    if !wait {
+        return Ok(AgentCommandResult {
+            barrier_revision,
+            working_revision: None,
+            activity: None,
+        });
+    }
+    wait_for_agent_events(
+        shared,
+        terminal_id,
+        barrier_revision,
+        None,
+        true,
+        timeout_ms.expect("validated wait timeout"),
+        events,
+        &mut lifecycle,
+    )
+    .await
+}
+
+async fn wait_agent(
+    shared: &Shared,
+    terminal_id: TerminalId,
+    timeout_ms: u64,
+) -> Result<AgentCommandResult, DaemonError> {
+    validate_agent_timeout(timeout_ms)?;
+    let (activity, events, mut lifecycle) = {
+        let state = shared.lock().await;
+        state
+            .resources
+            .resolve_terminal_target(Some(TargetSelector::Terminal(terminal_id)))?;
+        let activity = state.resources.agent_activity(terminal_id)?.clone();
+        if activity.integration.is_none() {
+            return Err(DaemonError::new(
+                "not_an_agent",
+                format!("terminal {terminal_id} has no agent integration"),
+            ));
+        }
+        let runtime = state
+            .runtimes
+            .get(&terminal_id)
+            .ok_or_else(|| DaemonError::new("terminal_exited", "terminal is not running"))?;
+        (
+            activity,
+            state.agent_events.subscribe(),
+            runtime.handle.subscribe_lifecycle(),
+        )
+    };
+    if activity.state != crate::domain::AgentState::Working {
+        return Ok(AgentCommandResult {
+            barrier_revision: activity.revision,
+            working_revision: None,
+            activity: Some(activity),
+        });
+    }
+    wait_for_agent_events(
+        shared,
+        terminal_id,
+        activity.revision,
+        Some(activity.revision),
+        false,
+        timeout_ms,
+        events,
+        &mut lifecycle,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wait_for_agent_events(
+    shared: &Shared,
+    terminal_id: TerminalId,
+    barrier_revision: u64,
+    mut working_revision: Option<u64>,
+    require_working: bool,
+    timeout_ms: u64,
+    mut events: broadcast::Receiver<AgentLifecycleUpdate>,
+    lifecycle: &mut watch::Receiver<TerminalLifecycle>,
+) -> Result<AgentCommandResult, DaemonError> {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        tokio::select! {
+            biased;
+            update = events.recv() => match update {
+                Ok(update) if update.terminal_id != terminal_id => {}
+                Ok(update) if update.activity.revision <= barrier_revision => {}
+                Ok(update) => {
+                    let Some(event) = update.activity.last_event.as_ref() else { continue };
+                    if event.kind == AgentReport::Working {
+                        working_revision = Some(event.revision);
+                        continue;
+                    }
+                    let settled = matches!(event.kind, AgentReport::Completed | AgentReport::Blocked | AgentReport::Idle);
+                    let after_working = working_revision.is_some_and(|revision| event.revision > revision);
+                    if settled && (!require_working || after_working) {
+                        return Ok(AgentCommandResult {
+                            barrier_revision,
+                            working_revision,
+                            activity: Some(update.activity),
+                        });
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    return Err(DaemonError::new(
+                        "agent_events_lagged",
+                        format!("agent lifecycle receiver lagged by {skipped} reports; retry from a fresh state"),
+                    ));
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    return Err(DaemonError::new("agent_events_closed", "agent lifecycle stream closed"));
+                }
+            },
+            changed = lifecycle.changed() => {
+                if changed.is_err() {
+                    return Err(DaemonError::new("terminal_exited", "terminal lifecycle stream closed"));
+                }
+                let terminal_lifecycle = lifecycle.borrow().clone();
+                if let TerminalLifecycle::Exited { exit_code } = terminal_lifecycle {
+                    // A final report may have been published immediately before
+                    // exit; the biased event branch above gets first refusal.
+                    let current = shared.lock().await.resources.agent_activity(terminal_id).cloned();
+                    if let Ok(activity) = current
+                        && let Some(event) = activity.last_event.as_ref()
+                    {
+                        let after_working = working_revision
+                            .is_some_and(|revision| event.revision > revision);
+                        if event.revision > barrier_revision
+                            && matches!(
+                                event.kind,
+                                AgentReport::Completed | AgentReport::Blocked | AgentReport::Idle
+                            )
+                            && (!require_working || after_working)
+                        {
+                            return Ok(AgentCommandResult {
+                                barrier_revision,
+                                working_revision,
+                                activity: Some(activity),
+                            });
+                        }
+                    }
+                    return Err(DaemonError::new(
+                        "terminal_exited",
+                        format!("terminal exited with status {exit_code:?} before the agent settled"),
+                    ));
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(DaemonError::new(
+                    "agent_timeout",
+                    format!("agent did not settle within {timeout_ms}ms"),
+                ));
+            }
+        }
+    }
+}
+
+async fn targeted_terminal_input(
+    shared: &Shared,
+    terminal_id: TerminalId,
+    operation: TerminalInputOperation,
+) -> Result<(), DaemonError> {
+    let terminal = {
+        let state = shared.lock().await;
+        if !state.accepting {
+            return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
+        }
+        if let Err(error) = state
+            .resources
+            .resolve_terminal_target(Some(TargetSelector::Terminal(terminal_id)))
+        {
+            if let Some((_, exit_code)) = state
+                .exited_terminals
+                .iter()
+                .find(|(exited, _)| *exited == terminal_id)
+            {
+                return Err(DaemonError::new(
+                    "terminal_exited",
+                    format!("terminal already exited with status {exit_code:?}"),
+                ));
+            }
+            return Err(error.into());
+        }
+        let runtime = state
+            .runtimes
+            .get(&terminal_id)
+            .ok_or_else(|| DaemonError::new("terminal_exited", "terminal is not running"))?;
+        if let TerminalLifecycle::Exited { exit_code } =
+            runtime.handle.subscribe_lifecycle().borrow().clone()
+        {
+            return Err(DaemonError::new(
+                "terminal_exited",
+                format!("terminal already exited with status {exit_code:?}"),
+            ));
+        }
+        Arc::clone(&runtime.handle)
+    };
+
+    let result = match operation {
+        TerminalInputOperation::Text { text } => terminal.paste(text).await,
+        TerminalInputOperation::Keys { bytes } => terminal.input(bytes).await,
+        TerminalInputOperation::Run { text } => terminal.paste_and_input(text, vec![b'\r']).await,
+    };
+    result.map_err(|error| {
+        let code = if matches!(error, CommandError::Stopped) {
+            "terminal_exited"
+        } else {
+            command_error_code(&error)
+        };
+        DaemonError::new(code, error.to_string())
+    })
+}
+
 async fn focused_input_response(
     connection: &mut ClientConnection,
     attachment: &mut Attachment,
@@ -3901,6 +4566,8 @@ fn ui_event_error_disposition(
             UiEventErrorDisposition::Reply
         }
         (_, CommandError::CopyMode(_)) => UiEventErrorDisposition::Reply,
+        (_, CommandError::Output(_)) => UiEventErrorDisposition::Reply,
+        (_, CommandError::CloseTimeout) => UiEventErrorDisposition::Reply,
         (UiEventPolicy::Disposable, CommandError::Emulator(_)) => UiEventErrorDisposition::Diagnose,
     }
 }
@@ -3973,8 +4640,10 @@ fn command_error_code(error: &CommandError) -> &'static str {
     match error {
         CommandError::Busy => "busy",
         CommandError::Stopped => "terminal_stopped",
+        CommandError::CloseTimeout => "close_timeout",
         CommandError::Emulator(_) => "terminal_emulator",
         CommandError::CopyMode(_) => "copy_mode",
+        CommandError::Output(_) => "terminal_output",
     }
 }
 
@@ -4572,7 +5241,9 @@ mod tests {
                 resources,
                 runtimes: HashMap::new(),
                 expected_finalizations: HashSet::new(),
+                exited_terminals: VecDeque::new(),
                 resource_changes: watch::channel(1).0,
+                agent_events: broadcast::channel(AGENT_EVENT_CAPACITY).0,
                 child_env: HashMap::new(),
                 accepting: true,
             },
@@ -4753,7 +5424,9 @@ mod tests {
             resources: ResourceTree::default(),
             runtimes: HashMap::new(),
             expected_finalizations: HashSet::new(),
+            exited_terminals: VecDeque::new(),
             resource_changes,
+            agent_events: broadcast::channel(AGENT_EVENT_CAPACITY).0,
             child_env: HashMap::new(),
             accepting: true,
         };

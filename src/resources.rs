@@ -13,8 +13,8 @@ use thiserror::Error;
 
 use crate::{
     domain::{
-        AgentActivity, AgentAttention, AgentReport, AgentState, AttentionKind, PaneId, SessionId,
-        TabId, TerminalId, WorkspaceId,
+        AgentActivity, AgentEvent, AgentIntegration, AgentReport, AgentReportMetadata, AgentState,
+        PaneId, SessionId, TabId, TerminalId, WorkspaceId,
     },
     splits::{SplitDirection, SplitTree},
 };
@@ -149,7 +149,7 @@ pub struct TabSnapshot {
     pub panes: Vec<PaneSnapshot>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PaneSnapshot {
     pub id: PaneId,
     pub terminal_id: TerminalId,
@@ -276,6 +276,8 @@ pub enum ResourceError {
     TargetRequired,
     #[error("target is ambiguous")]
     AmbiguousTarget,
+    #[error("invalid agent report: {0}")]
+    InvalidAgentReport(&'static str),
     #[error("resource tree invariant violated: {0}")]
     Invariant(String),
 }
@@ -303,7 +305,7 @@ struct Tab {
     panes: Vec<PaneId>,
     layout: SplitTree,
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Pane {
     tab_id: TabId,
     terminal_id: TerminalId,
@@ -558,6 +560,30 @@ impl ResourceTree {
         report: AgentReport,
         now_ms: u64,
     ) -> Result<u64, ResourceError> {
+        self.report_agent_with_metadata(terminal_id, report, AgentReportMetadata::default(), now_ms)
+    }
+
+    pub fn agent_activity(&self, terminal_id: TerminalId) -> Result<&AgentActivity, ResourceError> {
+        let pane_id = self
+            .terminals
+            .get(&terminal_id)
+            .ok_or(ResourceError::NotFound("terminal"))?;
+        self.panes
+            .get(pane_id)
+            .map(|pane| &pane.activity)
+            .ok_or_else(|| ResourceError::Invariant("terminal pane is missing".into()))
+    }
+
+    pub fn report_agent_with_metadata(
+        &mut self,
+        terminal_id: TerminalId,
+        report: AgentReport,
+        metadata: AgentReportMetadata,
+        now_ms: u64,
+    ) -> Result<u64, ResourceError> {
+        metadata
+            .validate()
+            .map_err(ResourceError::InvalidAgentReport)?;
         let pane_id = *self
             .terminals
             .get(&terminal_id)
@@ -569,6 +595,17 @@ impl ResourceTree {
             .get_mut(&pane_id)
             .ok_or_else(|| ResourceError::Invariant("terminal pane is missing".into()))?
             .activity;
+        let integration = activity
+            .integration
+            .get_or_insert_with(AgentIntegration::default);
+        if metadata.source.is_some() {
+            integration.source.clone_from(&metadata.source);
+        }
+        if metadata.agent_session_id.is_some() {
+            integration
+                .agent_session_id
+                .clone_from(&metadata.agent_session_id);
+        }
         activity.state = match report {
             AgentReport::Idle | AgentReport::Completed => AgentState::Idle,
             AgentReport::Working => AgentState::Working,
@@ -576,17 +613,12 @@ impl ResourceTree {
         };
         activity.revision = revision;
         activity.updated_at_ms = now_ms;
-        if let Some(kind) = match report {
-            AgentReport::Blocked => Some(AttentionKind::Blocked),
-            AgentReport::Completed => Some(AttentionKind::Completed),
-            AgentReport::Idle | AgentReport::Working => None,
-        } {
-            activity.attention = Some(AgentAttention {
-                revision,
-                kind,
-                occurred_at_ms: now_ms,
-            });
-        }
+        activity.last_event = Some(AgentEvent {
+            revision,
+            kind: report,
+            occurred_at_ms: now_ms,
+            turn_id: metadata.turn_id,
+        });
         Ok(revision)
     }
 
@@ -999,10 +1031,11 @@ impl ResourceTree {
         pane_id: PaneId,
         terminal_id: TerminalId,
     ) -> Result<Mutation, ResourceError> {
-        let anchor_pane = *self
+        let anchor_pane = self
             .panes
             .get(&anchor)
-            .ok_or(ResourceError::NotFound("pane"))?;
+            .ok_or(ResourceError::NotFound("pane"))?
+            .clone();
         if anchor_pane.closing {
             return Err(ResourceError::Closing("pane"));
         }
@@ -1043,10 +1076,11 @@ impl ResourceTree {
         pane_id: PaneId,
         destination: TabId,
     ) -> Result<Mutation, ResourceError> {
-        let pane = *self
+        let pane = self
             .panes
             .get(&pane_id)
-            .ok_or(ResourceError::NotFound("pane"))?;
+            .ok_or(ResourceError::NotFound("pane"))?
+            .clone();
         let source_tab = &self.tabs[&pane.tab_id];
         let destination_tab = self
             .tabs
@@ -1101,10 +1135,11 @@ impl ResourceTree {
     }
 
     pub fn close_pane(&mut self, pane_id: PaneId) -> Result<Mutation, ResourceError> {
-        let pane = *self
+        let pane = self
             .panes
             .get(&pane_id)
-            .ok_or(ResourceError::NotFound("pane"))?;
+            .ok_or(ResourceError::NotFound("pane"))?
+            .clone();
         let tab = &self.tabs[&pane.tab_id];
         let workspace = &self.workspaces[&tab.workspace_id];
         if self.sessions[&workspace.session_id].closing {
@@ -1131,10 +1166,11 @@ impl ResourceTree {
     }
 
     pub fn cancel_close_pane(&mut self, pane_id: PaneId) -> Result<Mutation, ResourceError> {
-        let pane = *self
+        let pane = self
             .panes
             .get(&pane_id)
-            .ok_or(ResourceError::NotFound("pane"))?;
+            .ok_or(ResourceError::NotFound("pane"))?
+            .clone();
         let session = self.session_for_tab(pane.tab_id);
         if session.closing {
             return Err(ResourceError::Closing("session"));
@@ -1660,12 +1696,12 @@ impl ResourceTree {
         }
     }
     fn pane_snapshot(&self, id: PaneId) -> PaneSnapshot {
-        let p = self.panes[&id];
+        let p = &self.panes[&id];
         PaneSnapshot {
             id,
             terminal_id: p.terminal_id,
             closing: p.closing,
-            activity: p.activity,
+            activity: p.activity.clone(),
         }
     }
     fn session_for_workspace(&self, workspace_id: WorkspaceId) -> &Session {
@@ -1884,33 +1920,105 @@ mod tests {
         let terminal_id = path.terminal_id;
         tree.create_session(path).unwrap();
 
+        let initial_snapshot = tree.snapshot();
+        let unintegrated = &initial_snapshot.sessions[0].workspaces[0].tabs[0].panes[0].activity;
+        assert_eq!(unintegrated.state, AgentState::Idle);
+        assert_eq!(unintegrated.integration, None);
+        assert_eq!(unintegrated.last_event, None);
+
         let working_revision = tree
-            .report_agent(terminal_id, AgentReport::Working, 10)
+            .report_agent_with_metadata(
+                terminal_id,
+                AgentReport::Working,
+                AgentReportMetadata {
+                    source: Some("pi".into()),
+                    agent_session_id: Some("session-1".into()),
+                    turn_id: Some("turn-1".into()),
+                },
+                10,
+            )
             .unwrap();
-        let working = tree.snapshot().sessions[0].workspaces[0].tabs[0].panes[0].activity;
+        let working = tree.snapshot().sessions[0].workspaces[0].tabs[0].panes[0]
+            .activity
+            .clone();
         assert_eq!(working.state, AgentState::Working);
         assert_eq!(working.revision, working_revision);
-        assert_eq!(working.attention, None);
+        assert_eq!(
+            working.integration.as_ref().unwrap().source.as_deref(),
+            Some("pi")
+        );
+        assert_eq!(
+            working.last_event,
+            Some(AgentEvent {
+                revision: working_revision,
+                kind: AgentReport::Working,
+                occurred_at_ms: 10,
+                turn_id: Some("turn-1".into()),
+            })
+        );
 
         let completed_revision = tree
             .report_agent(terminal_id, AgentReport::Completed, 20)
             .unwrap();
-        let completed = tree.snapshot().sessions[0].workspaces[0].tabs[0].panes[0].activity;
+        let completed = tree.snapshot().sessions[0].workspaces[0].tabs[0].panes[0]
+            .activity
+            .clone();
         assert_eq!(completed.state, AgentState::Idle);
         assert_eq!(
-            completed.attention,
-            Some(AgentAttention {
+            completed.last_event,
+            Some(AgentEvent {
                 revision: completed_revision,
-                kind: AttentionKind::Completed,
+                kind: AgentReport::Completed,
                 occurred_at_ms: 20,
+                turn_id: None,
             })
         );
-
+        let serialized_snapshot = serde_json::to_value(tree.snapshot()).unwrap();
+        let serialized_activity =
+            &serialized_snapshot["sessions"][0]["workspaces"][0]["tabs"][0]["panes"][0]["activity"];
+        assert!(serialized_activity.get("integration").is_some());
+        assert_eq!(serialized_activity["last_event"]["kind"], "completed");
+        assert!(serialized_activity.get("attention").is_none());
         tree.report_agent(terminal_id, AgentReport::Blocked, 30)
             .unwrap();
-        let blocked = tree.snapshot().sessions[0].workspaces[0].tabs[0].panes[0].activity;
+        let blocked = tree.snapshot().sessions[0].workspaces[0].tabs[0].panes[0]
+            .activity
+            .clone();
         assert_eq!(blocked.state, AgentState::Blocked);
-        assert_eq!(blocked.attention.unwrap().kind, AttentionKind::Blocked);
+        assert_eq!(
+            blocked.last_event.as_ref().unwrap().kind,
+            AgentReport::Blocked
+        );
+        assert_eq!(
+            blocked.integration.as_ref().unwrap().source.as_deref(),
+            Some("pi")
+        );
+
+        let before_rejected_report = tree.revision();
+        assert_eq!(
+            tree.report_agent_with_metadata(
+                terminal_id,
+                AgentReport::Working,
+                AgentReportMetadata {
+                    source: Some("x".repeat(crate::domain::MAX_AGENT_METADATA_VALUE_BYTES + 1)),
+                    ..AgentReportMetadata::default()
+                },
+                40,
+            ),
+            Err(ResourceError::InvalidAgentReport(
+                "agent report metadata value is too long"
+            ))
+        );
+        assert_eq!(tree.revision(), before_rejected_report);
+        assert_eq!(
+            tree.snapshot().sessions[0].workspaces[0].tabs[0].panes[0]
+                .activity
+                .last_event
+                .as_ref()
+                .unwrap()
+                .kind,
+            AgentReport::Blocked
+        );
     }
     fn assert_valid<T>(tree: &ResourceTree, result: &Result<T, ResourceError>) {
         tree.validate().unwrap();

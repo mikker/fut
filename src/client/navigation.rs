@@ -389,15 +389,15 @@ mod tests {
         let main = &session_one.workspaces[0];
         let tab_a = &main.tabs[0];
         let tab_b = &main.tabs[1];
-        let a1 = target(session_one, main, tab_a, tab_a.panes[0]);
-        let a2 = target(session_one, main, tab_a, tab_a.panes[1]);
-        let b = target(session_one, main, tab_b, tab_b.panes[0]);
+        let a1 = target(session_one, main, tab_a, tab_a.panes[0].clone());
+        let a2 = target(session_one, main, tab_a, tab_a.panes[1].clone());
+        let b = target(session_one, main, tab_b, tab_b.panes[0].clone());
         let feature = &session_one.workspaces[1];
         let c = target(
             session_one,
             feature,
             &feature.tabs[0],
-            feature.tabs[0].panes[0],
+            feature.tabs[0].panes[0].clone(),
         );
         let session_two = &snapshot.sessions[1];
         let two_main = &session_two.workspaces[0];
@@ -405,7 +405,7 @@ mod tests {
             session_two,
             two_main,
             &two_main.tabs[0],
-            two_main.tabs[0].panes[0],
+            two_main.tabs[0].panes[0].clone(),
         );
 
         let mut history = NavigationHistory::default();
@@ -448,7 +448,7 @@ mod tests {
             session,
             workspace,
             &workspace.tabs[0],
-            workspace.tabs[0].panes[0],
+            workspace.tabs[0].panes[0].clone(),
         );
         let second = workspace.tabs[1].panes[0].id;
         let history = NavigationHistory::default();
@@ -479,7 +479,7 @@ mod tests {
             session,
             workspace,
             &workspace.tabs[0],
-            workspace.tabs[0].panes[0],
+            workspace.tabs[0].panes[0].clone(),
         );
         let feature = session.workspaces[1].tabs[0].panes[0].id;
         let history = NavigationHistory::default();

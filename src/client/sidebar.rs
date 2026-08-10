@@ -79,7 +79,7 @@ impl WorkspaceModel {
                                 .tabs
                                 .iter()
                                 .flat_map(|tab| &tab.panes)
-                                .copied()
+                                .cloned()
                                 .collect::<Vec<_>>(),
                         ),
                     }
@@ -904,7 +904,7 @@ mod tests {
             .collect::<Vec<_>>();
         let workspace = &workspaces[current];
         let tab = &workspace.tabs[0];
-        let pane = tab.panes[0];
+        let pane = tab.panes[0].clone();
         let workspace_id = workspace.id;
         let tab_id = tab.id;
         let pane_id = pane.id;
@@ -982,7 +982,7 @@ mod tests {
             name: "remembered".into(),
             closing: false,
             layout: crate::splits::SplitTree::leaf(remembered.id),
-            panes: vec![remembered],
+            panes: vec![remembered.clone()],
         });
         let mut history = NavigationHistory::default();
         let mut remembered_target = focused.clone();

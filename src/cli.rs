@@ -1,8 +1,9 @@
-use std::{ffi::OsString, path::PathBuf, process::ExitCode, time::Duration};
+use std::{ffi::OsString, path::PathBuf, process::ExitCode, str::FromStr, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
-use clap::{Parser, Subcommand, ValueEnum, ValueHint};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum, ValueHint};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::json;
@@ -11,6 +12,9 @@ use tokio_util::codec::Framed;
 use uuid::Uuid;
 
 mod completion;
+
+// Bundled at build time so the printed skill always matches this binary's release.
+const AGENT_SKILL: &str = include_str!("../skills/fut/SKILL.md");
 
 use clap_complete::engine::ArgValueCompleter;
 
@@ -22,13 +26,17 @@ use crate::{
         path::socket_path,
         run_daemon,
     },
-    domain::{AgentReport, PaneId, SessionId, TabId, TerminalId, WorkspaceId},
+    domain::{
+        AgentReport, AgentReportMetadata, AgentState, MAX_TERMINAL_OUTPUT_ROWS, PaneId, SessionId,
+        TabId, TerminalId, TerminalOutputMatcher, TerminalOutputSource, WorkspaceId,
+    },
     protocol::{
         AcknowledgedCommand, ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION,
-        PROTOCOL_VERSION_0_1, RenameSelector, ServerMessage, codec, decode_payload, encode_payload,
+        PROTOCOL_VERSION_0_1, RenameSelector, ServerMessage, TerminalInputOperation, codec,
+        decode_payload, encode_payload,
     },
     resources::{ResourceSnapshot, SessionSelector, TabSnapshot, TargetSelector},
-    splits::{SplitAxis, SplitTree},
+    splits::{SplitAxis, SplitDirection, SplitTree},
 };
 
 #[derive(Parser)]
@@ -82,17 +90,31 @@ enum Command {
         #[command(subcommand)]
         command: TabCommand,
     },
-    /// Create, list, attach, move, or close a pane.
+    /// Create, split, list, attach, move, or close a pane.
     Pane {
         /// Pane operation to perform.
         #[command(subcommand)]
         command: PaneCommand,
     },
-    /// Attach to a terminal.
+    /// Attach to or send input to a terminal.
     Terminal {
         /// Terminal operation to perform.
         #[command(subcommand)]
         command: TerminalCommand,
+    },
+    /// Inspect or control coding-agent integrations.
+    Agent {
+        /// Agent operation to perform.
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
+    /// Resolve the current terminal ancestry from Fut's environment.
+    Context,
+    /// Look up any Fut resource by its globally unique UUID.
+    Get {
+        /// Raw session, workspace, tab, pane, or terminal UUID.
+        #[arg(add = ArgValueCompleter::new(completion::get))]
+        id: Uuid,
     },
     /// List resources from the existing daemon.
     List,
@@ -218,6 +240,21 @@ enum PaneCommand {
         #[arg(last = true, value_hint = ValueHint::CommandWithArguments)]
         command: Vec<String>,
     },
+    /// Split an explicit pane through an existing daemon without attaching.
+    Split {
+        /// Raw UUID of the pane to split.
+        #[arg(add = ArgValueCompleter::new(completion::pane_attach))]
+        pane_id: PaneId,
+        /// Place the new pane to the right of or below the anchor pane.
+        #[arg(value_enum)]
+        direction: PaneSplitDirection,
+        /// Working directory for the child; defaults to the anchor pane's directory.
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        cwd: Option<PathBuf>,
+        /// Child program and its direct argv, following `--`; defaults to the shell.
+        #[arg(last = true, value_hint = ValueHint::CommandWithArguments)]
+        command: Vec<String>,
+    },
     /// List the panes of a tab, including the tab's split layout.
     List {
         /// Raw UUID of the tab that owns the panes.
@@ -247,6 +284,21 @@ enum PaneCommand {
     },
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum PaneSplitDirection {
+    Right,
+    Down,
+}
+
+impl From<PaneSplitDirection> for SplitDirection {
+    fn from(value: PaneSplitDirection) -> Self {
+        match value {
+            PaneSplitDirection::Right => Self::Right,
+            PaneSplitDirection::Down => Self::Down,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum TerminalCommand {
     /// Attach to a terminal on the existing daemon.
@@ -254,6 +306,70 @@ enum TerminalCommand {
         /// Raw terminal UUID identifying one process-bearing terminal.
         #[arg(add = ArgValueCompleter::new(completion::terminal_attach))]
         terminal_id: TerminalId,
+    },
+    /// Send literal text without submitting it.
+    SendText {
+        /// Raw UUID of the terminal that will receive the text.
+        #[arg(add = ArgValueCompleter::new(completion::terminal_attach))]
+        terminal_id: TerminalId,
+        /// Literal Unicode text, encoded using the terminal's current paste mode.
+        #[arg(allow_hyphen_values = true)]
+        text: String,
+    },
+    /// Send validated logical keys or control chords.
+    SendKeys {
+        /// Raw UUID of the terminal that will receive the keys.
+        #[arg(add = ArgValueCompleter::new(completion::terminal_attach))]
+        terminal_id: TerminalId,
+        /// Named key, one character, or chord such as ctrl+c or alt+left.
+        #[arg(required = true, num_args = 1..)]
+        keys: Vec<LogicalKey>,
+    },
+    /// Send literal command text and Enter as one atomic operation.
+    Run {
+        /// Raw UUID of the terminal that will receive the command.
+        #[arg(add = ArgValueCompleter::new(completion::terminal_attach))]
+        terminal_id: TerminalId,
+        /// Literal command text to submit.
+        #[arg(allow_hyphen_values = true)]
+        command: String,
+    },
+    /// Read a bounded terminal output snapshot.
+    Read {
+        /// Raw UUID of the terminal to inspect.
+        #[arg(add = ArgValueCompleter::new(completion::terminal_attach))]
+        terminal_id: TerminalId,
+        /// Visible viewport or a bounded recent physical-row window.
+        #[arg(long, value_enum, default_value = "visible")]
+        source: TerminalOutputSourceArg,
+        /// Physical rows for recent sources; defaults to 200.
+        #[arg(long, value_parser = parse_output_lines)]
+        lines: Option<usize>,
+        /// Preserve terminal colors and styles as ANSI escape sequences.
+        #[arg(long)]
+        ansi: bool,
+    },
+    /// Wait for literal or regular-expression output without polling.
+    #[command(group(ArgGroup::new("matcher").required(true).args(["literal", "regex"])))]
+    WaitOutput {
+        /// Raw UUID of the terminal to observe.
+        #[arg(add = ArgValueCompleter::new(completion::terminal_attach))]
+        terminal_id: TerminalId,
+        /// Literal Unicode text to match.
+        #[arg(long, allow_hyphen_values = true)]
+        literal: Option<String>,
+        /// Rust regular expression to match.
+        #[arg(long, allow_hyphen_values = true)]
+        regex: Option<String>,
+        /// Required deadline, such as 500ms, 30s, or 2m.
+        #[arg(long, value_parser = parse_output_timeout)]
+        timeout: Duration,
+        /// Output source; defaults to recent soft-wrap reconstruction.
+        #[arg(long, value_enum, default_value = "recent-unwrapped")]
+        source: TerminalOutputSourceArg,
+        /// Physical rows retained for matching; defaults to 200.
+        #[arg(long, value_parser = parse_output_lines)]
+        lines: Option<usize>,
     },
     /// Report explicit agent state for a terminal.
     Report {
@@ -263,6 +379,247 @@ enum TerminalCommand {
         /// Terminal UUID; defaults to FUT_TERMINAL_ID inside Fut.
         #[arg(long)]
         terminal_id: Option<TerminalId>,
+        /// Integration name, such as codex or claude-code.
+        #[arg(long)]
+        source: Option<String>,
+        /// Integration-owned agent session identifier.
+        #[arg(long)]
+        agent_session_id: Option<String>,
+        /// Integration-owned turn identifier for this report.
+        #[arg(long)]
+        turn_id: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum TerminalOutputSourceArg {
+    Visible,
+    Recent,
+    RecentUnwrapped,
+}
+
+impl From<TerminalOutputSourceArg> for TerminalOutputSource {
+    fn from(value: TerminalOutputSourceArg) -> Self {
+        match value {
+            TerminalOutputSourceArg::Visible => Self::Visible,
+            TerminalOutputSourceArg::Recent => Self::Recent,
+            TerminalOutputSourceArg::RecentUnwrapped => Self::RecentUnwrapped,
+        }
+    }
+}
+
+fn parse_output_timeout(value: &str) -> Result<Duration, String> {
+    let (number, multiplier) = if let Some(number) = value.strip_suffix("ms") {
+        (number, 1_u64)
+    } else if let Some(number) = value.strip_suffix('s') {
+        (number, 1_000)
+    } else if let Some(number) = value.strip_suffix('m') {
+        (number, 60_000)
+    } else {
+        return Err("timeout must end in ms, s, or m".into());
+    };
+    let amount = number
+        .parse::<u64>()
+        .map_err(|_| "timeout must contain a positive integer".to_owned())?;
+    let milliseconds = amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| "timeout is too large".to_owned())?;
+    if !(1..=3_600_000).contains(&milliseconds) {
+        return Err("timeout must be between 1ms and 1h".into());
+    }
+    Ok(Duration::from_millis(milliseconds))
+}
+
+fn parse_output_lines(value: &str) -> Result<usize, String> {
+    let lines = value
+        .parse::<usize>()
+        .map_err(|_| "lines must be a positive integer".to_owned())?;
+    if !(1..=MAX_TERMINAL_OUTPUT_ROWS).contains(&lines) {
+        return Err(format!(
+            "lines must be between 1 and {MAX_TERMINAL_OUTPUT_ROWS}"
+        ));
+    }
+    Ok(lines)
+}
+
+#[derive(Clone)]
+struct LogicalKey {
+    bytes: Vec<u8>,
+}
+
+impl FromStr for LogicalKey {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let event = logical_key_event(value)?;
+        let bytes = client::input::encode_key(event)
+            .ok_or_else(|| format!("unsupported logical key: {value}"))?;
+        Ok(Self { bytes })
+    }
+}
+
+fn logical_key_event(value: &str) -> Result<KeyEvent, String> {
+    if value.is_empty() {
+        return Err("logical key cannot be empty".into());
+    }
+    if let Some(code) = named_key_code(value) {
+        return Ok(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+    if value.chars().count() == 1 {
+        return Ok(KeyEvent::new(
+            KeyCode::Char(value.chars().next().expect("one character")),
+            KeyModifiers::NONE,
+        ));
+    }
+
+    let parts = value.split('+').collect::<Vec<_>>();
+    let (key, modifiers) = parts
+        .split_last()
+        .ok_or_else(|| format!("invalid logical key: {value}"))?;
+    if modifiers.is_empty() || key.is_empty() {
+        return Err(format!("invalid logical key: {value}"));
+    }
+    let mut parsed_modifiers = KeyModifiers::NONE;
+    for modifier in modifiers {
+        parsed_modifiers |= match modifier.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => KeyModifiers::CONTROL,
+            "alt" | "meta" => KeyModifiers::ALT,
+            "shift" => KeyModifiers::SHIFT,
+            _ => return Err(format!("unknown key modifier `{modifier}` in `{value}`")),
+        };
+    }
+    let mut code = named_key_code(key)
+        .or_else(|| (key.chars().count() == 1).then(|| KeyCode::Char(key.chars().next().unwrap())));
+    if parsed_modifiers.contains(KeyModifiers::SHIFT) {
+        code = match code {
+            Some(KeyCode::Tab) => Some(KeyCode::BackTab),
+            Some(KeyCode::Char(character)) if character.is_ascii_lowercase() => {
+                Some(KeyCode::Char(character.to_ascii_uppercase()))
+            }
+            other => other,
+        };
+    }
+    if parsed_modifiers.contains(KeyModifiers::CONTROL)
+        && !matches!(code, Some(KeyCode::Char(character)) if control_character_supported(character))
+    {
+        return Err(format!("control modifier is unsupported for `{key}`"));
+    }
+    if parsed_modifiers.contains(KeyModifiers::SHIFT)
+        && !matches!(
+            code,
+            Some(KeyCode::Char(_) | KeyCode::Tab | KeyCode::BackTab)
+        )
+    {
+        return Err(format!("shift modifier is unsupported for `{key}`"));
+    }
+    code.map(|code| KeyEvent::new(code, parsed_modifiers))
+        .ok_or_else(|| format!("unknown logical key `{key}` in `{value}`"))
+}
+
+fn control_character_supported(character: char) -> bool {
+    matches!(
+        character.to_ascii_lowercase(),
+        '@' | ' ' | 'a'..='z' | '[' | '\\' | ']' | '^' | '_' | '?'
+    )
+}
+
+fn named_key_code(value: &str) -> Option<KeyCode> {
+    Some(match value.to_ascii_lowercase().as_str() {
+        "enter" | "return" => KeyCode::Enter,
+        "tab" => KeyCode::Tab,
+        "backtab" | "back-tab" => KeyCode::BackTab,
+        "backspace" => KeyCode::Backspace,
+        "escape" | "esc" => KeyCode::Esc,
+        "up" => KeyCode::Up,
+        "down" => KeyCode::Down,
+        "right" => KeyCode::Right,
+        "left" => KeyCode::Left,
+        "home" => KeyCode::Home,
+        "end" => KeyCode::End,
+        "insert" => KeyCode::Insert,
+        "delete" | "del" => KeyCode::Delete,
+        "page-up" | "pageup" => KeyCode::PageUp,
+        "page-down" | "pagedown" => KeyCode::PageDown,
+        "space" => KeyCode::Char(' '),
+        function if function.starts_with('f') => {
+            let number = function[1..].parse::<u8>().ok()?;
+            if !(1..=12).contains(&number) {
+                return None;
+            }
+            KeyCode::F(number)
+        }
+        _ => return None,
+    })
+}
+
+#[derive(Subcommand)]
+enum AgentCommand {
+    /// Print the bundled agent skill file.
+    Skill,
+    /// List integrated agent terminals.
+    List,
+    /// Inspect one integrated agent terminal.
+    Get {
+        /// Raw UUID of the integrated terminal.
+        #[arg(add = ArgValueCompleter::new(completion::agent))]
+        terminal_id: TerminalId,
+    },
+    /// Submit one prompt as literal text followed atomically by Enter.
+    Prompt {
+        /// Raw UUID of the integrated terminal.
+        #[arg(add = ArgValueCompleter::new(completion::agent))]
+        terminal_id: TerminalId,
+        /// Literal Unicode prompt text.
+        #[arg(allow_hyphen_values = true)]
+        text: String,
+        /// Wait for a fresh working transition and subsequent settled report.
+        #[arg(long)]
+        wait: bool,
+        /// Required with --wait; such as 500ms, 30s, or 2m.
+        #[arg(long, value_parser = parse_output_timeout)]
+        timeout: Option<Duration>,
+    },
+    /// Wait for a currently working agent to settle, or return current settled state.
+    Wait {
+        /// Raw UUID of the integrated terminal.
+        #[arg(add = ArgValueCompleter::new(completion::agent))]
+        terminal_id: TerminalId,
+        /// Required deadline, such as 500ms, 30s, or 2m.
+        #[arg(long, value_parser = parse_output_timeout)]
+        timeout: Duration,
+    },
+    /// Read bounded output together with current agent availability.
+    Read {
+        /// Raw UUID of the integrated terminal.
+        #[arg(add = ArgValueCompleter::new(completion::agent))]
+        terminal_id: TerminalId,
+        /// Visible viewport or a bounded recent physical-row window.
+        #[arg(long, value_enum, default_value = "visible")]
+        source: TerminalOutputSourceArg,
+        /// Physical rows for recent sources; defaults to 200.
+        #[arg(long, value_parser = parse_output_lines)]
+        lines: Option<usize>,
+        /// Preserve terminal colors and styles as ANSI escape sequences.
+        #[arg(long)]
+        ansi: bool,
+    },
+    /// Report explicit lifecycle state for an agent terminal.
+    Report {
+        /// Agent state or completion event.
+        #[arg(value_enum)]
+        state: AgentReportArg,
+        /// Terminal UUID; defaults to FUT_TERMINAL_ID inside Fut.
+        #[arg(long)]
+        terminal_id: Option<TerminalId>,
+        /// Integration name, such as codex or claude-code.
+        #[arg(long)]
+        source: Option<String>,
+        /// Integration-owned agent session identifier.
+        #[arg(long)]
+        agent_session_id: Option<String>,
+        /// Integration-owned turn identifier for this report.
+        #[arg(long)]
+        turn_id: Option<String>,
     },
 }
 
@@ -370,6 +727,23 @@ async fn run_from(args: impl IntoIterator<Item = OsString>) -> ExitCode {
 }
 
 async fn execute(cli: Cli) -> Result<()> {
+    if matches!(
+        &cli.command,
+        Some(Command::Agent {
+            command: AgentCommand::Skill
+        })
+    ) {
+        if cli.json {
+            return Err(CliError::new(
+                "invalid_arguments",
+                "--json is not supported for `fut agent skill`",
+            )
+            .into());
+        }
+        print!("{AGENT_SKILL}");
+        return Ok(());
+    }
+
     let socket = socket_path(cli.socket.as_deref())?;
     reject_interactive_json(&cli)?;
     match cli.command {
@@ -472,6 +846,55 @@ async fn execute(cli: Cli) -> Result<()> {
         }
         Some(Command::Pane {
             command:
+                PaneCommand::Split {
+                    pane_id,
+                    direction,
+                    cwd,
+                    command,
+                },
+        }) => {
+            let (program, argv) = child_command(command);
+            let direction = SplitDirection::from(direction);
+            let direction_name = match direction {
+                SplitDirection::Right => "right",
+                SplitDirection::Down => "down",
+            };
+            match control(
+                &socket,
+                ClientMessage::SplitPane {
+                    pane_id,
+                    direction,
+                    cwd,
+                    program,
+                    argv,
+                },
+            )
+            .await?
+            {
+                ServerMessage::PaneCreated { selected } => output(
+                    cli.json,
+                    "pane.split",
+                    json!({
+                        "anchor_pane_id": pane_id,
+                        "direction": direction,
+                        "selected": selected,
+                    }),
+                    format!(
+                        "anchor={} direction={direction_name} session={} workspace={} tab={} pane={} terminal={} pid={}",
+                        pane_id,
+                        selected.session_id,
+                        selected.workspace_id,
+                        selected.tab_id,
+                        selected.pane_id,
+                        selected.terminal_id,
+                        selected.child_pid
+                    ),
+                ),
+                other => unexpected(other),
+            }
+        }
+        Some(Command::Pane {
+            command:
                 PaneCommand::Move {
                     pane_id,
                     destination_tab_id,
@@ -511,39 +934,386 @@ async fn execute(cli: Cli) -> Result<()> {
             ),
             other => unexpected(other),
         },
+        Some(Command::Agent {
+            command: AgentCommand::List,
+        }) => {
+            let snapshot = list_resources(&socket).await?;
+            let agents = integrated_agents(&snapshot);
+            let human = agents
+                .iter()
+                .map(render_agent)
+                .collect::<Vec<_>>()
+                .join("\n");
+            output(
+                cli.json,
+                "agent.list",
+                json!({ "revision": snapshot.revision, "agents": agents }),
+                human,
+            )
+        }
+        Some(Command::Agent {
+            command: AgentCommand::Get { terminal_id },
+        }) => {
+            let snapshot = list_resources(&socket).await?;
+            let agent = resolve_agent(&snapshot, terminal_id)?;
+            output(
+                cli.json,
+                "agent.get",
+                json!({ "revision": snapshot.revision, "agent": agent }),
+                render_agent(&agent),
+            )
+        }
+        Some(Command::Agent {
+            command:
+                AgentCommand::Prompt {
+                    terminal_id,
+                    text,
+                    wait,
+                    timeout,
+                },
+        }) => {
+            if wait != timeout.is_some() {
+                return Err(CliError::new(
+                    "invalid_arguments",
+                    "--wait and --timeout must be used together",
+                )
+                .into());
+            }
+            match control(
+                &socket,
+                ClientMessage::PromptAgent {
+                    terminal_id,
+                    text,
+                    wait,
+                    timeout_ms: timeout.map(|value| value.as_millis() as u64),
+                },
+            )
+            .await?
+            {
+                ServerMessage::AgentPrompted {
+                    terminal_id,
+                    barrier_revision,
+                } => output(
+                    cli.json,
+                    "agent.prompt",
+                    json!({
+                        "terminal_id": terminal_id,
+                        "barrier_revision": barrier_revision,
+                        "submitted": true,
+                    }),
+                    format!("agent={terminal_id} submitted=true barrier={barrier_revision}"),
+                ),
+                ServerMessage::AgentSettled {
+                    terminal_id,
+                    barrier_revision,
+                    working_revision,
+                    activity,
+                } => output(
+                    cli.json,
+                    "agent.prompt",
+                    json!({
+                        "terminal_id": terminal_id,
+                        "barrier_revision": barrier_revision,
+                        "working_revision": working_revision,
+                        "submitted": true,
+                        "activity": activity,
+                    }),
+                    format!(
+                        "agent={terminal_id} submitted=true state={:?} barrier={barrier_revision} working={}",
+                        activity.state,
+                        working_revision
+                            .map_or_else(|| "-".into(), |revision| revision.to_string())
+                    ),
+                ),
+                other => unexpected(other),
+            }
+        }
+        Some(Command::Agent {
+            command:
+                AgentCommand::Wait {
+                    terminal_id,
+                    timeout,
+                },
+        }) => match control(
+            &socket,
+            ClientMessage::WaitAgent {
+                terminal_id,
+                timeout_ms: timeout.as_millis() as u64,
+            },
+        )
+        .await?
+        {
+            ServerMessage::AgentSettled {
+                terminal_id,
+                barrier_revision,
+                working_revision,
+                activity,
+            } => output(
+                cli.json,
+                "agent.wait",
+                json!({
+                    "terminal_id": terminal_id,
+                    "barrier_revision": barrier_revision,
+                    "working_revision": working_revision,
+                    "activity": activity,
+                }),
+                format!("agent={terminal_id} state={:?}", activity.state),
+            ),
+            other => unexpected(other),
+        },
+        Some(Command::Agent {
+            command:
+                AgentCommand::Read {
+                    terminal_id,
+                    source,
+                    lines,
+                    ansi,
+                },
+        }) => {
+            let source = TerminalOutputSource::from(source);
+            if source == TerminalOutputSource::Visible && lines.is_some() {
+                return Err(CliError::new(
+                    "invalid_arguments",
+                    "--lines is only valid with --source recent or recent-unwrapped",
+                )
+                .into());
+            }
+            // Resolve integration before observing the underlying terminal;
+            // lifecycle presence is sticky for the terminal's lifetime.
+            resolve_agent(&list_resources(&socket).await?, terminal_id)?;
+            let captured = match control(
+                &socket,
+                ClientMessage::ReadTerminalOutput {
+                    terminal_id,
+                    source,
+                    rows: lines.unwrap_or(200),
+                    ansi,
+                },
+            )
+            .await?
+            {
+                ServerMessage::TerminalOutput { output } => output,
+                other => return unexpected(other),
+            };
+            let snapshot = list_resources(&socket).await?;
+            let agent = resolve_agent(&snapshot, terminal_id)?;
+            let human = captured.text.clone();
+            output(
+                cli.json,
+                "agent.read",
+                json!({
+                    "revision": snapshot.revision,
+                    "agent": agent,
+                    "output": captured,
+                }),
+                human,
+            )
+        }
+        Some(Command::Agent {
+            command:
+                AgentCommand::Report {
+                    state,
+                    terminal_id,
+                    source,
+                    agent_session_id,
+                    turn_id,
+                },
+        }) => {
+            report_agent_command(
+                &socket,
+                cli.json,
+                "agent.report",
+                state,
+                terminal_id,
+                AgentReportMetadata {
+                    source,
+                    agent_session_id,
+                    turn_id,
+                },
+            )
+            .await
+        }
         Some(Command::Terminal {
             command: TerminalCommand::Attach { terminal_id },
         }) => client::attach(&socket, Some(TargetSelector::Terminal(terminal_id))).await,
         Some(Command::Terminal {
-            command: TerminalCommand::Report { state, terminal_id },
+            command: TerminalCommand::SendText { terminal_id, text },
         }) => {
-            let terminal_id = match terminal_id {
-                Some(terminal_id) => terminal_id,
-                None => std::env::var("FUT_TERMINAL_ID")
-                    .context("FUT_TERMINAL_ID is unavailable; pass --terminal-id")?
-                    .parse()
-                    .context("FUT_TERMINAL_ID is invalid")?,
-            };
-            response_ok(
-                control(
-                    &socket,
-                    ClientMessage::ReportAgent {
-                        terminal_id,
-                        report: state.into(),
-                    },
-                )
-                .await?,
-                AcknowledgedCommand::ReportAgent,
-            )?;
+            let byte_count = text.len();
+            terminal_input(
+                &socket,
+                ClientMessage::TerminalInput {
+                    terminal_id,
+                    operation: TerminalInputOperation::Text { text },
+                },
+            )
+            .await?;
             output(
                 cli.json,
-                "terminal.report",
-                json!({ "terminal_id": terminal_id, "state": AgentReport::from(state) }),
-                format!(
-                    "terminal={terminal_id} state={}",
-                    state.to_possible_value().expect("value enum").get_name()
-                ),
+                "terminal.send-text",
+                json!({ "terminal_id": terminal_id, "bytes": byte_count }),
+                format!("terminal={terminal_id} bytes={byte_count} submitted=false"),
             )
+        }
+        Some(Command::Terminal {
+            command: TerminalCommand::SendKeys { terminal_id, keys },
+        }) => {
+            let key_count = keys.len();
+            let bytes = keys
+                .into_iter()
+                .flat_map(|key| key.bytes)
+                .collect::<Vec<_>>();
+            terminal_input(
+                &socket,
+                ClientMessage::TerminalInput {
+                    terminal_id,
+                    operation: TerminalInputOperation::Keys { bytes },
+                },
+            )
+            .await?;
+            output(
+                cli.json,
+                "terminal.send-keys",
+                json!({ "terminal_id": terminal_id, "keys": key_count }),
+                format!("terminal={terminal_id} keys={key_count}"),
+            )
+        }
+        Some(Command::Terminal {
+            command:
+                TerminalCommand::Run {
+                    terminal_id,
+                    command,
+                },
+        }) => {
+            let byte_count = command.len();
+            terminal_input(
+                &socket,
+                ClientMessage::TerminalInput {
+                    terminal_id,
+                    operation: TerminalInputOperation::Run { text: command },
+                },
+            )
+            .await?;
+            output(
+                cli.json,
+                "terminal.run",
+                json!({ "terminal_id": terminal_id, "bytes": byte_count }),
+                format!("terminal={terminal_id} bytes={byte_count} submitted=true"),
+            )
+        }
+        Some(Command::Terminal {
+            command:
+                TerminalCommand::Read {
+                    terminal_id,
+                    source,
+                    lines,
+                    ansi,
+                },
+        }) => {
+            let source = TerminalOutputSource::from(source);
+            if source == TerminalOutputSource::Visible && lines.is_some() {
+                return Err(CliError::new(
+                    "invalid_arguments",
+                    "--lines is only valid with --source recent or recent-unwrapped",
+                )
+                .into());
+            }
+            let rows = lines.unwrap_or(200);
+            match control(
+                &socket,
+                ClientMessage::ReadTerminalOutput {
+                    terminal_id,
+                    source,
+                    rows,
+                    ansi,
+                },
+            )
+            .await?
+            {
+                ServerMessage::TerminalOutput { output: captured } => {
+                    let human = captured.text.clone();
+                    output(cli.json, "terminal.read", captured, human)
+                }
+                other => unexpected(other),
+            }
+        }
+        Some(Command::Terminal {
+            command:
+                TerminalCommand::WaitOutput {
+                    terminal_id,
+                    literal,
+                    regex,
+                    timeout,
+                    source,
+                    lines,
+                },
+        }) => {
+            let source = TerminalOutputSource::from(source);
+            if source == TerminalOutputSource::Visible && lines.is_some() {
+                return Err(CliError::new(
+                    "invalid_arguments",
+                    "--lines is only valid with --source recent or recent-unwrapped",
+                )
+                .into());
+            }
+            let matcher = match (literal, regex) {
+                (Some(value), None) => TerminalOutputMatcher::Literal(value),
+                (None, Some(value)) => TerminalOutputMatcher::Regex(value),
+                _ => unreachable!("clap requires exactly one output matcher"),
+            };
+            let rows = lines.unwrap_or(200);
+            match control(
+                &socket,
+                ClientMessage::WaitTerminalOutput {
+                    terminal_id,
+                    source,
+                    rows,
+                    matcher,
+                    timeout_ms: timeout.as_millis() as u64,
+                },
+            )
+            .await?
+            {
+                ServerMessage::TerminalOutputMatched {
+                    output: captured,
+                    start,
+                    end,
+                    matched,
+                } => output(
+                    cli.json,
+                    "terminal.wait-output",
+                    json!({
+                        "output": captured,
+                        "match": { "start": start, "end": end, "text": matched },
+                    }),
+                    matched,
+                ),
+                other => unexpected(other),
+            }
+        }
+        Some(Command::Terminal {
+            command:
+                TerminalCommand::Report {
+                    state,
+                    terminal_id,
+                    source,
+                    agent_session_id,
+                    turn_id,
+                },
+        }) => {
+            report_agent_command(
+                &socket,
+                cli.json,
+                "terminal.report",
+                state,
+                terminal_id,
+                AgentReportMetadata {
+                    source,
+                    agent_session_id,
+                    turn_id,
+                },
+            )
+            .await
         }
         Some(Command::Tab {
             command:
@@ -585,6 +1355,33 @@ async fn execute(cli: Cli) -> Result<()> {
             }
         }
         Some(Command::Events) => stream_events(&socket).await,
+        Some(Command::Context) => {
+            let environment = context_environment()?;
+            let snapshot = list_resources(&socket).await?;
+            let terminal_uuid = environment
+                .terminal_id
+                .to_string()
+                .parse()
+                .expect("typed Fut IDs contain UUIDs");
+            let target = discover_target(&snapshot, terminal_uuid)?;
+            validate_context_target(&target, environment)?;
+            output(
+                cli.json,
+                "context",
+                json!({ "revision": snapshot.revision, "target": target }),
+                render_discovered_target(snapshot.revision, &target),
+            )
+        }
+        Some(Command::Get { id }) => {
+            let snapshot = list_resources(&socket).await?;
+            let target = discover_target(&snapshot, id)?;
+            output(
+                cli.json,
+                "get",
+                json!({ "revision": snapshot.revision, "target": target }),
+                render_discovered_target(snapshot.revision, &target),
+            )
+        }
         Some(Command::List) => {
             let snapshot = list_resources(&socket).await?;
             if cli.json {
@@ -683,6 +1480,9 @@ async fn execute(cli: Cli) -> Result<()> {
             )
         }
         Some(Command::Doctor) => unreachable!("doctor is handled before command execution"),
+        Some(Command::Agent {
+            command: AgentCommand::Skill,
+        }) => unreachable!("agent skill is handled before daemon setup"),
         Some(command) => run_mutation(&socket, cli.json, command).await,
     }
 }
@@ -693,6 +1493,130 @@ fn child_command(command: Vec<String>) -> (Option<PathBuf>, Vec<String>) {
         .map_or((None, vec![]), |(program, argv)| {
             (Some(program.into()), argv.to_vec())
         })
+}
+
+async fn terminal_input(socket: &std::path::Path, message: ClientMessage) -> Result<()> {
+    response_ok(
+        control(socket, message).await?,
+        AcknowledgedCommand::TerminalInput,
+    )
+}
+
+async fn report_agent_command(
+    socket: &std::path::Path,
+    json_output: bool,
+    command: &'static str,
+    state: AgentReportArg,
+    terminal_id: Option<TerminalId>,
+    metadata: AgentReportMetadata,
+) -> Result<()> {
+    let terminal_id = match terminal_id {
+        Some(terminal_id) => terminal_id,
+        None => std::env::var("FUT_TERMINAL_ID")
+            .context("FUT_TERMINAL_ID is unavailable; pass --terminal-id")?
+            .parse()
+            .context("FUT_TERMINAL_ID is invalid")?,
+    };
+    response_ok(
+        control(
+            socket,
+            ClientMessage::ReportAgent {
+                terminal_id,
+                report: state.into(),
+                metadata: metadata.clone(),
+            },
+        )
+        .await?,
+        AcknowledgedCommand::ReportAgent,
+    )?;
+    output(
+        json_output,
+        command,
+        json!({
+            "terminal_id": terminal_id,
+            "state": AgentReport::from(state),
+            "metadata": metadata,
+        }),
+        format!(
+            "agent={terminal_id} state={}",
+            state.to_possible_value().expect("value enum").get_name()
+        ),
+    )
+}
+
+fn integrated_agents(snapshot: &ResourceSnapshot) -> Vec<serde_json::Value> {
+    let mut agents = Vec::new();
+    for session in &snapshot.sessions {
+        for workspace in &session.workspaces {
+            for tab in &workspace.tabs {
+                for pane in &tab.panes {
+                    if pane.activity.integration.is_none() {
+                        continue;
+                    }
+                    let available = !session.closing
+                        && !workspace.closing
+                        && !tab.closing
+                        && !pane.closing
+                        && pane.activity.state != AgentState::Working;
+                    agents.push(json!({
+                        "terminal_id": pane.terminal_id,
+                        "pane_id": pane.id,
+                        "tab": { "id": tab.id, "name": tab.name },
+                        "workspace": {
+                            "id": workspace.id,
+                            "name": workspace.name,
+                            "root": workspace.root,
+                        },
+                        "session": { "id": session.id, "name": session.name },
+                        "available": available,
+                        "activity": pane.activity,
+                    }));
+                }
+            }
+        }
+    }
+    agents
+}
+
+fn resolve_agent(
+    snapshot: &ResourceSnapshot,
+    terminal_id: TerminalId,
+) -> Result<serde_json::Value> {
+    if let Some(agent) = integrated_agents(snapshot)
+        .into_iter()
+        .find(|agent| agent["terminal_id"] == terminal_id.to_string())
+    {
+        return Ok(agent);
+    }
+    let terminal_exists = snapshot
+        .sessions
+        .iter()
+        .flat_map(|session| &session.workspaces)
+        .flat_map(|workspace| &workspace.tabs)
+        .flat_map(|tab| &tab.panes)
+        .any(|pane| pane.terminal_id == terminal_id);
+    let (code, message) = if terminal_exists {
+        (
+            "not_an_agent",
+            format!("terminal {terminal_id} has no agent integration"),
+        )
+    } else {
+        ("not_found", format!("terminal {terminal_id} was not found"))
+    };
+    Err(CliError::new(code, message).into())
+}
+
+fn render_agent(agent: &serde_json::Value) -> String {
+    format!(
+        "agent={} state={} available={} session={} workspace={} tab={} pane={}",
+        agent["terminal_id"].as_str().unwrap_or("-"),
+        agent["activity"]["state"].as_str().unwrap_or("-"),
+        agent["available"].as_bool().unwrap_or(false),
+        agent["session"]["id"].as_str().unwrap_or("-"),
+        agent["workspace"]["id"].as_str().unwrap_or("-"),
+        agent["tab"]["id"].as_str().unwrap_or("-"),
+        agent["pane_id"].as_str().unwrap_or("-"),
+    )
 }
 
 fn reject_interactive_json(cli: &Cli) -> Result<()> {
@@ -1021,11 +1945,23 @@ async fn request(
     mut framed: Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     command: ClientMessage,
 ) -> Result<ServerMessage> {
+    let response_timeout = match &command {
+        ClientMessage::WaitTerminalOutput { timeout_ms, .. }
+        | ClientMessage::WaitAgent { timeout_ms, .. } => {
+            Duration::from_millis((*timeout_ms).min(3_600_000)) + Duration::from_secs(1)
+        }
+        ClientMessage::PromptAgent {
+            wait: true,
+            timeout_ms: Some(timeout_ms),
+            ..
+        } => Duration::from_millis((*timeout_ms).min(3_600_000)) + Duration::from_secs(1),
+        _ => Duration::from_secs(15),
+    };
     let request_id = send(&mut framed, command).await?;
     receive(
         &mut framed,
         request_id,
-        Duration::from_secs(15),
+        response_timeout,
         "daemon response timed out",
     )
     .await
@@ -1071,6 +2007,196 @@ async fn list_resources(socket: &std::path::Path) -> Result<ResourceSnapshot> {
         ServerMessage::Resources { snapshot } => Ok(snapshot),
         other => unexpected(other),
     }
+}
+
+#[derive(Clone, Copy)]
+struct ContextEnvironment {
+    session_id: SessionId,
+    workspace_id: WorkspaceId,
+    tab_id: TabId,
+    pane_id: PaneId,
+    terminal_id: TerminalId,
+}
+
+fn context_environment() -> Result<ContextEnvironment> {
+    const NAMES: [&str; 5] = [
+        "FUT_SESSION_ID",
+        "FUT_WORKSPACE_ID",
+        "FUT_TAB_ID",
+        "FUT_PANE_ID",
+        "FUT_TERMINAL_ID",
+    ];
+    let present = NAMES
+        .iter()
+        .filter(|name| std::env::var_os(name).is_some())
+        .count();
+    if present == 0 {
+        return Err(CliError::new(
+            "missing_context",
+            "Fut context is unavailable; run inside Fut or use `fut get <UUID>`",
+        )
+        .into());
+    }
+    if present != NAMES.len() {
+        let missing = NAMES
+            .iter()
+            .filter(|name| std::env::var_os(name).is_none())
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(CliError::new(
+            "invalid_context",
+            format!("Fut context is incomplete; missing {missing}"),
+        )
+        .into());
+    }
+
+    Ok(ContextEnvironment {
+        session_id: context_id("FUT_SESSION_ID")?,
+        workspace_id: context_id("FUT_WORKSPACE_ID")?,
+        tab_id: context_id("FUT_TAB_ID")?,
+        pane_id: context_id("FUT_PANE_ID")?,
+        terminal_id: context_id("FUT_TERMINAL_ID")?,
+    })
+}
+
+fn context_id<T>(name: &'static str) -> Result<T>
+where
+    T: std::str::FromStr,
+{
+    let value = std::env::var(name)
+        .map_err(|_| CliError::new("invalid_context", format!("{name} is not valid UTF-8")))?;
+    value
+        .parse()
+        .map_err(|_| CliError::new("invalid_context", format!("{name} is not a valid UUID")).into())
+}
+
+fn validate_context_target(
+    target: &serde_json::Value,
+    environment: ContextEnvironment,
+) -> Result<()> {
+    let expected = [
+        ("/session/id", environment.session_id.to_string()),
+        ("/workspace/id", environment.workspace_id.to_string()),
+        ("/tab/id", environment.tab_id.to_string()),
+        ("/pane/id", environment.pane_id.to_string()),
+        ("/terminal/id", environment.terminal_id.to_string()),
+    ];
+    for (pointer, expected) in expected {
+        if target.pointer(pointer).and_then(serde_json::Value::as_str) != Some(expected.as_str()) {
+            return Err(CliError::new(
+                "invalid_context",
+                "Fut context IDs do not describe one live resource ancestry",
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn discover_target(snapshot: &ResourceSnapshot, id: Uuid) -> Result<serde_json::Value> {
+    let mut matches = Vec::new();
+    for session in &snapshot.sessions {
+        let session_json = json!({
+            "id": session.id,
+            "name": session.name,
+            "closing": session.closing,
+        });
+        if uuid_matches(session.id, id) {
+            matches.push(json!({ "kind": "session", "session": session_json }));
+        }
+        for workspace in &session.workspaces {
+            let workspace_json = json!({
+                "id": workspace.id,
+                "name": workspace.name,
+                "root": workspace.root,
+                "closing": workspace.closing,
+            });
+            if uuid_matches(workspace.id, id) {
+                matches.push(json!({
+                    "kind": "workspace",
+                    "session": session_json,
+                    "workspace": workspace_json,
+                }));
+            }
+            for tab in &workspace.tabs {
+                let tab_json = json!({
+                    "id": tab.id,
+                    "name": tab.name,
+                    "closing": tab.closing,
+                });
+                if uuid_matches(tab.id, id) {
+                    matches.push(json!({
+                        "kind": "tab",
+                        "session": session_json,
+                        "workspace": workspace_json,
+                        "tab": tab_json,
+                    }));
+                }
+                for pane in &tab.panes {
+                    let pane_json = json!({
+                        "id": pane.id,
+                        "closing": pane.closing,
+                        "activity": pane.activity,
+                    });
+                    let terminal_json = json!({ "id": pane.terminal_id });
+                    if uuid_matches(pane.id, id) {
+                        matches.push(json!({
+                            "kind": "pane",
+                            "session": session_json,
+                            "workspace": workspace_json,
+                            "tab": tab_json,
+                            "pane": pane_json,
+                            "terminal": terminal_json,
+                        }));
+                    }
+                    if uuid_matches(pane.terminal_id, id) {
+                        matches.push(json!({
+                            "kind": "terminal",
+                            "session": session_json,
+                            "workspace": workspace_json,
+                            "tab": tab_json,
+                            "pane": pane_json,
+                            "terminal": terminal_json,
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    match matches.len() {
+        0 => Err(CliError::new("not_found", format!("resource {id} not found")).into()),
+        1 => Ok(matches.pop().expect("one discovery match")),
+        _ => Err(CliError::new(
+            "ambiguous_target",
+            format!("UUID {id} identifies more than one resource"),
+        )
+        .into()),
+    }
+}
+
+fn uuid_matches(id: impl std::fmt::Display, expected: Uuid) -> bool {
+    id.to_string().parse::<Uuid>().ok() == Some(expected)
+}
+
+fn render_discovered_target(revision: u64, target: &serde_json::Value) -> String {
+    let field = |pointer| {
+        target
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+    };
+    format!(
+        "revision={revision} kind={} session={} workspace={} tab={} pane={} terminal={} activity={}",
+        field("/kind"),
+        field("/session/id"),
+        field("/workspace/id"),
+        field("/tab/id"),
+        field("/pane/id"),
+        field("/terminal/id"),
+        field("/pane/activity/state"),
+    )
 }
 
 fn render_tabs(revision: u64, tabs: &[TabSnapshot]) -> String {
@@ -1419,16 +2545,117 @@ mod tests {
             vec!["fut", "tab", "rename", &tab, "new"],
             vec!["fut", "tab", "close", &tab],
             vec!["fut", "pane", "new", &tab],
+            vec!["fut", "pane", "split", &pane, "right"],
             vec!["fut", "pane", "attach", &pane],
             vec!["fut", "pane", "move", &pane, &tab],
             vec!["fut", "pane", "close", &pane],
             vec!["fut", "terminal", "attach", &terminal],
+            vec!["fut", "terminal", "send-text", &terminal, "literal"],
+            vec!["fut", "terminal", "send-keys", &terminal, "ctrl+c"],
+            vec!["fut", "terminal", "run", &terminal, "echo ok"],
+            vec!["fut", "terminal", "read", &terminal],
+            vec![
+                "fut",
+                "terminal",
+                "read",
+                &terminal,
+                "--source",
+                "recent-unwrapped",
+                "--lines",
+                "200",
+            ],
+            vec![
+                "fut",
+                "terminal",
+                "wait-output",
+                &terminal,
+                "--literal",
+                "ready 雪",
+                "--timeout",
+                "30s",
+            ],
+            vec!["fut", "agent", "skill"],
+            vec!["fut", "agent", "list"],
+            vec!["fut", "agent", "get", &terminal],
+            vec!["fut", "agent", "prompt", &terminal, "review this"],
+            vec![
+                "fut",
+                "agent",
+                "prompt",
+                &terminal,
+                "review this",
+                "--wait",
+                "--timeout",
+                "2m",
+            ],
+            vec!["fut", "agent", "wait", &terminal, "--timeout", "30s"],
+            vec!["fut", "agent", "read", &terminal],
+            vec![
+                "fut",
+                "agent",
+                "report",
+                "working",
+                "--terminal-id",
+                &terminal,
+                "--source",
+                "codex",
+                "--agent-session-id",
+                "session",
+                "--turn-id",
+                "turn",
+            ],
+            vec!["fut", "context"],
+            vec!["fut", "get", &terminal],
             vec!["fut", "daemon", "run"],
             vec!["fut", "daemon", "ping"],
             vec!["fut", "daemon", "shutdown"],
         ] {
             Cli::try_parse_from(args).unwrap();
         }
+    }
+
+    #[test]
+    fn terminal_output_arguments_require_bounded_lines_matcher_and_duration() {
+        let terminal = TerminalId::new().to_string();
+        for args in [
+            vec![
+                "fut",
+                "terminal",
+                "wait-output",
+                &terminal,
+                "--timeout",
+                "1s",
+            ],
+            vec![
+                "fut",
+                "terminal",
+                "wait-output",
+                &terminal,
+                "--literal",
+                "x",
+                "--regex",
+                "x",
+                "--timeout",
+                "1s",
+            ],
+            vec![
+                "fut",
+                "terminal",
+                "wait-output",
+                &terminal,
+                "--literal",
+                "x",
+                "--timeout",
+                "0ms",
+            ],
+            vec![
+                "fut", "terminal", "read", &terminal, "--source", "recent", "--lines", "2001",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        assert_eq!(parse_output_timeout("2m"), Ok(Duration::from_secs(120)));
+        assert!(parse_output_timeout("10").is_err());
     }
 
     #[test]
@@ -1502,7 +2729,63 @@ mod tests {
         assert!(
             matches!(cli.command, Some(Command::Pane { command: PaneCommand::New { command, .. } }) if command == ["echo", "--flag"])
         );
+        let pane = PaneId::new().to_string();
+        assert!(Cli::try_parse_from(["fut", "pane", "split", &pane, "right", "echo"]).is_err());
+        let cli = Cli::try_parse_from([
+            "fut", "pane", "split", &pane, "down", "--", "echo", "--flag",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command, Some(Command::Pane { command: PaneCommand::Split { command, .. } }) if command == ["echo", "--flag"])
+        );
         assert!(Cli::try_parse_from(["fut", "daemon", "run", "echo"]).is_err());
+    }
+
+    #[test]
+    fn logical_keys_validate_and_match_live_keyboard_encoding() {
+        let encoded = ["é", "enter", "ctrl+c", "alt+left", "shift+tab", "f12"]
+            .into_iter()
+            .map(|key| key.parse::<LogicalKey>().unwrap().bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            encoded,
+            [
+                "é".as_bytes().to_vec(),
+                vec![b'\r'],
+                vec![3],
+                b"\x1b\x1b[D".to_vec(),
+                b"\x1b[Z".to_vec(),
+                b"\x1b[24~".to_vec(),
+            ]
+        );
+        for invalid in [
+            "",
+            "no-such-key",
+            "ctrl+",
+            "hyper+c",
+            "f13",
+            "ctrl+left",
+            "ctrl+é",
+            "shift+up",
+        ] {
+            assert!(
+                invalid.parse::<LogicalKey>().is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+
+        let terminal = TerminalId::new().to_string();
+        assert!(
+            Cli::try_parse_from([
+                "fut",
+                "terminal",
+                "send-keys",
+                &terminal,
+                "enter",
+                "no-such-key",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -1573,6 +2856,9 @@ mod tests {
                 "tab",
                 "pane",
                 "terminal",
+                "agent",
+                "context",
+                "get",
                 "list",
                 "events",
                 "doctor",

@@ -18,17 +18,20 @@ use tokio::sync::{broadcast, mpsc as async_mpsc, oneshot, watch};
 
 use crate::domain::{
     ClientId, CopyModeAction, CopyModeError, MouseEvent, MouseEventKind, ScreenSnapshot,
-    TerminalId, TerminalSize,
+    TerminalId, TerminalOutputSource, TerminalSize,
 };
 
 use super::{
-    CopyModeOutcome, MouseInputOutcome, ViewportSnapshot,
+    CopyModeOutcome, MouseInputOutcome, OutputCapture, OutputCaptureError, ViewportSnapshot,
     ghostty::{CopyModeFailure, GhosttyTerminal},
 };
 
 const QUEUE_CAPACITY: usize = 64;
 const OUTPUT_QUEUE_CAPACITY: usize = 16;
 const DROP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+const CLOSE_REAP_TIMEOUT: Duration = Duration::from_secs(3);
+const CLOSE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const CLOSE_REAP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 // Bound how much PTY output one drain pass parses before it snapshots, so a
 // very chatty PTY still lets control messages (keystrokes) interleave promptly.
 const OUTPUT_DRAIN_BYTE_BUDGET: usize = 2 * 1024 * 1024;
@@ -67,10 +70,14 @@ pub enum CommandError {
     Busy,
     #[error("terminal runtime has stopped")]
     Stopped,
+    #[error("terminal process did not exit before the close deadline")]
+    CloseTimeout,
     #[error("terminal emulator operation failed: {0}")]
     Emulator(String),
     #[error(transparent)]
     CopyMode(#[from] CopyModeError),
+    #[error(transparent)]
+    Output(#[from] OutputCaptureError),
 }
 
 #[derive(Clone)]
@@ -141,6 +148,10 @@ impl TerminalHandle {
 
     pub async fn paste(&self, text: String) -> Result<(), CommandError> {
         send_paste_with_backpressure(&self.commands, text).await
+    }
+
+    pub async fn paste_and_input(&self, text: String, input: Vec<u8>) -> Result<(), CommandError> {
+        send_paste_and_input_with_backpressure(&self.commands, text, input).await
     }
 
     pub async fn resize(&self, size: TerminalSize) -> Result<(), CommandError> {
@@ -227,6 +238,24 @@ impl TerminalHandle {
         }
     }
 
+    pub(crate) async fn read_output(
+        &self,
+        source: TerminalOutputSource,
+        rows: usize,
+        ansi: bool,
+    ) -> Result<OutputCapture, CommandError> {
+        let (completion, completed) = oneshot::channel();
+        self.commands
+            .send(RuntimeMessage::ReadOutput {
+                source,
+                rows,
+                ansi,
+                completion,
+            })
+            .await?;
+        completed.await.unwrap_or(Err(CommandError::Stopped))
+    }
+
     /// Last-resort cleanup for an unexpectedly dropped attachment. Normal
     /// lifecycle paths await [`Self::clear_client`] before dropping ownership.
     /// This fallback retries the bounded ordered queue and waits for runtime
@@ -245,17 +274,15 @@ impl TerminalHandle {
             return Ok(());
         }
 
-        let (completion, completed) = oneshot::channel();
-        let sent = tokio::time::timeout(
-            Duration::from_secs(2),
-            self.commands.send(RuntimeMessage::Close(completion)),
-        )
+        let result = tokio::time::timeout(CLOSE_REQUEST_TIMEOUT, async {
+            let (completion, completed) = oneshot::channel();
+            self.commands
+                .send(RuntimeMessage::Close(completion))
+                .await?;
+            completed.await.unwrap_or(Err(CommandError::Stopped))
+        })
         .await
-        .unwrap_or(Err(CommandError::Busy));
-        let result = match sent {
-            Ok(()) => completed.await.unwrap_or(Err(CommandError::Stopped)),
-            Err(error) => Err(error),
-        };
+        .unwrap_or(Err(CommandError::CloseTimeout));
         self.normalize_close_result(result)
     }
 
@@ -338,6 +365,22 @@ async fn send_paste_with_backpressure(
     completed.await.unwrap_or(Err(CommandError::Stopped))
 }
 
+async fn send_paste_and_input_with_backpressure(
+    commands: &RuntimeCommands,
+    text: String,
+    input: Vec<u8>,
+) -> Result<(), CommandError> {
+    let (completion, completed) = oneshot::channel();
+    commands
+        .send(RuntimeMessage::PasteAndInput {
+            text,
+            input,
+            completion,
+        })
+        .await?;
+    completed.await.unwrap_or(Err(CommandError::Stopped))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MouseSendPolicy {
     Lossless,
@@ -381,6 +424,11 @@ enum RuntimeMessage {
         text: String,
         completion: oneshot::Sender<Result<(), CommandError>>,
     },
+    PasteAndInput {
+        text: String,
+        input: Vec<u8>,
+        completion: oneshot::Sender<Result<(), CommandError>>,
+    },
     Resize(TerminalSize),
     MouseInput {
         event: MouseEvent,
@@ -406,6 +454,12 @@ enum RuntimeMessage {
     ClearCopyMode {
         owner: ClientId,
         completion: oneshot::Sender<Result<Option<ScreenSnapshot>, CommandError>>,
+    },
+    ReadOutput {
+        source: TerminalOutputSource,
+        rows: usize,
+        ansi: bool,
+        completion: oneshot::Sender<Result<OutputCapture, CommandError>>,
     },
     Close(oneshot::Sender<Result<(), CommandError>>),
 }
@@ -639,6 +693,21 @@ fn run(
                     );
                     let _ = completion.send(result);
                 }
+                RuntimeMessage::PasteAndInput {
+                    text,
+                    input,
+                    completion,
+                } => {
+                    let result = paste_and_input_after_output_barrier(
+                        &mut queues.output,
+                        terminal,
+                        &publishers,
+                        &mut reader_complete,
+                        text,
+                        &input,
+                    );
+                    let _ = completion.send(result);
+                }
                 RuntimeMessage::Resize(size) => {
                     if let Err(error) = size
                         .validate()
@@ -725,6 +794,23 @@ fn run(
                     }
                     let _ = completion.send(result);
                 }
+                RuntimeMessage::ReadOutput {
+                    source,
+                    rows,
+                    ansi,
+                    completion,
+                } => {
+                    drain_output_barrier(
+                        &mut queues.output,
+                        terminal,
+                        &publishers,
+                        &mut reader_complete,
+                    );
+                    let result = terminal
+                        .output(source, rows, ansi)
+                        .map_err(CommandError::Output);
+                    let _ = completion.send(result);
+                }
                 RuntimeMessage::Close(completion) => {
                     // The throttle may be holding an unpublished snapshot for
                     // bytes already fed to the parser; shutdown reads state
@@ -751,7 +837,14 @@ fn run(
                     // forked foreground group. Re-read the tty group after
                     // killing the session leader before entering wait().
                     kill_terminal_processes(&*master, child_pid);
-                    match child.wait() {
+                    match reap_child_while_draining(
+                        || child.try_wait(),
+                        &mut queues.output,
+                        terminal,
+                        &publishers,
+                        &mut reader_complete,
+                        CLOSE_REAP_TIMEOUT,
+                    ) {
                         Ok(status) => {
                             let code = Some(status.exit_code() as i32);
                             drain_output_until(
@@ -762,7 +855,7 @@ fn run(
                             );
                             publish_exit(publishers.events, publishers.lifecycle, code);
                             let _ = completion.send(Ok(()));
-                            acknowledge_pending_closes(&mut queues.control);
+                            serve_exited(&mut queues.control, terminal);
                             return;
                         }
                         Err(error) => {
@@ -778,7 +871,12 @@ fn run(
                                 publishers.snapshots,
                                 publishers.events,
                             );
-                            let _ = completion.send(Err(CommandError::Stopped));
+                            let close_error = if error.kind() == std::io::ErrorKind::TimedOut {
+                                CommandError::CloseTimeout
+                            } else {
+                                CommandError::Stopped
+                            };
+                            let _ = completion.send(Err(close_error));
                             continue 'runtime;
                         }
                     }
@@ -871,7 +969,94 @@ fn run(
                 publishers.events,
             );
             publish_exit(publishers.events, publishers.lifecycle, Some(exit_code));
+            serve_exited(&mut queues.control, terminal);
             break;
+        }
+    }
+}
+
+fn reap_child_while_draining<F>(
+    mut try_wait: F,
+    output: &mut OutputQueue,
+    terminal: &mut GhosttyTerminal,
+    publishers: &RuntimePublishers<'_>,
+    reader_complete: &mut bool,
+    timeout: Duration,
+) -> std::io::Result<portable_pty::ExitStatus>
+where
+    F: FnMut() -> std::io::Result<Option<portable_pty::ExitStatus>>,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = try_wait()? {
+            return Ok(status);
+        }
+
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "terminal process did not exit before the close deadline",
+            ));
+        };
+        let poll = remaining.min(CLOSE_REAP_POLL_INTERVAL);
+        if *reader_complete {
+            thread::sleep(poll);
+            continue;
+        }
+
+        match output.receiver.recv_timeout(poll) {
+            Ok(message) => match drain_output_batch(output, message, terminal, publishers) {
+                DrainOutcome::ReaderComplete => *reader_complete = true,
+                DrainOutcome::Fed => publish_optional(
+                    terminal.snapshot_after_feed(),
+                    publishers.snapshots,
+                    publishers.events,
+                ),
+            },
+            Err(channel::RecvTimeoutError::Disconnected) => *reader_complete = true,
+            Err(channel::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+fn serve_exited(
+    control: &mut async_mpsc::Receiver<RuntimeMessage>,
+    terminal: &mut GhosttyTerminal,
+) {
+    while let Some(message) = control.blocking_recv() {
+        match message {
+            RuntimeMessage::ReadOutput {
+                source,
+                rows,
+                ansi,
+                completion,
+            } => {
+                let result = terminal
+                    .output(source, rows, ansi)
+                    .map_err(CommandError::Output);
+                let _ = completion.send(result);
+            }
+            RuntimeMessage::Close(completion) => {
+                let _ = completion.send(Ok(()));
+            }
+            RuntimeMessage::Paste { completion, .. }
+            | RuntimeMessage::PasteAndInput { completion, .. } => {
+                let _ = completion.send(Err(CommandError::Stopped));
+            }
+            RuntimeMessage::MouseInput { completion, .. } => {
+                let _ = completion.send(Err(CommandError::Stopped));
+            }
+            RuntimeMessage::ViewportSnapshot { completion, .. }
+            | RuntimeMessage::CopyModeSnapshot { completion, .. } => {
+                let _ = completion.send(Err(CommandError::Stopped));
+            }
+            RuntimeMessage::CopyMode { completion, .. } => {
+                let _ = completion.send(Err(CommandError::Stopped));
+            }
+            RuntimeMessage::ClearCopyMode { completion, .. } => {
+                let _ = completion.send(Ok(None));
+            }
+            RuntimeMessage::Input(_) | RuntimeMessage::Resize(_) => {}
         }
     }
 }
@@ -886,6 +1071,20 @@ fn paste_after_output_barrier(
     drain_output_barrier(output, terminal, publishers, reader_complete);
     terminal
         .paste(text)
+        .map_err(|error| CommandError::Emulator(error.to_string()))
+}
+
+fn paste_and_input_after_output_barrier(
+    output: &mut OutputQueue,
+    terminal: &mut GhosttyTerminal,
+    publishers: &RuntimePublishers<'_>,
+    reader_complete: &mut bool,
+    text: String,
+    input: &[u8],
+) -> Result<(), CommandError> {
+    drain_output_barrier(output, terminal, publishers, reader_complete);
+    terminal
+        .paste_and_input(text, input)
         .map_err(|error| CommandError::Emulator(error.to_string()))
 }
 
@@ -912,12 +1111,25 @@ fn drain_output_barrier(
 ) {
     if !*reader_complete {
         let target = output.barrier_target();
+        let mut fed = false;
         while output.consumed < target {
             match output.receiver.recv() {
+                Ok(OutputMessage::Bytes(bytes)) => {
+                    terminal.vt_write(&bytes);
+                    output.record_consumed();
+                    fed = true;
+                }
                 Ok(message) => {
-                    if consume_output_message(output, message, terminal, publishers) {
-                        *reader_complete = true;
+                    if fed {
+                        publish_optional(
+                            terminal.snapshot_after_feed(),
+                            publishers.snapshots,
+                            publishers.events,
+                        );
+                        fed = false;
                     }
+                    *reader_complete =
+                        consume_output_message(output, message, terminal, publishers);
                 }
                 Err(_) => {
                     // A failed producer send is only observable here as a
@@ -932,6 +1144,13 @@ fn drain_output_barrier(
                     break;
                 }
             }
+        }
+        if fed {
+            publish_optional(
+                terminal.snapshot_after_feed(),
+                publishers.snapshots,
+                publishers.events,
+            );
         }
     }
 }
@@ -1122,14 +1341,6 @@ fn kill_terminal_processes(master: &dyn MasterPty, child_pid: u32) {
 
 #[cfg(not(unix))]
 fn kill_process_group(_child_pid: u32) {}
-
-fn acknowledge_pending_closes(receiver: &mut async_mpsc::Receiver<RuntimeMessage>) {
-    while let Ok(message) = receiver.try_recv() {
-        if let RuntimeMessage::Close(completion) = message {
-            let _ = completion.send(Ok(()));
-        }
-    }
-}
 
 fn output_queue() -> (OutputProducer, OutputQueue) {
     let (sender, receiver) = channel::bounded(OUTPUT_QUEUE_CAPACITY);
@@ -1890,6 +2101,76 @@ mod tests {
                 .success()
         );
         handle.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_drains_saturated_output_while_reaping_descendant_group() {
+        let handle = spawn_terminal(shell(
+            "while :; do head -c 1048576 /dev/zero; done",
+            HashMap::new(),
+        ))
+        .unwrap();
+        let pid = handle.child_pid();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::timeout(Duration::from_secs(5), handle.close())
+            .await
+            .expect("close deadlocked behind saturated PTY output")
+            .unwrap();
+        assert!(matches!(
+            handle.lifecycle(),
+            TerminalLifecycle::Exited { .. }
+        ));
+        assert!(
+            !std::process::Command::new("/bin/sh")
+                .args(["-c", &format!("kill -0 {pid} 2>/dev/null")])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    #[test]
+    fn close_reaper_keeps_draining_a_full_output_queue() {
+        let mut terminal = test_terminal(Box::new(std::io::sink()));
+        let initial = terminal.snapshot().unwrap();
+        let (snapshots, _) = watch::channel(initial);
+        let (events, _) = broadcast::channel(4);
+        let (lifecycle, _) = watch::channel(TerminalLifecycle::Running);
+        let publishers = RuntimePublishers {
+            snapshots: &snapshots,
+            events: &events,
+            lifecycle: &lifecycle,
+        };
+        let (output, mut queued_output) = output_queue();
+        for _ in 0..OUTPUT_QUEUE_CAPACITY {
+            output.send(OutputMessage::Bytes(b"x".to_vec())).unwrap();
+        }
+
+        let producer_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let producer_finished = Arc::clone(&producer_done);
+        let producer = thread::spawn(move || {
+            output.send(OutputMessage::ReaderEof).unwrap();
+            producer_finished.store(true, Ordering::Release);
+        });
+        let mut reader_complete = false;
+        let status = reap_child_while_draining(
+            || {
+                Ok(producer_done
+                    .load(Ordering::Acquire)
+                    .then(|| portable_pty::ExitStatus::with_exit_code(0)))
+            },
+            &mut queued_output,
+            &mut terminal,
+            &publishers,
+            &mut reader_complete,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+
+        producer.join().unwrap();
+        assert_eq!(status.exit_code(), 0);
+        assert!(queued_output.consumed > 0);
     }
 
     #[tokio::test]

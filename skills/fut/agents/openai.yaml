@@ -1,0 +1,4 @@
+interface:
+  display_name: "Fut"
+  short_description: "Control Fut terminal workspaces safely"
+  default_prompt: "Use $fut to inspect or control the current Fut session."

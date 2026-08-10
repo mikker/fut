@@ -8,7 +8,7 @@ pub(crate) mod config;
 mod copy_mode;
 mod dialog;
 mod git;
-mod input;
+pub(crate) mod input;
 mod jump;
 mod layout;
 mod navigation;
@@ -686,6 +686,12 @@ async fn run(
                         bail!("protocol became incompatible: client {client}, server {server}")
                     }
                     ServerMessage::Welcome { .. } => bail!("unexpected second welcome from daemon"),
+                    ServerMessage::TerminalOutput { .. }
+                    | ServerMessage::TerminalOutputMatched { .. }
+                    | ServerMessage::AgentPrompted { .. }
+                    | ServerMessage::AgentSettled { .. } => {
+                        bail!("unexpected control response on interactive connection")
+                    }
                 }
             }
             event = events.next(), if accepts_client_input(&focus, &create_workspace, &create_tab, &split_pane, &pending_focused_exit) => {

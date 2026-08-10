@@ -1,0 +1,8 @@
+{
+  "name": "fut",
+  "description": "Reports Claude Code lifecycle events to the containing Fut terminal",
+  "version": "0.1.0",
+  "author": {
+    "name": "Fut"
+  }
+}

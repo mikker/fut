@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Added `fut agent skill` to print Fut's bundled agent instructions.
+- Added `fut pane split` for creating right or downward splits without attaching.
+- Added `fut context` and `fut get` for compact, focus-independent resource discovery.
+- Added `fut terminal send-text`, `send-keys`, and `run` for explicit terminal input.
+- Added bounded terminal output reads and event-driven literal or regex waits.
+- Added lifecycle-aware `fut agent` discovery, prompting, waiting, reading, and reporting commands.
+- Added a lifecycle-only Claude Code plugin for reporting agent activity to Fut.
+- Updated the Pi integration to report ordered lifecycle state through `fut agent report`.
+- Agent activity snapshots now distinguish integrated terminals and retain the latest lifecycle event.
+- Fixed panes under heavy output getting stuck while closing and blocking attachment.
+
 ## 0.2
 
 - Fixed heavy terminal output making the whole UI lag or hang (e.g. animated TUIs like amp's orb): the daemon now batches PTY output and publishes at most one screen frame per 8 ms per terminal, instead of rebuilding and shipping the full screen for every kilobyte read.

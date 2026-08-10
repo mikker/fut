@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use super::actions::FocusDirection;
 use super::{actions::ClientAction, config::BindingsConfig};
 
-pub(super) fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
+pub(crate) fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return None;
     }

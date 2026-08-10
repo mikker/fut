@@ -16,6 +16,7 @@ libc = "0.2"
 libghostty-vt = { git = "https://github.com/uzaaft/libghostty-rs", rev = "72ac98f292879bf9f788fcbb11238c562a1eebe6", default-features = false }
 portable-pty = "=0.9.0"
 ratatui = "0.30"
+regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

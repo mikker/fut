@@ -683,6 +683,7 @@ dependencies = [
  "portable-pty",
  "predicates",
  "ratatui",
+ "regex",
  "rmp-serde",
  "serde",
  "serde_json",

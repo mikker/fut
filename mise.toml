@@ -29,6 +29,10 @@ run = "cargo test --test e2e --all-features isolated_daily_driver_journey -- --n
 description = "Run a reproducible isolated keyboard chaos journey"
 run = "cargo test --test e2e --all-features isolated_keyboard_chaos_journey -- --nocapture --test-threads=1"
 
+[tasks."journey:overload"]
+description = "Run the isolated Hollywood-style terminal overload journey"
+run = "cargo test --test e2e --all-features isolated_hollywood_overload_journey -- --nocapture --test-threads=1"
+
 [tasks.demo]
 description = "Build and attach to a disposable multi-workspace Fut demo"
 run = "bash scripts/demo"

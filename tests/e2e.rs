@@ -18,7 +18,7 @@ use std::{
 use bytes::Bytes;
 use fut::{
     domain::{
-        AgentReport, AgentState, AttentionKind, CopyModeAction, CopyModeError, CopyModeMovement,
+        AgentReport, AgentState, CopyModeAction, CopyModeError, CopyModeMovement,
         MAX_SEARCH_QUERY_BYTES, MouseButton, MouseButtons, MouseEvent, MouseEventKind,
         MouseModifiers, MouseWheelDirection, PaneId, ScreenSnapshot, SearchDirection, TabId,
         TerminalId, TerminalSize,
@@ -593,7 +593,7 @@ async fn agent_reports_flow_from_scoped_cli_into_authoritative_snapshots() {
     let session = &initial.sessions[0];
     let workspace = &session.workspaces[0];
     let tab = &workspace.tabs[0];
-    let pane = tab.panes[0];
+    let pane = tab.panes[0].clone();
     let terminal_id = pane.terminal_id;
     let env_path = harness.root.path().join("cwd/fut-env");
     wait_for(DEADLINE, || {
@@ -639,9 +639,11 @@ async fn agent_reports_flow_from_scoped_cli_into_authoritative_snapshots() {
         .unwrap();
     assert!(completed.status.success());
     let snapshot = harness.resources().await;
-    let activity = snapshot.sessions[0].workspaces[0].tabs[0].panes[0].activity;
+    let activity = snapshot.sessions[0].workspaces[0].tabs[0].panes[0]
+        .activity
+        .clone();
     assert_eq!(activity.state, AgentState::Idle);
-    assert_eq!(activity.attention.unwrap().kind, AttentionKind::Completed);
+    assert_eq!(activity.last_event.unwrap().kind, AgentReport::Completed);
 
     harness.shutdown().await;
 }
@@ -728,6 +730,885 @@ done
         harness.control_command(ClientMessage::Ping).await,
         ServerMessage::Pong { .. }
     ));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn terminal_output_read_and_wait_are_bounded_event_driven_and_typed() {
+    let script = r#"
+printf '\033[31mBOOT-雪\033[0m\r\n'
+while IFS= read -r line; do
+  case "$line" in
+    future) printf 'future-λ-42\r\n' ;;
+    alt) printf '\033[?1049hALT-SCREEN\r\n' ;;
+    exit) printf 'FINAL-BEFORE-EXIT\r\n'; break ;;
+  esac
+done
+"#;
+    let mut harness = Harness::start(script).await;
+    let resources = harness.resources().await;
+    let terminal_id = resources.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
+    let terminal = terminal_id.to_string();
+
+    let boot = harness
+        .cli()
+        .args([
+            "terminal",
+            "wait-output",
+            &terminal,
+            "--literal",
+            "BOOT-雪",
+            "--timeout",
+            "1s",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        boot.status.success(),
+        "{}",
+        String::from_utf8_lossy(&boot.stderr)
+    );
+
+    let read = harness
+        .cli()
+        .args([
+            "--json",
+            "terminal",
+            "read",
+            &terminal,
+            "--source",
+            "recent-unwrapped",
+            "--lines",
+            "30",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        read.status.success(),
+        "{}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+    let read: serde_json::Value = serde_json::from_slice(&read.stdout).unwrap();
+    assert_eq!(read["version"], 1);
+    assert_eq!(read["command"], "terminal.read");
+    assert_eq!(read["result"]["version"], 1);
+    assert_eq!(read["result"]["source"], "recent_unwrapped");
+    assert!(
+        read["result"]["text"].as_str().unwrap().contains("BOOT-雪"),
+        "{read}"
+    );
+    assert!(read["result"]["returned_rows"].as_u64().unwrap() <= 30);
+
+    let waiter = harness
+        .cli()
+        .args([
+            "--json",
+            "terminal",
+            "wait-output",
+            &terminal,
+            "--regex",
+            "future-λ-[0-9]+",
+            "--timeout",
+            "2s",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(30));
+    let run = harness
+        .cli()
+        .args(["terminal", "run", &terminal, "future"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let waited = waiter.wait_with_output().unwrap();
+    assert!(
+        waited.status.success(),
+        "{}",
+        String::from_utf8_lossy(&waited.stderr)
+    );
+    let waited: serde_json::Value = serde_json::from_slice(&waited.stdout).unwrap();
+    assert_eq!(waited["command"], "terminal.wait-output");
+    assert_eq!(waited["result"]["match"]["text"], "future-λ-42");
+    let start = waited["result"]["match"]["start"].as_u64().unwrap() as usize;
+    let end = waited["result"]["match"]["end"].as_u64().unwrap() as usize;
+    let text = waited["result"]["output"]["text"].as_str().unwrap();
+    assert_eq!(&text[start..end], "future-λ-42");
+
+    for (arguments, code) in [
+        (vec!["--regex", "(", "--timeout", "1s"], "invalid_regex"),
+        (
+            vec!["--literal", "never-produced", "--timeout", "20ms"],
+            "output_timeout",
+        ),
+    ] {
+        let failed = harness
+            .cli()
+            .args(["--json", "terminal", "wait-output", &terminal])
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(!failed.status.success());
+        let failed: serde_json::Value = serde_json::from_slice(&failed.stderr).unwrap();
+        assert_eq!(failed["error"]["code"], code);
+    }
+
+    assert!(
+        harness
+            .cli()
+            .args(["terminal", "run", &terminal, "alt"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let visible_alt = harness
+        .cli()
+        .args([
+            "terminal",
+            "wait-output",
+            &terminal,
+            "--literal",
+            "ALT-SCREEN",
+            "--timeout",
+            "1s",
+            "--source",
+            "visible",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        visible_alt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&visible_alt.stderr)
+    );
+    let historical_alt = harness
+        .cli()
+        .args([
+            "--json", "terminal", "read", &terminal, "--source", "recent",
+        ])
+        .output()
+        .unwrap();
+    assert!(!historical_alt.status.success());
+    let historical_alt: serde_json::Value = serde_json::from_slice(&historical_alt.stderr).unwrap();
+    assert_eq!(historical_alt["error"]["code"], "alternate_screen");
+
+    let exiting = harness
+        .cli()
+        .args([
+            "--json",
+            "terminal",
+            "wait-output",
+            &terminal,
+            "--literal",
+            "not-before-exit",
+            "--timeout",
+            "2s",
+            "--source",
+            "visible",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let final_output = harness
+        .cli()
+        .args([
+            "--json",
+            "terminal",
+            "wait-output",
+            &terminal,
+            "--literal",
+            "FINAL-BEFORE-EXIT",
+            "--timeout",
+            "2s",
+            "--source",
+            "visible",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(30));
+    assert!(
+        harness
+            .cli()
+            .args(["terminal", "run", &terminal, "exit"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let exited = exiting.wait_with_output().unwrap();
+    assert!(!exited.status.success());
+    let exited: serde_json::Value = serde_json::from_slice(&exited.stderr).unwrap();
+    assert_eq!(exited["error"]["code"], "terminal_exited");
+    let final_output = final_output.wait_with_output().unwrap();
+    assert!(
+        final_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&final_output.stderr)
+    );
+    let final_output: serde_json::Value = serde_json::from_slice(&final_output.stdout).unwrap();
+    assert_eq!(final_output["result"]["match"]["text"], "FINAL-BEFORE-EXIT");
+    harness.wait_until_exited().await;
+}
+
+#[tokio::test]
+async fn isolated_hollywood_overload_journey_stays_controllable_and_closes_cleanly() {
+    let mut harness = Harness::start(
+        "printf 'CONTROL_READY\\r\\n'; while IFS= read -r line; do [ \"$line\" = probe ] && printf 'CONTROL_ALIVE\\r\\n'; done",
+    )
+    .await;
+    let initial = harness.resources().await;
+    let anchor = initial.sessions[0].workspaces[0].tabs[0].panes[0].id;
+    let control_terminal = initial.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
+    let (mut attached, _, _) = harness.interactive().await;
+
+    let programs = [
+        r#"i=0; while :; do i=$((i+1)); printf '\033[H\033[32mMATRIX GRID %06d\033[0m\r\n' "$i"; head -c 32768 /dev/zero; sleep 0.005; done"#,
+        r#"printf '\033[?1049h'; i=0; while :; do i=$((i+1)); printf '\033[H\033[36mNEURAL SCAN %06d\033[0m\r\n\033[2K[||||||||||||||||||||||||||||||||]\r\n' "$i"; sleep 0.01; done"#,
+        r#"i=0; while :; do i=$((i+1)); printf '\033[33mACCESS %06d node=zion status=BREACH vector=0xDEADBEEF\033[0m\r\n' "$i"; sleep 0.005; done"#,
+    ];
+    let mut overload_panes = Vec::new();
+    let mut overload_terminals = Vec::new();
+    for (index, program) in programs.iter().enumerate() {
+        let direction = if index == 0 { "right" } else { "down" };
+        let split = harness
+            .cli()
+            .args([
+                "--json",
+                "pane",
+                "split",
+                &anchor.to_string(),
+                direction,
+                "--",
+                "/bin/sh",
+                "-c",
+                program,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            split.status.success(),
+            "overload pane {index} failed: {}",
+            String::from_utf8_lossy(&split.stderr)
+        );
+        let split: Value = serde_json::from_slice(&split.stdout).unwrap();
+        overload_panes.push(
+            split["result"]["selected"]["pane_id"]
+                .as_str()
+                .unwrap()
+                .parse::<PaneId>()
+                .unwrap(),
+        );
+        overload_terminals.push(
+            split["result"]["selected"]["terminal_id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+
+    time::sleep(Duration::from_millis(150)).await;
+    let ping_started = Instant::now();
+    assert!(matches!(
+        harness.control_command(ClientMessage::Ping).await,
+        ServerMessage::Pong { .. }
+    ));
+    assert!(
+        ping_started.elapsed() < Duration::from_secs(2),
+        "control ping stalled under overload"
+    );
+    for terminal in &overload_terminals {
+        let read_started = Instant::now();
+        let read = harness
+            .cli()
+            .args([
+                "--json", "terminal", "read", terminal, "--source", "visible",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            read.status.success(),
+            "overload read failed: {}",
+            String::from_utf8_lossy(&read.stderr)
+        );
+        let read_elapsed = read_started.elapsed();
+        assert!(
+            read_elapsed < Duration::from_secs(2),
+            "terminal {terminal} read stalled under overload for {read_elapsed:?}"
+        );
+    }
+
+    for pane in overload_panes.into_iter().rev() {
+        let close_started = Instant::now();
+        let closed = harness
+            .cli()
+            .args(["--json", "pane", "close", &pane.to_string()])
+            .output()
+            .unwrap();
+        assert!(
+            closed.status.success(),
+            "overload close failed: {}",
+            String::from_utf8_lossy(&closed.stderr)
+        );
+        assert!(
+            close_started.elapsed() < Duration::from_secs(5),
+            "overload pane close exceeded its deadline"
+        );
+    }
+    let resources = harness.resources().await;
+    assert_eq!(resources.sessions[0].workspaces[0].tabs[0].panes.len(), 1);
+
+    assert!(
+        harness
+            .cli()
+            .args(["terminal", "run", &control_terminal.to_string(), "probe"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    snapshot_containing(&mut attached, control_terminal, "CONTROL_ALIVE").await;
+    drop(attached);
+    let (mut reattached, terminal, _) = harness.interactive().await;
+    assert_eq!(terminal, control_terminal);
+    harness.detach(&mut reattached).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn agent_native_coordination_journey_uses_only_public_background_commands() {
+    let harness = Harness::start("while IFS= read -r line; do :; done").await;
+
+    let listed = harness.cli().args(["--json", "list"]).output().unwrap();
+    assert!(
+        listed.status.success(),
+        "list failed: {}\n{}",
+        String::from_utf8_lossy(&listed.stdout),
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let session = &listed["result"]["sessions"][0];
+    let workspace = &session["workspaces"][0];
+    let tab = &workspace["tabs"][0];
+    let anchor = &tab["panes"][0];
+    let session_id = session["id"].as_str().unwrap();
+    let workspace_id = workspace["id"].as_str().unwrap();
+    let tab_id = tab["id"].as_str().unwrap();
+    let anchor_pane_id = anchor["id"].as_str().unwrap();
+    let anchor_terminal_id = anchor["terminal_id"].as_str().unwrap();
+
+    let context = harness
+        .cli()
+        .env("FUT_SESSION_ID", session_id)
+        .env("FUT_WORKSPACE_ID", workspace_id)
+        .env("FUT_TAB_ID", tab_id)
+        .env("FUT_PANE_ID", anchor_pane_id)
+        .env("FUT_TERMINAL_ID", anchor_terminal_id)
+        .args(["--json", "context"])
+        .output()
+        .unwrap();
+    assert!(
+        context.status.success(),
+        "context failed: {}\n{}",
+        String::from_utf8_lossy(&context.stdout),
+        String::from_utf8_lossy(&context.stderr)
+    );
+    let context: Value = serde_json::from_slice(&context.stdout).unwrap();
+    assert_eq!(context["result"]["target"]["pane"]["id"], anchor_pane_id);
+    assert_eq!(
+        context["result"]["target"]["terminal"]["id"],
+        anchor_terminal_id
+    );
+
+    let binary = env!("CARGO_BIN_EXE_fut");
+    let fake_agent = format!(
+        r#"'{binary}' agent report idle --source journey --agent-session-id journey-session --turn-id setup
+printf 'JOURNEY_READY\r\n'
+turn=0
+while IFS= read -r prompt; do
+  turn=$((turn + 1))
+  case "$prompt" in
+    raw-command)
+      printf 'RAW_RESULT_λ\r\n'
+      ;;
+    complete*)
+      '{binary}' agent report working --source journey --agent-session-id journey-session --turn-id "turn-$turn"
+      printf 'COMPLETED_RESULT:%s\r\n' "$prompt"
+      '{binary}' agent report completed --source journey --agent-session-id journey-session --turn-id "turn-$turn"
+      ;;
+    blocked*)
+      '{binary}' agent report working --source journey --agent-session-id journey-session --turn-id "turn-$turn"
+      printf 'BLOCKED_RESULT:%s\r\n' "$prompt"
+      '{binary}' agent report blocked --source journey --agent-session-id journey-session --turn-id "turn-$turn"
+      ;;
+  esac
+done"#
+    );
+    let split = harness
+        .cli()
+        .args([
+            "--json",
+            "pane",
+            "split",
+            anchor_pane_id,
+            "right",
+            "--",
+            "/bin/sh",
+            "-c",
+        ])
+        .arg(&fake_agent)
+        .output()
+        .unwrap();
+    assert!(
+        split.status.success(),
+        "split failed: {}\n{}",
+        String::from_utf8_lossy(&split.stdout),
+        String::from_utf8_lossy(&split.stderr)
+    );
+    let split: Value = serde_json::from_slice(&split.stdout).unwrap();
+    let pane_id = split["result"]["selected"]["pane_id"].as_str().unwrap();
+    let terminal_id = split["result"]["selected"]["terminal_id"].as_str().unwrap();
+    assert_eq!(split["result"]["anchor_pane_id"], anchor_pane_id);
+
+    let ready = harness
+        .cli()
+        .args([
+            "--json",
+            "terminal",
+            "wait-output",
+            terminal_id,
+            "--literal",
+            "JOURNEY_READY",
+            "--timeout",
+            "2s",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        ready.status.success(),
+        "agent readiness failed: {}\n{}",
+        String::from_utf8_lossy(&ready.stdout),
+        String::from_utf8_lossy(&ready.stderr)
+    );
+
+    let agents = harness
+        .cli()
+        .args(["--json", "agent", "list"])
+        .output()
+        .unwrap();
+    assert!(agents.status.success());
+    let agents: Value = serde_json::from_slice(&agents.stdout).unwrap();
+    assert!(
+        agents["result"]["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|agent| agent["terminal_id"] == terminal_id)
+    );
+
+    let raw = harness
+        .cli()
+        .args(["--json", "terminal", "run", terminal_id, "raw-command"])
+        .output()
+        .unwrap();
+    assert!(
+        raw.status.success(),
+        "raw command failed: {}\n{}",
+        String::from_utf8_lossy(&raw.stdout),
+        String::from_utf8_lossy(&raw.stderr)
+    );
+    let raw_result = harness
+        .cli()
+        .args([
+            "--json",
+            "terminal",
+            "wait-output",
+            terminal_id,
+            "--regex",
+            "RAW_RESULT_.",
+            "--timeout",
+            "2s",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        raw_result.status.success(),
+        "raw output wait failed: {}\n{}",
+        String::from_utf8_lossy(&raw_result.stdout),
+        String::from_utf8_lossy(&raw_result.stderr)
+    );
+    let raw_read = harness
+        .cli()
+        .args([
+            "--json",
+            "terminal",
+            "read",
+            terminal_id,
+            "--source",
+            "recent-unwrapped",
+            "--lines",
+            "40",
+        ])
+        .output()
+        .unwrap();
+    assert!(raw_read.status.success());
+    let raw_read: Value = serde_json::from_slice(&raw_read.stdout).unwrap();
+    assert!(
+        raw_read["result"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("RAW_RESULT_λ")
+    );
+    assert!(raw_read["result"]["returned_rows"].as_u64().unwrap() <= 40);
+
+    let completed = harness
+        .cli()
+        .args([
+            "--json",
+            "agent",
+            "prompt",
+            terminal_id,
+            "complete revised request",
+            "--wait",
+            "--timeout",
+            "2s",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        completed.status.success(),
+        "completed prompt failed: {}\n{}",
+        String::from_utf8_lossy(&completed.stdout),
+        String::from_utf8_lossy(&completed.stderr)
+    );
+    let completed: Value = serde_json::from_slice(&completed.stdout).unwrap();
+    assert_eq!(completed["result"]["activity"]["state"], "idle");
+    assert_eq!(
+        completed["result"]["activity"]["last_event"]["kind"],
+        "completed"
+    );
+    assert!(
+        completed["result"]["barrier_revision"].as_u64().unwrap()
+            < completed["result"]["working_revision"].as_u64().unwrap()
+    );
+    assert!(
+        completed["result"]["working_revision"].as_u64().unwrap()
+            < completed["result"]["activity"]["revision"]
+                .as_u64()
+                .unwrap()
+    );
+
+    let blocked = harness
+        .cli()
+        .args([
+            "--json",
+            "agent",
+            "prompt",
+            terminal_id,
+            "blocked revised request",
+            "--wait",
+            "--timeout",
+            "2s",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        blocked.status.success(),
+        "blocked prompt failed: {}\n{}",
+        String::from_utf8_lossy(&blocked.stdout),
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+    let blocked: Value = serde_json::from_slice(&blocked.stdout).unwrap();
+    assert_eq!(blocked["result"]["activity"]["state"], "blocked");
+    assert_eq!(
+        blocked["result"]["activity"]["last_event"]["kind"],
+        "blocked"
+    );
+    assert!(
+        blocked["result"]["barrier_revision"].as_u64().unwrap()
+            < blocked["result"]["working_revision"].as_u64().unwrap()
+    );
+    assert!(
+        blocked["result"]["working_revision"].as_u64().unwrap()
+            < blocked["result"]["activity"]["revision"].as_u64().unwrap()
+    );
+
+    let result = harness
+        .cli()
+        .args([
+            "--json",
+            "agent",
+            "read",
+            terminal_id,
+            "--source",
+            "recent-unwrapped",
+            "--lines",
+            "60",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "agent result read failed: {}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let result: Value = serde_json::from_slice(&result.stdout).unwrap();
+    let output = result["result"]["output"]["text"].as_str().unwrap();
+    assert!(output.contains("COMPLETED_RESULT:complete revised request"));
+    assert!(output.contains("BLOCKED_RESULT:blocked revised request"));
+    assert_eq!(result["result"]["agent"]["activity"]["state"], "blocked");
+
+    let closed = harness
+        .cli()
+        .args(["--json", "pane", "close", pane_id])
+        .output()
+        .unwrap();
+    assert!(
+        closed.status.success(),
+        "pane cleanup failed: {}\n{}",
+        String::from_utf8_lossy(&closed.stdout),
+        String::from_utf8_lossy(&closed.stderr)
+    );
+    let closed: Value = serde_json::from_slice(&closed.stdout).unwrap();
+    assert_eq!(closed["result"]["pane_id"], pane_id);
+
+    let exited = harness
+        .cli()
+        .args([
+            "--json",
+            "terminal",
+            "wait-output",
+            terminal_id,
+            "--literal",
+            "output-after-close",
+            "--timeout",
+            "2s",
+        ])
+        .output()
+        .unwrap();
+    assert!(!exited.status.success());
+    assert!(exited.stdout.is_empty());
+    let exited: Value = serde_json::from_slice(&exited.stderr).unwrap();
+    assert_eq!(exited["error"]["code"], "terminal_exited");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn agent_cli_composes_lifecycle_input_and_bounded_output_without_stale_idle_races() {
+    let binary = env!("CARGO_BIN_EXE_fut");
+    let script = format!(
+        "while IFS= read -r line; do '{binary}' agent report working --source e2e --turn-id turn-1; '{binary}' agent report completed --source e2e --turn-id turn-1; done"
+    );
+    let harness = Harness::start(&script).await;
+    let resources = harness.resources().await;
+    let terminal_id = resources.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
+    let terminal = terminal_id.to_string();
+
+    let empty = harness
+        .cli()
+        .args(["--json", "agent", "list"])
+        .output()
+        .unwrap();
+    assert!(empty.status.success());
+    let empty: Value = serde_json::from_slice(&empty.stdout).unwrap();
+    assert!(empty["result"]["agents"].as_array().unwrap().is_empty());
+
+    let reported = harness
+        .cli()
+        .args([
+            "--json",
+            "agent",
+            "report",
+            "idle",
+            "--terminal-id",
+            &terminal,
+            "--source",
+            "e2e",
+            "--agent-session-id",
+            "session-1",
+            "--turn-id",
+            "setup",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        reported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reported.stderr)
+    );
+
+    let listed = harness
+        .cli()
+        .args(["--json", "agent", "list"])
+        .output()
+        .unwrap();
+    let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed["result"]["agents"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["result"]["agents"][0]["terminal_id"], terminal);
+    assert_eq!(listed["result"]["agents"][0]["available"], true);
+    let got = harness
+        .cli()
+        .args(["--json", "agent", "get", &terminal])
+        .output()
+        .unwrap();
+    assert!(got.status.success());
+    let got: Value = serde_json::from_slice(&got.stdout).unwrap();
+    assert_eq!(
+        got["result"]["agent"]["activity"]["integration"]["source"],
+        "e2e"
+    );
+
+    // The integration emits Working and Completed back-to-back. The prompt
+    // waiter must consume both lifecycle events rather than coalescing to the
+    // latest idle snapshot and incorrectly satisfying from the setup report.
+    let prompted = harness
+        .cli()
+        .args([
+            "--json",
+            "agent",
+            "prompt",
+            &terminal,
+            "hello λ",
+            "--wait",
+            "--timeout",
+            "2s",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        prompted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&prompted.stderr)
+    );
+    let prompted: Value = serde_json::from_slice(&prompted.stdout).unwrap();
+    assert_eq!(
+        prompted["result"]["activity"]["last_event"]["kind"],
+        "completed"
+    );
+    let barrier = prompted["result"]["barrier_revision"].as_u64().unwrap();
+    let working = prompted["result"]["working_revision"].as_u64().unwrap();
+    let completed = prompted["result"]["activity"]["revision"].as_u64().unwrap();
+    assert!(barrier < working && working < completed);
+
+    let read = harness
+        .cli()
+        .args([
+            "--json",
+            "agent",
+            "read",
+            &terminal,
+            "--source",
+            "recent-unwrapped",
+            "--lines",
+            "20",
+        ])
+        .output()
+        .unwrap();
+    assert!(read.status.success());
+    let read: Value = serde_json::from_slice(&read.stdout).unwrap();
+    assert_eq!(read["result"]["agent"]["available"], true);
+    assert_eq!(read["result"]["output"]["requested_rows"], 20);
+
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::ReportAgent {
+                terminal_id,
+                report: AgentReport::Working,
+                metadata: Default::default(),
+            })
+            .await,
+        ServerMessage::CommandCompleted { .. }
+    ));
+    let timed_out = harness
+        .cli()
+        .args(["--json", "agent", "wait", &terminal, "--timeout", "25ms"])
+        .output()
+        .unwrap();
+    assert!(!timed_out.status.success());
+    let timed_out: Value = serde_json::from_slice(&timed_out.stderr).unwrap();
+    assert_eq!(timed_out["error"]["code"], "agent_timeout");
+    let busy = harness
+        .cli()
+        .args(["--json", "agent", "prompt", &terminal, "do not steer"])
+        .output()
+        .unwrap();
+    assert!(!busy.status.success());
+    let busy: Value = serde_json::from_slice(&busy.stderr).unwrap();
+    assert_eq!(busy["error"]["code"], "agent_busy");
+
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::ReportAgent {
+                terminal_id,
+                report: AgentReport::Blocked,
+                metadata: Default::default(),
+            })
+            .await,
+        ServerMessage::CommandCompleted { .. }
+    ));
+    let blocked = harness
+        .cli()
+        .args(["--json", "agent", "wait", &terminal, "--timeout", "1s"])
+        .output()
+        .unwrap();
+    assert!(blocked.status.success());
+    let blocked: Value = serde_json::from_slice(&blocked.stdout).unwrap();
+    assert_eq!(blocked["result"]["activity"]["state"], "blocked");
+
+    let exit_cwd = harness.root.path().join("exiting-agent");
+    fs::create_dir(&exit_cwd).unwrap();
+    let ServerMessage::LocationOpened {
+        selected: exiting, ..
+    } = harness
+        .control_command(ClientMessage::OpenLocation {
+            name: Some("exiting-agent".into()),
+            cwd: exit_cwd,
+            program: Some("/bin/sh".into()),
+            argv: vec!["-c".into(), "IFS= read -r line; exit 7".into()],
+        })
+        .await
+    else {
+        panic!("failed to create exiting agent terminal")
+    };
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::ReportAgent {
+                terminal_id: exiting.terminal_id,
+                report: AgentReport::Idle,
+                metadata: Default::default(),
+            })
+            .await,
+        ServerMessage::CommandCompleted { .. }
+    ));
+    let exiting_id = exiting.terminal_id.to_string();
+    let exited = harness
+        .cli()
+        .args([
+            "--json",
+            "agent",
+            "prompt",
+            &exiting_id,
+            "bye",
+            "--wait",
+            "--timeout",
+            "2s",
+        ])
+        .output()
+        .unwrap();
+    assert!(!exited.status.success());
+    let exited: Value = serde_json::from_slice(&exited.stderr).unwrap();
+    assert_eq!(exited["error"]["code"], "terminal_exited");
+
     harness.shutdown().await;
 }
 
@@ -3531,6 +4412,9 @@ async fn public_child_commands_require_the_delimiter_before_the_child_argv() {
     let resources = harness.resources().await;
     let workspace_id = resources.sessions[0].workspaces[0].id.to_string();
     let tab_id = resources.sessions[0].workspaces[0].tabs[0].id.to_string();
+    let pane_id = resources.sessions[0].workspaces[0].tabs[0].panes[0]
+        .id
+        .to_string();
 
     for (arguments, marker_name) in [
         (
@@ -3544,6 +4428,10 @@ async fn public_child_commands_require_the_delimiter_before_the_child_argv() {
         (
             vec!["pane", "new", &tab_id, "/bin/sh", "-c", "touch"],
             "pane-no-delimiter",
+        ),
+        (
+            vec!["pane", "split", &pane_id, "right", "/bin/sh", "-c", "touch"],
+            "pane-split-no-delimiter",
         ),
         (
             vec!["daemon", "run", "/bin/sh", "-c", "touch"],
@@ -3563,6 +4451,395 @@ async fn public_child_commands_require_the_delimiter_before_the_child_argv() {
             "rejected child command executed: {arguments:?}"
         );
     }
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn public_pane_split_preserves_target_direction_cwd_argv_focus_and_atomic_failures() {
+    let mut harness = Harness::start(
+        "while IFS= read -r line; do [ \"$line\" = focus ] && touch ../focus-stayed; done",
+    )
+    .await;
+    let before = harness.resources().await;
+    let anchor = before.sessions[0].workspaces[0].tabs[0].panes[0].id;
+    let tab_id = before.sessions[0].workspaces[0].tabs[0].id;
+    let split_cwd = harness.root.path().join("split-cwd");
+    fs::create_dir(&split_cwd).unwrap();
+    let argv_capture = harness.root.path().join("split-argv");
+
+    let (mut attached, attached_terminal, _) = harness.interactive().await;
+    let output = harness
+        .cli()
+        .args(["--json", "pane", "split", &anchor.to_string(), "right"])
+        .arg("--cwd")
+        .arg(&split_cwd)
+        .args(["--", "/bin/sh", "-c"])
+        .arg(format!(
+            "printf '%s\\n' \"$PWD\" \"$0\" \"$1\" \"$2\" > '{}'; while IFS= read -r line; do :; done",
+            argv_capture.display()
+        ))
+        .args(["sentinel", "argument with spaces", "--literal-flag"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let split: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(split["version"], 1);
+    assert_eq!(split["command"], "pane.split");
+    assert_eq!(split["result"]["anchor_pane_id"], anchor.to_string());
+    assert_eq!(split["result"]["direction"], "right");
+    let right_pane: PaneId = split["result"]["selected"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(split["result"]["selected"]["terminal_id"].is_string());
+    wait_for(DEADLINE, || argv_capture.exists()).await;
+    assert_eq!(
+        fs::read_to_string(&argv_capture).unwrap(),
+        format!(
+            "{}\nsentinel\nargument with spaces\n--literal-flag\n",
+            split_cwd.canonicalize().unwrap().display()
+        )
+    );
+
+    send(
+        &mut attached,
+        ClientMessage::Input {
+            bytes: b"focus\n".to_vec(),
+        },
+    )
+    .await;
+    wait_for(DEADLINE, || {
+        harness.root.path().join("focus-stayed").exists()
+    })
+    .await;
+    assert_eq!(
+        attached_terminal,
+        before.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id
+    );
+    harness.detach(&mut attached).await;
+
+    let down = harness
+        .cli()
+        .args(["--json", "pane", "split", &right_pane.to_string(), "down"])
+        .output()
+        .unwrap();
+    assert!(
+        down.status.success(),
+        "{}",
+        String::from_utf8_lossy(&down.stderr)
+    );
+    let down: Value = serde_json::from_slice(&down.stdout).unwrap();
+    let down_pane: PaneId = down["result"]["selected"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let resources = harness.resources().await;
+    let tab = &resources.sessions[0].workspaces[0].tabs[0];
+    assert_eq!(tab.id, tab_id);
+    assert_eq!(tab.layout.leaf_ids(), vec![anchor, right_pane, down_pane]);
+    assert!(matches!(
+        &tab.layout,
+        fut::splits::SplitTree::Branch {
+            axis: fut::splits::SplitAxis::Horizontal,
+            second,
+            ..
+        } if matches!(
+            second.as_ref(),
+            fut::splits::SplitTree::Branch {
+                axis: fut::splits::SplitAxis::Vertical,
+                ..
+            }
+        )
+    ));
+
+    let stable = harness.resources().await;
+    for output in [
+        harness
+            .cli()
+            .args([
+                "--json",
+                "pane",
+                "split",
+                &Uuid::new_v4().to_string(),
+                "right",
+            ])
+            .output()
+            .unwrap(),
+        harness
+            .cli()
+            .args(["--json", "pane", "split", &anchor.to_string(), "down"])
+            .args(["--", "/definitely/missing/fut-pane-split"])
+            .output()
+            .unwrap(),
+        harness
+            .cli()
+            .args(["--json", "pane", "split", &anchor.to_string(), "down"])
+            .arg("--cwd")
+            .arg(harness.root.path().join("missing-split-cwd"))
+            .output()
+            .unwrap(),
+    ] {
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert!(matches!(
+            error["error"]["code"].as_str(),
+            Some("not_found" | "spawn_failed" | "invalid_cwd")
+        ));
+        assert_eq!(harness.resources().await, stable);
+    }
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn public_terminal_input_is_literal_validated_bracket_aware_atomic_and_exit_typed() {
+    let harness = Harness::start("while :; do sleep 1; done").await;
+    let resources = harness.resources().await;
+    let tab_id = resources.sessions[0].workspaces[0].tabs[0].id;
+    let plain_capture = harness.root.path().join("plain-input.bin");
+    let plain_ready = harness.root.path().join("plain-input.ready");
+    let bracket_capture = harness.root.path().join("bracket-input.bin");
+    let bracket_ready = harness.root.path().join("bracket-input.ready");
+    let plain_expected = ["hé 雪".as_bytes(), b"\x03\x1b[D\r", b"printf plain\r"].concat();
+    let bracket_expected = [
+        b"\x1b[200~".as_slice(),
+        "雪\nnext".as_bytes(),
+        b"\x1b[201~\x1bx\x1bOQ\x1b[200~echo bracket\x1b[201~\r",
+    ]
+    .concat();
+    let capture_script = |ready: &std::path::Path,
+                          capture: &std::path::Path,
+                          bracketed: bool,
+                          length: usize| {
+        format!(
+            "stty raw -echo; printf '{}INPUT_READY\\r\\n'; : > '{}'; dd bs=1 count={length} of='{}' 2>/dev/null; while :; do sleep 1; done",
+            if bracketed { "\\033[?2004h" } else { "" },
+            ready.display(),
+            capture.display(),
+        )
+    };
+    let create_capture = |script| ClientMessage::CreatePane {
+        tab_id,
+        cwd: None,
+        program: Some("/bin/sh".into()),
+        argv: vec!["-c".into(), script],
+    };
+    let ServerMessage::PaneCreated { selected: plain } = harness
+        .control_command(create_capture(capture_script(
+            &plain_ready,
+            &plain_capture,
+            false,
+            plain_expected.len(),
+        )))
+        .await
+    else {
+        panic!("failed to create plain input capture terminal")
+    };
+    let ServerMessage::PaneCreated { selected: bracket } = harness
+        .control_command(create_capture(capture_script(
+            &bracket_ready,
+            &bracket_capture,
+            true,
+            bracket_expected.len(),
+        )))
+        .await
+    else {
+        panic!("failed to create bracketed input capture terminal")
+    };
+    wait_for(DEADLINE, || plain_ready.exists() && bracket_ready.exists()).await;
+    let (mut bracket_probe, _) =
+        attach_once(&harness, TargetSelector::Terminal(bracket.terminal_id)).await;
+    snapshot_containing(&mut bracket_probe, bracket.terminal_id, "INPUT_READY").await;
+    harness.detach(&mut bracket_probe).await;
+
+    let json = |output: std::process::Output, command: &str, terminal_id: TerminalId| {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["command"], command);
+        assert_eq!(value["result"]["terminal_id"], terminal_id.to_string());
+    };
+
+    json(
+        harness
+            .cli()
+            .args([
+                "--json",
+                "terminal",
+                "send-text",
+                &plain.terminal_id.to_string(),
+                "hé 雪",
+            ])
+            .output()
+            .unwrap(),
+        "terminal.send-text",
+        plain.terminal_id,
+    );
+    let invalid = harness
+        .cli()
+        .args([
+            "--json",
+            "terminal",
+            "send-keys",
+            &plain.terminal_id.to_string(),
+            "ctrl+c",
+            "no-such-key",
+        ])
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    assert!(invalid.stdout.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&invalid.stderr).unwrap()["error"]["code"],
+        "invalid_arguments"
+    );
+    json(
+        harness
+            .cli()
+            .args([
+                "--json",
+                "terminal",
+                "send-keys",
+                &plain.terminal_id.to_string(),
+                "ctrl+c",
+                "left",
+                "enter",
+            ])
+            .output()
+            .unwrap(),
+        "terminal.send-keys",
+        plain.terminal_id,
+    );
+    json(
+        harness
+            .cli()
+            .args([
+                "--json",
+                "terminal",
+                "run",
+                &plain.terminal_id.to_string(),
+                "printf plain",
+            ])
+            .output()
+            .unwrap(),
+        "terminal.run",
+        plain.terminal_id,
+    );
+
+    json(
+        harness
+            .cli()
+            .args([
+                "--json",
+                "terminal",
+                "send-text",
+                &bracket.terminal_id.to_string(),
+                "雪\nnext",
+            ])
+            .output()
+            .unwrap(),
+        "terminal.send-text",
+        bracket.terminal_id,
+    );
+    json(
+        harness
+            .cli()
+            .args([
+                "--json",
+                "terminal",
+                "send-keys",
+                &bracket.terminal_id.to_string(),
+                "alt+x",
+                "f2",
+            ])
+            .output()
+            .unwrap(),
+        "terminal.send-keys",
+        bracket.terminal_id,
+    );
+    json(
+        harness
+            .cli()
+            .args([
+                "--json",
+                "terminal",
+                "run",
+                &bracket.terminal_id.to_string(),
+                "echo bracket",
+            ])
+            .output()
+            .unwrap(),
+        "terminal.run",
+        bracket.terminal_id,
+    );
+    wait_for(DEADLINE, || {
+        fs::read(&plain_capture).is_ok_and(|bytes| bytes.len() == plain_expected.len())
+            && fs::read(&bracket_capture).is_ok_and(|bytes| bytes.len() == bracket_expected.len())
+    })
+    .await;
+    assert_eq!(fs::read(&plain_capture).unwrap(), plain_expected);
+    assert_eq!(fs::read(&bracket_capture).unwrap(), bracket_expected);
+
+    let ServerMessage::PaneCreated { selected: exited } = harness
+        .control_command(ClientMessage::CreatePane {
+            tab_id,
+            cwd: None,
+            program: Some("/bin/sh".into()),
+            argv: vec!["-c".into(), "exit 17".into()],
+        })
+        .await
+    else {
+        panic!("failed to create exiting terminal")
+    };
+    time::timeout(DEADLINE, async {
+        loop {
+            let resources = harness.resources().await;
+            if resources
+                .sessions
+                .iter()
+                .flat_map(|session| &session.workspaces)
+                .flat_map(|workspace| &workspace.tabs)
+                .flat_map(|tab| &tab.panes)
+                .all(|pane| pane.terminal_id != exited.terminal_id)
+            {
+                break;
+            }
+            time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("exited terminal was not finalized");
+    let after_exit = harness
+        .cli()
+        .args([
+            "--json",
+            "terminal",
+            "run",
+            &exited.terminal_id.to_string(),
+            "echo too late",
+        ])
+        .output()
+        .unwrap();
+    assert!(!after_exit.status.success());
+    assert!(after_exit.stdout.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&after_exit.stderr).unwrap()["error"]["code"],
+        "terminal_exited"
+    );
+
     harness.shutdown().await;
 }
 
@@ -3609,6 +4886,7 @@ async fn public_events_stream_emits_versioned_json_snapshots_on_change() {
             .control_command(ClientMessage::ReportAgent {
                 terminal_id,
                 report: AgentReport::Blocked,
+                metadata: Default::default(),
             })
             .await,
         ServerMessage::CommandCompleted {
@@ -4249,7 +5527,7 @@ async fn public_agent_activity_spins_lists_waiting_terminals_and_navigates_unrea
     let harness =
         Harness::start("printf 'AGENT_A_READY\r\n'; while IFS= read -r line; do :; done").await;
     let resources = harness.resources().await;
-    let a = resources.sessions[0].workspaces[0].tabs[0].panes[0];
+    let a = resources.sessions[0].workspaces[0].tabs[0].panes[0].clone();
     let cwd_b = harness.root.path().join("agent-b");
     fs::create_dir(&cwd_b).unwrap();
     let ServerMessage::LocationOpened { selected: b, .. } = harness
@@ -4290,6 +5568,7 @@ async fn public_agent_activity_spins_lists_waiting_terminals_and_navigates_unrea
             .control_command(ClientMessage::ReportAgent {
                 terminal_id: a.terminal_id,
                 report: AgentReport::Working,
+                metadata: Default::default(),
             })
             .await,
         ServerMessage::CommandCompleted {
@@ -4303,6 +5582,7 @@ async fn public_agent_activity_spins_lists_waiting_terminals_and_navigates_unrea
             .control_command(ClientMessage::ReportAgent {
                 terminal_id: b.terminal_id,
                 report: AgentReport::Completed,
+                metadata: Default::default(),
             })
             .await,
         ServerMessage::CommandCompleted { .. }
@@ -4321,6 +5601,7 @@ async fn public_agent_activity_spins_lists_waiting_terminals_and_navigates_unrea
             .control_command(ClientMessage::ReportAgent {
                 terminal_id: a.terminal_id,
                 report: AgentReport::Completed,
+                metadata: Default::default(),
             })
             .await,
         ServerMessage::CommandCompleted { .. }
@@ -6531,7 +7812,7 @@ async fn copy_mode_attachments_cleanup_independently_across_output_focus_and_exi
     .await;
     let resources = harness.resources().await;
     let tab_id = resources.sessions[0].workspaces[0].tabs[0].id;
-    let pane_a = resources.sessions[0].workspaces[0].tabs[0].panes[0];
+    let pane_a = resources.sessions[0].workspaces[0].tabs[0].panes[0].clone();
     let ServerMessage::PaneCreated { selected: pane_b } = harness
         .control_command(ClientMessage::CreatePane {
             tab_id,
@@ -8775,6 +10056,142 @@ fn zsh_completion_registration_is_compact_and_side_effect_free() {
     assert!(script.len() < 4_096);
     assert_eq!(fs::read_dir(env.0.path()).unwrap().count(), before);
     assert!(!env.0.path().join("runtime").exists());
+}
+
+#[test]
+fn agent_skill_prints_the_bundled_skill_without_daemon_setup() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = root.path().join("runtime");
+    let output = Command::new(env!("CARGO_BIN_EXE_fut"))
+        .env("FUT_RUNTIME_DIR", &runtime)
+        .args(["agent", "skill"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        include_str!("../skills/fut/SKILL.md")
+    );
+    assert!(!runtime.exists());
+}
+
+#[tokio::test]
+async fn context_validates_environment_ancestry_and_get_resolves_explicit_ids() {
+    let harness = Harness::start("while IFS= read -r line; do :; done").await;
+    let snapshot = harness.resources().await;
+    let session = &snapshot.sessions[0];
+    let workspace = &session.workspaces[0];
+    let tab = &workspace.tabs[0];
+    let pane = &tab.panes[0];
+
+    let report = harness
+        .cli()
+        .args([
+            "terminal",
+            "report",
+            "working",
+            "--terminal-id",
+            &pane.terminal_id.to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        report.status.success(),
+        "{}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+
+    let explicit = harness
+        .cli()
+        .args(["--json", "get", &pane.terminal_id.to_string()])
+        .output()
+        .unwrap();
+    assert!(explicit.status.success());
+    let explicit: Value = serde_json::from_slice(&explicit.stdout).unwrap();
+    assert_eq!(explicit["version"], 1);
+    assert_eq!(explicit["command"], "get");
+    assert_eq!(explicit["result"]["target"]["kind"], "terminal");
+    assert_eq!(
+        explicit["result"]["target"]["pane"]["activity"]["state"],
+        "working"
+    );
+    for (id, kind) in [
+        (session.id.to_string(), "session"),
+        (workspace.id.to_string(), "workspace"),
+        (tab.id.to_string(), "tab"),
+        (pane.id.to_string(), "pane"),
+    ] {
+        let output = harness.cli().args(["--json", "get", &id]).output().unwrap();
+        assert!(output.status.success(), "get {kind} failed");
+        let output: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output["result"]["target"]["kind"], kind);
+    }
+
+    let context = harness
+        .cli()
+        .env("FUT_SESSION_ID", session.id.to_string())
+        .env("FUT_WORKSPACE_ID", workspace.id.to_string())
+        .env("FUT_TAB_ID", tab.id.to_string())
+        .env("FUT_PANE_ID", pane.id.to_string())
+        .env("FUT_TERMINAL_ID", pane.terminal_id.to_string())
+        .args(["--json", "context"])
+        .output()
+        .unwrap();
+    assert!(context.status.success());
+    let context: Value = serde_json::from_slice(&context.stdout).unwrap();
+    assert_eq!(context["command"], "context");
+    assert_eq!(
+        context["result"]["target"]["workspace"]["id"],
+        workspace.id.to_string()
+    );
+    assert_eq!(
+        context["result"]["target"]["terminal"]["id"],
+        pane.terminal_id.to_string()
+    );
+
+    let mismatched = harness
+        .cli()
+        .env("FUT_SESSION_ID", session.id.to_string())
+        .env("FUT_WORKSPACE_ID", workspace.id.to_string())
+        .env("FUT_TAB_ID", tab.id.to_string())
+        .env("FUT_PANE_ID", PaneId::new().to_string())
+        .env("FUT_TERMINAL_ID", pane.terminal_id.to_string())
+        .args(["--json", "context"])
+        .output()
+        .unwrap();
+    assert!(!mismatched.status.success());
+    let mismatched: Value = serde_json::from_slice(&mismatched.stderr).unwrap();
+    assert_eq!(mismatched["error"]["code"], "invalid_context");
+
+    harness.shutdown().await;
+}
+
+#[test]
+fn context_without_fut_environment_is_a_typed_error_before_daemon_connection() {
+    let root = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_fut"))
+        .env_clear()
+        .env("FUT_RUNTIME_DIR", root.path())
+        .args(["--json", "context"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "missing_context");
+
+    let incomplete = Command::new(env!("CARGO_BIN_EXE_fut"))
+        .env_clear()
+        .env("FUT_RUNTIME_DIR", root.path())
+        .env("FUT_TERMINAL_ID", TerminalId::new().to_string())
+        .args(["--json", "context"])
+        .output()
+        .unwrap();
+    assert!(!incomplete.status.success());
+    let error: Value = serde_json::from_slice(&incomplete.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "invalid_context");
 }
 
 #[tokio::test]

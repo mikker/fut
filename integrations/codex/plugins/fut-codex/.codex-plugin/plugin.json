@@ -1,0 +1,17 @@
+{
+  "name": "fut",
+  "version": "0.1.0",
+  "description": "Report native Codex lifecycle events to Fut.",
+  "author": {
+    "name": "Mikkel Malmberg"
+  },
+  "interface": {
+    "displayName": "Fut",
+    "shortDescription": "Show Codex lifecycle activity in Fut.",
+    "longDescription": "Reports Codex session, turn, approval, tool, and completion events to the containing Fut terminal without controlling either application.",
+    "developerName": "Mikkel Malmberg",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "Explain which Codex lifecycle states Fut can observe."
+  }
+}

@@ -477,7 +477,7 @@ fn flatten_with_notifications(
                     .iter()
                     .flat_map(|workspace| &workspace.tabs)
                     .flat_map(|tab| &tab.panes)
-                    .copied()
+                    .cloned()
                     .collect::<Vec<_>>(),
             ),
         });
@@ -503,7 +503,7 @@ fn flatten_with_notifications(
                         .tabs
                         .iter()
                         .flat_map(|tab| &tab.panes)
-                        .copied()
+                        .cloned()
                         .collect::<Vec<_>>(),
                 ),
             });

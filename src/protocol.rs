@@ -10,8 +10,9 @@ use std::path::PathBuf;
 
 use crate::{
     domain::{
-        AgentReport, CopyModeAction, CopyModeError, MouseEvent, PaneId, ScreenDelta,
-        ScreenSnapshot, SessionId, TabId, TerminalId, TerminalSize, WorkspaceId,
+        AgentActivity, AgentReport, AgentReportMetadata, CopyModeAction, CopyModeError, MouseEvent,
+        PaneId, ScreenDelta, ScreenSnapshot, SessionId, TabId, TerminalId, TerminalOutput,
+        TerminalOutputMatcher, TerminalOutputSource, TerminalSize, WorkspaceId,
     },
     resources::{ResourceSnapshot, SessionSelector, TargetSelector},
     splits::{SplitDirection, SplitTree},
@@ -20,7 +21,7 @@ use crate::{
 /// Protocol version used by released Fut 0.1 builds.
 pub const PROTOCOL_VERSION_0_1: u16 = 0;
 /// Current clients and daemons require an exact protocol match.
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 11;
 /// Enough for 50,000 individually styled MessagePack-encoded cells while
 /// remaining a firm pre-allocation bound for the length-delimited transport.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
@@ -50,9 +51,18 @@ pub enum AcknowledgedCommand {
     Paste,
     Resize,
     ReportAgent,
+    TerminalInput,
     CloseTarget,
     RenameTarget,
     Shutdown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TerminalInputOperation {
+    Text { text: String },
+    Keys { bytes: Vec<u8> },
+    Run { text: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -114,6 +124,34 @@ pub enum ClientMessage {
     },
     Paste {
         text: String,
+    },
+    TerminalInput {
+        terminal_id: TerminalId,
+        operation: TerminalInputOperation,
+    },
+    ReadTerminalOutput {
+        terminal_id: TerminalId,
+        source: TerminalOutputSource,
+        rows: usize,
+        ansi: bool,
+    },
+    WaitTerminalOutput {
+        terminal_id: TerminalId,
+        source: TerminalOutputSource,
+        rows: usize,
+        matcher: TerminalOutputMatcher,
+        timeout_ms: u64,
+    },
+    PromptAgent {
+        terminal_id: TerminalId,
+        text: String,
+        wait: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+    },
+    WaitAgent {
+        terminal_id: TerminalId,
+        timeout_ms: u64,
     },
     /// Fire-and-forget; its envelope must not carry a request ID.
     MouseInput {
@@ -214,6 +252,8 @@ pub enum ClientMessage {
     ReportAgent {
         terminal_id: TerminalId,
         report: AgentReport,
+        #[serde(default, skip_serializing_if = "AgentReportMetadata::is_empty")]
+        metadata: AgentReportMetadata,
     },
     Ping,
     Shutdown,
@@ -295,6 +335,26 @@ pub enum ServerMessage {
         terminal_id: TerminalId,
         exit_code: Option<i32>,
     },
+    TerminalOutput {
+        output: TerminalOutput,
+    },
+    TerminalOutputMatched {
+        output: TerminalOutput,
+        start: usize,
+        end: usize,
+        matched: String,
+    },
+    AgentPrompted {
+        terminal_id: TerminalId,
+        barrier_revision: u64,
+    },
+    AgentSettled {
+        terminal_id: TerminalId,
+        barrier_revision: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        working_revision: Option<u64>,
+        activity: AgentActivity,
+    },
     Pong {
         daemon_pid: u32,
     },
@@ -375,6 +435,36 @@ mod tests {
         MouseEvent, MouseEventKind, MouseModifiers, MouseWheelDirection,
     };
 
+    #[test]
+    fn agent_report_metadata_round_trips_and_old_requests_default_it() {
+        let terminal_id = TerminalId::new();
+        let message = ClientMessage::ReportAgent {
+            terminal_id,
+            report: AgentReport::Completed,
+            metadata: AgentReportMetadata {
+                source: Some("claude-code".into()),
+                agent_session_id: Some("session-1".into()),
+                turn_id: Some("turn-9".into()),
+            },
+        };
+        assert_eq!(
+            decode_payload::<ClientMessage>(&encode_payload(&message).unwrap()).unwrap(),
+            message
+        );
+
+        let legacy = format!(
+            r#"{{"type":"report_agent","terminal_id":"{terminal_id}","report":"working"}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientMessage>(&legacy).unwrap(),
+            ClientMessage::ReportAgent {
+                terminal_id,
+                report: AgentReport::Working,
+                metadata: AgentReportMetadata::default(),
+            }
+        );
+    }
+
     fn ping(request_id: Option<Uuid>) -> Envelope<ClientMessage> {
         Envelope {
             request_id,
@@ -442,6 +532,124 @@ mod tests {
 
         assert_eq!(
             decode_payload::<ClientMessage>(&encode_payload(&message).unwrap()).unwrap(),
+            message
+        );
+    }
+
+    #[test]
+    fn targeted_terminal_input_operations_round_trip() {
+        let terminal_id = TerminalId::new();
+        for operation in [
+            TerminalInputOperation::Text {
+                text: "literal λ\n".into(),
+            },
+            TerminalInputOperation::Keys {
+                bytes: b"\x03\x1b[A".to_vec(),
+            },
+            TerminalInputOperation::Run {
+                text: "printf '雪'".into(),
+            },
+        ] {
+            let message = ClientMessage::TerminalInput {
+                terminal_id,
+                operation,
+            };
+            assert_eq!(
+                decode_payload::<ClientMessage>(&encode_payload(&message).unwrap()).unwrap(),
+                message
+            );
+        }
+    }
+
+    #[test]
+    fn agent_prompt_and_wait_messages_round_trip() {
+        let terminal_id = TerminalId::new();
+        for message in [
+            ClientMessage::PromptAgent {
+                terminal_id,
+                text: "explain λ".into(),
+                wait: true,
+                timeout_ms: Some(30_000),
+            },
+            ClientMessage::WaitAgent {
+                terminal_id,
+                timeout_ms: 30_000,
+            },
+        ] {
+            assert_eq!(
+                decode_payload::<ClientMessage>(&encode_payload(&message).unwrap()).unwrap(),
+                message
+            );
+        }
+
+        let activity = AgentActivity {
+            integration: Some(Default::default()),
+            state: crate::domain::AgentState::Blocked,
+            revision: 9,
+            updated_at_ms: 12,
+            last_event: Some(crate::domain::AgentEvent {
+                revision: 9,
+                kind: AgentReport::Blocked,
+                occurred_at_ms: 12,
+                turn_id: Some("turn-1".into()),
+            }),
+        };
+        let message = ServerMessage::AgentSettled {
+            terminal_id,
+            barrier_revision: 6,
+            working_revision: Some(7),
+            activity,
+        };
+        assert_eq!(
+            decode_payload::<ServerMessage>(&encode_payload(&message).unwrap()).unwrap(),
+            message
+        );
+    }
+
+    #[test]
+    fn terminal_output_requests_and_results_round_trip_unicode() {
+        let terminal_id = TerminalId::new();
+        for message in [
+            ClientMessage::ReadTerminalOutput {
+                terminal_id,
+                source: TerminalOutputSource::RecentUnwrapped,
+                rows: 200,
+                ansi: true,
+            },
+            ClientMessage::WaitTerminalOutput {
+                terminal_id,
+                source: TerminalOutputSource::Recent,
+                rows: 40,
+                matcher: TerminalOutputMatcher::Regex("ready λ [0-9]+".into()),
+                timeout_ms: 30_000,
+            },
+        ] {
+            assert_eq!(
+                decode_payload::<ClientMessage>(&encode_payload(&message).unwrap()).unwrap(),
+                message
+            );
+        }
+
+        let output = TerminalOutput {
+            version: 1,
+            terminal_id,
+            revision: 7,
+            source: TerminalOutputSource::RecentUnwrapped,
+            requested_rows: 20,
+            returned_rows: 20,
+            truncated: true,
+            starts_mid_logical_line: true,
+            ansi: false,
+            text: "partial 雪\nready λ".into(),
+        };
+        let message = ServerMessage::TerminalOutputMatched {
+            output,
+            start: 12,
+            end: 20,
+            matched: "ready λ".into(),
+        };
+        assert_eq!(
+            decode_payload::<ServerMessage>(&encode_payload(&message).unwrap()).unwrap(),
             message
         );
     }
@@ -770,7 +978,7 @@ mod tests {
             switched
         );
         assert_eq!(PROTOCOL_VERSION_0_1, 0);
-        assert_eq!(PROTOCOL_VERSION, 7);
+        assert_eq!(PROTOCOL_VERSION, 11);
 
         let watch = ClientMessage::WatchResources;
         assert_eq!(

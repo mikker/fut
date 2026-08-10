@@ -40,6 +40,8 @@ completer!(pane_attach, PaneAttach);
 completer!(pane_close, PaneClose);
 completer!(pane_move_source, PaneMoveSource);
 completer!(terminal_attach, TerminalAttach);
+completer!(agent, Agent);
+completer!(get, Get);
 
 pub(super) fn pane_move_destination(_: &OsStr) -> Vec<CompletionCandidate> {
     let Some(source) = pane_move_source_from_argv(std::env::args_os()) else {
@@ -66,6 +68,8 @@ enum Operation {
     PaneMoveSource,
     PaneMoveDestination(crate::domain::PaneId),
     TerminalAttach,
+    Agent,
+    Get,
 }
 
 fn dynamic_candidates(operation: Operation) -> Vec<CompletionCandidate> {
@@ -201,6 +205,14 @@ fn candidates(snapshot: &ResourceSnapshot, operation: Operation) -> Vec<Candidat
             session_live && descendants_live && session_panes.clone().all(|pane| !pane.closing);
         let session_label = clean(&session.name);
 
+        if matches!(operation, Operation::Get) {
+            push(
+                &mut result,
+                session.id.to_string(),
+                format!("session {session_label}"),
+            );
+        }
+
         if matches!(operation, Operation::SessionAttach) && session_attachable
             || matches!(operation, Operation::SessionRename) && session_live
             || matches!(operation, Operation::SessionClose) && session_closable
@@ -234,6 +246,14 @@ fn candidates(snapshot: &ResourceSnapshot, operation: Operation) -> Vec<Candidat
             let root_suffix = format!(" — {}", clean(&workspace.root.to_string_lossy()));
             let workspace_label = format!("{hierarchy}{root_suffix}");
 
+            if matches!(operation, Operation::Get) {
+                push(
+                    &mut result,
+                    workspace.id.to_string(),
+                    workspace_label.clone(),
+                );
+            }
+
             if matches!(operation, Operation::WorkspaceAttach) && workspace_attachable
                 || matches!(operation, Operation::WorkspaceRename | Operation::TabNew)
                     && workspace_live
@@ -253,6 +273,10 @@ fn candidates(snapshot: &ResourceSnapshot, operation: Operation) -> Vec<Candidat
                     tab_live && tab.panes.len() == 1 && tab.panes.iter().all(|pane| !pane.closing);
                 let tab_hierarchy = format!("{hierarchy} › tab {}", clean(&tab.name));
                 let tab_label = format!("{tab_hierarchy}{root_suffix}");
+
+                if matches!(operation, Operation::Get) {
+                    push(&mut result, tab.id.to_string(), tab_label.clone());
+                }
 
                 if matches!(operation, Operation::TabAttach) && tab_attachable
                     || matches!(operation, Operation::TabRename | Operation::PaneNew) && tab_live
@@ -280,6 +304,14 @@ fn candidates(snapshot: &ResourceSnapshot, operation: Operation) -> Vec<Candidat
                     let pane_live = tab_live && !pane.closing;
                     let pane_hierarchy = format!("{tab_hierarchy} › pane {}", index + 1);
                     let pane_label = format!("{pane_hierarchy}{root_suffix}");
+                    if matches!(operation, Operation::Get) {
+                        push(&mut result, pane.id.to_string(), pane_label.clone());
+                        push(
+                            &mut result,
+                            pane.terminal_id.to_string(),
+                            format!("{pane_hierarchy} › terminal process{root_suffix}"),
+                        );
+                    }
                     if matches!(operation, Operation::PaneAttach | Operation::PaneClose)
                         && pane_live
                     {
@@ -299,6 +331,16 @@ fn candidates(snapshot: &ResourceSnapshot, operation: Operation) -> Vec<Candidat
                             &mut result,
                             pane.terminal_id.to_string(),
                             format!("{pane_hierarchy} › terminal process{root_suffix}"),
+                        );
+                    }
+                    if matches!(operation, Operation::Agent)
+                        && pane_live
+                        && pane.activity.integration.is_some()
+                    {
+                        push(
+                            &mut result,
+                            pane.terminal_id.to_string(),
+                            format!("{pane_hierarchy} › agent{root_suffix}"),
                         );
                     }
                 }
@@ -412,6 +454,43 @@ mod tests {
                 }],
             }],
         }
+    }
+
+    #[test]
+    fn get_completion_includes_every_resource_kind_even_when_closing() {
+        let snapshot = fixture();
+        let values = candidates(&snapshot, Operation::Get)
+            .into_iter()
+            .map(|candidate| candidate.value)
+            .collect::<Vec<_>>();
+        let session = &snapshot.sessions[0];
+        let workspace = &session.workspaces[0];
+        let closing_tab = &workspace.tabs[1];
+        let closing_pane = &closing_tab.panes[0];
+
+        assert_eq!(values.len(), 8);
+        for id in [
+            session.id.to_string(),
+            workspace.id.to_string(),
+            closing_tab.id.to_string(),
+            closing_pane.id.to_string(),
+            closing_pane.terminal_id.to_string(),
+        ] {
+            assert!(values.contains(&id), "missing get completion for {id}");
+        }
+    }
+
+    #[test]
+    fn agent_completion_includes_only_live_integrated_terminals() {
+        let mut snapshot = fixture();
+        let integrated = &mut snapshot.sessions[0].workspaces[0].tabs[0].panes[0];
+        integrated.activity.integration = Some(Default::default());
+        let integrated_id = integrated.terminal_id.to_string();
+        let values = candidates(&snapshot, Operation::Agent)
+            .into_iter()
+            .map(|candidate| candidate.value)
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![integrated_id]);
     }
 
     fn representative_trees() -> Vec<ResourceTree> {

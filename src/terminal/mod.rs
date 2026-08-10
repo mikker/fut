@@ -3,7 +3,9 @@
 mod ghostty;
 mod runtime;
 
-pub(crate) use ghostty::{CopyModeOutcome, MouseInputOutcome, ViewportSnapshot};
+pub(crate) use ghostty::{
+    CopyModeOutcome, MouseInputOutcome, OutputCapture, OutputCaptureError, ViewportSnapshot,
+};
 pub use runtime::{
     CommandError, SpawnSpec, TerminalEvent, TerminalHandle, TerminalLifecycle, spawn_terminal,
 };

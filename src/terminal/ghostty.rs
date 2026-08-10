@@ -22,8 +22,10 @@ use uuid::Uuid;
 use crate::domain::{
     Cell, CellColor, CellStyle, ClientId, CopyModeAction, CopyModeError, CopyModeMovement, Cursor,
     MAX_COPY_BYTES, MAX_COPY_CELLS, MAX_SEARCH_CELL_CODEPOINTS, MAX_SEARCH_CELLS,
-    MAX_SEARCH_QUERY_BYTES, MAX_SEARCH_TEXT_BYTES, MouseButton, MouseEvent, MouseEventKind,
-    MouseModifiers, MouseWheelDirection, Rgb, ScreenSnapshot, SearchDirection, TerminalSize,
+    MAX_SEARCH_QUERY_BYTES, MAX_SEARCH_TEXT_BYTES, MAX_TERMINAL_OUTPUT_BYTES,
+    MAX_TERMINAL_OUTPUT_CELLS, MAX_TERMINAL_OUTPUT_ROWS, MouseButton, MouseEvent, MouseEventKind,
+    MouseModifiers, MouseWheelDirection, Rgb, ScreenSnapshot, SearchDirection,
+    TerminalOutputSource, TerminalSize,
 };
 
 const SYNCHRONIZED_OUTPUT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -45,6 +47,32 @@ pub(crate) enum CopyModeOutcome {
     Prepared { copy_id: Uuid, text: String },
     Finalized { screen: ScreenSnapshot },
     Cancelled { screen: ScreenSnapshot },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OutputCapture {
+    pub(crate) revision: u64,
+    pub(crate) source: TerminalOutputSource,
+    pub(crate) requested_rows: usize,
+    pub(crate) returned_rows: usize,
+    pub(crate) truncated: bool,
+    pub(crate) starts_mid_logical_line: bool,
+    pub(crate) ansi: bool,
+    pub(crate) text: String,
+}
+
+#[derive(Clone, Debug, thiserror::Error, Eq, PartialEq)]
+pub enum OutputCaptureError {
+    #[error("terminal output rows must be between 1 and {MAX_TERMINAL_OUTPUT_ROWS}")]
+    InvalidRows,
+    #[error("terminal output inspection requires {actual} cells; maximum is {maximum}")]
+    TooManyCells { actual: usize, maximum: usize },
+    #[error("terminal output is {actual} bytes; maximum is {maximum}")]
+    TooManyBytes { actual: usize, maximum: usize },
+    #[error("historical terminal output is unavailable while the alternate screen is active")]
+    AlternateScreen,
+    #[error("terminal emulator operation failed: {0}")]
+    Emulator(String),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -212,6 +240,124 @@ impl GhosttyTerminal {
         self.snapshot()
     }
 
+    pub(super) fn output(
+        &self,
+        source: TerminalOutputSource,
+        requested_rows: usize,
+        ansi: bool,
+    ) -> std::result::Result<OutputCapture, OutputCaptureError> {
+        if requested_rows == 0 || requested_rows > MAX_TERMINAL_OUTPUT_ROWS {
+            return Err(OutputCaptureError::InvalidRows);
+        }
+        if source != TerminalOutputSource::Visible
+            && self
+                .terminal
+                .active_screen()
+                .map_err(|error| OutputCaptureError::Emulator(error.to_string()))?
+                == Screen::Alternate
+        {
+            return Err(OutputCaptureError::AlternateScreen);
+        }
+
+        let total_rows = self
+            .terminal
+            .total_rows()
+            .map_err(|error| OutputCaptureError::Emulator(error.to_string()))?;
+        let requested_rows = match source {
+            TerminalOutputSource::Visible => usize::from(self.size.rows),
+            TerminalOutputSource::Recent | TerminalOutputSource::RecentUnwrapped => requested_rows,
+        };
+        let returned_rows = requested_rows.min(total_rows);
+        let start_row = total_rows.saturating_sub(returned_rows);
+        let cells = returned_rows.saturating_mul(usize::from(self.size.columns));
+        if cells > MAX_TERMINAL_OUTPUT_CELLS {
+            return Err(OutputCaptureError::TooManyCells {
+                actual: cells,
+                maximum: MAX_TERMINAL_OUTPUT_CELLS,
+            });
+        }
+
+        let starts_mid_logical_line = if source == TerminalOutputSource::Visible || start_row == 0 {
+            false
+        } else {
+            self.terminal
+                .grid_ref(Point::Screen(PointCoordinate {
+                    x: 0,
+                    y: u32::try_from(start_row - 1)
+                        .map_err(|error| OutputCaptureError::Emulator(error.to_string()))?,
+                }))
+                .and_then(|reference| reference.row())
+                .and_then(|row| row.is_wrapped())
+                .map_err(|error| OutputCaptureError::Emulator(error.to_string()))?
+        };
+
+        let text = if returned_rows == 0 {
+            String::new()
+        } else {
+            let (start, end) = match source {
+                TerminalOutputSource::Visible => (
+                    Point::Active(PointCoordinate { x: 0, y: 0 }),
+                    Point::Active(PointCoordinate {
+                        x: self.size.columns - 1,
+                        y: u32::from(self.size.rows - 1),
+                    }),
+                ),
+                TerminalOutputSource::Recent | TerminalOutputSource::RecentUnwrapped => (
+                    Point::Screen(PointCoordinate {
+                        x: 0,
+                        y: u32::try_from(start_row)
+                            .map_err(|error| OutputCaptureError::Emulator(error.to_string()))?,
+                    }),
+                    Point::Screen(PointCoordinate {
+                        x: self.size.columns - 1,
+                        y: u32::try_from(total_rows - 1)
+                            .map_err(|error| OutputCaptureError::Emulator(error.to_string()))?,
+                    }),
+                ),
+            };
+            let start = self
+                .terminal
+                .grid_ref(start)
+                .map_err(|error| OutputCaptureError::Emulator(error.to_string()))?;
+            let end = self
+                .terminal
+                .grid_ref(end)
+                .map_err(|error| OutputCaptureError::Emulator(error.to_string()))?;
+            let selection = Selection::new(start, end, false);
+            let options = FormatOptions::new()
+                .with_emit_format(if ansi { Format::Vt } else { Format::Plain })
+                .with_unwrap(source == TerminalOutputSource::RecentUnwrapped)
+                .with_trim(true)
+                .with_selection(&selection);
+            let mut output = vec![0; MAX_TERMINAL_OUTPUT_BYTES];
+            let written = match self.terminal.format_selection_buf(options, &mut output) {
+                Ok(Some(written)) => written,
+                Ok(None) => 0,
+                Err(GhosttyError::OutOfSpace { required }) => {
+                    return Err(OutputCaptureError::TooManyBytes {
+                        actual: required,
+                        maximum: MAX_TERMINAL_OUTPUT_BYTES,
+                    });
+                }
+                Err(error) => return Err(OutputCaptureError::Emulator(error.to_string())),
+            };
+            output.truncate(written);
+            String::from_utf8(output)
+                .map_err(|error| OutputCaptureError::Emulator(error.to_string()))?
+        };
+
+        Ok(OutputCapture {
+            revision: self.revision,
+            source,
+            requested_rows,
+            returned_rows,
+            truncated: start_row > 0,
+            starts_mid_logical_line,
+            ansi,
+            text,
+        })
+    }
+
     /// Render one client-owned historical viewport, restoring the shared
     /// terminal to its canonical bottom before returning.
     pub(super) fn viewport_snapshot(&mut self, offset: Option<usize>) -> Result<ViewportSnapshot> {
@@ -295,6 +441,17 @@ impl GhosttyTerminal {
     }
 
     pub(super) fn paste(&mut self, text: String) -> Result<()> {
+        let response = self.encode_paste(text)?;
+        self.write_encoded_input(&response, "paste")
+    }
+
+    pub(super) fn paste_and_input(&mut self, text: String, input: &[u8]) -> Result<()> {
+        let mut response = self.encode_paste(text)?;
+        response.extend_from_slice(input);
+        self.write_encoded_input(&response, "paste and input")
+    }
+
+    fn encode_paste(&mut self, text: String) -> Result<Vec<u8>> {
         let mut data = text.into_bytes();
         let capacity = data
             .len()
@@ -304,15 +461,8 @@ impl GhosttyTerminal {
         let bracketed = self.terminal.mode(Mode::BRACKETED_PASTE)?;
         let written = paste::encode(&mut data, bracketed, &mut response)
             .context("encoding terminal paste with Ghostty")?;
-
-        let mut writer = self
-            .writer
-            .lock()
-            .map_err(|_| anyhow::anyhow!("PTY writer lock poisoned"))?;
-        writer
-            .write_all(&response[..written])
-            .context("writing encoded paste to PTY")?;
-        writer.flush().context("flushing encoded paste to PTY")
+        response.truncate(written);
+        Ok(response)
     }
 
     pub(super) fn copy_mode(
@@ -1466,6 +1616,66 @@ mod tests {
         }
     }
 
+    #[test]
+    fn output_sources_are_bounded_unicode_exact_and_optionally_ansi() {
+        let mut terminal = terminal(6, 2);
+        terminal.feed("first\r\n雪red\r\nlast".as_bytes()).unwrap();
+
+        let visible = terminal
+            .output(TerminalOutputSource::Visible, 1, false)
+            .unwrap();
+        assert_eq!(visible.requested_rows, 2);
+        assert_eq!(visible.returned_rows, 2);
+        assert!(visible.truncated);
+        assert!(visible.text.contains("雪red"));
+        assert!(visible.text.contains("last"));
+
+        let recent = terminal
+            .output(TerminalOutputSource::Recent, 1, false)
+            .unwrap();
+        assert_eq!(recent.returned_rows, 1);
+        assert!(recent.truncated);
+        assert_eq!(recent.text.trim(), "last");
+
+        terminal.feed(b"\r\n\x1b[31mstyled\x1b[0m").unwrap();
+        let ansi = terminal
+            .output(TerminalOutputSource::Recent, 1, true)
+            .unwrap();
+        assert!(ansi.ansi);
+        assert!(ansi.text.contains("styled"));
+        assert!(ansi.text.contains("\x1b["));
+    }
+
+    #[test]
+    fn unwrapped_output_marks_a_window_starting_inside_a_soft_wrap() {
+        let mut terminal = terminal(4, 2);
+        terminal.feed(b"abcdefgh").unwrap();
+        let output = terminal
+            .output(TerminalOutputSource::RecentUnwrapped, 1, false)
+            .unwrap();
+        assert!(output.truncated);
+        assert!(output.starts_mid_logical_line);
+        assert_eq!(output.text.trim(), "efgh");
+    }
+
+    #[test]
+    fn historical_output_rejects_alternate_screen_and_invalid_bounds() {
+        let mut alternate = terminal(8, 2);
+        assert_eq!(
+            alternate.output(TerminalOutputSource::Recent, 0, false),
+            Err(OutputCaptureError::InvalidRows)
+        );
+        alternate.feed(b"\x1b[?1049halternate").unwrap();
+        assert_eq!(
+            alternate.output(TerminalOutputSource::RecentUnwrapped, 2, false),
+            Err(OutputCaptureError::AlternateScreen)
+        );
+        let visible = alternate
+            .output(TerminalOutputSource::Visible, 2, false)
+            .unwrap();
+        assert_eq!(visible.text.replace('\n', ""), "alternate");
+    }
+
     fn wheel(direction: MouseWheelDirection, column: u16, row: u16) -> MouseEvent {
         mouse_event(MouseEventKind::Wheel { direction }, column, row)
     }
@@ -2019,6 +2229,19 @@ mod tests {
         assert_eq!(
             *output.lock().unwrap(),
             b"\x1b[200~h\xc3\xa9llo \xe9\x9b\xaa\nnext\r\t  [201~\x07\x02 \x1b[201~".to_vec()
+        );
+    }
+
+    #[test]
+    fn paste_and_input_appends_key_bytes_after_the_complete_bracketed_paste() {
+        let (mut terminal, output) = recording_terminal(10, 4);
+        terminal.feed(b"\x1b[?2004h").unwrap().unwrap();
+
+        terminal.paste_and_input("echo 雪".into(), b"\r").unwrap();
+
+        assert_eq!(
+            *output.lock().unwrap(),
+            b"\x1b[200~echo \xe9\x9b\xaa\x1b[201~\r".to_vec()
         );
     }
 

@@ -35,6 +35,14 @@ pub const MAX_COPY_BYTES: usize = 1024 * 1024;
 pub const MAX_COPY_CELLS: usize = 250_000;
 /// Maximum literal query accepted by the bounded on-demand scrollback scan.
 pub const MAX_SEARCH_QUERY_BYTES: usize = 4 * 1024;
+/// Maximum physical rows selected by terminal output inspection.
+pub const MAX_TERMINAL_OUTPUT_ROWS: usize = 2_000;
+/// Maximum cells traversed by one terminal output inspection.
+pub const MAX_TERMINAL_OUTPUT_CELLS: usize = 250_000;
+/// Maximum UTF-8/ANSI bytes returned by terminal output inspection.
+pub const MAX_TERMINAL_OUTPUT_BYTES: usize = 1024 * 1024;
+/// Maximum literal or regular-expression pattern accepted by output waits.
+pub const MAX_TERMINAL_OUTPUT_PATTERN_BYTES: usize = 4 * 1024;
 /// Maximum number of terminal cells inspected by one literal search. The
 /// search map uses three `u32` values per retained cell, bounding its primary
 /// temporary allocation to roughly three MiB.
@@ -281,6 +289,98 @@ pub enum AgentReport {
     Completed,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalOutputSource {
+    #[default]
+    Visible,
+    Recent,
+    RecentUnwrapped,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum TerminalOutputMatcher {
+    Literal(String),
+    Regex(String),
+}
+
+impl TerminalOutputMatcher {
+    #[must_use]
+    pub fn value(&self) -> &str {
+        match self {
+            Self::Literal(value) | Self::Regex(value) => value,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TerminalOutput {
+    pub version: u8,
+    pub terminal_id: TerminalId,
+    pub revision: u64,
+    pub source: TerminalOutputSource,
+    pub requested_rows: usize,
+    pub returned_rows: usize,
+    pub truncated: bool,
+    pub starts_mid_logical_line: bool,
+    pub ansi: bool,
+    pub text: String,
+}
+
+/// Optional identity supplied by an agent integration when reporting activity.
+///
+/// These values are descriptive correlation hints, not synchronization keys.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentReportMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+}
+
+pub const MAX_AGENT_METADATA_VALUE_BYTES: usize = 256;
+/// Prompts are deliberately smaller than the local protocol frame so malformed
+/// callers cannot monopolize the terminal input queue with one message.
+pub const MAX_AGENT_PROMPT_BYTES: usize = 1024 * 1024;
+
+impl AgentReportMetadata {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.source.is_none() && self.agent_session_id.is_none() && self.turn_id.is_none()
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if [&self.source, &self.agent_session_id, &self.turn_id]
+            .into_iter()
+            .flatten()
+            .any(|value| value.len() > MAX_AGENT_METADATA_VALUE_BYTES)
+        {
+            return Err("agent report metadata value is too long");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentIntegration {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentEvent {
+    pub revision: u64,
+    pub kind: AgentReport,
+    pub occurred_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttentionKind {
@@ -295,13 +395,81 @@ pub struct AgentAttention {
     pub occurred_at_ms: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct AgentActivity {
+    /// Presence means this terminal has reported through an agent integration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration: Option<AgentIntegration>,
     pub state: AgentState,
     pub revision: u64,
     pub updated_at_ms: u64,
+    /// The most recent lifecycle report, including completion events which map
+    /// back to the current idle state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub attention: Option<AgentAttention>,
+    pub last_event: Option<AgentEvent>,
+}
+
+impl<'de> Deserialize<'de> for AgentActivity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireActivity {
+            #[serde(default)]
+            integration: Option<AgentIntegration>,
+            #[serde(default)]
+            state: AgentState,
+            #[serde(default)]
+            revision: u64,
+            #[serde(default)]
+            updated_at_ms: u64,
+            #[serde(default)]
+            last_event: Option<AgentEvent>,
+            #[serde(default)]
+            attention: Option<AgentAttention>,
+        }
+
+        let wire = WireActivity::deserialize(deserializer)?;
+        let had_legacy_report =
+            wire.revision != 0 || wire.state != AgentState::Idle || wire.attention.is_some();
+        let has_report = had_legacy_report || wire.last_event.is_some();
+        let integration = wire
+            .integration
+            .or_else(|| has_report.then(AgentIntegration::default));
+        let last_event = wire.last_event.or_else(|| {
+            had_legacy_report.then(|| {
+                let kind = match wire.attention.filter(|a| a.revision == wire.revision) {
+                    Some(AgentAttention {
+                        kind: AttentionKind::Completed,
+                        ..
+                    }) => AgentReport::Completed,
+                    Some(AgentAttention {
+                        kind: AttentionKind::Blocked,
+                        ..
+                    }) => AgentReport::Blocked,
+                    None => match wire.state {
+                        AgentState::Idle => AgentReport::Idle,
+                        AgentState::Working => AgentReport::Working,
+                        AgentState::Blocked => AgentReport::Blocked,
+                    },
+                };
+                AgentEvent {
+                    revision: wire.revision,
+                    kind,
+                    occurred_at_ms: wire.updated_at_ms,
+                    turn_id: None,
+                }
+            })
+        });
+        Ok(Self {
+            integration,
+            state: wire.state,
+            revision: wire.revision,
+            updated_at_ms: wire.updated_at_ms,
+            last_event,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -684,6 +852,73 @@ pub struct ScreenDelta {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_activity_distinguishes_unintegrated_idle_from_integrated_idle() {
+        let unintegrated = AgentActivity::default();
+        assert_eq!(unintegrated.state, AgentState::Idle);
+        assert_eq!(unintegrated.integration, None);
+        assert_eq!(unintegrated.last_event, None);
+
+        let integrated = AgentActivity {
+            integration: Some(AgentIntegration::default()),
+            last_event: Some(AgentEvent {
+                revision: 4,
+                kind: AgentReport::Idle,
+                occurred_at_ms: 12,
+                turn_id: None,
+            }),
+            revision: 4,
+            updated_at_ms: 12,
+            ..AgentActivity::default()
+        };
+        assert_eq!(integrated.state, AgentState::Idle);
+        assert!(integrated.integration.is_some());
+    }
+
+    #[test]
+    fn legacy_agent_activity_infers_presence_and_latest_event() {
+        let working: AgentActivity =
+            serde_json::from_str(r#"{"state":"working","revision":7,"updated_at_ms":20}"#).unwrap();
+        assert!(working.integration.is_some());
+        assert_eq!(working.last_event.unwrap().kind, AgentReport::Working);
+
+        let completed: AgentActivity = serde_json::from_str(
+            r#"{"state":"idle","revision":8,"updated_at_ms":30,"attention":{"revision":8,"kind":"completed","occurred_at_ms":30}}"#,
+        )
+        .unwrap();
+        assert!(completed.integration.is_some());
+        assert_eq!(
+            completed.last_event.as_ref().unwrap().kind,
+            AgentReport::Completed
+        );
+
+        let serialized = serde_json::to_value(&completed).unwrap();
+        assert!(serialized.get("attention").is_none());
+        assert_eq!(serialized["last_event"]["kind"], "completed");
+
+        let never_reported: AgentActivity =
+            serde_json::from_str(r#"{"state":"idle","revision":0,"updated_at_ms":0}"#).unwrap();
+        assert_eq!(never_reported.integration, None);
+        assert_eq!(never_reported.last_event, None);
+    }
+
+    #[test]
+    fn agent_report_metadata_is_bounded_per_value() {
+        let accepted = AgentReportMetadata {
+            source: Some("x".repeat(MAX_AGENT_METADATA_VALUE_BYTES)),
+            ..AgentReportMetadata::default()
+        };
+        assert_eq!(accepted.validate(), Ok(()));
+        let rejected = AgentReportMetadata {
+            turn_id: Some("x".repeat(MAX_AGENT_METADATA_VALUE_BYTES + 1)),
+            ..AgentReportMetadata::default()
+        };
+        assert_eq!(
+            rejected.validate(),
+            Err("agent report metadata value is too long")
+        );
+    }
 
     #[test]
     fn ids_are_opaque_unique_and_serde_round_trip() {

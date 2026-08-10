@@ -7,7 +7,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use ratatui::{buffer::Buffer, layout::Rect, style::Style};
 
 use crate::{
-    domain::{AgentState, AttentionKind, PaneId, SessionId, TerminalId},
+    domain::{
+        AgentActivity, AgentAttention, AgentReport, AgentState, AttentionKind, PaneId, SessionId,
+        TerminalId,
+    },
     resources::{PaneSnapshot, ResourceSnapshot},
 };
 
@@ -21,6 +24,20 @@ const MAX_WIDTH: u16 = 80;
 const MAX_HEIGHT: u16 = 16;
 
 const BRAILLE_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+fn attention(activity: &AgentActivity) -> Option<AgentAttention> {
+    let event = activity.last_event.as_ref()?;
+    let kind = match event.kind {
+        AgentReport::Blocked => AttentionKind::Blocked,
+        AgentReport::Completed => AttentionKind::Completed,
+        AgentReport::Idle | AgentReport::Working => return None,
+    };
+    Some(AgentAttention {
+        revision: event.revision,
+        kind,
+        occurred_at_ms: event.occurred_at_ms,
+    })
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ActivityIndicator {
@@ -55,7 +72,7 @@ impl NotificationState {
     }
 
     pub(super) fn is_unseen(&self, pane: &PaneSnapshot) -> bool {
-        pane.activity.attention.is_some_and(|attention| {
+        attention(&pane.activity).is_some_and(|attention| {
             self.seen.get(&pane.terminal_id).copied().unwrap_or(0) < attention.revision
         })
     }
@@ -63,18 +80,14 @@ impl NotificationState {
     pub(super) fn indicator(&self, panes: &[PaneSnapshot]) -> Option<ActivityIndicator> {
         if panes.iter().any(|pane| {
             self.is_unseen(pane)
-                && pane
-                    .activity
-                    .attention
+                && attention(&pane.activity)
                     .is_some_and(|attention| attention.kind == AttentionKind::Blocked)
         }) {
             return Some(ActivityIndicator::Blocked);
         }
         if panes.iter().any(|pane| {
             self.is_unseen(pane)
-                && pane
-                    .activity
-                    .attention
+                && attention(&pane.activity)
                     .is_some_and(|attention| attention.kind == AttentionKind::Completed)
         }) {
             return Some(ActivityIndicator::Completed);
@@ -97,7 +110,7 @@ impl NotificationState {
             for workspace in &session.workspaces {
                 for tab in &workspace.tabs {
                     for pane in &tab.panes {
-                        let Some(attention) = pane.activity.attention else {
+                        let Some(attention) = attention(&pane.activity) else {
                             continue;
                         };
                         if !self.is_unseen(pane) || pane.closing {
@@ -339,7 +352,7 @@ fn age(timestamp_ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{AgentActivity, AgentAttention, AttentionKind};
+    use crate::domain::{AgentEvent, AgentIntegration};
 
     #[test]
     fn spinner_uses_braille_frames() {
@@ -355,13 +368,15 @@ mod tests {
             terminal_id,
             closing: false,
             activity: AgentActivity {
+                integration: Some(AgentIntegration::default()),
                 state: AgentState::Idle,
                 revision: 4,
                 updated_at_ms: 10,
-                attention: Some(AgentAttention {
+                last_event: Some(AgentEvent {
                     revision: 4,
-                    kind: AttentionKind::Completed,
+                    kind: AgentReport::Completed,
                     occurred_at_ms: 10,
+                    turn_id: None,
                 }),
             },
         };
@@ -379,13 +394,15 @@ mod tests {
             terminal_id,
             closing: false,
             activity: AgentActivity {
+                integration: Some(AgentIntegration::default()),
                 state: AgentState::Idle,
                 revision: 5,
                 updated_at_ms: 20,
-                attention: Some(AgentAttention {
+                last_event: Some(AgentEvent {
                     revision: 5,
-                    kind: AttentionKind::Completed,
+                    kind: AgentReport::Completed,
                     occurred_at_ms: 20,
+                    turn_id: None,
                 }),
             },
         };
