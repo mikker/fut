@@ -7571,7 +7571,14 @@ async fn keyboard_copy_search_uses_client_pbcopy_and_surfaces_success_and_failur
     let mut success = spawn_client(false);
     success.wait_for("COPY_READY").await;
     for _ in 0..10 {
-        success.send(b"\x02[hjlq");
+        // Let the begin reply become visible before testing the rapid
+        // move/move/move/cancel queue. Otherwise a faster local protocol can
+        // legitimately coalesce begin and cancel into the already-visible
+        // cancellation notice, leaving no new terminal bytes to observe.
+        success.send(b"\x02[");
+        success.wait_for("COPY ·").await;
+        success.clear_output();
+        success.send(b"hjlq");
         success.wait_for("copy mode cancelled").await;
         success.clear_output();
     }

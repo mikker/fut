@@ -21,7 +21,7 @@ use crate::{
 /// Protocol version used by released Fut 0.1 builds.
 pub const PROTOCOL_VERSION_0_1: u16 = 0;
 /// Current clients and daemons require an exact protocol match.
-pub const PROTOCOL_VERSION: u16 = 11;
+pub const PROTOCOL_VERSION: u16 = 12;
 /// Enough for 50,000 individually styled MessagePack-encoded cells while
 /// remaining a firm pre-allocation bound for the length-delimited transport.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
@@ -497,14 +497,11 @@ mod tests {
         let payload = encode_payload(&cell).unwrap();
         assert_eq!(decode_payload::<Cell>(&payload).unwrap(), cell);
 
-        // fixmap{2}: "c" -> "o", "s" -> fixarray[fg, bg, flags]. fg packs the
-        // RGB tag (0x0200_0000) with the r/g/b bytes; bg is 0 (no color);
-        // flags is 0b0001 (bold only). "x" is omitted (selected is false).
+        // fixarray["o", style], where style is fixarray[fg, bg, flags].
         #[rustfmt::skip]
         let expected: &[u8] = &[
-            0x82, // fixmap, 2 entries
-            0xa1, b'c', 0xa1, b'o', // "c": "o"
-            0xa1, b's', // "s":
+            0x92, // fixarray, 2 elements
+            0xa1, b'o', // contents: "o"
                 0x93, // fixarray, 3 elements
                 0xce, 0x02, 0x0a, 0x14, 0x1e, // fg: u32 0x02_0a141e
                 0x00, // bg: 0
@@ -978,7 +975,7 @@ mod tests {
             switched
         );
         assert_eq!(PROTOCOL_VERSION_0_1, 0);
-        assert_eq!(PROTOCOL_VERSION, 11);
+        assert_eq!(PROTOCOL_VERSION, 12);
 
         let watch = ClientMessage::WatchResources;
         assert_eq!(

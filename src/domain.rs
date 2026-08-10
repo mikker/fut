@@ -537,10 +537,6 @@ pub struct CellStyle {
     pub inverse: bool,
 }
 
-fn is_false(value: &bool) -> bool {
-    !value
-}
-
 /// Wire tags packed into a color's top byte, keeping "no color" (0) distinct
 /// from `Indexed(0)`.
 const COLOR_TAG_INDEXED: u32 = 0x0100_0000;
@@ -656,14 +652,76 @@ impl<'de> Deserialize<'de> for CellStyle {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Cell {
-    #[serde(rename = "c")]
     pub contents: CompactString,
-    #[serde(rename = "s", default, skip_serializing_if = "CellStyle::is_default")]
     pub style: CellStyle,
-    #[serde(rename = "x", default, skip_serializing_if = "is_false")]
     pub selected: bool,
+}
+
+/// Cells dominate terminal frames, so their wire form avoids a map and its
+/// repeated field names. Plain unselected cells are encoded as just their
+/// string; styled cells are `[contents, style]`, with a trailing `true` only
+/// for selected cells.
+impl Serialize for Cell {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.style.is_default() && !self.selected {
+            return serializer.serialize_str(&self.contents);
+        }
+        use serde::ser::SerializeTuple;
+        let mut tuple = serializer.serialize_tuple(if self.selected { 3 } else { 2 })?;
+        tuple.serialize_element(&self.contents)?;
+        tuple.serialize_element(&self.style)?;
+        if self.selected {
+            tuple.serialize_element(&true)?;
+        }
+        tuple.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Cell {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct CellVisitor;
+        impl<'de> serde::de::Visitor<'de> for CellVisitor {
+            type Value = Cell;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a cell string or [contents, style, selected] array")
+            }
+            fn visit_borrowed_str<E: serde::de::Error>(self, value: &'de str) -> Result<Cell, E> {
+                Ok(Cell {
+                    contents: CompactString::new(value),
+                    ..Cell::default()
+                })
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Cell, E> {
+                Ok(Cell {
+                    contents: CompactString::new(value),
+                    ..Cell::default()
+                })
+            }
+            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Cell, E> {
+                Ok(Cell {
+                    contents: value.into(),
+                    ..Cell::default()
+                })
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Cell, A::Error> {
+                let contents = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let style = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                let selected = seq.next_element()?.unwrap_or(false);
+                Ok(Cell {
+                    contents,
+                    style,
+                    selected,
+                })
+            }
+        }
+        deserializer.deserialize_any(CellVisitor)
+    }
 }
 
 impl CellStyle {
@@ -1091,19 +1149,17 @@ mod tests {
             },
             selected: true,
         };
-        // Pins CellStyle's Serialize/Deserialize shape (format-agnostic: the
+        // Pins Cell and CellStyle's Serialize/Deserialize shapes (format-agnostic: the
         // wire protocol itself uses MessagePack, see
         // protocol::tests::wire_pins_a_styled_cells_exact_messagepack_bytes).
+        // A cell is a [contents, style, selected] tuple when styled or selected.
         // Style is a flat [fg, bg, flags] array: fg packs the indexed-color
         // tag (0x0100_0000) with the palette index, bg packs the RGB tag
         // (0x0200_0000) with the r/g/b bytes, and flags is a bitfield
         // (bold|italic|underline|inverse = 0b1111).
         let json = serde_json::to_string(&cell).unwrap();
         assert_eq!(serde_json::from_str::<Cell>(&json).unwrap(), cell);
-        assert_eq!(json, r#"{"c":"λ","s":[16777217,50000102,15],"x":true}"#);
-        assert_eq!(
-            serde_json::to_string(&Cell::default()).unwrap(),
-            r#"{"c":" "}"#
-        );
+        assert_eq!(json, r#"["λ",[16777217,50000102,15],true]"#);
+        assert_eq!(serde_json::to_string(&Cell::default()).unwrap(), r#"" ""#);
     }
 }
