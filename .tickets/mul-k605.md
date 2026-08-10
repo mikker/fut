@@ -1,6 +1,6 @@
 ---
 id: mul-k605
-status: open
+status: in_progress
 deps: []
 links: []
 created: 2026-08-10T11:26:10Z
@@ -12,3 +12,9 @@ assignee: Mikkel Malmberg
 
 Add mouse dragging to resize panes by border
 
+
+## Notes
+
+**2026-08-10T13:09:50Z**
+
+Scope clarified: left-button border dragging is cell-accurate and obeys existing pane minimum sizes.

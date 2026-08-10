@@ -1,6 +1,6 @@
 ---
 id: mul-e66u
-status: open
+status: in_progress
 deps: []
 links: []
 created: 2026-08-10T11:29:17Z
@@ -15,3 +15,9 @@ Ie
 same for `fut workspace close` and so on. No id should imply self.
 If not applicable just fail with exit code and do nothing
 
+
+## Notes
+
+**2026-08-10T13:09:50Z**
+
+Scope clarified: omitted IDs resolve live ancestry from the calling Fut terminal (pane -> tab -> workspace -> session); explicit IDs remain supported; outside/stale/inapplicable context fails without mutation.

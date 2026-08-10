@@ -1,6 +1,6 @@
 ---
 id: mul-kyqv
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-08-10T11:27:10Z
@@ -12,3 +12,9 @@ assignee: Mikkel Malmberg
 
 Nvim/tmux can change this so insert mode is line, normal is block etc
 
+
+## Notes
+
+**2026-08-10T13:09:50Z**
+
+Scope clarified: honor block/bar/underline and blinking where representable; safely fall back to block and restore a sane host cursor.

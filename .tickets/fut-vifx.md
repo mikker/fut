@@ -1,6 +1,6 @@
 ---
 id: fut-vifx
-status: open
+status: in_progress
 deps: []
 links: []
 created: 2026-08-10T12:24:39Z
@@ -12,3 +12,9 @@ assignee: Mikkel Malmberg
 
 Make a `fut attach` command that launches with the navigator open. Wait, do we have that?
 
+
+## Notes
+
+**2026-08-10T13:09:50Z**
+
+Scope clarified: top-level fut attach connects only to an existing daemon, creates/opens no cwd resource, and starts in the global navigator.

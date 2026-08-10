@@ -1,6 +1,6 @@
 ---
 id: mul-qkwe
-status: open
+status: in_progress
 deps: []
 links: []
 created: 2026-08-10T11:31:48Z
@@ -12,3 +12,9 @@ assignee: Mikkel Malmberg
 
 Map to prefix+R (shift-r) to it by default
 
+
+## Notes
+
+**2026-08-10T13:09:50Z**
+
+Scope clarified: reload atomically; on any failure retain the old config and bindings and surface useful feedback. Default binding prefix+Shift-R.

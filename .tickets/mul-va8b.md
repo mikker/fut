@@ -1,6 +1,6 @@
 ---
 id: mul-va8b
-status: open
+status: in_progress
 deps: []
 links: []
 created: 2026-08-10T11:31:00Z
@@ -12,3 +12,9 @@ assignee: Mikkel Malmberg
 
 ie ctrl-b ctrl-b
 
+
+## Notes
+
+**2026-08-10T13:09:50Z**
+
+Scope clarified: prefix+prefix cycles next unread in resource order with wrapping; no unread candidate is a no-op.
