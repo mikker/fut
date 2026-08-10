@@ -659,9 +659,9 @@ pub struct Cell {
     pub selected: bool,
 }
 
-/// Cells dominate terminal frames, so their wire form avoids a map and its
-/// repeated field names. Plain unselected cells are encoded as just their
-/// string; styled cells are `[contents, style]`, with a trailing `true` only
+/// Cells dominate terminal frames, so their wire form avoids maps and nested
+/// containers. Plain unselected cells are encoded as just their string;
+/// styled cells are `[contents, fg, bg, flags]`, with a trailing `true` only
 /// for selected cells.
 impl Serialize for Cell {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -669,9 +669,11 @@ impl Serialize for Cell {
             return serializer.serialize_str(&self.contents);
         }
         use serde::ser::SerializeTuple;
-        let mut tuple = serializer.serialize_tuple(if self.selected { 3 } else { 2 })?;
+        let mut tuple = serializer.serialize_tuple(if self.selected { 5 } else { 4 })?;
         tuple.serialize_element(&self.contents)?;
-        tuple.serialize_element(&self.style)?;
+        tuple.serialize_element(&pack_color(self.style.foreground))?;
+        tuple.serialize_element(&pack_color(self.style.background))?;
+        tuple.serialize_element(&self.style.pack_flags())?;
         if self.selected {
             tuple.serialize_element(&true)?;
         }
@@ -685,7 +687,7 @@ impl<'de> Deserialize<'de> for Cell {
         impl<'de> serde::de::Visitor<'de> for CellVisitor {
             type Value = Cell;
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("a cell string or [contents, style, selected] array")
+                formatter.write_str("a cell string or [contents, fg, bg, flags, selected] array")
             }
             fn visit_borrowed_str<E: serde::de::Error>(self, value: &'de str) -> Result<Cell, E> {
                 Ok(Cell {
@@ -709,13 +711,27 @@ impl<'de> Deserialize<'de> for Cell {
                 let contents = seq
                     .next_element()?
                     .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
-                let style = seq
+                let foreground: u32 = seq
                     .next_element()?
                     .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                let background: u32 = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
+                let flags: u8 = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(3, &self))?;
                 let selected = seq.next_element()?.unwrap_or(false);
+                let (bold, italic, underline, inverse) = CellStyle::unpack_flags(flags);
                 Ok(Cell {
                     contents,
-                    style,
+                    style: CellStyle {
+                        foreground: unpack_color(foreground),
+                        background: unpack_color(background),
+                        bold,
+                        italic,
+                        underline,
+                        inverse,
+                    },
                     selected,
                 })
             }
@@ -1159,7 +1175,7 @@ mod tests {
         // (bold|italic|underline|inverse = 0b1111).
         let json = serde_json::to_string(&cell).unwrap();
         assert_eq!(serde_json::from_str::<Cell>(&json).unwrap(), cell);
-        assert_eq!(json, r#"["λ",[16777217,50000102,15],true]"#);
+        assert_eq!(json, r#"["λ",16777217,50000102,15,true]"#);
         assert_eq!(serde_json::to_string(&Cell::default()).unwrap(), r#"" ""#);
     }
 }
