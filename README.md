@@ -31,6 +31,15 @@ claude plugin install fut@fut-integrations
 Launch Claude Code inside Fut. Run `/hooks` in Claude Code to verify that the
 Fut handlers are loaded.
 
+### Pi
+
+```sh
+pi install git:github.com/mikker/fut
+```
+
+Restart Pi after installing, then launch it inside Fut. The extension reports
+Pi's working, blocked, completed, and idle lifecycle states automatically.
+
 ### Codex
 
 ```sh
