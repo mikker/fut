@@ -1,6 +1,5 @@
 use std::{ffi::OsStr, path::PathBuf, time::Duration};
 
-use clap::CommandFactory;
 use clap_complete::{CompleteEnv, engine::CompletionCandidate};
 
 use crate::{
@@ -9,12 +8,12 @@ use crate::{
     resources::ResourceSnapshot,
 };
 
-use super::Cli;
+use super::cli_command;
 
 const COMPLETION_TIMEOUT: Duration = Duration::from_millis(200);
 
 pub(super) fn complete_env() {
-    CompleteEnv::with_factory(Cli::command).complete();
+    CompleteEnv::with_factory(cli_command).complete();
 }
 
 macro_rules! completer {

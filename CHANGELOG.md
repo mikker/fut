@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added `-v` as the short form of `--version` (`-V` remains supported).
 - Added `fut agent skill` to print Fut's bundled agent instructions.
 - Added `fut pane split` for creating right or downward splits without attaching.
 - Added `fut context` and `fut get` for compact, focus-independent resource discovery.

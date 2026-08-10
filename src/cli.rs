@@ -2,7 +2,10 @@ use std::{ffi::OsString, path::PathBuf, process::ExitCode, str::FromStr, time::D
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
-use clap::{ArgGroup, Parser, Subcommand, ValueEnum, ValueHint};
+use clap::{
+    Arg, ArgAction, ArgGroup, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum,
+    ValueHint,
+};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
@@ -56,6 +59,26 @@ pub struct Cli {
     /// Command to run; omit it to open the current directory and attach.
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+fn cli_command() -> clap::Command {
+    Cli::command().disable_version_flag(true).arg(
+        Arg::new("version")
+            .short('v')
+            .short_alias('V')
+            .long("version")
+            .action(ArgAction::Version)
+            .help("Print version"),
+    )
+}
+
+fn try_parse_cli_from<I, T>(args: I) -> Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let matches = cli_command().try_get_matches_from(args)?;
+    Cli::from_arg_matches(&matches)
 }
 
 #[derive(Subcommand)]
@@ -670,7 +693,7 @@ pub async fn run() -> ExitCode {
 async fn run_from(args: impl IntoIterator<Item = OsString>) -> ExitCode {
     let args = args.into_iter().collect::<Vec<_>>();
     let json_requested = json_requested(&args);
-    let cli = match Cli::try_parse_from(&args) {
+    let cli = match try_parse_cli_from(&args) {
         Ok(cli) => cli,
         Err(error) if error.use_stderr() && json_requested => {
             render_json_error("invalid_arguments", error.to_string());
@@ -2511,8 +2534,15 @@ mod tests {
 
     #[test]
     fn help_and_version_are_successful_clap_results() {
-        for args in [&["fut", "--help"][..], &["fut", "--json", "--version"][..]] {
-            let error = match Cli::try_parse_from(args) {
+        try_parse_cli_from(["fut"]).unwrap();
+
+        for args in [
+            &["fut", "--help"][..],
+            &["fut", "-v"][..],
+            &["fut", "-V"][..],
+            &["fut", "--json", "--version"][..],
+        ] {
+            let error = match try_parse_cli_from(args) {
                 Ok(_) => panic!("help/version unexpectedly parsed as a command"),
                 Err(error) => error,
             };
@@ -2840,9 +2870,7 @@ mod tests {
 
     #[test]
     fn help_exposes_the_exact_noun_first_tree_and_command_contracts() {
-        use clap::CommandFactory;
-
-        let command = Cli::command();
+        let command = cli_command();
         let names: Vec<_> = command
             .get_subcommands()
             .map(clap::Command::get_name)
@@ -2867,7 +2895,7 @@ mod tests {
         );
 
         let mut help = Vec::new();
-        Cli::command().write_long_help(&mut help).unwrap();
+        cli_command().write_long_help(&mut help).unwrap();
         let help = String::from_utf8(help).unwrap();
         assert!(help.contains("versioned JSON for noninteractive commands only"));
         assert!(help.contains("existing daemon without attaching"));
