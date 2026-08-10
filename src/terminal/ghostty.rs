@@ -15,7 +15,7 @@ use libghostty_vt::{
     render::{CellIterator, RowIterator},
     screen::{CellContentTag, CellWide, GridRef, Screen, TrackedGridRef},
     selection::{FormatOptions, Selection},
-    style::{Style, StyleColor, Underline},
+    style::{StyleColor, Underline},
     terminal::{Mode, Point, PointCoordinate, PointSpace, ScrollViewport},
 };
 use uuid::Uuid;
@@ -1251,22 +1251,29 @@ impl GhosttyTerminal {
                     CellContentTag::BgColorPalette | CellContentTag::BgColorRgb => " ".into(),
                 };
                 // `has_styling` is false exactly when the cell's style is
-                // the default one, so we can skip fetching the full style
-                // (a comparatively expensive lookup) for the common case
-                // of unstyled cells.
-                let ghostty_style = if raw_cell.has_styling()? {
-                    cell.style()?
+                // default. Build Fut's zero-cost default directly instead of
+                // asking Ghostty to materialize its larger default style.
+                let mut style = if raw_cell.has_styling()? {
+                    let ghostty_style = cell.style()?;
+                    CellStyle {
+                        foreground: color(ghostty_style.fg_color),
+                        background: color(ghostty_style.bg_color),
+                        bold: ghostty_style.bold,
+                        italic: ghostty_style.italic,
+                        underline: ghostty_style.underline != Underline::None,
+                        inverse: ghostty_style.inverse,
+                    }
                 } else {
-                    Style::default()
+                    CellStyle::default()
                 };
-                let background = match content_tag {
+                style.background = match content_tag {
                     CellContentTag::BgColorPalette => {
                         Some(CellColor::Indexed(raw_cell.bg_color_palette()?.0))
                     }
                     CellContentTag::BgColorRgb => {
                         Some(CellColor::Rgb(rgb(raw_cell.bg_color_rgb()?)))
                     }
-                    _ => color(ghostty_style.bg_color),
+                    _ => style.background,
                 };
                 if let Some(widths) = &mut widths {
                     widths.push(raw_cell.wide()?);
@@ -1275,14 +1282,7 @@ impl GhosttyTerminal {
                     selection.is_some_and(|range| column >= range.start_x && column <= range.end_x);
                 result.push(Cell {
                     contents,
-                    style: CellStyle {
-                        foreground: color(ghostty_style.fg_color),
-                        background,
-                        bold: ghostty_style.bold,
-                        italic: ghostty_style.italic,
-                        underline: ghostty_style.underline != Underline::None,
-                        inverse: ghostty_style.inverse,
-                    },
+                    style,
                     selected,
                 });
                 column += 1;
