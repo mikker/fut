@@ -15,6 +15,11 @@ by similar projects (Zellij, tmux, Ghostty, mosh).
   (`examples/perf_client.rs`): `flood` (plain `seq`), `styled` (SGR-heavy
   output), `latency` (keystroke echo p50/p95). Reports snapshots/sec, wire
   MiB/s, largest frame, decode cost, and revisions coalesced away.
+- `mise run perf:pager` — run `less` in a fixed 200x50 PTY over a generated,
+  deterministic colored diff; capture the ANSI emitted by one `d` and the
+  following `u`; then report action byte counts and median Fut parse and
+  full-snapshot costs over 200 fresh terminals. Run the release-mode command
+  on the same host when comparing directions or revisions.
 - `FUT_PERF_LOG=/tmp/frames.csv fut … attach` — the real client logs one CSV
   row per frame decode and per draw (`src/client/perf.rs`). Summarize with
   `scripts/perf/report /tmp/frames.csv`.
@@ -239,6 +244,28 @@ comparisons; retain debug results only as a warning against evaluating UI
 smoothness from `target/debug/fut`.
 
 ## Remaining hypotheses
+
+### Pager direction measurement (2026-08-10, `less` 668)
+
+`mise run perf:pager` captured one half-page forward (`d`) and backward (`u`)
+operation from the same generated colored diff in a 200x50 xterm-compatible
+PTY. It then replayed each captured stream through Fut's Ghostty boundary,
+timing VT parsing separately from full-grid snapshot capture. Three release
+runs on the same M-series host were stable:
+
+| direction | pager bytes | median VT parse | median snapshot |
+| --- | ---: | ---: | ---: |
+| forward (`d`) | 3,783 | 9.4–9.8 µs | 261.8–267.0 µs |
+| backward (`u`) | 3,695 | 21.1–21.5 µs | 259.7–261.2 µs |
+
+`less` emits almost the same volume in both directions. Its backward ANSI is
+about 2.2x as expensive to parse, but the absolute difference is only ~12 µs;
+snapshot cost is direction-independent and dominates at ~260 µs. This does
+not support a Fut rendering-cache explanation for perceptible backward-page
+latency, and no production optimization is justified by these measurements.
+The remaining likely source is pager-side work before bytes reach the PTY
+(for example input/file seeking or line reconstruction), which this tool
+deliberately separates from Fut's handling after output becomes available.
 
 1. **Skip blitting unchanged rows in `Screen::render`** — deferred: ratatui
    resets the draw buffer every frame, so row-skipping would blank rows; it

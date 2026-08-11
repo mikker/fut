@@ -32,5 +32,13 @@ pub mod bench {
         pub fn feed(&mut self, bytes: &[u8]) -> anyhow::Result<Option<ScreenSnapshot>> {
             self.0.feed(bytes)
         }
+
+        pub fn write(&mut self, bytes: &[u8]) {
+            self.0.vt_write(bytes);
+        }
+
+        pub fn snapshot(&mut self) -> anyhow::Result<Option<ScreenSnapshot>> {
+            self.0.snapshot_after_feed()
+        }
     }
 }

@@ -57,6 +57,10 @@ run = "cargo bench --bench render"
 description = "Measure end-to-end snapshot throughput and input latency against a disposable daemon"
 run = "bash scripts/perf/run"
 
+[tasks."perf:pager"]
+description = "Capture and compare less forward/backward paging output and Fut VT costs"
+run = "cargo run --release --example pager_measure"
+
 [tasks."docs:setup"]
 description = "Install local documentation dependencies"
 run = "bundle config set --local path .bundle && bundle install"
