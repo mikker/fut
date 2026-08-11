@@ -4236,7 +4236,7 @@ async fn top_level_attach_is_navigator_only_until_selection_then_attaches_normal
 
     let mut selected = spawn_attach();
     selected.wait_for("other-session").await;
-    selected.send(b"other\r");
+    selected.send(b"\x1b[200~other\x1b[201~\r");
     selected.wait_for("SECONDARY_READY").await;
     selected.send(b"\x02d");
     selected.wait_success().await;

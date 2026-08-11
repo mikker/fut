@@ -347,6 +347,7 @@ async fn initial_navigator(
                         NavigatorAction::Select(selector) => return Ok(Some(selector)),
                     }
                 }
+                Some(Event::Paste(text)) => navigator.paste(&text),
                 Some(Event::Resize(_, _)) => {}
                 Some(_) => {}
                 None => return Ok(None),

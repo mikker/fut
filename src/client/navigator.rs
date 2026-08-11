@@ -126,7 +126,7 @@ impl NavigatorState {
         let old_index = self.selected;
         let previous_status = self.status.clone();
         self.rows = flatten_optional(snapshot, current, notifications);
-        self.refilter(old_key);
+        self.refilter();
         self.resource_revision = Some(snapshot.revision);
         self.status = match previous_status {
             status @ (NavigatorStatus::Switching | NavigatorStatus::Error { .. }) => status,
@@ -164,12 +164,17 @@ impl NavigatorState {
         }
         let last = self.filtered.len().saturating_sub(1);
         let page = visible_rows.max(1);
+        let filtering = !self.query.is_empty();
         match (key.code, key.modifiers) {
             (KeyCode::Up, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
-                self.jump_back(1)
+                if !filtering {
+                    self.jump_back(1)
+                }
             }
             (KeyCode::Down, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
-                self.jump_forward(1)
+                if !filtering {
+                    self.jump_forward(1)
+                }
             }
             (KeyCode::Char('k'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.move_selection(-1)
@@ -189,20 +194,28 @@ impl NavigatorState {
             (KeyCode::Char('d'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.move_selection(page as isize)
             }
-            (KeyCode::Char('s'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            (KeyCode::Char('s'), modifiers)
+                if !filtering && modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 self.cycle_depth(0)
             }
-            (KeyCode::Char('w'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            (KeyCode::Char('w'), modifiers)
+                if !filtering && modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 self.cycle_depth(1)
             }
-            (KeyCode::Char('t'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            (KeyCode::Char('t'), modifiers)
+                if !filtering && modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 self.cycle_depth(2)
             }
-            (KeyCode::Char('p'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            (KeyCode::Char('p'), modifiers)
+                if !filtering && modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 self.cycle_depth(3)
             }
-            (KeyCode::Left, _) => self.select_parent(),
-            (KeyCode::Right, _) => self.select_first_child(),
+            (KeyCode::Left, _) if !filtering => self.select_parent(),
+            (KeyCode::Right, _) if !filtering => self.select_first_child(),
             (KeyCode::Enter, _)
                 if matches!(
                     self.status,
@@ -236,44 +249,41 @@ impl NavigatorState {
     }
 
     pub fn paste(&mut self, value: &str) {
+        if matches!(self.status, NavigatorStatus::Switching) {
+            return;
+        }
         for character in value.chars().filter(|character| !character.is_control()) {
             if self.query.len() + character.len_utf8() > MAX_QUERY_BYTES {
                 break;
             }
             self.query.push(character);
         }
-        self.refilter(self.selected_key());
+        self.refilter();
         self.ensure_selected_match();
     }
 
     fn append(&mut self, character: char) {
         if self.query.len() + character.len_utf8() <= MAX_QUERY_BYTES {
-            let selected = self.selected_key();
             self.query.push(character);
-            self.refilter(selected);
+            self.refilter();
             self.ensure_selected_match();
         }
     }
 
     fn remove_last_grapheme(&mut self) {
         if let Some((index, _)) = self.query.grapheme_indices(true).next_back() {
-            let selected = self.selected_key();
             self.query.truncate(index);
-            self.refilter(selected);
+            self.refilter();
             self.ensure_selected_match();
         }
     }
 
-    fn refilter(&mut self, _preserve: Option<ResourceKey>) {
+    fn refilter(&mut self) {
         self.filtered = fuzzy::ranked(
             &self.query,
             self.rows.iter().map(|row| row.search_path.clone()),
         );
         self.scroll = 0;
-    }
-
-    fn selected_key(&self) -> Option<ResourceKey> {
-        self.rows.get(self.selected).map(|row| row.key)
     }
 
     fn ensure_selected_match(&mut self) {
@@ -1048,8 +1058,10 @@ mod tests {
         let rows = nav.rows.clone();
         let switch = Uuid::new_v4();
         nav.begin_switch(switch);
+        nav.paste("ignored");
         nav.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), 2);
         assert_eq!(nav.selected, selected);
+        assert!(nav.query.is_empty());
         assert!(matches!(
             nav.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 2),
             NavigatorAction::Stay
@@ -1215,6 +1227,45 @@ mod tests {
         nav.selected = 0;
         press(&mut nav, KeyCode::Left);
         assert_eq!(nav.selected, 0, "sessions have no parent");
+    }
+
+    #[test]
+    fn filtering_disables_every_structural_navigation_class() {
+        let mut nav = tree();
+        nav.query = "match".into();
+        nav.filtered = vec![3, 4];
+
+        for key in [
+            KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        ] {
+            nav.selected = 4;
+            nav.key(key, 10);
+            assert_eq!(nav.selected, 4, "{key:?} selected a hidden row");
+        }
+    }
+
+    #[test]
+    fn enter_acts_on_the_visibly_selected_filtered_result() {
+        let (mut snapshot, current, other_pane) = fixture();
+        snapshot.sessions[0].workspaces[0].tabs[0].panes[1].closing = false;
+        let mut nav = NavigatorState::open(&current);
+        nav.accept_resources(&snapshot, &current);
+
+        nav.paste("pane 2");
+
+        assert_eq!(nav.filtered, vec![4]);
+        assert_eq!(nav.selected, 4);
+        assert!(matches!(
+            nav.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 10),
+            NavigatorAction::Select(TargetSelector::Pane(pane)) if pane == other_pane
+        ));
     }
 
     #[test]
