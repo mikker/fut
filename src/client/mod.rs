@@ -19,6 +19,7 @@ mod presentation;
 mod rename;
 mod sidebar;
 mod tab_bar;
+mod temporary_command;
 
 use std::{io, path::Path, process::Stdio, time::Duration};
 
@@ -76,6 +77,7 @@ use uuid::Uuid;
 
 use sidebar::{WorkspaceSidebarAction, WorkspaceSidebarState, render_workspace_sidebar};
 use tab_bar::{TabBarAction, TabBarState};
+use temporary_command::{TemporaryCommandSurface, TemporaryCommandUpdate};
 
 use crate::{
     domain::{
@@ -380,6 +382,7 @@ async fn run(
     let mut view = ViewState::new(selected)?;
     let mut resources = ResourceState::default();
     let mut surface: Option<ClientSurface> = None;
+    let mut temporary_command: Option<TemporaryCommandSurface> = None;
     let mut copy_mode: Option<CopyModeState> = None;
     let mut rename: Option<RenameState> = None;
     let mut workspace_history = NavigationHistory::default();
@@ -414,6 +417,20 @@ async fn run(
                 // Returning unwinds through TerminalGuard, restoring the host
                 // terminal (mouse tracking off, cooked mode) before exit.
                 bail!("terminated by {name}");
+            }
+            update = async { temporary_command.as_mut().expect("guarded command").update().await }, if temporary_command.is_some() => {
+                match update {
+                    TemporaryCommandUpdate::Screen => force_draw = true,
+                    TemporaryCommandUpdate::Event(event) => {
+                        temporary_command = None;
+                        view.invalidate_drawn();
+                        if let Some(crate::terminal::TerminalEvent::Error { message }) = event {
+                            notice = Some(format!("command failed · {}", sanitize(&message)));
+                        }
+                        resize_view(framed, terminal.size()?.into(), &mut view, &resources, &ui).await?;
+                        force_draw = true;
+                    }
+                }
             }
             frame = framed.next() => {
                 let Some(frame) = frame else {
@@ -882,6 +899,18 @@ async fn run(
                     mouse_input.cancel_ui_drag();
                 }
                 match event {
+                    Event::Key(key) if temporary_command.is_some() => {
+                        if let Some(bytes) = encode_key(key) {
+                            temporary_command.as_ref().expect("command exists").input(bytes).await?;
+                        }
+                    }
+                    Event::Paste(text) if temporary_command.is_some() => {
+                        temporary_command.as_ref().expect("command exists").paste(text).await?;
+                    }
+                    Event::Resize(columns, rows) if temporary_command.is_some() && columns > 0 && rows > 0 => {
+                        temporary_command.as_ref().expect("command exists").resize(TerminalSize { columns, rows }).await?;
+                        force_draw = true;
+                    }
                     Event::Key(key) if copy_mode.is_some() => {
                         notice = None;
                         let input = copy_mode.as_mut().expect("copy mode exists").key(key);
@@ -1197,6 +1226,7 @@ async fn run(
                                     &mut prefix,
                                     terminal.size()?.into(),
                                     &mut ui,
+                                    &mut temporary_command,
                                 ).await?;
                                 force_draw = true;
                             }
@@ -1366,6 +1396,7 @@ async fn run(
                                     &mut prefix,
                                     terminal.size()?.into(),
                                     &mut ui,
+                                    &mut temporary_command,
                                 ).await?;
                                 force_draw = true;
                             }
@@ -1475,6 +1506,19 @@ async fn run(
                     let mut rendered_cursor = None;
                     terminal.draw(|frame| {
                         let area = frame.area();
+                        if let Some(command) = temporary_command.as_ref() {
+                            frame.render_widget(Screen(&command.screen), area);
+                            if command.screen.cursor.visible {
+                                frame.set_cursor_position((command.screen.cursor.column, command.screen.cursor.row));
+                                rendered_cursor = Some(RenderedCursor {
+                                    column: command.screen.cursor.column,
+                                    row: command.screen.cursor.row,
+                                    shape: command.screen.cursor.shape,
+                                    blinking: command.screen.cursor.blinking,
+                                });
+                            }
+                            return;
+                        }
                         let layout = client_layout(
                             area,
                             &ui,
@@ -2196,8 +2240,27 @@ async fn dispatch_client_action(
     prefix: &mut PrefixState,
     host: Rect,
     ui: &mut UiConfig,
+    temporary_command: &mut Option<TemporaryCommandSurface>,
 ) -> anyhow::Result<Option<String>> {
     match action {
+        ClientAction::RunCommand(index) => {
+            let Some(command) = ui.bindings.command(index) else {
+                return Ok(Some("configured command is no longer available".into()));
+            };
+            let size = TerminalSize {
+                columns: host.width,
+                rows: host.height,
+            };
+            let fallback = std::env::current_dir().unwrap_or_else(|_| "/".into());
+            match TemporaryCommandSurface::spawn(command, view.focused().child_pid, &fallback, size)
+                .await
+            {
+                Ok(command) => *temporary_command = Some(command),
+                Err(error) => {
+                    return Ok(Some(format!("command failed · {}", one_line_error(&error))));
+                }
+            }
+        }
         ClientAction::OpenCommandBar => {
             *surface = Some(ClientSurface::CommandBar(
                 CommandBarState::open_with_bindings(ui.bindings.clone()),

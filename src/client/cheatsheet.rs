@@ -63,11 +63,21 @@ pub(super) fn render(bindings: &BindingsConfig, host: Rect, buffer: &mut Buffer)
     }
 }
 
-fn entries(bindings: &BindingsConfig) -> Vec<(String, &'static str)> {
-    ALL_ACTIONS
+fn entries(bindings: &BindingsConfig) -> Vec<(String, String)> {
+    let mut entries = ALL_ACTIONS
         .into_iter()
-        .map(|action| (bindings.suffix_label(action), title(action)))
-        .collect()
+        .filter(|action| bindings.label(*action) != "Unbound")
+        .map(|action| (bindings.suffix_label(action), title(action).to_owned()))
+        .collect::<Vec<_>>();
+    entries.extend(bindings.commands().map(|(_, command)| {
+        (
+            super::actions::parse_suffix(&command.binding)
+                .expect("validated command binding")
+                .1,
+            command.title.clone(),
+        )
+    }));
+    entries
 }
 
 fn title(action: ClientAction) -> &'static str {

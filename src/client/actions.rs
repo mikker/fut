@@ -58,6 +58,7 @@ impl NavigationScope {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum ClientAction {
+    RunCommand(usize),
     OpenCommandBar,
     ReloadConfig,
     EnterCopyMode,
@@ -473,6 +474,9 @@ pub(super) const DIRECT_BINDINGS: [DirectBinding; 37] = [
 ];
 
 pub(super) fn definition(action: ClientAction) -> Option<&'static ActionDefinition> {
+    if matches!(action, ClientAction::RunCommand(_)) {
+        return None;
+    }
     COMMANDS
         .iter()
         .find(|definition| definition.action == action)
@@ -480,6 +484,7 @@ pub(super) fn definition(action: ClientAction) -> Option<&'static ActionDefiniti
 
 pub(super) fn config_key(action: ClientAction) -> &'static str {
     match action {
+        ClientAction::RunCommand(_) => panic!("configured commands do not have built-in keys"),
         ClientAction::OpenCommandBar => "open_command_bar",
         ClientAction::ReloadConfig => "reload_config",
         ClientAction::EnterCopyMode => "enter_copy_mode",
@@ -562,6 +567,7 @@ pub(super) fn suffix_name(suffix: &[u8]) -> String {
 #[cfg(test)]
 const fn requires_launcher(action: ClientAction) -> bool {
     match action {
+        ClientAction::RunCommand(_) => true,
         ClientAction::OpenCommandBar => false,
         ClientAction::ReloadConfig
         | ClientAction::EnterCopyMode

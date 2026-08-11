@@ -40,10 +40,19 @@ impl CommandBarState {
     }
 
     pub fn open_with_bindings(bindings: BindingsConfig) -> Self {
+        let filtered = COMMANDS
+            .iter()
+            .map(|command| command.action)
+            .chain(
+                bindings
+                    .commands()
+                    .map(|(index, _)| ClientAction::RunCommand(index)),
+            )
+            .collect();
         let mut state = Self {
             bindings,
             query: String::new(),
-            filtered: Vec::new(),
+            filtered,
             selected: None,
             scroll: 0,
         };
@@ -226,21 +235,32 @@ impl CommandBarState {
     }
 
     fn refilter(&mut self, preserve: Option<ClientAction>) {
+        let catalog = COMMANDS
+            .iter()
+            .map(|command| command.action)
+            .chain(
+                self.bindings
+                    .commands()
+                    .map(|(index, _)| ClientAction::RunCommand(index)),
+            )
+            .collect::<Vec<_>>();
         let ranked = fuzzy::ranked(
             &self.query,
-            COMMANDS.iter().map(|command| {
-                format!(
-                    "{} {} {}",
-                    command.title,
-                    command.keywords,
-                    self.bindings.label(command.action)
-                )
+            catalog.iter().map(|action| {
+                let (title, keywords) = match action {
+                    ClientAction::RunCommand(index) => self
+                        .bindings
+                        .command(*index)
+                        .map(|command| (command.title.as_str(), "configured trusted command"))
+                        .unwrap_or(("", "")),
+                    action => definition(*action)
+                        .map(|definition| (definition.title, definition.keywords))
+                        .unwrap_or(("", "")),
+                };
+                format!("{title} {keywords} {}", self.bindings.label(*action))
             }),
         );
-        self.filtered = ranked
-            .into_iter()
-            .map(|index| COMMANDS[index].action)
-            .collect();
+        self.filtered = ranked.into_iter().map(|index| catalog[index]).collect();
         self.selected = preserve
             .and_then(|action| {
                 self.filtered
@@ -289,9 +309,7 @@ impl CommandBarState {
 
     fn render_tiny(&self, area: Rect, buffer: &mut Buffer) {
         let detail = if let Some(action) = self.selected_action() {
-            definition(action)
-                .map(|command| command.title)
-                .unwrap_or("")
+            action_title(action, &self.bindings)
         } else {
             "No matching commands"
         };
@@ -357,7 +375,7 @@ fn render_result(
 ) {
     let style = row_style(selected);
     fill_row(area, style, buffer);
-    let definition = definition(action).expect("command bar actions have definitions");
+    let title = action_title(action, bindings);
     let full_binding = bindings.label(action);
     let binding = if area.width >= 56 {
         full_binding.as_str()
@@ -370,10 +388,7 @@ fn render_result(
     let title_width = usize::from(area.width)
         .saturating_sub(binding_width)
         .saturating_sub(2);
-    let title = format!(
-        " {}",
-        truncate(definition.title, title_width.saturating_sub(1))
-    );
+    let title = format!(" {}", truncate(title, title_width.saturating_sub(1)));
     buffer.set_stringn(area.x, area.y, title, title_width, style);
     if !binding.is_empty() {
         buffer.set_stringn(
@@ -383,6 +398,18 @@ fn render_result(
             binding_width,
             style.add_modifier(Modifier::DIM),
         );
+    }
+}
+
+fn action_title(action: ClientAction, bindings: &BindingsConfig) -> &str {
+    match action {
+        ClientAction::RunCommand(index) => bindings
+            .command(index)
+            .map(|command| command.title.as_str())
+            .unwrap_or(""),
+        action => definition(action)
+            .map(|command| command.title)
+            .unwrap_or(""),
     }
 }
 

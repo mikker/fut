@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Unified workspace-sidebar visibility into visible, auto-hide-when-single, and hidden modes; `h` now cycles these modes inside the sidebar.
+- Added trusted configurable keybinding commands that run in a temporary full-terminal PTY, inherit the focused pane's working directory, and restore the prior layout on exit.
 
 - Fixed multi-second backward paging latency in delta/less when running a development build.
 

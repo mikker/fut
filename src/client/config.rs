@@ -93,9 +93,25 @@ pub(super) enum SemanticStyle {
 #[serde(transparent)]
 pub(super) struct BindingsConfig {
     values: BTreeMap<String, String>,
+    #[serde(skip)]
+    commands: Vec<TrustedCommand>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TrustedCommand {
+    pub title: String,
+    pub binding: String,
+    pub program: PathBuf,
+    #[serde(default)]
+    pub args: Vec<String>,
 }
 
 impl BindingsConfig {
+    pub(super) fn command(&self, index: usize) -> Option<&TrustedCommand> {
+        self.commands.get(index)
+    }
+
     pub(super) fn suffix(&self, action: ClientAction) -> Vec<u8> {
         self.values
             .get(config_key(action))
@@ -111,13 +127,40 @@ impl BindingsConfig {
     }
 
     pub(super) fn label(&self, action: ClientAction) -> String {
+        if let ClientAction::RunCommand(index) = action {
+            return self.commands.get(index).map_or_else(
+                || "Unbound".into(),
+                |command| {
+                    format!(
+                        "Ctrl-b {}",
+                        parse_suffix(&command.binding)
+                            .expect("commands are validated")
+                            .1
+                    )
+                },
+            );
+        }
+        if self.commands.iter().any(|command| {
+            parse_suffix(&command.binding).is_some_and(|(suffix, _)| suffix == self.suffix(action))
+        }) {
+            return "Unbound".into();
+        }
         format!("Ctrl-b {}", self.suffix_label(action))
     }
 
     pub(super) fn action_for_suffix(&self, suffix: &[u8]) -> Option<ClientAction> {
+        if let Some(index) = self.commands.iter().position(|command| {
+            parse_suffix(&command.binding).is_some_and(|(bytes, _)| bytes == suffix)
+        }) {
+            return Some(ClientAction::RunCommand(index));
+        }
         ALL_ACTIONS
             .into_iter()
-            .find(|action| self.suffix(*action) == suffix)
+            .find(|action| self.suffix(*action) == suffix && self.label(*action) != "Unbound")
+    }
+
+    pub(super) fn commands(&self) -> impl Iterator<Item = (usize, &TrustedCommand)> {
+        self.commands.iter().enumerate()
     }
 }
 
@@ -806,6 +849,7 @@ impl UiConfig {
 #[serde(default, deny_unknown_fields)]
 struct Config {
     ui: UiConfig,
+    trusted_commands: BTreeMap<String, TrustedCommand>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -922,8 +966,9 @@ fn load_path_outcome(path: &std::path::Path, explicit: bool) -> Result<LoadedUiC
             path.display()
         );
     }
-    let config = toml::from_str::<Config>(&source)
+    let mut config = toml::from_str::<Config>(&source)
         .with_context(|| format!("parse Fut config {}", path.display()))?;
+    config.ui.bindings.commands = config.trusted_commands.into_values().collect();
     validate(&config.ui).with_context(|| format!("validate Fut config {}", path.display()))?;
     Ok(LoadedUiConfig {
         ui: config.ui,
@@ -950,6 +995,30 @@ fn validate(ui: &UiConfig) -> Result<()> {
     for action in ALL_ACTIONS {
         if !bound_suffixes.insert(ui.bindings.suffix(action)) {
             bail!("ui.bindings must not assign the same key to multiple actions");
+        }
+    }
+    let explicitly_bound = ui
+        .bindings
+        .values
+        .keys()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut command_suffixes = HashSet::new();
+    for command in &ui.bindings.commands {
+        validate_text("trusted_commands title", &command.title)?;
+        if command.title.is_empty() {
+            bail!("trusted command titles must not be empty");
+        }
+        let Some((suffix, _)) = parse_suffix(&command.binding) else {
+            bail!("trusted command bindings must be one character or a named key");
+        };
+        if !command_suffixes.insert(suffix.clone()) {
+            bail!("trusted_commands must not assign the same key to multiple commands");
+        }
+        if ALL_ACTIONS.into_iter().any(|action| {
+            explicitly_bound.contains(config_key(action)) && ui.bindings.suffix(action) == suffix
+        }) {
+            bail!("a trusted command conflicts with an explicitly configured ui binding");
         }
     }
     if !(MIN_SIDEBAR_WIDTH..=MAX_SIDEBAR_WIDTH).contains(&ui.workspace_sidebar.width) {
@@ -1433,5 +1502,67 @@ right = [{ token = "workspace.tab_count" }]
                 .to_string()
                 .contains("maximum")
         );
+    }
+
+    #[test]
+    fn trusted_commands_parse_displace_defaults_and_reject_collisions() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[trusted_commands.git_diff]
+title = "Repository diff"
+binding = "g"
+program = "/bin/sh"
+args = ["-c", "git diff"]
+"#,
+        )
+        .unwrap();
+        let config = load_path(&path, true).unwrap();
+        assert_eq!(
+            config.bindings.action_for_suffix(b"g"),
+            Some(ClientAction::RunCommand(0))
+        );
+        assert_eq!(
+            config.bindings.label(ClientAction::OpenNavigator),
+            "Unbound"
+        );
+        assert_eq!(config.bindings.command(0).unwrap().args, ["-c", "git diff"]);
+
+        fs::write(
+            &path,
+            r#"
+[ui.bindings]
+open_navigator = "g"
+[trusted_commands.git_diff]
+title = "Repository diff"
+binding = "g"
+program = "/bin/true"
+"#,
+        )
+        .unwrap();
+        assert!(
+            load_path(&path, true)
+                .unwrap_err()
+                .to_string()
+                .contains("validate")
+        );
+
+        fs::write(
+            &path,
+            r#"
+[trusted_commands.one]
+title = "One"
+binding = "x"
+program = "/bin/true"
+[trusted_commands.two]
+title = "Two"
+binding = "x"
+program = "/bin/true"
+"#,
+        )
+        .unwrap();
+        assert!(load_path(&path, true).is_err());
     }
 }
