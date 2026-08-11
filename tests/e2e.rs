@@ -9162,7 +9162,7 @@ async fn public_client_transfers_focus_when_the_focused_pane_exits() {
             program: Some("/bin/sh".into()),
             argv: vec![
                 "-c".into(),
-                "printf 'SURVIVOR_PANE_READY\r\n'; while IFS= read -r line; do [ \"$line\" = b ] && printf 'EXIT_B_INPUT\r\n'; done".into(),
+                "trap 'printf SURVIVOR_FOCUSED\\r\\n' WINCH; printf 'SURVIVOR_PANE_READY\r\n'; while :; do IFS= read -r line || continue; [ \"$line\" = b ] && printf 'EXIT_B_INPUT\r\n'; done".into(),
             ],
         })
         .await
@@ -9189,7 +9189,7 @@ async fn public_client_transfers_focus_when_the_focused_pane_exits() {
     client.wait_for("PRIMARY_EXIT_TARGET").await;
     client.wait_for("SURVIVOR_PANE_READY").await;
     client.send(b"exit\n");
-    client.wait_for_count("SURVIVOR_PANE_READY", 2).await;
+    client.wait_for("SURVIVOR_FOCUSED").await;
     client.send(b"b\n");
     client.wait_for("EXIT_B_INPUT").await;
     client.send(b"\x02d");
