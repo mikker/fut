@@ -8,7 +8,7 @@ use tokio::sync::{broadcast, watch};
 
 use crate::{
     domain::{ScreenSnapshot, TerminalId, TerminalSize},
-    terminal::{SpawnSpec, TerminalEvent, TerminalHandle, spawn_terminal},
+    terminal::{SpawnSpec, TerminalEvent, TerminalHandle, TerminalLifecycle, spawn_terminal},
 };
 
 use super::config::TrustedCommand;
@@ -17,12 +17,15 @@ pub(super) struct TemporaryCommandSurface {
     handle: TerminalHandle,
     snapshots: watch::Receiver<ScreenSnapshot>,
     events: broadcast::Receiver<TerminalEvent>,
+    lifecycle: watch::Receiver<TerminalLifecycle>,
     pub screen: ScreenSnapshot,
 }
 
 pub(super) enum TemporaryCommandUpdate {
     Screen,
-    Event(Option<TerminalEvent>),
+    Exited(Option<i32>),
+    Error(String),
+    Stopped,
 }
 
 impl TemporaryCommandSurface {
@@ -32,7 +35,7 @@ impl TemporaryCommandSurface {
         fallback: &Path,
         size: TerminalSize,
     ) -> anyhow::Result<Self> {
-        let cwd = process_cwd(pid)
+        let cwd = process_cwd(foreground_process_id(pid).await)
             .await
             .unwrap_or_else(|| fallback.to_path_buf());
         let handle = spawn_terminal(SpawnSpec {
@@ -47,10 +50,12 @@ impl TemporaryCommandSurface {
         let snapshots = handle.subscribe_snapshots();
         let screen = snapshots.borrow().clone();
         let events = handle.subscribe_events();
+        let lifecycle = handle.subscribe_lifecycle();
         Ok(Self {
             handle,
             snapshots,
             events,
+            lifecycle,
             screen,
         })
     }
@@ -71,22 +76,53 @@ impl TemporaryCommandSurface {
     }
 
     pub(super) async fn update(&mut self) -> TemporaryCommandUpdate {
+        if let TerminalLifecycle::Exited { exit_code } = self.lifecycle.borrow().clone() {
+            return TemporaryCommandUpdate::Exited(exit_code);
+        }
         tokio::select! {
             changed = self.snapshots.changed() => {
                 if changed.is_ok() {
                     self.screen = self.snapshots.borrow_and_update().clone();
                     TemporaryCommandUpdate::Screen
                 } else {
-                    TemporaryCommandUpdate::Event(None)
+                    TemporaryCommandUpdate::Stopped
                 }
             }
             event = self.events.recv() => match event {
-                Ok(event) => TemporaryCommandUpdate::Event(Some(event)),
+                Ok(TerminalEvent::TerminalExited { exit_code }) => TemporaryCommandUpdate::Exited(exit_code),
+                Ok(TerminalEvent::Error { message }) => TemporaryCommandUpdate::Error(message),
                 Err(broadcast::error::RecvError::Lagged(_)) => TemporaryCommandUpdate::Screen,
-                Err(broadcast::error::RecvError::Closed) => TemporaryCommandUpdate::Event(None),
+                Err(broadcast::error::RecvError::Closed) => TemporaryCommandUpdate::Stopped,
+            },
+            changed = self.lifecycle.changed() => {
+                if changed.is_err() {
+                    TemporaryCommandUpdate::Stopped
+                } else if let TerminalLifecycle::Exited { exit_code } = self.lifecycle.borrow().clone() {
+                    TemporaryCommandUpdate::Exited(exit_code)
+                } else {
+                    TemporaryCommandUpdate::Screen
+                }
             }
         }
     }
+}
+
+async fn foreground_process_id(child_pid: u32) -> u32 {
+    let output = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        tokio::process::Command::new("/bin/ps")
+            .args(["-o", "tpgid=", "-p", &child_pid.to_string()])
+            .output(),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok);
+    output
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|pid| *pid > 0)
+        .unwrap_or(child_pid)
 }
 
 async fn process_cwd(pid: u32) -> Option<PathBuf> {
@@ -96,25 +132,31 @@ async fn process_cwd(pid: u32) -> Option<PathBuf> {
     }
     #[cfg(target_os = "macos")]
     {
-        let output = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            tokio::process::Command::new("/usr/sbin/lsof")
-                .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
-                .output(),
-        )
-        .await
-        .ok()?
-        .ok()?;
-        output
-            .status
-            .success()
-            .then(|| {
-                String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .find_map(|line| line.strip_prefix('n'))
-                    .map(PathBuf::from)
-            })
-            .flatten()
+        use std::{ffi::CStr, os::unix::ffi::OsStringExt};
+
+        let mut info = std::mem::MaybeUninit::<libc::proc_vnodepathinfo>::zeroed();
+        let size = std::mem::size_of::<libc::proc_vnodepathinfo>();
+        // SAFETY: proc_pidinfo initializes at most `size` bytes in `info`, whose
+        // pointer and declared size exactly match proc_vnodepathinfo.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                i32::try_from(pid).ok()?,
+                libc::PROC_PIDVNODEPATHINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                i32::try_from(size).expect("proc_vnodepathinfo size fits i32"),
+            )
+        };
+        if usize::try_from(written).ok()? != size {
+            return None;
+        }
+        // SAFETY: the exact struct size was initialized above, and vip_path is
+        // a NUL-terminated MAXPATHLEN buffer supplied by libproc.
+        let info = unsafe { info.assume_init() };
+        let path = unsafe { CStr::from_ptr(info.pvi_cdir.vip_path.as_ptr().cast()) };
+        Some(PathBuf::from(std::ffi::OsString::from_vec(
+            path.to_bytes().to_vec(),
+        )))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -160,17 +202,14 @@ mod tests {
         .unwrap();
         let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if let TemporaryCommandUpdate::Event(event) = surface.update().await {
-                    break event;
+                if let TemporaryCommandUpdate::Exited(exit_code) = surface.update().await {
+                    break exit_code;
                 }
             }
         })
         .await
         .unwrap();
-        assert_eq!(
-            event,
-            Some(TerminalEvent::TerminalExited { exit_code: Some(0) })
-        );
+        assert_eq!(event, Some(0));
     }
 
     #[tokio::test]

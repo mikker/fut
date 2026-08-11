@@ -388,6 +388,17 @@ impl ResourceTree {
         self.revision
     }
 
+    #[must_use]
+    pub fn automatic_name_terminal_ids(&self) -> Vec<TerminalId> {
+        self.tabs
+            .values()
+            .filter(|tab| tab.name.is_empty() && !tab.closing)
+            .filter_map(|tab| self.panes.get(&tab.focused_pane))
+            .filter(|pane| !pane.closing)
+            .map(|pane| pane.terminal_id)
+            .collect()
+    }
+
     pub fn resolve_session(&self, selector: SessionSelector) -> Result<SessionId, ResourceError> {
         match selector {
             SessionSelector::Id(id) if self.sessions.contains_key(&id) => Ok(id),
@@ -924,10 +935,9 @@ impl ResourceTree {
             return Err(ResourceError::Duplicate("tab name"));
         }
 
-        let old_name = std::mem::replace(
-            &mut self.tabs.get_mut(&tab_id).unwrap().name,
-            new_name.clone(),
-        );
+        let tab = self.tabs.get_mut(&tab_id).unwrap();
+        let old_name = std::mem::replace(&mut tab.name, new_name.clone());
+        tab.automatic_name.clear();
         Ok(self.finish(
             vec![ResourceEvent::TabRenamed {
                 workspace_id,

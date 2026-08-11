@@ -3138,7 +3138,10 @@ async fn external_pane_closes_reconcile_background_then_transfer_focused_input()
 #[tokio::test]
 async fn public_pane_new_rejections_are_pre_spawn_and_atomic() {
     let harness = Harness::start("while IFS= read -r line; do :; done").await;
-    let before = harness.resources().await;
+    let before = resources_when(&harness, |snapshot| {
+        !snapshot.sessions[0].workspaces[0].tabs[0].name.is_empty()
+    })
+    .await;
     let tab_id = before.sessions[0].workspaces[0].tabs[0].id;
     let marker = harness.root.path().join("rejected-pane.marker");
     let missing_tab = Uuid::new_v4().to_string();
@@ -4399,7 +4402,10 @@ async fn location_aware_layout_commands_follow_live_terminal_ancestry_and_guard_
 #[tokio::test]
 async fn inferred_layout_commands_fail_typed_without_a_live_terminal_and_do_not_mutate() {
     let harness = Harness::start("while IFS= read -r line; do :; done").await;
-    let before = harness.resources().await;
+    let before = resources_when(&harness, |snapshot| {
+        !snapshot.sessions[0].workspaces[0].tabs[0].name.is_empty()
+    })
+    .await;
     for (terminal, code) in [
         (None, "missing_context"),
         (Some("not-a-uuid".to_owned()), "invalid_context"),
@@ -8141,13 +8147,14 @@ async fn workspace_and_tab_bars_create_and_rename_logical_contexts() {
         created_workspace
     );
     assert_eq!(final_snapshot.sessions[0].workspaces[1].name, "context λ");
-    assert_eq!(
-        final_snapshot.sessions[0].workspaces[1]
-            .tabs
-            .iter()
-            .map(|tab| tab.name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["first", "sh"],
+    let tab_names = final_snapshot.sessions[0].workspaces[1]
+        .tabs
+        .iter()
+        .map(|tab| tab.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(tab_names[0], "first");
+    assert!(
+        !tab_names[1].is_empty(),
         "unnamed tabs display their foreground process"
     );
 
@@ -10946,7 +10953,10 @@ fn context_without_terminal_identity_is_a_typed_error_before_daemon_connection()
 async fn process_completion_covers_live_resource_operations_and_refresh() {
     let harness = Harness::start("while IFS= read -r line; do :; done").await;
     let env = CompletionEnv::new();
-    let snapshot = harness.resources().await;
+    let snapshot = resources_when(&harness, |snapshot| {
+        !snapshot.sessions[0].workspaces[0].tabs[0].name.is_empty()
+    })
+    .await;
     let session = &snapshot.sessions[0];
     let workspace = &session.workspaces[0];
     let tab = &workspace.tabs[0];

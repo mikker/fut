@@ -421,12 +421,25 @@ async fn run(
             update = async { temporary_command.as_mut().expect("guarded command").update().await }, if temporary_command.is_some() => {
                 match update {
                     TemporaryCommandUpdate::Screen => force_draw = true,
-                    TemporaryCommandUpdate::Event(event) => {
+                    TemporaryCommandUpdate::Error(message) => {
+                        notice = Some(format!("command failed · {}", sanitize(&message)));
+                        force_draw = true;
+                    }
+                    TemporaryCommandUpdate::Exited(exit_code) => {
                         temporary_command = None;
                         view.invalidate_drawn();
-                        if let Some(crate::terminal::TerminalEvent::Error { message }) = event {
-                            notice = Some(format!("command failed · {}", sanitize(&message)));
+                        match exit_code {
+                            Some(0) => {}
+                            Some(code) => notice = Some(format!("command exited · status {code}")),
+                            None => notice = Some("command exited · status unknown".into()),
                         }
+                        resize_view(framed, terminal.size()?.into(), &mut view, &resources, &ui).await?;
+                        force_draw = true;
+                    }
+                    TemporaryCommandUpdate::Stopped => {
+                        temporary_command = None;
+                        view.invalidate_drawn();
+                        notice = Some("command failed · terminal runtime stopped".into());
                         resize_view(framed, terminal.size()?.into(), &mut view, &resources, &ui).await?;
                         force_draw = true;
                     }
@@ -911,6 +924,7 @@ async fn run(
                         temporary_command.as_ref().expect("command exists").resize(TerminalSize { columns, rows }).await?;
                         force_draw = true;
                     }
+                    Event::Mouse(_) if temporary_command.is_some() => {}
                     Event::Key(key) if copy_mode.is_some() => {
                         notice = None;
                         let input = copy_mode.as_mut().expect("copy mode exists").key(key);

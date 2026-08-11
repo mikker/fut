@@ -6,6 +6,7 @@ mod runtime;
 pub(crate) use ghostty::{
     CopyModeOutcome, MouseInputOutcome, OutputCapture, OutputCaptureError, ViewportSnapshot,
 };
+pub(crate) use runtime::AttachmentGeometry;
 pub use runtime::{
     CommandError, SpawnSpec, TerminalEvent, TerminalHandle, TerminalLifecycle, spawn_terminal,
 };

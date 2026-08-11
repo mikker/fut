@@ -1,6 +1,6 @@
 ---
 id: fut-0g3y
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-08-10T13:54:53Z
@@ -16,3 +16,9 @@ assignee: Mikkel Malmberg
 
 This is two settings now. H hotkey inside should cycle these.
 
+
+## Notes
+
+**2026-08-11T09:58:21Z**
+
+Replaced the two sidebar flags with visible/auto_hide_when_single/hidden visibility, added h cycling, removed obsolete branches/settings, and updated docs/tests.

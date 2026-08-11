@@ -1,6 +1,6 @@
 ---
 id: fut-mt16
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-08-10T13:29:34Z
@@ -21,3 +21,9 @@ Design this as an explicit trusted-command boundary rather than weakening pure p
 
 A user can configure prefix+g to launch the existing git_diff_popup.sh from the focused pane's live current directory. The command receives the full client terminal area without permanently mutating tab split topology; q/normal process exit returns to the previously focused pane and geometry. Invalid commands and spawn failures surface a bounded client error and leave the prior view usable. Custom bindings participate in uniqueness validation, config reload, command-palette search, and which-key help. Documentation clearly identifies executable command configuration as trusted and keeps rendering/presentation configuration non-executable. Automated tests cover config parsing and collisions, CWD inheritance, launch/exit restoration, and failure handling.
 
+
+## Notes
+
+**2026-08-11T09:58:21Z**
+
+Implemented trusted configured temporary full-area PTY commands with focused foreground-process CWD inheritance, binding displacement/collision validation, config reload, command palette and which-key discovery, lifecycle/error handling, docs, tests, and manual PTY verification.

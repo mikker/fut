@@ -624,7 +624,6 @@ struct FocusedViewportState {
 impl Attachment {
     fn new(
         owner: ClientId,
-        size: TerminalSize,
         panes: Vec<ObservedTarget>,
         focused: LeasedTarget,
         layout: SplitTree,
@@ -633,6 +632,10 @@ impl Attachment {
         resource_changes: watch::Receiver<u64>,
     ) -> Self {
         let (update_sender, updates) = mpsc::channel(ATTACHMENT_UPDATE_CAPACITY);
+        let size = focused
+            .lease
+            .client_size()
+            .expect("a new attachment retains its client size");
         let mut attachment = Self {
             owner,
             size,
@@ -674,14 +677,14 @@ impl Attachment {
 
     async fn resize_focused(&mut self, size: TerminalSize) -> Result<(), CommandError> {
         self.size = size;
-        let size = self
+        let geometry = self
             .focused
             .lease
             .resize(size)
             .ok_or(CommandError::Stopped)?;
         self.viewport_offsets
             .remove(&self.focused.selected.terminal_id);
-        self.focused.terminal.resize(size).await
+        self.focused.terminal.resize_for_attachment(geometry).await
     }
 
     fn size(&self) -> TerminalSize {
@@ -1266,8 +1269,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     let (exited_tx, mut exited_rx) = mpsc::unbounded_channel();
     watch_terminal(terminal, exited_tx.clone());
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-    let mut process_names = tokio::time::interval(Duration::from_millis(500));
-    process_names.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let process_names = watch_process_names(Arc::clone(&shared), shutdown_tx.subscribe());
     let mut connections = JoinSet::new();
     let writers = WriterTasks::default();
 
@@ -1284,7 +1286,6 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
                     break;
                 }
             }
-            _ = process_names.tick() => refresh_process_names(&shared).await,
             accepted = socket.listener.accept() => {
                 let (stream, _) = accepted.context("accept daemon client")?;
                 let shared = Arc::clone(&shared);
@@ -1305,6 +1306,8 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
             }
         }
     }
+    shutdown_tx.send_replace(true);
+    let _ = process_names.await;
     let handles = shared.lock().await.begin_shutdown();
     let mut first_close_error = None;
     for terminal in handles {
@@ -1335,29 +1338,55 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     Ok(())
 }
 
-async fn focus_automatic_tab(shared: &Shared, pane_id: PaneId) {
-    let mut state = shared.lock().await;
-    if let Ok(revision) = state.resources.focus_pane(pane_id) {
-        state.publish_resource_change(revision);
-    }
+fn watch_process_names(shared: Shared, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(500));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                }
+                _ = interval.tick() => refresh_process_names(&shared).await,
+            }
+        }
+    })
 }
 
 async fn refresh_process_names(shared: &Shared) {
-    let terminals = shared
-        .lock()
-        .await
-        .runtimes
-        .iter()
-        .map(|(id, entry)| (*id, Arc::clone(&entry.handle)))
-        .collect::<Vec<_>>();
-    for (terminal_id, terminal) in terminals {
-        let Ok(pid) = terminal.foreground_process_id().await else {
-            continue;
-        };
-        let Some(name) = process_name(pid).await else {
-            continue;
-        };
-        let mut state = shared.lock().await;
+    let terminals = {
+        let state = shared.lock().await;
+        state
+            .resources
+            .automatic_name_terminal_ids()
+            .into_iter()
+            .filter_map(|terminal_id| {
+                state
+                    .runtimes
+                    .get(&terminal_id)
+                    .map(|entry| (terminal_id, Arc::clone(&entry.handle)))
+            })
+            .collect::<Vec<_>>()
+    };
+    let names = futures_util::stream::iter(terminals)
+        .map(|(terminal_id, terminal)| async move {
+            timeout(Duration::from_millis(350), async {
+                let pid = terminal.foreground_process_id().await.ok()?;
+                process_name(pid).await.map(|name| (terminal_id, name))
+            })
+            .await
+            .ok()
+            .flatten()
+        })
+        .buffer_unordered(8)
+        .filter_map(std::future::ready)
+        .collect::<Vec<_>>()
+        .await;
+
+    let mut state = shared.lock().await;
+    for (terminal_id, name) in names {
         if let Ok(revision) = state.resources.update_process_name(terminal_id, name) {
             state.publish_resource_change(revision);
         }
@@ -1365,27 +1394,52 @@ async fn refresh_process_names(shared: &Shared) {
 }
 
 async fn process_name(pid: u32) -> Option<String> {
-    let output = timeout(
-        Duration::from_millis(250),
-        tokio::process::Command::new("/bin/ps")
-            .args(["-o", "comm=", "-p", &pid.to_string()])
-            .output(),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    if !output.status.success() {
-        return None;
+    #[cfg(target_os = "macos")]
+    {
+        let mut buffer = [0_u8; 1024];
+        // SAFETY: proc_name writes at most buffer.len() bytes to this valid buffer.
+        let length = unsafe {
+            libc::proc_name(
+                i32::try_from(pid).ok()?,
+                buffer.as_mut_ptr().cast(),
+                u32::try_from(buffer.len()).expect("process-name buffer length fits u32"),
+            )
+        };
+        let length = usize::try_from(length).ok()?;
+        (length > 0).then(|| String::from_utf8_lossy(&buffer[..length]).into_owned())
     }
-    let command = String::from_utf8_lossy(&output.stdout);
-    let command = command.trim();
-    (!command.is_empty()).then(|| {
-        Path::new(command)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(command)
-            .to_owned()
-    })
+    #[cfg(target_os = "linux")]
+    {
+        return tokio::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .await
+            .ok()
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty());
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let output = timeout(
+            Duration::from_millis(250),
+            tokio::process::Command::new("/bin/ps")
+                .args(["-o", "comm=", "-p", &pid.to_string()])
+                .output(),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let command = String::from_utf8_lossy(&output.stdout);
+        let command = command.trim();
+        (!command.is_empty()).then(|| {
+            Path::new(command)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(command)
+                .to_owned()
+        })
+    }
 }
 
 fn initial_path(resolved: &ResolvedLocation, name: String, terminal_id: TerminalId) -> InitialPath {
@@ -2177,7 +2231,6 @@ async fn handle_connection(
                             resource_revision,
                         } = selection
                         {
-                            focus_automatic_tab(&shared, selected.pane_id).await;
                             attachment.reconcile(
                                 panes,
                                 selected,
@@ -2207,11 +2260,6 @@ async fn handle_connection(
                                     continue;
                                 }
                                 attachment = candidate;
-                                focus_automatic_tab(
-                                    &shared,
-                                    attachment.focused.selected.pane_id,
-                                )
-                                .await;
                                 send(
                                     &mut connection,
                                     envelope.request_id,
@@ -3288,7 +3336,7 @@ async fn lease_view(
     client: ClientId,
     size: TerminalSize,
 ) -> Result<Attachment, DaemonError> {
-    let state = shared.lock().await;
+    let mut state = shared.lock().await;
     if !state.accepting {
         return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
     }
@@ -3343,9 +3391,10 @@ async fn lease_view(
         });
     }
     let layout = retain_observed_layout(layout, &panes)?;
+    let revision = state.resources.focus_pane(focused.pane_id)?;
+    state.publish_resource_change(revision);
     Ok(Attachment::new(
         client,
-        size,
         panes,
         focused_target,
         layout,
@@ -3401,7 +3450,7 @@ async fn focus_leased_attachment(
         .clear_active_copy_mode()
         .await
         .map_err(|error| DaemonError::new(command_error_code(&error), error.to_string()))?;
-    let state = shared.lock().await;
+    let mut state = shared.lock().await;
     if !state.accepting {
         return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
     }
@@ -3422,6 +3471,8 @@ async fn focus_leased_attachment(
     focused.selected = selected_target(path, &focused.terminal);
     let panes = observed_targets(&state, paths, focused.selected.terminal_id)?;
     let layout = retain_observed_layout(layout, &panes)?;
+    let revision = state.resources.focus_pane(path.pane_id)?;
+    state.publish_resource_change(revision);
     let selected = focused.selected.clone();
     attachment.focused = focused;
     attachment.reconcile(
@@ -5163,6 +5214,15 @@ async fn send_snapshot(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn process_names_are_read_without_control_characters() {
+        let name = process_name(std::process::id())
+            .await
+            .expect("current process has a name");
+        assert!(!name.is_empty());
+        assert!(!name.chars().any(char::is_control));
+    }
+
     #[test]
     fn snapshot_message_encodes_a_small_row_diff_as_a_delta() {
         use crate::domain::{Cell, Cursor, CursorShape, TerminalSize};
@@ -5636,7 +5696,6 @@ mod tests {
         let (_, resource_changes) = watch::channel(0);
         let attachment = Attachment::new(
             owner,
-            size,
             vec![ObservedTarget {
                 selected: selected.clone(),
                 terminal: Arc::clone(&terminal),

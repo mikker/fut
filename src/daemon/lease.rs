@@ -5,11 +5,17 @@ use std::{
 
 use crate::{
     domain::{ClientId, TerminalSize},
-    terminal::TerminalHandle,
+    terminal::{AttachmentGeometry, TerminalHandle},
 };
 
 #[derive(Clone, Default)]
-pub struct AttachmentLease(Arc<Mutex<HashMap<ClientId, TerminalSize>>>);
+pub struct AttachmentLease(Arc<Mutex<AttachmentState>>);
+
+#[derive(Default)]
+struct AttachmentState {
+    sizes: HashMap<ClientId, TerminalSize>,
+    revision: u64,
+}
 
 impl AttachmentLease {
     pub fn acquire(
@@ -18,10 +24,11 @@ impl AttachmentLease {
         size: TerminalSize,
         terminal: Arc<TerminalHandle>,
     ) -> Option<LeaseGuard> {
-        let mut attachments = self.0.lock().ok()?;
-        if attachments.insert(client, size).is_some() {
+        let mut state = self.0.lock().ok()?;
+        if state.sizes.contains_key(&client) {
             return None;
         }
+        state.sizes.insert(client, size);
         Some(LeaseGuard {
             lease: self.clone(),
             client,
@@ -31,7 +38,7 @@ impl AttachmentLease {
 
     #[cfg(test)]
     fn sizes(&self) -> Vec<TerminalSize> {
-        self.0.lock().unwrap().values().copied().collect()
+        self.0.lock().unwrap().sizes.values().copied().collect()
     }
 }
 
@@ -43,39 +50,49 @@ pub struct LeaseGuard {
 
 impl LeaseGuard {
     pub fn has_peers(&self) -> bool {
-        self.lease
-            .0
-            .lock()
-            .is_ok_and(|attachments| attachments.len() > 1)
+        self.lease.0.lock().is_ok_and(|state| state.sizes.len() > 1)
     }
 
-    pub fn resize(&self, size: TerminalSize) -> Option<TerminalSize> {
-        let mut attachments = self.lease.0.lock().ok()?;
-        *attachments.get_mut(&self.client)? = size;
-        smallest(&attachments)
+    pub fn client_size(&self) -> Option<TerminalSize> {
+        self.lease.0.lock().ok()?.sizes.get(&self.client).copied()
+    }
+
+    pub fn resize(&self, size: TerminalSize) -> Option<AttachmentGeometry> {
+        let mut state = self.lease.0.lock().ok()?;
+        *state.sizes.get_mut(&self.client)? = size;
+        geometry(&mut state)
     }
 }
 
 impl Drop for LeaseGuard {
     fn drop(&mut self) {
-        let size = self.lease.0.lock().ok().and_then(|mut attachments| {
-            attachments.remove(&self.client)?;
-            smallest(&attachments)
+        let geometry = self.lease.0.lock().ok().and_then(|mut state| {
+            state.sizes.remove(&self.client)?;
+            geometry(&mut state)
         });
-        if let Some(size) = size {
-            self.terminal.resize_on_attachment_change(size);
+        if let Some(geometry) = geometry {
+            self.terminal.resize_on_attachment_change(geometry);
         }
     }
 }
 
-fn smallest(attachments: &HashMap<ClientId, TerminalSize>) -> Option<TerminalSize> {
-    attachments
+fn geometry(state: &mut AttachmentState) -> Option<AttachmentGeometry> {
+    let size = state
+        .sizes
         .values()
         .copied()
         .reduce(|smallest, size| TerminalSize {
             columns: smallest.columns.min(size.columns),
             rows: smallest.rows.min(size.rows),
-        })
+        })?;
+    state.revision = state
+        .revision
+        .checked_add(1)
+        .expect("attachment revision overflow");
+    Some(AttachmentGeometry {
+        revision: state.revision,
+        size,
+    })
 }
 
 #[cfg(test)]
@@ -88,15 +105,15 @@ mod tests {
         let first = ClientId::new();
         // Lease guards need a real terminal only when dropped; exercise the
         // pure size selection directly instead.
-        let mut attachments = HashMap::new();
-        attachments.insert(
+        let mut state = AttachmentState::default();
+        state.sizes.insert(
             first,
             TerminalSize {
                 columns: 120,
                 rows: 40,
             },
         );
-        attachments.insert(
+        state.sizes.insert(
             ClientId::new(),
             TerminalSize {
                 columns: 80,
@@ -104,7 +121,7 @@ mod tests {
             },
         );
         assert_eq!(
-            smallest(&attachments),
+            geometry(&mut state).map(|geometry| geometry.size),
             Some(TerminalSize {
                 columns: 80,
                 rows: 40

@@ -52,6 +52,12 @@ pub struct SpawnSpec {
     pub size: TerminalSize,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AttachmentGeometry {
+    pub revision: u64,
+    pub size: TerminalSize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TerminalEvent {
     TerminalExited { exit_code: Option<i32> },
@@ -166,15 +172,22 @@ impl TerminalHandle {
         self.send(RuntimeMessage::Resize(size))
     }
 
+    pub(crate) async fn resize_for_attachment(
+        &self,
+        geometry: AttachmentGeometry,
+    ) -> Result<(), CommandError> {
+        self.send(RuntimeMessage::AttachmentResize(geometry))
+    }
+
     /// Applies geometry selected while an attachment is being dropped. Drop
     /// cannot await the bounded runtime queue, so finish the update in the
     /// current Tokio runtime rather than leaving the surviving attachment at
     /// the departed client's size.
-    pub(crate) fn resize_on_attachment_change(&self, size: TerminalSize) {
+    pub(crate) fn resize_on_attachment_change(&self, geometry: AttachmentGeometry) {
         let terminal = self.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                let _ = terminal.resize(size).await;
+                let _ = terminal.resize_for_attachment(geometry).await;
             });
         }
     }
@@ -451,6 +464,7 @@ enum RuntimeMessage {
         completion: oneshot::Sender<Result<(), CommandError>>,
     },
     Resize(TerminalSize),
+    AttachmentResize(AttachmentGeometry),
     ForegroundProcessId {
         completion: oneshot::Sender<Result<u32, CommandError>>,
     },
@@ -690,6 +704,7 @@ fn run(
     // Bytes have been fed to the parser since the last published snapshot.
     let mut dirty = false;
     let mut last_snapshot = Instant::now();
+    let mut attachment_revision = 0;
     'runtime: loop {
         // Output has its own bounded queue, so PTY backpressure can never make
         // control commands Busy. Bound this drain to ensure output still moves.
@@ -744,6 +759,26 @@ fn run(
                     } else {
                         publish(
                             terminal.resize(size),
+                            publishers.snapshots,
+                            publishers.events,
+                        );
+                    }
+                }
+                RuntimeMessage::AttachmentResize(geometry) => {
+                    if geometry.revision < attachment_revision {
+                        continue;
+                    }
+                    attachment_revision = geometry.revision;
+                    if let Err(error) = geometry
+                        .size
+                        .validate()
+                        .map_err(Into::into)
+                        .and_then(|()| master.resize(pty_size(geometry.size)))
+                    {
+                        send_error(publishers.events, error);
+                    } else {
+                        publish(
+                            terminal.resize(geometry.size),
                             publishers.snapshots,
                             publishers.events,
                         );
@@ -1092,7 +1127,9 @@ fn serve_exited(
             RuntimeMessage::ForegroundProcessId { completion } => {
                 let _ = completion.send(Err(CommandError::Stopped));
             }
-            RuntimeMessage::Input(_) | RuntimeMessage::Resize(_) => {}
+            RuntimeMessage::Input(_)
+            | RuntimeMessage::Resize(_)
+            | RuntimeMessage::AttachmentResize(_) => {}
         }
     }
 }
@@ -1986,6 +2023,44 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(snapshots.borrow().cells.len(), 68);
+        handle.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_attachment_geometry_cannot_override_a_newer_resize() {
+        let handle = spawn_terminal(shell("sleep 2", HashMap::new())).unwrap();
+        let mut snapshots = handle.subscribe_snapshots();
+        let newest = TerminalSize {
+            columns: 37,
+            rows: 11,
+        };
+        handle
+            .resize_for_attachment(AttachmentGeometry {
+                revision: 2,
+                size: newest,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while snapshots.borrow().size != newest {
+                snapshots.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+
+        handle
+            .resize_for_attachment(AttachmentGeometry {
+                revision: 1,
+                size: TerminalSize {
+                    columns: 90,
+                    rows: 30,
+                },
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(snapshots.borrow().size, newest);
         handle.close().await.unwrap();
     }
 
