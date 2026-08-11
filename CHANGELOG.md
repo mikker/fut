@@ -3,6 +3,8 @@
 ## Unreleased
 
 - Fixed workspace Git branch and diff metadata remaining stale while the UI is idle.
+- Combined resource navigation and fuzzy search in the global navigator; `Ctrl-b f` and the `open_jump` binding have been removed.
+- Command search now uses fuzzy matching, and unnamed navigator tabs display positional names.
 
 ## 0.3
 
@@ -33,7 +35,6 @@
 - Added a render-performance harness: `mise run perf:bench` (microbenchmarks incl. a vtebench-style dense-cells workload), `mise run perf:e2e` (headless flood, styled, dense, and latency scenarios against a disposable daemon), and `FUT_PERF_LOG` client frame logging with `scripts/perf/report`. Findings live in `PERF.md`.
 - Tabs are now created unnamed and the tab bar shows each tab's name beside its number.
 - Restyled the workspace sidebar: wider rows, a bullet marker for the current workspace, underline-free selection, and a Git branch and diff summary under each workspace.
-- Added a jump dialog (`Ctrl-b f`): type to filter all sessions, workspaces, tabs, and panes, Enter switches.
 - Added `Ctrl-b ↑/↓` to cycle workspaces, digit keys in the workspace sidebar to pick one directly, and `h` there to toggle sidebar auto-hide.
 - Added the current workspace name to the tab bar's right side.
 - Added `fut tab list` and `fut pane list` for inspecting tabs, panes, and split layouts, with `--json` support.

@@ -4230,13 +4230,13 @@ async fn top_level_attach_is_navigator_only_until_selection_then_attaches_normal
         .await;
     harness.detach(&mut contender).await;
     drop(contender);
-    cancelled.send(b"q");
+    cancelled.send(b"\x1b");
     cancelled.wait_success().await;
     assert_eq!(harness.resources().await, before);
 
     let mut selected = spawn_attach();
     selected.wait_for("other-session").await;
-    selected.send(b"G\r");
+    selected.send(b"other\r");
     selected.wait_for("SECONDARY_READY").await;
     selected.send(b"\x02d");
     selected.wait_success().await;
@@ -9149,7 +9149,7 @@ async fn public_client_ctrl_b_c_creates_routes_and_navigates_back() {
     client.wait_for("CTRL_C_NEW_INPUT").await;
     client.send(b"\x02g");
     client.wait_for(" navigator").await;
-    client.send(b"gjjj\r");
+    client.send(b"tab 1 pane\x1b[A\r");
     client.wait_for_count("CTRL_C_A_READY", 2).await;
     client.send(b"a\n");
     client.wait_for("CTRL_C_A_INPUT").await;

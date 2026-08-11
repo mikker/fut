@@ -11,6 +11,7 @@ use super::{
         dialog_area, fill_row, muted_style, render_frame, render_list_scrollbar, row_style,
         title_style,
     },
+    fuzzy,
 };
 
 const MAX_QUERY_BYTES: usize = 512;
@@ -207,9 +208,8 @@ impl CommandBarState {
     }
 
     fn append(&mut self, character: char) {
-        let selected = self.selected_action();
         self.append_raw(character);
-        self.refilter(selected);
+        self.refilter(None);
     }
 
     fn append_raw(&mut self, character: char) {
@@ -219,32 +219,27 @@ impl CommandBarState {
     }
 
     fn remove_last_grapheme(&mut self) {
-        let selected = self.selected_action();
         if let Some((index, _)) = self.query.grapheme_indices(true).next_back() {
             self.query.truncate(index);
-            self.refilter(selected);
+            self.refilter(None);
         }
     }
 
     fn refilter(&mut self, preserve: Option<ClientAction>) {
-        let tokens = self
-            .query
-            .split_whitespace()
-            .map(str::to_lowercase)
-            .collect::<Vec<_>>();
-        self.filtered = COMMANDS
-            .iter()
-            .filter(|command| {
-                let haystack = format!(
+        let ranked = fuzzy::ranked(
+            &self.query,
+            COMMANDS.iter().map(|command| {
+                format!(
                     "{} {} {}",
                     command.title,
                     command.keywords,
                     self.bindings.label(command.action)
                 )
-                .to_lowercase();
-                tokens.iter().all(|token| haystack.contains(token))
-            })
-            .map(|command| command.action)
+            }),
+        );
+        self.filtered = ranked
+            .into_iter()
+            .map(|index| COMMANDS[index].action)
             .collect();
         self.selected = preserve
             .and_then(|action| {
@@ -420,7 +415,11 @@ mod tests {
         bar.paste("CYCLE   pane");
         assert_eq!(
             bar.filtered,
-            [ClientAction::FocusNextPane, ClientAction::FocusPreviousPane]
+            [
+                ClientAction::FocusNextPane,
+                ClientAction::FocusPreviousPane,
+                ClientAction::FocusNextWorkspace,
+            ]
         );
         bar.key(key(KeyCode::Char(' '), KeyModifiers::NONE));
         bar.paste("previous");

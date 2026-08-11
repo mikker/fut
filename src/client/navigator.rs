@@ -4,6 +4,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
 };
+use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
 
 use crate::{
@@ -16,10 +17,12 @@ use super::dialog::{
     dialog_area, fill_row, frame_inner, render_footer, render_frame, render_list_scrollbar,
     render_title,
 };
+use super::fuzzy;
 use super::notifications::{ActivityIndicator, NotificationState};
 
 const MAX_WIDTH: u16 = 80;
 const MAX_HEIGHT: u16 = 20;
+const MAX_QUERY_BYTES: usize = 512;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ResourceKey {
@@ -34,6 +37,7 @@ pub(super) struct NavigatorRow {
     pub key: ResourceKey,
     pub depth: u16,
     pub label: String,
+    pub search_path: String,
     pub current: bool,
     pub closing: bool,
     pub destination: Option<PaneId>,
@@ -51,6 +55,8 @@ pub(super) enum NavigatorStatus {
 
 pub(super) struct NavigatorState {
     pub rows: Vec<NavigatorRow>,
+    filtered: Vec<usize>,
+    query: String,
     pub selected: usize,
     pub scroll: usize,
     pub status: NavigatorStatus,
@@ -72,6 +78,8 @@ impl NavigatorState {
     pub fn open_global() -> Self {
         Self {
             rows: Vec::new(),
+            filtered: Vec::new(),
+            query: String::new(),
             selected: 0,
             scroll: 0,
             status: NavigatorStatus::Loading,
@@ -118,6 +126,7 @@ impl NavigatorState {
         let old_index = self.selected;
         let previous_status = self.status.clone();
         self.rows = flatten_optional(snapshot, current, notifications);
+        self.refilter(old_key);
         self.resource_revision = Some(snapshot.revision);
         self.status = match previous_status {
             status @ (NavigatorStatus::Switching | NavigatorStatus::Error { .. }) => status,
@@ -136,6 +145,7 @@ impl NavigatorState {
         {
             self.selected = index;
         }
+        self.ensure_selected_match();
         true
     }
 
@@ -149,10 +159,10 @@ impl NavigatorState {
         if matches!(self.status, NavigatorStatus::Switching) {
             return NavigatorAction::Stay;
         }
-        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+        if matches!(key.code, KeyCode::Esc) {
             return NavigatorAction::Close;
         }
-        let last = self.rows.len().saturating_sub(1);
+        let last = self.filtered.len().saturating_sub(1);
         let page = visible_rows.max(1);
         match (key.code, key.modifiers) {
             (KeyCode::Up, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
@@ -161,30 +171,36 @@ impl NavigatorState {
             (KeyCode::Down, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
                 self.jump_forward(1)
             }
-            (KeyCode::Up | KeyCode::Char('k'), _) => {
-                self.selected = self.selected.saturating_sub(1)
+            (KeyCode::Char('k'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_selection(-1)
             }
-            (KeyCode::Down | KeyCode::Char('j'), _) => {
-                self.selected = (self.selected + 1).min(last)
+            (KeyCode::Char('j'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_selection(1)
             }
-            (KeyCode::Home | KeyCode::Char('g'), _) => self.selected = 0,
-            (KeyCode::End | KeyCode::Char('G'), _) => self.selected = last,
-            (KeyCode::PageUp, _) => self.selected = self.selected.saturating_sub(page),
+            (KeyCode::Up, _) => self.move_selection(-1),
+            (KeyCode::Down, _) => self.move_selection(1),
+            (KeyCode::Home, _) => self.select_filtered(0),
+            (KeyCode::End, _) => self.select_filtered(last),
+            (KeyCode::PageUp, _) => self.move_selection(-(page as isize)),
             (KeyCode::Char('u'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.selected = self.selected.saturating_sub(page)
+                self.move_selection(-(page as isize))
             }
-            (KeyCode::PageDown, _) => self.selected = (self.selected + page).min(last),
+            (KeyCode::PageDown, _) => self.move_selection(page as isize),
             (KeyCode::Char('d'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.selected = (self.selected + page).min(last)
+                self.move_selection(page as isize)
             }
-            (KeyCode::Char('s'), _) => self.cycle_depth(0),
-            (KeyCode::Char('w'), _) => self.cycle_depth(1),
-            (KeyCode::Char('t'), _) => self.cycle_depth(2),
-            (KeyCode::Char('p'), _) => self.cycle_depth(3),
-            (KeyCode::Char('K'), _) => self.jump_back(1),
-            (KeyCode::Char('J'), _) => self.jump_forward(1),
-            (KeyCode::Char('['), _) => self.jump_back(2),
-            (KeyCode::Char(']'), _) => self.jump_forward(2),
+            (KeyCode::Char('s'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cycle_depth(0)
+            }
+            (KeyCode::Char('w'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cycle_depth(1)
+            }
+            (KeyCode::Char('t'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cycle_depth(2)
+            }
+            (KeyCode::Char('p'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cycle_depth(3)
+            }
             (KeyCode::Left, _) => self.select_parent(),
             (KeyCode::Right, _) => self.select_first_child(),
             (KeyCode::Enter, _)
@@ -200,10 +216,91 @@ impl NavigatorState {
                     return NavigatorAction::Select(TargetSelector::Pane(pane));
                 }
             }
+            (KeyCode::Backspace | KeyCode::Delete, _) => self.remove_last_grapheme(),
+            (KeyCode::Char(character), modifiers)
+                if !character.is_control()
+                    && !modifiers.intersects(
+                        KeyModifiers::CONTROL
+                            | KeyModifiers::ALT
+                            | KeyModifiers::SUPER
+                            | KeyModifiers::HYPER
+                            | KeyModifiers::META,
+                    ) =>
+            {
+                self.append(character)
+            }
             _ => {}
         }
         self.keep_visible(visible_rows);
         NavigatorAction::Stay
+    }
+
+    pub fn paste(&mut self, value: &str) {
+        for character in value.chars().filter(|character| !character.is_control()) {
+            if self.query.len() + character.len_utf8() > MAX_QUERY_BYTES {
+                break;
+            }
+            self.query.push(character);
+        }
+        self.refilter(self.selected_key());
+        self.ensure_selected_match();
+    }
+
+    fn append(&mut self, character: char) {
+        if self.query.len() + character.len_utf8() <= MAX_QUERY_BYTES {
+            let selected = self.selected_key();
+            self.query.push(character);
+            self.refilter(selected);
+            self.ensure_selected_match();
+        }
+    }
+
+    fn remove_last_grapheme(&mut self) {
+        if let Some((index, _)) = self.query.grapheme_indices(true).next_back() {
+            let selected = self.selected_key();
+            self.query.truncate(index);
+            self.refilter(selected);
+            self.ensure_selected_match();
+        }
+    }
+
+    fn refilter(&mut self, _preserve: Option<ResourceKey>) {
+        self.filtered = fuzzy::ranked(
+            &self.query,
+            self.rows.iter().map(|row| row.search_path.clone()),
+        );
+        self.scroll = 0;
+    }
+
+    fn selected_key(&self) -> Option<ResourceKey> {
+        self.rows.get(self.selected).map(|row| row.key)
+    }
+
+    fn ensure_selected_match(&mut self) {
+        if !self.filtered.contains(&self.selected) {
+            self.selected = self.filtered.first().copied().unwrap_or(0);
+        }
+    }
+
+    fn selected_filtered_position(&self) -> usize {
+        self.filtered
+            .iter()
+            .position(|index| *index == self.selected)
+            .unwrap_or(0)
+    }
+
+    fn select_filtered(&mut self, position: usize) {
+        if let Some(index) = self.filtered.get(position) {
+            self.selected = *index;
+        }
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        let position = self
+            .selected_filtered_position()
+            .saturating_add_signed(delta)
+            .min(self.filtered.len().saturating_sub(1));
+        self.select_filtered(position);
     }
 
     pub fn begin_switch(&mut self, request: Uuid) {
@@ -320,11 +417,12 @@ impl NavigatorState {
 
     fn keep_visible(&mut self, height: usize) {
         let height = height.max(1);
-        if self.selected < self.scroll {
-            self.scroll = self.selected;
+        let selected = self.selected_filtered_position();
+        if selected < self.scroll {
+            self.scroll = selected;
         }
-        if self.selected >= self.scroll + height {
-            self.scroll = self.selected + 1 - height;
+        if selected >= self.scroll + height {
+            self.scroll = selected + 1 - height;
         }
     }
 
@@ -335,7 +433,7 @@ impl NavigatorState {
         }
         let (header, footer) = chrome_rows(area.height);
         if header == 1 {
-            render_title(area, " navigator", buffer);
+            render_title(area, &format!(" navigator › {}", self.query), buffer);
         }
         if footer == 1 {
             let footer = match &self.status {
@@ -346,8 +444,9 @@ impl NavigatorState {
                     format!("Error: {message}  enter retry  esc cancel")
                 }
                 NavigatorStatus::Ready => match self.rows.get(self.selected) {
-                    Some(row) if row.closing => "Closing…  ↑↓/jk move  esc cancel".to_owned(),
-                    _ => "↑↓/jk move  s/w/t/p cycle  ←→ tree  enter switch  esc cancel".to_owned(),
+                    Some(row) if row.closing => "Closing…  ↑↓/C-jk move  esc cancel".to_owned(),
+                    _ => "type search  ↑↓/C-jk move  C-s/w/t/p cycle  enter switch  esc close"
+                        .to_owned(),
                 },
             };
             render_footer(area, &format!(" {footer}"), buffer);
@@ -381,42 +480,54 @@ impl NavigatorState {
                 Style::default(),
             ),
             NavigatorStatus::Ready | NavigatorStatus::Switching | NavigatorStatus::Error { .. } => {
-                for (line, (index, row)) in self
-                    .rows
-                    .iter()
-                    .enumerate()
-                    .skip(self.scroll)
-                    .take(body_height)
-                    .enumerate()
-                {
-                    let marker = if row.closing {
-                        "×"
-                    } else if let Some(activity) = row.activity {
-                        activity.marker(spinner_frame)
-                    } else if row.current && matches!(row.key, ResourceKey::Pane(_)) {
-                        "•"
-                    } else {
-                        " "
-                    };
-                    let text = format!(
-                        "{}{} {}",
-                        "  ".repeat(usize::from(row.depth)),
-                        marker,
-                        row.label
+                if self.filtered.is_empty() {
+                    put(
+                        buffer,
+                        area.x,
+                        body_y,
+                        area.width,
+                        "No matching resources",
+                        Style::default(),
                     );
-                    let mut style = Style::default();
-                    if row.closing {
-                        style = style.add_modifier(Modifier::DIM);
+                } else {
+                    for (line, index) in self
+                        .filtered
+                        .iter()
+                        .skip(self.scroll)
+                        .take(body_height)
+                        .enumerate()
+                    {
+                        let index = *index;
+                        let row = &self.rows[index];
+                        let marker = if row.closing {
+                            "×"
+                        } else if let Some(activity) = row.activity {
+                            activity.marker(spinner_frame)
+                        } else if row.current && matches!(row.key, ResourceKey::Pane(_)) {
+                            "•"
+                        } else {
+                            " "
+                        };
+                        let text = format!(
+                            "{}{} {}",
+                            "  ".repeat(usize::from(row.depth)),
+                            marker,
+                            row.label
+                        );
+                        let mut style = Style::default();
+                        if row.closing {
+                            style = style.add_modifier(Modifier::DIM);
+                        }
+                        if row.current && !matches!(row.key, ResourceKey::Pane(_)) {
+                            style = style.add_modifier(Modifier::BOLD);
+                        }
+                        if index == self.selected {
+                            style = style.add_modifier(Modifier::REVERSED);
+                        }
+                        let y = body_y + line as u16;
+                        fill_row(Rect::new(area.x, y, area.width, 1), style, buffer);
+                        put(buffer, area.x, y, area.width, &text, style);
                     }
-                    if row.current && !matches!(row.key, ResourceKey::Pane(_)) {
-                        style = style.add_modifier(Modifier::BOLD);
-                    }
-                    if index == self.selected {
-                        style = style.add_modifier(Modifier::REVERSED);
-                    }
-                    let y = body_y + line as u16;
-                    fill_row(Rect::new(area.x, y, area.width, 1), style, buffer);
-                    put(buffer, area.x, y, area.width, &text, style);
                 }
                 let body = Rect::new(
                     area.x,
@@ -424,7 +535,7 @@ impl NavigatorState {
                     area.width,
                     u16::try_from(body_height).expect("body height fits u16"),
                 );
-                render_list_scrollbar(self.scroll, self.rows.len(), body, buffer);
+                render_list_scrollbar(self.scroll, self.filtered.len(), body, buffer);
             }
         }
     }
@@ -496,6 +607,7 @@ fn flatten_optional(
 
     let mut rows = Vec::new();
     for session in &snapshot.sessions {
+        let session_path = session.name.clone();
         let session_current = Some(session.id) == current_session_id;
         let session_target = if session_current
             && current_pane_id.is_some_and(|pane| pane_available_session(session, pane, false))
@@ -508,6 +620,7 @@ fn flatten_optional(
             key: ResourceKey::Session(session.id),
             depth: 0,
             label: session.name.clone(),
+            search_path: session_path.clone(),
             current: session_current,
             closing: session.closing,
             destination: (!session.closing).then_some(session_target).flatten(),
@@ -522,6 +635,7 @@ fn flatten_optional(
             ),
         });
         for workspace in &session.workspaces {
+            let workspace_path = format!("{session_path} › {}", workspace.name);
             let closing = session.closing || workspace.closing;
             let workspace_current = session_current && Some(workspace.id) == current_workspace_id;
             let target = if workspace_current
@@ -536,6 +650,7 @@ fn flatten_optional(
                 key: ResourceKey::Workspace(workspace.id),
                 depth: 1,
                 label: workspace.name.clone(),
+                search_path: workspace_path.clone(),
                 current: workspace_current,
                 closing,
                 destination: (!closing).then_some(target).flatten(),
@@ -548,7 +663,13 @@ fn flatten_optional(
                         .collect::<Vec<_>>(),
                 ),
             });
-            for tab in &workspace.tabs {
+            for (tab_index, tab) in workspace.tabs.iter().enumerate() {
+                let tab_label = if tab.name.is_empty() {
+                    format!("tab {}", tab_index + 1)
+                } else {
+                    tab.name.clone()
+                };
+                let tab_path = format!("{workspace_path} › {tab_label}");
                 let tab_current = workspace_current && Some(tab.id) == current_tab_id;
                 let tab_closing = closing || tab.closing;
                 let target = if tab_current
@@ -568,7 +689,8 @@ fn flatten_optional(
                 rows.push(NavigatorRow {
                     key: ResourceKey::Tab(tab.id),
                     depth: 2,
-                    label: tab.name.clone(),
+                    label: tab_label,
+                    search_path: tab_path.clone(),
                     current: tab_current,
                     closing: tab_closing,
                     destination: (!tab_closing).then_some(target).flatten(),
@@ -580,6 +702,7 @@ fn flatten_optional(
                         key: ResourceKey::Pane(pane.id),
                         depth: 3,
                         label: format!("pane {}", index + 1),
+                        search_path: format!("{tab_path} › pane {}", index + 1),
                         current: Some(pane.id) == current_pane_id,
                         closing: pane_closing,
                         destination: (!pane_closing).then_some(pane.id),
@@ -861,6 +984,42 @@ mod tests {
     }
 
     #[test]
+    fn fuzzy_search_matches_hidden_paths_keeps_rows_and_names_unnamed_tabs() {
+        let (mut snapshot, current, _) = fixture();
+        snapshot.sessions[0].workspaces[0].tabs[0].name.clear();
+        let mut nav = NavigatorState::open(&current);
+        nav.accept_resources(&snapshot, &current);
+
+        assert_eq!(
+            nav.rows
+                .iter()
+                .find(|row| matches!(row.key, ResourceKey::Tab(_)))
+                .unwrap()
+                .label,
+            "tab 1"
+        );
+        nav.paste("sesn pane 1");
+        assert!(!nav.filtered.is_empty());
+        assert!(nav.filtered.iter().all(|index| nav.rows[*index].depth == 3));
+        assert!(
+            nav.filtered
+                .iter()
+                .all(|index| nav.rows[*index].search_path.contains("sessión"))
+        );
+        assert!(
+            nav.rows.len() > nav.filtered.len(),
+            "filtering preserves the live tree model"
+        );
+
+        nav.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), 10);
+        assert!(nav.query.ends_with('q'), "plain q is search text");
+        assert!(matches!(
+            nav.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), 10),
+            NavigatorAction::Close
+        ));
+    }
+
+    #[test]
     fn only_matching_request_ids_complete_pending_switches() {
         let (snapshot, current, _) = fixture();
         let mut nav = NavigatorState::open(&current);
@@ -969,6 +1128,7 @@ mod tests {
             key: ResourceKey::Pane(PaneId::new()),
             depth,
             label: String::new(),
+            search_path: String::new(),
             current: false,
             closing: false,
             destination: None,
@@ -979,6 +1139,7 @@ mod tests {
             .into_iter()
             .map(row)
             .collect();
+        nav.filtered = (0..nav.rows.len()).collect();
         nav.status = NavigatorStatus::Ready;
         nav
     }
@@ -987,57 +1148,54 @@ mod tests {
         nav.key(KeyEvent::new(code, KeyModifiers::NONE), 10);
     }
 
+    fn press_ctrl(nav: &mut NavigatorState, character: char) {
+        nav.key(
+            KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL),
+            10,
+        );
+    }
+
     #[test]
     fn kind_keys_cycle_within_the_enclosing_scope_and_descend_from_above() {
         let mut nav = tree();
         // From P1 (3): panes wrap within T1, tabs and workspaces and sessions
         // cycle within their own parents.
         nav.selected = 3;
-        press(&mut nav, KeyCode::Char('p'));
+        press_ctrl(&mut nav, 'p');
         assert_eq!(nav.selected, 4);
-        press(&mut nav, KeyCode::Char('p'));
+        press_ctrl(&mut nav, 'p');
         assert_eq!(nav.selected, 3, "pane cycle wraps inside T1");
-        press(&mut nav, KeyCode::Char('t'));
+        press_ctrl(&mut nav, 't');
         assert_eq!(nav.selected, 5, "next tab in W1");
-        press(&mut nav, KeyCode::Char('t'));
+        press_ctrl(&mut nav, 't');
         assert_eq!(nav.selected, 2, "tab cycle wraps inside W1");
-        press(&mut nav, KeyCode::Char('w'));
+        press_ctrl(&mut nav, 'w');
         assert_eq!(nav.selected, 7, "next workspace in S1");
-        press(&mut nav, KeyCode::Char('w'));
+        press_ctrl(&mut nav, 'w');
         assert_eq!(nav.selected, 1, "workspace cycle wraps inside S1");
-        press(&mut nav, KeyCode::Char('s'));
+        press_ctrl(&mut nav, 's');
         assert_eq!(nav.selected, 10);
-        press(&mut nav, KeyCode::Char('s'));
+        press_ctrl(&mut nav, 's');
         assert_eq!(nav.selected, 0, "session cycle wraps globally");
         // From a session, kind keys descend into its subtree.
-        press(&mut nav, KeyCode::Char('p'));
+        press_ctrl(&mut nav, 'p');
         assert_eq!(nav.selected, 3, "first pane inside S1");
     }
 
     #[test]
-    fn workspace_and_tab_jumps_cross_scopes_without_wrapping() {
+    fn shift_arrows_jump_workspaces_without_wrapping() {
         let mut nav = tree();
         nav.selected = 0;
-        press(&mut nav, KeyCode::Char('J'));
+        nav.key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT), 10);
         assert_eq!(nav.selected, 1);
-        press(&mut nav, KeyCode::Char('J'));
+        nav.key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT), 10);
         assert_eq!(nav.selected, 7);
-        press(&mut nav, KeyCode::Char('J'));
+        nav.key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT), 10);
         assert_eq!(nav.selected, 11, "workspace jump crosses into S2");
-        press(&mut nav, KeyCode::Char('J'));
-        assert_eq!(nav.selected, 11, "no wrap at the end");
-        press(&mut nav, KeyCode::Char('K'));
-        assert_eq!(nav.selected, 7);
-        // Shift+arrows mirror J/K.
         nav.key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT), 10);
         assert_eq!(nav.selected, 11);
         nav.key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT), 10);
         assert_eq!(nav.selected, 7);
-        nav.selected = 5;
-        press(&mut nav, KeyCode::Char(']'));
-        assert_eq!(nav.selected, 8, "tab jump crosses into W2");
-        press(&mut nav, KeyCode::Char('['));
-        assert_eq!(nav.selected, 5);
     }
 
     #[test]

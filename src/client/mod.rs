@@ -7,9 +7,9 @@ mod command_bar;
 pub(crate) mod config;
 mod copy_mode;
 mod dialog;
+mod fuzzy;
 mod git;
 pub(crate) mod input;
-mod jump;
 mod layout;
 mod navigation;
 mod navigator;
@@ -48,7 +48,6 @@ use crossterm::{
 use futures_util::{SinkExt, StreamExt};
 use git::GitStatusCache;
 use input::{PrefixAction, PrefixState, encode_key};
-use jump::{JumpAction, JumpState};
 use layout::{
     PaneLayout, SplitDivider, authored_layout, authored_navigation_layout, directional_neighbor,
     navigation_pane_layouts, pane_layouts,
@@ -94,7 +93,6 @@ use crate::{
 
 enum ClientSurface {
     Navigator(NavigatorState),
-    Jump(JumpState),
     Notifications(NotificationsDialog),
     WorkspaceSidebar(WorkspaceSidebarState),
     TabBar(TabBarState),
@@ -1012,44 +1010,9 @@ async fn run(
                             }
                         }
                     }
-                    Event::Key(key) if matches!(surface.as_ref(), Some(ClientSurface::Jump(_))) => {
-                        notice = None;
-                        let action = match surface.as_mut().expect("jump exists") {
-                            ClientSurface::Jump(jump) => jump.key(key),
-                            _ => unreachable!("surface guard ensures jump"),
-                        };
-                        match action {
-                            JumpAction::Stay => force_draw = true,
-                            JumpAction::Close => {
-                                surface = None;
-                                view.invalidate_drawn();
-                                force_draw = true;
-                            }
-                            JumpAction::Select(pane_id) => {
-                                release_captured_mouse_input(
-                                    framed,
-                                    &mut mouse_input,
-                                    view.focused().terminal_id,
-                                ).await?;
-                                surface = None;
-                                view.invalidate_drawn();
-                                if let Some(request) = focus.begin(FocusOrigin::Pane) {
-                                    send_request(
-                                        framed,
-                                        Some(request),
-                                        ClientMessage::SelectTarget {
-                                            selector: TargetSelector::Pane(pane_id),
-                                            expected: None,
-                                        },
-                                    ).await?;
-                                }
-                                force_draw = true;
-                            }
-                        }
-                    }
-                    Event::Paste(text) if matches!(surface.as_ref(), Some(ClientSurface::Jump(_))) => {
-                        if let Some(ClientSurface::Jump(jump)) = surface.as_mut() {
-                            jump.paste(&text);
+                    Event::Paste(text) if matches!(surface.as_ref(), Some(ClientSurface::Navigator(_))) => {
+                        if let Some(ClientSurface::Navigator(navigator)) = surface.as_mut() {
+                            navigator.paste(&text);
                             force_draw = true;
                         }
                     }
@@ -1586,9 +1549,6 @@ async fn run(
                             Some(ClientSurface::CommandBar(command_bar)) => {
                                 command_bar.render(layout.terminal, frame.buffer_mut());
                             }
-                            Some(ClientSurface::Jump(jump)) => {
-                                jump.render(layout.terminal, frame.buffer_mut());
-                            }
                             Some(ClientSurface::WorkspaceSidebar(_))
                             | Some(ClientSurface::TabBar(_))
                             | None => {}
@@ -1657,9 +1617,6 @@ fn refresh_surface_resources(
         }
         Some(ClientSurface::Notifications(dialog)) => {
             dialog.accept_resources(snapshot, notifications);
-        }
-        Some(ClientSurface::Jump(jump)) => {
-            jump.accept_resources(snapshot, focused);
         }
         Some(ClientSurface::CommandBar(_)) | None => {}
     }
@@ -2275,15 +2232,6 @@ async fn dispatch_client_action(
                 );
             }
             *surface = Some(ClientSurface::Navigator(navigator));
-        }
-        ClientAction::OpenJump => {
-            let Some(snapshot) = resources.snapshot() else {
-                return Ok(Some("resources are still loading".into()));
-            };
-            *surface = Some(ClientSurface::Jump(JumpState::open(
-                snapshot,
-                view.focused(),
-            )));
         }
         ClientAction::OpenWorkspaceSidebar => {
             let Some(snapshot) = resources.snapshot() else {

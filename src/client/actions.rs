@@ -62,7 +62,6 @@ pub(super) enum ClientAction {
     ReloadConfig,
     EnterCopyMode,
     OpenNavigator,
-    OpenJump,
     OpenWorkspaceSidebar,
     OpenTabBar,
     OpenNotifications,
@@ -96,12 +95,11 @@ pub(super) struct DirectBinding {
     pub action: ClientAction,
 }
 
-pub(super) const ALL_ACTIONS: [ClientAction; 38] = [
+pub(super) const ALL_ACTIONS: [ClientAction; 37] = [
     ClientAction::OpenCommandBar,
     ClientAction::ReloadConfig,
     ClientAction::EnterCopyMode,
     ClientAction::OpenNavigator,
-    ClientAction::OpenJump,
     ClientAction::OpenWorkspaceSidebar,
     ClientAction::OpenTabBar,
     ClientAction::OpenNotifications,
@@ -137,7 +135,7 @@ pub(super) const ALL_ACTIONS: [ClientAction; 38] = [
     ClientAction::Detach,
 ];
 
-pub(super) const COMMANDS: [ActionDefinition; 37] = [
+pub(super) const COMMANDS: [ActionDefinition; 36] = [
     ActionDefinition {
         action: ClientAction::ReloadConfig,
         title: "Reload configuration",
@@ -147,11 +145,6 @@ pub(super) const COMMANDS: [ActionDefinition; 37] = [
         action: ClientAction::OpenNavigator,
         title: "Open global navigator",
         keywords: "global resources sessions tabs panes switch go",
-    },
-    ActionDefinition {
-        action: ClientAction::OpenJump,
-        title: "Jump to resource",
-        keywords: "jump find filter search fuzzy quick switcher sessions workspaces tabs panes",
     },
     ActionDefinition {
         action: ClientAction::OpenWorkspaceSidebar,
@@ -328,7 +321,7 @@ pub(super) const COMMANDS: [ActionDefinition; 37] = [
 const UP: &[u8] = b"\x1b[A";
 const DOWN: &[u8] = b"\x1b[B";
 
-pub(super) const DIRECT_BINDINGS: [DirectBinding; 38] = [
+pub(super) const DIRECT_BINDINGS: [DirectBinding; 37] = [
     DirectBinding {
         suffix: b" ",
         action: ClientAction::OpenCommandBar,
@@ -344,10 +337,6 @@ pub(super) const DIRECT_BINDINGS: [DirectBinding; 38] = [
     DirectBinding {
         suffix: b"g",
         action: ClientAction::OpenNavigator,
-    },
-    DirectBinding {
-        suffix: b"f",
-        action: ClientAction::OpenJump,
     },
     DirectBinding {
         suffix: b"w",
@@ -495,7 +484,6 @@ pub(super) fn config_key(action: ClientAction) -> &'static str {
         ClientAction::ReloadConfig => "reload_config",
         ClientAction::EnterCopyMode => "enter_copy_mode",
         ClientAction::OpenNavigator => "open_navigator",
-        ClientAction::OpenJump => "open_jump",
         ClientAction::OpenWorkspaceSidebar => "open_workspace_sidebar",
         ClientAction::OpenTabBar => "open_tab_bar",
         ClientAction::OpenNotifications => "open_notifications",
@@ -578,7 +566,6 @@ const fn requires_launcher(action: ClientAction) -> bool {
         ClientAction::ReloadConfig
         | ClientAction::EnterCopyMode
         | ClientAction::OpenNavigator
-        | ClientAction::OpenJump
         | ClientAction::OpenWorkspaceSidebar
         | ClientAction::OpenTabBar
         | ClientAction::OpenNotifications
