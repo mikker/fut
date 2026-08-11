@@ -567,7 +567,7 @@ struct PaneMove {
 struct LeasedTarget {
     selected: SelectedTarget,
     terminal: Arc<TerminalHandle>,
-    _lease: lease::LeaseGuard,
+    lease: lease::LeaseGuard,
 }
 
 struct ObservedTarget {
@@ -597,6 +597,7 @@ enum AttachmentUpdate {
 
 struct Attachment {
     owner: ClientId,
+    size: TerminalSize,
     panes: Vec<ObservedTarget>,
     focused: LeasedTarget,
     layout: SplitTree,
@@ -623,6 +624,7 @@ struct FocusedViewportState {
 impl Attachment {
     fn new(
         owner: ClientId,
+        size: TerminalSize,
         panes: Vec<ObservedTarget>,
         focused: LeasedTarget,
         layout: SplitTree,
@@ -633,6 +635,7 @@ impl Attachment {
         let (update_sender, updates) = mpsc::channel(ATTACHMENT_UPDATE_CAPACITY);
         let mut attachment = Self {
             owner,
+            size,
             panes,
             focused,
             layout,
@@ -667,6 +670,26 @@ impl Attachment {
 
     fn focused_terminal(&self) -> &Arc<TerminalHandle> {
         &self.focused.terminal
+    }
+
+    async fn resize_focused(&mut self, size: TerminalSize) -> Result<(), CommandError> {
+        self.size = size;
+        let size = self
+            .focused
+            .lease
+            .resize(size)
+            .ok_or(CommandError::Stopped)?;
+        self.viewport_offsets
+            .remove(&self.focused.selected.terminal_id);
+        self.focused.terminal.resize(size).await
+    }
+
+    fn size(&self) -> TerminalSize {
+        self.size
+    }
+
+    fn shares_focused_terminal(&self) -> bool {
+        self.focused.lease.has_peers()
     }
 
     fn focused_viewport_state(&self) -> FocusedViewportState {
@@ -1840,7 +1863,7 @@ async fn handle_connection(
                 .await?;
                 return Ok(());
             }
-            let attachment = match lease_view(&shared, selector, None, client).await {
+            let mut attachment = match lease_view(&shared, selector, None, client, size).await {
                 Ok(attachment) => attachment,
                 Err(error) => {
                     send_error(
@@ -1861,6 +1884,12 @@ async fn handle_connection(
                     &error.message,
                 )
                 .await?;
+                return Ok(());
+            }
+            if attachment.shares_focused_terminal()
+                && let Err(error) = attachment.resize_focused(size).await
+            {
+                send_command_error(&mut connection, first.request_id, error).await?;
                 return Ok(());
             }
             (Some(attachment), Some(size))
@@ -2084,12 +2113,11 @@ async fn handle_connection(
                         if let Err(error) = size.validate() {
                             send_error(&mut connection, envelope.request_id, "invalid_size", &error.to_string()).await?;
                         } else if terminal_id == attachment.focused.selected.terminal_id {
-                            attachment.viewport_offsets.remove(&terminal_id);
-                            command_response(
+                                command_response(
                                 &mut connection,
                                 envelope.request_id,
                                 AcknowledgedCommand::Resize,
-                                attachment.focused_terminal().resize(size).await,
+                                attachment.resize_focused(size).await,
                                 UiEventPolicy::Disposable,
                             ).await?;
                         // An old focused pane can leave one resize queued while exit
@@ -2164,7 +2192,15 @@ async fn handle_connection(
                             ).await?;
                             continue;
                         }
-                        match switch_candidate(&shared, selector, expected.as_ref(), client).await {
+                        match switch_candidate(
+                            &shared,
+                            selector,
+                            expected.as_ref(),
+                            client,
+                            attachment.size(),
+                        )
+                        .await
+                        {
                             Ok(candidate) => {
                                 if let Err(error) = attachment.close().await {
                                     send_command_error(&mut connection, envelope.request_id, error).await?;
@@ -2487,6 +2523,7 @@ async fn handle_connection(
                                 Some(TargetSelector::Terminal(terminal_id)),
                                 None,
                                 client,
+                                attachment.size(),
                             ).await
                                 && candidate.all_running().is_ok()
                             {
@@ -3249,6 +3286,7 @@ async fn lease_view(
     selector: Option<TargetSelector>,
     expected: Option<&SelectionExpectation>,
     client: ClientId,
+    size: TerminalSize,
 ) -> Result<Attachment, DaemonError> {
     let state = shared.lock().await;
     if !state.accepting {
@@ -3276,16 +3314,14 @@ async fn lease_view(
             format!("terminal already exited with status {exit_code:?}"),
         ));
     }
-    let guard = focused_runtime.lease.acquire(client).ok_or_else(|| {
-        DaemonError::new(
-            "already_attached",
-            "another interactive client holds this terminal's attachment lease",
-        )
-    })?;
+    let guard = focused_runtime
+        .lease
+        .acquire(client, size, Arc::clone(&focused_runtime.handle))
+        .ok_or_else(|| DaemonError::new("attachment_error", "client already attached"))?;
     let focused_target = LeasedTarget {
         selected: selected_target(focused, &focused_runtime.handle),
         terminal: Arc::clone(&focused_runtime.handle),
-        _lease: guard,
+        lease: guard,
     };
     let mut panes = Vec::with_capacity(paths.len());
     for path in paths {
@@ -3309,6 +3345,7 @@ async fn lease_view(
     let layout = retain_observed_layout(layout, &panes)?;
     Ok(Attachment::new(
         client,
+        size,
         panes,
         focused_target,
         layout,
@@ -3572,8 +3609,9 @@ async fn switch_candidate(
     selector: TargetSelector,
     expected: Option<&SelectionExpectation>,
     client: ClientId,
+    size: TerminalSize,
 ) -> Result<Attachment, DaemonError> {
-    let attachment = lease_view(shared, Some(selector), expected, client).await?;
+    let attachment = lease_view(shared, Some(selector), expected, client, size).await?;
     attachment.all_running()?;
     Ok(attachment)
 }
@@ -3952,12 +3990,12 @@ async fn create_workspace(
                         .expect("new runtime inserted");
                     let guard = runtime
                         .lease
-                        .acquire(client)
+                        .acquire(client, size, Arc::clone(&terminal))
                         .expect("new terminal has an independent lease");
                     CreatedTerminal::Attached(LeasedTarget {
                         selected,
                         terminal: Arc::clone(&terminal),
-                        _lease: guard,
+                        lease: guard,
                     })
                 }
             }),
@@ -4072,12 +4110,12 @@ async fn create_tab(
                         .expect("new runtime inserted");
                     let guard = runtime
                         .lease
-                        .acquire(client)
+                        .acquire(client, size, Arc::clone(&terminal))
                         .expect("new terminal has an independent lease");
                     let target = LeasedTarget {
                         selected,
                         terminal: Arc::clone(&terminal),
-                        _lease: guard,
+                        lease: guard,
                     };
                     CreatedTerminal::Attached(target)
                 }
@@ -4245,12 +4283,12 @@ async fn create_pane(
                         .expect("new runtime inserted");
                     let guard = runtime
                         .lease
-                        .acquire(client)
+                        .acquire(client, size, Arc::clone(&terminal))
                         .expect("new terminal has an independent lease");
                     CreatedTerminal::Attached(LeasedTarget {
                         selected,
                         terminal: Arc::clone(&terminal),
-                        _lease: guard,
+                        lease: guard,
                     })
                 }
             }),
@@ -5590,10 +5628,15 @@ mod tests {
         };
         let lease = AttachmentLease::default();
         let owner = ClientId::new();
-        let guard = lease.acquire(owner).unwrap();
+        let size = TerminalSize {
+            columns: 80,
+            rows: 24,
+        };
+        let guard = lease.acquire(owner, size, Arc::clone(&terminal)).unwrap();
         let (_, resource_changes) = watch::channel(0);
         let attachment = Attachment::new(
             owner,
+            size,
             vec![ObservedTarget {
                 selected: selected.clone(),
                 terminal: Arc::clone(&terminal),
@@ -5601,7 +5644,7 @@ mod tests {
             LeasedTarget {
                 selected,
                 terminal: Arc::clone(&terminal),
-                _lease: guard,
+                lease: guard,
             },
             SplitTree::leaf(pane_id),
             Vec::new(),
@@ -6026,6 +6069,10 @@ mod tests {
             Some(TargetSelector::Pane(path.pane_id)),
             None,
             ClientId::new(),
+            TerminalSize {
+                columns: 80,
+                rows: 24,
+            },
         )
         .await
         .unwrap();

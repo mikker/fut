@@ -1994,10 +1994,6 @@ async fn public_pane_new_preserves_attachment_isolates_input_and_cascades_on_las
         panes.iter().map(|pane| pane.id).collect::<Vec<_>>(),
         [pane_a.id, pane_b]
     );
-    assert_eq!(
-        attach_error_once(&harness, TargetSelector::Terminal(pane_a.terminal_id)).await,
-        "already_attached"
-    );
     for target in [
         TargetSelector::Session(SessionSelector::Id(session.id)),
         TargetSelector::Workspace(workspace.id),
@@ -2235,10 +2231,6 @@ async fn public_pane_move_preserves_attachment_identity_order_and_cascades_empty
     assert!(process_alive(selected_a.child_pid));
     assert!(process_alive(pid_c));
     assert!(process_alive(destination_pid));
-    assert_eq!(
-        attach_error_once(&harness, TargetSelector::Terminal(terminal_a)).await,
-        "already_attached"
-    );
 
     let ServerMessage::TargetSelected { selected: refreshed } = receive_matching(
         &mut attached_a,
@@ -2541,10 +2533,6 @@ async fn interactive_create_tab_correlates_ack_switches_atomically_and_routes_in
     assert_eq!(selected.panes.as_slice(), std::slice::from_ref(&created));
     snapshot_containing(&mut connection, created.terminal_id, "RAW_B_READY").await;
 
-    assert_eq!(
-        attach_error_once(&harness, TargetSelector::Terminal(created.terminal_id)).await,
-        "already_attached"
-    );
     let (mut old, selected_old) =
         attach_once(&harness, TargetSelector::Terminal(old_terminal)).await;
     assert_eq!(selected_old.child_pid, old_pid);
@@ -2637,10 +2625,6 @@ async fn interactive_create_pane_correlates_ack_switches_atomically_and_holds_le
     assert_eq!(selected.panes[0].terminal_id, old_terminal);
     assert_eq!(selected.panes[1], created);
     snapshot_containing(&mut connection, created.terminal_id, "RAW_PANE_B_READY").await;
-    assert_eq!(
-        attach_error_once(&harness, TargetSelector::Terminal(created.terminal_id)).await,
-        "already_attached"
-    );
 
     let (mut old, selected_old) =
         attach_once(&harness, TargetSelector::Terminal(old_terminal)).await;
@@ -2787,10 +2771,6 @@ async fn interactive_tab_view_streams_all_panes_with_per_client_focus() {
         attach_once(&harness, TargetSelector::Terminal(pane_b.terminal_id)).await;
     assert_eq!(selected_b, pane_b);
     snapshot_containing(&mut second, pane_b.terminal_id, "VIEW_B_READY").await;
-    assert_eq!(
-        select_error(&mut first, TargetSelector::Terminal(pane_b.terminal_id)).await,
-        "already_attached"
-    );
     send(
         &mut first,
         ClientMessage::Input {
@@ -5697,26 +5677,113 @@ async fn existing_reopen_is_idempotent_and_invalid_name_never_spawns() {
 }
 
 #[tokio::test]
-async fn terminal_attachment_lease_rejects_contention_and_releases_on_detach_and_eof() {
-    let mut harness = Harness::start("while IFS= read -r line; do :; done").await;
-    let (mut first, terminal_id, child_pid) = harness.interactive().await;
+async fn terminal_attachments_share_input_and_use_the_smallest_client_geometry() {
+    let harness =
+        Harness::start("while IFS= read -r line; do printf 'INPUT:%s\\r\\n' \"$line\"; done").await;
+    let mut first = harness.connect().await.unwrap();
+    let ServerMessage::Welcome {
+        selected: Some(first_selected),
+        ..
+    } = hello(
+        &mut first,
+        interactive_mode_with_size(
+            Some(TargetSelector::Session(SessionSelector::Name("cwd".into()))),
+            TerminalSize {
+                columns: 100,
+                rows: 40,
+            },
+        ),
+        PROTOCOL_VERSION,
+    )
+    .await
+    .unwrap()
+    else {
+        panic!("first client was not attached")
+    };
+    let terminal_id = first_selected.focused.terminal_id;
 
-    let mut contender = harness.connect().await.unwrap();
-    assert!(matches!(
-        hello(&mut contender, interactive_mode(Some(TargetSelector::Session(SessionSelector::Name("cwd".into())))), PROTOCOL_VERSION).await.unwrap(),
-        ServerMessage::Error { ref code, .. } if code == "already_attached"
-    ));
+    let mut second = harness.connect().await.unwrap();
+    let ServerMessage::Welcome {
+        selected: Some(second_selected),
+        ..
+    } = hello(
+        &mut second,
+        interactive_mode_with_size(
+            Some(TargetSelector::Terminal(terminal_id)),
+            TerminalSize {
+                columns: 80,
+                rows: 30,
+            },
+        ),
+        PROTOCOL_VERSION,
+    )
+    .await
+    .unwrap()
+    else {
+        panic!("second client was not attached")
+    };
+    assert_eq!(second_selected.focused.terminal_id, terminal_id);
+    snapshot_with_size(
+        &mut first,
+        terminal_id,
+        TerminalSize {
+            columns: 80,
+            rows: 30,
+        },
+    )
+    .await;
+
+    send(
+        &mut second,
+        ClientMessage::Input {
+            bytes: b"second\n".to_vec(),
+        },
+    )
+    .await;
+    snapshot_containing(&mut first, terminal_id, "INPUT:second").await;
+    send(
+        &mut first,
+        ClientMessage::Input {
+            bytes: b"first\n".to_vec(),
+        },
+    )
+    .await;
+    snapshot_containing(&mut second, terminal_id, "INPUT:first").await;
+
+    send(
+        &mut second,
+        ClientMessage::Resize {
+            terminal_id,
+            size: TerminalSize {
+                columns: 70,
+                rows: 35,
+            },
+        },
+    )
+    .await;
+    snapshot_with_size(
+        &mut first,
+        terminal_id,
+        TerminalSize {
+            columns: 70,
+            rows: 35,
+        },
+    )
+    .await;
+
+    harness.detach(&mut second).await;
+    drop(second);
+    snapshot_with_size(
+        &mut first,
+        terminal_id,
+        TerminalSize {
+            columns: 100,
+            rows: 40,
+        },
+    )
+    .await;
     harness.detach(&mut first).await;
     drop(first);
-
-    let (second, second_id, second_pid) = harness.interactive().await;
-    assert_eq!((second_id, second_pid), (terminal_id, child_pid));
-    drop(second);
-    time::sleep(POLL_INTERVAL).await;
-    let (mut third, third_id, third_pid) = harness.interactive().await;
-    assert_eq!((third_id, third_pid), (terminal_id, child_pid));
-    harness.detach(&mut third).await;
-    drop(third);
     harness.shutdown().await;
 }
 
@@ -9275,8 +9342,6 @@ async fn same_target_list_and_failed_switches_preserve_the_attachment() {
     for selector in [TargetSelector::Terminal(a_id), TargetSelector::Pane(pane_a)] {
         let selected = select_response(&mut a, selector).await;
         assert_eq!((selected.terminal_id, selected.child_pid), (a_id, a_pid));
-        let contender = attach_error_once(&harness, TargetSelector::Terminal(a_id)).await;
-        assert_eq!(contender, "already_attached");
     }
     let request = Uuid::new_v4();
     send_envelope(
@@ -9299,10 +9364,6 @@ async fn same_target_list_and_failed_switches_preserve_the_attachment() {
     };
     assert!(matches!(response.message, ServerMessage::Resources { .. }));
 
-    assert_eq!(
-        select_error(&mut a, TargetSelector::Terminal(b.terminal_id)).await,
-        "already_attached"
-    );
     send(
         &mut a,
         ClientMessage::Input {
@@ -10016,14 +10077,6 @@ async fn public_rename_preserves_a_live_process_and_rejects_invalid_changes_atom
         .await,
         "not_found"
     );
-    assert_eq!(
-        attach_error_once(
-            &harness,
-            TargetSelector::Session(SessionSelector::Name("セッション 六".into()))
-        )
-        .await,
-        "already_attached"
-    );
 
     let listed = run(&["list"]);
     assert!(listed.status.success());
@@ -10187,10 +10240,11 @@ async fn hello(
 }
 
 fn interactive_mode(selector: Option<TargetSelector>) -> ClientMode {
-    ClientMode::Interactive {
-        size: SIZE,
-        selector,
-    }
+    interactive_mode_with_size(selector, SIZE)
+}
+
+fn interactive_mode_with_size(selector: Option<TargetSelector>, size: TerminalSize) -> ClientMode {
+    ClientMode::Interactive { size, selector }
 }
 
 async fn send(connection: &mut Connection, message: ClientMessage) {
@@ -10484,6 +10538,21 @@ async fn snapshot_containing(
             screen,
         } => *id == terminal_id && snapshot_text(screen).contains(needle),
         _ => false,
+    })
+    .await;
+    match message {
+        ServerMessage::Snapshot { screen, .. } => screen,
+        _ => unreachable!(),
+    }
+}
+
+async fn snapshot_with_size(
+    connection: &mut Connection,
+    terminal_id: TerminalId,
+    size: TerminalSize,
+) -> ScreenSnapshot {
+    let message = receive_matching(connection, |message| {
+        matches!(message, ServerMessage::Snapshot { terminal_id: id, screen } if *id == terminal_id && screen.size == size)
     })
     .await;
     match message {

@@ -7,7 +7,7 @@ permalink: /configuration/
 
 # Configuration
 
-Fut's global presentation configuration is safe, declarative, and non-executable. A separate, explicitly named `trusted_commands` section may run programs from keybindings; see [Security boundary](#security-boundary).
+Fut's global presentation configuration is safe, declarative, and non-executable. A separate, explicitly named `trusted_commands` section may run programs from keybindings; see [Security boundary](#security-boundary). Multiple terminal windows may attach to the same session at once. They share terminal input and output, while focus, dialogs, scrollback, and configuration remain local to each client. Shared PTYs use the smallest attached client's dimensions; resizing or detaching a client immediately recalculates that geometry.
 
 ## Location and lifecycle
 

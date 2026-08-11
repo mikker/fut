@@ -166,6 +166,19 @@ impl TerminalHandle {
         self.send(RuntimeMessage::Resize(size))
     }
 
+    /// Applies geometry selected while an attachment is being dropped. Drop
+    /// cannot await the bounded runtime queue, so finish the update in the
+    /// current Tokio runtime rather than leaving the surviving attachment at
+    /// the departed client's size.
+    pub(crate) fn resize_on_attachment_change(&self, size: TerminalSize) {
+        let terminal = self.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = terminal.resize(size).await;
+            });
+        }
+    }
+
     pub(crate) async fn mouse_input(
         &self,
         event: MouseEvent,
