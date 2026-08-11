@@ -3428,6 +3428,21 @@ fn render_scrollbar(
 
 struct Screen<'a>(&'a ScreenSnapshot);
 
+/// Benchmark-only access to the snapshot-to-ratatui-buffer path.
+#[doc(hidden)]
+pub mod bench {
+    use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+
+    use crate::domain::ScreenSnapshot;
+
+    pub fn render_snapshot(screen: &ScreenSnapshot) -> Buffer {
+        let area = Rect::new(0, 0, screen.size.columns, screen.size.rows);
+        let mut buffer = Buffer::empty(area);
+        super::Screen(screen).render(area, &mut buffer);
+        buffer
+    }
+}
+
 impl Widget for Screen<'_> {
     fn render(self, area: Rect, buffer: &mut Buffer) {
         let screen = self.0;

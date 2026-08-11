@@ -15,11 +15,11 @@ by similar projects (Zellij, tmux, Ghostty, mosh).
   (`examples/perf_client.rs`): `flood` (plain `seq`), `styled` (SGR-heavy
   output), `latency` (keystroke echo p50/p95). Reports snapshots/sec, wire
   MiB/s, largest frame, decode cost, and revisions coalesced away.
-- `mise run perf:pager` — run `less` in a fixed 200x50 PTY over a generated,
-  deterministic colored diff; capture the ANSI emitted by one `d` and the
-  following `u`; then report action byte counts and median Fut parse and
-  full-snapshot costs over 200 fresh terminals. Run the release-mode command
-  on the same host when comparing directions or revisions.
+- `mise run perf:pager` — run a sanitized `less` in a fixed 200x50 PTY over a
+  generated diff; measure input-to-first-byte and input-to-last-byte/quiet for
+  `d` and `u` at three positions, validate every round trip, hash streams, and
+  replay them through Fut parse, snapshot, wire encode/decode, and client grid
+  rendering. Run on the same idle host when comparing revisions.
 - `FUT_PERF_LOG=/tmp/frames.csv fut … attach` — the real client logs one CSV
   row per frame decode and per draw (`src/client/perf.rs`). Summarize with
   `scripts/perf/report /tmp/frames.csv`.
@@ -245,27 +245,31 @@ smoothness from `target/debug/fut`.
 
 ## Remaining hypotheses
 
-### Pager direction measurement (2026-08-10, `less` 668)
+### Pager direction measurement
 
-`mise run perf:pager` captured one half-page forward (`d`) and backward (`u`)
-operation from the same generated colored diff in a 200x50 xterm-compatible
-PTY. It then replayed each captured stream through Fut's Ghostty boundary,
-timing VT parsing separately from full-grid snapshot capture. Three release
-runs on the same M-series host were stable:
+`mise run perf:pager` measures only this deterministic synthetic case. It
+reports pager response timing and separately replays the exact streams through
+the practical in-process Fut path. The 100 ms quiet window is deliberately
+included in input-to-quiet, while input-to-last-byte avoids that fixed floor.
+Each nonempty captured action must produce a different complete parsed screen;
+first-byte and quiet waits have explicit failure bounds rather than silently
+accepting an empty or unchanged capture. Results are host- and pager-version-
+specific; record the command's metadata and output when investigating.
 
-| direction | pager bytes | median VT parse | median snapshot |
-| --- | ---: | ---: | ---: |
-| forward (`d`) | 3,783 | 9.4–9.8 µs | 261.8–267.0 µs |
-| backward (`u`) | 3,695 | 21.1–21.5 µs | 259.7–261.2 µs |
+One release run on 2026-08-11 (macOS/aarch64, `less` 668) measured three
+positions: `d` input-to-first-byte 0.044–0.069 ms and input-to-last-byte
+0.245–0.330 ms; `u` 0.024–0.077 ms and 0.204–0.291 ms. The fixed quiet check
+made input-to-quiet 100.9–105.4 ms. Across 200 replays per position, downstream
+medians were 9.0/20.7 µs parse (`d`/`u`), 257.6/257.9 µs snapshot,
+149.2/149.6 µs encode, 467.6/466.5 µs decode, and 102.5/103.0 µs client grid
+render. Captured streams were 3,559–3,919 bytes; the command printed the six
+individual stream hashes for comparison.
 
-`less` emits almost the same volume in both directions. Its backward ANSI is
-about 2.2x as expensive to parse, but the absolute difference is only ~12 µs;
-snapshot cost is direction-independent and dominates at ~260 µs. This does
-not support a Fut rendering-cache explanation for perceptible backward-page
-latency, and no production optimization is justified by these measurements.
-The remaining likely source is pager-side work before bytes reach the PTY
-(for example input/file seeking or line reconstruction), which this tool
-deliberately separates from Fut's handling after output becomes available.
+This diagnostic can show a directional difference in the measured pager or
+in-process stages. It does **not** measure PTY scheduling, daemon wake-up and
+coalescing, socket I/O, ratatui terminal diff/flush, or the host terminal's
+paint. Therefore it neither proves nor rules out a rendering-cache effect in
+those unmeasured stages, and it does not by itself identify a root cause.
 
 1. **Skip blitting unchanged rows in `Screen::render`** — deferred: ratatui
    resets the draw buffer every frame, so row-skipping would blank rows; it
