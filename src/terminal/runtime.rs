@@ -142,6 +142,14 @@ impl TerminalHandle {
         &self.spawn_cwd
     }
 
+    pub async fn foreground_process_id(&self) -> Result<u32, CommandError> {
+        let (completion, completed) = oneshot::channel();
+        self.commands
+            .send(RuntimeMessage::ForegroundProcessId { completion })
+            .await?;
+        completed.await.unwrap_or(Err(CommandError::Stopped))
+    }
+
     pub async fn input(&self, bytes: Vec<u8>) -> Result<(), CommandError> {
         self.commands.send(RuntimeMessage::Input(bytes)).await
     }
@@ -430,6 +438,9 @@ enum RuntimeMessage {
         completion: oneshot::Sender<Result<(), CommandError>>,
     },
     Resize(TerminalSize),
+    ForegroundProcessId {
+        completion: oneshot::Sender<Result<u32, CommandError>>,
+    },
     MouseInput {
         event: MouseEvent,
         viewport_offset: Option<usize>,
@@ -724,6 +735,13 @@ fn run(
                             publishers.events,
                         );
                     }
+                }
+                RuntimeMessage::ForegroundProcessId { completion } => {
+                    let process_id = master
+                        .process_group_leader()
+                        .and_then(|pid| u32::try_from(pid).ok())
+                        .unwrap_or(child_pid);
+                    let _ = completion.send(Ok(process_id));
                 }
                 RuntimeMessage::MouseInput {
                     event,
@@ -1057,6 +1075,9 @@ fn serve_exited(
             }
             RuntimeMessage::ClearCopyMode { completion, .. } => {
                 let _ = completion.send(Ok(None));
+            }
+            RuntimeMessage::ForegroundProcessId { completion } => {
+                let _ = completion.send(Err(CommandError::Stopped));
             }
             RuntimeMessage::Input(_) | RuntimeMessage::Resize(_) => {}
         }

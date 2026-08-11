@@ -8080,8 +8080,8 @@ async fn workspace_and_tab_bars_create_and_rename_logical_contexts() {
             .iter()
             .map(|tab| tab.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["first", ""],
-        "tabs created from the tab bar stay unnamed"
+        vec!["first", "sh"],
+        "unnamed tabs display their foreground process"
     );
 
     client.send(b"\x02d");
@@ -9017,7 +9017,10 @@ fn public_doctor_is_read_only_and_json_reports_configuration_errors() {
 #[tokio::test]
 async fn public_doctor_probes_a_running_daemon_without_mutating_resources() {
     let harness = Harness::start("while :; do sleep 1; done").await;
-    let before = harness.resources().await;
+    let before = resources_when(&harness, |snapshot| {
+        !snapshot.sessions[0].workspaces[0].tabs[0].name.is_empty()
+    })
+    .await;
     let output = harness.cli().args(["--json", "doctor"]).output().unwrap();
     assert!(
         output.status.success(),
@@ -9149,7 +9152,7 @@ async fn public_client_ctrl_b_c_creates_routes_and_navigates_back() {
     client.wait_for("CTRL_C_NEW_INPUT").await;
     client.send(b"\x02g");
     client.wait_for(" navigator").await;
-    client.send(b"tab 1 pane\x1b[A\r");
+    client.send(b"\x14\r");
     client.wait_for_count("CTRL_C_A_READY", 2).await;
     client.send(b"a\n");
     client.wait_for("CTRL_C_A_INPUT").await;

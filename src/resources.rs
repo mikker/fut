@@ -355,7 +355,10 @@ struct Workspace {
 #[derive(Clone, Debug)]
 struct Tab {
     workspace_id: WorkspaceId,
+    /// A non-empty user title wins permanently until the user clears it.
     name: String,
+    automatic_name: String,
+    focused_pane: PaneId,
     closing: bool,
     panes: Vec<PaneId>,
     layout: SplitTree,
@@ -629,6 +632,45 @@ impl ResourceTree {
             .ok_or_else(|| ResourceError::Invariant("terminal pane is missing".into()))
     }
 
+    /// Record the readable foreground process for a pane. Automatic tab names
+    /// belong to the resource tree, rather than being guessed independently by
+    /// each client, and only follow the tab's focused pane.
+    pub fn update_process_name(
+        &mut self,
+        terminal_id: TerminalId,
+        process_name: String,
+    ) -> Result<u64, ResourceError> {
+        let pane_id = *self
+            .terminals
+            .get(&terminal_id)
+            .ok_or(ResourceError::NotFound("terminal"))?;
+        let tab_id = self.panes[&pane_id].tab_id;
+        let tab = self.tabs.get_mut(&tab_id).expect("pane tab exists");
+        if !tab.name.is_empty() || tab.focused_pane != pane_id || tab.automatic_name == process_name
+        {
+            return Ok(self.revision);
+        }
+        tab.automatic_name = process_name;
+        self.revision += 1;
+        Ok(self.revision)
+    }
+
+    /// Select which pane supplies an unnamed tab's automatic title.
+    pub fn focus_pane(&mut self, pane_id: PaneId) -> Result<u64, ResourceError> {
+        let pane = self
+            .panes
+            .get(&pane_id)
+            .ok_or(ResourceError::NotFound("pane"))?;
+        let tab = self.tabs.get_mut(&pane.tab_id).expect("pane tab exists");
+        if tab.focused_pane == pane_id {
+            return Ok(self.revision);
+        }
+        tab.focused_pane = pane_id;
+        tab.automatic_name.clear();
+        self.revision += 1;
+        Ok(self.revision)
+    }
+
     pub fn report_agent_with_metadata(
         &mut self,
         terminal_id: TerminalId,
@@ -735,6 +777,8 @@ impl ResourceTree {
             Tab {
                 workspace_id: path.workspace_id,
                 name: path.tab_name,
+                automatic_name: String::new(),
+                focused_pane: path.pane_id,
                 closing: false,
                 panes: vec![path.pane_id],
                 layout: SplitTree::leaf(path.pane_id),
@@ -951,6 +995,8 @@ impl ResourceTree {
             Tab {
                 workspace_id: path.workspace_id,
                 name: path.tab_name,
+                automatic_name: String::new(),
+                focused_pane: path.pane_id,
                 closing: false,
                 panes: vec![path.pane_id],
                 layout: SplitTree::leaf(path.pane_id),
@@ -1019,6 +1065,8 @@ impl ResourceTree {
             Tab {
                 workspace_id,
                 name: path.tab_name,
+                automatic_name: String::new(),
+                focused_pane: path.pane_id,
                 closing: false,
                 panes: vec![path.pane_id],
                 layout: SplitTree::leaf(path.pane_id),
@@ -1213,6 +1261,12 @@ impl ResourceTree {
             .clone()
             .without(pane_id)
             .unwrap_or_else(|| SplitTree::leaf(pane_id));
+        if source.focused_pane == pane_id
+            && let Some(replacement) = source.panes.last().copied()
+        {
+            source.focused_pane = replacement;
+            source.automatic_name.clear();
+        }
         let destination_tab = self.tabs.get_mut(&destination).unwrap();
         let anchor = *destination_tab
             .panes
@@ -1697,6 +1751,12 @@ impl ResourceTree {
         if let Some(layout) = tab.layout.clone().without(pane_id) {
             tab.layout = layout;
         }
+        if tab.focused_pane == pane_id
+            && let Some(replacement) = tab.panes.last().copied()
+        {
+            tab.focused_pane = replacement;
+            tab.automatic_name.clear();
+        }
         pane.tab_id
     }
 
@@ -1790,7 +1850,11 @@ impl ResourceTree {
         let t = &self.tabs[&id];
         TabSnapshot {
             id,
-            name: t.name.clone(),
+            name: if t.name.is_empty() {
+                t.automatic_name.clone()
+            } else {
+                t.name.clone()
+            },
             closing: t.closing,
             layout: t.layout.clone(),
             panes: t.panes.iter().map(|id| self.pane_snapshot(*id)).collect(),
@@ -2012,6 +2076,71 @@ mod tests {
             pane_id: PaneId::new(),
             terminal_id: TerminalId::new(),
         }
+    }
+
+    #[test]
+    fn unnamed_tabs_follow_the_focused_process_but_explicit_titles_stay_stable() {
+        let mut tree = ResourceTree::default();
+        let path = initial("processes", "/processes");
+        let tab_id = path.tab_id;
+        let first_pane = path.pane_id;
+        let first_terminal = path.terminal_id;
+        tree.create_session(path).unwrap();
+
+        tree.update_process_name(first_terminal, "zsh".into())
+            .unwrap();
+        assert_eq!(
+            tree.snapshot().sessions[0].workspaces[0].tabs[0].name,
+            "shell"
+        );
+
+        tree.rename_tab(tab_id, String::new()).unwrap();
+        tree.update_process_name(first_terminal, "zsh".into())
+            .unwrap();
+        assert_eq!(
+            tree.snapshot().sessions[0].workspaces[0].tabs[0].name,
+            "zsh"
+        );
+
+        let second_pane = PaneId::new();
+        let second_terminal = TerminalId::new();
+        tree.split_pane(
+            first_pane,
+            SplitDirection::Right,
+            second_pane,
+            second_terminal,
+        )
+        .unwrap();
+        tree.update_process_name(second_terminal, "vim".into())
+            .unwrap();
+        assert_eq!(
+            tree.snapshot().sessions[0].workspaces[0].tabs[0].name,
+            "zsh"
+        );
+        tree.focus_pane(second_pane).unwrap();
+        tree.update_process_name(second_terminal, "vim".into())
+            .unwrap();
+        assert_eq!(
+            tree.snapshot().sessions[0].workspaces[0].tabs[0].name,
+            "vim"
+        );
+
+        tree.rename_tab(tab_id, "editor".into()).unwrap();
+        tree.update_process_name(second_terminal, "less".into())
+            .unwrap();
+        assert_eq!(
+            tree.snapshot().sessions[0].workspaces[0].tabs[0].name,
+            "editor"
+        );
+
+        tree.rename_tab(tab_id, String::new()).unwrap();
+        tree.terminal_exited(second_terminal).unwrap();
+        tree.update_process_name(first_terminal, "fish".into())
+            .unwrap();
+        assert_eq!(
+            tree.snapshot().sessions[0].workspaces[0].tabs[0].name,
+            "fish"
+        );
     }
 
     #[test]

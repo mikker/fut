@@ -1243,6 +1243,8 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     let (exited_tx, mut exited_rx) = mpsc::unbounded_channel();
     watch_terminal(terminal, exited_tx.clone());
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let mut process_names = tokio::time::interval(Duration::from_millis(500));
+    process_names.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut connections = JoinSet::new();
     let writers = WriterTasks::default();
 
@@ -1259,6 +1261,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
                     break;
                 }
             }
+            _ = process_names.tick() => refresh_process_names(&shared).await,
             accepted = socket.listener.accept() => {
                 let (stream, _) = accepted.context("accept daemon client")?;
                 let shared = Arc::clone(&shared);
@@ -1307,6 +1310,59 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     })
     .await;
     Ok(())
+}
+
+async fn focus_automatic_tab(shared: &Shared, pane_id: PaneId) {
+    let mut state = shared.lock().await;
+    if let Ok(revision) = state.resources.focus_pane(pane_id) {
+        state.publish_resource_change(revision);
+    }
+}
+
+async fn refresh_process_names(shared: &Shared) {
+    let terminals = shared
+        .lock()
+        .await
+        .runtimes
+        .iter()
+        .map(|(id, entry)| (*id, Arc::clone(&entry.handle)))
+        .collect::<Vec<_>>();
+    for (terminal_id, terminal) in terminals {
+        let Ok(pid) = terminal.foreground_process_id().await else {
+            continue;
+        };
+        let Some(name) = process_name(pid).await else {
+            continue;
+        };
+        let mut state = shared.lock().await;
+        if let Ok(revision) = state.resources.update_process_name(terminal_id, name) {
+            state.publish_resource_change(revision);
+        }
+    }
+}
+
+async fn process_name(pid: u32) -> Option<String> {
+    let output = timeout(
+        Duration::from_millis(250),
+        tokio::process::Command::new("/bin/ps")
+            .args(["-o", "comm=", "-p", &pid.to_string()])
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let command = String::from_utf8_lossy(&output.stdout);
+    let command = command.trim();
+    (!command.is_empty()).then(|| {
+        Path::new(command)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(command)
+            .to_owned()
+    })
 }
 
 fn initial_path(resolved: &ResolvedLocation, name: String, terminal_id: TerminalId) -> InitialPath {
@@ -2093,6 +2149,7 @@ async fn handle_connection(
                             resource_revision,
                         } = selection
                         {
+                            focus_automatic_tab(&shared, selected.pane_id).await;
                             attachment.reconcile(
                                 panes,
                                 selected,
@@ -2114,6 +2171,11 @@ async fn handle_connection(
                                     continue;
                                 }
                                 attachment = candidate;
+                                focus_automatic_tab(
+                                    &shared,
+                                    attachment.focused.selected.pane_id,
+                                )
+                                .await;
                                 send(
                                     &mut connection,
                                     envelope.request_id,
