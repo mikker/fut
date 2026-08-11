@@ -193,7 +193,7 @@ impl NavigationHistory {
             .or_else(|| tab_destination(tab, None))
     }
 
-    fn session_destination(&self, session: &SessionSnapshot) -> Option<PaneId> {
+    pub fn session_destination(&self, session: &SessionSnapshot) -> Option<PaneId> {
         self.session_destinations
             .get(&session.id)
             .copied()

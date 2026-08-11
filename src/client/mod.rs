@@ -20,6 +20,7 @@ mod rename;
 mod sidebar;
 mod tab_bar;
 mod temporary_command;
+mod toast;
 
 use std::{io, path::Path, process::Stdio, time::Duration};
 
@@ -79,6 +80,7 @@ use uuid::Uuid;
 use sidebar::{WorkspaceSidebarAction, WorkspaceSidebarState, render_workspace_sidebar};
 use tab_bar::{TabBarAction, TabBarState};
 use temporary_command::{TemporaryCommandSurface, TemporaryCommandUpdate};
+use toast::{Toast, ToastState};
 
 use crate::{
     domain::{
@@ -331,7 +333,7 @@ async fn initial_navigator(
     snapshot: ResourceSnapshot,
     ui: &UiConfig,
 ) -> anyhow::Result<Option<TargetSelector>> {
-    let mut navigator = NavigatorState::open_global();
+    let mut navigator = NavigatorState::open();
     navigator.accept_global_resources(&snapshot);
     let mut events = EventStream::new();
     let mut termination = TerminationSignals::subscribe()?;
@@ -394,7 +396,7 @@ async fn run(
     let mut create_tab = CreateState::default();
     let mut split_pane = CreateState::default();
     let mut focus = FocusState::default();
-    let mut notice: Option<String> = None;
+    let mut toasts = ToastState::default();
     let mut pending_focused_exit: Option<Option<i32>> = None;
     let mut force_draw = false;
     let mut cheatsheet_at: Option<time::Instant> = None;
@@ -425,7 +427,7 @@ async fn run(
                 match update {
                     TemporaryCommandUpdate::Screen => force_draw = true,
                     TemporaryCommandUpdate::Error(message) => {
-                        notice = Some(format!("command failed · {}", sanitize(&message)));
+                        toasts.error(format!("command failed · {}", sanitize(&message)));
                         force_draw = true;
                     }
                     TemporaryCommandUpdate::Exited(exit_code) => {
@@ -433,8 +435,8 @@ async fn run(
                         view.invalidate_drawn();
                         match exit_code {
                             Some(0) => {}
-                            Some(code) => notice = Some(format!("command exited · status {code}")),
-                            None => notice = Some("command exited · status unknown".into()),
+                            Some(code) => toasts.error(format!("command exited · status {code}")),
+                            None => toasts.error("command exited · status unknown"),
                         }
                         resize_view(framed, terminal.size()?.into(), &mut view, &resources, &ui).await?;
                         force_draw = true;
@@ -442,7 +444,7 @@ async fn run(
                     TemporaryCommandUpdate::Stopped => {
                         temporary_command = None;
                         view.invalidate_drawn();
-                        notice = Some("command failed · terminal runtime stopped".into());
+                        toasts.error("command failed · terminal runtime stopped");
                         resize_view(framed, terminal.size()?.into(), &mut view, &resources, &ui).await?;
                         force_draw = true;
                     }
@@ -553,7 +555,7 @@ async fn run(
                             view.accept(terminal_id, screen);
                             copy_mode = None;
                             if let Some(bytes) = copied_bytes {
-                                notice = Some(format!("copied {bytes} bytes to clipboard"));
+                                toasts.info(format!("copied {bytes} bytes to clipboard"));
                             }
                             force_draw = true;
                         }
@@ -569,7 +571,7 @@ async fn run(
                         if accepted {
                             view.accept(terminal_id, screen);
                             copy_mode = None;
-                            notice = Some("copy mode cancelled".into());
+                            toasts.info("copy mode cancelled");
                             force_draw = true;
                         }
                     }
@@ -587,7 +589,7 @@ async fn run(
                         match disposition {
                             CopyModeErrorDisposition::Ignored => {}
                             CopyModeErrorDisposition::Continue => {
-                                notice = Some(format!("copy mode · {error}"));
+                                toasts.error(format!("copy mode · {error}"));
                                 pump_copy_mode(
                                     framed,
                                     copy_mode.as_mut().expect("recoverable copy-mode error"),
@@ -595,7 +597,7 @@ async fn run(
                                 force_draw = true;
                             }
                             CopyModeErrorDisposition::Exit => {
-                                notice = Some(format!("copy mode · {error}"));
+                                toasts.error(format!("copy mode · {error}"));
                                 copy_mode = None;
                                 force_draw = true;
                             }
@@ -700,7 +702,7 @@ async fn run(
                             copy_mode.terminal_id() != view.focused().terminal_id
                         }) {
                             copy_mode = None;
-                            notice = Some("copy mode cancelled · focus changed".into());
+                            toasts.info("copy mode cancelled · focus changed");
                         }
                         if !resources
                             .snapshot()
@@ -821,7 +823,7 @@ async fn run(
                         match copy_failure {
                             CopyModeErrorDisposition::Ignored => {}
                             CopyModeErrorDisposition::Continue => {
-                                notice = Some(format!("copy mode failed · {message}"));
+                                toasts.error(format!("copy mode failed · {message}"));
                                 pump_copy_mode(
                                     framed,
                                     copy_mode.as_mut().expect("recoverable copy-mode failure"),
@@ -831,7 +833,7 @@ async fn run(
                             }
                             CopyModeErrorDisposition::Exit => {
                                 copy_mode = None;
-                                notice = Some(format!("copy mode failed · {message}"));
+                                toasts.error(format!("copy mode failed · {message}"));
                                 force_draw = true;
                                 continue;
                             }
@@ -844,17 +846,17 @@ async fn run(
                             continue;
                         }
                         if create_workspace.fail(request_id) {
-                            notice = Some(format!("create workspace failed · {message}"));
+                            toasts.error(format!("create workspace failed · {message}"));
                             force_draw = true;
                             continue;
                         }
                         if create_tab.fail(request_id) {
-                            notice = Some(format!("create tab failed · {message}"));
+                            toasts.error(format!("create tab failed · {message}"));
                             force_draw = true;
                             continue;
                         }
                         if split_pane.fail(request_id) {
-                            notice = Some(format!("split failed · {message}"));
+                            toasts.error(format!("split failed · {message}"));
                             force_draw = true;
                             continue;
                         }
@@ -873,24 +875,24 @@ async fn run(
                                         sidebar.switch_error(message);
                                         force_draw = true;
                                     } else {
-                                        notice = Some(format!("workspace unavailable · {message}"));
+                                        toasts.error(format!("workspace unavailable · {message}"));
                                         force_draw = true;
                                     }
                                 }
                                 Some(FocusOrigin::Pane) => {
-                                    notice = Some(format!("pane unavailable · {message}"));
+                                    toasts.error(format!("pane unavailable · {message}"));
                                     force_draw = true;
                                 }
                                 Some(FocusOrigin::Tab) => {
-                                    notice = Some(format!("tab unavailable · {message}"));
+                                    toasts.error(format!("tab unavailable · {message}"));
                                     force_draw = true;
                                 }
                                 Some(FocusOrigin::Session) => {
-                                    notice = Some(format!("session unavailable · {message}"));
+                                    toasts.error(format!("session unavailable · {message}"));
                                     force_draw = true;
                                 }
                                 Some(FocusOrigin::Notification) => {
-                                    notice = Some(format!("notification unavailable · {message}"));
+                                    toasts.error(format!("notification unavailable · {message}"));
                                     force_draw = true;
                                 }
                                 None => bail!("daemon error ({code}): {message}"),
@@ -941,7 +943,7 @@ async fn run(
                     }
                     Event::Mouse(_) if temporary_command.is_some() => {}
                     Event::Key(key) if copy_mode.is_some() => {
-                        notice = None;
+                        toasts.clear();
                         let input = copy_mode.as_mut().expect("copy mode exists").key(key);
                         match input {
                             CopyModeInput::Stay => {}
@@ -951,21 +953,21 @@ async fn run(
                                     copy_mode.as_mut().expect("copy mode exists"),
                                 ).await?;
                             }
-                            CopyModeInput::Notice(message) => notice = Some(message.into()),
+                            CopyModeInput::Notice(message) => toasts.error(message),
                         }
                         force_draw = true;
                     }
                     Event::Paste(text) if copy_mode.is_some() => {
-                        notice = match copy_mode
+                        toasts.clear();
+                        if matches!(
+                            copy_mode
                             .as_mut()
                             .expect("copy mode exists")
-                            .paste(&text)
-                        {
-                            CopyModePaste::Accepted | CopyModePaste::Ignored => None,
-                            CopyModePaste::TooLarge => Some(
-                                "search query is too large; paste was not added".into(),
-                            ),
-                        };
+                            .paste(&text),
+                            CopyModePaste::TooLarge
+                        ) {
+                            toasts.error("search query is too large; paste was not added");
+                        }
                         force_draw = true;
                     }
                     Event::Key(key) if rename.is_some() => {
@@ -997,7 +999,7 @@ async fn run(
                         force_draw = true;
                     }
                     Event::Key(key) if matches!(surface.as_ref(), Some(ClientSurface::Notifications(_))) => {
-                        notice = None;
+                        toasts.clear();
                         let size = terminal.size()?;
                         let visible = notifications::dialog_body_rows(Rect::new(0, 0, size.width, size.height));
                         let action = match surface.as_mut().expect("notifications exist") {
@@ -1034,7 +1036,7 @@ async fn run(
                         }
                     }
                     Event::Key(key) if matches!(surface.as_ref(), Some(ClientSurface::Navigator(_))) => {
-                        notice = None;
+                        toasts.clear();
                         let size = terminal.size()?;
                         let visible = navigator::dialog_body_rows(Rect::new(0, 0, size.width, size.height));
                         let action = match surface.as_mut().expect("navigator exists") {
@@ -1078,7 +1080,7 @@ async fn run(
                         }
                     }
                     Event::Key(key) if matches!(surface.as_ref(), Some(ClientSurface::WorkspaceSidebar(_))) => {
-                        notice = None;
+                        toasts.clear();
                         let action = match surface.as_mut().expect("workspace sidebar exists") {
                             ClientSurface::WorkspaceSidebar(sidebar) => sidebar.key(key),
                             _ => unreachable!("surface guard ensures workspace sidebar"),
@@ -1158,7 +1160,7 @@ async fn run(
                         }
                     }
                     Event::Key(key) if matches!(surface.as_ref(), Some(ClientSurface::TabBar(_))) => {
-                        notice = None;
+                        toasts.clear();
                         let action = match surface.as_mut().expect("tab bar exists") {
                             ClientSurface::TabBar(tab_bar) => tab_bar.key(key),
                             _ => unreachable!("surface guard ensures tab bar"),
@@ -1221,7 +1223,7 @@ async fn run(
                         }
                     }
                     Event::Key(key) if matches!(surface.as_ref(), Some(ClientSurface::CommandBar(_))) => {
-                        notice = None;
+                        toasts.clear();
                         let action = match surface.as_mut().expect("command bar exists") {
                             ClientSurface::CommandBar(command_bar) => command_bar.key(key),
                             _ => unreachable!("surface guard ensures command bar"),
@@ -1241,7 +1243,7 @@ async fn run(
                                 ).await?;
                                 surface = None;
                                 view.invalidate_drawn();
-                                notice = dispatch_client_action(
+                                toasts.replace(dispatch_client_action(
                                     action,
                                     framed,
                                     &mut view,
@@ -1256,7 +1258,7 @@ async fn run(
                                     terminal.size()?.into(),
                                     &mut ui,
                                     &mut temporary_command,
-                                ).await?;
+                                ).await?);
                                 force_draw = true;
                             }
                         }
@@ -1381,7 +1383,7 @@ async fn run(
                             }
                         }
                     Event::Key(key) if surface.is_none() && copy_mode.is_none() => if let Some(bytes) = encode_key(key) {
-                        notice = None;
+                        toasts.clear();
                         let was_visible = cheatsheet_visible;
                         cheatsheet_at = None;
                         cheatsheet_visible = false;
@@ -1411,7 +1413,7 @@ async fn run(
                                         terminal_id: view.focused().terminal_id,
                                     },
                                 ).await?;
-                                notice = dispatch_client_action(
+                                toasts.replace(dispatch_client_action(
                                     action,
                                     framed,
                                     &mut view,
@@ -1426,7 +1428,7 @@ async fn run(
                                     terminal.size()?.into(),
                                     &mut ui,
                                     &mut temporary_command,
-                                ).await?;
+                                ).await?);
                                 force_draw = true;
                             }
                             PrefixAction::Send(bytes) => send(framed, ClientMessage::Input { bytes }).await?,
@@ -1473,7 +1475,7 @@ async fn run(
                                     .as_mut()
                                     .expect("accepted clipboard copy is active");
                                 state.finalize_copy(copy_id, bytes);
-                                notice = None;
+                                toasts.clear();
                                 pump_copy_mode(framed, state).await?;
                                 force_draw = true;
                             }
@@ -1484,7 +1486,7 @@ async fn run(
                                 .and_then(|state| state.finish_clipboard(request_id))
                                 .is_some()
                             {
-                                notice = Some(format!(
+                                toasts.error(format!(
                                     "COPY FAILED · press y to retry · {message}"
                                 ));
                                 pump_copy_mode(
@@ -1500,6 +1502,10 @@ async fn run(
             _ = async { time::sleep_until(cheatsheet_at.expect("deadline is set")).await }, if cheatsheet_at.is_some() => {
                 cheatsheet_at = None;
                 cheatsheet_visible = true;
+                force_draw = true;
+            }
+            _ = async { time::sleep_until(toasts.deadline().expect("deadline is set")).await }, if toasts.deadline().is_some() => {
+                toasts.expire();
                 force_draw = true;
             }
             Some(()) = git_update.recv() => {
@@ -1529,7 +1535,7 @@ async fn run(
                 )
                 .then(|| resources.attention_revision(focused_terminal_id))
                 .flatten()
-                .filter(|_| rename.is_none() && notice.is_none());
+                .filter(|_| rename.is_none() && !toasts.is_visible());
                 let draw_started = std::time::Instant::now();
                 io::stdout().sync_update(|stdout| -> io::Result<()> {
                     let mut rendered_cursor = None;
@@ -1648,11 +1654,7 @@ async fn run(
                             rename.render(layout.terminal, frame.buffer_mut());
                         }
                         if let Some(copy_mode) = copy_mode.as_ref() {
-                            copy_mode.render(
-                                layout.terminal,
-                                frame.buffer_mut(),
-                                notice.as_deref(),
-                            );
+                            copy_mode.render(layout.terminal, frame.buffer_mut());
                         }
                         if app_overlay_clear(
                             surface.is_none(),
@@ -1660,17 +1662,18 @@ async fn run(
                             copy_mode.is_none(),
                             cheatsheet_visible,
                         )
-                            && notice.is_none()
+                            && !toasts.is_visible()
                             && let Some(cursor) = cursor
                         {
                             frame.set_cursor_position((cursor.column, cursor.row));
                             rendered_cursor = Some(cursor);
                         }
-                        if copy_mode.is_none()
-                            && let Some(message) = notice.as_deref()
-                        {
-                            render_notice(area, frame.buffer_mut(), message);
-                        }
+                        toasts.render(
+                            area,
+                            ui.tab_bar.position,
+                            &ui.styles,
+                            frame.buffer_mut(),
+                        );
                     })?;
                     host_cursor.apply(stdout, rendered_cursor)
                 })??;
@@ -1695,7 +1698,12 @@ fn refresh_surface_resources(
 ) {
     match surface.as_mut() {
         Some(ClientSurface::Navigator(nav)) => {
-            nav.accept_resources_with_notifications(snapshot, focused, notifications);
+            nav.accept_resources_with_notifications(
+                snapshot,
+                focused,
+                workspace_history,
+                notifications,
+            );
         }
         Some(ClientSurface::WorkspaceSidebar(sidebar)) => {
             sidebar.accept_resources(snapshot, focused, workspace_history, notifications);
@@ -2282,11 +2290,13 @@ async fn dispatch_client_action(
     host: Rect,
     ui: &mut UiConfig,
     temporary_command: &mut Option<TemporaryCommandSurface>,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Option<Toast>> {
     match action {
         ClientAction::RunCommand(index) => {
             let Some(command) = ui.bindings.command(index) else {
-                return Ok(Some("configured command is no longer available".into()));
+                return Ok(Some(Toast::error(
+                    "configured command is no longer available",
+                )));
             };
             let content = temporary_command_content(host);
             let size = TerminalSize {
@@ -2299,7 +2309,10 @@ async fn dispatch_client_action(
             {
                 Ok(command) => *temporary_command = Some(command),
                 Err(error) => {
-                    return Ok(Some(format!("command failed · {}", one_line_error(&error))));
+                    return Ok(Some(Toast::error(format!(
+                        "command failed · {}",
+                        one_line_error(&error)
+                    ))));
                 }
             }
         }
@@ -2314,13 +2327,13 @@ async fn dispatch_client_action(
                 *ui = reloaded;
                 resize_view(framed, host, view, resources, ui).await?;
                 view.invalidate_drawn();
-                return Ok(Some("config reloaded".into()));
+                return Ok(Some(Toast::info("config reloaded")));
             }
             Err(error) => {
-                return Ok(Some(format!(
+                return Ok(Some(Toast::error(format!(
                     "config reload failed · {}",
                     one_line_error(&error)
-                )));
+                ))));
             }
         },
         ClientAction::EnterCopyMode => {
@@ -2331,11 +2344,12 @@ async fn dispatch_client_action(
             }
         }
         ClientAction::OpenNavigator => {
-            let mut navigator = NavigatorState::open(view.focused());
+            let mut navigator = NavigatorState::open();
             if let Some(snapshot) = resources.snapshot() {
                 navigator.accept_resources_with_notifications(
                     snapshot,
                     view.focused(),
+                    workspace_history,
                     resources.notifications(),
                 );
             }
@@ -2343,10 +2357,10 @@ async fn dispatch_client_action(
         }
         ClientAction::OpenWorkspaceSidebar => {
             let Some(snapshot) = resources.snapshot() else {
-                return Ok(Some("workspaces are still loading".into()));
+                return Ok(Some(Toast::error("workspaces are still loading")));
             };
             if !view.resources_are_current(snapshot) {
-                return Ok(Some("navigation is syncing".into()));
+                return Ok(Some(Toast::error("navigation is syncing")));
             }
             let Some(sidebar) = WorkspaceSidebarState::open(
                 snapshot,
@@ -2354,32 +2368,32 @@ async fn dispatch_client_action(
                 workspace_history,
                 resources.notifications(),
             ) else {
-                return Ok(Some("no workspace available".into()));
+                return Ok(Some(Toast::error("no workspace available")));
             };
             *surface = Some(ClientSurface::WorkspaceSidebar(sidebar));
         }
         ClientAction::OpenTabBar => {
             let Some(snapshot) = resources.snapshot() else {
-                return Ok(Some("tabs are still loading".into()));
+                return Ok(Some(Toast::error("tabs are still loading")));
             };
             if !view.resources_are_current(snapshot) {
-                return Ok(Some("navigation is syncing".into()));
+                return Ok(Some(Toast::error("navigation is syncing")));
             }
             if client_layout(host, ui, resources.workspace_count(view.focused()))
                 .tab_bar
                 .is_none()
             {
-                return Ok(Some("tab bar is unavailable at this size".into()));
+                return Ok(Some(Toast::error("tab bar is unavailable at this size")));
             }
             let Some(tab_bar) = TabBarState::open(snapshot, view.focused(), workspace_history)
             else {
-                return Ok(Some("no tab available".into()));
+                return Ok(Some(Toast::error("no tab available")));
             };
             *surface = Some(ClientSurface::TabBar(tab_bar));
         }
         ClientAction::OpenNotifications => {
             let Some(snapshot) = resources.snapshot() else {
-                return Ok(Some("notifications are still loading".into()));
+                return Ok(Some(Toast::error("notifications are still loading")));
             };
             *surface = Some(ClientSurface::Notifications(NotificationsDialog::open(
                 snapshot,
@@ -2388,10 +2402,10 @@ async fn dispatch_client_action(
         }
         ClientAction::FocusNextNotification => {
             let Some(snapshot) = resources.snapshot() else {
-                return Ok(Some("notifications are still loading".into()));
+                return Ok(Some(Toast::error("notifications are still loading")));
             };
             if !view.resources_are_current(snapshot) {
-                return Ok(Some("navigation is syncing".into()));
+                return Ok(Some(Toast::error("navigation is syncing")));
             }
             let Some(pane_id) = resources
                 .notifications()
@@ -2429,10 +2443,10 @@ async fn dispatch_client_action(
         }
         ClientAction::FocusNextTab | ClientAction::FocusPreviousTab => {
             let Some(snapshot) = resources.snapshot() else {
-                return Ok(Some("tabs are still loading".into()));
+                return Ok(Some(Toast::error("tabs are still loading")));
             };
             if !view.resources_are_current(snapshot) {
-                return Ok(Some("navigation is syncing".into()));
+                return Ok(Some(Toast::error("navigation is syncing")));
             }
             let forward = action == ClientAction::FocusNextTab;
             if let Some(pane_id) = workspace_history.adjacent_tab(snapshot, view.focused(), forward)
@@ -2451,10 +2465,10 @@ async fn dispatch_client_action(
         }
         ClientAction::FocusNextWorkspace | ClientAction::FocusPreviousWorkspace => {
             let Some(snapshot) = resources.snapshot() else {
-                return Ok(Some("workspaces are still loading".into()));
+                return Ok(Some(Toast::error("workspaces are still loading")));
             };
             if !view.resources_are_current(snapshot) {
-                return Ok(Some("navigation is syncing".into()));
+                return Ok(Some(Toast::error("navigation is syncing")));
             }
             let forward = action == ClientAction::FocusNextWorkspace;
             if let Some(pane_id) =
@@ -2531,10 +2545,10 @@ async fn dispatch_client_action(
         }
         ClientAction::FocusLast(scope) => {
             let Some(snapshot) = resources.snapshot() else {
-                return Ok(Some("resources are still loading".into()));
+                return Ok(Some(Toast::error("resources are still loading")));
             };
             if !view.resources_are_current(snapshot) {
-                return Ok(Some("navigation is syncing".into()));
+                return Ok(Some(Toast::error("navigation is syncing")));
             }
             let pane_id = match scope {
                 NavigationScope::Pane => workspace_history.last_pane(snapshot, view.focused()),
@@ -2547,7 +2561,7 @@ async fn dispatch_client_action(
                 }
             };
             let Some(pane_id) = pane_id else {
-                return Ok(Some(format!("no previous {}", scope.label())));
+                return Ok(Some(Toast::error(format!("no previous {}", scope.label()))));
             };
             if let Some(request) = focus.begin(FocusOrigin::for_scope(scope)) {
                 send_request(
@@ -2563,15 +2577,15 @@ async fn dispatch_client_action(
         }
         ClientAction::FocusTab(number) => {
             let Some(snapshot) = resources.snapshot() else {
-                return Ok(Some("tabs are still loading".into()));
+                return Ok(Some(Toast::error("tabs are still loading")));
             };
             if !view.resources_are_current(snapshot) {
-                return Ok(Some("navigation is syncing".into()));
+                return Ok(Some(Toast::error("navigation is syncing")));
             }
             let number = number.get();
             let Some(pane_id) = workspace_history.numbered_tab(snapshot, view.focused(), number)
             else {
-                return Ok(Some(format!("tab {number} is unavailable")));
+                return Ok(Some(Toast::error(format!("tab {number} is unavailable"))));
             };
             if let Some(request) = focus.begin(FocusOrigin::Tab) {
                 send_request(
@@ -2587,7 +2601,7 @@ async fn dispatch_client_action(
         }
         ClientAction::TogglePaneZoom => {
             let Some(_) = view.toggle_zoom() else {
-                return Ok(Some("pane zoom needs more than one pane".into()));
+                return Ok(Some(Toast::error("pane zoom needs more than one pane")));
             };
             resize_view(framed, host, view, resources, ui).await?;
         }
@@ -3686,20 +3700,6 @@ fn render_shared_size_gutter(
     {
         cell.set_symbol("┘").set_style(border_style);
     }
-}
-
-fn render_notice(area: Rect, buffer: &mut Buffer, message: &str) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let text = format!(" {message} ");
-    buffer.set_stringn(
-        area.x,
-        area.y + area.height - 1,
-        text,
-        usize::from(area.width),
-        Style::default().add_modifier(Modifier::REVERSED),
-    );
 }
 
 fn one_line_error(error: &anyhow::Error) -> String {

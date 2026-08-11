@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Replaced transient bottom-row notices with compact corner toasts that avoid the tab bar, dismiss confirmations automatically, and keep errors visible until the next keypress.
+- Fuzzy navigator results now collapse redundant descendant matches, and the in-client navigator returns parent selections to their most recently focused pane.
 - Unified workspace-sidebar visibility into visible, auto-hide-when-single, and hidden modes; the current mode is shown in the sidebar and `h` cycles it.
 - Added trusted configurable keybinding commands that run in a framed temporary full-terminal PTY, inherit the focused pane's working directory, and restore the prior layout on exit.
 - Unnamed tabs now follow the foreground process in their focused pane; explicit tab titles remain fixed, and fuzzy navigator results show their complete ancestry with matched characters emphasized.

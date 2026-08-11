@@ -297,7 +297,7 @@ impl CopyModeState {
         self.copied_bytes = None;
     }
 
-    pub fn render(&self, area: Rect, buffer: &mut Buffer, notice: Option<&str>) {
+    pub fn render(&self, area: Rect, buffer: &mut Buffer) {
         if area.width == 0 || area.height == 0 {
             return;
         }
@@ -311,21 +311,13 @@ impl CopyModeState {
             }
         }
         let text = if self.clipboard.is_some() {
-            notice.map_or_else(
-                || " COPY · clipboard pending… ".to_owned(),
-                |notice| format!(" COPY · clipboard pending · {} ", sanitize(notice)),
-            )
+            " COPY · clipboard pending… ".to_owned()
         } else if self.copied_bytes.is_some()
             || self
                 .pending
                 .is_some_and(|(_, reply)| reply == CopyModeReply::Finalized)
         {
-            notice.map_or_else(
-                || " COPY · finalizing clipboard… ".to_owned(),
-                |notice| format!(" COPY · finalizing · {} ", sanitize(notice)),
-            )
-        } else if let Some(notice) = notice {
-            format!(" {} ", sanitize(notice))
+            " COPY · finalizing clipboard… ".to_owned()
         } else if let Some(query) = self.search_prompt.as_ref() {
             format!(" /{} · Enter find · Esc closes prompt ", sanitize(query))
         } else if self.pending.is_some() || !self.actions.is_empty() {
@@ -635,12 +627,11 @@ mod tests {
 
         let area = Rect::new(0, 0, 60, 1);
         let mut buffer = Buffer::empty(area);
-        state.render(area, &mut buffer, Some(notice));
+        state.render(area, &mut buffer);
         let status = (12..60)
             .map(|column| buffer[(column, 0)].symbol())
             .collect::<String>();
         assert!(status.contains("clipboard pending"));
-        assert!(status.contains("action was not"));
 
         assert_eq!(state.finish_clipboard(prepared.request_id), Some(copy_id));
         state.finalize_copy(copy_id, 42);
@@ -683,18 +674,18 @@ mod tests {
         let area = Rect::new(0, 0, 60, 3);
         let mut buffer = Buffer::filled(area, ratatui::buffer::Cell::new("x"));
         let state = CopyModeState::enter(TerminalId::new());
-        state.render(area, &mut buffer, Some("copy failed · retry"));
+        state.render(area, &mut buffer);
 
         assert_eq!(buffer[(0, 0)].symbol(), "x");
         assert_eq!(buffer[(0, 2)].symbol(), "x");
         let cue = (12..60)
             .map(|column| buffer[(column, 0)].symbol())
             .collect::<String>();
-        assert!(cue.contains("copy failed"));
+        assert!(cue.contains("COPY"));
 
         let tiny = Rect::new(0, 0, 4, 1);
         let mut tiny_buffer = Buffer::filled(tiny, ratatui::buffer::Cell::new("x"));
-        state.render(tiny, &mut tiny_buffer, None);
+        state.render(tiny, &mut tiny_buffer);
         assert_eq!(
             (0..4)
                 .map(|column| tiny_buffer[(column, 0)].symbol())

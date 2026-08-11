@@ -8322,15 +8322,26 @@ async fn keyboard_copy_search_uses_client_pbcopy_and_surfaces_success_and_failur
     for iteration in 1..=10 {
         // Begin, search, select, move, and copy arrive without pacing. The
         // client must preserve this exact order behind one wire request.
-        success.send(b"\x02[/COPY_TARGET\r \x1b[Fy");
+        let expected = if iteration % 2 == 0 {
+            "COPY_READY"
+        } else {
+            "COPY_TARGET λ雪"
+        };
+        success.send(format!("\x02[/{expected}\r \x1b[Fy").as_bytes());
         let captured = PathBuf::from(format!("{}.{}", capture.display(), iteration));
         wait_for(DEADLINE, || {
-            fs::read_to_string(&captured).is_ok_and(|text| text == "COPY_TARGET λ雪")
+            fs::read_to_string(&captured).is_ok_and(|text| text == expected)
         })
         .await;
-        assert_eq!(fs::read_to_string(captured).unwrap(), "COPY_TARGET λ雪");
+        assert_eq!(fs::read_to_string(captured).unwrap(), expected);
         success.wait_for("copied ").await;
         success.clear_output();
+        if iteration < 10 {
+            success.send(b"\x02d");
+            success.wait_success().await;
+            success = spawn_client(false);
+            success.wait_for("COPY_READY").await;
+        }
     }
     assert!(!input_log.exists(), "copy-mode keys reached the PTY");
     success.send(b"\x02d");

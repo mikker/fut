@@ -7,7 +7,11 @@ if [[ -n "${FUT_TERMINAL_ID:-}" ]]; then
   exit 1
 fi
 
-FUT_BIN=${FUT_BIN:-fut}
+PROJECT_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+if [[ -z "${FUT_BIN+x}" ]]; then
+  FUT_BIN="$PROJECT_ROOT/target/debug/fut"
+  (cd "$PROJECT_ROOT" && cargo build --quiet)
+fi
 for command in "$FUT_BIN" python3 cmatrix pipes.sh htop genact; do
   command -v "$command" >/dev/null || {
     echo "Required command not found: $command" >&2

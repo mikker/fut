@@ -21,6 +21,7 @@ use super::dialog::{
     render_title,
 };
 use super::fuzzy;
+use super::navigation::NavigationHistory;
 use super::notifications::{ActivityIndicator, NotificationState};
 
 const MAX_WIDTH: u16 = 80;
@@ -74,11 +75,7 @@ pub(super) enum NavigatorAction {
 }
 
 impl NavigatorState {
-    pub fn open(_current: &SelectedTarget) -> Self {
-        Self::open_global()
-    }
-
-    pub fn open_global() -> Self {
+    pub fn open() -> Self {
         Self {
             rows: Vec::new(),
             filtered: Vec::new(),
@@ -97,26 +94,40 @@ impl NavigatorState {
         snapshot: &ResourceSnapshot,
         current: &SelectedTarget,
     ) -> bool {
-        self.accept_resources_with_notifications(snapshot, current, &NotificationState::default())
+        let mut history = NavigationHistory::default();
+        history.record(current);
+        self.accept_resources_with_notifications(
+            snapshot,
+            current,
+            &history,
+            &NotificationState::default(),
+        )
     }
 
     pub fn accept_resources_with_notifications(
         &mut self,
         snapshot: &ResourceSnapshot,
         current: &SelectedTarget,
+        history: &NavigationHistory,
         notifications: &NotificationState,
     ) -> bool {
-        self.accept_optional_resources(snapshot, Some(current), notifications)
+        self.accept_optional_resources(snapshot, Some(current), history, notifications)
     }
 
     pub fn accept_global_resources(&mut self, snapshot: &ResourceSnapshot) -> bool {
-        self.accept_optional_resources(snapshot, None, &NotificationState::default())
+        self.accept_optional_resources(
+            snapshot,
+            None,
+            &NavigationHistory::default(),
+            &NotificationState::default(),
+        )
     }
 
     fn accept_optional_resources(
         &mut self,
         snapshot: &ResourceSnapshot,
         current: Option<&SelectedTarget>,
+        history: &NavigationHistory,
         notifications: &NotificationState,
     ) -> bool {
         if self
@@ -128,7 +139,7 @@ impl NavigatorState {
         let old_key = self.rows.get(self.selected).map(|row| row.key);
         let old_index = self.selected;
         let previous_status = self.status.clone();
-        self.rows = flatten_optional(snapshot, current, notifications);
+        self.rows = flatten_optional(snapshot, current, history, notifications);
         self.refilter();
         self.resource_revision = Some(snapshot.revision);
         self.status = match previous_status {
@@ -280,10 +291,7 @@ impl NavigatorState {
     }
 
     fn refilter(&mut self) {
-        self.filtered = fuzzy::ranked(
-            &self.query,
-            self.rows.iter().map(|row| row.search_path.clone()),
-        );
+        self.filtered = minimal_fuzzy_matches(&self.query, &self.rows);
         self.scroll = 0;
     }
 
@@ -681,23 +689,51 @@ fn matches_request(pending: Option<Uuid>, response: Option<Uuid>) -> bool {
     pending.is_some() && pending == response
 }
 
+fn minimal_fuzzy_matches(query: &str, rows: &[NavigatorRow]) -> Vec<usize> {
+    let mut ranked = fuzzy::ranked(query, rows.iter().map(|row| row.search_path.clone()));
+    if query.is_empty() {
+        return ranked;
+    }
+
+    let mut path_matches = vec![false; rows.len()];
+    for &index in &ranked {
+        path_matches[index] = true;
+    }
+
+    let mut ancestor_matches = Vec::new();
+    let mut visible = vec![false; rows.len()];
+    for (index, row) in rows.iter().enumerate() {
+        ancestor_matches.truncate(usize::from(row.depth));
+        let direct_match = fuzzy::matched_char_indices(query, &row.label).is_some();
+        visible[index] = path_matches[index]
+            && (direct_match || !ancestor_matches.iter().any(|matched| *matched));
+        ancestor_matches.push(path_matches[index]);
+    }
+    ranked.retain(|index| visible[*index]);
+    ranked
+}
+
 #[cfg(test)]
 pub(super) fn flatten(snapshot: &ResourceSnapshot, current: &SelectedTarget) -> Vec<NavigatorRow> {
-    flatten_with_notifications(snapshot, current, &NotificationState::default())
+    let mut history = NavigationHistory::default();
+    history.record(current);
+    flatten_with_notifications(snapshot, current, &history, &NotificationState::default())
 }
 
 #[cfg(test)]
 fn flatten_with_notifications(
     snapshot: &ResourceSnapshot,
     current: &SelectedTarget,
+    history: &NavigationHistory,
     notifications: &NotificationState,
 ) -> Vec<NavigatorRow> {
-    flatten_optional(snapshot, Some(current), notifications)
+    flatten_optional(snapshot, Some(current), history, notifications)
 }
 
 fn flatten_optional(
     snapshot: &ResourceSnapshot,
     current: Option<&SelectedTarget>,
+    history: &NavigationHistory,
     notifications: &NotificationState,
 ) -> Vec<NavigatorRow> {
     let current_ancestry = current.and_then(|current| {
@@ -729,13 +765,6 @@ fn flatten_optional(
     for session in &snapshot.sessions {
         let session_path = session.name.clone();
         let session_current = Some(session.id) == current_session_id;
-        let session_target = if session_current
-            && current_pane_id.is_some_and(|pane| pane_available_session(session, pane, false))
-        {
-            current_pane_id
-        } else {
-            first_pane_session(session, false)
-        };
         rows.push(NavigatorRow {
             key: ResourceKey::Session(session.id),
             depth: 0,
@@ -743,7 +772,9 @@ fn flatten_optional(
             search_path: session_path.clone(),
             current: session_current,
             closing: session.closing,
-            destination: (!session.closing).then_some(session_target).flatten(),
+            destination: (!session.closing)
+                .then(|| history.session_destination(session))
+                .flatten(),
             activity: notifications.indicator(
                 &session
                     .workspaces
@@ -758,14 +789,6 @@ fn flatten_optional(
             let workspace_path = format!("{session_path} › {}", workspace.name);
             let closing = session.closing || workspace.closing;
             let workspace_current = session_current && Some(workspace.id) == current_workspace_id;
-            let target = if workspace_current
-                && current_pane_id
-                    .is_some_and(|pane| pane_available_workspace(workspace, pane, session.closing))
-            {
-                current_pane_id
-            } else {
-                first_pane_workspace(workspace, closing)
-            };
             rows.push(NavigatorRow {
                 key: ResourceKey::Workspace(workspace.id),
                 depth: 1,
@@ -773,7 +796,9 @@ fn flatten_optional(
                 search_path: workspace_path.clone(),
                 current: workspace_current,
                 closing,
-                destination: (!closing).then_some(target).flatten(),
+                destination: (!closing)
+                    .then(|| history.workspace_destination(workspace))
+                    .flatten(),
                 activity: notifications.indicator(
                     &workspace
                         .tabs
@@ -792,20 +817,6 @@ fn flatten_optional(
                 let tab_path = format!("{workspace_path} › {tab_label}");
                 let tab_current = workspace_current && Some(tab.id) == current_tab_id;
                 let tab_closing = closing || tab.closing;
-                let target = if tab_current
-                    && tab
-                        .panes
-                        .iter()
-                        .any(|pane| Some(pane.id) == current_pane_id && !pane.closing)
-                    && !tab_closing
-                {
-                    current_pane_id
-                } else {
-                    tab.panes
-                        .iter()
-                        .find(|pane| !tab_closing && !pane.closing)
-                        .map(|pane| pane.id)
-                };
                 rows.push(NavigatorRow {
                     key: ResourceKey::Tab(tab.id),
                     depth: 2,
@@ -813,7 +824,9 @@ fn flatten_optional(
                     search_path: tab_path.clone(),
                     current: tab_current,
                     closing: tab_closing,
-                    destination: (!tab_closing).then_some(target).flatten(),
+                    destination: (!tab_closing)
+                        .then(|| history.tab_destination(tab))
+                        .flatten(),
                     activity: notifications.indicator(&tab.panes),
                 });
                 for (index, pane) in tab.panes.iter().enumerate() {
@@ -833,58 +846,6 @@ fn flatten_optional(
         }
     }
     rows
-}
-
-fn first_pane_session(
-    session: &crate::resources::SessionSnapshot,
-    inherited: bool,
-) -> Option<PaneId> {
-    session
-        .workspaces
-        .iter()
-        .find_map(|workspace| first_pane_workspace(workspace, inherited || session.closing))
-}
-
-fn first_pane_workspace(
-    workspace: &crate::resources::WorkspaceSnapshot,
-    inherited: bool,
-) -> Option<PaneId> {
-    workspace
-        .tabs
-        .iter()
-        .filter(|tab| !tab.closing)
-        .flat_map(|tab| &tab.panes)
-        .find(|pane| !inherited && !workspace.closing && !pane.closing)
-        .map(|pane| pane.id)
-}
-
-fn pane_available_session(
-    session: &crate::resources::SessionSnapshot,
-    pane_id: PaneId,
-    inherited: bool,
-) -> bool {
-    !inherited
-        && !session.closing
-        && session
-            .workspaces
-            .iter()
-            .any(|workspace| pane_available_workspace(workspace, pane_id, session.closing))
-}
-
-fn pane_available_workspace(
-    workspace: &crate::resources::WorkspaceSnapshot,
-    pane_id: PaneId,
-    inherited: bool,
-) -> bool {
-    !inherited
-        && !workspace.closing
-        && workspace.tabs.iter().any(|tab| {
-            !tab.closing
-                && tab
-                    .panes
-                    .iter()
-                    .any(|pane| pane.id == pane_id && !pane.closing)
-        })
 }
 
 fn put(buffer: &mut Buffer, x: u16, y: u16, width: u16, text: &str, style: Style) {
@@ -1009,9 +970,35 @@ mod tests {
     }
 
     #[test]
+    fn parent_destinations_use_the_most_recently_focused_pane() {
+        let (mut snapshot, current, remembered_pane_id) = fixture();
+        let remembered_pane = &mut snapshot.sessions[0].workspaces[0].tabs[0].panes[1];
+        remembered_pane.closing = false;
+        let mut remembered = current.clone();
+        remembered.pane_id = remembered_pane_id;
+        remembered.terminal_id = remembered_pane.terminal_id;
+        let mut history = NavigationHistory::default();
+        history.record(&current);
+        history.record(&remembered);
+
+        let rows = flatten_with_notifications(
+            &snapshot,
+            &current,
+            &history,
+            &NotificationState::default(),
+        );
+
+        assert!(
+            rows[..3]
+                .iter()
+                .all(|row| row.destination == Some(remembered_pane_id))
+        );
+    }
+
+    #[test]
     fn global_navigator_has_no_current_row_and_selects_a_live_destination() {
         let (snapshot, current, _) = fixture();
-        let mut nav = NavigatorState::open_global();
+        let mut nav = NavigatorState::open();
 
         assert!(nav.accept_global_resources(&snapshot));
         assert!(nav.rows.iter().all(|row| !row.current));
@@ -1087,7 +1074,7 @@ mod tests {
     #[test]
     fn navigation_clamps_pages_and_snapshot_refreshes_preserve_selection() {
         let (mut snapshot, current, _) = fixture();
-        let mut nav = NavigatorState::open(&current);
+        let mut nav = NavigatorState::open();
         assert!(nav.accept_resources(&snapshot, &current));
         assert!(!nav.accept_resources(&snapshot, &current));
         assert_eq!(nav.selected, 3);
@@ -1107,7 +1094,7 @@ mod tests {
     fn fuzzy_search_matches_hidden_paths_keeps_rows_and_names_unnamed_tabs() {
         let (mut snapshot, current, _) = fixture();
         snapshot.sessions[0].workspaces[0].tabs[0].name.clear();
-        let mut nav = NavigatorState::open(&current);
+        let mut nav = NavigatorState::open();
         nav.accept_resources(&snapshot, &current);
 
         assert_eq!(
@@ -1137,6 +1124,38 @@ mod tests {
             nav.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), 10),
             NavigatorAction::Close
         ));
+    }
+
+    #[test]
+    fn fuzzy_search_collapses_descendants_matched_only_through_their_ancestor() {
+        let (snapshot, current, _) = fixture();
+        let mut nav = NavigatorState::open();
+        nav.accept_resources(&snapshot, &current);
+
+        nav.paste("sessión");
+        assert_eq!(nav.filtered, [0]);
+
+        nav.query.clear();
+        nav.refilter();
+        nav.paste("workspace tab");
+        assert_eq!(
+            nav.filtered
+                .iter()
+                .map(|index| nav.rows[*index].key)
+                .collect::<Vec<_>>(),
+            [ResourceKey::Tab(current.tab_id)]
+        );
+
+        nav.query.clear();
+        nav.refilter();
+        nav.paste("pane 1");
+        assert_eq!(
+            nav.filtered
+                .iter()
+                .map(|index| nav.rows[*index].key)
+                .collect::<Vec<_>>(),
+            [ResourceKey::Pane(current.pane_id)]
+        );
     }
 
     #[test]
@@ -1208,7 +1227,7 @@ mod tests {
     #[test]
     fn only_matching_request_ids_complete_pending_switches() {
         let (snapshot, current, _) = fixture();
-        let mut nav = NavigatorState::open(&current);
+        let mut nav = NavigatorState::open();
         assert!(nav.accept_resources(&snapshot, &current));
         assert!(!nav.switch_selected(None));
         assert!(!nav.switch_error(None, "unsolicited".into()));
@@ -1228,7 +1247,7 @@ mod tests {
     #[test]
     fn switching_keeps_rows_and_disables_actions_while_error_allows_retry() {
         let (snapshot, current, _) = fixture();
-        let mut nav = NavigatorState::open(&current);
+        let mut nav = NavigatorState::open();
         nav.accept_resources(&snapshot, &current);
         let selected = nav.selected;
         let rows = nav.rows.clone();
@@ -1253,10 +1272,9 @@ mod tests {
 
     #[test]
     fn escape_and_q_cannot_cancel_a_pending_switch() {
-        let (_, current, _) = fixture();
         for code in [KeyCode::Esc, KeyCode::Char('q')] {
             let request = Uuid::new_v4();
-            let mut nav = NavigatorState::open(&current);
+            let mut nav = NavigatorState::open();
             nav.begin_switch(request);
 
             assert!(matches!(
@@ -1271,7 +1289,7 @@ mod tests {
     #[test]
     fn render_keeps_hierarchy_visible_and_puts_progress_or_error_in_footer() {
         let (snapshot, current, _) = fixture();
-        let mut nav = NavigatorState::open(&current);
+        let mut nav = NavigatorState::open();
         nav.accept_resources(&snapshot, &current);
         nav.selected = 0;
         let (ready, buffer) = rendered(&mut nav, 50, 9);
@@ -1302,7 +1320,7 @@ mod tests {
     #[test]
     fn small_hosts_drop_the_title_before_the_footer() {
         let (snapshot, current, _) = fixture();
-        let mut nav = NavigatorState::open(&current);
+        let mut nav = NavigatorState::open();
         nav.accept_resources(&snapshot, &current);
         // Height 6 leaves a 4-row interior: footer but no title.
         let (text, _) = rendered(&mut nav, 40, 6);
@@ -1322,7 +1340,7 @@ mod tests {
             destination: None,
             activity: None,
         };
-        let mut nav = NavigatorState::open(&fixture().1);
+        let mut nav = NavigatorState::open();
         nav.rows = [0, 1, 2, 3, 3, 2, 3, 1, 2, 3, 0, 1, 2, 3]
             .into_iter()
             .map(row)
@@ -1431,7 +1449,7 @@ mod tests {
     fn enter_acts_on_the_visibly_selected_filtered_result() {
         let (mut snapshot, current, other_pane) = fixture();
         snapshot.sessions[0].workspaces[0].tabs[0].panes[1].closing = false;
-        let mut nav = NavigatorState::open(&current);
+        let mut nav = NavigatorState::open();
         nav.accept_resources(&snapshot, &current);
 
         nav.paste("pane 2");
@@ -1447,7 +1465,7 @@ mod tests {
     #[test]
     fn enter_does_nothing_when_filter_has_no_results() {
         let (snapshot, current, _) = fixture();
-        let mut nav = NavigatorState::open(&current);
+        let mut nav = NavigatorState::open();
         nav.accept_resources(&snapshot, &current);
 
         nav.paste("definitely absent");
@@ -1462,7 +1480,7 @@ mod tests {
     #[test]
     fn enter_is_disabled_while_loading_and_for_closing_rows_and_escape_closes() {
         let (snapshot, current, _) = fixture();
-        let mut nav = NavigatorState::open(&current);
+        let mut nav = NavigatorState::open();
         assert!(matches!(
             nav.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 3),
             NavigatorAction::Stay
@@ -1483,7 +1501,7 @@ mod tests {
     fn rendering_tiny_and_narrow_unicode_buffers_never_panics_and_keeps_selection_visible() {
         let (snapshot, current, _) = fixture();
         for (width, height) in [(1, 1), (2, 2), (5, 3), (12, 4)] {
-            let mut nav = NavigatorState::open(&current);
+            let mut nav = NavigatorState::open();
             nav.accept_resources(&snapshot, &current);
             nav.selected = nav.rows.len() - 1;
             let area = Rect::new(0, 0, width, height);
