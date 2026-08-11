@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Development builds now identify themselves with a `-dev` suffix in `fut -v` output.
 - Fixed workspace Git branch and diff metadata remaining stale while the UI is idle.
 - Combined resource navigation and fuzzy search in the global navigator; `Ctrl-b f` and the `open_jump` binding have been removed.
 - Command search now uses fuzzy matching, and unnamed navigator tabs display positional names.

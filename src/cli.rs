@@ -18,6 +18,11 @@ mod completion;
 
 // Bundled at build time so the printed skill always matches this binary's release.
 const AGENT_SKILL: &str = include_str!("../skills/fut/SKILL.md");
+const BUILD_VERSION: &str = if cfg!(debug_assertions) {
+    concat!(env!("CARGO_PKG_VERSION"), "-dev")
+} else {
+    env!("CARGO_PKG_VERSION")
+};
 
 use clap_complete::engine::ArgValueCompleter;
 
@@ -45,7 +50,7 @@ use crate::{
 #[derive(Parser)]
 #[command(
     name = "fut",
-    version,
+    version = BUILD_VERSION,
     about = "A project-oriented terminal multiplexer",
     after_help = "Enable shell completion with, for example: source <(COMPLETE=zsh fut)"
 )]
@@ -2782,6 +2787,9 @@ mod tests {
             };
             assert!(!error.use_stderr());
             assert_eq!(error.exit_code(), 0);
+            if args.contains(&"-v") || args.contains(&"-V") || args.contains(&"--version") {
+                assert_eq!(error.to_string(), format!("fut {BUILD_VERSION}\n"));
+            }
         }
     }
 
