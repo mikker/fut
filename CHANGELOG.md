@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fixed workspace Git branch and diff metadata remaining stale while the UI is idle.
+
 ## 0.3
 
 - Added `-v` as the short form of `--version` (`-V` remains supported).

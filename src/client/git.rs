@@ -8,7 +8,7 @@ use std::{
 
 use tokio::{process::Command, sync::mpsc, time};
 
-const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+pub(super) const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const GIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -20,6 +20,7 @@ pub(super) struct GitStatus {
 
 struct Entry {
     requested: Instant,
+    in_flight: bool,
     status: Option<GitStatus>,
 }
 
@@ -62,9 +63,10 @@ impl GitStatusCache {
             return false;
         };
         match entries.get_mut(root) {
-            Some(entry) if entry.requested.elapsed() < REFRESH_INTERVAL => false,
+            Some(entry) if entry.in_flight || entry.requested.elapsed() < REFRESH_INTERVAL => false,
             Some(entry) => {
                 entry.requested = Instant::now();
+                entry.in_flight = true;
                 true
             }
             None => {
@@ -72,6 +74,7 @@ impl GitStatusCache {
                     root.to_owned(),
                     Entry {
                         requested: Instant::now(),
+                        in_flight: true,
                         status: None,
                     },
                 );
@@ -81,12 +84,17 @@ impl GitStatusCache {
     }
 
     fn store(&self, root: &Path, status: Option<GitStatus>) {
+        let mut changed = false;
         if let Ok(mut entries) = self.entries.lock()
             && let Some(entry) = entries.get_mut(root)
         {
-            entry.status = status;
+            entry.in_flight = false;
+            if entry.status != status {
+                entry.status = status;
+                changed = true;
+            }
         }
-        if let Some(updates) = self.updates.as_ref() {
+        if changed && let Some(updates) = self.updates.as_ref() {
             let _ = updates.try_send(());
         }
     }
@@ -142,6 +150,47 @@ fn parse_shortstat(summary: &str) -> GitStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    async fn wait_for_status(cache: &GitStatusCache, root: &Path, expected: &GitStatus) {
+        for _ in 0..500 {
+            if cache.status(root).as_ref() == Some(expected) {
+                return;
+            }
+            time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("git status did not become {expected:?}");
+    }
+
+    async fn wait_for_idle(cache: &GitStatusCache, root: &Path) {
+        for _ in 0..500 {
+            if !cache.entries.lock().expect("cache lock")[root].in_flight {
+                return;
+            }
+            time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("git refresh did not finish");
+    }
+
+    fn expire(cache: &GitStatusCache, root: &Path) {
+        cache
+            .entries
+            .lock()
+            .expect("cache lock")
+            .get_mut(root)
+            .expect("cached repository")
+            .requested = Instant::now() - REFRESH_INTERVAL;
+    }
+
+    fn git(root: &Path, arguments: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(arguments)
+            .current_dir(root)
+            .output()
+            .expect("git runs");
+        assert!(output.status.success(), "git {:?} failed", arguments);
+    }
 
     #[test]
     fn shortstat_parsing_reads_counts_and_tolerates_missing_lanes() {
@@ -177,5 +226,55 @@ mod tests {
             time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(cache.status(root), None);
+    }
+
+    #[tokio::test]
+    async fn status_can_refresh_after_the_interval_without_a_draw() {
+        let repository = TempDir::new().expect("temporary repository");
+        let root = repository.path();
+        git(root, &["init", "--initial-branch=main"]);
+        git(root, &["config", "user.name", "Fut Test"]);
+        git(root, &["config", "user.email", "fut@example.test"]);
+        fs::write(root.join("tracked"), "first\n").expect("write fixture");
+        git(root, &["add", "tracked"]);
+        git(root, &["commit", "-m", "fixture"]);
+
+        let (updates, mut update) = mpsc::channel(1);
+        let cache = GitStatusCache::new(updates);
+        cache.refresh(std::iter::once(root));
+        wait_for_status(
+            &cache,
+            root,
+            &GitStatus {
+                branch: "main".into(),
+                insertions: 0,
+                deletions: 0,
+            },
+        )
+        .await;
+        assert_eq!(update.try_recv(), Ok(()));
+
+        expire(&cache, root);
+        cache.refresh(std::iter::once(root));
+        wait_for_idle(&cache, root).await;
+        assert!(
+            update.try_recv().is_err(),
+            "unchanged status does not redraw"
+        );
+
+        fs::write(root.join("tracked"), "first\nsecond\n").expect("change fixture");
+        expire(&cache, root);
+        cache.refresh(std::iter::once(root));
+        wait_for_status(
+            &cache,
+            root,
+            &GitStatus {
+                branch: "main".into(),
+                insertions: 1,
+                deletions: 0,
+            },
+        )
+        .await;
+        assert_eq!(update.try_recv(), Ok(()));
     }
 }

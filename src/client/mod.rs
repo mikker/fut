@@ -401,6 +401,8 @@ async fn run(
     redraw.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut spinner = time::interval(Duration::from_millis(100));
     spinner.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut git_refresh = time::interval(git::REFRESH_INTERVAL);
+    git_refresh.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let (clipboard_results, mut clipboard_result) = mpsc::channel(1);
     let (git_updates, mut git_update) = mpsc::channel(1);
     let git = GitStatusCache::new(git_updates);
@@ -1477,20 +1479,21 @@ async fn run(
             Some(()) = git_update.recv() => {
                 force_draw = true;
             }
+            _ = git_refresh.tick(), if resources.snapshot().is_some() => {
+                let snapshot = resources.snapshot().expect("git refresh requires resources");
+                git.refresh(
+                    snapshot
+                        .sessions
+                        .iter()
+                        .flat_map(|session| &session.workspaces)
+                        .map(|workspace| workspace.root.as_path()),
+                );
+            }
             _ = spinner.tick(), if resources.has_working() => {
                 spinner_frame = spinner_frame.wrapping_add(1);
                 force_draw = true;
             }
             _ = redraw.tick(), if force_draw || view.needs_draw() => {
-                if let Some(snapshot) = resources.snapshot() {
-                    git.refresh(
-                        snapshot
-                            .sessions
-                            .iter()
-                            .flat_map(|session| &session.workspaces)
-                            .map(|workspace| workspace.root.as_path()),
-                    );
-                }
                 let focused_terminal_id = view.focused().terminal_id;
                 let rendered_attention = matches!(
                     surface.as_ref(),
