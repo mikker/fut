@@ -88,7 +88,8 @@ These may appear in `ui.workspace_sidebar.header` and `footer`:
 | `session.name` | Current session name |
 | `workspace.name` | Current workspace name |
 | `workspace.icon` | Workspace icon from the selected preset |
-| `sidebar.status` | Contextual controls, switching progress, or a retryable error; empty in the passive sidebar |
+| `sidebar.visibility` | Current compact visibility label: `visible`, `hide with one`, or `hidden` |
+| `sidebar.status` | Current visibility plus contextual controls, switching progress, or a retryable error |
 
 ## Future dynamic tokens
 

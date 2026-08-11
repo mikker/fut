@@ -625,6 +625,7 @@ fn render_sidebar_chrome(
 ) -> ratatui::text::Line<'static> {
     let current = model.items.iter().find(|item| item.current);
     let icons = ui.icons.resolve();
+    let visibility = ui.workspace_sidebar.visibility.label();
     render_token_segments(
         segments,
         None,
@@ -637,13 +638,19 @@ fn render_sidebar_chrome(
                 TokenValue::plain(sanitize(current.map_or("", |item| item.name.as_str())))
             }
             "workspace.icon" => TokenValue::plain(icons.workspace.clone()),
+            "sidebar.visibility" => TokenValue::plain(visibility),
             "sidebar.status" => match status {
-                Some(WorkspaceStatus::Ready) => TokenValue::plain(" press ? for hotkeys"),
-                Some(WorkspaceStatus::Switching) => TokenValue::plain(" switching…"),
-                Some(WorkspaceStatus::Error(message)) => {
-                    TokenValue::styled(format!(" {message} · retry"), SemanticStyle::Error)
+                Some(WorkspaceStatus::Ready) => {
+                    TokenValue::plain(format!(" {visibility} · h cycle · ? hotkeys"))
                 }
-                None => TokenValue::plain(""),
+                Some(WorkspaceStatus::Switching) => {
+                    TokenValue::plain(format!(" switching… · {visibility}"))
+                }
+                Some(WorkspaceStatus::Error(message)) => TokenValue::styled(
+                    format!(" {message} · retry · {visibility}"),
+                    SemanticStyle::Error,
+                ),
+                None => TokenValue::plain(format!(" {visibility}")),
             },
             _ => TokenValue::plain(""),
         },
@@ -1178,7 +1185,7 @@ mod tests {
             9,
             WorkspaceSidebarPosition::Left,
         );
-        assert!(ready.contains("press ? for hotkeys"));
+        assert!(ready.contains("hide with one"));
         assert_eq!(buffer[(0, 3)].bg, ratatui::style::Color::DarkGray);
         assert!(
             !buffer[(0, 3)].modifier.contains(Modifier::UNDERLINED),

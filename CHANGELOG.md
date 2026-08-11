@@ -2,10 +2,10 @@
 
 ## Unreleased
 
-- Unified workspace-sidebar visibility into visible, auto-hide-when-single, and hidden modes; `h` now cycles these modes inside the sidebar.
-- Added trusted configurable keybinding commands that run in a temporary full-terminal PTY, inherit the focused pane's working directory, and restore the prior layout on exit.
-- Unnamed tabs now follow the foreground process in their focused pane; explicit tab titles remain fixed.
-- Multiple terminal windows can now attach to the same session; its terminal geometry follows the smallest attached client and restores as clients resize or detach.
+- Unified workspace-sidebar visibility into visible, auto-hide-when-single, and hidden modes; the current mode is shown in the sidebar and `h` cycles it.
+- Added trusted configurable keybinding commands that run in a framed temporary full-terminal PTY, inherit the focused pane's working directory, and restore the prior layout on exit.
+- Unnamed tabs now follow the foreground process in their focused pane; explicit tab titles remain fixed, and fuzzy navigator results show their complete ancestry with matched characters emphasized.
+- Multiple terminal windows can now attach to the same session; its terminal geometry follows the smallest attached client, restores as clients resize or detach, and larger clients show the shared-size margin with a subtle border and sparse muted star field.
 - Fixed multi-second backward paging latency in delta/less when running a development build.
 
 - Development builds now identify themselves with a `-dev` suffix in `fut -v` output.

@@ -3,8 +3,10 @@ use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Modifier, Style},
+    text::{Line, Span},
 };
 use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
 use crate::{
@@ -13,6 +15,7 @@ use crate::{
     resources::{ResourceSnapshot, TargetSelector},
 };
 
+use super::config::{SemanticStyle, StylesConfig};
 use super::dialog::{
     dialog_area, fill_row, frame_inner, render_footer, render_frame, render_list_scrollbar,
     render_title,
@@ -434,7 +437,13 @@ impl NavigatorState {
         }
     }
 
-    pub fn render(&mut self, host: Rect, spinner_frame: usize, buffer: &mut Buffer) {
+    pub fn render(
+        &mut self,
+        host: Rect,
+        spinner_frame: usize,
+        styles: &StylesConfig,
+        buffer: &mut Buffer,
+    ) {
         let area = render_frame(dialog_area(host, MAX_WIDTH, MAX_HEIGHT), buffer);
         if area.width == 0 || area.height == 0 {
             return;
@@ -519,12 +528,6 @@ impl NavigatorState {
                         } else {
                             " "
                         };
-                        let text = format!(
-                            "{}{} {}",
-                            "  ".repeat(usize::from(row.depth)),
-                            marker,
-                            row.label
-                        );
                         let mut style = Style::default();
                         if row.closing {
                             style = style.add_modifier(Modifier::DIM);
@@ -537,7 +540,25 @@ impl NavigatorState {
                         }
                         let y = body_y + line as u16;
                         fill_row(Rect::new(area.x, y, area.width, 1), style, buffer);
-                        put(buffer, area.x, y, area.width, &text, style);
+                        if self.query.is_empty() {
+                            let text = format!(
+                                "{}{} {}",
+                                "  ".repeat(usize::from(row.depth)),
+                                marker,
+                                row.label
+                            );
+                            put(buffer, area.x, y, area.width, &text, style);
+                        } else {
+                            render_fuzzy_path(
+                                buffer,
+                                Rect::new(area.x, y, area.width, 1),
+                                marker,
+                                &row.search_path,
+                                &self.query,
+                                style,
+                                styles.apply(SemanticStyle::Muted, style),
+                            );
+                        }
                     }
                 }
                 let body = Rect::new(
@@ -550,6 +571,94 @@ impl NavigatorState {
             }
         }
     }
+}
+
+fn render_fuzzy_path(
+    buffer: &mut Buffer,
+    area: Rect,
+    marker: &str,
+    path: &str,
+    query: &str,
+    style: Style,
+    muted: Style,
+) {
+    let matched = fuzzy::matched_char_indices(query, path).unwrap_or_default();
+    let highlighted = style
+        .remove_modifier(Modifier::DIM)
+        .add_modifier(Modifier::BOLD);
+    let prefix = format!(" {marker} ");
+    let available = usize::from(area.width).saturating_sub(prefix.width());
+    let mut spans = vec![Span::styled(prefix, muted)];
+    let mut character_index = 0;
+    let path = path
+        .graphemes(true)
+        .map(|grapheme| {
+            let start = character_index;
+            character_index += grapheme.chars().count();
+            let is_matched = matched
+                .iter()
+                .any(|index| (start..character_index).contains(index));
+            (grapheme, is_matched)
+        })
+        .collect::<Vec<_>>();
+    let path_len = path.len();
+    let total_width = path
+        .iter()
+        .map(|(grapheme, _)| grapheme.width())
+        .sum::<usize>();
+    let (start, end) = if total_width > available {
+        let end = path
+            .iter()
+            .rposition(|(_, is_matched)| *is_matched)
+            .map_or(path_len, |last| (last + 2).min(path_len));
+        let suffix_width = usize::from(end < path_len);
+        let mut remaining = available.saturating_sub(1 + suffix_width);
+        let mut start = end;
+        while start > 0 {
+            let width = path[start - 1].0.width();
+            if width > remaining {
+                break;
+            }
+            remaining -= width;
+            start -= 1;
+        }
+        (start, end)
+    } else {
+        (0, path_len)
+    };
+    if start > 0 {
+        spans.push(Span::styled("…", muted));
+    }
+    let mut run = String::new();
+    let mut run_matched = None;
+    for (grapheme, is_matched) in path.into_iter().skip(start).take(end.saturating_sub(start)) {
+        if run_matched.is_some_and(|current| current != is_matched) {
+            spans.push(Span::styled(
+                std::mem::take(&mut run),
+                if run_matched == Some(true) {
+                    highlighted
+                } else {
+                    muted
+                },
+            ));
+        }
+        run_matched = Some(is_matched);
+        run.push_str(grapheme);
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(
+            run,
+            if run_matched == Some(true) {
+                highlighted
+            } else {
+                muted
+            },
+        ));
+    }
+    if end < path_len {
+        spans.push(Span::styled("…", muted));
+    }
+    buffer.set_line(area.x, area.y, &Line::from(spans), area.width);
 }
 
 fn chrome_rows(height: u16) -> (u16, u16) {
@@ -863,7 +972,7 @@ mod tests {
     fn rendered(nav: &mut NavigatorState, width: u16, height: u16) -> (String, Buffer) {
         let area = Rect::new(0, 0, width, height);
         let mut buffer = Buffer::empty(area);
-        nav.render(area, 0, &mut buffer);
+        nav.render(area, 0, &StylesConfig::default(), &mut buffer);
         let text = (0..height)
             .map(|y| {
                 (0..width)
@@ -1028,6 +1137,72 @@ mod tests {
             nav.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), 10),
             NavigatorAction::Close
         ));
+    }
+
+    #[test]
+    fn fuzzy_render_shows_the_complete_path_and_only_emphasizes_matches() {
+        let area = Rect::new(0, 0, 40, 1);
+        let mut buffer = Buffer::empty(area);
+        render_fuzzy_path(
+            &mut buffer,
+            area,
+            " ",
+            "fut › work › nvim",
+            "fuvim",
+            Style::default(),
+            Style::default().add_modifier(Modifier::DIM),
+        );
+        let text = (0..area.width)
+            .map(|column| buffer[(column, 0)].symbol())
+            .collect::<String>();
+
+        assert!(text.contains("fut › work › nvim"));
+        assert!(buffer[(3, 0)].modifier.contains(Modifier::BOLD));
+        assert!(!buffer[(3, 0)].modifier.contains(Modifier::DIM));
+        assert!(buffer[(5, 0)].modifier.contains(Modifier::DIM));
+        assert!(buffer[(17, 0)].modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn fuzzy_render_keeps_a_late_match_visible_when_the_path_is_too_wide() {
+        let area = Rect::new(0, 0, 24, 1);
+        let mut buffer = Buffer::empty(area);
+        render_fuzzy_path(
+            &mut buffer,
+            area,
+            " ",
+            "界界界界 wide session › workspace › matching-pane",
+            "matching",
+            Style::default(),
+            Style::default().add_modifier(Modifier::DIM),
+        );
+        let text = (0..area.width)
+            .map(|column| buffer[(column, 0)].symbol())
+            .collect::<String>();
+
+        assert!(text.contains("…"));
+        assert!(text.contains("matching"));
+    }
+
+    #[test]
+    fn fuzzy_render_never_clips_through_a_grapheme() {
+        let area = Rect::new(0, 0, 15, 1);
+        let mut buffer = Buffer::empty(area);
+        render_fuzzy_path(
+            &mut buffer,
+            area,
+            " ",
+            "prefixprefix 👩‍💻 matching",
+            "matching",
+            Style::default(),
+            Style::default().add_modifier(Modifier::DIM),
+        );
+        let text = (0..area.width)
+            .map(|column| buffer[(column, 0)].symbol())
+            .collect::<String>();
+
+        assert!(text.contains("…👩‍💻"), "{text:?}");
+        assert!(text.contains("matching"), "{text:?}");
     }
 
     #[test]
@@ -1313,7 +1488,7 @@ mod tests {
             nav.selected = nav.rows.len() - 1;
             let area = Rect::new(0, 0, width, height);
             let mut buffer = Buffer::empty(area);
-            nav.render(area, 0, &mut buffer);
+            nav.render(area, 0, &StylesConfig::default(), &mut buffer);
             assert!(nav.scroll <= nav.selected);
         }
     }

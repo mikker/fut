@@ -73,6 +73,7 @@ use tokio::{
     time,
 };
 use tokio_util::codec::Framed;
+use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
 use sidebar::{WorkspaceSidebarAction, WorkspaceSidebarState, render_workspace_sidebar};
@@ -201,7 +202,8 @@ pub async fn attach_navigator(socket_path: &Path) -> anyhow::Result<()> {
 
     let guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let selector = initial_navigator(&mut terminal, &mut navigator_connection, snapshot).await?;
+    let selector =
+        initial_navigator(&mut terminal, &mut navigator_connection, snapshot, &ui).await?;
     drop(navigator_connection);
     let Some(selector) = selector else {
         drop(terminal);
@@ -327,6 +329,7 @@ async fn initial_navigator(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     snapshot: ResourceSnapshot,
+    ui: &UiConfig,
 ) -> anyhow::Result<Option<TargetSelector>> {
     let mut navigator = NavigatorState::open_global();
     navigator.accept_global_resources(&snapshot);
@@ -336,7 +339,7 @@ async fn initial_navigator(
         terminal.draw(|frame| {
             let area = frame.area();
             frame.render_widget(Clear, area);
-            navigator.render(area, 0, frame.buffer_mut());
+            navigator.render(area, 0, &ui.styles, frame.buffer_mut());
         })?;
         tokio::select! {
             name = termination.recv() => bail!("terminated by {name}"),
@@ -780,6 +783,11 @@ async fn run(
                             force_draw = true;
                         }
                     }
+                    ServerMessage::TerminalResized { terminal_id, size } => {
+                        if view.complete_resize(request_id, terminal_id, size) {
+                            force_draw = true;
+                        }
+                    }
                     ServerMessage::Pong { .. }
                     | ServerMessage::CommandCompleted { .. }
                     | ServerMessage::LocationOpened { .. } => {}
@@ -802,6 +810,9 @@ async fn run(
                     }
                     ServerMessage::Detached => break,
                     ServerMessage::Error { code, message } => {
+                        if view.reject_resize(request_id) {
+                            continue;
+                        }
                         let copy_failure = copy_mode
                             .as_mut()
                             .map_or(CopyModeErrorDisposition::Ignored, |copy_mode| {
@@ -921,7 +932,11 @@ async fn run(
                         temporary_command.as_ref().expect("command exists").paste(text).await?;
                     }
                     Event::Resize(columns, rows) if temporary_command.is_some() && columns > 0 && rows > 0 => {
-                        temporary_command.as_ref().expect("command exists").resize(TerminalSize { columns, rows }).await?;
+                        let content = temporary_command_content(Rect::new(0, 0, columns, rows));
+                        temporary_command.as_ref().expect("command exists").resize(TerminalSize {
+                            columns: content.width,
+                            rows: content.height,
+                        }).await?;
                         force_draw = true;
                     }
                     Event::Mouse(_) if temporary_command.is_some() => {}
@@ -1521,12 +1536,24 @@ async fn run(
                     terminal.draw(|frame| {
                         let area = frame.area();
                         if let Some(command) = temporary_command.as_ref() {
-                            frame.render_widget(Screen(&command.screen), area);
-                            if command.screen.cursor.visible {
-                                frame.set_cursor_position((command.screen.cursor.column, command.screen.cursor.row));
+                            let content = render_temporary_command_frame(
+                                area,
+                                command.title(),
+                                &ui.styles,
+                                frame.buffer_mut(),
+                            );
+                            frame.render_widget(Screen(&command.screen), content);
+                            if command.screen.cursor.visible
+                                && command.screen.cursor.column < content.width
+                                && command.screen.cursor.row < content.height
+                            {
+                                frame.set_cursor_position((
+                                    content.x + command.screen.cursor.column,
+                                    content.y + command.screen.cursor.row,
+                                ));
                                 rendered_cursor = Some(RenderedCursor {
-                                    column: command.screen.cursor.column,
-                                    row: command.screen.cursor.row,
+                                    column: content.x + command.screen.cursor.column,
+                                    row: content.y + command.screen.cursor.row,
                                     shape: command.screen.cursor.shape,
                                     blinking: command.screen.cursor.blinking,
                                 });
@@ -1602,7 +1629,7 @@ async fn run(
                         }
                         match surface.as_mut() {
                             Some(ClientSurface::Navigator(nav)) => {
-                                nav.render(area, spinner_frame, frame.buffer_mut());
+                                nav.render(area, spinner_frame, &ui.styles, frame.buffer_mut());
                             }
                             Some(ClientSurface::Notifications(dialog)) => {
                                 dialog.render(area, frame.buffer_mut());
@@ -2261,9 +2288,10 @@ async fn dispatch_client_action(
             let Some(command) = ui.bindings.command(index) else {
                 return Ok(Some("configured command is no longer available".into()));
             };
+            let content = temporary_command_content(host);
             let size = TerminalSize {
-                columns: host.width,
-                rows: host.height,
+                columns: content.width,
+                rows: content.height,
             };
             let fallback = std::env::current_dir().unwrap_or_else(|_| "/".into());
             match TemporaryCommandSurface::spawn(command, view.focused().child_pid, &fallback, size)
@@ -2849,6 +2877,8 @@ struct PaneState {
     /// [`ScreenDelta`] rows spliced in as they arrive.
     pending: Option<ScreenSnapshot>,
     last_size: Option<TerminalSize>,
+    resize_request_id: Option<Uuid>,
+    constrained_size: bool,
     /// Set once a [`ClientMessage::RefreshTerminal`] has been sent for an
     /// unapplicable delta, and cleared when a full snapshot arrives, so a
     /// run of mismatched deltas sends at most one refresh request.
@@ -2871,8 +2901,25 @@ impl PaneState {
             drawn_revision: None,
             pending: None,
             last_size: None,
+            resize_request_id: None,
+            constrained_size: false,
             refresh_requested: false,
         }
+    }
+
+    fn complete_resize(&mut self, request_id: Uuid, size: TerminalSize) -> bool {
+        if self.resize_request_id != Some(request_id) {
+            return false;
+        }
+        self.observe_authoritative_size(size);
+        self.resize_request_id = None;
+        true
+    }
+
+    fn observe_authoritative_size(&mut self, size: TerminalSize) {
+        self.constrained_size = self.last_size.is_some_and(|requested| {
+            size.columns < requested.columns || size.rows < requested.rows
+        });
     }
 
     fn accept(&mut self, screen: ScreenSnapshot) -> bool {
@@ -2881,6 +2928,9 @@ impl PaneState {
             .is_some_and(|revision| screen.revision <= revision)
         {
             return false;
+        }
+        if self.resize_request_id.is_none() {
+            self.observe_authoritative_size(screen.size);
         }
         self.newest_revision = Some(screen.revision);
         self.pending = Some(screen);
@@ -2909,6 +2959,9 @@ impl PaneState {
         current.revision = delta.revision;
         current.cursor = delta.cursor;
         current.scroll = delta.scroll;
+        if self.resize_request_id.is_none() {
+            self.observe_authoritative_size(delta.size);
+        }
         self.newest_revision = Some(delta.revision);
         DeltaOutcome::Applied
     }
@@ -3070,6 +3123,47 @@ impl ViewState {
             .iter_mut()
             .find(|pane| pane.target.terminal_id == terminal_id)
             .is_some_and(|pane| pane.accept(screen))
+    }
+
+    fn mark_resize_requested(&mut self, terminal_id: TerminalId, request_id: Uuid) {
+        if let Some(pane) = self
+            .panes
+            .iter_mut()
+            .find(|pane| pane.target.terminal_id == terminal_id)
+        {
+            pane.resize_request_id = Some(request_id);
+        }
+    }
+
+    fn complete_resize(
+        &mut self,
+        request_id: Option<Uuid>,
+        terminal_id: TerminalId,
+        size: TerminalSize,
+    ) -> bool {
+        let Some(request_id) = request_id else {
+            return false;
+        };
+        self.panes
+            .iter_mut()
+            .find(|pane| pane.target.terminal_id == terminal_id)
+            .is_some_and(|pane| pane.complete_resize(request_id, size))
+    }
+
+    fn reject_resize(&mut self, request_id: Option<Uuid>) -> bool {
+        let Some(request_id) = request_id else {
+            return false;
+        };
+        let Some(pane) = self
+            .panes
+            .iter_mut()
+            .find(|pane| pane.resize_request_id == Some(request_id))
+        else {
+            return false;
+        };
+        pane.resize_request_id = None;
+        pane.last_size = None;
+        true
     }
 
     /// Applies a delta for `terminal_id`'s pane, if that pane is currently
@@ -3314,6 +3408,7 @@ impl ViewState {
             Vec::new()
         } else {
             pane.last_size = Some(size);
+            pane.constrained_size = false;
             vec![(pane.target.terminal_id, size)]
         }
     }
@@ -3328,7 +3423,14 @@ async fn resize_view(
 ) -> anyhow::Result<()> {
     let terminal = client_layout(area, ui, resources.workspace_count(view.focused())).terminal;
     for (terminal_id, size) in view.resize_requests(terminal, ui.pane_layout) {
-        send(framed, ClientMessage::Resize { terminal_id, size }).await?;
+        let request_id = Uuid::new_v4();
+        view.mark_resize_requested(terminal_id, request_id);
+        send_request(
+            framed,
+            Some(request_id),
+            ClientMessage::Resize { terminal_id, size },
+        )
+        .await?;
     }
     Ok(())
 }
@@ -3373,6 +3475,76 @@ impl HostCursorState {
         self.applied = Some(style);
         Ok(())
     }
+}
+
+fn temporary_command_content(area: Rect) -> Rect {
+    if area.width < 4 || area.height < 3 {
+        area
+    } else {
+        Rect::new(area.x + 1, area.y + 1, area.width - 2, area.height - 2)
+    }
+}
+
+fn render_temporary_command_frame(
+    area: Rect,
+    title: &str,
+    styles: &config::StylesConfig,
+    buffer: &mut Buffer,
+) -> Rect {
+    let content = temporary_command_content(area);
+    if content == area {
+        return content;
+    }
+    let muted = styles.apply(
+        config::SemanticStyle::Muted,
+        styles.apply(config::SemanticStyle::Normal, Style::default()),
+    );
+    let title_style = muted.add_modifier(Modifier::BOLD);
+    for column in area.x..area.right() {
+        if let Some(top) = buffer.cell_mut((column, area.y)) {
+            top.set_symbol("┄").set_style(muted);
+        }
+        if let Some(bottom) = buffer.cell_mut((column, area.bottom() - 1)) {
+            bottom.set_symbol("┄").set_style(muted);
+        }
+    }
+    for row in area.y..area.bottom() {
+        if let Some(left) = buffer.cell_mut((area.x, row)) {
+            left.set_symbol("┆").set_style(muted);
+        }
+        if let Some(right) = buffer.cell_mut((area.right() - 1, row)) {
+            right.set_symbol("┆").set_style(muted);
+        }
+    }
+    for (column, row) in [
+        (area.x, area.y),
+        (area.right() - 1, area.y),
+        (area.x, area.bottom() - 1),
+        (area.right() - 1, area.bottom() - 1),
+    ] {
+        if let Some(cell) = buffer.cell_mut((column, row)) {
+            cell.set_symbol("·").set_style(muted);
+        }
+    }
+    buffer.set_stringn(
+        area.x + 2,
+        area.y,
+        format!(" {} ", sanitize(title)),
+        usize::from(area.width.saturating_sub(4)),
+        title_style,
+    );
+    let footer = " temporary · returns when command exits ";
+    let footer_width = u16::try_from(footer.width()).unwrap_or(u16::MAX);
+    if area.width > footer_width.saturating_add(4) {
+        buffer.set_stringn(
+            area.right() - footer_width - 2,
+            area.bottom() - 1,
+            footer,
+            usize::from(footer_width),
+            muted,
+        );
+    }
+    content
 }
 
 fn render_view(
@@ -3420,6 +3592,21 @@ fn render_view(
         let Some(screen) = pane.pending.as_ref() else {
             continue;
         };
+        if pane.constrained_size {
+            render_shared_size_gutter(
+                *content,
+                screen.size,
+                styles.apply(
+                    config::SemanticStyle::Muted,
+                    styles.apply(config::SemanticStyle::Normal, Style::default()),
+                ),
+                styles.apply(
+                    config::SemanticStyle::Divider,
+                    styles.apply(config::SemanticStyle::Normal, Style::default()),
+                ),
+                buffer,
+            );
+        }
         Screen(screen).render(*content, buffer);
         render_scrollbar(
             screen.scroll,
@@ -3442,6 +3629,63 @@ fn render_view(
         }
     }
     cursor
+}
+
+/// A larger attached client cannot grow a shared PTY beyond the smallest
+/// client. Make that intentional constraint visible instead of presenting an
+/// unexplained blank rectangle.
+fn render_shared_size_gutter(
+    area: Rect,
+    screen: TerminalSize,
+    star_style: Style,
+    border_style: Style,
+    buffer: &mut Buffer,
+) {
+    if screen.columns >= area.width && screen.rows >= area.height {
+        return;
+    }
+    let right_border = (screen.columns < area.width).then_some(screen.columns);
+    let bottom_border = (screen.rows < area.height).then_some(screen.rows);
+    for row in 0..area.height {
+        for column in 0..area.width {
+            let border_cell = (right_border == Some(column) && row < screen.rows)
+                || (bottom_border == Some(row) && column < screen.columns)
+                || (right_border == Some(column) && bottom_border == Some(row));
+            if (column < screen.columns && row < screen.rows) || border_cell {
+                continue;
+            }
+            let hash = u32::from(column).wrapping_mul(73_856_093)
+                ^ u32::from(row).wrapping_mul(19_349_663);
+            let symbol = match hash % 67 {
+                0 => "✦",
+                1 => "⋆",
+                2 => "·",
+                _ => " ",
+            };
+            if let Some(cell) = buffer.cell_mut((area.x + column, area.y + row)) {
+                cell.set_symbol(symbol).set_style(star_style);
+            }
+        }
+    }
+    if let Some(column) = right_border {
+        for row in 0..screen.rows.min(area.height) {
+            if let Some(cell) = buffer.cell_mut((area.x + column, area.y + row)) {
+                cell.set_symbol("│").set_style(border_style);
+            }
+        }
+    }
+    if let Some(row) = bottom_border {
+        for column in 0..screen.columns.min(area.width) {
+            if let Some(cell) = buffer.cell_mut((area.x + column, area.y + row)) {
+                cell.set_symbol("─").set_style(border_style);
+            }
+        }
+    }
+    if let (Some(column), Some(row)) = (right_border, bottom_border)
+        && let Some(cell) = buffer.cell_mut((area.x + column, area.y + row))
+    {
+        cell.set_symbol("┘").set_style(border_style);
+    }
 }
 
 fn render_notice(area: Rect, buffer: &mut Buffer, message: &str) {
@@ -3834,6 +4078,47 @@ mod tests {
     }
 
     #[test]
+    fn shared_size_gutter_waits_for_the_correlated_resize_response() {
+        let snapshot = |revision, size: TerminalSize| {
+            ScreenSnapshot::new(
+                revision,
+                size,
+                vec![crate::domain::Cell::default(); size.cell_count().unwrap()],
+                crate::domain::Cursor {
+                    column: 0,
+                    row: 0,
+                    visible: true,
+                    shape: Default::default(),
+                    blinking: false,
+                },
+            )
+            .unwrap()
+        };
+        let requested = TerminalSize {
+            columns: 100,
+            rows: 30,
+        };
+        let shared = TerminalSize {
+            columns: 80,
+            rows: 24,
+        };
+        let mut pane = PaneState::new(targets(1).remove(0));
+        pane.last_size = Some(requested);
+        let request_id = Uuid::new_v4();
+        pane.resize_request_id = Some(request_id);
+        assert!(pane.accept(snapshot(1, shared)));
+        assert!(!pane.constrained_size, "stale pre-resize frame stays plain");
+        assert!(!pane.complete_resize(Uuid::new_v4(), shared));
+        assert!(pane.complete_resize(request_id, shared));
+        assert!(pane.constrained_size, "daemon confirmed the shared minimum");
+        assert!(pane.accept(snapshot(3, requested)));
+        assert!(
+            !pane.constrained_size,
+            "the gutter clears when the PTY expands"
+        );
+    }
+
+    #[test]
     fn cursor_only_delta_updates_the_interactive_cursor_style() {
         let target = targets(1).remove(0);
         let terminal_id = target.terminal_id;
@@ -3955,6 +4240,19 @@ mod tests {
             state
                 .resize_requests(area, PaneLayoutPolicy::Accordion)
                 .is_empty()
+        );
+        let request_id = Uuid::new_v4();
+        state.mark_resize_requested(first, request_id);
+        assert!(state.reject_resize(Some(request_id)));
+        assert_eq!(
+            state.resize_requests(area, PaneLayoutPolicy::Accordion),
+            [(
+                first,
+                TerminalSize {
+                    columns: 24,
+                    rows: 4
+                }
+            )]
         );
         assert_eq!(
             state.resize_requests(Rect::new(0, 0, 37, 4), PaneLayoutPolicy::Accordion),
@@ -5051,6 +5349,64 @@ mod tests {
                 .add_modifier
                 .contains(Modifier::REVERSED)
         );
+    }
+
+    #[test]
+    fn temporary_commands_have_one_dashed_frame_and_an_inset_pty() {
+        let area = Rect::new(0, 0, 48, 8);
+        let mut buffer = Buffer::empty(area);
+        let content = render_temporary_command_frame(
+            area,
+            "Repository diff",
+            &config::StylesConfig::default(),
+            &mut buffer,
+        );
+
+        assert_eq!(content, Rect::new(1, 1, 46, 6));
+        let text = (0..area.height)
+            .map(|row| {
+                (0..area.width)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Repository diff"));
+        assert!(text.contains("temporary · returns when command exits"));
+        assert_eq!(buffer[(0, 0)].symbol(), "·");
+        assert_eq!(buffer[(1, 0)].symbol(), "┄");
+        assert_eq!(buffer[(0, 1)].symbol(), "┆");
+    }
+
+    #[test]
+    fn shared_terminal_gutter_is_a_muted_sparse_star_field() {
+        let area = Rect::new(0, 0, 30, 10);
+        let mut buffer = Buffer::empty(area);
+        render_shared_size_gutter(
+            area,
+            TerminalSize {
+                columns: 4,
+                rows: 2,
+            },
+            Style::default().add_modifier(Modifier::DIM),
+            Style::default().add_modifier(Modifier::BOLD),
+            &mut buffer,
+        );
+
+        for row in 0..2 {
+            for column in 0..4 {
+                assert_eq!(buffer[(column, row)].symbol(), " ");
+            }
+        }
+        assert_eq!(buffer[(4, 0)].symbol(), "│");
+        assert_eq!(buffer[(0, 2)].symbol(), "─");
+        assert_eq!(buffer[(4, 2)].symbol(), "┘");
+        let stars = (0..area.height)
+            .flat_map(|row| (0..area.width).map(move |column| (column, row)))
+            .filter(|&(column, row)| matches!(buffer[(column, row)].symbol(), "·" | "⋆" | "✦"))
+            .count();
+        assert!(stars > 0);
+        assert!(stars < 20, "the star field stays sparse");
     }
 
     #[cfg(unix)]

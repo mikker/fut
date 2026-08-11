@@ -21,7 +21,7 @@ use crate::{
 /// Protocol version used by released Fut 0.1 builds.
 pub const PROTOCOL_VERSION_0_1: u16 = 0;
 /// Current clients and daemons require an exact protocol match.
-pub const PROTOCOL_VERSION: u16 = 16;
+pub const PROTOCOL_VERSION: u16 = 17;
 /// Enough for 50,000 individually styled MessagePack-encoded cells while
 /// remaining a firm pre-allocation bound for the length-delimited transport.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
@@ -49,7 +49,6 @@ pub enum ClientMode {
 pub enum AcknowledgedCommand {
     Input,
     Paste,
-    Resize,
     ReportAgent,
     TerminalInput,
     CloseTarget,
@@ -431,6 +430,10 @@ pub enum ServerMessage {
     },
     Pong {
         daemon_pid: u32,
+    },
+    TerminalResized {
+        terminal_id: TerminalId,
+        size: TerminalSize,
     },
     CommandCompleted {
         command: AcknowledgedCommand,
@@ -1023,7 +1026,7 @@ mod tests {
         let envelope = Envelope {
             request_id: Some(Uuid::new_v4()),
             message: ServerMessage::CommandCompleted {
-                command: AcknowledgedCommand::Resize,
+                command: AcknowledgedCommand::Input,
             },
         };
         let frame = encode_payload(&envelope).unwrap();
@@ -1101,7 +1104,7 @@ mod tests {
             switched
         );
         assert_eq!(PROTOCOL_VERSION_0_1, 0);
-        assert_eq!(PROTOCOL_VERSION, 16);
+        assert_eq!(PROTOCOL_VERSION, 17);
 
         let watch = ClientMessage::WatchResources;
         assert_eq!(
@@ -1166,6 +1169,17 @@ mod tests {
         assert_eq!(
             decode_payload::<ClientMessage>(&encode_payload(&resize).unwrap()).unwrap(),
             resize
+        );
+        let resized = ServerMessage::TerminalResized {
+            terminal_id,
+            size: TerminalSize {
+                columns: 80,
+                rows: 24,
+            },
+        };
+        assert_eq!(
+            decode_payload::<ServerMessage>(&encode_payload(&resized).unwrap()).unwrap(),
+            resized
         );
         let resize_split = ClientMessage::ResizeSplit {
             tab_id: TabId::new(),

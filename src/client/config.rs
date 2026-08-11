@@ -53,6 +53,14 @@ impl WorkspaceSidebarVisibility {
             Self::Hidden => Self::Visible,
         };
     }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Visible => "visible",
+            Self::AutoHideWhenSingle => "hide with one",
+            Self::Hidden => "hidden",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
@@ -1227,7 +1235,12 @@ fn token_allowed(scope: TokenScope, token: &str) -> bool {
         ),
         TokenScope::Sidebar => matches!(
             token,
-            "fut" | "session.name" | "workspace.name" | "workspace.icon" | "sidebar.status"
+            "fut"
+                | "session.name"
+                | "workspace.name"
+                | "workspace.icon"
+                | "sidebar.status"
+                | "sidebar.visibility"
         ),
     }
 }
@@ -1302,6 +1315,7 @@ segments = [{ token = "tab.icon" }, { text = " " }, { token = "tab.name" }]
 [ui.workspace_sidebar]
 position = "right"
 width = 30
+visibility = "visible"
 header = [{ token = "session.name" }]
 footer = [{ token = "sidebar.status" }]
 
@@ -1322,7 +1336,7 @@ right = [{ token = "workspace.tab_count" }]
         assert_eq!(config.workspace_sidebar.width, 30);
         assert_eq!(
             config.workspace_sidebar.visibility,
-            WorkspaceSidebarVisibility::AutoHideWhenSingle
+            WorkspaceSidebarVisibility::Visible
         );
         assert_eq!(config.tab_bar.item.min_width, 8);
         assert_eq!(config.icons.resolve().workspace, "W");

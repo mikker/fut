@@ -675,7 +675,7 @@ impl Attachment {
         &self.focused.terminal
     }
 
-    async fn resize_focused(&mut self, size: TerminalSize) -> Result<(), CommandError> {
+    async fn resize_focused(&mut self, size: TerminalSize) -> Result<TerminalSize, CommandError> {
         self.size = size;
         let geometry = self
             .focused
@@ -684,7 +684,11 @@ impl Attachment {
             .ok_or(CommandError::Stopped)?;
         self.viewport_offsets
             .remove(&self.focused.selected.terminal_id);
-        self.focused.terminal.resize_for_attachment(geometry).await
+        self.focused
+            .terminal
+            .resize_for_attachment(geometry)
+            .await?;
+        Ok(geometry.size)
     }
 
     fn size(&self) -> TerminalSize {
@@ -2167,13 +2171,25 @@ async fn handle_connection(
                         if let Err(error) = size.validate() {
                             send_error(&mut connection, envelope.request_id, "invalid_size", &error.to_string()).await?;
                         } else if terminal_id == attachment.focused.selected.terminal_id {
-                                command_response(
-                                &mut connection,
-                                envelope.request_id,
-                                AcknowledgedCommand::Resize,
-                                attachment.resize_focused(size).await,
-                                UiEventPolicy::Disposable,
-                            ).await?;
+                            match attachment.resize_focused(size).await {
+                                Ok(size) if envelope.request_id.is_some() => {
+                                    send(
+                                        &mut connection,
+                                        envelope.request_id,
+                                        ServerMessage::TerminalResized { terminal_id, size },
+                                    ).await?;
+                                }
+                                Ok(_) => {}
+                                Err(error) => {
+                                    respond_to_ui_event_error(
+                                        &mut connection,
+                                        envelope.request_id,
+                                        "resize terminal",
+                                        error,
+                                        UiEventPolicy::Disposable,
+                                    ).await?;
+                                }
+                            }
                         // An old focused pane can leave one resize queued while exit
                         // fallback selects its replacement. Uncorrelated resizes are
                         // fire-and-forget; correlated callers keep the semantic error.

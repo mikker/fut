@@ -22,7 +22,7 @@ use super::{
     presentation::{ItemState, TokenValue, apply_item_state, render_token_segments, truncate_line},
 };
 
-pub(super) const MIN_DOCKED_TERMINAL_WIDTH: u16 = 96;
+pub(super) const MIN_DOCKED_TERMINAL_WIDTH: u16 = 40;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ClientLayout {
@@ -928,18 +928,18 @@ mod tests {
     fn chrome_layout_composes_tab_and_sidebar_positions_at_the_exact_breakpoint() {
         let top_left = UiConfig::default();
         assert_eq!(
-            client_layout(Rect::new(3, 4, 123, 24), &top_left, Some(2)),
+            client_layout(Rect::new(3, 4, 67, 24), &top_left, Some(2)),
             ClientLayout {
-                tab_bar: Some(Rect::new(3, 4, 123, 1)),
-                terminal: Rect::new(3, 5, 123, 23),
+                tab_bar: Some(Rect::new(3, 4, 67, 1)),
+                terminal: Rect::new(3, 5, 67, 23),
                 workspace_sidebar: Some(WorkspaceSidebarLayout::Drawer(Rect::new(3, 4, 28, 24,))),
             }
         );
         assert_eq!(
-            client_layout(Rect::new(3, 4, 124, 24), &top_left, Some(2)),
+            client_layout(Rect::new(3, 4, 68, 24), &top_left, Some(2)),
             ClientLayout {
-                tab_bar: Some(Rect::new(31, 4, 96, 1)),
-                terminal: Rect::new(31, 5, 96, 23),
+                tab_bar: Some(Rect::new(31, 4, 40, 1)),
+                terminal: Rect::new(31, 5, 40, 23),
                 workspace_sidebar: Some(WorkspaceSidebarLayout::Docked(Rect::new(3, 4, 28, 24,))),
             }
         );
@@ -947,11 +947,11 @@ mod tests {
         bottom_right.tab_bar.position = TabBarPosition::Bottom;
         bottom_right.workspace_sidebar.position = WorkspaceSidebarPosition::Right;
         assert_eq!(
-            client_layout(Rect::new(3, 4, 124, 24), &bottom_right, Some(2)),
+            client_layout(Rect::new(3, 4, 68, 24), &bottom_right, Some(2)),
             ClientLayout {
-                tab_bar: Some(Rect::new(3, 27, 96, 1)),
-                terminal: Rect::new(3, 4, 96, 23),
-                workspace_sidebar: Some(WorkspaceSidebarLayout::Docked(Rect::new(99, 4, 28, 24,))),
+                tab_bar: Some(Rect::new(3, 27, 40, 1)),
+                terminal: Rect::new(3, 4, 40, 23),
+                workspace_sidebar: Some(WorkspaceSidebarLayout::Docked(Rect::new(43, 4, 28, 24,))),
             }
         );
     }

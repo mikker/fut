@@ -14,6 +14,7 @@ use crate::{
 use super::config::TrustedCommand;
 
 pub(super) struct TemporaryCommandSurface {
+    title: String,
     handle: TerminalHandle,
     snapshots: watch::Receiver<ScreenSnapshot>,
     events: broadcast::Receiver<TerminalEvent>,
@@ -52,12 +53,17 @@ impl TemporaryCommandSurface {
         let events = handle.subscribe_events();
         let lifecycle = handle.subscribe_lifecycle();
         Ok(Self {
+            title: command.title.clone(),
             handle,
             snapshots,
             events,
             lifecycle,
             screen,
         })
+    }
+
+    pub(super) fn title(&self) -> &str {
+        &self.title
     }
 
     pub(super) async fn input(&self, bytes: Vec<u8>) -> anyhow::Result<()> {

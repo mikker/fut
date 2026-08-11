@@ -2803,25 +2803,16 @@ async fn interactive_tab_view_streams_all_panes_with_per_client_focus() {
         },
     )
     .await;
-    receive_matching(&mut first, |message| {
-        matches!(
-            message,
-            ServerMessage::CommandCompleted {
-                command: fut::protocol::AcknowledgedCommand::Resize
-            }
-        )
-    })
-    .await;
     let resized = receive_matching(&mut first, |message| {
         matches!(
             message,
-            ServerMessage::Snapshot { terminal_id, screen }
+            ServerMessage::TerminalResized { terminal_id, size }
                 if *terminal_id == pane_b.terminal_id
-                    && screen.size == TerminalSize { columns: 31, rows: 9 }
+                    && *size == TerminalSize { columns: 31, rows: 9 }
         )
     })
     .await;
-    assert!(matches!(resized, ServerMessage::Snapshot { .. }));
+    assert!(matches!(resized, ServerMessage::TerminalResized { .. }));
 
     harness.detach(&mut first).await;
     harness.shutdown().await;
@@ -4725,6 +4716,16 @@ async fn public_pane_split_preserves_target_direction_cwd_argv_focus_and_atomic_
         "while IFS= read -r line; do [ \"$line\" = focus ] && touch ../focus-stayed; done",
     )
     .await;
+    let initial_tab = harness.resources().await.sessions[0].workspaces[0].tabs[0].id;
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::RenameTarget {
+                selector: RenameSelector::Tab(initial_tab),
+                name: "stable".into(),
+            })
+            .await,
+        ServerMessage::CommandCompleted { .. }
+    ));
     let before = harness.resources().await;
     let anchor = before.sessions[0].workspaces[0].tabs[0].panes[0].id;
     let tab_id = before.sessions[0].workspaces[0].tabs[0].id;
@@ -5611,6 +5612,16 @@ async fn linked_git_worktree_is_a_peer_workspace_and_reopens_idempotently() {
 #[tokio::test]
 async fn existing_reopen_is_idempotent_and_invalid_name_never_spawns() {
     let harness = Harness::start("while IFS= read -r line; do :; done").await;
+    let tab_id = harness.resources().await.sessions[0].workspaces[0].tabs[0].id;
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::RenameTarget {
+                selector: RenameSelector::Tab(tab_id),
+                name: "stable".into(),
+            })
+            .await,
+        ServerMessage::CommandCompleted { .. }
+    ));
     let before = harness.resources().await;
     let pid_file = harness.root.path().join("duplicate.pid");
     let marker_file = harness.root.path().join("duplicate.marker");
@@ -7695,7 +7706,10 @@ position = "right"
     bottom.wait_for("work}").await;
     bottom.wait_for("\x1b[24;1H").await;
     let bar_positioned_on_last_row = bottom.text().split("\x1b[24;1H").any(|suffix| {
-        let nearby = &suffix[..suffix.len().min(200)];
+        let nearby = suffix
+            .char_indices()
+            .nth(200)
+            .map_or(suffix, |(end, _)| &suffix[..end]);
         nearby.contains("work") || nearby.contains("checks")
     });
     assert!(
@@ -7806,7 +7820,7 @@ done
     left.send(b"size-main\n");
     left.wait_for("ALPHA_SIZE_23_96").await;
     left.send(b"\x02w");
-    left.wait_for("press ? for hotkeys").await;
+    left.wait_for("h cycle").await;
     left.send(b"j\r");
     left.wait_for("ZETA_READY").await;
     left.send(b"linked\nsize-linked\n");
@@ -7847,6 +7861,7 @@ done
 [ui.workspace_sidebar]
 position = "right"
 header = [{ text = "WORKSPACES" }]
+footer = [{ text = "MODE:" }, { token = "sidebar.visibility" }]
 
 [ui.workspace_sidebar.row]
 left = [{ text = "WS[" }]
@@ -7894,7 +7909,7 @@ right = [{ text = "]" }, { token = "workspace.tab_count" }]
     let mut narrow = spawn_client(123, main_pane);
     narrow.wait_for("ALPHA_READY").await;
     narrow.send(b"size-narrow\n");
-    narrow.wait_for("NARROW_SIZE_23_123").await;
+    narrow.wait_for("NARROW_SIZE_23_95").await;
     narrow.send(b"\x02w");
     narrow.wait_for("feature").await;
     narrow.wait_for("λ").await;
@@ -7915,7 +7930,7 @@ right = [{ text = "]" }, { token = "workspace.tab_count" }]
     let mut narrow_reset = spawn_client(123, main_pane);
     narrow_reset.wait_for("ALPHA_READY").await;
     narrow_reset.send(b"size-narrow\n");
-    narrow_reset.wait_for("NARROW_SIZE_23_123").await;
+    narrow_reset.wait_for("NARROW_SIZE_23_95").await;
     narrow_reset.send(b"\x02d");
     narrow_reset.wait_success().await;
 
@@ -7947,7 +7962,19 @@ right = [{ text = "]" }, { token = "workspace.tab_count" }]
     live_close.wait_for("ZETA_SIZE_23_124").await;
     live_close.send(b"\x02w");
     live_close.wait_for("done").await;
-    live_close.wait_for("press ? for hotkeys").await;
+    live_close.wait_for("MODE:hide").await;
+    live_close.wait_for("with").await;
+    live_close.wait_for("one").await;
+    live_close.clear_output();
+    live_close.send(b"h");
+    live_close.wait_for("MODE:hidden").await;
+    live_close.clear_output();
+    live_close.send(b"h");
+    live_close.send(b"qsize-linked\n");
+    live_close.wait_for("ZETA_SIZE_23_96").await;
+    live_close.send(b"\x02whqsize-linked\n");
+    live_close.wait_for("ZETA_SIZE_23_124").await;
+    live_close.send(b"\x02w");
     live_close.send(b"k\r");
     live_close.send(b"after-close\n");
     live_close.wait_for("OMEGA_ACK").await;
@@ -7989,7 +8016,7 @@ async fn workspace_and_tab_bars_create_and_rename_logical_contexts() {
     client.wait_for("CONTEXT_READY").await;
 
     client.send(b"\x02w");
-    client.wait_for("press ? for hotkeys").await;
+    client.wait_for("h cycle").await;
     client.send(b"c");
     let created_workspace = time::timeout(DEADLINE, async {
         loop {
