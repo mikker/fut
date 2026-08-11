@@ -1048,8 +1048,8 @@ async fn run(
                                 }
                                 force_draw = true;
                             }
-                            WorkspaceSidebarAction::ToggleAutoHide => {
-                                ui.workspace_sidebar.auto_hide = !ui.workspace_sidebar.auto_hide;
+                            WorkspaceSidebarAction::CycleVisibility => {
+                                ui.workspace_sidebar.visibility.cycle();
                                 resize_view(
                                     framed,
                                     terminal.size()?.into(),

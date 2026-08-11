@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use ratatui::style::{Color, Modifier, Style};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -34,6 +34,25 @@ pub(super) enum WorkspaceSidebarPosition {
     #[default]
     Left,
     Right,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum WorkspaceSidebarVisibility {
+    Visible,
+    #[default]
+    AutoHideWhenSingle,
+    Hidden,
+}
+
+impl WorkspaceSidebarVisibility {
+    pub fn cycle(&mut self) {
+        *self = match self {
+            Self::Visible => Self::AutoHideWhenSingle,
+            Self::AutoHideWhenSingle => Self::Hidden,
+            Self::Hidden => Self::Visible,
+        };
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
@@ -702,19 +721,13 @@ impl Default for SidebarRowConfig {
     }
 }
 
-fn default_true() -> bool {
-    true
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct WorkspaceSidebarConfig {
     pub position: WorkspaceSidebarPosition,
     #[serde(default = "default_sidebar_width")]
     pub width: u16,
-    #[serde(default = "default_true")]
-    pub hide_when_single: bool,
-    pub auto_hide: bool,
+    pub visibility: WorkspaceSidebarVisibility,
     pub header: Vec<SegmentConfig>,
     pub footer: Vec<SegmentConfig>,
     pub row: SidebarRowConfig,
@@ -725,8 +738,7 @@ impl Default for WorkspaceSidebarConfig {
         Self {
             position: WorkspaceSidebarPosition::Left,
             width: default_sidebar_width(),
-            hide_when_single: true,
-            auto_hide: false,
+            visibility: WorkspaceSidebarVisibility::AutoHideWhenSingle,
             header: Vec::new(),
             footer: vec![SegmentConfig {
                 token: Some("sidebar.status".into()),
@@ -1239,6 +1251,10 @@ right = [{ token = "workspace.tab_count" }]
             WorkspaceSidebarPosition::Right
         );
         assert_eq!(config.workspace_sidebar.width, 30);
+        assert_eq!(
+            config.workspace_sidebar.visibility,
+            WorkspaceSidebarVisibility::AutoHideWhenSingle
+        );
         assert_eq!(config.tab_bar.item.min_width, 8);
         assert_eq!(config.icons.resolve().workspace, "W");
         assert_eq!(config.icons.resolve().pill_left, "\u{e0b6}");
@@ -1298,6 +1314,40 @@ right = [{ token = "workspace.tab_count" }]
             config.workspace_sidebar.row.right,
             SidebarRowConfig::default().right
         );
+    }
+
+    #[test]
+    fn workspace_sidebar_visibility_parses_serializes_and_rejects_obsolete_settings() {
+        for (value, visibility) in [
+            ("visible", WorkspaceSidebarVisibility::Visible),
+            (
+                "auto_hide_when_single",
+                WorkspaceSidebarVisibility::AutoHideWhenSingle,
+            ),
+            ("hidden", WorkspaceSidebarVisibility::Hidden),
+        ] {
+            let config: UiConfig =
+                toml::from_str(&format!("[workspace_sidebar]\nvisibility = {value:?}\n")).unwrap();
+            assert_eq!(config.workspace_sidebar.visibility, visibility);
+            assert_eq!(
+                serde_json::to_string(&visibility).unwrap(),
+                format!("{value:?}")
+            );
+        }
+
+        let mut visibility = WorkspaceSidebarVisibility::Visible;
+        visibility.cycle();
+        assert_eq!(visibility, WorkspaceSidebarVisibility::AutoHideWhenSingle);
+        visibility.cycle();
+        assert_eq!(visibility, WorkspaceSidebarVisibility::Hidden);
+        visibility.cycle();
+        assert_eq!(visibility, WorkspaceSidebarVisibility::Visible);
+
+        for obsolete in ["hide_when_single = false", "auto_hide = true"] {
+            assert!(
+                toml::from_str::<UiConfig>(&format!("[workspace_sidebar]\n{obsolete}\n")).is_err()
+            );
+        }
     }
 
     #[test]

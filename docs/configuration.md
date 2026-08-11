@@ -98,8 +98,7 @@ segments = [
 [ui.workspace_sidebar]
 position = "left" # "left" or "right"
 width = 28
-hide_when_single = true
-auto_hide = false
+visibility = "auto_hide_when_single" # "visible", "auto_hide_when_single", or "hidden"
 header = [{ token = "session.name", style = "current" }]
 footer = [{ token = "sidebar.status", style = "muted" }]
 
@@ -129,7 +128,7 @@ Mouse input uses pane-local cells. The first left click on an unfocused pane cha
 
 Inside the workspace sidebar, `1` through `9` and `0` switch straight to that workspace in session order, exactly as Enter switches to the highlighted row. Press `?` for the sidebar's hotkey list; any key returns to the workspaces.
 
-Sidebar width is 4 through 80 cells and includes its one-cell divider. Left-drag the visible divider from either edge to resize it cell by cell. A docked drag preserves at least 96 terminal columns; an open drawer's divider is also draggable, while a hidden drawer is not. The dragged width belongs only to that attached client: it is not written to configuration and the configured width returns on reattach or configuration reload. The active workspace is marked with a bullet. By default, it collapses when the current session has only one workspace; set `hide_when_single = false` to keep it docked. Set `auto_hide = true`, or press `h` inside the sidebar, to hide it whenever it is not focused; it then opens as a drawer on demand. Otherwise it docks when the host is at least `width + 96` columns wide, so the default width docks from 124 columns. When collapsed or below that threshold it remains available as an edge drawer without reducing terminal geometry. `vertical_divider` must be exactly one grapheme and one display cell.
+Sidebar width is 4 through 80 cells and includes its one-cell divider. Left-drag the visible divider from either edge to resize it cell by cell. A docked drag preserves at least 96 terminal columns; an open drawer's divider is also draggable, while a hidden drawer is not. The dragged width belongs only to that attached client: it is not written to configuration and the configured width returns on reattach or configuration reload. The active workspace is marked with a bullet. `visibility = "visible"` keeps the sidebar docked whenever the terminal is wide enough. `visibility = "auto_hide_when_single"` (the default) docks it only when the current session has more than one workspace. `visibility = "hidden"` leaves it as an on-demand drawer. Press `h` inside the sidebar to cycle visible → auto-hide when single → hidden. When not docked or below the `width + 96` column threshold (124 by default), it remains available as an edge drawer without reducing terminal geometry. `vertical_divider` must be exactly one grapheme and one display cell.
 
 ## Segments, groups, and components
 

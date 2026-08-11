@@ -14,7 +14,10 @@ use crate::{
 };
 
 use super::{
-    config::{GroupConfig, SemanticStyle, TabBarPosition, UiConfig, WorkspaceSidebarPosition},
+    config::{
+        GroupConfig, SemanticStyle, TabBarPosition, UiConfig, WorkspaceSidebarPosition,
+        WorkspaceSidebarVisibility,
+    },
     notifications::{ActivityIndicator, NotificationState},
     presentation::{ItemState, TokenValue, apply_item_state, render_token_segments, truncate_line},
 };
@@ -68,9 +71,13 @@ pub(super) fn client_layout(
     }
 
     let sidebar_width = ui.workspace_sidebar.width;
-    let sidebar_needed = !ui.workspace_sidebar.auto_hide
-        && (!ui.workspace_sidebar.hide_when_single
-            || workspace_count.is_none_or(|count| count > 1));
+    let sidebar_needed = match ui.workspace_sidebar.visibility {
+        WorkspaceSidebarVisibility::Visible => true,
+        WorkspaceSidebarVisibility::AutoHideWhenSingle => {
+            workspace_count.is_none_or(|count| count > 1)
+        }
+        WorkspaceSidebarVisibility::Hidden => false,
+    };
     let docked =
         sidebar_needed && host.width >= sidebar_width.saturating_add(MIN_DOCKED_TERMINAL_WIDTH);
     let (workspace, docked_sidebar) = if docked {
@@ -950,7 +957,7 @@ mod tests {
     }
 
     #[test]
-    fn single_workspace_hides_only_the_docked_sidebar() {
+    fn workspace_sidebar_visibility_controls_docking() {
         let ui = UiConfig::default();
         let layout = client_layout(Rect::new(0, 0, 124, 24), &ui, Some(1));
         assert_eq!(layout.terminal, Rect::new(0, 1, 124, 23));
@@ -960,7 +967,7 @@ mod tests {
         );
 
         let mut always_visible = UiConfig::default();
-        always_visible.workspace_sidebar.hide_when_single = false;
+        always_visible.workspace_sidebar.visibility = WorkspaceSidebarVisibility::Visible;
         assert!(matches!(
             client_layout(Rect::new(0, 0, 124, 24), &always_visible, Some(1)).workspace_sidebar,
             Some(WorkspaceSidebarLayout::Docked(_))
@@ -968,9 +975,9 @@ mod tests {
     }
 
     #[test]
-    fn auto_hide_leaves_the_sidebar_as_a_focus_only_drawer() {
+    fn hidden_workspace_sidebar_is_available_as_a_drawer() {
         let mut ui = UiConfig::default();
-        ui.workspace_sidebar.auto_hide = true;
+        ui.workspace_sidebar.visibility = WorkspaceSidebarVisibility::Hidden;
         let layout = client_layout(Rect::new(0, 0, 124, 24), &ui, Some(3));
         assert_eq!(layout.terminal, Rect::new(0, 1, 124, 23));
         assert_eq!(

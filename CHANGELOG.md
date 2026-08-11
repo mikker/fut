@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Unified workspace-sidebar visibility into visible, auto-hide-when-single, and hidden modes; `h` now cycles these modes inside the sidebar.
+
 - Fixed multi-second backward paging latency in delta/less when running a development build.
 
 - Development builds now identify themselves with a `-dev` suffix in `fut -v` output.

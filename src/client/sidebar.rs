@@ -139,7 +139,7 @@ const HELP_KEYS: [(&str, &str); 7] = [
     ("1-9 0", "pick by number"),
     ("c", "new workspace"),
     ("r", "rename"),
-    ("h", "toggle auto-hide"),
+    ("h", "cycle visibility"),
     ("q esc", "close"),
 ];
 
@@ -148,7 +148,7 @@ pub(super) enum WorkspaceSidebarAction {
     Stay,
     Close,
     Create,
-    ToggleAutoHide,
+    CycleVisibility,
     Rename(WorkspaceId, String),
     Select(PaneId),
 }
@@ -239,7 +239,7 @@ impl WorkspaceSidebarState {
                 .map(|item| WorkspaceSidebarAction::Rename(item.id, item.name.clone()))
                 .unwrap_or(WorkspaceSidebarAction::Stay),
             KeyCode::Char('h') if key.modifiers == KeyModifiers::NONE => {
-                WorkspaceSidebarAction::ToggleAutoHide
+                WorkspaceSidebarAction::CycleVisibility
             }
             KeyCode::Char(digit)
                 if digit.is_ascii_digit() && key.modifiers == KeyModifiers::NONE =>
@@ -1037,7 +1037,7 @@ mod tests {
         ));
         assert_eq!(
             state.key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)),
-            WorkspaceSidebarAction::ToggleAutoHide
+            WorkspaceSidebarAction::CycleVisibility
         );
         assert_eq!(
             state.key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE)),
