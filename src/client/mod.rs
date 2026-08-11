@@ -570,6 +570,7 @@ async fn run(
                     ServerMessage::Resources { snapshot } => {
                         if resources.accept(snapshot) {
                             let snapshot = resources.snapshot().expect("accepted resources exist");
+                            git.refresh(snapshot.sessions.iter().flat_map(|session| &session.workspaces).map(|workspace| workspace.root.as_path()));
                             refresh_surface_resources(
                                 &mut surface,
                                 snapshot,
@@ -597,6 +598,7 @@ async fn run(
                     ServerMessage::ResourcesChanged { snapshot } => {
                         if resources.accept(snapshot) {
                             let snapshot = resources.snapshot().expect("accepted resources exist");
+                            git.refresh(snapshot.sessions.iter().flat_map(|session| &session.workspaces).map(|workspace| workspace.root.as_path()));
                             refresh_surface_resources(
                                 &mut surface,
                                 snapshot,

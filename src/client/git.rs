@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
@@ -21,72 +21,91 @@ pub(super) struct GitStatus {
 struct Entry {
     requested: Instant,
     in_flight: bool,
+    token: u64,
     status: Option<GitStatus>,
+}
+
+#[derive(Default)]
+struct CacheState {
+    entries: HashMap<PathBuf, Entry>,
+    next_token: u64,
 }
 
 /// Branch and working-tree diff size per workspace root, resolved by bounded
 /// background processes so neither the render nor the event loop waits for git.
 #[derive(Clone, Default)]
 pub(super) struct GitStatusCache {
-    entries: Arc<Mutex<HashMap<PathBuf, Entry>>>,
+    state: Arc<Mutex<CacheState>>,
     updates: Option<mpsc::Sender<()>>,
 }
 
 impl GitStatusCache {
     pub fn new(updates: mpsc::Sender<()>) -> Self {
         Self {
-            entries: Arc::default(),
+            state: Arc::default(),
             updates: Some(updates),
         }
     }
 
     pub fn status(&self, root: &Path) -> Option<GitStatus> {
-        self.entries.lock().ok()?.get(root)?.status.clone()
+        self.state.lock().ok()?.entries.get(root)?.status.clone()
     }
 
+    /// Make the cache match the accepted resource snapshot and start work for
+    /// new or expired roots. A token binds each completion to the exact entry
+    /// that requested it, including across prune-and-recreate cycles.
     pub fn refresh<'a>(&self, roots: impl Iterator<Item = &'a Path>) {
-        for root in roots {
-            if !self.claim(root) {
-                continue;
-            }
+        let roots = roots.map(Path::to_path_buf).collect::<HashSet<_>>();
+        let claims = self.reconcile(&roots);
+        for (root, token) in claims {
             let cache = self.clone();
-            let root = root.to_path_buf();
             tokio::spawn(async move {
                 let status = status(&root).await;
-                cache.store(&root, status);
+                cache.store(&root, token, status);
             });
         }
     }
 
-    fn claim(&self, root: &Path) -> bool {
-        let Ok(mut entries) = self.entries.lock() else {
-            return false;
+    fn reconcile(&self, roots: &HashSet<PathBuf>) -> Vec<(PathBuf, u64)> {
+        let Ok(mut state) = self.state.lock() else {
+            return Vec::new();
         };
-        match entries.get_mut(root) {
-            Some(entry) if entry.in_flight || entry.requested.elapsed() < REFRESH_INTERVAL => false,
-            Some(entry) => {
+        state.entries.retain(|root, _| roots.contains(root));
+        let mut claims = Vec::new();
+        for root in roots {
+            let due = state.entries.get(root).is_none_or(|entry| {
+                !entry.in_flight && entry.requested.elapsed() >= REFRESH_INTERVAL
+            });
+            if !due {
+                continue;
+            }
+            state.next_token = state.next_token.wrapping_add(1);
+            let token = state.next_token;
+            if let Some(entry) = state.entries.get_mut(root) {
                 entry.requested = Instant::now();
                 entry.in_flight = true;
-                true
-            }
-            None => {
-                entries.insert(
+                entry.token = token;
+            } else {
+                state.entries.insert(
                     root.to_owned(),
                     Entry {
                         requested: Instant::now(),
                         in_flight: true,
+                        token,
                         status: None,
                     },
                 );
-                true
             }
+            claims.push((root.clone(), token));
         }
+        claims
     }
 
-    fn store(&self, root: &Path, status: Option<GitStatus>) {
+    fn store(&self, root: &Path, token: u64, status: Option<GitStatus>) {
         let mut changed = false;
-        if let Ok(mut entries) = self.entries.lock()
-            && let Some(entry) = entries.get_mut(root)
+        if let Ok(mut state) = self.state.lock()
+            && let Some(entry) = state.entries.get_mut(root)
+            && entry.token == token
         {
             entry.in_flight = false;
             if entry.status != status {
@@ -101,13 +120,15 @@ impl GitStatusCache {
 }
 
 async fn status(root: &Path) -> Option<GitStatus> {
-    let branch = run(root, &["rev-parse", "--abbrev-ref", "HEAD"]).await?;
-    let shortstat = run(root, &["diff", "HEAD", "--shortstat"])
-        .await
-        .unwrap_or_default();
+    let branch = run(root, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
+    let shortstat = run(root, &["diff", "HEAD", "--shortstat"]).await;
+    parsed_status(branch, shortstat)
+}
+
+fn parsed_status(branch: Option<String>, shortstat: Option<String>) -> Option<GitStatus> {
     Some(GitStatus {
-        branch: branch.trim().to_owned(),
-        ..parse_shortstat(&shortstat)
+        branch: branch?.trim().to_owned(),
+        ..parse_shortstat(&shortstat?)
     })
 }
 
@@ -165,7 +186,7 @@ mod tests {
 
     async fn wait_for_idle(cache: &GitStatusCache, root: &Path) {
         for _ in 0..500 {
-            if !cache.entries.lock().expect("cache lock")[root].in_flight {
+            if !cache.state.lock().expect("cache lock").entries[root].in_flight {
                 return;
             }
             time::sleep(Duration::from_millis(1)).await;
@@ -175,9 +196,10 @@ mod tests {
 
     fn expire(cache: &GitStatusCache, root: &Path) {
         cache
-            .entries
+            .state
             .lock()
             .expect("cache lock")
+            .entries
             .get_mut(root)
             .expect("cached repository")
             .requested = Instant::now() - REFRESH_INTERVAL;
@@ -213,12 +235,64 @@ mod tests {
         assert_eq!(parse_shortstat(""), GitStatus::default());
     }
 
+    #[test]
+    fn failed_git_lanes_do_not_produce_a_clean_status() {
+        assert_eq!(parsed_status(Some("main\n".into()), None), None);
+        assert_eq!(parsed_status(None, Some(String::new())), None);
+    }
+
+    #[test]
+    fn new_roots_are_claimed_immediately_and_removed_roots_are_pruned() {
+        let cache = GitStatusCache::default();
+        let first = PathBuf::from("/first");
+        let second = PathBuf::from("/second");
+        let first_claim = cache.reconcile(&HashSet::from([first.clone()]));
+        assert_eq!(first_claim.len(), 1);
+
+        let second_claim = cache.reconcile(&HashSet::from([second.clone()]));
+        assert_eq!(
+            second_claim.len(),
+            1,
+            "new root does not wait for the interval"
+        );
+        let state = cache.state.lock().expect("cache lock");
+        assert!(!state.entries.contains_key(&first));
+        assert!(state.entries[&second].in_flight);
+    }
+
+    #[test]
+    fn stale_completion_cannot_mutate_a_pruned_and_recreated_entry() {
+        let cache = GitStatusCache::default();
+        let root = PathBuf::from("/repository");
+        let old_token = cache.reconcile(&HashSet::from([root.clone()]))[0].1;
+        cache.reconcile(&HashSet::new());
+        let new_token = cache.reconcile(&HashSet::from([root.clone()]))[0].1;
+
+        cache.store(
+            &root,
+            old_token,
+            Some(GitStatus {
+                branch: "old".into(),
+                ..GitStatus::default()
+            }),
+        );
+        let state = cache.state.lock().expect("cache lock");
+        assert!(state.entries[&root].in_flight);
+        assert_eq!(state.entries[&root].token, new_token);
+        assert_eq!(state.entries[&root].status, None);
+    }
+
     #[tokio::test]
     async fn missing_roots_resolve_to_nothing_and_refresh_is_throttled() {
         let cache = GitStatusCache::default();
         let root = Path::new("/definitely/missing/fut-workspace");
         cache.refresh(std::iter::once(root));
-        assert!(!cache.claim(root), "a fresh request is not repeated");
+        assert!(
+            cache
+                .reconcile(&HashSet::from([root.to_path_buf()]))
+                .is_empty(),
+            "a fresh request is not repeated"
+        );
         for _ in 0..50 {
             if cache.status(root).is_some() {
                 break;
