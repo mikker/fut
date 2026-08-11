@@ -1,4 +1,4 @@
-//! Reproducible `less` input latency and Fut downstream pipeline diagnostic.
+//! Reproducible `less -X` input latency and Fut downstream pipeline diagnostic.
 //! Run with `cargo run --release --example pager_measure`.
 
 use std::{
@@ -108,7 +108,9 @@ fn metadata() {
         env::consts::ARCH,
         std::env::consts::FAMILY
     );
-    println!("pager: {less}; TERM=xterm-256color LANG=C LC_ALL=C LESS/LESSOPEN/LESSCLOSE unset");
+    println!(
+        "pager: {less}; args=-R -X; TERM=xterm-256color LANG=C LC_ALL=C LESS/LESSOPEN/LESSCLOSE unset"
+    );
 }
 
 fn path() -> String {
@@ -143,7 +145,14 @@ fn capture_less(pathname: &Path) -> Result<Vec<Capture>> {
         pixel_height: 0,
     })?;
     let mut command = CommandBuilder::new("less");
-    command.args(["-R", pathname.to_str().context("non-UTF-8 temporary path")?]);
+    // Delta uses less without terminal initialization so the pager remains on
+    // the primary screen. Backward half-pages then use reverse-index (ESC M),
+    // the direction-specific path this diagnostic needs to exercise.
+    command.args([
+        "-R",
+        "-X",
+        pathname.to_str().context("non-UTF-8 temporary path")?,
+    ]);
     command.env_clear();
     for (key, value) in [
         ("PATH", path()),

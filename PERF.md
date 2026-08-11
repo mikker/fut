@@ -15,11 +15,13 @@ by similar projects (Zellij, tmux, Ghostty, mosh).
   (`examples/perf_client.rs`): `flood` (plain `seq`), `styled` (SGR-heavy
   output), `latency` (keystroke echo p50/p95). Reports snapshots/sec, wire
   MiB/s, largest frame, decode cost, and revisions coalesced away.
-- `mise run perf:pager` — run a sanitized `less` in a fixed 200x50 PTY over a
-  generated diff; measure input-to-first-byte and input-to-last-byte/quiet for
-  `d` and `u` at three positions, validate every round trip, hash streams, and
-  replay them through Fut parse, snapshot, wire encode/decode, and client grid
-  rendering. Run on the same idle host when comparing revisions.
+- `mise run perf:pager` — run a sanitized `less -X` in a fixed 200x50 PTY over
+  a generated diff; measure input-to-first-byte and input-to-last-byte/quiet
+  for `d` and `u` at three positions, validate every round trip, hash streams,
+  and replay them through Fut parse, snapshot, wire encode/decode, and client
+  grid rendering. `-X` matches delta's primary-screen pager behavior and makes
+  backward pages exercise reverse-index. Run on the same idle host when
+  comparing revisions.
 - `FUT_PERF_LOG=/tmp/frames.csv fut … attach` — the real client logs one CSV
   row per frame decode and per draw (`src/client/perf.rs`). Summarize with
   `scripts/perf/report /tmp/frames.csv`.
@@ -270,6 +272,22 @@ in-process stages. It does **not** measure PTY scheduling, daemon wake-up and
 coalescing, socket I/O, ratatui terminal diff/flush, or the host terminal's
 paint. Therefore it neither proves nor rules out a rendering-cache effect in
 those unmeasured stages, and it does not by itself identify a root cause.
+
+The original latency was specific to development builds and delta's pager
+shape. Delta runs `less` on the primary screen; each `u` half-page emits 33
+`ESC M` reverse-index operations at 300x65. Ghostty's Zig Debug mode made that
+captured 12.8 KiB update take 5.7–7.8 seconds to parse, versus 0.06–0.20 seconds
+for a forward page. The complete real client path reproduced the same
+asymmetry: `d` reached host output in 185–262 ms while `u` took 5.2–7.9
+seconds. Direct delta/less paging took under 6 ms in both directions, locating
+the delay inside Fut's VT feed rather than the pager, socket, client draw, or
+host terminal.
+
+Fut's dev profile now builds at opt-level 1 with debug info and debug assertions
+intact. It builds `libghostty-vt-sys` without debug info, which makes its build
+script select the optimized native terminal engine. On the captured stream,
+reverse-index parsing falls to 0.10–0.23 ms; full snapshots remain 5–6 ms in
+the Rust development build. Release behavior is unchanged.
 
 1. **Skip blitting unchanged rows in `Screen::render`** — deferred: ratatui
    resets the draw buffer every frame, so row-skipping would blank rows; it

@@ -37,6 +37,23 @@ criterion = "0.5"
 predicates = "3"
 tempfile = "3"
 
+[profile.dev]
+# Keep the development binary responsive enough to use as a daily driver while
+# retaining debug info and debug assertions.
+opt-level = 1
+
+[profile.dev.package.libghostty-vt-sys]
+# Ghostty's Zig Debug mode validates its full scrollback after each reverse
+# index. A half-page `less` scroll emits one reverse index per row, turning a
+# debug Fut build's `u` key into seconds of VT work. Omitting debug info makes
+# its build script select the native terminal engine's optimized mode.
+debug = false
+
+[profile.test.package.libghostty-vt-sys]
+# Keep Ghostty's safety checks under the parallel test harness; only the
+# contributor-facing development binary needs the optimized native engine.
+debug = true
+
 [[bench]]
 name = "render"
 harness = false
