@@ -1,6 +1,6 @@
 ---
 id: fut-cxhg
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-08-10T13:26:18Z

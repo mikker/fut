@@ -166,16 +166,14 @@ impl NavigatorState {
         let page = visible_rows.max(1);
         let filtering = !self.query.is_empty();
         match (key.code, key.modifiers) {
-            (KeyCode::Up, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
-                if !filtering {
-                    self.jump_back(1)
-                }
+            (KeyCode::Up, modifiers) if !filtering && modifiers.contains(KeyModifiers::SHIFT) => {
+                self.jump_back(1)
             }
-            (KeyCode::Down, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
-                if !filtering {
-                    self.jump_forward(1)
-                }
+            (KeyCode::Down, modifiers) if !filtering && modifiers.contains(KeyModifiers::SHIFT) => {
+                self.jump_forward(1)
             }
+            (KeyCode::Up | KeyCode::Down, modifiers)
+                if filtering && modifiers.contains(KeyModifiers::SHIFT) => {}
             (KeyCode::Char('k'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.move_selection(-1)
             }
@@ -220,7 +218,7 @@ impl NavigatorState {
                 if matches!(
                     self.status,
                     NavigatorStatus::Ready | NavigatorStatus::Error { .. }
-                ) =>
+                ) && self.filtered.contains(&self.selected) =>
             {
                 if let Some(row) = self.rows.get(self.selected)
                     && !row.closing
@@ -455,6 +453,9 @@ impl NavigatorState {
                 }
                 NavigatorStatus::Ready => match self.rows.get(self.selected) {
                     Some(row) if row.closing => "Closing…  ↑↓/C-jk move  esc cancel".to_owned(),
+                    _ if !self.query.is_empty() => {
+                        "type search  ↑↓/C-jk move  enter switch  esc close".to_owned()
+                    }
                     _ => "type search  ↑↓/C-jk move  C-s/w/t/p cycle  enter switch  esc close"
                         .to_owned(),
                 },
@@ -1265,6 +1266,21 @@ mod tests {
         assert!(matches!(
             nav.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 10),
             NavigatorAction::Select(TargetSelector::Pane(pane)) if pane == other_pane
+        ));
+    }
+
+    #[test]
+    fn enter_does_nothing_when_filter_has_no_results() {
+        let (snapshot, current, _) = fixture();
+        let mut nav = NavigatorState::open(&current);
+        nav.accept_resources(&snapshot, &current);
+
+        nav.paste("definitely absent");
+
+        assert!(nav.filtered.is_empty());
+        assert!(matches!(
+            nav.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 10),
+            NavigatorAction::Stay
         ));
     }
 

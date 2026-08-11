@@ -1,6 +1,6 @@
 ---
 id: fut-bb3z
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-08-10T13:55:26Z
