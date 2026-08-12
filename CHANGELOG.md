@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Removed `ui.tab_bar.item.min_width`; tab content now uses its intrinsic width instead of padding short labels to a configured minimum.
 - Replaced transient bottom-row notices with compact corner toasts that avoid the tab bar, dismiss confirmations automatically, and keep errors visible until the next keypress.
 - Fuzzy navigator results now collapse redundant descendant matches, and the in-client navigator returns parent selections to their most recently focused pane.
 - Workspace-sidebar display and visibility are now independent: it can be expanded or minimized to a compact status rail while separately remaining visible, hiding with one workspace, or staying hidden; expanded rows retain workspace numbers, status glyphs have safe edge padding, and open-sidebar hotkeys use separate footer lines with Nerd Font icons when enabled.

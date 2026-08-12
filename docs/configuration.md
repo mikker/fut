@@ -92,7 +92,6 @@ right = [
 ]
 
 [ui.tab_bar.item]
-min_width = 8
 segments = [
   { text = " " },
   { token = "tab.index" },
@@ -153,7 +152,7 @@ Every segment sets exactly one of:
 
 Token segments may also set `prefix`, `suffix`, `max_width`, and `style`. Prefix and suffix are emitted only when the token is nonempty. Text segments accept `style` but not affixes or `max_width`. Components must be the only segment in their group and do not accept segment options.
 
-`ui.tab_bar.item.min_width` is a display-cell minimum from 0 through 256. Short items are left-aligned and padded on the right with styled spaces, so current and keyboard-selected states always occupy the same width. The default format supplies one cell of leading padding, and the default minimum is 8; use `0` for intrinsic-width tabs. New tabs are created unnamed, so their title follows the foreground process in the focused pane. Name a tab with `fut tab new --name` or `Ctrl-b r` to keep that title fixed; renaming it to an empty string restores automatic naming.
+Tab-item content uses the intrinsic display-cell width of its configured segments. The default format supplies one cell of padding on each side; add or remove text segments to adjust that spacing. The Nerd Font preset additionally reserves one cell at each end of every item so its active-tab pill does not move neighboring tabs. New tabs are created unnamed, so their title follows the foreground process in the focused pane. Name a tab with `fut tab new --name` or `Ctrl-b r` to keep that title fixed; renaming it to an empty string restores automatic naming.
 
 Tab-bar lanes contain groups. A group has `segments`, an optional semantic `style`, and a `priority` from 0 through 255. The tabs component is flexible and keeps its active or keyboard-selected item visible. Groups with higher priority than tabs reserve their complete width first. Tabs then grow toward their complete preferred width. Lower-priority groups appear only in remaining space. Left and right lanes stay edge-aligned; the center lane is geometrically centered and clamped between them. Groups never overlap. By default the right lane names the current workspace, truncated at 20 cells.
 

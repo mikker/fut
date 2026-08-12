@@ -631,16 +631,10 @@ impl Default for GroupConfig {
     }
 }
 
-fn default_tab_min_width() -> u16 {
-    8
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct ItemFormat {
     pub segments: Vec<SegmentConfig>,
-    #[serde(default = "default_tab_min_width")]
-    pub min_width: u16,
 }
 
 impl Default for ItemFormat {
@@ -666,7 +660,6 @@ impl Default for ItemFormat {
                 },
                 SegmentConfig::text(" "),
             ],
-            min_width: default_tab_min_width(),
         }
     }
 }
@@ -1077,9 +1070,6 @@ fn validate(ui: &UiConfig) -> Result<()> {
     if !(MIN_SIDEBAR_WIDTH..=MAX_SIDEBAR_WIDTH).contains(&ui.workspace_sidebar.width) {
         bail!("ui.workspace_sidebar.width must be between 4 and 80");
     }
-    if ui.tab_bar.item.min_width > 256 {
-        bail!("ui.tab_bar.item.min_width must be at most 256");
-    }
     for (name, value) in [
         ("current", &ui.icons.current),
         ("closing", &ui.icons.closing),
@@ -1389,7 +1379,6 @@ right = [{ token = "workspace.tab_count" }]
             config.workspace_sidebar.visibility,
             WorkspaceSidebarVisibility::Visible
         );
-        assert_eq!(config.tab_bar.item.min_width, 8);
         assert_eq!(config.icons.resolve().workspace, "W");
         assert_eq!(config.icons.resolve().pill_left, "\u{e0b6}");
         assert_eq!(config.icons.resolve().pill_right, "\u{e0b4}");
@@ -1422,7 +1411,6 @@ right = [{ token = "workspace.tab_count" }]
             "Ctrl-b :"
         );
         assert_eq!(config.tab_bar.position, TabBarPosition::Bottom);
-        assert_eq!(config.tab_bar.item.min_width, 8);
         assert!(config.tab_bar.left.iter().any(|group| {
             group
                 .segments
@@ -1556,7 +1544,7 @@ right = [{ token = "workspace.tab_count" }]
             "[ui.tab_bar]\nleft = [{ segments = [{ text = \"x\\n\" }] }]\n",
             "[ui]\nexecute = 'surprise'\n",
             "[ui.workspace_sidebar]\nwidth = 2\n",
-            "[ui.tab_bar.item]\nmin_width = 257\n",
+            "[ui.tab_bar.item]\nmin_width = 8\n",
             "[ui.bindings]\nunknown = 'x'\n",
             "[ui.bindings]\nopen_command_bar = 'g'\n",
             "[ui.bindings]\nopen_command_bar = 'ctrl-x'\n",

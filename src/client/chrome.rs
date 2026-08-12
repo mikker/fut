@@ -652,25 +652,21 @@ fn render_tab_item(
     ui: &UiConfig,
 ) -> Line<'static> {
     let line = render_tab_item_content(model, index, selected, component_style, spinner_frame, ui);
-    let minimum = usize::from(ui.tab_bar.item.min_width);
-    let padding = minimum.saturating_sub(line.width());
-    let style = tab_item_style(model, index, selected, component_style, ui);
-    let mut spans = Vec::with_capacity(line.spans.len() + 3);
-    spans.extend(line.spans);
-    if padding > 0 {
-        spans.push(Span::styled(" ".repeat(padding), style));
-    }
     let icons = ui.icons.resolve();
-    if !icons.pill_left.is_empty() && !icons.pill_right.is_empty() {
-        let cap = pill_cap_style(style, component_style, ui);
-        if index == model.active {
-            spans.insert(0, Span::styled(icons.pill_left, cap));
-            spans.push(Span::styled(icons.pill_right, cap));
-        } else {
-            // Inactive tabs pad by the cap width so items keep a stable width.
-            spans.insert(0, Span::styled(" ", cap));
-            spans.push(Span::styled(" ", cap));
-        }
+    if icons.pill_left.is_empty() || icons.pill_right.is_empty() {
+        return line;
+    }
+    let style = tab_item_style(model, index, selected, component_style, ui);
+    let cap = pill_cap_style(style, component_style, ui);
+    let mut spans = Vec::with_capacity(line.spans.len() + 2);
+    spans.extend(line.spans);
+    if index == model.active {
+        spans.insert(0, Span::styled(icons.pill_left, cap));
+        spans.push(Span::styled(icons.pill_right, cap));
+    } else {
+        // Inactive tabs pad by the cap width so items keep a stable width.
+        spans.insert(0, Span::styled(" ", cap));
+        spans.push(Span::styled(" ", cap));
     }
     Line::from(spans)
 }
@@ -1166,6 +1162,12 @@ mod tests {
     }
 
     #[test]
+    fn short_tab_items_use_their_intrinsic_width() {
+        let (text, _) = render(&["a", "bb", "c"], 1, 30);
+        assert!(text.starts_with(" 1 a  2 bb  3 c "), "{text:?}");
+    }
+
+    #[test]
     fn nerd_font_preset_draws_the_active_tab_as_a_pill() {
         let ui: UiConfig = toml::from_str("[icons]\npreset = 'nerd_font'\n").unwrap();
         let (snapshot, focused) = fixture(&["shell", "editor", "tests"], 1);
@@ -1201,6 +1203,32 @@ mod tests {
 
         let (plain, _) = render(&["shell", "editor", "tests"], 1, 60);
         assert!(!plain.contains('\u{e0b6}') && !plain.contains('\u{e0b4}'));
+    }
+
+    #[test]
+    fn nerd_font_placeholders_keep_tab_positions_stable_as_focus_changes() {
+        let ui: UiConfig = toml::from_str("[icons]\npreset = 'nerd_font'\n").unwrap();
+        let rendered = [0, 1].map(|active| {
+            let (snapshot, focused) = fixture(&["a", "bb", "c"], active);
+            let area = Rect::new(0, 0, 30, 1);
+            let mut buffer = Buffer::empty(area);
+            render_tab_bar(
+                Some(&snapshot),
+                &focused,
+                false,
+                None,
+                &NotificationState::default(),
+                0,
+                &ui,
+                area,
+                &mut buffer,
+            );
+            ['1', '2', '3'].map(|number| {
+                (0..area.width).find(|column| buffer[(*column, 0)].symbol() == number.to_string())
+            })
+        });
+
+        assert_eq!(rendered[0], rendered[1]);
     }
 
     #[test]
