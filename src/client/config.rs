@@ -65,6 +65,30 @@ impl WorkspaceSidebarVisibility {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub(super) enum WorkspaceSidebarDisplay {
+    #[default]
+    Expanded,
+    Minimized,
+}
+
+impl WorkspaceSidebarDisplay {
+    pub fn toggle(&mut self) {
+        *self = match self {
+            Self::Expanded => Self::Minimized,
+            Self::Minimized => Self::Expanded,
+        };
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Expanded => "expanded",
+            Self::Minimized => "minimized",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(super) enum PaneLayoutPolicy {
     #[default]
     Splits,
@@ -526,7 +550,7 @@ impl IconsConfig {
     pub fn resolve(&self) -> IconSet {
         let defaults = match self.preset {
             IconPreset::Ascii => ["*", "x", "...", "", "", "zoom", "|", "", ""],
-            IconPreset::Unicode => ["●", "×", "…", "", "", "zoom", "│", "", ""],
+            IconPreset::Unicode => ["•", "×", "…", "", "", "zoom", "│", "", ""],
             IconPreset::NerdFont => ["󰄬", "󰅖", "…", "󰉋", "󰓩", "󰍉", "│", "\u{e0b6}", "\u{e0b4}"],
         };
         IconSet {
@@ -720,6 +744,7 @@ fn default_sidebar_width() -> u16 {
 
 pub(super) const MIN_SIDEBAR_WIDTH: u16 = 4;
 pub(super) const MAX_SIDEBAR_WIDTH: u16 = 80;
+pub(super) const MINIMIZED_SIDEBAR_WIDTH: u16 = 6;
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -737,7 +762,14 @@ impl Default for SidebarRowConfig {
                 SegmentConfig::token("workspace.marker"),
                 SegmentConfig::text(" "),
             ],
-            body: vec![SegmentConfig::token("workspace.name")],
+            body: vec![
+                SegmentConfig::token("workspace.index"),
+                SegmentConfig {
+                    token: Some("workspace.name".into()),
+                    prefix: " ".into(),
+                    ..SegmentConfig::default()
+                },
+            ],
             right: vec![
                 SegmentConfig {
                     token: Some("workspace.activity".into()),
@@ -749,9 +781,10 @@ impl Default for SidebarRowConfig {
                     prefix: " ".into(),
                     ..SegmentConfig::default()
                 },
+                SegmentConfig::text(" "),
             ],
             detail: vec![
-                SegmentConfig::text("  "),
+                SegmentConfig::text("    "),
                 SegmentConfig {
                     token: Some("workspace.git_branch".into()),
                     style: Some(SemanticStyle::Muted),
@@ -778,10 +811,19 @@ pub(super) struct WorkspaceSidebarConfig {
     pub position: WorkspaceSidebarPosition,
     #[serde(default = "default_sidebar_width")]
     pub width: u16,
+    pub display: WorkspaceSidebarDisplay,
     pub visibility: WorkspaceSidebarVisibility,
     pub header: Vec<SegmentConfig>,
     pub footer: Vec<SegmentConfig>,
     pub row: SidebarRowConfig,
+}
+
+fn default_sidebar_footer() -> Vec<SegmentConfig> {
+    vec![SegmentConfig {
+        token: Some("sidebar.status".into()),
+        style: Some(SemanticStyle::Muted),
+        ..SegmentConfig::default()
+    }]
 }
 
 impl Default for WorkspaceSidebarConfig {
@@ -789,15 +831,18 @@ impl Default for WorkspaceSidebarConfig {
         Self {
             position: WorkspaceSidebarPosition::Left,
             width: default_sidebar_width(),
+            display: WorkspaceSidebarDisplay::Expanded,
             visibility: WorkspaceSidebarVisibility::AutoHideWhenSingle,
             header: Vec::new(),
-            footer: vec![SegmentConfig {
-                token: Some("sidebar.status".into()),
-                style: Some(SemanticStyle::Muted),
-                ..SegmentConfig::default()
-            }],
+            footer: default_sidebar_footer(),
             row: SidebarRowConfig::default(),
         }
+    }
+}
+
+impl WorkspaceSidebarConfig {
+    pub fn uses_default_footer(&self) -> bool {
+        self.footer == default_sidebar_footer()
     }
 }
 
@@ -1239,6 +1284,7 @@ fn token_allowed(scope: TokenScope, token: &str) -> bool {
                 | "session.name"
                 | "workspace.name"
                 | "workspace.icon"
+                | "sidebar.display"
                 | "sidebar.status"
                 | "sidebar.visibility"
         ),
@@ -1315,6 +1361,7 @@ segments = [{ token = "tab.icon" }, { text = " " }, { token = "tab.name" }]
 [ui.workspace_sidebar]
 position = "right"
 width = 30
+display = "minimized"
 visibility = "visible"
 header = [{ token = "session.name" }]
 footer = [{ token = "sidebar.status" }]
@@ -1334,6 +1381,10 @@ right = [{ token = "workspace.tab_count" }]
             WorkspaceSidebarPosition::Right
         );
         assert_eq!(config.workspace_sidebar.width, 30);
+        assert_eq!(
+            config.workspace_sidebar.display,
+            WorkspaceSidebarDisplay::Minimized
+        );
         assert_eq!(
             config.workspace_sidebar.visibility,
             WorkspaceSidebarVisibility::Visible
@@ -1431,6 +1482,28 @@ right = [{ token = "workspace.tab_count" }]
                 toml::from_str::<UiConfig>(&format!("[workspace_sidebar]\n{obsolete}\n")).is_err()
             );
         }
+    }
+
+    #[test]
+    fn workspace_sidebar_display_parses_and_toggles_independently() {
+        let config: UiConfig = toml::from_str(
+            "[workspace_sidebar]\ndisplay = 'minimized'\nvisibility = 'auto_hide_when_single'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.workspace_sidebar.display,
+            WorkspaceSidebarDisplay::Minimized
+        );
+        assert_eq!(
+            config.workspace_sidebar.visibility,
+            WorkspaceSidebarVisibility::AutoHideWhenSingle
+        );
+
+        let mut display = WorkspaceSidebarDisplay::Expanded;
+        display.toggle();
+        assert_eq!(display, WorkspaceSidebarDisplay::Minimized);
+        display.toggle();
+        assert_eq!(display, WorkspaceSidebarDisplay::Expanded);
     }
 
     #[test]

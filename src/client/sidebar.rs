@@ -1,5 +1,10 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::{buffer::Buffer, layout::Rect, style::Style};
+use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
+    style::Style,
+    text::{Line, Span},
+};
 
 use crate::{
     domain::{PaneId, WorkspaceId},
@@ -8,8 +13,11 @@ use crate::{
 };
 
 use super::{
-    chrome::sanitize,
-    config::{SemanticStyle, UiConfig, WorkspaceSidebarPosition},
+    chrome::{sanitize, truncate},
+    config::{
+        IconPreset, SemanticStyle, UiConfig, WorkspaceSidebarDisplay, WorkspaceSidebarPosition,
+        WorkspaceSidebarVisibility,
+    },
     git::GitStatusCache,
     navigation::NavigationHistory,
     notifications::{ActivityIndicator, NotificationState},
@@ -18,7 +26,7 @@ use super::{
 
 /// The current workspace is marked with a bullet instead of an icon so the
 /// sidebar reads the same at every icon preset.
-const CURRENT_MARKER: &str = "●";
+const CURRENT_MARKER: &str = "•";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct WorkspaceItem {
@@ -133,13 +141,14 @@ pub(super) struct WorkspaceSidebarState {
     help: bool,
 }
 
-const HELP_KEYS: [(&str, &str); 7] = [
+const HELP_KEYS: [(&str, &str); 8] = [
     ("↵", "switch to workspace"),
     ("↑↓ j k", "move selection"),
     ("1-9 0", "pick by number"),
     ("c", "new workspace"),
     ("r", "rename"),
     ("h", "cycle visibility"),
+    ("m", "toggle minimized"),
     ("q esc", "close"),
 ];
 
@@ -149,6 +158,7 @@ pub(super) enum WorkspaceSidebarAction {
     Close,
     Create,
     CycleVisibility,
+    ToggleDisplay,
     Rename(WorkspaceId, String),
     Select(PaneId),
 }
@@ -240,6 +250,9 @@ impl WorkspaceSidebarState {
                 .unwrap_or(WorkspaceSidebarAction::Stay),
             KeyCode::Char('h') if key.modifiers == KeyModifiers::NONE => {
                 WorkspaceSidebarAction::CycleVisibility
+            }
+            KeyCode::Char('m') if key.modifiers == KeyModifiers::NONE => {
+                WorkspaceSidebarAction::ToggleDisplay
             }
             KeyCode::Char(digit)
                 if digit.is_ascii_digit() && key.modifiers == KeyModifiers::NONE =>
@@ -388,6 +401,10 @@ pub(super) fn render_workspace_sidebar(
     let model = snapshot
         .map(|snapshot| WorkspaceModel::from_snapshot(snapshot, focused, history, notifications))
         .unwrap_or_default();
+    if ui.workspace_sidebar.display == WorkspaceSidebarDisplay::Minimized {
+        render_minimized_model(&model, spinner_frame, area, position, ui, buffer);
+        return;
+    }
     render_model(
         &model,
         None,
@@ -400,6 +417,116 @@ pub(super) fn render_workspace_sidebar(
         git,
         buffer,
     );
+}
+
+fn render_minimized_model(
+    model: &WorkspaceModel,
+    spinner_frame: usize,
+    area: Rect,
+    position: WorkspaceSidebarPosition,
+    ui: &UiConfig,
+    buffer: &mut Buffer,
+) {
+    let Some(content) = render_sidebar_frame(area, position, ui, buffer) else {
+        return;
+    };
+    let anchor = model
+        .items
+        .iter()
+        .position(|item| item.current)
+        .unwrap_or(0);
+    for (offset, row) in
+        visible_rows_with_item_height(model.items.len(), anchor, usize::from(content.height), 1)
+            .into_iter()
+            .enumerate()
+    {
+        let Ok(offset) = u16::try_from(offset) else {
+            break;
+        };
+        let y = content.y.saturating_add(offset);
+        match row {
+            VisibleRow::Ellipsis => {
+                buffer.set_line(content.x, y, &Line::from(" …  "), content.width);
+            }
+            VisibleRow::Item(index) => render_minimized_workspace_row(
+                &model.items[index],
+                spinner_frame,
+                Rect::new(content.x, y, content.width, 1),
+                ui,
+                buffer,
+            ),
+        }
+    }
+}
+
+fn render_minimized_workspace_row(
+    item: &WorkspaceItem,
+    spinner_frame: usize,
+    area: Rect,
+    ui: &UiConfig,
+    buffer: &mut Buffer,
+) {
+    if area.width == 0 {
+        return;
+    }
+    let attention = matches!(
+        item.activity,
+        Some(ActivityIndicator::Blocked | ActivityIndicator::Completed)
+    );
+    let state = ItemState {
+        current: false,
+        selected: false,
+        closing: item.closing,
+        attention,
+    };
+    let base = apply_item_state(
+        &ui.styles,
+        state,
+        ui.styles.apply(SemanticStyle::Normal, Style::default()),
+    );
+    clear(area, base, buffer);
+    let marker = if item.current { CURRENT_MARKER } else { " " };
+    let index = match item.index {
+        0..=8 => (item.index + 1).to_string(),
+        9 => "0".into(),
+        _ => "…".into(),
+    };
+    let (status, status_style) = if item.closing {
+        (
+            truncate(&ui.icons.resolve().closing, 1),
+            ui.styles.apply(SemanticStyle::Closing, base),
+        )
+    } else if let Some(activity) = item.activity {
+        let role = match activity {
+            ActivityIndicator::Working => SemanticStyle::Activity,
+            ActivityIndicator::Blocked | ActivityIndicator::Completed => SemanticStyle::Attention,
+        };
+        (
+            activity.marker(spinner_frame).into(),
+            ui.styles.apply(role, base),
+        )
+    } else {
+        (" ".into(), base)
+    };
+    buffer.set_line(
+        area.x,
+        area.y,
+        &Line::from(vec![
+            Span::styled(marker, base),
+            Span::styled(" ", base),
+            Span::styled(index, base),
+            Span::styled(status, status_style),
+            Span::styled(" ", base),
+        ]),
+        area.width,
+    );
+    if item.current {
+        for column in area.x..area.x.saturating_add(area.width) {
+            if let Some(cell) = buffer.cell_mut((column, area.y)) {
+                cell.modifier.insert(ratatui::style::Modifier::BOLD);
+            }
+        }
+    }
 }
 
 #[allow(
@@ -418,59 +545,12 @@ fn render_model(
     git: &GitStatusCache,
     buffer: &mut Buffer,
 ) {
-    if area.width == 0 || area.height == 0 {
+    let Some(content) = render_sidebar_frame(area, position, ui, buffer) else {
         return;
-    }
-    clear(
-        area,
-        ui.styles.apply(SemanticStyle::Normal, Style::default()),
-        buffer,
-    );
-    let (content, divider_x) = if area.width == 1 {
-        (area, None)
-    } else {
-        match position {
-            WorkspaceSidebarPosition::Left => (
-                Rect::new(area.x, area.y, area.width - 1, area.height),
-                Some(area.x.saturating_add(area.width - 1)),
-            ),
-            WorkspaceSidebarPosition::Right => (
-                Rect::new(
-                    area.x.saturating_add(1),
-                    area.y,
-                    area.width - 1,
-                    area.height,
-                ),
-                Some(area.x),
-            ),
-        }
     };
-    if let Some(divider_x) = divider_x {
-        let icons = ui.icons.resolve();
-        for row in area.y..area.y.saturating_add(area.height) {
-            if let Some(cell) = buffer.cell_mut((divider_x, row)) {
-                let style = ui.styles.apply(SemanticStyle::Normal, Style::default());
-                cell.set_symbol(&icons.vertical_divider)
-                    .set_style(ui.styles.apply(SemanticStyle::Divider, style));
-            }
-        }
-    }
-    if content.width == 0 {
-        return;
-    }
 
     let header_line = render_sidebar_chrome(&ui.workspace_sidebar.header, model, status, ui);
-    let footer_line = if help {
-        ratatui::text::Line::from(ratatui::text::Span::styled(
-            " esc back",
-            ui.styles.apply(
-                SemanticStyle::Muted,
-                ui.styles.apply(SemanticStyle::Normal, Style::default()),
-            ),
-        ))
-    } else {
-        render_sidebar_chrome(&ui.workspace_sidebar.footer, model, status, ui)
-    };
+    let footer_lines = render_sidebar_footer(model, status, help, ui);
     let header = (!header_line.spans.is_empty() && content.height >= 3).then_some(header_line);
     let footer_allowed = status
         .is_none_or(|status| content.height >= 5 || !matches!(status, WorkspaceStatus::Ready));
@@ -478,13 +558,26 @@ fn render_model(
         status,
         Some(WorkspaceStatus::Switching | WorkspaceStatus::Error(_))
     );
-    let footer =
-        (!footer_line.spans.is_empty() && footer_allowed && (content.height >= 2 || urgent_footer))
-            .then_some(footer_line);
+    let footer_capacity = if urgent_footer {
+        content.height
+    } else {
+        content
+            .height
+            .saturating_sub(u16::from(header.is_some()) + 1)
+    };
+    let footer = if footer_allowed && (content.height >= 2 || urgent_footer) {
+        footer_lines
+            .into_iter()
+            .take(usize::from(footer_capacity))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let footer_height = u16::try_from(footer.len()).unwrap_or(u16::MAX);
     let row_y = content.y.saturating_add(u16::from(header.is_some()));
     let row_height = content
         .height
-        .saturating_sub(u16::from(header.is_some()) + u16::from(footer.is_some()));
+        .saturating_sub(u16::from(header.is_some()) + footer_height);
     if let Some(header) = header.as_ref() {
         buffer.set_line(
             content.x,
@@ -576,14 +669,146 @@ fn render_model(
         }
     }
 
-    if let Some(footer) = footer.as_ref() {
+    let footer_y = content
+        .y
+        .saturating_add(content.height.saturating_sub(footer_height));
+    for (offset, footer) in footer.iter().enumerate() {
+        let Ok(offset) = u16::try_from(offset) else {
+            break;
+        };
         buffer.set_line(
             content.x,
-            content.y.saturating_add(content.height - 1),
+            footer_y.saturating_add(offset),
             &truncate_line(footer, usize::from(content.width)),
             content.width,
         );
     }
+}
+
+fn render_sidebar_footer(
+    model: &WorkspaceModel,
+    status: Option<&WorkspaceStatus>,
+    help: bool,
+    ui: &UiConfig,
+) -> Vec<Line<'static>> {
+    if help {
+        return vec![Line::from(Span::styled(
+            " esc back",
+            ui.styles.apply(
+                SemanticStyle::Muted,
+                ui.styles.apply(SemanticStyle::Normal, Style::default()),
+            ),
+        ))];
+    }
+    if matches!(status, Some(WorkspaceStatus::Ready)) && ui.workspace_sidebar.uses_default_footer()
+    {
+        return render_sidebar_hotkeys(ui);
+    }
+    let footer = render_sidebar_chrome(&ui.workspace_sidebar.footer, model, status, ui);
+    (!footer.spans.is_empty())
+        .then_some(footer)
+        .into_iter()
+        .collect()
+}
+
+fn render_sidebar_hotkeys(ui: &UiConfig) -> Vec<Line<'static>> {
+    let nerd_font = ui.icons.preset == IconPreset::NerdFont;
+    let visibility_icon = if nerd_font {
+        match ui.workspace_sidebar.visibility {
+            WorkspaceSidebarVisibility::Visible => "󰈈",
+            WorkspaceSidebarVisibility::AutoHideWhenSingle => "󱥼",
+            WorkspaceSidebarVisibility::Hidden => "󰈉",
+        }
+    } else {
+        ""
+    };
+    let display_icon = if nerd_font {
+        match ui.workspace_sidebar.display {
+            WorkspaceSidebarDisplay::Expanded => "󰡎",
+            WorkspaceSidebarDisplay::Minimized => "󰡌",
+        }
+    } else {
+        ""
+    };
+    [
+        (
+            "h",
+            visibility_icon,
+            ui.workspace_sidebar.visibility.label(),
+        ),
+        ("m", display_icon, ui.workspace_sidebar.display.label()),
+        ("?", if nerd_font { "󰘥" } else { "" }, "hotkeys"),
+    ]
+    .into_iter()
+    .map(|(key, icon, label)| render_sidebar_hotkey(key, icon, label, ui))
+    .collect()
+}
+
+fn render_sidebar_hotkey(
+    key: &'static str,
+    icon: &'static str,
+    label: &'static str,
+    ui: &UiConfig,
+) -> Line<'static> {
+    let normal = ui.styles.apply(SemanticStyle::Normal, Style::default());
+    let muted = ui.styles.apply(SemanticStyle::Muted, normal);
+    let icon = (!icon.is_empty()).then(|| Span::styled(format!("{icon}  "), muted));
+    Line::from(
+        [
+            Some(Span::styled(format!(" {key}  "), normal)),
+            icon,
+            Some(Span::styled(label, muted)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>(),
+    )
+}
+
+fn render_sidebar_frame(
+    area: Rect,
+    position: WorkspaceSidebarPosition,
+    ui: &UiConfig,
+    buffer: &mut Buffer,
+) -> Option<Rect> {
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    clear(
+        area,
+        ui.styles.apply(SemanticStyle::Normal, Style::default()),
+        buffer,
+    );
+    let (content, divider_x) = if area.width == 1 {
+        (area, None)
+    } else {
+        match position {
+            WorkspaceSidebarPosition::Left => (
+                Rect::new(area.x, area.y, area.width - 1, area.height),
+                Some(area.x.saturating_add(area.width - 1)),
+            ),
+            WorkspaceSidebarPosition::Right => (
+                Rect::new(
+                    area.x.saturating_add(1),
+                    area.y,
+                    area.width - 1,
+                    area.height,
+                ),
+                Some(area.x),
+            ),
+        }
+    };
+    if let Some(divider_x) = divider_x {
+        let icons = ui.icons.resolve();
+        for row in area.y..area.y.saturating_add(area.height) {
+            if let Some(cell) = buffer.cell_mut((divider_x, row)) {
+                let style = ui.styles.apply(SemanticStyle::Normal, Style::default());
+                cell.set_symbol(&icons.vertical_divider)
+                    .set_style(ui.styles.apply(SemanticStyle::Divider, style));
+            }
+        }
+    }
+    (content.width > 0).then_some(content)
 }
 
 fn render_help(area: Rect, ui: &UiConfig, buffer: &mut Buffer) {
@@ -625,6 +850,7 @@ fn render_sidebar_chrome(
 ) -> ratatui::text::Line<'static> {
     let current = model.items.iter().find(|item| item.current);
     let icons = ui.icons.resolve();
+    let display = ui.workspace_sidebar.display.label();
     let visibility = ui.workspace_sidebar.visibility.label();
     render_token_segments(
         segments,
@@ -638,19 +864,20 @@ fn render_sidebar_chrome(
                 TokenValue::plain(sanitize(current.map_or("", |item| item.name.as_str())))
             }
             "workspace.icon" => TokenValue::plain(icons.workspace.clone()),
+            "sidebar.display" => TokenValue::plain(display),
             "sidebar.visibility" => TokenValue::plain(visibility),
             "sidebar.status" => match status {
                 Some(WorkspaceStatus::Ready) => {
-                    TokenValue::plain(format!(" {visibility} · h cycle · ? hotkeys"))
+                    TokenValue::plain(format!(" h/m/? · {visibility} · {display}"))
                 }
                 Some(WorkspaceStatus::Switching) => {
-                    TokenValue::plain(format!(" switching… · {visibility}"))
+                    TokenValue::plain(format!(" switching… · {display} · {visibility}"))
                 }
                 Some(WorkspaceStatus::Error(message)) => TokenValue::styled(
-                    format!(" {message} · retry · {visibility}"),
+                    format!(" {message} · retry · {display} · {visibility}"),
                     SemanticStyle::Error,
                 ),
-                None => TokenValue::plain(format!(" {visibility}")),
+                None => TokenValue::plain(format!(" {display} · {visibility}")),
             },
             _ => TokenValue::plain(""),
         },
@@ -1047,6 +1274,10 @@ mod tests {
             WorkspaceSidebarAction::CycleVisibility
         );
         assert_eq!(
+            state.key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)),
+            WorkspaceSidebarAction::ToggleDisplay
+        );
+        assert_eq!(
             state.key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE)),
             WorkspaceSidebarAction::Stay
         );
@@ -1121,6 +1352,10 @@ mod tests {
         assert!(left.contains("closing"));
         assert!(left.contains('×'));
         assert_eq!(left_buffer[(0, 0)].symbol(), CURRENT_MARKER);
+        assert_eq!(left_buffer[(1, 0)].symbol(), " ");
+        assert_eq!(left_buffer[(2, 0)].symbol(), "1");
+        assert_eq!(left_buffer[(3, 0)].symbol(), " ");
+        assert_eq!(left_buffer[(22, 4)].symbol(), " ");
         assert!(!left_buffer[(0, 0)].modifier.contains(Modifier::REVERSED));
         assert!(left_buffer[(0, 0)].modifier.contains(Modifier::BOLD));
         assert_eq!(left_buffer[(23, 0)].symbol(), "│");
@@ -1135,6 +1370,52 @@ mod tests {
         assert!(right.contains("main"));
         assert_eq!(right_buffer[(0, 0)].symbol(), "│");
         assert_eq!(right_buffer[(1, 0)].symbol(), CURRENT_MARKER);
+    }
+
+    #[test]
+    fn minimized_render_keeps_marker_number_status_padding_and_mirrored_divider() {
+        let (snapshot, focused) = fixture(&["main", "feature"], 0);
+        let mut model = WorkspaceModel::from_snapshot(
+            &snapshot,
+            &focused,
+            &NavigationHistory::default(),
+            &NotificationState::default(),
+        );
+        model.items[1].activity = Some(ActivityIndicator::Blocked);
+        let ui = UiConfig::default();
+
+        let area = Rect::new(0, 0, 6, 2);
+        let mut left = Buffer::empty(area);
+        render_minimized_model(
+            &model,
+            0,
+            area,
+            WorkspaceSidebarPosition::Left,
+            &ui,
+            &mut left,
+        );
+        assert_eq!(left[(0, 0)].symbol(), CURRENT_MARKER);
+        assert_eq!(left[(1, 0)].symbol(), " ");
+        assert_eq!(left[(2, 0)].symbol(), "1");
+        assert_eq!(left[(3, 1)].symbol(), "!");
+        assert_eq!(left[(4, 1)].symbol(), " ");
+        assert_eq!(left[(5, 1)].symbol(), "│");
+
+        let mut right = Buffer::empty(area);
+        render_minimized_model(
+            &model,
+            0,
+            area,
+            WorkspaceSidebarPosition::Right,
+            &ui,
+            &mut right,
+        );
+        assert_eq!(right[(0, 1)].symbol(), "│");
+        assert_eq!(right[(1, 0)].symbol(), CURRENT_MARKER);
+        assert_eq!(right[(2, 0)].symbol(), " ");
+        assert_eq!(right[(3, 0)].symbol(), "1");
+        assert_eq!(right[(4, 1)].symbol(), "!");
+        assert_eq!(right[(5, 1)].symbol(), " ");
     }
 
     #[test]
@@ -1166,7 +1447,7 @@ mod tests {
     }
 
     #[test]
-    fn active_render_marks_selection_and_exposes_compact_help() {
+    fn active_render_marks_selection_and_lists_footer_hotkeys_on_separate_lines() {
         let (snapshot, focused) = fixture(&["main", "feature"], 0);
         let history = NavigationHistory::default();
         let mut state = WorkspaceSidebarState::open(
@@ -1186,6 +1467,10 @@ mod tests {
             WorkspaceSidebarPosition::Left,
         );
         assert!(ready.contains("hide with one"));
+        let lines = ready.lines().collect::<Vec<_>>();
+        assert!(lines[6].contains("h  hide with one"));
+        assert!(lines[7].contains("m  expanded"));
+        assert!(lines[8].contains("?  hotkeys"));
         assert_eq!(buffer[(0, 3)].bg, ratatui::style::Color::DarkGray);
         assert!(
             !buffer[(0, 3)].modifier.contains(Modifier::UNDERLINED),
@@ -1218,6 +1503,21 @@ mod tests {
             WorkspaceSidebarPosition::Left,
         );
         assert!(tiny_error.contains("destination busy"));
+    }
+
+    #[test]
+    fn nerd_font_footer_uses_stateful_visibility_and_display_icons() {
+        let mut ui: UiConfig = toml::from_str("[icons]\npreset = 'nerd_font'\n").unwrap();
+        let lines = render_sidebar_hotkeys(&ui);
+        assert_eq!(lines[0].spans[1].content, "󱥼  ");
+        assert_eq!(lines[1].spans[1].content, "󰡎  ");
+        assert_eq!(lines[2].spans[1].content, "󰘥  ");
+
+        ui.workspace_sidebar.visibility = WorkspaceSidebarVisibility::Hidden;
+        ui.workspace_sidebar.display = WorkspaceSidebarDisplay::Minimized;
+        let lines = render_sidebar_hotkeys(&ui);
+        assert_eq!(lines[0].spans[1].content, "󰈉  ");
+        assert_eq!(lines[1].spans[1].content, "󰡌  ");
     }
 
     #[test]

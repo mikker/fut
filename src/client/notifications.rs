@@ -66,7 +66,7 @@ impl ActivityIndicator {
         match self {
             Self::Working => BRAILLE_SPINNER[frame % BRAILLE_SPINNER.len()],
             Self::Blocked => "!",
-            Self::Completed => "●",
+            Self::Completed => "•",
         }
     }
 }
@@ -305,7 +305,7 @@ impl NotificationsDialog {
                 let style = row_style(index == self.selected);
                 let marker = match row.kind {
                     AttentionKind::Blocked => "!",
-                    AttentionKind::Completed => "●",
+                    AttentionKind::Completed => "•",
                 };
                 let kind = match row.kind {
                     AttentionKind::Blocked => "blocked",

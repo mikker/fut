@@ -4,7 +4,7 @@
 
 - Replaced transient bottom-row notices with compact corner toasts that avoid the tab bar, dismiss confirmations automatically, and keep errors visible until the next keypress.
 - Fuzzy navigator results now collapse redundant descendant matches, and the in-client navigator returns parent selections to their most recently focused pane.
-- Unified workspace-sidebar visibility into visible, auto-hide-when-single, and hidden modes; the current mode is shown in the sidebar and `h` cycles it.
+- Workspace-sidebar display and visibility are now independent: it can be expanded or minimized to a compact status rail while separately remaining visible, hiding with one workspace, or staying hidden; expanded rows retain workspace numbers, status glyphs have safe edge padding, and open-sidebar hotkeys use separate footer lines with Nerd Font icons when enabled.
 - Added trusted configurable keybinding commands that run in a framed temporary full-terminal PTY, inherit the focused pane's working directory, and restore the prior layout on exit.
 - Unnamed tabs now follow the foreground process in their focused pane; explicit tab titles remain fixed, and fuzzy navigator results show their complete ancestry with matched characters emphasized.
 - Multiple terminal windows can now attach to the same session; its terminal geometry follows the smallest attached client, restores as clients resize or detach, and larger clients show the shared-size margin with a subtle border and sparse muted star field.

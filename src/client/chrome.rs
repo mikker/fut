@@ -15,8 +15,8 @@ use crate::{
 
 use super::{
     config::{
-        GroupConfig, SemanticStyle, TabBarPosition, UiConfig, WorkspaceSidebarPosition,
-        WorkspaceSidebarVisibility,
+        GroupConfig, MINIMIZED_SIDEBAR_WIDTH, SemanticStyle, TabBarPosition, UiConfig,
+        WorkspaceSidebarDisplay, WorkspaceSidebarPosition, WorkspaceSidebarVisibility,
     },
     notifications::{ActivityIndicator, NotificationState},
     presentation::{ItemState, TokenValue, apply_item_state, render_token_segments, truncate_line},
@@ -38,12 +38,6 @@ pub(super) enum WorkspaceSidebarLayout {
 }
 
 impl WorkspaceSidebarLayout {
-    pub fn area(self) -> Rect {
-        match self {
-            Self::Docked(area) | Self::Drawer(area) => area,
-        }
-    }
-
     pub fn docked(self) -> Option<Rect> {
         match self {
             Self::Docked(area) => Some(area),
@@ -70,7 +64,10 @@ pub(super) fn client_layout(
         };
     }
 
-    let sidebar_width = ui.workspace_sidebar.width;
+    let sidebar_width = match ui.workspace_sidebar.display {
+        WorkspaceSidebarDisplay::Expanded => ui.workspace_sidebar.width,
+        WorkspaceSidebarDisplay::Minimized => MINIMIZED_SIDEBAR_WIDTH,
+    };
     let sidebar_needed = match ui.workspace_sidebar.visibility {
         WorkspaceSidebarVisibility::Visible => true,
         WorkspaceSidebarVisibility::AutoHideWhenSingle => {
@@ -130,11 +127,16 @@ pub(super) fn client_layout(
         tab_bar,
         workspace_sidebar: docked_sidebar
             .map(WorkspaceSidebarLayout::Docked)
-            .or_else(|| {
-                sidebar_rect(host, ui.workspace_sidebar.position, sidebar_width)
-                    .map(WorkspaceSidebarLayout::Drawer)
-            }),
+            .or_else(|| workspace_sidebar_drawer(host, ui).map(WorkspaceSidebarLayout::Drawer)),
     }
+}
+
+pub(super) fn workspace_sidebar_drawer(host: Rect, ui: &UiConfig) -> Option<Rect> {
+    sidebar_rect(
+        host,
+        ui.workspace_sidebar.position,
+        ui.workspace_sidebar.width,
+    )
 }
 
 fn sidebar_rect(
@@ -442,11 +444,11 @@ fn render_bar_group(
             "client.zoom" if zoomed => TokenValue::plain(icons.zoom.clone()),
             "client.help" if selected.is_some() => TokenValue::plain("c new · r rename · esc "),
             "client.waiting" if model.client_waiting > 0 => TokenValue::styled(
-                format!("● {}", model.client_waiting),
+                format!("• {}", model.client_waiting),
                 SemanticStyle::Attention,
             ),
             "session.waiting" if model.session_waiting > 0 => TokenValue::styled(
-                format!("● {}", model.session_waiting),
+                format!("• {}", model.session_waiting),
                 SemanticStyle::Attention,
             ),
             "tab.activity" => active.activity.map_or_else(
@@ -972,6 +974,25 @@ mod tests {
             client_layout(Rect::new(0, 0, 124, 24), &always_visible, Some(1)).workspace_sidebar,
             Some(WorkspaceSidebarLayout::Docked(_))
         ));
+
+        let mut minimized = UiConfig::default();
+        minimized.workspace_sidebar.display = WorkspaceSidebarDisplay::Minimized;
+        let single = client_layout(Rect::new(0, 0, 46, 24), &minimized, Some(1));
+        assert_eq!(single.terminal, Rect::new(0, 1, 46, 23));
+        assert_eq!(
+            single.workspace_sidebar,
+            Some(WorkspaceSidebarLayout::Drawer(Rect::new(0, 0, 28, 24)))
+        );
+        let layout = client_layout(Rect::new(0, 0, 46, 24), &minimized, Some(2));
+        assert_eq!(layout.terminal, Rect::new(6, 1, 40, 23));
+        assert_eq!(
+            layout.workspace_sidebar,
+            Some(WorkspaceSidebarLayout::Docked(Rect::new(0, 0, 6, 24)))
+        );
+        assert_eq!(
+            workspace_sidebar_drawer(Rect::new(0, 0, 46, 24), &minimized),
+            Some(Rect::new(0, 0, 28, 24))
+        );
     }
 
     #[test]

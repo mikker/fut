@@ -104,16 +104,17 @@ segments = [
 [ui.workspace_sidebar]
 position = "left" # "left" or "right"
 width = 28
+display = "expanded" # "expanded" or "minimized"
 visibility = "auto_hide_when_single" # "visible", "auto_hide_when_single", or "hidden"
 header = [{ token = "session.name", style = "current" }]
 footer = [{ token = "sidebar.status", style = "muted" }]
 
 [ui.workspace_sidebar.row]
 left = [{ token = "workspace.marker" }, { text = " " }]
-body = [{ token = "workspace.name" }]
-right = [{ token = "workspace.tab_count" }, { token = "workspace.closing", prefix = " " }]
+body = [{ token = "workspace.index" }, { token = "workspace.name", prefix = " " }]
+right = [{ token = "workspace.tab_count" }, { token = "workspace.closing", prefix = " " }, { text = " " }]
 detail = [
-  { text = "  " },
+  { text = "    " },
   { token = "workspace.git_branch", style = "muted" },
   { token = "workspace.git_added", prefix = " " },
   { token = "workspace.git_deleted", prefix = " " },
@@ -136,7 +137,11 @@ Mouse input uses pane-local cells. The first left click on an unfocused pane cha
 
 Inside the workspace sidebar, `1` through `9` and `0` switch straight to that workspace in session order, exactly as Enter switches to the highlighted row. Press `?` for the sidebar's hotkey list; any key returns to the workspaces.
 
-Sidebar width is 4 through 80 cells and includes its one-cell divider. Left-drag the visible divider from either edge to resize it cell by cell. A docked drag preserves at least 40 terminal columns; an open drawer's divider is also draggable, while a hidden drawer is not. The dragged width belongs only to that attached client: it is not written to configuration and the configured width returns on reattach or configuration reload. The active workspace is marked with a bullet. `visibility = "visible"` keeps the sidebar docked whenever the terminal is wide enough. `visibility = "auto_hide_when_single"` (the default) docks it only when the current session has more than one workspace. `visibility = "hidden"` leaves it as an on-demand drawer. The current mode appears in the default footer; press `h` inside the sidebar to cycle visible → auto-hide when single → hidden. When not docked or below the `width + 40` column threshold (68 by default), it remains available as an edge drawer without reducing terminal geometry. `sidebar.visibility` exposes the compact mode label to custom sidebar chrome. `vertical_divider` must be exactly one grapheme and one display cell.
+Sidebar width is 4 through 80 cells and includes its one-cell divider. Left-drag the visible divider from either edge to resize it cell by cell. A docked drag preserves at least 40 terminal columns; an open drawer's divider is also draggable, while a hidden drawer is not. The dragged width belongs only to that attached client: it is not written to configuration and the configured width returns on reattach or configuration reload. The active workspace is marked with a bullet.
+
+Display and visibility are independent. `display = "expanded"` uses the configured width, while `display = "minimized"` uses a fixed six-cell rail with each workspace's active marker, number, and status. The marker reserves a trailing cell so round glyphs remain visually separate from the number in fonts such as Iosevka. Opening a minimized sidebar temporarily expands its drawer to the configured width; the rail itself is not draggable, but its open drawer remains resizable. Press `m` inside the sidebar to toggle expanded/minimized. `visibility = "visible"` keeps the chosen display docked whenever the terminal is wide enough. `visibility = "auto_hide_when_single"` (the default) docks it only when the current session has more than one workspace, and `visibility = "hidden"` leaves it as an on-demand drawer. Press `h` to cycle visible → auto-hide when single → hidden. This allows combinations such as a minimized sidebar that also hides when only one workspace exists. With the default footer, an open sidebar shows `h`, `m`, and `?` on separate lines with their current states; the `nerd_font` preset adds matching visibility, width, and help icons.
+
+When not docked or below the sidebar width plus 40 terminal columns, the sidebar remains available as an edge drawer without reducing terminal geometry. The current display and visibility appear in the default footer. `sidebar.display` and `sidebar.visibility` expose their labels to custom sidebar chrome. `vertical_divider` must be exactly one grapheme and one display cell.
 
 ## Segments, groups, and components
 
@@ -152,7 +157,7 @@ Token segments may also set `prefix`, `suffix`, `max_width`, and `style`. Prefix
 
 Tab-bar lanes contain groups. A group has `segments`, an optional semantic `style`, and a `priority` from 0 through 255. The tabs component is flexible and keeps its active or keyboard-selected item visible. Groups with higher priority than tabs reserve their complete width first. Tabs then grow toward their complete preferred width. Lower-priority groups appear only in remaining space. Left and right lanes stay edge-aligned; the center lane is geometrically centered and clamped between them. Groups never overlap. By default the right lane names the current workspace, truncated at 20 cells.
 
-Workspace rows have intrinsic `left` and `right` lanes; `body` receives the remaining cells and truncates safely. A nonempty `detail` format adds a second full-width line, and one blank line separates each entry. The default detail indents two cells under the row name and shows the workspace root's Git branch with its short working-tree diff (`+N` inserted, `-N` deleted). Those Git values come from bounded background `git` processes cached per root, so rendering never waits and non-Git roots simply stay empty. Set `detail = []` for compact one-line rows. Header and footer are optional single-line segment lists. At tiny heights Fut preserves resource rows over decorative header/footer content, while switching and error status remains visible.
+Workspace rows have intrinsic `left` and `right` lanes; `body` receives the remaining cells and truncates safely. Expanded default rows retain the same marker and workspace number as the minimized rail, followed by the workspace name, and reserve trailing padding after status indicators so glyphs do not clip at the divider. A nonempty `detail` format adds a second full-width line. The default detail aligns under the row name and shows the workspace root's Git branch with its short working-tree diff (`+N` inserted, `-N` deleted). Those Git values come from bounded background `git` processes cached per root, so rendering never waits and non-Git roots simply stay empty. Set `detail = []` for compact one-line rows. Header and footer are optional single-line segment lists. At tiny heights Fut preserves resource rows over decorative header/footer content, while switching and error status remains visible.
 
 All widths are terminal display cells. Dynamic values are sanitized and truncated at grapheme boundaries. Bars never wrap.
 

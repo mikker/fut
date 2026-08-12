@@ -89,7 +89,7 @@ aside a[aria-current="page"] {
 }
 
 aside a[aria-current="page"]::before {
-  content: "● ";
+  content: "• ";
   color: var(--accent);
   margin-left: -2ch;
 }

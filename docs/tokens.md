@@ -32,8 +32,8 @@ These may appear in groups under `ui.tab_bar.left`, `center`, or `right`.
 | `tab.pane_count` | Number of panes in the current tab |
 | `client.zoom` | Configured zoom icon while zoomed; otherwise empty |
 | `client.help` | Contextual create/rename/close help while the tab bar is keyboard-active |
-| `client.waiting` | `●` and this client's count of terminals with unseen blocked or completed attention across Fut; empty when zero |
-| `session.waiting` | `●` and this client's count of terminals with unseen blocked or completed attention in the current session; empty when zero |
+| `client.waiting` | `•` and this client's count of terminals with unseen blocked or completed attention across Fut; empty when zero |
+| `session.waiting` | `•` and this client's count of terminals with unseen blocked or completed attention in the current session; empty when zero |
 
 The special `{ component = "tabs" }` segment renders the focus-aware repeated tab collection. At most one may occur in a tab bar.
 
@@ -50,7 +50,7 @@ These may appear only under `ui.tab_bar.item.segments`.
 | `tab.closing` | Closing icon while closing; otherwise empty |
 | `tab.pane_count` | Number of panes in the tab |
 | `tab.icon` | Tab icon from the selected preset |
-| `tab.activity` | A spinner for working, `!` for blocked, or `●` for unseen completion; empty when inactive |
+| `tab.activity` | A spinner for working, `!` for blocked, or `•` for unseen completion; empty when inactive |
 
 Current, closing, and keyboard-selected styles are composed over every item segment.
 
@@ -60,7 +60,7 @@ These may appear in `ui.workspace_sidebar.row.left`, `body`, `right`, or `detail
 
 | Token | Value |
 | --- | --- |
-| `workspace.marker` | A solid block (`█`) for the active workspace, otherwise one blank cell |
+| `workspace.marker` | A bullet (`•`) for the active workspace, otherwise one blank cell |
 | `workspace.index` | One-based workspace index |
 | `workspace.name` | Workspace name |
 | `workspace.id` | Full stable workspace UUID |
@@ -69,7 +69,7 @@ These may appear in `ui.workspace_sidebar.row.left`, `body`, `right`, or `detail
 | `workspace.closing` | Closing icon while closing; otherwise empty |
 | `workspace.tab_count` | Number of tabs in the workspace |
 | `workspace.icon` | Workspace icon from the selected preset |
-| `workspace.activity` | A spinner for working, `!` for blocked, or `●` for unseen completion; empty when inactive |
+| `workspace.activity` | A spinner for working, `!` for blocked, or `•` for unseen completion; empty when inactive |
 | `workspace.git_branch` | Current branch of the workspace root; empty outside a Git work tree or until resolved |
 | `workspace.git_added` | `+N` inserted lines against `HEAD`, styled `added`; empty when none |
 | `workspace.git_deleted` | `-N` deleted lines against `HEAD`, styled `deleted`; empty when none |
@@ -88,8 +88,9 @@ These may appear in `ui.workspace_sidebar.header` and `footer`:
 | `session.name` | Current session name |
 | `workspace.name` | Current workspace name |
 | `workspace.icon` | Workspace icon from the selected preset |
+| `sidebar.display` | Current display label: `expanded` or `minimized` |
 | `sidebar.visibility` | Current compact visibility label: `visible`, `hide with one`, or `hidden` |
-| `sidebar.status` | Current visibility plus contextual controls, switching progress, or a retryable error |
+| `sidebar.status` | Current display and visibility plus contextual controls, switching progress, or a retryable error |
 
 ## Future dynamic tokens
 

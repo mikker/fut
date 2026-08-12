@@ -5950,7 +5950,7 @@ async fn public_agent_activity_spins_lists_waiting_terminals_and_navigates_unrea
             .await,
         ServerMessage::CommandCompleted { .. }
     ));
-    client.wait_for("● 1").await;
+    client.wait_for("• 1").await;
     client.send(b"\x02u");
     client.wait_for(" terminals waiting").await;
     client.wait_for("waiting-b").await;
@@ -5969,7 +5969,7 @@ async fn public_agent_activity_spins_lists_waiting_terminals_and_navigates_unrea
             .await,
         ServerMessage::CommandCompleted { .. }
     ));
-    client.wait_for("● 1").await;
+    client.wait_for("• 1").await;
     client.clear_output();
     client.send(b"\x02\x02");
     client.wait_for("AGENT_A").await;
@@ -7820,7 +7820,7 @@ done
     left.send(b"size-main\n");
     left.wait_for("ALPHA_SIZE_23_96").await;
     left.send(b"\x02w");
-    left.wait_for("h cycle").await;
+    left.wait_for("hotkeys").await;
     left.send(b"j\r");
     left.wait_for("ZETA_READY").await;
     left.send(b"linked\nsize-linked\n");
@@ -7972,6 +7972,8 @@ right = [{ text = "]" }, { token = "workspace.tab_count" }]
     live_close.send(b"h");
     live_close.send(b"qsize-linked\n");
     live_close.wait_for("ZETA_SIZE_23_96").await;
+    live_close.send(b"\x02wmqsize-linked\n");
+    live_close.wait_for("ZETA_SIZE_23_118").await;
     live_close.send(b"\x02whqsize-linked\n");
     live_close.wait_for("ZETA_SIZE_23_124").await;
     live_close.send(b"\x02w");
@@ -8016,7 +8018,7 @@ async fn workspace_and_tab_bars_create_and_rename_logical_contexts() {
     client.wait_for("CONTEXT_READY").await;
 
     client.send(b"\x02w");
-    client.wait_for("h cycle").await;
+    client.wait_for("hotkeys").await;
     client.send(b"c");
     let created_workspace = time::timeout(DEADLINE, async {
         loop {

@@ -27,9 +27,14 @@ use std::{io, path::Path, process::Stdio, time::Duration};
 use actions::{ClientAction, FocusDirection, NavigationScope};
 use anyhow::{Context, bail};
 use bytes::Bytes;
-use chrome::{MIN_DOCKED_TERMINAL_WIDTH, ResourceState, client_layout, render_tab_bar, sanitize};
+use chrome::{
+    MIN_DOCKED_TERMINAL_WIDTH, ResourceState, client_layout, render_tab_bar, sanitize,
+    workspace_sidebar_drawer,
+};
 use command_bar::{CommandBarAction, CommandBarState};
-use config::{MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH, PaneLayoutPolicy, UiConfig};
+use config::{
+    MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH, PaneLayoutPolicy, UiConfig, WorkspaceSidebarDisplay,
+};
 use copy_mode::{
     CopyModeErrorDisposition, CopyModeInput, CopyModePaste, CopyModeReply, CopyModeState,
 };
@@ -1120,6 +1125,18 @@ async fn run(
                                 view.invalidate_drawn();
                                 force_draw = true;
                             }
+                            WorkspaceSidebarAction::ToggleDisplay => {
+                                ui.workspace_sidebar.display.toggle();
+                                resize_view(
+                                    framed,
+                                    terminal.size()?.into(),
+                                    &mut view,
+                                    &resources,
+                                    &ui,
+                                ).await?;
+                                view.invalidate_drawn();
+                                force_draw = true;
+                            }
                             WorkspaceSidebarAction::Rename(workspace_id, name) => {
                                 rename = Some(RenameState::open(
                                     crate::protocol::RenameSelector::Workspace(workspace_id),
@@ -1285,24 +1302,33 @@ async fn run(
                         let open_sidebar = rename.is_none()
                             && copy_mode.is_none()
                             && matches!(surface.as_ref(), Some(ClientSurface::WorkspaceSidebar(_)));
-                        let visible_sidebar = layout.workspace_sidebar.and_then(|sidebar| {
-                            (open_sidebar || (unobstructed && sidebar.docked().is_some()))
-                                .then(|| {
-                                    let max_width = if sidebar.docked().is_some() {
-                                        host.width
-                                            .saturating_sub(MIN_DOCKED_TERMINAL_WIDTH)
-                                            .clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH)
-                                    } else {
-                                        MAX_SIDEBAR_WIDTH
-                                    };
+                        let visible_sidebar = if open_sidebar {
+                            workspace_sidebar_drawer(host, &ui).and_then(|area| {
+                                sidebar_divider(
+                                    area,
+                                    ui.workspace_sidebar.position,
+                                    MAX_SIDEBAR_WIDTH,
+                                )
+                            })
+                        } else if unobstructed
+                            && ui.workspace_sidebar.display != WorkspaceSidebarDisplay::Minimized
+                        {
+                            layout.workspace_sidebar.and_then(|sidebar| {
+                                sidebar.docked().and_then(|area| {
+                                    let max_width = host
+                                        .width
+                                        .saturating_sub(MIN_DOCKED_TERMINAL_WIDTH)
+                                        .clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
                                     sidebar_divider(
-                                        sidebar.area(),
+                                        area,
                                         ui.workspace_sidebar.position,
                                         max_width,
                                     )
                                 })
-                                .flatten()
-                        });
+                            })
+                        } else {
+                            None
+                        };
                         let split_dividers = if unobstructed {
                             view.pane_layouts(layout.terminal, ui.pane_layout).1
                         } else {
@@ -1605,9 +1631,7 @@ async fn run(
                             }
                         }
                         if let Some(ClientSurface::WorkspaceSidebar(sidebar)) = surface.as_ref() {
-                            if let Some(sidebar_area) =
-                                layout.workspace_sidebar.map(|sidebar| sidebar.area())
-                            {
+                            if let Some(sidebar_area) = workspace_sidebar_drawer(area, &ui) {
                                 sidebar.render(
                                     sidebar_area,
                                     ui.workspace_sidebar.position,
