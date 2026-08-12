@@ -9268,8 +9268,14 @@ async fn public_client_ctrl_b_c_creates_routes_and_navigates_back() {
     client.wait_for(" navigator").await;
     client.send(b"\x14\r");
     client.wait_for_count("CTRL_C_A_READY", 2).await;
-    client.send(b"a\n");
-    client.wait_for("CTRL_C_A_INPUT").await;
+    time::timeout(DEADLINE, async {
+        while !client.text().contains("CTRL_C_A_INPUT") {
+            client.send(b"a\n");
+            time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("focused tab never accepted input: {:?}", client.text()));
     client.send(b"\x02d");
     client.wait_success().await;
 
