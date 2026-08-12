@@ -123,6 +123,10 @@ enum MouseButtonState {
     #[default]
     Idle,
     Suppressed,
+    Selecting {
+        terminal_id: TerminalId,
+        anchor: (u16, u16),
+    },
     Captured {
         terminal_id: TerminalId,
         column: u16,
@@ -927,7 +931,7 @@ async fn run(
                 };
                 let event = event?;
                 if !matches!(&event, Event::Mouse(_)) {
-                    mouse_input.cancel_ui_drag();
+                    mouse_input.cancel_local_drags();
                 }
                 match event {
                     Event::Key(key) if temporary_command.is_some() => {
@@ -972,6 +976,58 @@ async fn run(
                             CopyModePaste::TooLarge
                         ) {
                             toasts.error("search query is too large; paste was not added");
+                        }
+                        force_draw = true;
+                    }
+                    Event::Mouse(mouse)
+                        if copy_mode
+                            .as_ref()
+                            .is_some_and(CopyModeState::is_mouse_dragging) =>
+                    {
+                        let host = terminal.size()?.into();
+                        let layout = client_layout(
+                            host,
+                            &ui,
+                            resources.workspace_count(view.focused()),
+                        );
+                        let state = copy_mode.as_mut().expect("mouse copy mode exists");
+                        let terminal_id = state.terminal_id();
+                        let input = match mouse.kind {
+                            HostMouseEventKind::Drag(HostMouseButton::Left) => view
+                                .copy_cell(
+                                    layout.terminal,
+                                    ui.pane_layout,
+                                    terminal_id,
+                                    mouse.column,
+                                    mouse.row,
+                                    true,
+                                )
+                                .map_or(CopyModeInput::Stay, |(column, row)| {
+                                    state.mouse_drag(column, row)
+                                }),
+                            HostMouseEventKind::Up(HostMouseButton::Left) => {
+                                let position = view.copy_cell(
+                                    layout.terminal,
+                                    ui.pane_layout,
+                                    terminal_id,
+                                    mouse.column,
+                                    mouse.row,
+                                    true,
+                                );
+                                match position {
+                                    Some((column, row)) => state.mouse_release(column, row),
+                                    None => state.mouse_release_current(),
+                                }
+                            }
+                            _ => CopyModeInput::Stay,
+                        };
+                        mouse_input.discard(mouse);
+                        match input {
+                            CopyModeInput::Stay => {}
+                            CopyModeInput::Pump => {
+                                pump_copy_mode(framed, state).await?;
+                            }
+                            CopyModeInput::Notice(message) => toasts.error(message),
                         }
                         force_draw = true;
                     }
@@ -1334,6 +1390,40 @@ async fn run(
                         } else {
                             Vec::new()
                         };
+                        if let MouseButtonState::Selecting {
+                            terminal_id,
+                            anchor,
+                        } = mouse_input.button(MouseButton::Left)
+                        {
+                            match mouse.kind {
+                                HostMouseEventKind::Drag(HostMouseButton::Left) => {
+                                    if let Some(position) = view.copy_cell(
+                                        layout.terminal,
+                                        ui.pane_layout,
+                                        terminal_id,
+                                        mouse.column,
+                                        mouse.row,
+                                        true,
+                                    ) {
+                                        let mut state = CopyModeState::enter_mouse(
+                                            terminal_id,
+                                            anchor,
+                                            position,
+                                        );
+                                        pump_copy_mode(framed, &mut state).await?;
+                                        copy_mode = Some(state);
+                                        force_draw = true;
+                                    }
+                                    mouse_input.discard(mouse);
+                                    continue;
+                                }
+                                HostMouseEventKind::Up(HostMouseButton::Left) => {
+                                    mouse_input.discard(mouse);
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
                         match mouse_input.route_ui(
                             mouse,
                             host,
@@ -1366,6 +1456,17 @@ async fn run(
                             }
                             UiMouseRoute::Owned(None) => {}
                             UiMouseRoute::NotOwned if unobstructed => {
+                                if mouse_input.can_begin_selection()
+                                    && let Some((terminal_id, anchor)) = mouse_selection_anchor(
+                                        &view,
+                                        layout.terminal,
+                                        ui.pane_layout,
+                                        mouse,
+                                    )
+                                {
+                                    mouse_input.begin_selection(terminal_id, anchor);
+                                    continue;
+                                }
                                 if let Some(action) = mouse_input.route(
                                     &view,
                                     layout.terminal,
@@ -1798,6 +1899,22 @@ fn accepts_client_input(
 }
 
 impl MouseInputState {
+    fn can_begin_selection(&self) -> bool {
+        self.buttons
+            .iter()
+            .all(|button| matches!(button, MouseButtonState::Idle))
+    }
+
+    fn begin_selection(&mut self, terminal_id: TerminalId, anchor: (u16, u16)) {
+        self.set_button(
+            MouseButton::Left,
+            MouseButtonState::Selecting {
+                terminal_id,
+                anchor,
+            },
+        );
+    }
+
     fn route_ui(
         &mut self,
         mouse: HostMouseEvent,
@@ -1914,8 +2031,14 @@ impl MouseInputState {
         UiMouseRoute::NotOwned
     }
 
-    fn cancel_ui_drag(&mut self) {
+    fn cancel_local_drags(&mut self) {
         self.ui_drag = None;
+        if matches!(
+            self.button(MouseButton::Left),
+            MouseButtonState::Selecting { .. }
+        ) {
+            self.suppress(MouseButton::Left);
+        }
     }
 
     fn reconcile_ui_drag(&mut self, tab_id: crate::domain::TabId, layout: &SplitTree) {
@@ -2196,6 +2319,33 @@ impl MouseInputState {
 
 fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
     column >= area.x && column < area.right() && row >= area.y && row < area.bottom()
+}
+
+fn mouse_selection_anchor(
+    view: &ViewState,
+    area: Rect,
+    policy: PaneLayoutPolicy,
+    mouse: HostMouseEvent,
+) -> Option<(TerminalId, (u16, u16))> {
+    if !matches!(mouse.kind, HostMouseEventKind::Down(HostMouseButton::Left)) {
+        return None;
+    }
+    let (target, _, _) = view.pane_at(area, policy, mouse.column, mouse.row)?;
+    if target.terminal_id != view.focused().terminal_id
+        || (view.mouse_tracking(target.terminal_id)
+            && !mouse.modifiers.contains(KeyModifiers::SHIFT))
+    {
+        return None;
+    }
+    let cell = view.copy_cell(
+        area,
+        policy,
+        target.terminal_id,
+        mouse.column,
+        mouse.row,
+        false,
+    )?;
+    Some((target.terminal_id, cell))
 }
 
 fn app_overlay_clear(
@@ -2997,6 +3147,7 @@ impl PaneState {
         current.revision = delta.revision;
         current.cursor = delta.cursor;
         current.scroll = delta.scroll;
+        current.mouse_tracking = delta.mouse_tracking;
         if self.resize_request_id.is_none() {
             self.observe_authoritative_size(delta.size);
         }
@@ -3420,6 +3571,38 @@ impl ViewState {
             column.saturating_sub(content.x).min(content.width - 1),
             row.saturating_sub(content.y).min(content.height - 1),
         ))
+    }
+
+    fn copy_cell(
+        &self,
+        area: Rect,
+        policy: PaneLayoutPolicy,
+        terminal_id: TerminalId,
+        column: u16,
+        row: u16,
+        clamp: bool,
+    ) -> Option<(u16, u16)> {
+        let pane = self
+            .panes
+            .iter()
+            .find(|pane| pane.target.terminal_id == terminal_id)?;
+        let screen = pane.pending.as_ref()?;
+        let (column, row) = self.terminal_cell(area, policy, terminal_id, column, row, clamp)?;
+        if !clamp && (column >= screen.size.columns || row >= screen.size.rows) {
+            return None;
+        }
+        Some((
+            column.min(screen.size.columns.saturating_sub(1)),
+            row.min(screen.size.rows.saturating_sub(1)),
+        ))
+    }
+
+    fn mouse_tracking(&self, terminal_id: TerminalId) -> bool {
+        self.panes
+            .iter()
+            .find(|pane| pane.target.terminal_id == terminal_id)
+            .and_then(|pane| pane.pending.as_ref())
+            .is_some_and(|screen| screen.mouse_tracking)
     }
 
     fn resize_requests(
@@ -4186,6 +4369,7 @@ mod tests {
                         blinking: true,
                     },
                     scroll: ScrollPosition::default(),
+                    mouse_tracking: true,
                 },
             ),
             DeltaApplyResult::Applied
@@ -4193,6 +4377,7 @@ mod tests {
         let cursor = state.panes[0].pending.as_ref().unwrap().cursor;
         assert_eq!(cursor.shape, CursorShape::Underline);
         assert!(cursor.blinking);
+        assert!(state.panes[0].pending.as_ref().unwrap().mouse_tracking);
     }
 
     #[test]
@@ -4324,6 +4509,69 @@ mod tests {
             state
                 .pane_at(area, PaneLayoutPolicy::Splits, 0, 0)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn mouse_selection_defers_to_application_tracking_unless_shift_overrides_it() {
+        let panes = targets(1);
+        let terminal_id = panes[0].terminal_id;
+        let mut state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
+        let area = Rect::new(7, 3, 20, 8);
+        let mut screen = ScreenSnapshot::new(
+            1,
+            TerminalSize {
+                columns: 20,
+                rows: 8,
+            },
+            vec![Cell::default(); 160],
+            Cursor {
+                column: 0,
+                row: 0,
+                visible: true,
+                shape: CursorShape::Block,
+                blinking: false,
+            },
+        )
+        .unwrap();
+        assert!(state.accept(terminal_id, screen.clone()));
+
+        let down = |modifiers| HostMouseEvent {
+            kind: HostMouseEventKind::Down(HostMouseButton::Left),
+            column: area.x + 4,
+            row: area.y + 2,
+            modifiers,
+        };
+        assert_eq!(
+            mouse_selection_anchor(
+                &state,
+                area,
+                PaneLayoutPolicy::Splits,
+                down(KeyModifiers::NONE),
+            ),
+            Some((terminal_id, (4, 2)))
+        );
+
+        screen.revision = 2;
+        screen.mouse_tracking = true;
+        assert!(state.accept(terminal_id, screen));
+        assert_eq!(
+            mouse_selection_anchor(
+                &state,
+                area,
+                PaneLayoutPolicy::Splits,
+                down(KeyModifiers::NONE),
+            ),
+            None
+        );
+        assert_eq!(
+            mouse_selection_anchor(
+                &state,
+                area,
+                PaneLayoutPolicy::Splits,
+                down(KeyModifiers::SHIFT),
+            ),
+            Some((terminal_id, (4, 2)))
         );
     }
 

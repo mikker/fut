@@ -8309,6 +8309,28 @@ async fn keyboard_copy_search_uses_client_pbcopy_and_surfaces_success_and_failur
 
     let mut success = spawn_client(false);
     success.wait_for("COPY_READY").await;
+    success.send(&[sgr_mouse(0, 1, 2, false), sgr_mouse(0, 1, 2, true)].concat());
+    time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !PathBuf::from(format!("{}.1", capture.display())).exists(),
+        "a plain click copied text"
+    );
+    success.send(
+        &[
+            sgr_mouse(0, 1, 2, false),
+            sgr_mouse(32, 11, 2, false),
+            sgr_mouse(0, 11, 2, true),
+        ]
+        .concat(),
+    );
+    let mouse_capture = PathBuf::from(format!("{}.1", capture.display()));
+    wait_for(DEADLINE, || {
+        fs::read_to_string(&mouse_capture).is_ok_and(|text| text == "COPY_TARGET")
+    })
+    .await;
+    assert_eq!(fs::read_to_string(mouse_capture).unwrap(), "COPY_TARGET");
+    success.wait_for("copied ").await;
+    success.clear_output();
     for _ in 0..10 {
         // Let the begin reply become visible before testing the rapid
         // move/move/move/cancel queue. Otherwise a faster local protocol can
@@ -8330,7 +8352,7 @@ async fn keyboard_copy_search_uses_client_pbcopy_and_surfaces_success_and_failur
             "COPY_TARGET λ雪"
         };
         success.send(format!("\x02[/{expected}\r \x1b[Fy").as_bytes());
-        let captured = PathBuf::from(format!("{}.{}", capture.display(), iteration));
+        let captured = PathBuf::from(format!("{}.{}", capture.display(), iteration + 1));
         wait_for(DEADLINE, || {
             fs::read_to_string(&captured).is_ok_and(|text| text == expected)
         })
@@ -8356,7 +8378,7 @@ async fn keyboard_copy_search_uses_client_pbcopy_and_surfaces_success_and_failur
     assert!(!input_log.exists(), "failed copy exited copy mode");
     failure.clear_output();
     failure.send(b"y");
-    let retried_capture = PathBuf::from(format!("{}.11", capture.display()));
+    let retried_capture = PathBuf::from(format!("{}.12", capture.display()));
     wait_for(DEADLINE, || {
         fs::read_to_string(&retried_capture).is_ok_and(|text| text == "COPY_TARGET λ雪")
     })

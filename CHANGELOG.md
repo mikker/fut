@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Dragging in a focused pane now selects and copies text when its application is not using mouse reporting; Shift-drag forces selection, while mouse-aware applications keep their gestures.
 - Removed `ui.tab_bar.item.min_width`; tab content now uses its intrinsic width instead of padding short labels to a configured minimum.
 - Replaced transient bottom-row notices with compact corner toasts that avoid the tab bar, dismiss confirmations automatically, and keep errors visible until the next keypress.
 - Fuzzy navigator results now collapse redundant descendant matches, and the in-client navigator returns parent selections to their most recently focused pane.

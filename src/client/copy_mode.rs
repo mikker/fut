@@ -29,6 +29,8 @@ impl CopyModeReply {
     fn for_action(action: &CopyModeAction) -> Self {
         match action {
             CopyModeAction::Begin
+            | CopyModeAction::BeginSelection { .. }
+            | CopyModeAction::SetSelectionEnd { .. }
             | CopyModeAction::Move { .. }
             | CopyModeAction::ToggleSelection
             | CopyModeAction::Search { .. }
@@ -78,25 +80,87 @@ pub(super) struct CopyModeState {
     actions: VecDeque<CopyModeAction>,
     clipboard: Option<(Uuid, Uuid)>,
     copied_bytes: Option<usize>,
+    mouse_position: Option<(u16, u16)>,
 }
 
 impl CopyModeState {
     pub fn enter(terminal_id: TerminalId) -> Self {
-        let mut actions = VecDeque::new();
-        actions.push_back(CopyModeAction::Begin);
+        let mut state = Self::new(terminal_id);
+        state.actions.push_back(CopyModeAction::Begin);
+        state
+    }
+
+    fn new(terminal_id: TerminalId) -> Self {
         Self {
             terminal_id,
             search_prompt: None,
             active: false,
             pending: None,
-            actions,
+            actions: VecDeque::new(),
             clipboard: None,
             copied_bytes: None,
+            mouse_position: None,
         }
+    }
+
+    pub fn enter_mouse(terminal_id: TerminalId, anchor: (u16, u16), position: (u16, u16)) -> Self {
+        let mut state = Self::new(terminal_id);
+        state.actions.push_back(CopyModeAction::BeginSelection {
+            column: anchor.0,
+            row: anchor.1,
+        });
+        state.actions.push_back(CopyModeAction::SetSelectionEnd {
+            column: position.0,
+            row: position.1,
+        });
+        state.mouse_position = Some(position);
+        state
     }
 
     pub fn terminal_id(&self) -> TerminalId {
         self.terminal_id
+    }
+
+    pub fn is_mouse_dragging(&self) -> bool {
+        self.mouse_position.is_some()
+    }
+
+    pub fn mouse_drag(&mut self, column: u16, row: u16) -> CopyModeInput {
+        let Some(position) = self.mouse_position else {
+            return CopyModeInput::Stay;
+        };
+        if position == (column, row) {
+            return CopyModeInput::Stay;
+        }
+        self.mouse_position = Some((column, row));
+        let action = CopyModeAction::SetSelectionEnd { column, row };
+        if matches!(
+            self.actions.back(),
+            Some(CopyModeAction::SetSelectionEnd { .. })
+        ) {
+            self.actions.pop_back();
+        }
+        self.enqueue(action)
+    }
+
+    pub fn mouse_release(&mut self, column: u16, row: u16) -> CopyModeInput {
+        if self.mouse_position.is_none() {
+            return CopyModeInput::Stay;
+        }
+        let moved = self.mouse_drag(column, row);
+        self.mouse_position = None;
+        if matches!(moved, CopyModeInput::Notice(_)) {
+            moved
+        } else {
+            self.enqueue(CopyModeAction::Copy)
+        }
+    }
+
+    pub fn mouse_release_current(&mut self) -> CopyModeInput {
+        self.mouse_position
+            .map_or(CopyModeInput::Stay, |(column, row)| {
+                self.mouse_release(column, row)
+            })
     }
 
     pub fn key(&mut self, key: KeyEvent) -> CopyModeInput {
@@ -295,6 +359,7 @@ impl CopyModeState {
         self.actions.clear();
         self.clipboard = None;
         self.copied_bytes = None;
+        self.mouse_position = None;
     }
 
     pub fn render(&self, area: Rect, buffer: &mut Buffer) {
@@ -444,6 +509,31 @@ mod tests {
             CopyModeInput::Pump
         );
         assert_eq!(take_and_complete(&mut cancel), CopyModeAction::Cancel);
+    }
+
+    #[test]
+    fn mouse_drag_begins_at_the_anchor_coalesces_motion_and_copies_on_release() {
+        let terminal_id = TerminalId::new();
+        let mut state = CopyModeState::enter_mouse(terminal_id, (2, 3), (5, 3));
+        assert!(state.is_mouse_dragging());
+        assert_eq!(
+            take_and_complete(&mut state),
+            CopyModeAction::BeginSelection { column: 2, row: 3 }
+        );
+
+        assert_eq!(state.mouse_drag(6, 3), CopyModeInput::Pump);
+        assert_eq!(state.mouse_drag(8, 4), CopyModeInput::Pump);
+        assert_eq!(
+            take_and_complete(&mut state),
+            CopyModeAction::SetSelectionEnd { column: 8, row: 4 }
+        );
+        assert_eq!(state.mouse_release(9, 4), CopyModeInput::Pump);
+        assert!(!state.is_mouse_dragging());
+        assert_eq!(
+            take_and_complete(&mut state),
+            CopyModeAction::SetSelectionEnd { column: 9, row: 4 }
+        );
+        assert_eq!(take_and_complete(&mut state), CopyModeAction::Copy);
     }
 
     #[test]

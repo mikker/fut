@@ -124,6 +124,8 @@ pub enum SearchDirection {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CopyModeAction {
     Begin,
+    BeginSelection { column: u16, row: u16 },
+    SetSelectionEnd { column: u16, row: u16 },
     Move { movement: CopyModeMovement },
     ToggleSelection,
     Search { query: String },
@@ -131,6 +133,12 @@ pub enum CopyModeAction {
     Copy,
     FinalizeCopy { copy_id: Uuid },
     Cancel,
+}
+
+impl CopyModeAction {
+    pub(crate) fn begins(&self) -> bool {
+        matches!(self, Self::Begin | Self::BeginSelection { .. })
+    }
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq, Serialize, Deserialize)]
@@ -156,6 +164,15 @@ pub enum CopyModeError {
     NoMatch,
     #[error("search cell has {actual} codepoints; maximum is {maximum}")]
     SearchCellTooLarge { actual: usize, maximum: usize },
+    #[error(
+        "copy-mode position ({column}, {row}) is outside the {columns}x{rows} terminal viewport"
+    )]
+    PositionOutOfBounds {
+        column: u16,
+        row: u16,
+        columns: u16,
+        rows: u16,
+    },
     #[error("selection spans {actual} cells; maximum is {maximum}")]
     CopySpanTooLarge { actual: usize, maximum: usize },
     #[error("selected text is {actual} bytes; maximum is {maximum}")]
@@ -856,6 +873,9 @@ pub struct ScreenSnapshot {
     // Defaulted so snapshots from daemons predating scroll metrics decode.
     #[serde(rename = "v", default)]
     pub scroll: ScrollPosition,
+    /// Whether the pane application currently owns mouse button gestures.
+    #[serde(rename = "m", default, skip_serializing_if = "std::ops::Not::not")]
+    pub mouse_tracking: bool,
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -932,6 +952,7 @@ impl ScreenSnapshot {
             cells,
             cursor,
             scroll: ScrollPosition::default(),
+            mouse_tracking: false,
         }
     }
 }
@@ -964,6 +985,8 @@ pub struct ScreenDelta {
     pub cursor: Cursor,
     #[serde(rename = "v")]
     pub scroll: ScrollPosition,
+    #[serde(rename = "m", default, skip_serializing_if = "std::ops::Not::not")]
+    pub mouse_tracking: bool,
 }
 
 #[cfg(test)]

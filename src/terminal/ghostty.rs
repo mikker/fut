@@ -472,7 +472,7 @@ impl GhosttyTerminal {
         action: CopyModeAction,
         viewport_offset: Option<usize>,
     ) -> std::result::Result<CopyModeOutcome, CopyModeFailure> {
-        let beginning = matches!(&action, CopyModeAction::Begin);
+        let beginning = action.begins();
         let result = self
             .check_copy_state(owner, beginning)
             .and_then(|()| self.copy_mode_inner(owner, action, viewport_offset));
@@ -492,8 +492,16 @@ impl GhosttyTerminal {
     ) -> std::result::Result<CopyModeOutcome, CopyModeFailure> {
         match action {
             CopyModeAction::Begin => self
-                .begin_copy_mode(owner, viewport_offset)
+                .begin_copy_mode(owner, viewport_offset, None)
                 .map(CopyModeOutcome::Active),
+            CopyModeAction::BeginSelection { column, row } => self
+                .begin_copy_mode(owner, viewport_offset, Some((column, row)))
+                .map(CopyModeOutcome::Active),
+            CopyModeAction::SetSelectionEnd { column, row } => {
+                self.set_copy_cursor(owner, column, row, viewport_offset)?;
+                self.copy_mode_snapshot_inner(owner, viewport_offset)
+                    .map(CopyModeOutcome::Active)
+            }
             CopyModeAction::Move { movement } => {
                 self.move_copy_cursor(owner, movement)?;
                 self.copy_mode_snapshot_inner(owner, viewport_offset)
@@ -601,28 +609,35 @@ impl GhosttyTerminal {
         &mut self,
         owner: ClientId,
         viewport_offset: Option<usize>,
+        selection_anchor: Option<(u16, u16)>,
     ) -> std::result::Result<ViewportSnapshot, CopyModeFailure> {
         self.restore_canonical()?;
         let screen = self.terminal.active_screen()?;
         let total_rows = self.terminal.total_rows()?;
-        let visible_rows = usize::from(self.size.rows);
-        let bottom = total_rows.saturating_sub(visible_rows);
-        let viewport_top = viewport_offset.unwrap_or(bottom).min(bottom);
-        let relative_y = usize::from(self.terminal.cursor_y()?.min(self.size.rows - 1));
-        let y = viewport_top
-            .saturating_add(relative_y)
-            .min(total_rows.saturating_sub(1));
-        let cursor = PointCoordinate {
-            x: self.terminal.cursor_x()?.min(self.size.columns - 1),
-            y: u32::try_from(y).context("converting initial copy-mode cursor row")?,
+        let viewport_top = self.copy_viewport_top(total_rows, viewport_offset);
+        let cursor_point = if let Some((column, row)) = selection_anchor {
+            self.copy_position(viewport_top, column, row)?
+        } else {
+            let relative_y = usize::from(self.terminal.cursor_y()?.min(self.size.rows - 1));
+            let y = viewport_top
+                .saturating_add(relative_y)
+                .min(total_rows.saturating_sub(1));
+            PointCoordinate {
+                x: self.terminal.cursor_x()?.min(self.size.columns - 1),
+                y: u32::try_from(y).context("converting initial copy-mode cursor row")?,
+            }
         };
-        let cursor = self.terminal.track_grid_ref(Point::Screen(cursor))?;
+        let anchor = selection_anchor
+            .is_some()
+            .then(|| self.terminal.track_grid_ref(Point::Screen(cursor_point)))
+            .transpose()?;
+        let cursor = self.terminal.track_grid_ref(Point::Screen(cursor_point))?;
         self.copy_modes.insert(
             owner,
             ClientCopyState {
                 screen,
                 cursor,
-                anchor: None,
+                anchor,
                 search: None,
                 prepared_copy: None,
             },
@@ -788,6 +803,52 @@ impl GhosttyTerminal {
         state.cursor.set(&mut self.terminal, Point::Screen(point))?;
         state.prepared_copy = None;
         Ok(())
+    }
+
+    fn set_copy_cursor(
+        &mut self,
+        owner: ClientId,
+        column: u16,
+        row: u16,
+        viewport_offset: Option<usize>,
+    ) -> std::result::Result<(), CopyModeFailure> {
+        let total_rows = self.terminal.total_rows()?;
+        let viewport_top = self.copy_viewport_top(total_rows, viewport_offset);
+        let point = self.copy_position(viewport_top, column, row)?;
+        let state = self
+            .copy_modes
+            .get_mut(&owner)
+            .ok_or(CopyModeError::NotActive)?;
+        state.cursor.set(&mut self.terminal, Point::Screen(point))?;
+        state.prepared_copy = None;
+        Ok(())
+    }
+
+    fn copy_viewport_top(&self, total_rows: usize, viewport_offset: Option<usize>) -> usize {
+        let bottom = total_rows.saturating_sub(usize::from(self.size.rows));
+        viewport_offset.unwrap_or(bottom).min(bottom)
+    }
+
+    fn copy_position(
+        &self,
+        viewport_top: usize,
+        column: u16,
+        row: u16,
+    ) -> std::result::Result<PointCoordinate, CopyModeFailure> {
+        if column >= self.size.columns || row >= self.size.rows {
+            return Err(CopyModeError::PositionOutOfBounds {
+                column,
+                row,
+                columns: self.size.columns,
+                rows: self.size.rows,
+            }
+            .into());
+        }
+        let y = viewport_top.saturating_add(usize::from(row));
+        Ok(PointCoordinate {
+            x: column,
+            y: u32::try_from(y).context("converting mouse copy-mode row")?,
+        })
     }
 
     fn toggle_copy_selection(
@@ -1309,6 +1370,7 @@ impl GhosttyTerminal {
         // `ScreenSnapshot::new` does is unnecessary here.
         let mut snapshot = ScreenSnapshot::from_terminal(revision, self.size, result, cursor)?;
         snapshot.scroll = self.scroll_position()?;
+        snapshot.mouse_tracking = self.terminal.is_mouse_tracking()?;
         self.revision = revision;
         Ok(snapshot)
     }
@@ -2138,7 +2200,8 @@ mod tests {
         assert!(take_output(&x10_output).is_empty());
 
         let (mut normal, normal_output) = recording_terminal(10, 4);
-        normal.feed(b"\x1b[?1000h\x1b[?1006h").unwrap().unwrap();
+        let snapshot = normal.feed(b"\x1b[?1000h\x1b[?1006h").unwrap().unwrap();
+        assert!(snapshot.mouse_tracking);
         take_output(&normal_output);
         normal.mouse_input(drag, None, true).unwrap();
         normal.mouse_input(hover, None, true).unwrap();
@@ -2338,6 +2401,41 @@ mod tests {
             CopyModeOutcome::Finalized { .. }
         ));
         text
+    }
+
+    #[test]
+    fn mouse_copy_actions_select_viewport_cells_and_reject_invalid_positions() {
+        let mut terminal = terminal(12, 3);
+        terminal.feed(b"alpha\r\nbeta").unwrap().unwrap();
+        let owner = ClientId::new();
+
+        copy_action(
+            &mut terminal,
+            owner,
+            CopyModeAction::BeginSelection { column: 0, row: 0 },
+        );
+        copy_action(
+            &mut terminal,
+            owner,
+            CopyModeAction::SetSelectionEnd { column: 4, row: 0 },
+        );
+        assert_eq!(copy_and_finalize(&mut terminal, owner), "alpha");
+
+        assert!(matches!(
+            terminal.copy_mode(
+                ClientId::new(),
+                CopyModeAction::BeginSelection { column: 12, row: 0 },
+                None,
+            ),
+            Err(CopyModeFailure::Semantic(
+                CopyModeError::PositionOutOfBounds {
+                    column: 12,
+                    row: 0,
+                    columns: 12,
+                    rows: 3,
+                }
+            ))
+        ));
     }
 
     #[test]

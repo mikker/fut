@@ -760,7 +760,7 @@ impl Attachment {
     async fn copy_mode(&mut self, action: CopyModeAction) -> Result<CopyModeOutcome, CommandError> {
         let terminal_id = self.focused.selected.terminal_id;
         let offset = self.viewport_offsets.get(&terminal_id).copied();
-        let beginning = matches!(&action, CopyModeAction::Begin);
+        let beginning = action.begins();
         if beginning {
             self.record_copy_mode_begin()?;
         }
@@ -1792,6 +1792,7 @@ fn snapshot_message(
             rows,
             cursor: screen.cursor,
             scroll: screen.scroll,
+            mouse_tracking: screen.mouse_tracking,
         };
         last_sent.insert(terminal_id, screen);
         return ServerMessage::SnapshotDelta { terminal_id, delta };
@@ -5266,7 +5267,7 @@ mod tests {
         let message = snapshot_message(terminal_id, second, false, &mut last_sent);
         assert!(matches!(message, ServerMessage::SnapshotDelta { .. }));
 
-        let third = ScreenSnapshot::new(
+        let mut third = ScreenSnapshot::new(
             3,
             size,
             second_cells,
@@ -5277,6 +5278,7 @@ mod tests {
             },
         )
         .unwrap();
+        third.mouse_tracking = true;
         let message = snapshot_message(terminal_id, third, false, &mut last_sent);
         let ServerMessage::SnapshotDelta { delta, .. } = message else {
             panic!("cursor-only change should produce a delta")
@@ -5284,6 +5286,7 @@ mod tests {
         assert!(delta.rows.is_empty());
         assert_eq!(delta.cursor.shape, CursorShape::Bar);
         assert!(delta.cursor.blinking);
+        assert!(delta.mouse_tracking);
     }
 
     #[tokio::test]
