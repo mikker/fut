@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.4
+
 - Added fallback Codex idle, working, and blocked detection from the live terminal screen when no lifecycle plugin is active, including unread completion attention when detected work finishes.
 - Dragging in a focused pane now selects and copies text when its application is not using mouse reporting; Shift-drag forces selection, while mouse-aware applications keep their gestures.
 - Removed `ui.tab_bar.item.min_width`; tab content now uses its intrinsic width instead of padding short labels to a configured minimum.
