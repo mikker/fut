@@ -1,5 +1,6 @@
 //! Shared, transport-independent building blocks for Fut.
 
+mod agent_detection;
 pub mod cli;
 pub mod client;
 pub mod daemon;

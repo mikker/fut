@@ -414,11 +414,20 @@ pub struct AgentAttention {
     pub occurred_at_ms: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentDetection {
+    pub agent: String,
+    pub rule: String,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct AgentActivity {
     /// Presence means this terminal has reported through an agent integration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integration: Option<AgentIntegration>,
+    /// Presence means Fut inferred this activity from the live terminal screen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detection: Option<AgentDetection>,
     pub state: AgentState,
     pub revision: u64,
     pub updated_at_ms: u64,
@@ -438,6 +447,8 @@ impl<'de> Deserialize<'de> for AgentActivity {
             #[serde(default)]
             integration: Option<AgentIntegration>,
             #[serde(default)]
+            detection: Option<AgentDetection>,
+            #[serde(default)]
             state: AgentState,
             #[serde(default)]
             revision: u64,
@@ -452,12 +463,13 @@ impl<'de> Deserialize<'de> for AgentActivity {
         let wire = WireActivity::deserialize(deserializer)?;
         let had_legacy_report =
             wire.revision != 0 || wire.state != AgentState::Idle || wire.attention.is_some();
-        let has_report = had_legacy_report || wire.last_event.is_some();
+        let has_report =
+            (had_legacy_report && wire.detection.is_none()) || wire.last_event.is_some();
         let integration = wire
             .integration
             .or_else(|| has_report.then(AgentIntegration::default));
         let last_event = wire.last_event.or_else(|| {
-            had_legacy_report.then(|| {
+            (had_legacy_report && wire.detection.is_none()).then(|| {
                 let kind = match wire.attention.filter(|a| a.revision == wire.revision) {
                     Some(AgentAttention {
                         kind: AttentionKind::Completed,
@@ -483,6 +495,7 @@ impl<'de> Deserialize<'de> for AgentActivity {
         });
         Ok(Self {
             integration,
+            detection: wire.detection,
             state: wire.state,
             revision: wire.revision,
             updated_at_ms: wire.updated_at_ms,

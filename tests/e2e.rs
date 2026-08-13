@@ -649,6 +649,78 @@ async fn agent_reports_flow_from_scoped_cli_into_authoritative_snapshots() {
 }
 
 #[tokio::test]
+async fn codex_node_wrapper_screen_detection_tracks_working_then_idle() {
+    let script = r#"
+mkfifo codex
+( exec > codex
+  printf '› Build it\r\n\r\n◦ Working (3s • esc to interrupt)\r\n'
+  sleep 2
+  printf '\r\n• Implemented the change.\r\n\r\n› \r\n'
+  sleep 5
+) &
+exec ./node ./codex
+"#;
+    let harness = Harness::start_with(script, |root| {
+        let source = root.join("codex-fixture.c");
+        fs::write(
+            &source,
+            "#include <fcntl.h>\n#include <unistd.h>\nint main(int c, char **v) { char b[1024]; int f = open(v[1], O_RDONLY); ssize_t n; while ((n = read(f, b, sizeof b)) > 0) write(1, b, n); sleep(30); }\n",
+        )
+        .unwrap();
+        let status = Command::new("cc")
+            .arg(&source)
+            .arg("-o")
+            .arg(root.join("cwd/node"))
+            .status()
+            .expect("compile fake Node runtime");
+        assert!(status.success());
+    })
+    .await;
+
+    fn activity(snapshot: &fut::resources::ResourceSnapshot) -> &fut::domain::AgentActivity {
+        &snapshot.sessions[0].workspaces[0].tabs[0].panes[0].activity
+    }
+    time::timeout(DEADLINE, async {
+        loop {
+            let snapshot = harness.resources().await;
+            if activity(&snapshot).state == AgentState::Working {
+                assert_eq!(
+                    activity(&snapshot).detection.as_ref().unwrap().agent,
+                    "codex"
+                );
+                break;
+            }
+            time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("fake Codex was not detected working: {}", harness.logs()));
+
+    time::timeout(DEADLINE, async {
+        loop {
+            let snapshot = harness.resources().await;
+            if activity(&snapshot).state == AgentState::Idle
+                && activity(&snapshot)
+                    .detection
+                    .as_ref()
+                    .is_some_and(|detection| detection.rule == "idle_fallback")
+            {
+                assert_eq!(
+                    activity(&snapshot).last_event.as_ref().unwrap().kind,
+                    AgentReport::Completed
+                );
+                break;
+            }
+            time::sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("fake Codex did not return idle: {}", harness.logs()));
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn terminal_survives_detach_and_preserves_output_continuity() {
     let script = r#"
 printf 'READY\r\n'

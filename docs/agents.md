@@ -110,6 +110,28 @@ unwrapping return `alternate_screen`. Other stable failures include
 `invalid_regex`, `output_timeout`, `terminal_exited`, `invalid_output_rows`, and
 `output_too_large`.
 
+## Codex screen detection
+
+When the foreground process is Codex and it has not reported through an agent
+integration, Fut infers idle, working, and blocked state from the canonical live
+bottom viewport. Client scrollback does not affect detection. Resource JSON
+keeps inferred provenance explicit under `activity.detection`, including the
+matched `rule`; lifecycle reports remain authoritative and clear inferred
+provenance.
+
+When testing this fallback, uninstall or disable existing Fut Codex lifecycle
+plugins first. A plugin report intentionally takes precedence and prevents the
+screen detector from affecting state. Inference stops and clears when Codex is
+no longer the foreground process.
+
+A detected transition from working to idle creates the same per-client unread
+completion attention as a lifecycle `completed` report.
+
+Set `FUT_AGENT_DETECTION_LOG=1` on the Fut daemon to print each Codex process,
+command line, matched rule, state, and quoted canonical screen to daemon stderr.
+This diagnostic can include terminal content and should only be enabled while
+debugging.
+
 Report semantic state from an integration with:
 
 ```sh

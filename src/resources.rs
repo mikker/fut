@@ -13,8 +13,9 @@ use thiserror::Error;
 
 use crate::{
     domain::{
-        AgentActivity, AgentEvent, AgentIntegration, AgentReport, AgentReportMetadata, AgentState,
-        PaneId, SessionId, SplitId, TabId, TerminalId, WorkspaceId,
+        AgentActivity, AgentDetection, AgentEvent, AgentIntegration, AgentReport,
+        AgentReportMetadata, AgentState, PaneId, SessionId, SplitId, TabId, TerminalId,
+        WorkspaceId,
     },
     splits::{SplitDirection, SplitRatio, SplitTree},
 };
@@ -643,6 +644,47 @@ impl ResourceTree {
             .ok_or_else(|| ResourceError::Invariant("terminal pane is missing".into()))
     }
 
+    pub fn update_agent_detection(
+        &mut self,
+        terminal_id: TerminalId,
+        detection: Option<AgentDetection>,
+        state: AgentState,
+        now_ms: u64,
+    ) -> Result<u64, ResourceError> {
+        let pane_id = *self
+            .terminals
+            .get(&terminal_id)
+            .ok_or(ResourceError::NotFound("terminal"))?;
+        let activity = &mut self
+            .panes
+            .get_mut(&pane_id)
+            .expect("terminal pane exists")
+            .activity;
+        if activity.integration.is_some()
+            || (activity.detection == detection && activity.state == state)
+        {
+            return Ok(self.revision);
+        }
+        let completed = activity.detection.is_some()
+            && activity.state == AgentState::Working
+            && state == AgentState::Idle
+            && detection.is_some();
+        self.revision += 1;
+        activity.detection = detection;
+        activity.state = state;
+        activity.revision = self.revision;
+        activity.updated_at_ms = now_ms;
+        if completed {
+            activity.last_event = Some(AgentEvent {
+                revision: self.revision,
+                kind: AgentReport::Completed,
+                occurred_at_ms: now_ms,
+                turn_id: None,
+            });
+        }
+        Ok(self.revision)
+    }
+
     /// Record the readable foreground process for a pane. Automatic tab names
     /// belong to the resource tree, rather than being guessed independently by
     /// each client, and only follow the tab's focused pane.
@@ -706,6 +748,7 @@ impl ResourceTree {
         let integration = activity
             .integration
             .get_or_insert_with(AgentIntegration::default);
+        activity.detection = None;
         if metadata.source.is_some() {
             integration.source.clone_from(&metadata.source);
         }
@@ -2150,6 +2193,66 @@ mod tests {
         assert_eq!(
             tree.snapshot().sessions[0].workspaces[0].tabs[0].name,
             "fish"
+        );
+    }
+
+    #[test]
+    fn lifecycle_reports_replace_and_override_screen_detection() {
+        let mut tree = ResourceTree::default();
+        let path = initial("agent", "/agent");
+        let terminal_id = path.terminal_id;
+        tree.create_session(path).unwrap();
+
+        let detection = AgentDetection {
+            agent: "codex".into(),
+            rule: "working_indicator".into(),
+        };
+        tree.update_agent_detection(terminal_id, Some(detection), AgentState::Working, 10)
+            .unwrap();
+        let detected = tree.agent_activity(terminal_id).unwrap();
+        assert_eq!(detected.state, AgentState::Working);
+        assert!(detected.detection.is_some());
+        assert!(detected.integration.is_none());
+        assert!(detected.last_event.is_none());
+
+        tree.update_agent_detection(
+            terminal_id,
+            Some(AgentDetection {
+                agent: "codex".into(),
+                rule: "idle_fallback".into(),
+            }),
+            AgentState::Idle,
+            15,
+        )
+        .unwrap();
+        let completed = tree.agent_activity(terminal_id).unwrap();
+        assert_eq!(
+            completed.last_event.as_ref().unwrap().kind,
+            AgentReport::Completed
+        );
+
+        tree.report_agent(terminal_id, AgentReport::Idle, 20)
+            .unwrap();
+        let integrated_revision = tree.revision();
+        let integrated = tree.agent_activity(terminal_id).unwrap();
+        assert_eq!(integrated.state, AgentState::Idle);
+        assert!(integrated.detection.is_none());
+        assert!(integrated.integration.is_some());
+
+        tree.update_agent_detection(
+            terminal_id,
+            Some(AgentDetection {
+                agent: "codex".into(),
+                rule: "live_blocker".into(),
+            }),
+            AgentState::Blocked,
+            30,
+        )
+        .unwrap();
+        assert_eq!(tree.revision(), integrated_revision);
+        assert_eq!(
+            tree.agent_activity(terminal_id).unwrap().state,
+            AgentState::Idle
         );
     }
 

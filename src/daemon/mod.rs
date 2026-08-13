@@ -35,11 +35,13 @@ use tokio_util::codec::Framed;
 use uuid::Uuid;
 
 use crate::{
+    agent_detection::{CodexStabilizer, detect_codex, is_codex_process},
     domain::{
-        AgentActivity, AgentReport, ClientId, CopyModeAction, CopyModeError, DeltaRow,
-        MAX_AGENT_PROMPT_BYTES, MAX_TERMINAL_OUTPUT_PATTERN_BYTES, MAX_TERMINAL_OUTPUT_ROWS,
-        PaneId, ScreenDelta, ScreenSnapshot, SessionId, SplitId, TabId, TerminalId, TerminalOutput,
-        TerminalOutputMatcher, TerminalOutputSource, TerminalSize, WorkspaceId,
+        AgentActivity, AgentDetection, AgentReport, AgentState, ClientId, CopyModeAction,
+        CopyModeError, DeltaRow, MAX_AGENT_PROMPT_BYTES, MAX_TERMINAL_OUTPUT_PATTERN_BYTES,
+        MAX_TERMINAL_OUTPUT_ROWS, PaneId, ScreenDelta, ScreenSnapshot, SessionId, SplitId, TabId,
+        TerminalId, TerminalOutput, TerminalOutputMatcher, TerminalOutputSource, TerminalSize,
+        WorkspaceId,
     },
     project::{ProjectError, ProjectResolver, ResolvedLocation},
     protocol::{
@@ -1345,6 +1347,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
 fn watch_process_names(shared: Shared, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(500));
+        let mut codex = HashMap::<TerminalId, CodexStabilizer>::new();
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
@@ -1353,32 +1356,58 @@ fn watch_process_names(shared: Shared, mut shutdown: watch::Receiver<bool>) -> J
                         return;
                     }
                 }
-                _ = interval.tick() => refresh_process_names(&shared).await,
+                _ = interval.tick() => refresh_process_names(&shared, &mut codex).await,
             }
         }
     })
 }
 
-async fn refresh_process_names(shared: &Shared) {
-    let terminals = {
+struct ProcessObservation {
+    terminal_id: TerminalId,
+    pid: u32,
+    name: String,
+    command: String,
+    codex_screen: Option<String>,
+}
+
+async fn refresh_process_names(shared: &Shared, codex: &mut HashMap<TerminalId, CodexStabilizer>) {
+    let (terminals, automatic_names) = {
         let state = shared.lock().await;
-        state
-            .resources
-            .automatic_name_terminal_ids()
-            .into_iter()
-            .filter_map(|terminal_id| {
-                state
-                    .runtimes
-                    .get(&terminal_id)
-                    .map(|entry| (terminal_id, Arc::clone(&entry.handle)))
-            })
-            .collect::<Vec<_>>()
+        (
+            state
+                .runtimes
+                .iter()
+                .map(|(terminal_id, entry)| (*terminal_id, Arc::clone(&entry.handle)))
+                .collect::<Vec<_>>(),
+            state
+                .resources
+                .automatic_name_terminal_ids()
+                .into_iter()
+                .collect::<HashSet<_>>(),
+        )
     };
-    let names = futures_util::stream::iter(terminals)
+    let observations = futures_util::stream::iter(terminals)
         .map(|(terminal_id, terminal)| async move {
             timeout(Duration::from_millis(350), async {
                 let pid = terminal.foreground_process_id().await.ok()?;
-                process_name(pid).await.map(|name| (terminal_id, name))
+                let name = process_name(pid).await?;
+                let command = process_command(pid).await.unwrap_or_default();
+                let codex_screen = if is_codex_process(&name, &command) {
+                    terminal
+                        .read_output(TerminalOutputSource::Visible, 1, false)
+                        .await
+                        .ok()
+                        .map(|output| output.text)
+                } else {
+                    None
+                };
+                Some(ProcessObservation {
+                    terminal_id,
+                    pid,
+                    name,
+                    command,
+                    codex_screen,
+                })
             })
             .await
             .ok()
@@ -1390,8 +1419,68 @@ async fn refresh_process_names(shared: &Shared) {
         .await;
 
     let mut state = shared.lock().await;
-    for (terminal_id, name) in names {
-        if let Ok(revision) = state.resources.update_process_name(terminal_id, name) {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    let live = observations
+        .iter()
+        .map(|observation| observation.terminal_id)
+        .collect::<HashSet<_>>();
+    codex.retain(|terminal_id, _| live.contains(terminal_id));
+    for observation in observations {
+        let ProcessObservation {
+            terminal_id,
+            pid,
+            name,
+            command,
+            codex_screen,
+        } = observation;
+        if automatic_names.contains(&terminal_id)
+            && let Ok(revision) = state
+                .resources
+                .update_process_name(terminal_id, name.clone())
+        {
+            state.publish_resource_change(revision);
+        }
+        let integrated = state
+            .resources
+            .agent_activity(terminal_id)
+            .is_ok_and(|activity| activity.integration.is_some());
+        if integrated {
+            codex.remove(&terminal_id);
+            continue;
+        }
+        let (detection, detected_state) = if let Some(screen) = codex_screen {
+            let detected = detect_codex(&screen);
+            if std::env::var_os("FUT_AGENT_DETECTION_LOG").is_some() {
+                eprintln!(
+                    "codex detection terminal={terminal_id} pid={pid} process={name:?} command={command:?} state={:?} rule={} screen={screen:?}",
+                    detected.state, detected.rule
+                );
+            }
+            let stabilizer = codex.entry(terminal_id).or_default();
+            let Some(stable_state) = stabilizer.observe(detected.state) else {
+                continue;
+            };
+            (
+                Some(AgentDetection {
+                    agent: "codex".into(),
+                    rule: detected.rule.into(),
+                }),
+                stable_state,
+            )
+        } else {
+            codex.remove(&terminal_id);
+            (None, AgentState::Idle)
+        };
+        if let Ok(revision) =
+            state
+                .resources
+                .update_agent_detection(terminal_id, detection, detected_state, now_ms)
+        {
             state.publish_resource_change(revision);
         }
     }
@@ -1444,6 +1533,23 @@ async fn process_name(pid: u32) -> Option<String> {
                 .to_owned()
         })
     }
+}
+
+async fn process_command(pid: u32) -> Option<String> {
+    let output = timeout(
+        Duration::from_millis(250),
+        tokio::process::Command::new("/bin/ps")
+            .args(["-o", "command=", "-p", &pid.to_string()])
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let command = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!command.is_empty()).then_some(command)
 }
 
 fn initial_path(resolved: &ResolvedLocation, name: String, terminal_id: TerminalId) -> InitialPath {

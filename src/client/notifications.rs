@@ -379,6 +379,7 @@ mod tests {
             closing,
             activity: AgentActivity {
                 integration: Some(AgentIntegration::default()),
+                detection: None,
                 state: AgentState::Idle,
                 revision: 1,
                 updated_at_ms: 10,
@@ -407,6 +408,7 @@ mod tests {
             closing: false,
             activity: AgentActivity {
                 integration: Some(AgentIntegration::default()),
+                detection: None,
                 state: AgentState::Idle,
                 revision: 4,
                 updated_at_ms: 10,
@@ -433,6 +435,7 @@ mod tests {
             closing: false,
             activity: AgentActivity {
                 integration: Some(AgentIntegration::default()),
+                detection: None,
                 state: AgentState::Idle,
                 revision: 5,
                 updated_at_ms: 20,

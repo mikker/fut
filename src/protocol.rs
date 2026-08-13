@@ -706,6 +706,7 @@ mod tests {
 
         let activity = AgentActivity {
             integration: Some(Default::default()),
+            detection: None,
             state: crate::domain::AgentState::Blocked,
             revision: 9,
             updated_at_ms: 12,
