@@ -32,13 +32,15 @@ if [[ "$current_package_version" != "$package_version" ]]; then
   cargo check --quiet
 fi
 
+perl -0pi -e "s/^version: \x22[^\x22]+\x22/version: \x22$version\x22/m" docs/_config.yml
+
 echo "Releasing $version"
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 
-if ! git diff --quiet -- Cargo.toml Cargo.lock; then
-  git add Cargo.toml Cargo.lock
+if ! git diff --quiet -- Cargo.toml Cargo.lock docs/_config.yml; then
+  git add Cargo.toml Cargo.lock docs/_config.yml
   git commit -m "Release $version"
 fi
 

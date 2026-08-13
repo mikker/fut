@@ -40,9 +40,21 @@ jobs:
       matrix:
         include:
           - os: macos-15
+            platform: macos
             arch: arm64
+            machine: arm64
           - os: macos-15-intel
+            platform: macos
             arch: x86_64
+            machine: x86_64
+          - os: ubuntu-24.04-arm
+            platform: linux
+            arch: arm64
+            machine: aarch64
+          - os: ubuntu-24.04
+            platform: linux
+            arch: x86_64
+            machine: x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -58,18 +70,24 @@ jobs:
       - run: cargo build --release --locked
       - name: Package binary
         env:
+          PLATFORM: ${{ matrix.platform }}
           ARCH: ${{ matrix.arch }}
+          MACHINE: ${{ matrix.machine }}
         run: |
-          test "$(uname -m)" = "$ARCH"
+          test "$(uname -m)" = "$MACHINE"
           mkdir dist
           cp target/release/fut dist/fut
-          archive="fut-macos-$ARCH.tar.gz"
+          archive="fut-$PLATFORM-$ARCH.tar.gz"
           tar -C dist -czf "dist/$archive" fut
-          shasum -a 256 "dist/$archive" > "dist/$archive.sha256"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "dist/$archive" > "dist/$archive.sha256"
+          else
+            shasum -a 256 "dist/$archive" > "dist/$archive.sha256"
+          fi
           "dist/fut" --version
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: fut-macos-${{ matrix.arch }}
+          name: fut-${{ matrix.platform }}-${{ matrix.arch }}
           path: |
             dist/*.tar.gz
             dist/*.sha256
@@ -82,7 +100,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: fut-macos-*
+          pattern: fut-*
           path: dist
           merge-multiple: true
       - name: Publish GitHub release

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Added a verified `curl | bash` installer with prebuilt arm64 and x86_64 releases for Linux and macOS.
+- Added the latest release number and a changelog page to fut.sh.
+
 ## 0.4
 
 - Added fallback Codex idle, working, and blocked detection from the live terminal screen when no lifecycle plugin is active, including unread completion attention when detected work finishes.

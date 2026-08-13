@@ -4,7 +4,13 @@
 
 > fear, uncertainty and ... terminals?
 
-[Install with Homebrew](https://github.com/mikker/homebrew-tap):
+Install the latest release on macOS or Linux:
+
+```sh
+curl -fsSL https://fut.sh/install.sh | bash
+```
+
+Or [install with Homebrew](https://github.com/mikker/homebrew-tap):
 
 ```sh
 brew install mikker/tap/fut

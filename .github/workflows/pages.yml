@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - docs/**
+      - install.sh
       - .github/workflows/pages.yml
   workflow_dispatch:
 
@@ -27,6 +28,8 @@ jobs:
         with:
           source: ./docs
           destination: ./_site
+      - name: Add installer
+        run: cp install.sh _site/install.sh
       - uses: actions/upload-pages-artifact@v3
 
   deploy:
