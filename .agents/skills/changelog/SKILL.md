@@ -12,6 +12,7 @@ Record what shipped while the change is fresh. Do not reconstruct the changelog 
 3. Write it for a user reading release notes, not as a commit message:
    - Keep it to one concise line.
    - Describe the user-visible effect, not implementation details or file paths.
+   - Limit it to changes in the Fut app; skip the project website, installer, distribution, and release process unless the installed app behaves differently.
    - Skip refactors, dependencies, CI, tests, and other internal work unless users notice the result.
 
 Match the existing tense and style. Do not add category subheadings, links, or contributor credits.

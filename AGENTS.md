@@ -4,9 +4,9 @@ This project uses a CLI ticket system for task management. Run `tk help` when yo
 
 ## Changelog
 
-- `CHANGELOG.md` is user-facing. Only note changes users will notice; omit internal work.
+- `CHANGELOG.md` covers user-visible changes to the Fut app itself. Omit project website, installer, distribution, CI, release-process, and other repository-maintenance changes unless they alter the installed app's behavior.
 - Keep entries brief and update `Unreleased` as user-facing tasks finish.
-- Before releasing, consolidate related entries, move them under the new version, and start a fresh `Unreleased` section.
+- Before releasing, review `Unreleased`, prune anything outside that scope, consolidate related entries, move them under the new version, and start a fresh `Unreleased` section.
 
 ## Release
 
