@@ -20,6 +20,18 @@ use crate::{
     splits::{SplitDirection, SplitRatio, SplitTree},
 };
 
+/// A daemon-wide bound on materialized extension presentation values. Token
+/// declarations are bounded separately while loading extension manifests.
+pub const MAX_MATERIALIZED_TOKEN_VALUES: usize = 4096;
+/// Token values are presentation text, never style or executable content.
+pub const MAX_MATERIALIZED_TOKEN_VALUE_BYTES: usize = 1024;
+
+pub type MaterializedTokenMap = BTreeMap<String, String>;
+
+pub(crate) const WORKSPACE_GIT_BRANCH_TOKEN: &str = "workspace.git_branch";
+pub(crate) const WORKSPACE_GIT_ADDED_TOKEN: &str = "workspace.git_added";
+pub(crate) const WORKSPACE_GIT_DELETED_TOKEN: &str = "workspace.git_deleted";
+
 /// Tabs may be unnamed; any other name must carry visible characters and stay
 /// unique inside its workspace.
 fn check_tab_name(name: &str) -> Result<(), ResourceError> {
@@ -38,6 +50,17 @@ fn disambiguate(suggested: &str, exists: impl Fn(&str) -> bool) -> String {
         .map(|suffix| format!("{suggested}-{suffix}"))
         .find(|candidate| !exists(candidate))
         .expect("an unbounded suffix must produce a unique name")
+}
+
+fn is_builtin_token(name: &str) -> bool {
+    matches!(
+        name,
+        WORKSPACE_GIT_BRANCH_TOKEN | WORKSPACE_GIT_ADDED_TOKEN | WORKSPACE_GIT_DELETED_TOKEN
+    )
+}
+
+fn extension_token_count(tokens: &MaterializedTokenMap) -> usize {
+    tokens.keys().filter(|name| !is_builtin_token(name)).count()
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -129,6 +152,8 @@ pub struct SessionSnapshot {
     pub name: String,
     pub project: Project,
     pub closing: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tokens: MaterializedTokenMap,
     pub workspaces: Vec<WorkspaceSnapshot>,
 }
 
@@ -138,6 +163,8 @@ pub struct WorkspaceSnapshot {
     pub name: String,
     pub root: PathBuf,
     pub closing: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tokens: MaterializedTokenMap,
     pub tabs: Vec<TabSnapshot>,
 }
 
@@ -146,6 +173,8 @@ pub struct TabSnapshot {
     pub id: TabId,
     pub name: String,
     pub closing: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tokens: MaterializedTokenMap,
     pub layout: SplitTree,
     pub panes: Vec<PaneSnapshot>,
 }
@@ -155,7 +184,24 @@ pub struct PaneSnapshot {
     pub id: PaneId,
     pub terminal_id: TerminalId,
     pub closing: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tokens: MaterializedTokenMap,
     pub activity: AgentActivity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "scope", content = "id", rename_all = "snake_case")]
+pub enum PresentationTokenTarget {
+    Session(SessionId),
+    Workspace(WorkspaceId),
+    Tab(TabId),
+    Pane(PaneId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TokenPublication {
+    pub revision: u64,
+    pub changed: bool,
 }
 
 impl ResourceSnapshot {
@@ -233,6 +279,7 @@ pub enum ResourceEvent {
     WorkspaceRenamed {
         session_id: SessionId,
         id: WorkspaceId,
+        root: PathBuf,
         old_name: String,
         new_name: String,
     },
@@ -299,7 +346,10 @@ pub enum ResourceEvent {
         tab_id: TabId,
     },
     WorkspaceClosed {
+        session_id: SessionId,
         workspace_id: WorkspaceId,
+        name: String,
+        root: PathBuf,
     },
     SessionClosed {
         session_id: SessionId,
@@ -334,6 +384,8 @@ pub enum ResourceError {
     InvalidAgentReport(&'static str),
     #[error("invalid split ratio")]
     InvalidSplitRatio,
+    #[error("maximum of {MAX_MATERIALIZED_TOKEN_VALUES} materialized token values reached")]
+    TooManyMaterializedTokens,
     #[error("resource tree invariant violated: {0}")]
     Invariant(String),
 }
@@ -343,6 +395,7 @@ struct Session {
     name: String,
     project: Project,
     closing: bool,
+    tokens: MaterializedTokenMap,
     workspaces: Vec<WorkspaceId>,
 }
 #[derive(Clone, Debug)]
@@ -351,6 +404,7 @@ struct Workspace {
     name: String,
     root: PathBuf,
     closing: bool,
+    tokens: MaterializedTokenMap,
     tabs: Vec<TabId>,
 }
 #[derive(Clone, Debug)]
@@ -361,6 +415,7 @@ struct Tab {
     automatic_name: String,
     focused_pane: PaneId,
     closing: bool,
+    tokens: MaterializedTokenMap,
     panes: Vec<PaneId>,
     layout: SplitTree,
 }
@@ -369,6 +424,7 @@ struct Pane {
     tab_id: TabId,
     terminal_id: TerminalId,
     closing: bool,
+    tokens: MaterializedTokenMap,
     activity: AgentActivity,
 }
 
@@ -624,6 +680,196 @@ impl ResourceTree {
         }
     }
 
+    /// Materialize already-declared extension presentation text on one live
+    /// resource. Declaration and text validation live at the daemon boundary;
+    /// this pure tree owns target/closing checks, cardinality, revisioning,
+    /// snapshot publication, and cleanup through ordinary resource removal.
+    pub fn publish_presentation_token(
+        &mut self,
+        target: PresentationTokenTarget,
+        qualified_name: String,
+        value: String,
+    ) -> Result<TokenPublication, ResourceError> {
+        self.replace_presentation_tokens(target, [(qualified_name, Some(value))])
+    }
+
+    /// Atomically replace Fut's internal Git presentation values for one live
+    /// workspace. Empty values are absent from the snapshot, matching token
+    /// rendering semantics and ensuring an error or vanished repository clears
+    /// a previously materialized status in the same revision.
+    pub(crate) fn publish_workspace_git_tokens(
+        &mut self,
+        workspace_id: WorkspaceId,
+        branch: Option<String>,
+        added: Option<String>,
+        deleted: Option<String>,
+    ) -> Result<TokenPublication, ResourceError> {
+        self.replace_presentation_tokens(
+            PresentationTokenTarget::Workspace(workspace_id),
+            [
+                (WORKSPACE_GIT_BRANCH_TOKEN.to_owned(), branch),
+                (WORKSPACE_GIT_ADDED_TOKEN.to_owned(), added),
+                (WORKSPACE_GIT_DELETED_TOKEN.to_owned(), deleted),
+            ],
+        )
+    }
+
+    fn replace_presentation_tokens(
+        &mut self,
+        target: PresentationTokenTarget,
+        replacements: impl IntoIterator<Item = (String, Option<String>)>,
+    ) -> Result<TokenPublication, ResourceError> {
+        let replacements = replacements.into_iter().collect::<BTreeMap<_, _>>();
+        let tokens = self.presentation_tokens_for(target)?;
+        let changed = replacements.iter().any(|(name, value)| match value {
+            Some(value) => tokens.get(name) != Some(value),
+            None => tokens.contains_key(name),
+        });
+        if !changed {
+            return Ok(TokenPublication {
+                revision: self.revision,
+                changed: false,
+            });
+        }
+
+        let removed_extension_values = replacements
+            .iter()
+            .filter(|(name, value)| {
+                value.is_none() && tokens.contains_key(*name) && !is_builtin_token(name)
+            })
+            .count();
+        let added_extension_values = replacements
+            .iter()
+            .filter(|(name, value)| {
+                value.is_some() && !tokens.contains_key(*name) && !is_builtin_token(name)
+            })
+            .count();
+        if self
+            .materialized_extension_token_value_count()
+            .saturating_sub(removed_extension_values)
+            .saturating_add(added_extension_values)
+            > MAX_MATERIALIZED_TOKEN_VALUES
+        {
+            return Err(ResourceError::TooManyMaterializedTokens);
+        }
+
+        self.revision += 1;
+        let tokens = self.presentation_tokens_for_mut(target);
+        for (name, value) in replacements {
+            if let Some(value) = value {
+                tokens.insert(name, value);
+            } else {
+                tokens.remove(&name);
+            }
+        }
+        Ok(TokenPublication {
+            revision: self.revision,
+            changed: true,
+        })
+    }
+
+    fn materialized_extension_token_value_count(&self) -> usize {
+        self.sessions
+            .values()
+            .map(|resource| extension_token_count(&resource.tokens))
+            .chain(
+                self.workspaces
+                    .values()
+                    .map(|resource| extension_token_count(&resource.tokens)),
+            )
+            .chain(
+                self.tabs
+                    .values()
+                    .map(|resource| extension_token_count(&resource.tokens)),
+            )
+            .chain(
+                self.panes
+                    .values()
+                    .map(|resource| extension_token_count(&resource.tokens)),
+            )
+            .sum()
+    }
+
+    fn presentation_tokens_for(
+        &self,
+        target: PresentationTokenTarget,
+    ) -> Result<&MaterializedTokenMap, ResourceError> {
+        match target {
+            PresentationTokenTarget::Session(id) => {
+                let session = self
+                    .sessions
+                    .get(&id)
+                    .ok_or(ResourceError::NotFound("session"))?;
+                if session.closing {
+                    return Err(ResourceError::Closing("session"));
+                }
+                Ok(&session.tokens)
+            }
+            PresentationTokenTarget::Workspace(id) => {
+                let workspace = self
+                    .workspaces
+                    .get(&id)
+                    .ok_or(ResourceError::NotFound("workspace"))?;
+                let session = &self.sessions[&workspace.session_id];
+                if session.closing {
+                    return Err(ResourceError::Closing("session"));
+                }
+                if workspace.closing {
+                    return Err(ResourceError::Closing("workspace"));
+                }
+                Ok(&workspace.tokens)
+            }
+            PresentationTokenTarget::Tab(id) => {
+                let tab = self.tabs.get(&id).ok_or(ResourceError::NotFound("tab"))?;
+                let workspace = &self.workspaces[&tab.workspace_id];
+                let session = &self.sessions[&workspace.session_id];
+                if session.closing {
+                    return Err(ResourceError::Closing("session"));
+                }
+                if workspace.closing {
+                    return Err(ResourceError::Closing("workspace"));
+                }
+                if tab.closing {
+                    return Err(ResourceError::Closing("tab"));
+                }
+                Ok(&tab.tokens)
+            }
+            PresentationTokenTarget::Pane(id) => {
+                let pane = self.panes.get(&id).ok_or(ResourceError::NotFound("pane"))?;
+                let tab = &self.tabs[&pane.tab_id];
+                let workspace = &self.workspaces[&tab.workspace_id];
+                let session = &self.sessions[&workspace.session_id];
+                if session.closing {
+                    return Err(ResourceError::Closing("session"));
+                }
+                if workspace.closing {
+                    return Err(ResourceError::Closing("workspace"));
+                }
+                if tab.closing {
+                    return Err(ResourceError::Closing("tab"));
+                }
+                if pane.closing {
+                    return Err(ResourceError::Closing("pane"));
+                }
+                Ok(&pane.tokens)
+            }
+        }
+    }
+
+    fn presentation_tokens_for_mut(
+        &mut self,
+        target: PresentationTokenTarget,
+    ) -> &mut MaterializedTokenMap {
+        match target {
+            PresentationTokenTarget::Session(id) => &mut self.sessions.get_mut(&id).unwrap().tokens,
+            PresentationTokenTarget::Workspace(id) => {
+                &mut self.workspaces.get_mut(&id).unwrap().tokens
+            }
+            PresentationTokenTarget::Tab(id) => &mut self.tabs.get_mut(&id).unwrap().tokens,
+            PresentationTokenTarget::Pane(id) => &mut self.panes.get_mut(&id).unwrap().tokens,
+        }
+    }
+
     pub fn report_agent(
         &mut self,
         terminal_id: TerminalId,
@@ -812,6 +1058,7 @@ impl ResourceTree {
                 name: path.session_name,
                 project: path.project,
                 closing: false,
+                tokens: BTreeMap::new(),
                 workspaces: vec![path.workspace_id],
             },
         );
@@ -823,6 +1070,7 @@ impl ResourceTree {
                 name: path.workspace_name,
                 root: path.root,
                 closing: false,
+                tokens: BTreeMap::new(),
                 tabs: vec![path.tab_id],
             },
         );
@@ -834,6 +1082,7 @@ impl ResourceTree {
                 automatic_name: String::new(),
                 focused_pane: path.pane_id,
                 closing: false,
+                tokens: BTreeMap::new(),
                 panes: vec![path.pane_id],
                 layout: SplitTree::leaf(path.pane_id),
             },
@@ -934,10 +1183,12 @@ impl ResourceTree {
             &mut self.workspaces.get_mut(&workspace_id).unwrap().name,
             new_name.clone(),
         );
+        let root = self.workspaces[&workspace_id].root.clone();
         Ok(self.finish(
             vec![ResourceEvent::WorkspaceRenamed {
                 session_id,
                 id: workspace_id,
+                root,
                 old_name,
                 new_name,
             }],
@@ -1040,6 +1291,7 @@ impl ResourceTree {
                 name: path.workspace_name,
                 root: path.root,
                 closing: false,
+                tokens: BTreeMap::new(),
                 tabs: vec![path.tab_id],
             },
         );
@@ -1051,6 +1303,7 @@ impl ResourceTree {
                 automatic_name: String::new(),
                 focused_pane: path.pane_id,
                 closing: false,
+                tokens: BTreeMap::new(),
                 panes: vec![path.pane_id],
                 layout: SplitTree::leaf(path.pane_id),
             },
@@ -1121,6 +1374,7 @@ impl ResourceTree {
                 automatic_name: String::new(),
                 focused_pane: path.pane_id,
                 closing: false,
+                tokens: BTreeMap::new(),
                 panes: vec![path.pane_id],
                 layout: SplitTree::leaf(path.pane_id),
             },
@@ -1691,6 +1945,9 @@ impl ResourceTree {
     }
 
     pub fn validate(&self) -> Result<(), ResourceError> {
+        if self.materialized_extension_token_value_count() > MAX_MATERIALIZED_TOKEN_VALUES {
+            return Err(ResourceError::TooManyMaterializedTokens);
+        }
         if self.session_order.len() != self.sessions.len()
             || self
                 .session_order
@@ -1827,13 +2084,19 @@ impl ResourceTree {
         if !self.workspaces[&workspace_id].tabs.is_empty() {
             return;
         }
-        let session_id = self.workspaces.remove(&workspace_id).unwrap().session_id;
+        let workspace = self.workspaces.remove(&workspace_id).unwrap();
+        let session_id = workspace.session_id;
         self.sessions
             .get_mut(&session_id)
             .unwrap()
             .workspaces
             .retain(|id| *id != workspace_id);
-        events.push(ResourceEvent::WorkspaceClosed { workspace_id });
+        events.push(ResourceEvent::WorkspaceClosed {
+            session_id,
+            workspace_id,
+            name: workspace.name,
+            root: workspace.root,
+        });
         if !self.sessions[&session_id].workspaces.is_empty() {
             return;
         }
@@ -1849,6 +2112,7 @@ impl ResourceTree {
                 tab_id,
                 terminal_id,
                 closing: false,
+                tokens: BTreeMap::new(),
                 activity: AgentActivity::default(),
             },
         );
@@ -1882,6 +2146,7 @@ impl ResourceTree {
             name: s.name.clone(),
             project: s.project.clone(),
             closing: s.closing,
+            tokens: s.tokens.clone(),
             workspaces: s
                 .workspaces
                 .iter()
@@ -1896,6 +2161,7 @@ impl ResourceTree {
             name: w.name.clone(),
             root: w.root.clone(),
             closing: w.closing,
+            tokens: w.tokens.clone(),
             tabs: w.tabs.iter().map(|id| self.tab_snapshot(*id)).collect(),
         }
     }
@@ -1909,6 +2175,7 @@ impl ResourceTree {
                 t.name.clone()
             },
             closing: t.closing,
+            tokens: t.tokens.clone(),
             layout: t.layout.clone(),
             panes: t.panes.iter().map(|id| self.pane_snapshot(*id)).collect(),
         }
@@ -1919,6 +2186,7 @@ impl ResourceTree {
             id,
             terminal_id: p.terminal_id,
             closing: p.closing,
+            tokens: p.tokens.clone(),
             activity: p.activity.clone(),
         }
     }
@@ -2129,6 +2397,163 @@ mod tests {
             pane_id: PaneId::new(),
             terminal_id: TerminalId::new(),
         }
+    }
+
+    #[test]
+    fn materialized_tokens_are_revisioned_snapshotted_and_owned_by_resources() {
+        let mut tree = ResourceTree::default();
+        let path = initial("tokens", "/tokens");
+        let (session_id, workspace_id, tab_id, pane_id, terminal_id) = (
+            path.session_id,
+            path.workspace_id,
+            path.tab_id,
+            path.pane_id,
+            path.terminal_id,
+        );
+        tree.create_session(path).unwrap();
+        let before = tree.revision();
+
+        let first = tree
+            .publish_presentation_token(
+                PresentationTokenTarget::Workspace(workspace_id),
+                "workspace.extension.status.state".into(),
+                "ready".into(),
+            )
+            .unwrap();
+        assert!(first.changed);
+        assert_eq!(first.revision, before + 1);
+        let unchanged = tree
+            .publish_presentation_token(
+                PresentationTokenTarget::Workspace(workspace_id),
+                "workspace.extension.status.state".into(),
+                "ready".into(),
+            )
+            .unwrap();
+        assert!(!unchanged.changed);
+        assert_eq!(unchanged.revision, first.revision);
+
+        for (target, name) in [
+            (
+                PresentationTokenTarget::Session(session_id),
+                "session.extension.status.state",
+            ),
+            (
+                PresentationTokenTarget::Tab(tab_id),
+                "tab.extension.status.state",
+            ),
+            (
+                PresentationTokenTarget::Pane(pane_id),
+                "pane.extension.status.state",
+            ),
+        ] {
+            tree.publish_presentation_token(target, name.into(), "value".into())
+                .unwrap();
+        }
+        let snapshot = tree.snapshot();
+        let session = &snapshot.sessions[0];
+        let workspace = &session.workspaces[0];
+        let tab = &workspace.tabs[0];
+        assert_eq!(session.tokens.len(), 1);
+        assert_eq!(workspace.tokens.len(), 1);
+        assert_eq!(tab.tokens.len(), 1);
+        assert_eq!(tab.panes[0].tokens.len(), 1);
+
+        tree.close_pane(pane_id).unwrap();
+        assert_eq!(
+            tree.publish_presentation_token(
+                PresentationTokenTarget::Pane(pane_id),
+                "pane.extension.status.state".into(),
+                "other".into(),
+            ),
+            Err(ResourceError::Closing("pane"))
+        );
+        tree.terminal_exited(terminal_id).unwrap();
+        assert!(tree.snapshot().sessions.is_empty());
+    }
+
+    #[test]
+    fn workspace_git_tokens_publish_and_clear_atomically_only_when_changed() {
+        let mut tree = ResourceTree::default();
+        let path = initial("git-tokens", "/git-tokens");
+        let workspace_id = path.workspace_id;
+        tree.create_session(path).unwrap();
+        let before = tree.revision();
+
+        let published = tree
+            .publish_workspace_git_tokens(
+                workspace_id,
+                Some("main".into()),
+                Some("+3".into()),
+                Some("-2".into()),
+            )
+            .unwrap();
+        assert_eq!(published.revision, before + 1);
+        assert!(published.changed);
+        assert_eq!(
+            tree.snapshot().sessions[0].workspaces[0].tokens,
+            BTreeMap::from([
+                (WORKSPACE_GIT_BRANCH_TOKEN.into(), "main".into()),
+                (WORKSPACE_GIT_ADDED_TOKEN.into(), "+3".into()),
+                (WORKSPACE_GIT_DELETED_TOKEN.into(), "-2".into()),
+            ])
+        );
+
+        let unchanged = tree
+            .publish_workspace_git_tokens(
+                workspace_id,
+                Some("main".into()),
+                Some("+3".into()),
+                Some("-2".into()),
+            )
+            .unwrap();
+        assert_eq!(unchanged.revision, published.revision);
+        assert!(!unchanged.changed);
+
+        let cleared = tree
+            .publish_workspace_git_tokens(workspace_id, None, None, None)
+            .unwrap();
+        assert_eq!(cleared.revision, published.revision + 1);
+        assert!(cleared.changed);
+        assert!(tree.snapshot().sessions[0].workspaces[0].tokens.is_empty());
+
+        tree.close_workspace(workspace_id).unwrap();
+        assert_eq!(
+            tree.publish_workspace_git_tokens(workspace_id, Some("stale".into()), None, None,),
+            Err(ResourceError::Closing("workspace"))
+        );
+    }
+
+    #[test]
+    fn materialized_token_value_count_is_bounded_but_existing_values_can_update() {
+        let mut tree = ResourceTree::default();
+        let path = initial("token-limit", "/token-limit");
+        let session_id = path.session_id;
+        tree.create_session(path).unwrap();
+        for index in 0..MAX_MATERIALIZED_TOKEN_VALUES {
+            tree.publish_presentation_token(
+                PresentationTokenTarget::Session(session_id),
+                format!("session.extension.test.value-{index}"),
+                "value".into(),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            tree.publish_presentation_token(
+                PresentationTokenTarget::Session(session_id),
+                "session.extension.test.overflow".into(),
+                "value".into(),
+            ),
+            Err(ResourceError::TooManyMaterializedTokens)
+        );
+        assert!(
+            tree.publish_presentation_token(
+                PresentationTokenTarget::Session(session_id),
+                "session.extension.test.value-0".into(),
+                "updated".into(),
+            )
+            .unwrap()
+            .changed
+        );
     }
 
     #[test]
@@ -3455,6 +3880,7 @@ mod tests {
             vec![ResourceEvent::WorkspaceRenamed {
                 session_id,
                 id: workspace_id,
+                root: "/project/main".into(),
                 old_name: "main".into(),
                 new_name: "  Main  ".into(),
             }]

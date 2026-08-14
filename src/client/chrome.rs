@@ -10,7 +10,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::{
     domain::{AgentReport, TabId},
     protocol::SelectedTarget,
-    resources::ResourceSnapshot,
+    resources::{MaterializedTokenMap, ResourceSnapshot},
 };
 
 use super::{
@@ -225,13 +225,17 @@ struct TabItem {
     name: String,
     closing: bool,
     pane_count: usize,
+    tokens: MaterializedTokenMap,
     activity: Option<ActivityIndicator>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TabBarModel {
     session_name: String,
+    session_tokens: MaterializedTokenMap,
     workspace_name: String,
+    workspace_tokens: MaterializedTokenMap,
+    pane_tokens: MaterializedTokenMap,
     tabs: Vec<TabItem>,
     active: usize,
     client_waiting: usize,
@@ -258,7 +262,14 @@ impl TabBarModel {
             .position(|tab| tab.id == focused.tab_id)?;
         Some(Self {
             session_name: sanitize(&session.name),
+            session_tokens: session.tokens.clone(),
             workspace_name: sanitize(&workspace.name),
+            workspace_tokens: workspace.tokens.clone(),
+            pane_tokens: workspace.tabs[active]
+                .panes
+                .iter()
+                .find(|pane| pane.id == focused.pane_id)
+                .map_or_else(MaterializedTokenMap::new, |pane| pane.tokens.clone()),
             tabs: workspace
                 .tabs
                 .iter()
@@ -267,6 +278,7 @@ impl TabBarModel {
                     name: sanitize(&tab.name),
                     closing: tab.closing,
                     pane_count: tab.panes.len(),
+                    tokens: tab.tokens.clone(),
                     activity: notifications.indicator(&tab.panes),
                 })
                 .collect(),
@@ -274,6 +286,15 @@ impl TabBarModel {
             client_waiting: notifications.waiting_count(snapshot),
             session_waiting: notifications.session_waiting_count(snapshot, focused.session_id),
         })
+    }
+
+    fn extension_value(&self, token: &str) -> &str {
+        self.session_tokens
+            .get(token)
+            .or_else(|| self.workspace_tokens.get(token))
+            .or_else(|| self.tabs[self.active].tokens.get(token))
+            .or_else(|| self.pane_tokens.get(token))
+            .map_or("", String::as_str)
     }
 }
 
@@ -321,12 +342,16 @@ pub(super) fn render_tab_bar(
         .and_then(|snapshot| TabBarModel::from_snapshot(snapshot, focused, notifications))
         .unwrap_or_else(|| TabBarModel {
             session_name: "session".into(),
+            session_tokens: MaterializedTokenMap::new(),
             workspace_name: "workspace".into(),
+            workspace_tokens: MaterializedTokenMap::new(),
+            pane_tokens: MaterializedTokenMap::new(),
             tabs: vec![TabItem {
                 id: focused.tab_id,
                 name: "tab".into(),
                 closing: false,
                 pane_count: 1,
+                tokens: MaterializedTokenMap::new(),
                 activity: None,
             }],
             active: 0,
@@ -455,7 +480,7 @@ fn render_bar_group(
                 || TokenValue::plain(""),
                 |activity| activity_token(activity, spinner_frame),
             ),
-            _ => TokenValue::plain(""),
+            _ => TokenValue::plain(model.extension_value(token)),
         },
     )
 }
@@ -766,7 +791,7 @@ fn tab_token(
             || TokenValue::plain(""),
             |activity| activity_token(activity, spinner_frame),
         ),
-        _ => TokenValue::plain(""),
+        _ => TokenValue::plain(tab.tokens.get(token).map_or("", String::as_str)),
     }
 }
 
@@ -855,11 +880,13 @@ mod tests {
             .map(|name| {
                 let pane_id = PaneId::new();
                 TabSnapshot {
+                    tokens: Default::default(),
                     id: TabId::new(),
                     name: (*name).into(),
                     closing: false,
                     layout: crate::splits::SplitTree::leaf(pane_id),
                     panes: vec![PaneSnapshot {
+                        tokens: Default::default(),
                         id: pane_id,
                         terminal_id: TerminalId::new(),
                         closing: false,
@@ -882,6 +909,7 @@ mod tests {
             ResourceSnapshot {
                 revision: 1,
                 sessions: vec![SessionSnapshot {
+                    tokens: Default::default(),
                     id: session_id,
                     name: "project".into(),
                     project: Project {
@@ -889,6 +917,7 @@ mod tests {
                     },
                     closing: false,
                     workspaces: vec![WorkspaceSnapshot {
+                        tokens: Default::default(),
                         id: workspace_id,
                         name: "main".into(),
                         root: PathBuf::from("/project"),
@@ -899,6 +928,68 @@ mod tests {
             },
             target,
         )
+    }
+
+    #[test]
+    fn extension_tokens_resolve_from_current_bar_ancestry_and_tab_items() {
+        let (mut snapshot, focused) = fixture(&["shell", "peer"], 0);
+        let session = &mut snapshot.sessions[0];
+        session
+            .tokens
+            .insert("session.extension.demo.value".into(), "S".into());
+        let workspace = &mut session.workspaces[0];
+        workspace
+            .tokens
+            .insert("workspace.extension.demo.value".into(), "W".into());
+        let tab = &mut workspace.tabs[0];
+        tab.tokens
+            .insert("tab.extension.demo.value".into(), "T".into());
+        tab.panes[0]
+            .tokens
+            .insert("pane.extension.demo.value".into(), "P".into());
+        let model =
+            TabBarModel::from_snapshot(&snapshot, &focused, &NotificationState::default()).unwrap();
+        let group = GroupConfig {
+            segments: [
+                "session.extension.demo.value",
+                "workspace.extension.demo.value",
+                "tab.extension.demo.value",
+                "pane.extension.demo.value",
+            ]
+            .into_iter()
+            .map(|token| super::super::config::SegmentConfig {
+                token: Some(token.into()),
+                ..Default::default()
+            })
+            .collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            render_bar_group(&group, &model, false, None, 0, &UiConfig::default()).to_string(),
+            "SWTP"
+        );
+        assert_eq!(
+            tab_token(
+                &model,
+                0,
+                "tab.extension.demo.value",
+                0,
+                &UiConfig::default().icons.resolve(),
+            )
+            .text,
+            "T"
+        );
+        assert_eq!(
+            tab_token(
+                &model,
+                1,
+                "tab.extension.demo.value",
+                0,
+                &UiConfig::default().icons.resolve(),
+            )
+            .text,
+            ""
+        );
     }
 
     fn render(names: &[&str], active: usize, width: u16) -> (String, Buffer) {

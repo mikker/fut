@@ -15,6 +15,7 @@ use unicode_width::UnicodeWidthStr;
 use super::actions::{
     ALL_ACTIONS, ClientAction, config_key, default_suffix, parse_suffix, suffix_name,
 };
+use crate::extensions::{self, Extension};
 
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_SEGMENTS: usize = 64;
@@ -936,6 +937,7 @@ impl UiConfig {
 struct Config {
     ui: UiConfig,
     trusted_commands: BTreeMap<String, TrustedCommand>,
+    extensions: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -945,8 +947,10 @@ pub(crate) struct ConfigLocation {
     pub source: &'static str,
 }
 
-pub(crate) struct LoadedUiConfig {
+#[derive(Debug)]
+pub(crate) struct LoadedConfig {
     pub ui: UiConfig,
+    pub extensions: Vec<Extension>,
     pub present: bool,
 }
 
@@ -995,11 +999,12 @@ pub(super) fn load() -> Result<UiConfig> {
     Ok(load_location(&location)?.ui)
 }
 
-pub(crate) fn load_location(location: &ConfigLocation) -> Result<LoadedUiConfig> {
+pub(crate) fn load_location(location: &ConfigLocation) -> Result<LoadedConfig> {
     location.path.as_ref().map_or_else(
         || {
-            Ok(LoadedUiConfig {
+            Ok(LoadedConfig {
                 ui: UiConfig::default(),
+                extensions: Vec::new(),
                 present: false,
             })
         },
@@ -1007,12 +1012,58 @@ pub(crate) fn load_location(location: &ConfigLocation) -> Result<LoadedUiConfig>
     )
 }
 
+/// Load only the daemon-owned extension declarations. Client presentation
+/// mistakes must not prevent the daemon from starting; the interactive client
+/// validates the complete configuration independently before changing terminal
+/// state.
+pub(crate) fn load_extensions_location(location: &ConfigLocation) -> Result<Vec<Extension>> {
+    let Some(path) = &location.path else {
+        return Ok(Vec::new());
+    };
+    let Some(source) = read_config_source(path, location.explicit)? else {
+        return Ok(Vec::new());
+    };
+
+    #[derive(Default, Deserialize)]
+    struct ExtensionConfig {
+        #[serde(default)]
+        extensions: Vec<PathBuf>,
+    }
+
+    let config = toml::from_str::<ExtensionConfig>(&source)
+        .with_context(|| format!("parse extension paths from Fut config {}", path.display()))?;
+    extensions::load(&config.extensions)
+        .with_context(|| format!("load extensions from Fut config {}", path.display()))
+}
+
 #[cfg(test)]
 fn load_path(path: &std::path::Path, explicit: bool) -> Result<UiConfig> {
     Ok(load_path_outcome(path, explicit)?.ui)
 }
 
-fn load_path_outcome(path: &std::path::Path, explicit: bool) -> Result<LoadedUiConfig> {
+fn load_path_outcome(path: &std::path::Path, explicit: bool) -> Result<LoadedConfig> {
+    let Some(source) = read_config_source(path, explicit)? else {
+        return Ok(LoadedConfig {
+            ui: UiConfig::default(),
+            extensions: Vec::new(),
+            present: false,
+        });
+    };
+    let mut config = toml::from_str::<Config>(&source)
+        .with_context(|| format!("parse Fut config {}", path.display()))?;
+    let loaded_extensions = extensions::load(&config.extensions)
+        .with_context(|| format!("load extensions from Fut config {}", path.display()))?;
+    config.ui.bindings.commands = config.trusted_commands.into_values().collect();
+    validate(&config.ui, &loaded_extensions)
+        .with_context(|| format!("validate Fut config {}", path.display()))?;
+    Ok(LoadedConfig {
+        ui: config.ui,
+        extensions: loaded_extensions,
+        present: true,
+    })
+}
+
+fn read_config_source(path: &std::path::Path, explicit: bool) -> Result<Option<String>> {
     let file = match fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
@@ -1020,10 +1071,7 @@ fn load_path_outcome(path: &std::path::Path, explicit: bool) -> Result<LoadedUiC
     {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && !explicit => {
-            return Ok(LoadedUiConfig {
-                ui: UiConfig::default(),
-                present: false,
-            });
+            return Ok(None);
         }
         Err(error) => {
             return Err(error).with_context(|| format!("read Fut config {}", path.display()));
@@ -1052,17 +1100,10 @@ fn load_path_outcome(path: &std::path::Path, explicit: bool) -> Result<LoadedUiC
             path.display()
         );
     }
-    let mut config = toml::from_str::<Config>(&source)
-        .with_context(|| format!("parse Fut config {}", path.display()))?;
-    config.ui.bindings.commands = config.trusted_commands.into_values().collect();
-    validate(&config.ui).with_context(|| format!("validate Fut config {}", path.display()))?;
-    Ok(LoadedUiConfig {
-        ui: config.ui,
-        present: true,
-    })
+    Ok(Some(source))
 }
 
-fn validate(ui: &UiConfig) -> Result<()> {
+fn validate(ui: &UiConfig, extensions: &[Extension]) -> Result<()> {
     let valid_binding_keys = ALL_ACTIONS
         .into_iter()
         .map(config_key)
@@ -1143,6 +1184,7 @@ fn validate(ui: &UiConfig) -> Result<()> {
                 TokenScope::Bar,
                 true,
                 &mut tab_components,
+                extensions,
             )?;
             if group
                 .segments
@@ -1165,6 +1207,7 @@ fn validate(ui: &UiConfig) -> Result<()> {
         TokenScope::Tab,
         false,
         &mut 0,
+        extensions,
     )?;
     for (name, segments, scope) in [
         ("header", &ui.workspace_sidebar.header, TokenScope::Sidebar),
@@ -1196,6 +1239,7 @@ fn validate(ui: &UiConfig) -> Result<()> {
             scope,
             false,
             &mut 0,
+            extensions,
         )?;
     }
     Ok(())
@@ -1215,6 +1259,7 @@ fn validate_segments(
     scope: TokenScope,
     components: bool,
     component_count: &mut usize,
+    extensions: &[Extension],
 ) -> Result<()> {
     if segments.len() > MAX_SEGMENTS {
         bail!("{path} contains too many segments");
@@ -1244,7 +1289,7 @@ fn validate_segments(
             bail!("{path} text segments do not accept prefix, suffix, or max_width");
         }
         if let Some(token) = segment.token.as_deref()
-            && !token_allowed(scope, token)
+            && !token_allowed(scope, token, extensions)
         {
             bail!("{path} contains unknown or out-of-scope token {token:?}");
         }
@@ -1265,8 +1310,8 @@ fn validate_segments(
     Ok(())
 }
 
-fn token_allowed(scope: TokenScope, token: &str) -> bool {
-    match scope {
+fn token_allowed(scope: TokenScope, token: &str, extensions: &[Extension]) -> bool {
+    let builtin = match scope {
         TokenScope::Bar => matches!(
             token,
             "fut"
@@ -1318,7 +1363,22 @@ fn token_allowed(scope: TokenScope, token: &str) -> bool {
                 | "sidebar.status"
                 | "sidebar.visibility"
         ),
-    }
+    };
+    builtin || extension_token_allowed(scope, token, extensions)
+}
+
+fn extension_token_allowed(scope: TokenScope, token: &str, extensions: &[Extension]) -> bool {
+    extensions
+        .iter()
+        .flat_map(Extension::presentation_tokens)
+        .find(|declaration| declaration.qualified_name() == token)
+        .is_some_and(|declaration| match scope {
+            TokenScope::Bar | TokenScope::Sidebar => true,
+            TokenScope::Tab => declaration.scope() == extensions::PresentationScope::Tab,
+            TokenScope::Workspace => {
+                declaration.scope() == extensions::PresentationScope::Workspace
+            }
+        })
 }
 
 fn validate_text(path: &str, value: &str) -> Result<()> {
@@ -1617,6 +1677,113 @@ right = [{ token = "workspace.tab_count" }]
                 .to_string()
                 .contains("maximum")
         );
+    }
+
+    #[test]
+    fn daemon_extension_loading_ignores_unrelated_invalid_ui() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("config.toml");
+        fs::write(
+            &path,
+            "[ui.tab_bar]\nleft = [{ segments = [{ token = 'not.a.token' }] }]\n",
+        )
+        .unwrap();
+        let location = ConfigLocation {
+            path: Some(path),
+            explicit: true,
+            source: "test",
+        };
+
+        assert!(load_location(&location).is_err());
+        assert!(load_extensions_location(&location).unwrap().is_empty());
+    }
+
+    #[test]
+    fn global_config_loads_explicit_extensions_atomically() {
+        let temporary = tempfile::tempdir().unwrap();
+        let extension_root = temporary.path().join("extension");
+        fs::create_dir(&extension_root).unwrap();
+        fs::write(
+            extension_root.join(extensions::MANIFEST_FILE_NAME),
+            "id = 'configured'\n",
+        )
+        .unwrap();
+        let path = temporary.path().join("config.toml");
+        fs::write(
+            &path,
+            format!(
+                "extensions = [{:?}]\n",
+                extension_root.display().to_string()
+            ),
+        )
+        .unwrap();
+
+        let loaded = load_path_outcome(&path, true).unwrap();
+        assert_eq!(loaded.extensions.len(), 1);
+        assert_eq!(loaded.extensions[0].id(), "configured");
+
+        let invalid_root = temporary.path().join("invalid");
+        fs::create_dir(&invalid_root).unwrap();
+        fs::write(
+            invalid_root.join(extensions::MANIFEST_FILE_NAME),
+            "id = 'INVALID'\n",
+        )
+        .unwrap();
+        fs::write(
+            &path,
+            format!(
+                "extensions = [{:?}, {:?}]\n",
+                extension_root.display().to_string(),
+                invalid_root.display().to_string()
+            ),
+        )
+        .unwrap();
+        let error = format!("{:#}", load_path_outcome(&path, true).unwrap_err());
+        assert!(error.contains("INVALID"), "{error}");
+        assert!(error.contains(&path.display().to_string()), "{error}");
+    }
+
+    #[test]
+    fn extension_tokens_are_validated_against_each_newly_loaded_catalog() {
+        let temporary = tempfile::tempdir().unwrap();
+        let extension_root = temporary.path().join("extension");
+        fs::create_dir(&extension_root).unwrap();
+        let manifest = extension_root.join(extensions::MANIFEST_FILE_NAME);
+        fs::write(
+            &manifest,
+            "id = 'status'\n[[presentation_tokens]]\nname = 'whole'\nscope = 'session'\n[[presentation_tokens]]\nname = 'state'\nscope = 'workspace'\n[[presentation_tokens]]\nname = 'badge'\nscope = 'tab'\n[[presentation_tokens]]\nname = 'mark'\nscope = 'pane'\n",
+        )
+        .unwrap();
+        let path = temporary.path().join("config.toml");
+        fs::write(
+            &path,
+            format!(
+                "extensions = [{:?}]\n[ui.tab_bar]\nright = [{{ segments = [{{ token = 'session.extension.status.whole' }}, {{ token = 'pane.extension.status.mark' }}] }}]\n[ui.workspace_sidebar.row]\nbody = [{{ token = 'workspace.extension.status.state' }}]\n[ui.tab_bar.item]\nsegments = [{{ token = 'tab.extension.status.badge' }}]\n",
+                extension_root.display().to_string()
+            ),
+        )
+        .unwrap();
+        load_path_outcome(&path, true).unwrap();
+
+        fs::write(&manifest, "id = 'status'\n").unwrap();
+        let error = format!("{:#}", load_path_outcome(&path, true).unwrap_err());
+        assert!(error.contains("unknown or out-of-scope token"), "{error}");
+
+        fs::write(
+            &manifest,
+            "id = 'status'\n[[presentation_tokens]]\nname = 'state'\nscope = 'workspace'\n",
+        )
+        .unwrap();
+        fs::write(
+            &path,
+            format!(
+                "extensions = [{:?}]\n[ui.tab_bar.item]\nsegments = [{{ token = 'workspace.extension.status.state' }}]\n",
+                extension_root.display().to_string()
+            ),
+        )
+        .unwrap();
+        let error = format!("{:#}", load_path_outcome(&path, true).unwrap_err());
+        assert!(error.contains("unknown or out-of-scope token"), "{error}");
     }
 
     #[test]

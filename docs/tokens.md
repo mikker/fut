@@ -76,7 +76,7 @@ These may appear in `ui.workspace_sidebar.row.left`, `body`, `right`, or `detail
 
 Current, closing, and keyboard-selected styles compose over each workspace row.
 
-The Git tokens are resolved by bounded background `git` processes, cached per workspace root and refreshed at most every five seconds. They never block rendering and stay empty for non-Git roots, errors, or timeouts.
+The daemon resolves Git tokens with bounded background `git` processes and refreshes each workspace at most every five seconds. Each Git command has a two-second timeout. Branch, insertion, and deletion values enter the authoritative resource snapshot together in at most one revision and only when changed, so every attached client sees the same status. They never block rendering and all three stay empty for non-Git roots, errors, timeouts, or a repository that disappears.
 
 ## Sidebar header and footer tokens
 
@@ -92,9 +92,19 @@ These may appear in `ui.workspace_sidebar.header` and `footer`:
 | `sidebar.visibility` | Current compact visibility label: `visible`, `hide with one`, or `hidden` |
 | `sidebar.status` | Current display and visibility plus contextual controls, switching progress, or a retryable error |
 
-## Future dynamic tokens
+## Extension tokens
 
-Process titles, clocks, and custom providers are intentionally absent from the synchronous renderer. Implemented semantic activity comes from explicit reports already present in the resource snapshot. Future dynamic providers should be asynchronous, bounded, cached, explicitly trusted where executable, and publish typed values into the same pure rendering context.
+Explicit local extensions may declare namespaced string tokens in their manifests and publish materialized values through `fut token publish`. The qualified UI name is `<scope>.extension.<extension-id>.<name>`, such as `workspace.extension.review-status.state`. Fut validates configured references against the explicit extension catalog on client startup and every configuration reload; undeclared or out-of-context names reject the complete new configuration.
+
+Compatibility follows the resource represented by each format:
+
+- Generic current tab-bar groups and workspace-sidebar headers and footers accept declared session, workspace, tab, and pane tokens from the focused resource's current ancestry.
+- Tab-item segments accept only declared tab tokens and resolve them from that item.
+- Workspace-row segments accept only declared workspace tokens and resolve them from that row.
+
+A declared value that has not been published is empty, including its configured prefix and suffix. Published values are plain text and receive only the normal group, segment, and item styles already configured by the user; a value cannot inject a style. Values are stored in the authoritative resource snapshot, shared by every client, and removed with their target. Rendering never invokes an extension or performs publication I/O.
+
+See [Local extensions](configuration.md#local-extensions) for declarations, publication syntax, limits, and the security boundary.
 
 ## Related
 

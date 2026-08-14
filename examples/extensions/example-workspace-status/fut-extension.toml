@@ -1,0 +1,9 @@
+id = "example-workspace-status"
+
+[hooks]
+"workspace.created" = ["./bin/workspace-event"]
+"workspace.renamed" = ["./bin/workspace-event"]
+
+[[presentation_tokens]]
+name = "last_event"
+scope = "workspace"

@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+: "${FUT_BIN:?}"
+: "${FUT_EVENT:?}"
+: "${FUT_SOCKET:?}"
+: "${FUT_WORKSPACE_ID:?}"
+
+exec "$FUT_BIN" --socket "$FUT_SOCKET" token publish \
+  example-workspace-status last_event "$FUT_EVENT" \
+  --workspace-id "$FUT_WORKSPACE_ID"

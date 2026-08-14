@@ -6,6 +6,7 @@ pub mod client;
 pub mod daemon;
 pub mod doctor;
 pub mod domain;
+pub(crate) mod extensions;
 pub mod project;
 pub mod protocol;
 pub mod resources;

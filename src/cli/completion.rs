@@ -450,6 +450,7 @@ mod tests {
 
     fn fixture() -> ResourceSnapshot {
         let pane = |closing| PaneSnapshot {
+            tokens: Default::default(),
             id: PaneId::new(),
             terminal_id: TerminalId::new(),
             closing,
@@ -460,6 +461,7 @@ mod tests {
         ResourceSnapshot {
             revision: 1,
             sessions: vec![SessionSnapshot {
+                tokens: Default::default(),
                 id: SessionId::new(),
                 name: "Sés\nsion".into(),
                 project: Project {
@@ -467,12 +469,14 @@ mod tests {
                 },
                 closing: false,
                 workspaces: vec![WorkspaceSnapshot {
+                    tokens: Default::default(),
                     id: WorkspaceId::new(),
                     name: "W\tork".into(),
                     root: "/root\nwork".into(),
                     closing: false,
                     tabs: vec![
                         TabSnapshot {
+                            tokens: Default::default(),
                             id: TabId::new(),
                             name: "One".into(),
                             closing: false,
@@ -480,6 +484,7 @@ mod tests {
                             panes: vec![first_pane],
                         },
                         TabSnapshot {
+                            tokens: Default::default(),
                             id: TabId::new(),
                             name: "Two".into(),
                             closing: false,
@@ -878,6 +883,7 @@ mod tests {
         let closing_workspace = snapshot.sessions[0].workspaces[0].clone();
         snapshot.sessions[0].workspaces[0].tabs.truncate(1);
         snapshot.sessions[0].workspaces.push(WorkspaceSnapshot {
+            tokens: Default::default(),
             closing: true,
             ..closing_workspace
         });
@@ -890,6 +896,7 @@ mod tests {
     fn sibling_panes_have_distinct_hierarchical_descriptions() {
         let mut snapshot = fixture();
         let second = PaneSnapshot {
+            tokens: Default::default(),
             id: PaneId::new(),
             terminal_id: TerminalId::new(),
             closing: false,

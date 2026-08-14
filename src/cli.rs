@@ -3,7 +3,7 @@ use std::{ffi::OsString, path::PathBuf, process::ExitCode, str::FromStr, time::D
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use clap::{
-    Arg, ArgAction, ArgGroup, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum,
+    Arg, ArgAction, ArgGroup, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum,
     ValueHint,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -43,7 +43,9 @@ use crate::{
         PROTOCOL_VERSION, PROTOCOL_VERSION_0_1, RenameSelector, ServerMessage, TerminalContext,
         TerminalInputOperation, codec, decode_payload, encode_payload,
     },
-    resources::{ResourceSnapshot, SessionSelector, TabSnapshot, TargetSelector},
+    resources::{
+        PresentationTokenTarget, ResourceSnapshot, SessionSelector, TabSnapshot, TargetSelector,
+    },
     splits::{SplitAxis, SplitDirection, SplitTree},
 };
 
@@ -137,6 +139,12 @@ enum Command {
         /// Agent operation to perform.
         #[command(subcommand)]
         command: AgentCommand,
+    },
+    /// Publish a declared extension presentation token.
+    Token {
+        /// Token operation to perform.
+        #[command(subcommand)]
+        command: TokenCommand,
     },
     /// Resolve the current terminal ancestry from Fut's environment.
     Context,
@@ -687,6 +695,41 @@ enum DaemonCommand {
     Ping,
     /// Ask the existing daemon to shut down.
     Shutdown,
+}
+
+#[derive(Subcommand)]
+enum TokenCommand {
+    /// Materialize unstyled presentation text on one live resource.
+    Publish(TokenPublishArgs),
+}
+
+#[derive(Args)]
+#[command(group(
+    ArgGroup::new("target")
+        .required(true)
+        .multiple(false)
+        .args(["session_id", "workspace_id", "tab_id", "pane_id"])
+))]
+struct TokenPublishArgs {
+    /// Configured extension ID.
+    extension: String,
+    /// Manifest presentation-token declaration name (not its qualified name).
+    token: String,
+    /// Plain UTF-8 presentation text, at most 1 KiB.
+    #[arg(allow_hyphen_values = true)]
+    value: String,
+    /// Publish to this session.
+    #[arg(long)]
+    session_id: Option<SessionId>,
+    /// Publish to this workspace.
+    #[arg(long)]
+    workspace_id: Option<WorkspaceId>,
+    /// Publish to this tab.
+    #[arg(long)]
+    tab_id: Option<TabId>,
+    /// Publish to this pane.
+    #[arg(long)]
+    pane_id: Option<PaneId>,
 }
 
 pub fn complete() {
@@ -1391,6 +1434,50 @@ async fn execute(cli: Cli) -> Result<()> {
                 },
             )
             .await
+        }
+        Some(Command::Token {
+            command: TokenCommand::Publish(args),
+        }) => {
+            let target = match (
+                args.session_id,
+                args.workspace_id,
+                args.tab_id,
+                args.pane_id,
+            ) {
+                (Some(id), None, None, None) => PresentationTokenTarget::Session(id),
+                (None, Some(id), None, None) => PresentationTokenTarget::Workspace(id),
+                (None, None, Some(id), None) => PresentationTokenTarget::Tab(id),
+                (None, None, None, Some(id)) => PresentationTokenTarget::Pane(id),
+                _ => unreachable!("clap requires exactly one token target"),
+            };
+            match control(
+                &socket,
+                ClientMessage::PublishToken {
+                    extension_id: args.extension.clone(),
+                    token: args.token.clone(),
+                    value: args.value,
+                    target,
+                },
+            )
+            .await?
+            {
+                ServerMessage::TokenPublished {
+                    resource_revision,
+                    changed,
+                } => output(
+                    cli.json,
+                    "token.publish",
+                    json!({
+                        "extension": args.extension,
+                        "token": args.token,
+                        "target": target,
+                        "revision": resource_revision,
+                        "changed": changed,
+                    }),
+                    format!("revision={resource_revision} changed={changed}"),
+                ),
+                other => unexpected(other),
+            }
         }
         Some(Command::Tab {
             command:
@@ -2603,6 +2690,72 @@ mod tests {
     use super::*;
 
     #[test]
+    fn token_publish_accepts_hyphen_leading_presentation_text() {
+        let workspace_id = WorkspaceId::new();
+        let parsed = try_parse_cli_from([
+            "fut",
+            "token",
+            "publish",
+            "status",
+            "deletions",
+            "-5",
+            "--workspace-id",
+            &workspace_id.to_string(),
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Token {
+                command: TokenCommand::Publish(TokenPublishArgs { value, .. })
+            }) if value == "-5"
+        ));
+    }
+
+    #[test]
+    fn token_publish_requires_exactly_one_explicit_target() {
+        assert!(
+            try_parse_cli_from(["fut", "token", "publish", "status", "state", "ready"]).is_err()
+        );
+        assert!(
+            try_parse_cli_from([
+                "fut",
+                "token",
+                "publish",
+                "status",
+                "state",
+                "ready",
+                "--workspace-id",
+                &WorkspaceId::new().to_string(),
+                "--tab-id",
+                &TabId::new().to_string(),
+            ])
+            .is_err()
+        );
+        let workspace_id = WorkspaceId::new();
+        let parsed = try_parse_cli_from([
+            "fut",
+            "token",
+            "publish",
+            "status",
+            "state",
+            "ready",
+            "--workspace-id",
+            &workspace_id.to_string(),
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Token {
+                command: TokenCommand::Publish(TokenPublishArgs {
+                    workspace_id: Some(id),
+                    ..
+                })
+            }) if id == workspace_id
+        ));
+    }
+
+    #[test]
     fn detects_json_only_before_the_child_argv_delimiter() {
         let args = |values: &[&str]| values.iter().map(OsString::from).collect::<Vec<_>>();
         assert!(json_requested(&args(&["fut", "open", "--json"])));
@@ -3027,12 +3180,14 @@ mod tests {
         let mut layout = SplitTree::leaf(first);
         assert!(layout.split(first, SplitDirection::Down, second));
         let pane = |id| PaneSnapshot {
+            tokens: Default::default(),
             id,
             terminal_id: TerminalId::new(),
             closing: false,
             activity: Default::default(),
         };
         let tab = TabSnapshot {
+            tokens: Default::default(),
             id: TabId::new(),
             name: "agent".into(),
             closing: false,
@@ -3213,6 +3368,7 @@ mod tests {
                 "pane",
                 "terminal",
                 "agent",
+                "token",
                 "context",
                 "get",
                 "list",

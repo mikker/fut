@@ -291,6 +291,7 @@ mod tests {
 
     fn pane() -> crate::resources::PaneSnapshot {
         PaneSnapshot {
+            tokens: Default::default(),
             id: PaneId::new(),
             terminal_id: TerminalId::new(),
             closing: false,
@@ -308,6 +309,7 @@ mod tests {
             ));
         }
         TabSnapshot {
+            tokens: Default::default(),
             id: TabId::new(),
             name: name.into(),
             closing: false,
@@ -337,6 +339,7 @@ mod tests {
         let second = pane();
         let sessions = vec![
             SessionSnapshot {
+                tokens: Default::default(),
                 id: SessionId::new(),
                 name: "one".into(),
                 project: Project {
@@ -345,6 +348,7 @@ mod tests {
                 closing: false,
                 workspaces: vec![
                     WorkspaceSnapshot {
+                        tokens: Default::default(),
                         id: WorkspaceId::new(),
                         name: "main".into(),
                         root: PathBuf::from("/one/main"),
@@ -352,6 +356,7 @@ mod tests {
                         tabs: vec![tab("a", vec![first, second]), tab("b", vec![pane()])],
                     },
                     WorkspaceSnapshot {
+                        tokens: Default::default(),
                         id: WorkspaceId::new(),
                         name: "feature".into(),
                         root: PathBuf::from("/one/feature"),
@@ -361,6 +366,7 @@ mod tests {
                 ],
             },
             SessionSnapshot {
+                tokens: Default::default(),
                 id: SessionId::new(),
                 name: "two".into(),
                 project: Project {
@@ -368,6 +374,7 @@ mod tests {
                 },
                 closing: false,
                 workspaces: vec![WorkspaceSnapshot {
+                    tokens: Default::default(),
                     id: WorkspaceId::new(),
                     name: "main".into(),
                     root: PathBuf::from("/two/main"),

@@ -933,6 +933,7 @@ mod tests {
             ResourceSnapshot {
                 revision: 1,
                 sessions: vec![SessionSnapshot {
+                    tokens: Default::default(),
                     id: session_id,
                     name: "sessión 🛰".into(),
                     project: Project {
@@ -940,23 +941,27 @@ mod tests {
                     },
                     closing: false,
                     workspaces: vec![WorkspaceSnapshot {
+                        tokens: Default::default(),
                         id: workspace_id,
                         name: "workspace".into(),
                         root: PathBuf::from("/tmp"),
                         closing: false,
                         tabs: vec![TabSnapshot {
+                            tokens: Default::default(),
                             id: tab_id,
                             name: "tab".into(),
                             closing: false,
                             layout,
                             panes: vec![
                                 PaneSnapshot {
+                                    tokens: Default::default(),
                                     id: current_pane,
                                     terminal_id: current_terminal,
                                     closing: false,
                                     activity: Default::default(),
                                 },
                                 PaneSnapshot {
+                                    tokens: Default::default(),
                                     id: other_pane,
                                     terminal_id: TerminalId::new(),
                                     closing: true,
@@ -1065,6 +1070,7 @@ mod tests {
         let destination_tab_id = TabId::new();
         let moved_pane = snapshot.sessions[0].workspaces[0].tabs[0].panes.remove(0);
         snapshot.sessions[0].workspaces[0].tabs.push(TabSnapshot {
+            tokens: Default::default(),
             id: destination_tab_id,
             name: "destination".into(),
             closing: false,

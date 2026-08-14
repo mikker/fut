@@ -9,7 +9,7 @@ use ratatui::{
 use crate::{
     domain::{PaneId, WorkspaceId},
     protocol::SelectedTarget,
-    resources::ResourceSnapshot,
+    resources::{MaterializedTokenMap, ResourceSnapshot},
 };
 
 use super::{
@@ -18,7 +18,6 @@ use super::{
         IconPreset, SemanticStyle, UiConfig, WorkspaceSidebarDisplay, WorkspaceSidebarPosition,
         WorkspaceSidebarVisibility,
     },
-    git::GitStatusCache,
     navigation::NavigationHistory,
     notifications::{ActivityIndicator, NotificationState},
     presentation::{ItemState, TokenValue, apply_item_state, render_token_segments, truncate_line},
@@ -38,13 +37,23 @@ struct WorkspaceItem {
     tab_count: usize,
     current: bool,
     closing: bool,
+    tokens: MaterializedTokenMap,
     destination: Option<PaneId>,
     activity: Option<ActivityIndicator>,
+}
+
+impl WorkspaceItem {
+    fn token_value(&self, token: &str) -> &str {
+        self.tokens.get(token).map_or("", String::as_str)
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct WorkspaceModel {
     session_name: String,
+    session_tokens: MaterializedTokenMap,
+    tab_tokens: MaterializedTokenMap,
+    pane_tokens: MaterializedTokenMap,
     items: Vec<WorkspaceItem>,
 }
 
@@ -64,8 +73,20 @@ impl WorkspaceModel {
             return Self::default();
         };
 
+        let focused_workspace = session
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id);
+        let focused_tab = focused_workspace
+            .and_then(|workspace| workspace.tabs.iter().find(|tab| tab.id == focused.tab_id));
         Self {
             session_name: sanitize(&session.name),
+            session_tokens: session.tokens.clone(),
+            tab_tokens: focused_tab
+                .map_or_else(MaterializedTokenMap::new, |tab| tab.tokens.clone()),
+            pane_tokens: focused_tab
+                .and_then(|tab| tab.panes.iter().find(|pane| pane.id == focused.pane_id))
+                .map_or_else(MaterializedTokenMap::new, |pane| pane.tokens.clone()),
             items: session
                 .workspaces
                 .iter()
@@ -80,6 +101,7 @@ impl WorkspaceModel {
                         tab_count: workspace.tabs.len(),
                         current: workspace.id == workspace_id,
                         closing,
+                        tokens: workspace.tokens.clone(),
                         destination: (!closing)
                             .then(|| history.workspace_destination(workspace))
                             .flatten(),
@@ -95,6 +117,20 @@ impl WorkspaceModel {
                 })
                 .collect(),
         }
+    }
+
+    fn extension_value(&self, token: &str) -> &str {
+        self.session_tokens
+            .get(token)
+            .or_else(|| {
+                self.items
+                    .iter()
+                    .find(|item| item.current)
+                    .and_then(|item| item.tokens.get(token))
+            })
+            .or_else(|| self.tab_tokens.get(token))
+            .or_else(|| self.pane_tokens.get(token))
+            .map_or("", String::as_str)
     }
 }
 
@@ -324,7 +360,6 @@ impl WorkspaceSidebarState {
         area: Rect,
         position: WorkspaceSidebarPosition,
         ui: &UiConfig,
-        git: &GitStatusCache,
         spinner_frame: usize,
         buffer: &mut Buffer,
     ) {
@@ -337,7 +372,6 @@ impl WorkspaceSidebarState {
             area,
             position,
             ui,
-            git,
             buffer,
         );
     }
@@ -396,7 +430,6 @@ pub(super) fn render_workspace_sidebar(
     area: Rect,
     position: WorkspaceSidebarPosition,
     ui: &UiConfig,
-    git: &GitStatusCache,
     buffer: &mut Buffer,
 ) {
     let model = snapshot
@@ -415,7 +448,6 @@ pub(super) fn render_workspace_sidebar(
         area,
         position,
         ui,
-        git,
         buffer,
     );
 }
@@ -551,7 +583,6 @@ fn render_model(
     area: Rect,
     position: WorkspaceSidebarPosition,
     ui: &UiConfig,
-    git: &GitStatusCache,
     buffer: &mut Buffer,
 ) {
     let Some(content) = render_sidebar_frame(area, position, ui, buffer) else {
@@ -592,6 +623,7 @@ fn render_model(
     } else if model.items.is_empty() {
         let item = WorkspaceItem {
             id: WorkspaceId::new(),
+            tokens: Default::default(),
             name: "workspace".into(),
             root: std::path::PathBuf::new(),
             index: 0,
@@ -607,7 +639,6 @@ fn render_model(
             spinner_frame,
             Rect::new(content.x, row_y, content.width, row_height.min(2)),
             ui,
-            git,
             buffer,
         );
     } else {
@@ -657,7 +688,6 @@ fn render_model(
                                 .min(row_bottom.saturating_sub(y)),
                         ),
                         ui,
-                        git,
                         buffer,
                     );
                     y = y.saturating_add(u16::try_from(item_height).unwrap_or(u16::MAX));
@@ -876,7 +906,7 @@ fn render_sidebar_chrome(
                 ),
                 None => TokenValue::plain(format!(" {display} · {visibility}")),
             },
-            _ => TokenValue::plain(""),
+            _ => TokenValue::plain(model.extension_value(token)),
         },
     )
 }
@@ -887,14 +917,12 @@ fn render_workspace_row(
     spinner_frame: usize,
     area: Rect,
     ui: &UiConfig,
-    git: &GitStatusCache,
     buffer: &mut Buffer,
 ) {
     if area.width == 0 {
         return;
     }
     let icons = ui.icons.resolve();
-    let git_status = git.status(&item.root).unwrap_or_default();
     let state = ItemState {
         // The workspace marker carries active state so keyboard selection can own
         // the row background without making two rows look selected at once.
@@ -933,12 +961,12 @@ fn render_workspace_row(
         }
         "workspace.tab_count" => TokenValue::plain(item.tab_count.to_string()),
         "workspace.icon" => TokenValue::plain(icons.workspace.clone()),
-        "workspace.git_branch" => TokenValue::plain(sanitize(&git_status.branch)),
-        "workspace.git_added" if git_status.insertions > 0 => {
-            TokenValue::styled(format!("+{}", git_status.insertions), SemanticStyle::Added)
+        "workspace.git_branch" => TokenValue::plain(sanitize(item.token_value(token))),
+        "workspace.git_added" if !item.token_value(token).is_empty() => {
+            TokenValue::styled(item.token_value(token).to_owned(), SemanticStyle::Added)
         }
-        "workspace.git_deleted" if git_status.deletions > 0 => {
-            TokenValue::styled(format!("-{}", git_status.deletions), SemanticStyle::Deleted)
+        "workspace.git_deleted" if !item.token_value(token).is_empty() => {
+            TokenValue::styled(item.token_value(token).to_owned(), SemanticStyle::Deleted)
         }
         "workspace.activity" => item.activity.map_or_else(
             || TokenValue::plain(""),
@@ -952,7 +980,7 @@ fn render_workspace_row(
                 TokenValue::styled(activity.marker(spinner_frame), style)
             },
         ),
-        _ => TokenValue::plain(""),
+        _ => TokenValue::plain(item.token_value(token)),
     };
     let left = render_token_segments(
         &ui.workspace_sidebar.row.left,
@@ -1139,16 +1167,19 @@ mod tests {
             .map(|(index, name)| {
                 let pane_id = PaneId::new();
                 WorkspaceSnapshot {
+                    tokens: Default::default(),
                     id: WorkspaceId::new(),
                     name: (*name).into(),
                     root: PathBuf::from(format!("/project/{index}")),
                     closing: false,
                     tabs: vec![TabSnapshot {
+                        tokens: Default::default(),
                         id: TabId::new(),
                         name: "shell".into(),
                         closing: false,
                         layout: crate::splits::SplitTree::leaf(pane_id),
                         panes: vec![PaneSnapshot {
+                            tokens: Default::default(),
                             id: pane_id,
                             terminal_id: TerminalId::new(),
                             closing: false,
@@ -1169,6 +1200,7 @@ mod tests {
             ResourceSnapshot {
                 revision: 1,
                 sessions: vec![SessionSnapshot {
+                    tokens: Default::default(),
                     id: session_id,
                     name: "project".into(),
                     project: Project {
@@ -1187,6 +1219,86 @@ mod tests {
                 child_pid: 1,
             },
         )
+    }
+
+    #[test]
+    fn extension_tokens_resolve_from_sidebar_ancestry_and_workspace_rows() {
+        let (mut snapshot, focused) = fixture(&["main", "peer"], 0);
+        let session = &mut snapshot.sessions[0];
+        session
+            .tokens
+            .insert("session.extension.demo.value".into(), "session".into());
+        let workspace = &mut session.workspaces[0];
+        workspace
+            .tokens
+            .insert("workspace.extension.demo.value".into(), "workspace".into());
+        let tab = &mut workspace.tabs[0];
+        tab.tokens
+            .insert("tab.extension.demo.value".into(), "tab".into());
+        tab.panes[0]
+            .tokens
+            .insert("pane.extension.demo.value".into(), "pane".into());
+
+        let model = WorkspaceModel::from_snapshot(
+            &snapshot,
+            &focused,
+            &NavigationHistory::default(),
+            &NotificationState::default(),
+        );
+        assert_eq!(
+            model.extension_value("session.extension.demo.value"),
+            "session"
+        );
+        assert_eq!(
+            model.extension_value("workspace.extension.demo.value"),
+            "workspace"
+        );
+        assert_eq!(model.extension_value("tab.extension.demo.value"), "tab");
+        assert_eq!(model.extension_value("pane.extension.demo.value"), "pane");
+        assert_eq!(
+            model.items[0].token_value("workspace.extension.demo.value"),
+            "workspace"
+        );
+        assert_eq!(
+            model.items[1].token_value("workspace.extension.demo.value"),
+            ""
+        );
+    }
+
+    #[test]
+    fn workspace_git_tokens_render_from_snapshot_with_builtin_semantic_styles() {
+        let (mut snapshot, focused) = fixture(&["main"], 0);
+        let tokens = &mut snapshot.sessions[0].workspaces[0].tokens;
+        tokens.insert("workspace.git_branch".into(), "feature".into());
+        tokens.insert("workspace.git_added".into(), "+3".into());
+        tokens.insert("workspace.git_deleted".into(), "-2".into());
+        let model = WorkspaceModel::from_snapshot(
+            &snapshot,
+            &focused,
+            &NavigationHistory::default(),
+            &NotificationState::default(),
+        );
+
+        let (text, buffer) = rendered(&model, None, None, 28, 6, WorkspaceSidebarPosition::Left);
+        assert!(text.contains("feature +3 -2"), "{text:?}");
+        assert_eq!(
+            buffer
+                .content()
+                .iter()
+                .find(|cell| cell.symbol() == "+")
+                .unwrap()
+                .fg,
+            ratatui::style::Color::Green
+        );
+        assert_eq!(
+            buffer
+                .content()
+                .iter()
+                .find(|cell| cell.symbol() == "-")
+                .unwrap()
+                .fg,
+            ratatui::style::Color::Red
+        );
     }
 
     fn rendered(
@@ -1208,7 +1320,6 @@ mod tests {
             area,
             position,
             &UiConfig::default(),
-            &GitStatusCache::default(),
             &mut buffer,
         );
         let text = (0..height)
@@ -1228,12 +1339,14 @@ mod tests {
         focused.workspace_id = snapshot.sessions[0].workspaces[0].id;
         let feature = &mut snapshot.sessions[0].workspaces[1];
         let remembered = PaneSnapshot {
+            tokens: Default::default(),
             id: PaneId::new(),
             terminal_id: TerminalId::new(),
             closing: false,
             activity: Default::default(),
         };
         feature.tabs.push(TabSnapshot {
+            tokens: Default::default(),
             id: TabId::new(),
             name: "remembered".into(),
             closing: false,
@@ -1585,7 +1698,6 @@ mod tests {
             area,
             WorkspaceSidebarPosition::Left,
             &ui,
-            &GitStatusCache::default(),
             &mut buffer,
         );
         let text = (0..area.width)

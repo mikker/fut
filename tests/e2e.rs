@@ -27,7 +27,7 @@ use fut::{
         ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, PROTOCOL_VERSION_0_1,
         RenameSelector, SelectedTarget, ServerMessage, codec, decode_payload, encode_payload,
     },
-    resources::{SessionSelector, TargetSelector},
+    resources::{PresentationTokenTarget, SessionSelector, TargetSelector},
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
@@ -544,11 +544,17 @@ fn spawn_daemon(
         fs::File::create(root.path().join("daemon.stdout")).expect("create daemon stdout capture");
     let stderr =
         fs::File::create(root.path().join("daemon.stderr")).expect("create daemon stderr capture");
+    let test_bin = root.path().join("bin");
+    let path = if test_bin.is_dir() {
+        format!("{}:/usr/bin:/bin", test_bin.display())
+    } else {
+        "/usr/bin:/bin".into()
+    };
     let mut command = Command::new(env!("CARGO_BIN_EXE_fut"));
     command
         .env_clear()
         .env("HOME", home)
-        .env("PATH", "/usr/bin:/bin")
+        .env("PATH", path)
         .env("TMPDIR", runtime)
         .env("FUT_RUNTIME_DIR", runtime)
         .env("TERM", "xterm-256color")
@@ -1875,6 +1881,565 @@ async fn public_cli_lists_creates_and_closes_resources() {
     );
     wait_for(DEADLINE, || !process_alive(terminal_pid)).await;
     harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn configured_workspace_hooks_observe_committed_lifecycle_in_order() {
+    let harness = Harness::start_with("while :; do sleep 1; done", |root| {
+        let extension = root.join("extension");
+        fs::create_dir(&extension).unwrap();
+        fs::write(
+            extension.join("fut-extension.toml"),
+            r#"
+id = "lifecycle"
+[hooks]
+"workspace.created" = ["./hook"]
+"workspace.renamed" = ["./hook"]
+"workspace.closed" = ["./hook"]
+"#,
+        )
+        .unwrap();
+        let hook = extension.join("hook");
+        fs::write(
+            &hook,
+            "#!/bin/sh\nprintf '%s|%s|%s|%s|%s\\n' \"$FUT_EVENT\" \"$FUT_EVENT_VERSION\" \"$FUT_SESSION_ID\" \"$FUT_WORKSPACE_ID\" \"$FUT_SOCKET\" >> environment\ncat >> events.jsonl\n",
+        )
+        .unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::create_dir_all(root.join("home/.config/fut")).unwrap();
+        fs::write(
+            root.join("home/.config/fut/config.toml"),
+            format!("extensions = [{:?}]\n", extension.display().to_string()),
+        )
+        .unwrap();
+    })
+    .await;
+    let events_path = harness.root.path().join("extension/events.jsonl");
+    wait_for(DEADLINE, || {
+        fs::read_to_string(&events_path).is_ok_and(|events| events.lines().count() == 1)
+    })
+    .await;
+
+    let second_root = harness.root.path().join("second");
+    fs::create_dir(&second_root).unwrap();
+    let opened = harness
+        .cli()
+        .arg("open")
+        .arg(&second_root)
+        .args([
+            "--name",
+            "second",
+            "--",
+            "/bin/sh",
+            "-c",
+            "while :; do sleep 1; done",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        opened.status.success(),
+        "{}",
+        String::from_utf8_lossy(&opened.stderr)
+    );
+    let second = harness
+        .resources()
+        .await
+        .sessions
+        .into_iter()
+        .flat_map(|session| session.workspaces)
+        .find(|workspace| workspace.name == "second")
+        .unwrap();
+    assert_eq!(
+        harness
+            .control_command(ClientMessage::RenameTarget {
+                selector: RenameSelector::Workspace(second.id),
+                name: "renamed".into(),
+            })
+            .await,
+        ServerMessage::CommandCompleted {
+            command: fut::protocol::AcknowledgedCommand::RenameTarget,
+        }
+    );
+    assert_eq!(
+        harness
+            .control_command(ClientMessage::CloseTarget {
+                selector: TargetSelector::Workspace(second.id),
+            })
+            .await,
+        ServerMessage::CommandCompleted {
+            command: fut::protocol::AcknowledgedCommand::CloseTarget,
+        }
+    );
+    wait_for(DEADLINE, || {
+        fs::read_to_string(&events_path).is_ok_and(|events| events.lines().count() == 4)
+    })
+    .await;
+
+    let events = fs::read_to_string(&events_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["event"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "workspace.created",
+            "workspace.created",
+            "workspace.renamed",
+            "workspace.closed",
+        ]
+    );
+    assert_eq!(events[2]["previous_name"], "second");
+    assert_eq!(events[3]["workspace"]["name"], "renamed");
+    assert_eq!(
+        events[3]["workspace"]["root"],
+        fs::canonicalize(&second_root)
+            .unwrap()
+            .display()
+            .to_string()
+    );
+    let environment =
+        fs::read_to_string(harness.root.path().join("extension/environment")).unwrap();
+    assert!(environment.lines().all(|line| {
+        let fields = line.split('|').collect::<Vec<_>>();
+        fields.len() == 5
+            && fields[1] == "1"
+            && !fields[2].is_empty()
+            && !fields[3].is_empty()
+            && fields[4] == harness.socket.to_str().unwrap()
+    }));
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn checked_in_example_extension_smokes_hooks_cli_tokens_and_configuration() {
+    let example = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/extensions/example-workspace-status");
+    let harness = Harness::start_with("while :; do sleep 1; done", |root| {
+        fs::create_dir_all(root.join("home/.config/fut")).unwrap();
+        fs::write(
+            root.join("home/.config/fut/config.toml"),
+            format!(
+                "extensions = [{:?}]\n[ui.workspace_sidebar.row]\nright = [{{ token = 'workspace.extension.example-workspace-status.last_event' }}]\n",
+                example.display().to_string()
+            ),
+        )
+        .unwrap();
+    })
+    .await;
+
+    let created = resources_when_with_timeout(&harness, DEADLINE, |snapshot| {
+        snapshot.sessions[0].workspaces[0]
+            .tokens
+            .get("workspace.extension.example-workspace-status.last_event")
+            .is_some_and(|value| value == "workspace.created")
+    })
+    .await;
+    let workspace_id = created.sessions[0].workspaces[0].id;
+
+    let doctor = harness.cli().arg("doctor").output().unwrap();
+    assert!(
+        doctor.status.success(),
+        "{}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    assert_eq!(
+        harness
+            .control_command(ClientMessage::RenameTarget {
+                selector: RenameSelector::Workspace(workspace_id),
+                name: "example-renamed".into(),
+            })
+            .await,
+        ServerMessage::CommandCompleted {
+            command: fut::protocol::AcknowledgedCommand::RenameTarget,
+        }
+    );
+    resources_when_with_timeout(&harness, DEADLINE, |snapshot| {
+        snapshot.sessions[0].workspaces[0]
+            .tokens
+            .get("workspace.extension.example-workspace-status.last_event")
+            .is_some_and(|value| value == "workspace.renamed")
+    })
+    .await;
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn declared_extension_tokens_publish_authoritatively_through_cli_and_protocol() {
+    let harness = Harness::start_with("while :; do sleep 1; done", |root| {
+        let extension = root.join("extension");
+        fs::create_dir(&extension).unwrap();
+        fs::write(
+            extension.join("fut-extension.toml"),
+            r#"
+id = "status"
+[[presentation_tokens]]
+name = "state"
+scope = "workspace"
+[[presentation_tokens]]
+name = "badge"
+scope = "tab"
+[[presentation_tokens]]
+name = "mark"
+scope = "pane"
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("home/.config/fut")).unwrap();
+        fs::write(
+            root.join("home/.config/fut/config.toml"),
+            format!(
+                "extensions = [{:?}]\n[ui.workspace_sidebar.row]\nright = [{{ token = 'workspace.extension.status.state' }}]\n",
+                extension.display().to_string()
+            ),
+        )
+        .unwrap();
+    })
+    .await;
+    let initial = harness.resources().await;
+    let workspace = &initial.sessions[0].workspaces[0];
+    let workspace_id = workspace.id;
+    let tab_id = workspace.tabs[0].id;
+    let pane_id = workspace.tabs[0].panes[0].id;
+
+    let mut watcher = harness.connect().await.unwrap();
+    assert!(matches!(
+        hello(&mut watcher, ClientMode::Control, PROTOCOL_VERSION)
+            .await
+            .unwrap(),
+        ServerMessage::Welcome { .. }
+    ));
+    send(&mut watcher, ClientMessage::WatchResources).await;
+    assert!(matches!(
+        receive(&mut watcher).await.unwrap(),
+        ServerMessage::Resources { .. }
+    ));
+
+    let published = harness
+        .cli()
+        .args([
+            "token",
+            "publish",
+            "status",
+            "state",
+            "ready",
+            "--workspace-id",
+            &workspace_id.to_string(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        published.status.success(),
+        "{}",
+        String::from_utf8_lossy(&published.stderr)
+    );
+    let published: Value = serde_json::from_slice(&published.stdout).unwrap();
+    assert_eq!(published["command"], "token.publish");
+    assert_eq!(published["result"]["changed"], true);
+    let published_revision = published["result"]["revision"].as_u64().unwrap();
+    assert!(published_revision > initial.revision);
+
+    let changed = receive_matching(&mut watcher, |message| {
+        matches!(
+            message,
+            ServerMessage::ResourcesChanged { snapshot }
+                if snapshot.sessions[0].workspaces[0]
+                    .tokens
+                    .get("workspace.extension.status.state")
+                    .is_some_and(|value| value == "ready")
+        )
+    })
+    .await;
+    let ServerMessage::ResourcesChanged { snapshot } = changed else {
+        unreachable!()
+    };
+    assert_eq!(
+        snapshot.sessions[0].workspaces[0]
+            .tokens
+            .get("workspace.extension.status.state")
+            .map(String::as_str),
+        Some("ready")
+    );
+    assert!(snapshot.revision >= published_revision);
+
+    let unchanged = harness
+        .cli()
+        .args([
+            "--json",
+            "token",
+            "publish",
+            "status",
+            "state",
+            "ready",
+            "--workspace-id",
+            &workspace_id.to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(unchanged.status.success());
+    let unchanged: Value = serde_json::from_slice(&unchanged.stdout).unwrap();
+    assert_eq!(unchanged["result"]["changed"], false);
+    assert!(unchanged["result"]["revision"].as_u64().unwrap() >= published_revision);
+
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::PublishToken {
+                extension_id: "status".into(),
+                token: "badge".into(),
+                value: "tab".into(),
+                target: PresentationTokenTarget::Workspace(workspace_id),
+            })
+            .await,
+        ServerMessage::Error { ref code, .. } if code == "invalid_token_scope"
+    ));
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::PublishToken {
+                extension_id: "missing".into(),
+                token: "state".into(),
+                value: "value".into(),
+                target: PresentationTokenTarget::Workspace(workspace_id),
+            })
+            .await,
+        ServerMessage::Error { ref code, .. } if code == "unknown_extension"
+    ));
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::PublishToken {
+                extension_id: "status".into(),
+                token: "missing".into(),
+                value: "value".into(),
+                target: PresentationTokenTarget::Workspace(workspace_id),
+            })
+            .await,
+        ServerMessage::Error { ref code, .. } if code == "undeclared_token"
+    ));
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::PublishToken {
+                extension_id: "status".into(),
+                token: "state".into(),
+                value: "unsafe\nvalue".into(),
+                target: PresentationTokenTarget::Workspace(workspace_id),
+            })
+            .await,
+        ServerMessage::Error { ref code, .. } if code == "invalid_token_value"
+    ));
+
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::PublishToken {
+                extension_id: "status".into(),
+                token: "badge".into(),
+                value: "tab".into(),
+                target: PresentationTokenTarget::Tab(tab_id),
+            })
+            .await,
+        ServerMessage::TokenPublished { changed: true, .. }
+    ));
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::PublishToken {
+                extension_id: "status".into(),
+                token: "mark".into(),
+                value: "pane".into(),
+                target: PresentationTokenTarget::Pane(pane_id),
+            })
+            .await,
+        ServerMessage::TokenPublished { changed: true, .. }
+    ));
+    let snapshot = harness.resources().await;
+    assert_eq!(
+        snapshot.sessions[0].workspaces[0].tabs[0]
+            .tokens
+            .get("tab.extension.status.badge")
+            .map(String::as_str),
+        Some("tab")
+    );
+    assert_eq!(
+        snapshot.sessions[0].workspaces[0].tabs[0].panes[0]
+            .tokens
+            .get("pane.extension.status.mark")
+            .map(String::as_str),
+        Some("pane")
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn daemon_git_tokens_publish_atomic_shared_snapshots_and_clear_when_git_disappears() {
+    let harness = Harness::start_with("while :; do sleep 1; done", |root| {
+        let cwd = root.join("cwd");
+        git(&cwd, &["init", "--initial-branch=main"]);
+        fs::write(cwd.join("tracked"), "one\ntwo\n").unwrap();
+        git(&cwd, &["add", "tracked"]);
+        git(&cwd, &["commit", "-m", "fixture"]);
+    })
+    .await;
+
+    let initial = resources_when_with_timeout(&harness, Duration::from_secs(20), |snapshot| {
+        workspace_git_tokens(snapshot) == [Some("main"), None, None]
+    })
+    .await;
+    let mut watchers = Vec::new();
+    for _ in 0..2 {
+        let mut watcher = harness.connect().await.unwrap();
+        assert!(matches!(
+            hello(&mut watcher, ClientMode::Control, PROTOCOL_VERSION)
+                .await
+                .unwrap(),
+            ServerMessage::Welcome { .. }
+        ));
+        send(&mut watcher, ClientMessage::WatchResources).await;
+        let ServerMessage::Resources { snapshot } = receive(&mut watcher).await.unwrap() else {
+            panic!("expected initial resources")
+        };
+        assert_eq!(workspace_git_tokens(&snapshot), [Some("main"), None, None]);
+        watchers.push(watcher);
+    }
+
+    fs::write(
+        harness.root.path().join("cwd/tracked"),
+        "one\nthree\nfour\n",
+    )
+    .unwrap();
+    resources_when_with_timeout(&harness, Duration::from_secs(20), |snapshot| {
+        workspace_git_tokens(snapshot) == [Some("main"), Some("+2"), Some("-1")]
+    })
+    .await;
+    let mut changed_revisions = Vec::new();
+    for watcher in &mut watchers {
+        let message = receive_matching(watcher, |message| {
+            let ServerMessage::ResourcesChanged { snapshot } = message else {
+                return false;
+            };
+            let tokens = workspace_git_tokens(snapshot);
+            assert!(
+                tokens == [Some("main"), None, None]
+                    || tokens == [Some("main"), Some("+2"), Some("-1")],
+                "Git values must never be published as a partial snapshot: {tokens:?}"
+            );
+            tokens == [Some("main"), Some("+2"), Some("-1")]
+        })
+        .await;
+        let ServerMessage::ResourcesChanged { snapshot } = message else {
+            unreachable!()
+        };
+        changed_revisions.push(snapshot.revision);
+    }
+    assert_eq!(changed_revisions[0], changed_revisions[1]);
+    assert!(changed_revisions[0] > initial.revision);
+
+    fs::rename(
+        harness.root.path().join("cwd/.git"),
+        harness.root.path().join("cwd/git-hidden"),
+    )
+    .unwrap();
+    resources_when_with_timeout(&harness, Duration::from_secs(20), |snapshot| {
+        workspace_git_tokens(snapshot) == [None, None, None]
+    })
+    .await;
+    let cleared = receive_matching(&mut watchers[0], |message| {
+        let ServerMessage::ResourcesChanged { snapshot } = message else {
+            return false;
+        };
+        let tokens = workspace_git_tokens(snapshot);
+        assert!(
+            tokens == [Some("main"), Some("+2"), Some("-1")] || tokens == [None, None, None],
+            "Git values must clear together: {tokens:?}"
+        );
+        tokens == [None, None, None]
+    })
+    .await;
+    let ServerMessage::ResourcesChanged { snapshot } = cleared else {
+        unreachable!()
+    };
+    assert_eq!(workspace_git_tokens(&snapshot), [None, None, None]);
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn daemon_shutdown_cancels_an_in_flight_git_refresh() {
+    let harness = Harness::start_with("while :; do sleep 1; done", |root| {
+        let cwd = root.join("cwd");
+        git(&cwd, &["init", "--initial-branch=main"]);
+        fs::write(cwd.join("tracked"), "ready\n").unwrap();
+        git(&cwd, &["add", "tracked"]);
+        git(&cwd, &["commit", "-m", "fixture"]);
+
+        let bin = root.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let marker = root.join("git-refresh-started");
+        let fake_git = bin.join("git");
+        fs::write(
+            &fake_git,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n  *\"--abbrev-ref HEAD\"*)\n    : > {:?}\n    exec sleep 60\n    ;;\nesac\nexec /usr/bin/git \"$@\"\n",
+                marker.display().to_string()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&fake_git, fs::Permissions::from_mode(0o755)).unwrap();
+    })
+    .await;
+    wait_for(DEADLINE, || {
+        harness.root.path().join("git-refresh-started").exists()
+    })
+    .await;
+
+    let started = Instant::now();
+    harness.shutdown().await;
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "daemon shutdown waited for the hung Git process"
+    );
+}
+
+#[test]
+fn daemon_setup_rejects_unsupported_extension_hooks_before_creating_resources() {
+    let root = tempfile::tempdir().unwrap();
+    let extension = root.path().join("extension");
+    fs::create_dir(&extension).unwrap();
+    fs::write(
+        extension.join("fut-extension.toml"),
+        "id = 'invalid'\n[hooks]\n'workspace.changed' = ['helper']\n",
+    )
+    .unwrap();
+    let config = root.path().join("config.toml");
+    fs::write(
+        &config,
+        format!("extensions = [{:?}]\n", extension.display().to_string()),
+    )
+    .unwrap();
+    let socket = root.path().join("fut.sock");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_fut"))
+        .env_clear()
+        .env("FUT_CONFIG", &config)
+        .env("PATH", "/usr/bin:/bin")
+        .env("TERM", "xterm-256color")
+        .args(["--socket"])
+        .arg(&socket)
+        .args(["daemon", "run", "--cwd"])
+        .arg(root.path())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unsupported hook"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!socket.exists());
 }
 
 #[tokio::test]
@@ -5607,7 +6172,6 @@ async fn linked_git_worktree_is_a_peer_workspace_and_reopens_idempotently() {
     ));
 
     let marker = harness.root.path().join("must-not-run");
-    let revision = snapshot.revision;
     let reopened = harness
         .control_command(ClientMessage::OpenLocation {
             name: Some("ignored".into()),
@@ -5624,7 +6188,11 @@ async fn linked_git_worktree_is_a_peer_workspace_and_reopens_idempotently() {
         panic!("unexpected reopen: {reopened:?}")
     };
     assert_eq!(same, linked_target);
-    assert_eq!(harness.resources().await.revision, revision);
+    assert_eq!(
+        without_workspace_git_tokens(harness.resources().await),
+        without_workspace_git_tokens(snapshot.clone()),
+        "reopening an existing worktree must not mutate resource structure"
+    );
     assert!(!marker.exists());
 
     let (mut main_client, _, main_pid) = harness
@@ -8039,7 +8607,9 @@ right = [{ text = "]" }, { token = "workspace.tab_count" }]
     live_close.wait_for("one").await;
     live_close.clear_output();
     live_close.send(b"h");
-    live_close.wait_for("MODE:hidden").await;
+    // A concurrent resource redraw may preserve the unchanged `MODE:hide`
+    // prefix and emit only the changed suffix through the terminal diff.
+    live_close.wait_for("den").await;
     live_close.clear_output();
     live_close.send(b"h");
     live_close.send(b"qsize-linked\n");
@@ -10819,7 +11389,15 @@ async fn resources_when(
     harness: &Harness,
     condition: impl Fn(&fut::resources::ResourceSnapshot) -> bool,
 ) -> fut::resources::ResourceSnapshot {
-    time::timeout(DEADLINE, async {
+    resources_when_with_timeout(harness, DEADLINE, condition).await
+}
+
+async fn resources_when_with_timeout(
+    harness: &Harness,
+    deadline: Duration,
+    condition: impl Fn(&fut::resources::ResourceSnapshot) -> bool,
+) -> fut::resources::ResourceSnapshot {
+    time::timeout(deadline, async {
         loop {
             let snapshot = harness.resources().await;
             if condition(&snapshot) {
@@ -10830,6 +11408,35 @@ async fn resources_when(
     })
     .await
     .expect("resource condition did not become true before timeout")
+}
+
+fn workspace_git_tokens(snapshot: &fut::resources::ResourceSnapshot) -> [Option<&str>; 3] {
+    let tokens = &snapshot.sessions[0].workspaces[0].tokens;
+    [
+        tokens.get("workspace.git_branch").map(String::as_str),
+        tokens.get("workspace.git_added").map(String::as_str),
+        tokens.get("workspace.git_deleted").map(String::as_str),
+    ]
+}
+
+fn without_workspace_git_tokens(
+    mut snapshot: fut::resources::ResourceSnapshot,
+) -> fut::resources::ResourceSnapshot {
+    snapshot.revision = 0;
+    for workspace in snapshot
+        .sessions
+        .iter_mut()
+        .flat_map(|session| &mut session.workspaces)
+    {
+        for name in [
+            "workspace.git_branch",
+            "workspace.git_added",
+            "workspace.git_deleted",
+        ] {
+            workspace.tokens.remove(name);
+        }
+    }
+    snapshot
 }
 
 fn process_alive(pid: u32) -> bool {

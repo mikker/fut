@@ -8,7 +8,6 @@ pub(crate) mod config;
 mod copy_mode;
 mod dialog;
 mod fuzzy;
-mod git;
 mod graphics;
 pub(crate) mod input;
 mod layout;
@@ -54,7 +53,6 @@ use crossterm::{
     },
 };
 use futures_util::{SinkExt, StreamExt};
-use git::GitStatusCache;
 use input::{PrefixAction, PrefixState, encode_key};
 use layout::{
     PaneLayout, SplitDivider, authored_layout, authored_navigation_layout, directional_neighbor,
@@ -419,11 +417,7 @@ async fn run(
     redraw.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut spinner = time::interval(Duration::from_millis(100));
     spinner.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-    let mut git_refresh = time::interval(git::REFRESH_INTERVAL);
-    git_refresh.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let (clipboard_results, mut clipboard_result) = mpsc::channel(1);
-    let (git_updates, mut git_update) = mpsc::channel(1);
-    let git = GitStatusCache::new(git_updates);
     send_request(framed, Some(Uuid::new_v4()), ClientMessage::ListResources).await?;
     resize_view(framed, terminal.size()?.into(), &mut view, &resources, &ui).await?;
 
@@ -617,7 +611,6 @@ async fn run(
                     ServerMessage::Resources { snapshot } => {
                         if resources.accept(snapshot) {
                             let snapshot = resources.snapshot().expect("accepted resources exist");
-                            git.refresh(snapshot.sessions.iter().flat_map(|session| &session.workspaces).map(|workspace| workspace.root.as_path()));
                             refresh_surface_resources(
                                 &mut surface,
                                 snapshot,
@@ -645,7 +638,6 @@ async fn run(
                     ServerMessage::ResourcesChanged { snapshot } => {
                         if resources.accept(snapshot) {
                             let snapshot = resources.snapshot().expect("accepted resources exist");
-                            git.refresh(snapshot.sessions.iter().flat_map(|session| &session.workspaces).map(|workspace| workspace.root.as_path()));
                             refresh_surface_resources(
                                 &mut surface,
                                 snapshot,
@@ -917,7 +909,8 @@ async fn run(
                     ServerMessage::TerminalOutput { .. }
                     | ServerMessage::TerminalOutputMatched { .. }
                     | ServerMessage::AgentPrompted { .. }
-                    | ServerMessage::AgentSettled { .. } => {
+                    | ServerMessage::AgentSettled { .. }
+                    | ServerMessage::TokenPublished { .. } => {
                         bail!("unexpected control response on interactive connection")
                     }
                 }
@@ -1639,19 +1632,6 @@ async fn run(
                 toasts.expire();
                 force_draw = true;
             }
-            Some(()) = git_update.recv() => {
-                force_draw = true;
-            }
-            _ = git_refresh.tick(), if resources.snapshot().is_some() => {
-                let snapshot = resources.snapshot().expect("git refresh requires resources");
-                git.refresh(
-                    snapshot
-                        .sessions
-                        .iter()
-                        .flat_map(|session| &session.workspaces)
-                        .map(|workspace| workspace.root.as_path()),
-                );
-            }
             _ = spinner.tick(), if resources.has_working() => {
                 spinner_frame = spinner_frame.wrapping_add(1);
                 force_draw = true;
@@ -1743,7 +1723,6 @@ async fn run(
                                     sidebar_area,
                                     ui.workspace_sidebar.position,
                                     &ui,
-                                    &git,
                                     spinner_frame,
                                     frame.buffer_mut(),
                                 );
@@ -1760,7 +1739,6 @@ async fn run(
                                 sidebar_area,
                                 ui.workspace_sidebar.position,
                                 &ui,
-                                &git,
                                 frame.buffer_mut(),
                             );
                         }

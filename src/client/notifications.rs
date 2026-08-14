@@ -374,6 +374,7 @@ mod tests {
 
     fn completed_pane(closing: bool) -> PaneSnapshot {
         PaneSnapshot {
+            tokens: Default::default(),
             id: PaneId::new(),
             terminal_id: TerminalId::new(),
             closing,
@@ -403,6 +404,7 @@ mod tests {
     fn unseen_is_per_client_revision() {
         let terminal_id = TerminalId::new();
         let pane = PaneSnapshot {
+            tokens: Default::default(),
             id: PaneId::new(),
             terminal_id,
             closing: false,
@@ -430,6 +432,7 @@ mod tests {
     fn observing_an_older_render_does_not_hide_a_newer_completion() {
         let terminal_id = TerminalId::new();
         let pane = PaneSnapshot {
+            tokens: Default::default(),
             id: PaneId::new(),
             terminal_id,
             closing: false,
@@ -462,6 +465,7 @@ mod tests {
         let snapshot = ResourceSnapshot {
             revision: 1,
             sessions: vec![SessionSnapshot {
+                tokens: Default::default(),
                 id: SessionId::new(),
                 name: "project".into(),
                 project: Project {
@@ -469,11 +473,13 @@ mod tests {
                 },
                 closing: false,
                 workspaces: vec![WorkspaceSnapshot {
+                    tokens: Default::default(),
                     id: WorkspaceId::new(),
                     name: "main".into(),
                     root: PathBuf::from("/project"),
                     closing: false,
                     tabs: vec![TabSnapshot {
+                        tokens: Default::default(),
                         id: TabId::new(),
                         name: "agents".into(),
                         closing: false,
@@ -507,6 +513,7 @@ mod tests {
             identity: ProjectIdentity::CanonicalDirectory(PathBuf::from("/project")),
         };
         let tab = |name: &str, closing: bool, panes: Vec<PaneSnapshot>| TabSnapshot {
+            tokens: Default::default(),
             id: TabId::new(),
             name: name.into(),
             closing,
@@ -514,6 +521,7 @@ mod tests {
             panes,
         };
         let workspace = |name: &str, closing: bool, tabs: Vec<TabSnapshot>| WorkspaceSnapshot {
+            tokens: Default::default(),
             id: WorkspaceId::new(),
             name: name.into(),
             root: PathBuf::from("/project"),
@@ -524,6 +532,7 @@ mod tests {
             revision: 1,
             sessions: vec![
                 SessionSnapshot {
+                    tokens: Default::default(),
                     id: SessionId::new(),
                     name: "closing-session".into(),
                     project: project(),
@@ -535,6 +544,7 @@ mod tests {
                     )],
                 },
                 SessionSnapshot {
+                    tokens: Default::default(),
                     id: SessionId::new(),
                     name: "closing-workspace".into(),
                     project: project(),
@@ -546,6 +556,7 @@ mod tests {
                     )],
                 },
                 SessionSnapshot {
+                    tokens: Default::default(),
                     id: open_session_id,
                     name: "open".into(),
                     project: project(),

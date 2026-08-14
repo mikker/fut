@@ -303,6 +303,7 @@ mod tests {
         let mut snapshot = ResourceSnapshot {
             revision: 1,
             sessions: vec![SessionSnapshot {
+                tokens: Default::default(),
                 id: SessionId::new(),
                 name: "project".into(),
                 project: Project {
@@ -310,6 +311,7 @@ mod tests {
                 },
                 closing: false,
                 workspaces: vec![WorkspaceSnapshot {
+                    tokens: Default::default(),
                     id: workspace_id,
                     name: "main".into(),
                     root: PathBuf::from("/project"),

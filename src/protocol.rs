@@ -14,7 +14,7 @@ use crate::{
         PaneId, ScreenDelta, ScreenSnapshot, SessionId, SplitId, TabId, TerminalId, TerminalOutput,
         TerminalOutputMatcher, TerminalOutputSource, TerminalSize, WorkspaceId,
     },
-    resources::{ResourceSnapshot, SessionSelector, TargetSelector},
+    resources::{PresentationTokenTarget, ResourceSnapshot, SessionSelector, TargetSelector},
     splits::{SplitDirection, SplitRatio, SplitTree},
 };
 
@@ -322,6 +322,12 @@ pub enum ClientMessage {
         selector: RenameSelector,
         name: String,
     },
+    PublishToken {
+        extension_id: String,
+        token: String,
+        value: String,
+        target: PresentationTokenTarget,
+    },
     ReportAgent {
         terminal_id: TerminalId,
         report: AgentReport,
@@ -361,6 +367,10 @@ pub enum ServerMessage {
     },
     TargetRenamed {
         resource_revision: u64,
+    },
+    TokenPublished {
+        resource_revision: u64,
+        changed: bool,
     },
     TargetSelected {
         selected: SelectedView,
@@ -1066,6 +1076,24 @@ mod tests {
         assert_eq!(
             decode_payload::<ClientMessage>(&encode_payload(&close).unwrap()).unwrap(),
             close
+        );
+        let publish = ClientMessage::PublishToken {
+            extension_id: "review-status".into(),
+            token: "state".into(),
+            value: "ready".into(),
+            target: PresentationTokenTarget::Workspace(WorkspaceId::new()),
+        };
+        assert_eq!(
+            decode_payload::<ClientMessage>(&encode_payload(&publish).unwrap()).unwrap(),
+            publish
+        );
+        let published = ServerMessage::TokenPublished {
+            resource_revision: 10,
+            changed: true,
+        };
+        assert_eq!(
+            decode_payload::<ServerMessage>(&encode_payload(&published).unwrap()).unwrap(),
+            published
         );
         let resources = ServerMessage::Resources {
             snapshot: ResourceSnapshot {

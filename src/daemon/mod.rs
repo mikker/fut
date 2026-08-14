@@ -1,5 +1,6 @@
 //! The single per-user Fut daemon and its local socket lifecycle.
 
+mod git;
 mod lease;
 pub mod path;
 
@@ -36,6 +37,7 @@ use uuid::Uuid;
 
 use crate::{
     agent_detection::{CodexStabilizer, detect_codex, is_codex_process},
+    client::config as global_config,
     domain::{
         AgentActivity, AgentDetection, AgentReport, AgentState, ClientId, CopyModeAction,
         CopyModeError, DeltaRow, MAX_AGENT_PROMPT_BYTES, MAX_TERMINAL_OUTPUT_PATTERN_BYTES,
@@ -51,8 +53,8 @@ use crate::{
         decode_payload, encode_payload,
     },
     resources::{
-        CheckoutDestination, InitialPath, ResourceError, ResourceTree, SessionSelector, TabPath,
-        TargetSelector, WorkspacePath,
+        CheckoutDestination, InitialPath, Mutation, PresentationTokenTarget, ResourceError,
+        ResourceTree, SessionSelector, TabPath, TargetSelector, TokenPublication, WorkspacePath,
     },
     splits::{SplitDirection, SplitRatio, SplitTree},
     terminal::{
@@ -95,6 +97,7 @@ impl DaemonConfig {
 }
 
 const CONNECTION_GRACE_PERIOD: Duration = Duration::from_secs(1);
+const HOOK_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(1);
 
 struct RuntimeEntry {
     handle: Arc<TerminalHandle>,
@@ -109,6 +112,8 @@ struct SharedState {
     resource_changes: watch::Sender<u64>,
     agent_events: broadcast::Sender<AgentLifecycleUpdate>,
     child_env: HashMap<String, String>,
+    extensions: Vec<crate::extensions::Extension>,
+    hook_queue: crate::extensions::HookQueue,
     accepting: bool,
 }
 
@@ -150,6 +155,7 @@ impl From<ResourceError> for DaemonError {
             ResourceError::TargetRequired | ResourceError::AmbiguousTarget => "target_required",
             ResourceError::EmptyName => "invalid_name",
             ResourceError::InvalidAgentReport(_) => "invalid_agent_report",
+            ResourceError::TooManyMaterializedTokens => "token_limit",
             _ => "resource_error",
         };
         Self::new(code, error.to_string())
@@ -209,6 +215,71 @@ impl SharedState {
         }
     }
 
+    fn publish_mutation(&self, mutation: &Mutation) {
+        self.publish_resource_change(mutation.revision);
+        self.hook_queue.enqueue(mutation);
+    }
+
+    fn publish_token(
+        &mut self,
+        extension_id: &str,
+        token_name: &str,
+        value: String,
+        target: PresentationTokenTarget,
+    ) -> Result<TokenPublication, DaemonError> {
+        if !self.accepting {
+            return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
+        }
+        let extension = self
+            .extensions
+            .iter()
+            .find(|extension| extension.id() == extension_id)
+            .ok_or_else(|| {
+                DaemonError::new(
+                    "unknown_extension",
+                    format!("extension {extension_id:?} is not configured"),
+                )
+            })?;
+        let declaration = extension.presentation_token(token_name).ok_or_else(|| {
+            DaemonError::new(
+                "undeclared_token",
+                format!(
+                    "extension {extension_id:?} does not declare presentation token {token_name:?}"
+                ),
+            )
+        })?;
+        let target_scope = match target {
+            PresentationTokenTarget::Session(_) => crate::extensions::PresentationScope::Session,
+            PresentationTokenTarget::Workspace(_) => {
+                crate::extensions::PresentationScope::Workspace
+            }
+            PresentationTokenTarget::Tab(_) => crate::extensions::PresentationScope::Tab,
+            PresentationTokenTarget::Pane(_) => crate::extensions::PresentationScope::Pane,
+        };
+        if declaration.scope() != target_scope {
+            return Err(DaemonError::new(
+                "invalid_token_scope",
+                format!(
+                    "presentation token {:?} has {} scope, not {} scope",
+                    declaration.qualified_name(),
+                    declaration.scope().as_str(),
+                    target_scope.as_str()
+                ),
+            ));
+        }
+        crate::extensions::validate_presentation_value(&value)
+            .map_err(|error| DaemonError::new("invalid_token_value", error.to_string()))?;
+        let publication = self.resources.publish_presentation_token(
+            target,
+            declaration.qualified_name().to_owned(),
+            value,
+        )?;
+        if publication.changed {
+            self.publish_resource_change(publication.revision);
+        }
+        Ok(publication)
+    }
+
     fn report_agent(
         &mut self,
         terminal_id: TerminalId,
@@ -248,7 +319,7 @@ impl SharedState {
                 lease: AttachmentLease::default(),
             },
         );
-        self.publish_resource_change(mutation.revision);
+        self.publish_mutation(&mutation);
         Ok(())
     }
 
@@ -268,7 +339,7 @@ impl SharedState {
                 lease: AttachmentLease::default(),
             },
         );
-        self.publish_resource_change(mutation.revision);
+        self.publish_mutation(&mutation);
         Ok(())
     }
 
@@ -288,7 +359,7 @@ impl SharedState {
                 lease: AttachmentLease::default(),
             },
         );
-        self.publish_resource_change(mutation.revision);
+        self.publish_mutation(&mutation);
         Ok(())
     }
 
@@ -308,7 +379,7 @@ impl SharedState {
                 lease: AttachmentLease::default(),
             },
         );
-        self.publish_resource_change(mutation.revision);
+        self.publish_mutation(&mutation);
         Ok(())
     }
 
@@ -330,7 +401,7 @@ impl SharedState {
                 lease: AttachmentLease::default(),
             },
         );
-        self.publish_resource_change(mutation.revision);
+        self.publish_mutation(&mutation);
         Ok(())
     }
 
@@ -341,7 +412,7 @@ impl SharedState {
         ratio: SplitRatio,
     ) -> Result<(), DaemonError> {
         let mutation = self.resources.resize_split(tab_id, split_id, ratio)?;
-        self.publish_resource_change(mutation.revision);
+        self.publish_mutation(&mutation);
         Ok(())
     }
 
@@ -392,7 +463,7 @@ impl SharedState {
         if self.exited_terminals.len() > 256 {
             self.exited_terminals.pop_front();
         }
-        self.publish_resource_change(mutation.revision);
+        self.publish_mutation(&mutation);
         if mutation.multiplexer_empty {
             self.accepting = false;
         }
@@ -440,13 +511,13 @@ impl SharedState {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let mutation = scope.begin(&mut self.resources)?;
-        self.publish_resource_change(mutation.revision);
+        self.publish_mutation(&mutation);
         Ok((scope, handles))
     }
 
     fn cancel_target_close(&mut self, scope: CloseScope) {
         if let Ok(mutation) = scope.cancel(&mut self.resources) {
-            self.publish_resource_change(mutation.revision);
+            self.publish_mutation(&mutation);
         }
     }
 
@@ -477,7 +548,7 @@ impl SharedState {
         let source_tab_id = source.tab_id;
         let moved = source_tab_id != destination_tab_id;
         let mutation = self.resources.move_pane(pane_id, destination_tab_id)?;
-        self.publish_resource_change(mutation.revision);
+        self.publish_mutation(&mutation);
         let source_tab_closed = mutation.events.iter().any(|event| {
             matches!(
                 event,
@@ -516,7 +587,7 @@ impl SharedState {
             RenameSelector::Workspace(id) => self.resources.rename_workspace(id, name)?,
             RenameSelector::Tab(id) => self.resources.rename_tab(id, name)?,
         };
-        self.publish_resource_change(mutation.revision);
+        self.publish_mutation(&mutation);
         Ok(mutation.revision)
     }
 
@@ -1233,6 +1304,10 @@ fn watch_attachment(
 
 /// Bind Fut's sole socket and run while at least one session is alive.
 pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
+    let config_location = global_config::resolve_location()?;
+    let extensions = global_config::load_extensions_location(&config_location)?;
+    let fut_bin = std::env::current_exe().context("resolve current Fut executable")?;
+    let (hook_queue, hook_receiver) = crate::extensions::hook_queue();
     let resolved = ProjectResolver::default()
         .resolve(&config.spawn.cwd)
         .await
@@ -1265,17 +1340,33 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
         resource_changes,
         agent_events,
         child_env,
+        extensions: extensions.clone(),
+        hook_queue,
         accepting: true,
     };
     if let Err(error) = state.register_session(initial, Arc::clone(&terminal)) {
         let _ = terminal.close().await;
         return Err(error.into());
     }
+    let git_resource_changes = state.resource_changes.subscribe();
     let shared = Arc::new(Mutex::new(state));
+    let (hook_shutdown_tx, hook_shutdown_rx) = watch::channel(false);
+    let mut hooks = tokio::spawn(crate::extensions::run_hooks(
+        hook_receiver,
+        extensions,
+        fut_bin,
+        config.socket_path.clone(),
+        hook_shutdown_rx,
+    ));
     let (exited_tx, mut exited_rx) = mpsc::unbounded_channel();
     watch_terminal(terminal, exited_tx.clone());
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let process_names = watch_process_names(Arc::clone(&shared), shutdown_tx.subscribe());
+    let git_metadata = git::watch(
+        Arc::clone(&shared),
+        git_resource_changes,
+        shutdown_tx.subscribe(),
+    );
     let mut connections = JoinSet::new();
     let writers = WriterTasks::default();
 
@@ -1314,6 +1405,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     }
     shutdown_tx.send_replace(true);
     let _ = process_names.await;
+    let _ = git_metadata.await;
     let handles = shared.lock().await.begin_shutdown();
     let mut first_close_error = None;
     for terminal in handles {
@@ -1341,6 +1433,13 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
         while writers.join_next().await.is_some() {}
     })
     .await;
+    hook_shutdown_tx.send_replace(true);
+    if timeout(HOOK_SHUTDOWN_GRACE_PERIOD, &mut hooks)
+        .await
+        .is_err()
+    {
+        hooks.abort();
+    }
     Ok(())
 }
 
@@ -2612,7 +2711,7 @@ async fn handle_connection(
                             Err(error) => send_error(&mut connection, envelope.request_id, error.code, &error.message).await?,
                         }
                     }
-                    ClientMessage::OpenLocation { .. } | ClientMessage::MovePane { .. } | ClientMessage::Contextual { .. } | ClientMessage::CloseTarget { .. } | ClientMessage::ReportAgent { .. } | ClientMessage::TerminalInput { .. } | ClientMessage::ReadTerminalOutput { .. } | ClientMessage::WaitTerminalOutput { .. } | ClientMessage::PromptAgent { .. } | ClientMessage::WaitAgent { .. } | ClientMessage::WatchResources | ClientMessage::Shutdown => send_error(&mut connection, envelope.request_id, "control_only", "command requires a control connection").await?,
+                    ClientMessage::OpenLocation { .. } | ClientMessage::MovePane { .. } | ClientMessage::Contextual { .. } | ClientMessage::CloseTarget { .. } | ClientMessage::PublishToken { .. } | ClientMessage::ReportAgent { .. } | ClientMessage::TerminalInput { .. } | ClientMessage::ReadTerminalOutput { .. } | ClientMessage::WaitTerminalOutput { .. } | ClientMessage::PromptAgent { .. } | ClientMessage::WaitAgent { .. } | ClientMessage::WatchResources | ClientMessage::Shutdown => send_error(&mut connection, envelope.request_id, "control_only", "command requires a control connection").await?,
                     ClientMessage::Hello { .. } => send_error(&mut connection, envelope.request_id, "already_hello", "hello was already received").await?,
                 }
             },
@@ -2969,6 +3068,34 @@ async fn control_loop(
                     command,
                 )
                 .await?;
+            }
+            ClientMessage::PublishToken {
+                extension_id,
+                token,
+                value,
+                target,
+            } => {
+                let result = shared
+                    .lock()
+                    .await
+                    .publish_token(&extension_id, &token, value, target);
+                match result {
+                    Ok(publication) => {
+                        send(
+                            connection,
+                            envelope.request_id,
+                            ServerMessage::TokenPublished {
+                                resource_revision: publication.revision,
+                                changed: publication.changed,
+                            },
+                        )
+                        .await?
+                    }
+                    Err(error) => {
+                        send_error(connection, envelope.request_id, error.code, &error.message)
+                            .await?
+                    }
+                }
             }
             ClientMessage::ListResources => {
                 let snapshot = shared.lock().await.resources.snapshot();
@@ -5942,6 +6069,8 @@ mod tests {
                 resource_changes: watch::channel(1).0,
                 agent_events: broadcast::channel(AGENT_EVENT_CAPACITY).0,
                 child_env: HashMap::new(),
+                extensions: Vec::new(),
+                hook_queue: crate::extensions::hook_queue().0,
                 accepting: true,
             },
             path,
@@ -6263,6 +6392,8 @@ mod tests {
             resource_changes,
             agent_events: broadcast::channel(AGENT_EVENT_CAPACITY).0,
             child_env: HashMap::new(),
+            extensions: Vec::new(),
+            hook_queue: crate::extensions::hook_queue().0,
             accepting: true,
         };
         state

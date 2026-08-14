@@ -274,11 +274,13 @@ mod tests {
         let second_tab = TabId::new();
         let tabs = vec![
             TabSnapshot {
+                tokens: Default::default(),
                 id: first_tab,
                 name: "shell".into(),
                 closing: false,
                 layout: SplitTree::leaf(first_pane),
                 panes: vec![PaneSnapshot {
+                    tokens: Default::default(),
                     id: first_pane,
                     terminal_id: first_terminal,
                     closing: false,
@@ -286,11 +288,13 @@ mod tests {
                 }],
             },
             TabSnapshot {
+                tokens: Default::default(),
                 id: second_tab,
                 name: "tests".into(),
                 closing: false,
                 layout: SplitTree::leaf(second_pane),
                 panes: vec![PaneSnapshot {
+                    tokens: Default::default(),
                     id: second_pane,
                     terminal_id: second_terminal,
                     closing: false,
@@ -301,6 +305,7 @@ mod tests {
         let snapshot = ResourceSnapshot {
             revision: 1,
             sessions: vec![SessionSnapshot {
+                tokens: Default::default(),
                 id: session_id,
                 name: "project".into(),
                 project: Project {
@@ -308,6 +313,7 @@ mod tests {
                 },
                 closing: false,
                 workspaces: vec![WorkspaceSnapshot {
+                    tokens: Default::default(),
                     id: workspace_id,
                     name: "main".into(),
                     root: PathBuf::from("/project"),

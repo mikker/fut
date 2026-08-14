@@ -90,6 +90,7 @@ pub async fn run(socket: &Path) -> DoctorReport {
                     loaded.ui.icon_probe(),
                 ));
                 let present = loaded.present;
+                let extension_count = loaded.extensions.len();
                 let path = location.path.as_deref().map(path_text);
                 checks.push(check(
                     "config",
@@ -106,6 +107,7 @@ pub async fn run(socket: &Path) -> DoctorReport {
                         "source": location.source,
                         "path": path,
                         "present": present,
+                        "extensions": extension_count,
                     }),
                 ));
             }

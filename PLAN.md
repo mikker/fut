@@ -79,6 +79,19 @@ These constraints protect the foundational model during implementation:
 - Prefer a small control protocol over an in-process plugin system.
 - Start macOS-first without baking macOS UI concepts into the core.
 
+## Scoped extensions
+
+Fut may load explicitly configured local extension directories as a packaging and configuration boundary, not as a general plugin runtime. An extension has a stable namespaced ID, a small manifest, and a root from which direct argv such as `./bin/refresh` can resolve. It may contribute only capabilities that require Fut cooperation:
+
+- asynchronous executable hooks for a small, documented set of committed lifecycle events; and
+- declared, namespaced presentation tokens whose materialized values are published through the versioned control surface.
+
+The implemented `workspace.created`, `workspace.renamed`, and `workspace.closed` hooks run only after state commits, cannot veto or rewrite Fut behavior, and receive bounded JSON plus relevant `FUT_*` resource context. Execution is direct argv without an implicit shell, bounded by timeout and output limits, isolated from daemon correctness, and covered by the same explicit trust boundary as other executable configuration. Dynamic tokens remain pure at render time: extension commands will publish bounded values into authoritative state, while clients only render already-materialized values.
+
+Loading stays deliberately plain: users configure local extension paths explicitly, packaged commands resolve relative to the extension root, declarations are namespaced, and invalid extension configuration fails atomically with useful diagnostics. Fut does not provide extension actions, automatic discovery, installation, registries, dependency resolution, build commands, supervised services, storage APIs, pane entrypoints, native UI, or an in-process SDK. The existing CLI and `fut events` remain the general integration architecture; trusted commands remain the user-configured launcher surface.
+
+The first internal dogfood target, workspace Git metadata, is implemented. The daemon's bounded asynchronous Git collector atomically publishes `workspace.git_branch`, `workspace.git_added`, and `workspace.git_deleted` through the same dynamic token store without turning Git collection into an extension. Clients render only the shared snapshot values, proving the publication and pure-rendering boundary while preserving the default names, styles, timing, and empty behavior.
+
 ## Milestone 0: Scaffold and executable
 
 Create the smallest Rust project capable of growing along the intended boundaries.
