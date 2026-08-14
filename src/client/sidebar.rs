@@ -27,6 +27,7 @@ use super::{
 /// The current workspace is marked with a bullet instead of an icon so the
 /// sidebar reads the same at every icon preset.
 const CURRENT_MARKER: &str = "•";
+const SIDEBAR_HEADER_HEIGHT: u16 = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct WorkspaceItem {
@@ -430,28 +431,36 @@ fn render_minimized_model(
     let Some(content) = render_sidebar_frame(area, position, ui, buffer) else {
         return;
     };
+    let header = render_sidebar_chrome(&ui.workspace_sidebar.header, model, None, ui);
+    let header_height = render_sidebar_header(&header, content, 2, buffer);
+    let rows = Rect::new(
+        content.x,
+        content.y.saturating_add(header_height),
+        content.width,
+        content.height.saturating_sub(header_height),
+    );
     let anchor = model
         .items
         .iter()
         .position(|item| item.current)
         .unwrap_or(0);
     for (offset, row) in
-        visible_rows_with_item_height(model.items.len(), anchor, usize::from(content.height), 1)
+        visible_rows_with_item_height(model.items.len(), anchor, usize::from(rows.height), 1)
             .into_iter()
             .enumerate()
     {
         let Ok(offset) = u16::try_from(offset) else {
             break;
         };
-        let y = content.y.saturating_add(offset);
+        let y = rows.y.saturating_add(offset);
         match row {
             VisibleRow::Ellipsis => {
-                buffer.set_line(content.x, y, &Line::from(" …  "), content.width);
+                buffer.set_line(rows.x, y, &Line::from(" …  "), rows.width);
             }
             VisibleRow::Item(index) => render_minimized_workspace_row(
                 &model.items[index],
                 spinner_frame,
-                Rect::new(content.x, y, content.width, 1),
+                Rect::new(rows.x, y, rows.width, 1),
                 ui,
                 buffer,
             ),
@@ -551,7 +560,7 @@ fn render_model(
 
     let header_line = render_sidebar_chrome(&ui.workspace_sidebar.header, model, status, ui);
     let footer_lines = render_sidebar_footer(model, status, help, ui);
-    let header = (!header_line.spans.is_empty() && content.height >= 3).then_some(header_line);
+    let header_height = render_sidebar_header(&header_line, content, content.width, buffer);
     let footer_allowed = status
         .is_none_or(|status| content.height >= 5 || !matches!(status, WorkspaceStatus::Ready));
     let urgent_footer = matches!(
@@ -561,9 +570,7 @@ fn render_model(
     let footer_capacity = if urgent_footer {
         content.height
     } else {
-        content
-            .height
-            .saturating_sub(u16::from(header.is_some()) + 1)
+        content.height.saturating_sub(header_height + 1)
     };
     let footer = if footer_allowed && (content.height >= 2 || urgent_footer) {
         footer_lines
@@ -574,18 +581,8 @@ fn render_model(
         Vec::new()
     };
     let footer_height = u16::try_from(footer.len()).unwrap_or(u16::MAX);
-    let row_y = content.y.saturating_add(u16::from(header.is_some()));
-    let row_height = content
-        .height
-        .saturating_sub(u16::from(header.is_some()) + footer_height);
-    if let Some(header) = header.as_ref() {
-        buffer.set_line(
-            content.x,
-            content.y,
-            &truncate_line(header, usize::from(content.width)),
-            content.width,
-        );
-    }
+    let row_y = content.y.saturating_add(header_height);
+    let row_height = content.height.saturating_sub(header_height + footer_height);
     if help {
         render_help(
             Rect::new(content.x, row_y, content.width, row_height),
@@ -1094,6 +1091,31 @@ fn clear(area: Rect, style: Style, buffer: &mut Buffer) {
     }
 }
 
+fn render_sidebar_header(
+    header: &Line<'static>,
+    content: Rect,
+    max_width: u16,
+    buffer: &mut Buffer,
+) -> u16 {
+    if header.spans.is_empty() || content.height <= SIDEBAR_HEADER_HEIGHT {
+        return 0;
+    }
+
+    let width = content.width.min(max_width);
+    buffer.set_line(
+        content.x,
+        content.y,
+        &truncate_line(header, usize::from(width)),
+        width,
+    );
+    for column in content.x..content.x.saturating_add(width) {
+        if let Some(cell) = buffer.cell_mut((column, content.y)) {
+            cell.modifier.insert(ratatui::style::Modifier::BOLD);
+        }
+    }
+    SIDEBAR_HEADER_HEIGHT
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1346,30 +1368,34 @@ mod tests {
             &NotificationState::default(),
         );
         let (left, left_buffer) =
-            rendered(&model, None, None, 24, 9, WorkspaceSidebarPosition::Left);
+            rendered(&model, None, None, 24, 10, WorkspaceSidebarPosition::Left);
+        assert!(left.lines().next().unwrap().contains("project"));
         assert!(left.contains("main"));
         assert!(left.contains("bad�name"));
         assert!(left.contains("closing"));
         assert!(left.contains('×'));
-        assert_eq!(left_buffer[(0, 0)].symbol(), CURRENT_MARKER);
-        assert_eq!(left_buffer[(1, 0)].symbol(), " ");
-        assert_eq!(left_buffer[(2, 0)].symbol(), "1");
-        assert_eq!(left_buffer[(3, 0)].symbol(), " ");
-        assert_eq!(left_buffer[(22, 4)].symbol(), " ");
-        assert!(!left_buffer[(0, 0)].modifier.contains(Modifier::REVERSED));
         assert!(left_buffer[(0, 0)].modifier.contains(Modifier::BOLD));
+        assert_eq!(left.lines().nth(1).unwrap().trim(), "│");
+        assert_eq!(left.lines().nth(2).unwrap().trim(), "│");
+        assert_eq!(left_buffer[(0, 3)].symbol(), CURRENT_MARKER);
+        assert_eq!(left_buffer[(1, 3)].symbol(), " ");
+        assert_eq!(left_buffer[(2, 3)].symbol(), "1");
+        assert_eq!(left_buffer[(3, 3)].symbol(), " ");
+        assert_eq!(left_buffer[(22, 7)].symbol(), " ");
+        assert!(!left_buffer[(0, 3)].modifier.contains(Modifier::REVERSED));
+        assert!(left_buffer[(0, 3)].modifier.contains(Modifier::BOLD));
         assert_eq!(left_buffer[(23, 0)].symbol(), "│");
         assert_eq!(left_buffer[(23, 0)].fg, ratatui::style::Color::DarkGray);
         assert!(
-            left.lines().nth(2).unwrap().contains("bad�name"),
+            left.lines().nth(5).unwrap().contains("bad�name"),
             "entries follow each other without spacing"
         );
 
         let (right, right_buffer) =
-            rendered(&model, None, None, 24, 9, WorkspaceSidebarPosition::Right);
+            rendered(&model, None, None, 24, 10, WorkspaceSidebarPosition::Right);
         assert!(right.contains("main"));
         assert_eq!(right_buffer[(0, 0)].symbol(), "│");
-        assert_eq!(right_buffer[(1, 0)].symbol(), CURRENT_MARKER);
+        assert_eq!(right_buffer[(1, 3)].symbol(), CURRENT_MARKER);
     }
 
     #[test]
@@ -1416,6 +1442,23 @@ mod tests {
         assert_eq!(right[(3, 0)].symbol(), "1");
         assert_eq!(right[(4, 1)].symbol(), "!");
         assert_eq!(right[(5, 1)].symbol(), " ");
+
+        let area = Rect::new(0, 0, 6, 5);
+        let mut headed = Buffer::empty(area);
+        render_minimized_model(
+            &model,
+            0,
+            area,
+            WorkspaceSidebarPosition::Left,
+            &ui,
+            &mut headed,
+        );
+        assert_eq!(headed[(0, 0)].symbol(), "p");
+        assert_eq!(headed[(1, 0)].symbol(), "…");
+        assert!(headed[(0, 0)].modifier.contains(Modifier::BOLD));
+        assert_eq!(headed[(0, 1)].symbol(), " ");
+        assert_eq!(headed[(0, 2)].symbol(), " ");
+        assert_eq!(headed[(0, 3)].symbol(), CURRENT_MARKER);
     }
 
     #[test]
@@ -1471,15 +1514,15 @@ mod tests {
         assert!(lines[6].contains("h  hide with one"));
         assert!(lines[7].contains("m  expanded"));
         assert!(lines[8].contains("?  hotkeys"));
-        assert_eq!(buffer[(0, 3)].bg, ratatui::style::Color::DarkGray);
+        assert_eq!(buffer[(0, 4)].bg, ratatui::style::Color::DarkGray);
         assert!(
-            !buffer[(0, 3)].modifier.contains(Modifier::UNDERLINED),
+            !buffer[(0, 4)].modifier.contains(Modifier::UNDERLINED),
             "selection reads as a background, never an underline"
         );
         assert_eq!(
-            buffer[(0, 5)].bg,
+            buffer[(0, 2)].bg,
             ratatui::style::Color::Reset,
-            "the spacing line keeps the plain bar background"
+            "header padding keeps the plain bar background"
         );
 
         state.begin_switch();

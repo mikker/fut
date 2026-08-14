@@ -855,6 +855,10 @@ fn default_sidebar_footer() -> Vec<SegmentConfig> {
     }]
 }
 
+fn default_sidebar_header() -> Vec<SegmentConfig> {
+    vec![SegmentConfig::token("session.name")]
+}
+
 impl Default for WorkspaceSidebarConfig {
     fn default() -> Self {
         Self {
@@ -862,7 +866,7 @@ impl Default for WorkspaceSidebarConfig {
             width: default_sidebar_width(),
             display: WorkspaceSidebarDisplay::Expanded,
             visibility: WorkspaceSidebarVisibility::AutoHideWhenSingle,
-            header: Vec::new(),
+            header: default_sidebar_header(),
             footer: default_sidebar_footer(),
             row: SidebarRowConfig::default(),
         }
