@@ -204,6 +204,11 @@ mod tests {
         );
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
         assert_eq!(
+            prefix.feed(b"C".to_vec()),
+            PrefixAction::Dispatch(ClientAction::CreateWorkspace)
+        );
+        assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
+        assert_eq!(
             prefix.feed(b"l".to_vec()),
             PrefixAction::Dispatch(ClientAction::FocusPane(FocusDirection::Right))
         );

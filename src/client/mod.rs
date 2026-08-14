@@ -1323,6 +1323,7 @@ async fn run(
                                     &resources,
                                     &mut surface,
                                     &workspace_history,
+                                    &mut create_workspace,
                                     &mut create_tab,
                                     &mut split_pane,
                                     &mut focus,
@@ -1547,6 +1548,7 @@ async fn run(
                                     &resources,
                                     &mut surface,
                                     &workspace_history,
+                                    &mut create_workspace,
                                     &mut create_tab,
                                     &mut split_pane,
                                     &mut focus,
@@ -2456,6 +2458,7 @@ async fn dispatch_client_action(
     resources: &ResourceState,
     surface: &mut Option<ClientSurface>,
     workspace_history: &NavigationHistory,
+    create_workspace: &mut CreateState,
     create_tab: &mut CreateState,
     split_pane: &mut CreateState,
     focus: &mut FocusState,
@@ -2594,6 +2597,22 @@ async fn dispatch_client_action(
                     ClientMessage::SelectTarget {
                         selector: TargetSelector::Pane(pane_id),
                         expected: None,
+                    },
+                )
+                .await?;
+            }
+        }
+        ClientAction::CreateWorkspace => {
+            if let Some(request) = create_workspace.begin() {
+                send_request(
+                    framed,
+                    Some(request),
+                    ClientMessage::CreateWorkspace {
+                        session_id: view.focused().session_id,
+                        name: None,
+                        cwd: None,
+                        program: None,
+                        argv: Vec::new(),
                     },
                 )
                 .await?;

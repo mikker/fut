@@ -67,6 +67,7 @@ pub(super) enum ClientAction {
     OpenTabBar,
     OpenNotifications,
     FocusNextNotification,
+    CreateWorkspace,
     CreateTab,
     FocusNextTab,
     FocusPreviousTab,
@@ -96,7 +97,7 @@ pub(super) struct DirectBinding {
     pub action: ClientAction,
 }
 
-pub(super) const ALL_ACTIONS: [ClientAction; 37] = [
+pub(super) const ALL_ACTIONS: [ClientAction; 38] = [
     ClientAction::OpenCommandBar,
     ClientAction::ReloadConfig,
     ClientAction::EnterCopyMode,
@@ -105,6 +106,7 @@ pub(super) const ALL_ACTIONS: [ClientAction; 37] = [
     ClientAction::OpenTabBar,
     ClientAction::OpenNotifications,
     ClientAction::FocusNextNotification,
+    ClientAction::CreateWorkspace,
     ClientAction::CreateTab,
     ClientAction::FocusNextTab,
     ClientAction::FocusPreviousTab,
@@ -136,7 +138,7 @@ pub(super) const ALL_ACTIONS: [ClientAction; 37] = [
     ClientAction::Detach,
 ];
 
-pub(super) const COMMANDS: [ActionDefinition; 36] = [
+pub(super) const COMMANDS: [ActionDefinition; 37] = [
     ActionDefinition {
         action: ClientAction::ReloadConfig,
         title: "Reload configuration",
@@ -166,6 +168,11 @@ pub(super) const COMMANDS: [ActionDefinition; 36] = [
         action: ClientAction::FocusNextNotification,
         title: "Switch to next waiting terminal",
         keywords: "notifications unread next waiting agents completed blocked",
+    },
+    ActionDefinition {
+        action: ClientAction::CreateWorkspace,
+        title: "Create workspace",
+        keywords: "create new workspace worktree checkout shell",
     },
     ActionDefinition {
         action: ClientAction::CreateTab,
@@ -322,7 +329,7 @@ pub(super) const COMMANDS: [ActionDefinition; 36] = [
 const UP: &[u8] = b"\x1b[A";
 const DOWN: &[u8] = b"\x1b[B";
 
-pub(super) const DIRECT_BINDINGS: [DirectBinding; 37] = [
+pub(super) const DIRECT_BINDINGS: [DirectBinding; 38] = [
     DirectBinding {
         suffix: b" ",
         action: ClientAction::OpenCommandBar,
@@ -354,6 +361,10 @@ pub(super) const DIRECT_BINDINGS: [DirectBinding; 37] = [
     DirectBinding {
         suffix: b"\x02",
         action: ClientAction::FocusNextNotification,
+    },
+    DirectBinding {
+        suffix: b"C",
+        action: ClientAction::CreateWorkspace,
     },
     DirectBinding {
         suffix: b"c",
@@ -493,6 +504,7 @@ pub(super) fn config_key(action: ClientAction) -> &'static str {
         ClientAction::OpenTabBar => "open_tab_bar",
         ClientAction::OpenNotifications => "open_notifications",
         ClientAction::FocusNextNotification => "focus_next_notification",
+        ClientAction::CreateWorkspace => "create_workspace",
         ClientAction::CreateTab => "create_tab",
         ClientAction::FocusNextTab => "focus_next_tab",
         ClientAction::FocusPreviousTab => "focus_previous_tab",
@@ -576,6 +588,7 @@ const fn requires_launcher(action: ClientAction) -> bool {
         | ClientAction::OpenTabBar
         | ClientAction::OpenNotifications
         | ClientAction::FocusNextNotification
+        | ClientAction::CreateWorkspace
         | ClientAction::CreateTab
         | ClientAction::FocusNextTab
         | ClientAction::FocusPreviousTab
