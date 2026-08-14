@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Navigator resource shortcuts now filter sessions, scoped workspaces, tabs, or panes instead of cycling through them, and each resource level has a distinct configurable color.
 - Added a verified `curl | bash` installer with prebuilt arm64 and x86_64 releases for Linux and macOS.
 - Added the latest release number and a changelog page to fut.sh.
 

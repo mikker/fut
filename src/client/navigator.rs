@@ -36,6 +36,34 @@ pub(super) enum ResourceKey {
     Pane(PaneId),
 }
 
+impl ResourceKey {
+    fn style(self) -> SemanticStyle {
+        match self {
+            Self::Session(_) => SemanticStyle::Session,
+            Self::Workspace(_) => SemanticStyle::Workspace,
+            Self::Tab(_) => SemanticStyle::Tab,
+            Self::Pane(_) => SemanticStyle::Pane,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResourceFilter {
+    depth: u16,
+    scope: Option<ResourceKey>,
+}
+
+impl ResourceFilter {
+    fn label(self) -> &'static str {
+        match self.depth {
+            0 => "sessions",
+            1 => "workspaces",
+            2 => "tabs",
+            _ => "panes",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct NavigatorRow {
     pub key: ResourceKey,
@@ -60,6 +88,7 @@ pub(super) enum NavigatorStatus {
 pub(super) struct NavigatorState {
     pub rows: Vec<NavigatorRow>,
     filtered: Vec<usize>,
+    filter: Option<ResourceFilter>,
     query: String,
     pub selected: usize,
     pub scroll: usize,
@@ -79,6 +108,7 @@ impl NavigatorState {
         Self {
             rows: Vec::new(),
             filtered: Vec::new(),
+            filter: None,
             query: String::new(),
             selected: 0,
             scroll: 0,
@@ -178,16 +208,21 @@ impl NavigatorState {
         }
         let last = self.filtered.len().saturating_sub(1);
         let page = visible_rows.max(1);
-        let filtering = !self.query.is_empty();
+        let searching = !self.query.is_empty();
+        let navigating_tree = !searching && self.filter.is_none();
         match (key.code, key.modifiers) {
-            (KeyCode::Up, modifiers) if !filtering && modifiers.contains(KeyModifiers::SHIFT) => {
+            (KeyCode::Up, modifiers)
+                if navigating_tree && modifiers.contains(KeyModifiers::SHIFT) =>
+            {
                 self.jump_back(1)
             }
-            (KeyCode::Down, modifiers) if !filtering && modifiers.contains(KeyModifiers::SHIFT) => {
+            (KeyCode::Down, modifiers)
+                if navigating_tree && modifiers.contains(KeyModifiers::SHIFT) =>
+            {
                 self.jump_forward(1)
             }
             (KeyCode::Up | KeyCode::Down, modifiers)
-                if filtering && modifiers.contains(KeyModifiers::SHIFT) => {}
+                if !navigating_tree && modifiers.contains(KeyModifiers::SHIFT) => {}
             (KeyCode::Char('k'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.move_selection(-1)
             }
@@ -206,28 +241,23 @@ impl NavigatorState {
             (KeyCode::Char('d'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.move_selection(page as isize)
             }
-            (KeyCode::Char('s'), modifiers)
-                if !filtering && modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                self.cycle_depth(0)
+            (KeyCode::Char('a'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.show_all()
             }
-            (KeyCode::Char('w'), modifiers)
-                if !filtering && modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                self.cycle_depth(1)
+            (KeyCode::Char('s'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.filter_depth(0)
             }
-            (KeyCode::Char('t'), modifiers)
-                if !filtering && modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                self.cycle_depth(2)
+            (KeyCode::Char('w'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.filter_depth(1)
             }
-            (KeyCode::Char('p'), modifiers)
-                if !filtering && modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                self.cycle_depth(3)
+            (KeyCode::Char('t'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.filter_depth(2)
             }
-            (KeyCode::Left, _) if !filtering => self.select_parent(),
-            (KeyCode::Right, _) if !filtering => self.select_first_child(),
+            (KeyCode::Char('p'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.filter_depth(3)
+            }
+            (KeyCode::Left, _) if navigating_tree => self.select_parent(),
+            (KeyCode::Right, _) if navigating_tree => self.select_first_child(),
             (KeyCode::Enter, _)
                 if matches!(
                     self.status,
@@ -290,8 +320,25 @@ impl NavigatorState {
         }
     }
 
+    fn show_all(&mut self) {
+        self.filter = None;
+        self.query.clear();
+        self.refilter();
+        self.ensure_selected_match();
+    }
+
     fn refilter(&mut self) {
         self.filtered = minimal_fuzzy_matches(&self.query, &self.rows);
+        if let Some(filter) = self.filter {
+            let scope = filter
+                .scope
+                .and_then(|key| self.rows.iter().position(|row| row.key == key));
+            let range = scope.map_or(0..self.rows.len(), |start| {
+                start + 1..self.subtree_end(start)
+            });
+            self.filtered
+                .retain(|index| self.rows[*index].depth == filter.depth && range.contains(index));
+        }
         self.scroll = 0;
     }
 
@@ -344,41 +391,39 @@ impl NavigatorState {
         true
     }
 
-    /// Cycle through rows of one kind within the selection's enclosing scope:
-    /// `s` through sessions, `w` through workspaces of the current session,
-    /// `t` through tabs of the current workspace, `p` through panes of the
-    /// current tab. From a shallower row, descend to the first such row inside
-    /// its subtree.
-    fn cycle_depth(&mut self, depth: u16) {
+    /// Limit rows to one resource kind inside the selected row's enclosing
+    /// scope. Repeating the active filter restores the complete tree.
+    fn filter_depth(&mut self, depth: u16) {
         let Some(current) = self.rows.get(self.selected) else {
             return;
         };
-        if current.depth < depth {
+        let target = if current.depth < depth {
             let end = self.subtree_end(self.selected);
-            if let Some(index) =
-                (self.selected + 1..end).find(|&index| self.rows[index].depth == depth)
-            {
-                self.selected = index;
-            }
-            return;
+            (self.selected + 1..end).find(|&index| self.rows[index].depth == depth)
+        } else {
+            (0..=self.selected)
+                .rev()
+                .find(|&index| self.rows[index].depth == depth)
+        };
+        let Some(target) = target else { return };
+        let scope = if depth > 0 {
+            let Some(index) = (0..=target)
+                .rev()
+                .find(|&index| self.rows[index].depth == depth - 1)
+            else {
+                return;
+            };
+            Some(self.rows[index].key)
+        } else {
+            None
+        };
+        let filter = ResourceFilter { depth, scope };
+        self.filter = (self.filter != Some(filter)).then_some(filter);
+        self.refilter();
+        if self.filter.is_some() && self.rows[target].depth == depth {
+            self.selected = target;
         }
-        // Siblings of this kind live between the enclosing ancestor and the
-        // next row that is at least as shallow as that ancestor.
-        let start = (0..self.selected)
-            .rev()
-            .find(|&index| self.rows[index].depth < depth)
-            .map_or(0, |index| index + 1);
-        let end = (start..self.rows.len())
-            .find(|&index| self.rows[index].depth < depth)
-            .unwrap_or(self.rows.len());
-        let mut candidates = (start..end).filter(|&index| self.rows[index].depth == depth);
-        let next = candidates
-            .clone()
-            .find(|&index| index > self.selected)
-            .or_else(|| candidates.next());
-        if let Some(index) = next {
-            self.selected = index;
-        }
+        self.ensure_selected_match();
     }
 
     fn jump_forward(&mut self, depth: u16) {
@@ -458,7 +503,14 @@ impl NavigatorState {
         }
         let (header, footer) = chrome_rows(area.height);
         if header == 1 {
-            render_title(area, &format!(" navigator › {}", self.query), buffer);
+            let filter = self
+                .filter
+                .map_or_else(String::new, |filter| format!("{} › ", filter.label()));
+            render_title(
+                area,
+                &format!(" navigator › {filter}{}", self.query),
+                buffer,
+            );
         }
         if footer == 1 {
             let footer = match &self.status {
@@ -470,10 +522,7 @@ impl NavigatorState {
                 }
                 NavigatorStatus::Ready => match self.rows.get(self.selected) {
                     Some(row) if row.closing => "Closing…  ↑↓/C-jk move  esc cancel".to_owned(),
-                    _ if !self.query.is_empty() => {
-                        "type search  ↑↓/C-jk move  enter switch  esc close".to_owned()
-                    }
-                    _ => "type search  ↑↓/C-jk move  C-s/w/t/p cycle  enter switch  esc close"
+                    _ => "type search  ↑↓/C-jk move  C-s/w/t/p filter  C-a all  enter switch  esc close"
                         .to_owned(),
                 },
             };
@@ -536,7 +585,7 @@ impl NavigatorState {
                         } else {
                             " "
                         };
-                        let mut style = Style::default();
+                        let mut style = styles.apply(row.key.style(), Style::default());
                         if row.closing {
                             style = style.add_modifier(Modifier::DIM);
                         }
@@ -1297,6 +1346,10 @@ mod tests {
         assert!(ready.contains("sessión 🛰"));
         assert!(ready.contains("pane 1"));
         assert_eq!(ready.matches('•').count(), 1);
+        assert_eq!(buffer[(3, 2)].fg, ratatui::style::Color::Red);
+        assert_eq!(buffer[(5, 3)].fg, ratatui::style::Color::Blue);
+        assert_eq!(buffer[(7, 4)].fg, ratatui::style::Color::Green);
+        assert_eq!(buffer[(9, 5)].fg, ratatui::style::Color::Magenta);
         // First body row sits inside the border, below the title.
         assert!(
             buffer
@@ -1362,30 +1415,46 @@ mod tests {
     }
 
     #[test]
-    fn kind_keys_cycle_within_the_enclosing_scope_and_descend_from_above() {
+    fn kind_keys_filter_within_the_enclosing_scope_and_repeat_to_clear() {
         let mut nav = tree();
-        // From P1 (3): panes wrap within T1, tabs and workspaces and sessions
-        // cycle within their own parents.
         nav.selected = 3;
         press_ctrl(&mut nav, 'p');
-        assert_eq!(nav.selected, 4);
+        assert_eq!(nav.filtered, [3, 4], "panes in T1");
         press_ctrl(&mut nav, 'p');
-        assert_eq!(nav.selected, 3, "pane cycle wraps inside T1");
+        assert_eq!(nav.filtered, (0..14).collect::<Vec<_>>(), "repeat clears");
+
         press_ctrl(&mut nav, 't');
-        assert_eq!(nav.selected, 5, "next tab in W1");
-        press_ctrl(&mut nav, 't');
-        assert_eq!(nav.selected, 2, "tab cycle wraps inside W1");
+        assert_eq!(nav.filtered, [2, 5], "tabs in W1");
         press_ctrl(&mut nav, 'w');
-        assert_eq!(nav.selected, 7, "next workspace in S1");
-        press_ctrl(&mut nav, 'w');
-        assert_eq!(nav.selected, 1, "workspace cycle wraps inside S1");
+        assert_eq!(nav.filtered, [1, 7], "workspaces in S1");
         press_ctrl(&mut nav, 's');
-        assert_eq!(nav.selected, 10);
-        press_ctrl(&mut nav, 's');
-        assert_eq!(nav.selected, 0, "session cycle wraps globally");
-        // From a session, kind keys descend into its subtree.
+        assert_eq!(nav.filtered, [0, 10], "all sessions");
+
+        nav.show_all();
+        nav.selected = 0;
         press_ctrl(&mut nav, 'p');
-        assert_eq!(nav.selected, 3, "first pane inside S1");
+        assert_eq!(nav.filtered, [3, 4], "first tab's panes inside S1");
+        assert_eq!(nav.selected, 3);
+
+        nav.show_all();
+        nav.selected = 13;
+        press_ctrl(&mut nav, 's');
+        assert_eq!(nav.selected, 10, "keeps the enclosing session selected");
+    }
+
+    #[test]
+    fn control_a_clears_resource_and_text_filters() {
+        let mut nav = tree();
+        nav.selected = 3;
+        press_ctrl(&mut nav, 'p');
+        nav.query = "match".into();
+        nav.refilter();
+
+        press_ctrl(&mut nav, 'a');
+
+        assert!(nav.filter.is_none());
+        assert!(nav.query.is_empty());
+        assert_eq!(nav.filtered, (0..14).collect::<Vec<_>>());
     }
 
     #[test]
@@ -1424,7 +1493,7 @@ mod tests {
     }
 
     #[test]
-    fn filtering_disables_every_structural_navigation_class() {
+    fn text_or_resource_filtering_disables_tree_navigation() {
         let mut nav = tree();
         nav.query = "match".into();
         nav.filtered = vec![3, 4];
@@ -1432,16 +1501,21 @@ mod tests {
         for key in [
             KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT),
             KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
-            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
-            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
-            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
-            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
             KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
             KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
         ] {
             nav.selected = 4;
             nav.key(key, 10);
             assert_eq!(nav.selected, 4, "{key:?} selected a hidden row");
+        }
+
+        nav.query.clear();
+        nav.refilter();
+        nav.selected = 3;
+        press_ctrl(&mut nav, 'p');
+        for code in [KeyCode::Left, KeyCode::Right] {
+            nav.key(KeyEvent::new(code, KeyModifiers::NONE), 10);
+            assert_eq!(nav.selected, 3);
         }
     }
 

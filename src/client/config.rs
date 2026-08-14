@@ -110,6 +110,10 @@ pub(super) enum SemanticStyle {
     #[default]
     Normal,
     Muted,
+    Session,
+    Workspace,
+    Tab,
+    Pane,
     Current,
     Selected,
     Closing,
@@ -348,6 +352,10 @@ impl StyleConfig {
 pub(super) struct StylesConfig {
     normal: StyleConfig,
     muted: StyleConfig,
+    session: StyleConfig,
+    workspace: StyleConfig,
+    tab: StyleConfig,
+    pane: StyleConfig,
     current: StyleConfig,
     selected: StyleConfig,
     closing: StyleConfig,
@@ -390,6 +398,10 @@ impl StylePatch {
 struct StylesPatch {
     normal: Option<StylePatch>,
     muted: Option<StylePatch>,
+    session: Option<StylePatch>,
+    workspace: Option<StylePatch>,
+    tab: Option<StylePatch>,
+    pane: Option<StylePatch>,
     current: Option<StylePatch>,
     selected: Option<StylePatch>,
     closing: Option<StylePatch>,
@@ -411,6 +423,10 @@ impl<'de> Deserialize<'de> for StylesConfig {
         for (patch, style) in [
             (patch.normal, &mut styles.normal),
             (patch.muted, &mut styles.muted),
+            (patch.session, &mut styles.session),
+            (patch.workspace, &mut styles.workspace),
+            (patch.tab, &mut styles.tab),
+            (patch.pane, &mut styles.pane),
             (patch.current, &mut styles.current),
             (patch.selected, &mut styles.selected),
             (patch.closing, &mut styles.closing),
@@ -438,6 +454,22 @@ impl Default for StylesConfig {
         Self {
             normal: StyleConfig::default(),
             muted: with(ModifierName::Dim),
+            session: StyleConfig {
+                foreground: Some(UiColor::Red),
+                ..StyleConfig::default()
+            },
+            workspace: StyleConfig {
+                foreground: Some(UiColor::Blue),
+                ..StyleConfig::default()
+            },
+            tab: StyleConfig {
+                foreground: Some(UiColor::Green),
+                ..StyleConfig::default()
+            },
+            pane: StyleConfig {
+                foreground: Some(UiColor::Magenta),
+                ..StyleConfig::default()
+            },
             // Reversed blue: the background renders blue and the text renders in
             // the terminal's own background color, whatever the theme.
             current: StyleConfig {
@@ -487,6 +519,10 @@ impl StylesConfig {
         match role {
             SemanticStyle::Normal => &self.normal,
             SemanticStyle::Muted => &self.muted,
+            SemanticStyle::Session => &self.session,
+            SemanticStyle::Workspace => &self.workspace,
+            SemanticStyle::Tab => &self.tab,
+            SemanticStyle::Pane => &self.pane,
             SemanticStyle::Current => &self.current,
             SemanticStyle::Selected => &self.selected,
             SemanticStyle::Closing => &self.closing,

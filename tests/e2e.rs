@@ -9360,7 +9360,7 @@ async fn public_client_ctrl_b_c_creates_routes_and_navigates_back() {
     client.wait_for("CTRL_C_NEW_INPUT").await;
     client.send(b"\x02g");
     client.wait_for(" navigator").await;
-    client.send(b"\x14\r");
+    client.send(b"\x14\x1b[A\r");
     client.wait_for_count("CTRL_C_A_READY", 2).await;
     time::timeout(DEADLINE, async {
         while !client.text().contains("CTRL_C_A_INPUT") {

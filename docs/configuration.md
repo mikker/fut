@@ -62,6 +62,19 @@ remove_modifiers = ["underlined"]
 background = "dark_gray"
 remove_modifiers = ["reversed"]
 
+# Navigator resource levels default to red, blue, green, and magenta.
+[ui.styles.session]
+foreground = "red"
+
+[ui.styles.workspace]
+foreground = "blue"
+
+[ui.styles.tab]
+foreground = "green"
+
+[ui.styles.pane]
+foreground = "magenta"
+
 [ui.styles.divider]
 foreground = "dark_gray"
 
@@ -126,7 +139,7 @@ Bindings are suffixes after the fixed `Ctrl-b` prefix. Override any action under
 
 Each `[trusted_commands.NAME]` table requires `title`, `binding`, and an executable `program`, plus an optional string array `args`. Running one opens a dashed frame containing a temporary PTY over the complete client terminal, inherits the focused pane process's live working directory, and sends normal terminal input to the command. The frame names the command and identifies the temporary surface; when the process exits, Fut restores the previous panes, focus, and geometry. A trusted command may take a built-in's default key (as `git_diff` takes `g` above); rebind that built-in under `ui.bindings` to keep it. Explicit binding collisions and duplicate command keys are rejected. Commands appear in both the command palette and delayed which-key help, and configuration reload replaces them atomically.
 
-`open_navigator` (default `Ctrl-b g`) opens the single cross-resource dialog. Printable text fuzzy-filters individual hierarchical rows against their full ancestor path; every query term must match. While filtering, each result shows that complete session › workspace › tab › pane path in muted text, with only the fuzzy-matched characters emphasized. Use arrows, Home/End, page keys, or `Ctrl-j`/`Ctrl-k` to move. With an empty query, Left/Right and Shift-arrows navigate the hierarchy while `Ctrl-s`/`Ctrl-w`/`Ctrl-t`/`Ctrl-p` cycle structural levels. Enter switches and Escape closes. Plain `q` is search text. A newly created tab briefly appears as positional `tab 1`, `tab 2`, and so on until its foreground process is available.
+`open_navigator` (default `Ctrl-b g`) opens the single cross-resource dialog. Printable text fuzzy-filters individual hierarchical rows against their full ancestor path; every query term must match. While filtering, each result shows that complete session › workspace › tab › pane path in muted text, with only the fuzzy-matched characters emphasized. Use arrows, Home/End, page keys, or `Ctrl-j`/`Ctrl-k` to move. `Ctrl-s` shows only sessions; `Ctrl-w`, `Ctrl-t`, and `Ctrl-p` show workspaces in the selected session, tabs in the selected workspace, or panes in the selected tab. Repeat the active filter to restore the complete tree, or press `Ctrl-a` to clear both the resource filter and text search. With no resource or text filter, Left/Right and Shift-arrows navigate the hierarchy. Enter switches and Escape closes. Plain `q` is search text. A newly created tab briefly appears as positional `tab 1`, `tab 2`, and so on until its foreground process is available.
 
 `enter_copy_mode` (default `Ctrl-b [`) opens per-client scrollback navigation for the focused terminal. Move by physical terminal cells with arrows or `hjkl`, Home/End, and Page Up/Page Down. Space starts or clears a selection; movement extends it. `y` or Enter copies plain text through the local client's bounded `pbcopy` process and exits only after the clipboard write succeeds. A clipboard error leaves the selection active so `y` can retry. Escape or `q` cancels. `/` opens a literal-search prompt, where Escape closes only the prompt (`q` is ordinary query text); `n` and `N` repeat forward and backward after the prompt closes. Rapid actions are processed in key order; the copy cue reports if the bounded local queue cannot accept another action. Copy-mode keys and search paste never reach the terminal process.
 
@@ -166,6 +179,10 @@ The fixed semantic roles are:
 
 - `normal`
 - `muted`
+- `session`
+- `workspace`
+- `tab`
+- `pane`
 - `current`
 - `selected`
 - `closing`
