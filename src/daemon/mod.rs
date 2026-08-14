@@ -62,7 +62,7 @@ use crate::{
 };
 
 use lease::AttachmentLease;
-use path::{prepare_runtime_dir, runtime_dir};
+use path::prepare_runtime_dir;
 
 #[derive(Clone, Debug)]
 pub struct DaemonConfig {
@@ -1641,7 +1641,9 @@ async fn bind_socket(path: &Path) -> Result<OwnedSocket> {
 }
 
 fn acquire_socket_lock(socket: &Path) -> Result<File> {
-    let path = runtime_dir(socket)?.join("fut.lock");
+    let mut path = socket.as_os_str().to_os_string();
+    path.push(".lock");
+    let path = PathBuf::from(path);
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -6362,6 +6364,20 @@ mod tests {
         let error = bind_socket(&path).await.unwrap_err();
         assert!(error.to_string().contains("already owns"));
         drop(first);
+    }
+
+    #[tokio::test]
+    async fn distinct_sockets_in_one_runtime_directory_have_distinct_owners() {
+        let temporary = tempfile::tempdir().unwrap();
+        let first_path = temporary.path().join("runtime/fut-debug.sock");
+        let second_path = temporary.path().join("runtime/fut-release.sock");
+
+        let first = bind_socket(&first_path).await.unwrap();
+        let second = bind_socket(&second_path).await.unwrap();
+
+        assert!(first_path.exists());
+        assert!(second_path.exists());
+        drop((first, second));
     }
 
     #[tokio::test]
