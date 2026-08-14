@@ -1902,6 +1902,7 @@ fn snapshot_message(
             cursor: screen.cursor,
             scroll: screen.scroll,
             mouse_tracking: screen.mouse_tracking,
+            graphics: (previous.graphics != screen.graphics).then(|| screen.graphics.clone()),
         };
         last_sent.insert(terminal_id, screen);
         return ServerMessage::SnapshotDelta { terminal_id, delta };
@@ -5388,6 +5389,22 @@ mod tests {
         )
         .unwrap();
         third.mouse_tracking = true;
+        third
+            .graphics
+            .placements
+            .push(crate::domain::KittyPlacement {
+                image_id: 1,
+                placement_id: 1,
+                column: 0,
+                row: 0,
+                columns: 1,
+                rows: 1,
+                source_x: 0,
+                source_y: 0,
+                source_width: 1,
+                source_height: 1,
+                z: 0,
+            });
         let message = snapshot_message(terminal_id, third, false, &mut last_sent);
         let ServerMessage::SnapshotDelta { delta, .. } = message else {
             panic!("cursor-only change should produce a delta")
@@ -5396,6 +5413,7 @@ mod tests {
         assert_eq!(delta.cursor.shape, CursorShape::Bar);
         assert!(delta.cursor.blinking);
         assert!(delta.mouse_tracking);
+        assert_eq!(delta.graphics.unwrap().placements.len(), 1);
     }
 
     #[tokio::test]

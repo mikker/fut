@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Render Kitty-protocol inline images through Fut in Ghostty, Kitty, and WezTerm.
+
 - `Ctrl-b C` now creates a workspace; `Ctrl-b c` continues to create a tab.
 - Explicit OSC 8 hyperlinks from terminal applications now remain clickable through Fut.
 - Workspace lists now show the session name in a bold, padded header, abbreviated in the minimized rail.

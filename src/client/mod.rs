@@ -9,6 +9,7 @@ mod copy_mode;
 mod dialog;
 mod fuzzy;
 mod git;
+mod graphics;
 pub(crate) mod input;
 mod layout;
 mod navigation;
@@ -412,6 +413,7 @@ async fn run(
     let mut cheatsheet_visible = false;
     let mut spinner_frame = 0usize;
     let mut host_cursor = HostCursorState::default();
+    let mut kitty_graphics = graphics::Renderer::new();
     let mut perf = perf::PerfLog::from_env();
     let mut redraw = time::interval(Duration::from_millis(16));
     redraw.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -1668,6 +1670,7 @@ async fn run(
                 let draw_started = std::time::Instant::now();
                 io::stdout().sync_update(|stdout| -> io::Result<()> {
                     let mut rendered_cursor = None;
+                    let mut graphics_area = None;
                     terminal.draw(|frame| {
                         let area = frame.area();
                         if let Some(command) = temporary_command.as_ref() {
@@ -1700,6 +1703,7 @@ async fn run(
                             &ui,
                             resources.workspace_count(view.focused()),
                         );
+                        graphics_area = Some(layout.terminal);
                         let cursor = render_view(
                             &view,
                             layout.terminal,
@@ -1802,7 +1806,19 @@ async fn run(
                             frame.buffer_mut(),
                         );
                     })?;
-                    host_cursor.apply(stdout, rendered_cursor)
+                    host_cursor.apply(stdout, rendered_cursor)?;
+                    kitty_graphics.sync(
+                        stdout,
+                        &view,
+                        graphics_area,
+                        ui.pane_layout,
+                        temporary_command.is_none()
+                            && surface.is_none()
+                            && rename.is_none()
+                            && copy_mode.is_none()
+                            && !cheatsheet_visible
+                            && !toasts.is_visible(),
+                    )
                 })??;
                 if let Some(perf) = perf.as_mut() {
                     perf.record("draw", draw_started.elapsed(), 0);
@@ -3168,6 +3184,9 @@ impl PaneState {
         current.cursor = delta.cursor;
         current.scroll = delta.scroll;
         current.mouse_tracking = delta.mouse_tracking;
+        if let Some(graphics) = delta.graphics {
+            current.graphics = graphics;
+        }
         if self.resize_request_id.is_none() {
             self.observe_authoritative_size(delta.size);
         }
@@ -4475,6 +4494,7 @@ mod tests {
                     },
                     scroll: ScrollPosition::default(),
                     mouse_tracking: true,
+                    graphics: None,
                 },
             ),
             DeltaApplyResult::Applied

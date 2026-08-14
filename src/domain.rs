@@ -893,6 +893,61 @@ pub struct ScrollPosition {
     pub max_offset_from_bottom: usize,
 }
 
+/// A decoded Kitty image, recompressed as PNG for transport to attached
+/// clients. Image generations are process-wide libghostty stamps and let a
+/// client avoid retransmitting unchanged pixels to its host terminal.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct KittyImage {
+    #[serde(rename = "i")]
+    pub id: u32,
+    #[serde(rename = "g")]
+    pub generation: u64,
+    #[serde(rename = "d", with = "serde_bytes")]
+    pub png: Vec<u8>,
+}
+
+/// One visible, non-placeholder Kitty placement in terminal-grid space.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct KittyPlacement {
+    #[serde(rename = "i")]
+    pub image_id: u32,
+    #[serde(rename = "p")]
+    pub placement_id: u32,
+    #[serde(rename = "c")]
+    pub column: i32,
+    #[serde(rename = "r")]
+    pub row: i32,
+    #[serde(rename = "w")]
+    pub columns: u32,
+    #[serde(rename = "h")]
+    pub rows: u32,
+    #[serde(rename = "x")]
+    pub source_x: u32,
+    #[serde(rename = "y")]
+    pub source_y: u32,
+    #[serde(rename = "s")]
+    pub source_width: u32,
+    #[serde(rename = "t")]
+    pub source_height: u32,
+    #[serde(rename = "z")]
+    pub z: i32,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct KittyGraphics {
+    #[serde(rename = "i")]
+    pub images: Vec<KittyImage>,
+    #[serde(rename = "p")]
+    pub placements: Vec<KittyPlacement>,
+}
+
+impl KittyGraphics {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.placements.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScreenSnapshot {
     #[serde(rename = "r")]
@@ -912,6 +967,8 @@ pub struct ScreenSnapshot {
     /// Whether the pane application currently owns mouse button gestures.
     #[serde(rename = "m", default, skip_serializing_if = "std::ops::Not::not")]
     pub mouse_tracking: bool,
+    #[serde(rename = "g", default, skip_serializing_if = "KittyGraphics::is_empty")]
+    pub graphics: KittyGraphics,
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -993,6 +1050,7 @@ impl ScreenSnapshot {
             cursor,
             scroll: ScrollPosition::default(),
             mouse_tracking: false,
+            graphics: KittyGraphics::default(),
         }
     }
 }
@@ -1029,6 +1087,10 @@ pub struct ScreenDelta {
     pub scroll: ScrollPosition,
     #[serde(rename = "m", default, skip_serializing_if = "std::ops::Not::not")]
     pub mouse_tracking: bool,
+    /// Complete graphics state when it changed; omitted for ordinary text,
+    /// cursor, and scroll updates so image bytes are not resent every frame.
+    #[serde(rename = "g", default, skip_serializing_if = "Option::is_none")]
+    pub graphics: Option<KittyGraphics>,
 }
 
 #[cfg(test)]

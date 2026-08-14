@@ -13,12 +13,15 @@ compact_str = { version = "0.9", features = ["serde"] }
 crossbeam-channel = "0.5"
 crossterm = { version = "0.29", features = ["event-stream"] }
 futures-util = { version = "0.3", features = ["sink"] }
+base64 = "0.22"
 libc = "0.2"
-libghostty-vt = { path = "vendor/libghostty-vt", default-features = false }
+libghostty-vt = { path = "vendor/libghostty-vt", default-features = false, features = ["kitty-graphics", "png"] }
+png = "0.18"
 portable-pty = "=0.9.0"
 ratatui = "0.30"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }

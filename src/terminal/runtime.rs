@@ -16,6 +16,7 @@ use crossbeam_channel as channel;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::{broadcast, mpsc as async_mpsc, oneshot, watch};
 
+use super::{DEFAULT_CELL_PIXEL_HEIGHT, DEFAULT_CELL_PIXEL_WIDTH};
 use crate::domain::{
     ClientId, CopyModeAction, CopyModeError, MouseEvent, MouseEventKind, ScreenSnapshot,
     TerminalId, TerminalOutputSource, TerminalSize,
@@ -1239,7 +1240,7 @@ fn copy_mode_result<T>(
             cleanup_error,
         } => {
             if let Some(canonical) = canonical {
-                publishers.snapshots.send_replace(canonical);
+                publishers.snapshots.send_replace(*canonical);
             }
             if let Some(cleanup_error) = cleanup_error {
                 send_error(publishers.events, cleanup_error);
@@ -1504,8 +1505,11 @@ fn pty_size(size: TerminalSize) -> PtySize {
     PtySize {
         rows: size.rows,
         cols: size.columns,
-        pixel_width: 0,
-        pixel_height: 0,
+        // Keep PTY ioctl geometry consistent with the fallback cell metrics
+        // used by the VT adapter until attachment-specific host pixels are
+        // part of the client protocol.
+        pixel_width: size.columns.saturating_mul(DEFAULT_CELL_PIXEL_WIDTH),
+        pixel_height: size.rows.saturating_mul(DEFAULT_CELL_PIXEL_HEIGHT),
     }
 }
 #[cfg(all(test, unix))]

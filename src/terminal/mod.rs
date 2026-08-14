@@ -3,6 +3,9 @@
 mod ghostty;
 mod runtime;
 
+const DEFAULT_CELL_PIXEL_WIDTH: u16 = 9;
+const DEFAULT_CELL_PIXEL_HEIGHT: u16 = 18;
+
 pub(crate) use ghostty::{
     CopyModeOutcome, MouseInputOutcome, OutputCapture, OutputCaptureError, ViewportSnapshot,
 };

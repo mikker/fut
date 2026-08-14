@@ -938,7 +938,7 @@ pub trait DecodePng: 'static {
 /// graphics::set_png_decoder(RustPngDecoder::new());
 /// ```
 #[cfg(all(feature = "kitty-graphics", feature = "png"))]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct RustPngDecoder {
     buf: Vec<u8>,
 }
@@ -958,14 +958,16 @@ impl DecodePng for RustPngDecoder {
         // transformations to accept images in other formats, namely
         // expanding palette and grayscale colors to RGBA8 and stripping
         // 16-bit color depth information back down into 8-bit.
-        decoder.set_transformations(Transformations::ALPHA | Transformations::STRIP_16);
+        decoder.set_transformations(
+            Transformations::EXPAND | Transformations::ALPHA | Transformations::STRIP_16,
+        );
 
         let mut frame = decoder.read_info().ok()?;
         let buf_size = frame.output_buffer_size()?;
         if buf_size > self.buf.capacity() {
             self.buf.reserve(buf_size - self.buf.capacity());
         }
-        self.buf.fill(0);
+        self.buf.resize(buf_size, 0);
 
         let info = frame.next_frame(&mut self.buf).ok()?;
 

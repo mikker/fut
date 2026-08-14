@@ -5,13 +5,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use compact_str::CompactString;
 use libghostty_vt::{
     RenderState, Terminal, TerminalOptions,
     error::Error as GhosttyError,
     fmt::Format,
-    key, mouse, paste,
+    key,
+    kitty::graphics::{self, ImageFormat, PlacementIterator},
+    mouse, paste,
     render::{CellIterator, CursorVisualStyle, RowIterator},
     screen::{CellContentTag, CellWide, GridRef, Screen, TrackedGridRef},
     selection::{FormatOptions, Selection},
@@ -20,11 +22,12 @@ use libghostty_vt::{
 };
 use uuid::Uuid;
 
+use super::{DEFAULT_CELL_PIXEL_HEIGHT, DEFAULT_CELL_PIXEL_WIDTH};
 use crate::domain::{
     Cell, CellColor, CellStyle, ClientId, CopyModeAction, CopyModeError, CopyModeMovement, Cursor,
-    CursorShape, MAX_COPY_BYTES, MAX_COPY_CELLS, MAX_HYPERLINK_URI_BYTES,
-    MAX_SCREEN_HYPERLINK_BYTES, MAX_SEARCH_CELL_CODEPOINTS, MAX_SEARCH_CELLS,
-    MAX_SEARCH_QUERY_BYTES, MAX_SEARCH_TEXT_BYTES, MAX_TERMINAL_OUTPUT_BYTES,
+    CursorShape, KittyGraphics, KittyImage, KittyPlacement, MAX_COPY_BYTES, MAX_COPY_CELLS,
+    MAX_HYPERLINK_URI_BYTES, MAX_SCREEN_HYPERLINK_BYTES, MAX_SEARCH_CELL_CODEPOINTS,
+    MAX_SEARCH_CELLS, MAX_SEARCH_QUERY_BYTES, MAX_SEARCH_TEXT_BYTES, MAX_TERMINAL_OUTPUT_BYTES,
     MAX_TERMINAL_OUTPUT_CELLS, MAX_TERMINAL_OUTPUT_ROWS, MouseButton, MouseEvent, MouseEventKind,
     MouseModifiers, MouseWheelDirection, Rgb, ScreenSnapshot, SearchDirection,
     TerminalOutputSource, TerminalSize,
@@ -32,6 +35,9 @@ use crate::domain::{
 
 const SYNCHRONIZED_OUTPUT_TIMEOUT: Duration = Duration::from_secs(1);
 const MOUSE_WHEEL_LINES: isize = 3;
+const KITTY_IMAGE_STORAGE_BYTES: u64 = 16 * 1024 * 1024;
+const KITTY_APC_BYTES: usize = 24 * 1024 * 1024;
+const KITTY_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
 
 pub(crate) enum MouseInputOutcome {
     Handled,
@@ -83,7 +89,7 @@ pub(crate) enum CopyModeFailure {
     Semantic(#[from] CopyModeError),
     #[error("copy-mode cursor was discarded by the terminal")]
     CursorLost {
-        canonical: Option<ScreenSnapshot>,
+        canonical: Option<Box<ScreenSnapshot>>,
         cleanup_error: Option<anyhow::Error>,
     },
     #[error(transparent)]
@@ -146,6 +152,8 @@ pub(super) struct GhosttyTerminal {
     key_event: key::Event<'static>,
     mouse_encoder: mouse::Encoder<'static>,
     mouse_event: mouse::Event<'static>,
+    kitty_placements: PlacementIterator<'static>,
+    kitty_png_cache: HashMap<u64, Vec<u8>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     size: TerminalSize,
     revision: u64,
@@ -164,6 +172,15 @@ impl GhosttyTerminal {
             rows: size.rows,
             max_scrollback: 10_000,
         })?;
+        graphics::set_png_decoder(Some(Box::new(graphics::RustPngDecoder::default())))?;
+        terminal.set_kitty_image_storage_limit(KITTY_IMAGE_STORAGE_BYTES)?;
+        terminal.set_apc_max_bytes_kitty(Some(KITTY_APC_BYTES))?;
+        terminal.resize(
+            size.columns,
+            size.rows,
+            u32::from(DEFAULT_CELL_PIXEL_WIDTH),
+            u32::from(DEFAULT_CELL_PIXEL_HEIGHT),
+        )?;
         let callback_writer = Arc::clone(&writer);
         terminal.on_pty_write(move |_, bytes| {
             if let Ok(mut writer) = callback_writer.lock() {
@@ -181,6 +198,8 @@ impl GhosttyTerminal {
             key_event: key::Event::new()?,
             mouse_encoder: mouse::Encoder::new()?,
             mouse_event: mouse::Event::new()?,
+            kitty_placements: PlacementIterator::new()?,
+            kitty_png_cache: HashMap::new(),
             writer,
             size,
             revision: 0,
@@ -235,7 +254,12 @@ impl GhosttyTerminal {
             self.terminal.set_mode(Mode::SYNC_OUTPUT, false)?;
         }
         self.terminal
-            .resize(size.columns, size.rows, 0, 0)
+            .resize(
+                size.columns,
+                size.rows,
+                u32::from(DEFAULT_CELL_PIXEL_WIDTH),
+                u32::from(DEFAULT_CELL_PIXEL_HEIGHT),
+            )
             .context("resizing Ghostty terminal")?;
         self.size = size;
         self.synchronized_output_started = None;
@@ -724,7 +748,7 @@ impl GhosttyTerminal {
     fn invalidate_cursor_lost(&mut self, owner: ClientId) -> CopyModeFailure {
         match self.finish_copy_mode(owner) {
             Ok(canonical) => CopyModeFailure::CursorLost {
-                canonical: Some(canonical),
+                canonical: Some(Box::new(canonical)),
                 cleanup_error: None,
             },
             Err(error) => CopyModeFailure::CursorLost {
@@ -1400,8 +1424,86 @@ impl GhosttyTerminal {
             ScreenSnapshot::from_terminal(revision, self.size, result, hyperlinks, cursor)?;
         snapshot.scroll = self.scroll_position()?;
         snapshot.mouse_tracking = self.terminal.is_mouse_tracking()?;
+        snapshot.graphics = self.kitty_graphics_snapshot()?;
         self.revision = revision;
         Ok(snapshot)
+    }
+
+    fn kitty_graphics_snapshot(&mut self) -> Result<KittyGraphics> {
+        let graphics = self.terminal.kitty_graphics()?;
+        if graphics.generation()? == 0 {
+            return Ok(KittyGraphics::default());
+        }
+
+        let mut placements = Vec::new();
+        let mut image_ids = Vec::new();
+        let mut iteration = self.kitty_placements.update(&graphics)?;
+        while let Some(placement) = iteration.next() {
+            if placement.is_virtual()? {
+                continue;
+            }
+            let image_id = placement.image_id()?;
+            let Some(image) = graphics.image(image_id) else {
+                continue;
+            };
+            let info = placement.placement_render_info(&image, &self.terminal)?;
+            if !info.viewport_visible || info.grid_cols == 0 || info.grid_rows == 0 {
+                continue;
+            }
+            image_ids.push(image_id);
+            placements.push(KittyPlacement {
+                image_id,
+                placement_id: placement.placement_id()?,
+                column: info.viewport_col,
+                row: info.viewport_row,
+                columns: info.grid_cols,
+                rows: info.grid_rows,
+                source_x: info.source_x,
+                source_y: info.source_y,
+                source_width: info.source_width,
+                source_height: info.source_height,
+                z: placement.z()?,
+            });
+        }
+        image_ids.sort_unstable();
+        image_ids.dedup();
+
+        let mut images = Vec::with_capacity(image_ids.len());
+        let mut retained_generations = Vec::with_capacity(image_ids.len());
+        let mut total_bytes = 0usize;
+        for image_id in image_ids {
+            let Some(image) = graphics.image(image_id) else {
+                continue;
+            };
+            let image_generation = image.generation()?;
+            let png = if let Some(cached) = self.kitty_png_cache.get(&image_generation) {
+                cached.clone()
+            } else {
+                let encoded = encode_kitty_png(
+                    image.width()?,
+                    image.height()?,
+                    image.format()?,
+                    image.data()?,
+                )?;
+                self.kitty_png_cache
+                    .insert(image_generation, encoded.clone());
+                encoded
+            };
+            total_bytes = total_bytes.saturating_add(png.len());
+            if total_bytes > KITTY_SNAPSHOT_BYTES {
+                placements.retain(|placement| placement.image_id != image_id);
+                continue;
+            }
+            retained_generations.push(image_generation);
+            images.push(KittyImage {
+                id: image_id,
+                generation: image_generation,
+                png,
+            });
+        }
+        self.kitty_png_cache
+            .retain(|generation, _| retained_generations.contains(generation));
+        Ok(KittyGraphics { images, placements })
     }
 
     fn scroll_position(&mut self) -> Result<crate::domain::ScrollPosition> {
@@ -1715,6 +1817,35 @@ fn cursor_shape(style: CursorVisualStyle) -> CursorShape {
     }
 }
 
+fn encode_kitty_png(
+    width: u32,
+    height: u32,
+    format: ImageFormat,
+    pixels: &[u8],
+) -> Result<Vec<u8>> {
+    let color = match format {
+        ImageFormat::Rgb => png::ColorType::Rgb,
+        ImageFormat::Rgba => png::ColorType::Rgba,
+        ImageFormat::GrayAlpha => png::ColorType::GrayscaleAlpha,
+        ImageFormat::Gray => png::ColorType::Grayscale,
+        ImageFormat::Png => bail!("libghostty returned an undecoded PNG image"),
+        _ => bail!("libghostty returned an unsupported Kitty image format"),
+    };
+    let mut encoded = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut encoded, width, height);
+        encoder.set_color(color);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder
+            .write_header()
+            .context("starting Kitty PNG encoding")?;
+        writer
+            .write_image_data(pixels)
+            .context("encoding Kitty image as PNG")?;
+    }
+    Ok(encoded)
+}
+
 fn rgb(color: libghostty_vt::style::RgbColor) -> Rgb {
     Rgb {
         red: color.r,
@@ -1760,6 +1891,32 @@ mod tests {
         )
         .unwrap();
         (terminal, output)
+    }
+
+    #[test]
+    fn kitty_png_images_are_retained_as_transportable_placements() {
+        let mut terminal = terminal(10, 4);
+        let screen = terminal
+            .feed(
+                b"\x1b_Ga=T,f=100,q=2,c=2,r=2,i=7;\
+                  iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAA\
+                  DUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==\
+                  \x1b\\",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(screen.graphics.images.len(), 1);
+        assert_eq!(screen.graphics.images[0].id, 7);
+        assert!(
+            screen.graphics.images[0]
+                .png
+                .starts_with(b"\x89PNG\r\n\x1a\n")
+        );
+        assert_eq!(screen.graphics.placements.len(), 1);
+        let placement = &screen.graphics.placements[0];
+        assert_eq!(placement.image_id, 7);
+        assert_eq!((placement.column, placement.row), (0, 0));
+        assert_eq!((placement.columns, placement.rows), (2, 2));
     }
 
     fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
