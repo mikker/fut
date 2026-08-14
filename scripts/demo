@@ -16,7 +16,8 @@ DAEMON_LOG="$DEMO_ROOT/daemon.log"
 DAEMON_PID_FILE="$DEMO_ROOT/daemon.pid"
 OWNERSHIP_FILE="$DEMO_ROOT/.fut-demo-owned"
 # Dogfood the current development build so local changes are always represented.
-FUT_BIN=${FUT_BIN:-"$PROJECT_ROOT/target/debug/fut"}
+DEBUG_FUT_BIN="$PROJECT_ROOT/target/debug/fut"
+FUT_BIN=${FUT_BIN:-"$DEBUG_FUT_BIN"}
 DEMO_SHELL=${SHELL:-/bin/sh}
 DEMO_DAEMON_PID=""
 
@@ -65,6 +66,24 @@ wait_for_exit() {
       return 1
     fi
     sleep 0.05
+  done
+}
+
+stop_debug_daemons() {
+  local pids=()
+  local pid command
+  while read -r pid command; do
+    if [[ "$command" == "$DEBUG_FUT_BIN "* && "$command" == *" daemon run"* ]]; then
+      pids+=("$pid")
+      kill "$pid" 2>/dev/null || true
+    fi
+  done < <(ps -axo pid=,command=)
+
+  for pid in "${pids[@]}"; do
+    if ! wait_for_exit "$pid"; then
+      kill -9 "$pid" 2>/dev/null || true
+      wait_for_exit "$pid" || true
+    fi
   done
 }
 
@@ -218,6 +237,7 @@ EOF
 setup_demo() {
   command -v git >/dev/null || { echo "git is required" >&2; exit 1; }
   command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 1; }
+  stop_debug_daemons
   if [[ "$DEMO_SHELL" != /* ]]; then
     DEMO_SHELL=$(command -v "$DEMO_SHELL")
   fi
