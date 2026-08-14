@@ -22,7 +22,8 @@ use uuid::Uuid;
 
 use crate::domain::{
     Cell, CellColor, CellStyle, ClientId, CopyModeAction, CopyModeError, CopyModeMovement, Cursor,
-    CursorShape, MAX_COPY_BYTES, MAX_COPY_CELLS, MAX_SEARCH_CELL_CODEPOINTS, MAX_SEARCH_CELLS,
+    CursorShape, MAX_COPY_BYTES, MAX_COPY_CELLS, MAX_HYPERLINK_URI_BYTES,
+    MAX_SCREEN_HYPERLINK_BYTES, MAX_SEARCH_CELL_CODEPOINTS, MAX_SEARCH_CELLS,
     MAX_SEARCH_QUERY_BYTES, MAX_SEARCH_TEXT_BYTES, MAX_TERMINAL_OUTPUT_BYTES,
     MAX_TERMINAL_OUTPUT_CELLS, MAX_TERMINAL_OUTPUT_ROWS, MouseButton, MouseEvent, MouseEventKind,
     MouseModifiers, MouseWheelDirection, Rgb, ScreenSnapshot, SearchDirection,
@@ -1278,6 +1279,10 @@ impl GhosttyTerminal {
         let mut result = Vec::with_capacity(expected);
         let mut widths = has_selection.then(|| Vec::with_capacity(expected));
         let mut contents_buffer = String::new();
+        let mut hyperlink_buffer = vec![0; 256];
+        let mut hyperlinks = Vec::<CompactString>::new();
+        let mut hyperlink_ids = HashMap::<CompactString, u16>::new();
+        let mut hyperlink_bytes = 0usize;
         let mut rows = self.rows.update(&snapshot)?;
         while let Some(row) = rows.next() {
             // Row-local selection range, fetched once per row instead of
@@ -1287,6 +1292,7 @@ impl GhosttyTerminal {
             } else {
                 None
             };
+            let row_has_hyperlinks = row.raw_row()?.has_hyperlink()?;
             let mut cells = self.cells.update(row)?;
             let mut column: u16 = 0;
             while let Some(cell) = cells.next() {
@@ -1347,10 +1353,32 @@ impl GhosttyTerminal {
                 }
                 let selected =
                     selection.is_some_and(|range| column >= range.start_x && column <= range.end_x);
+                let hyperlink = if row_has_hyperlinks {
+                    let reference = self.terminal.grid_ref(Point::Viewport(PointCoordinate {
+                        x: column,
+                        y: u32::from(result.len() as u16 / self.size.columns),
+                    }))?;
+                    read_hyperlink_uri(&reference, &mut hyperlink_buffer)?.and_then(|uri| {
+                        if let Some(id) = hyperlink_ids.get(uri.as_str()) {
+                            return Some(*id);
+                        }
+                        if hyperlink_bytes.saturating_add(uri.len()) > MAX_SCREEN_HYPERLINK_BYTES {
+                            return None;
+                        }
+                        let id = u16::try_from(hyperlinks.len()).ok()?;
+                        hyperlink_bytes += uri.len();
+                        hyperlink_ids.insert(uri.clone(), id);
+                        hyperlinks.push(uri);
+                        Some(id)
+                    })
+                } else {
+                    None
+                };
                 result.push(Cell {
                     contents,
                     style,
                     selected,
+                    hyperlink,
                 });
                 column += 1;
             }
@@ -1368,7 +1396,8 @@ impl GhosttyTerminal {
         // one grapheme cluster (or a single space fallback), with no
         // control characters, so the untrusted-input revalidation that
         // `ScreenSnapshot::new` does is unnecessary here.
-        let mut snapshot = ScreenSnapshot::from_terminal(revision, self.size, result, cursor)?;
+        let mut snapshot =
+            ScreenSnapshot::from_terminal(revision, self.size, result, hyperlinks, cursor)?;
         snapshot.scroll = self.scroll_position()?;
         snapshot.mouse_tracking = self.terminal.is_mouse_tracking()?;
         self.revision = revision;
@@ -1391,6 +1420,28 @@ impl GhosttyTerminal {
         self.terminal.scroll_viewport(ScrollViewport::Bottom);
         Ok(())
     }
+}
+
+fn read_hyperlink_uri(
+    reference: &GridRef<'_>,
+    buffer: &mut Vec<u8>,
+) -> Result<Option<CompactString>> {
+    let written = match reference.hyperlink_uri(buffer) {
+        Ok(written) => written,
+        Err(GhosttyError::OutOfSpace { required }) if required <= MAX_HYPERLINK_URI_BYTES => {
+            buffer.resize(required, 0);
+            reference.hyperlink_uri(buffer)?
+        }
+        Err(GhosttyError::OutOfSpace { .. }) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if written == 0 || written > MAX_HYPERLINK_URI_BYTES {
+        return Ok(None);
+    }
+    let uri = std::str::from_utf8(&buffer[..written]).ok();
+    Ok(uri
+        .filter(|uri| !uri.chars().any(char::is_control))
+        .map(CompactString::new))
 }
 
 impl SearchText {
@@ -1803,6 +1854,26 @@ mod tests {
         assert_eq!(&text(&snapshot)[..5], "hi   ");
         assert_eq!(snapshot.cells.len(), 10);
         assert!(snapshot.revision > 0);
+    }
+
+    #[test]
+    fn preserves_explicit_osc_8_hyperlinks() {
+        let snapshot = terminal(10, 1)
+            .feed(b"\x1b]8;;https://example.com/docs\x1b\\docs\x1b]8;;\x1b\\ plain")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(snapshot.hyperlinks, ["https://example.com/docs"]);
+        assert!(
+            snapshot.cells[..4]
+                .iter()
+                .all(|cell| cell.hyperlink == Some(0))
+        );
+        assert!(
+            snapshot.cells[4..]
+                .iter()
+                .all(|cell| cell.hyperlink.is_none())
+        );
     }
 
     #[test]

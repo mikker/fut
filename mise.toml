@@ -12,6 +12,24 @@ run = "cargo fmt --check"
 [tasks.clippy]
 run = "cargo clippy --all-targets --all-features -- -D warnings"
 
+[tasks.fresh]
+description = "Restart the debug daemon and attach without rebuilding"
+run = '''
+socket="${TMPDIR:-/tmp}"
+socket="${socket%/}/fut-debug.sock"
+
+# Prefer a graceful stop when the daemon speaks this build's protocol. Fall
+# back to its socket owner so `fresh` also replaces an older debug daemon.
+if [ -S "$socket" ]; then
+  target/debug/fut --socket "$socket" daemon shutdown >/dev/null 2>&1 || {
+    pids="$(lsof -t -- "$socket" 2>/dev/null || true)"
+    [ -z "$pids" ] || kill $pids
+  }
+fi
+
+exec target/debug/fut --socket "$socket"
+'''
+
 [tasks.test]
 run = "cargo test --all-targets --all-features"
 

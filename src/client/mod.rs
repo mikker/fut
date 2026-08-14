@@ -22,7 +22,7 @@ mod tab_bar;
 mod temporary_command;
 mod toast;
 
-use std::{io, path::Path, process::Stdio, time::Duration};
+use std::{io, num::NonZeroU16, path::Path, process::Stdio, time::Duration};
 
 use actions::{ClientAction, FocusDirection, NavigationScope};
 use anyhow::{Context, bail};
@@ -65,7 +65,7 @@ use notifications::{NotificationsAction, NotificationsDialog};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
-    buffer::Buffer,
+    buffer::{Buffer, CellDiffOption},
     layout::Rect,
     style::{Color, Modifier, Style},
     widgets::{Clear, Widget},
@@ -3164,6 +3164,7 @@ impl PaneState {
             slice.clone_from_slice(&row.cells);
         }
         current.revision = delta.revision;
+        current.hyperlinks = delta.hyperlinks;
         current.cursor = delta.cursor;
         current.scroll = delta.scroll;
         current.mouse_tracking = delta.mouse_tracking;
@@ -3993,16 +3994,18 @@ pub mod bench {
 impl Widget for Screen<'_> {
     fn render(self, area: Rect, buffer: &mut Buffer) {
         let screen = self.0;
+        let columns = screen.size.columns.min(area.width);
         // Adjacent cells frequently share the same style (runs of plain
         // text, whole-line backgrounds, ...), so remember the last resolved
         // `Style` and reuse it instead of rebuilding one per cell.
         let mut resolved: Option<(CellStyle, bool, Style)> = None;
         for row in 0..screen.size.rows.min(area.height) {
-            for column in 0..screen.size.columns.min(area.width) {
+            let mut column = 0;
+            while column < columns {
                 let index =
                     usize::from(row) * usize::from(screen.size.columns) + usize::from(column);
                 let Some(cell) = screen.cells.get(index) else {
-                    continue;
+                    break;
                 };
                 let cell_style = match resolved {
                     Some((style, selected, cell_style))
@@ -4016,12 +4019,94 @@ impl Widget for Screen<'_> {
                         cell_style
                     }
                 };
-                if let Some(target) = buffer.cell_mut((area.x + column, area.y + row)) {
-                    target.set_symbol(&cell.contents).set_style(cell_style);
+
+                if let Some(uri) = hyperlink_uri(screen, cell) {
+                    let start = column;
+                    let (text, width) = hyperlink_run(screen, row, start, columns, cell);
+                    column += width;
+                    if let Some(target) = buffer.cell_mut((area.x + start, area.y + row)) {
+                        let symbol = format!("\x1b]8;;{uri}\x1b\\{text}\x1b]8;;\x1b\\");
+                        target
+                            .set_symbol(&symbol)
+                            .set_diff_option(CellDiffOption::ForcedWidth(
+                                NonZeroU16::new(width).expect("hyperlink run is non-empty"),
+                            ))
+                            .set_style(cell_style);
+                    }
+                    for trailing in start + 1..column {
+                        if let Some(target) = buffer.cell_mut((area.x + trailing, area.y + row)) {
+                            target.set_diff_option(CellDiffOption::Skip);
+                        }
+                    }
+                } else {
+                    if let Some(target) = buffer.cell_mut((area.x + column, area.y + row)) {
+                        target
+                            .set_symbol(&cell.contents)
+                            .set_diff_option(CellDiffOption::None)
+                            .set_style(cell_style);
+                    }
+                    column += 1;
                 }
             }
         }
     }
+}
+
+fn hyperlink_uri<'a>(screen: &'a ScreenSnapshot, cell: &crate::domain::Cell) -> Option<&'a str> {
+    cell.hyperlink
+        .and_then(|id| screen.hyperlinks.get(usize::from(id)))
+        .filter(|uri| {
+            uri.len() <= crate::domain::MAX_HYPERLINK_URI_BYTES
+                && !uri.chars().any(char::is_control)
+        })
+        .map(|uri| uri.as_str())
+}
+
+fn hyperlink_run(
+    screen: &ScreenSnapshot,
+    row: u16,
+    start: u16,
+    columns: u16,
+    first: &crate::domain::Cell,
+) -> (String, u16) {
+    let mut text = String::new();
+    let mut column = start;
+    while column < columns {
+        let index = usize::from(row) * usize::from(screen.size.columns) + usize::from(column);
+        let Some(cell) = screen.cells.get(index) else {
+            break;
+        };
+        if cell.hyperlink != first.hyperlink
+            || cell.style != first.style
+            || cell.selected != first.selected
+        {
+            break;
+        }
+        let width = u16::try_from(UnicodeWidthStr::width(cell.contents.as_str()))
+            .unwrap_or(1)
+            .max(1)
+            .min(columns - column);
+        let occupied_have_same_link = (1..width).all(|offset| {
+            screen
+                .cells
+                .get(index + usize::from(offset))
+                .is_some_and(|tail| {
+                    tail.hyperlink == first.hyperlink
+                        && tail.style == first.style
+                        && tail.selected == first.selected
+                })
+        });
+        if !occupied_have_same_link {
+            if column == start {
+                text.push_str(&cell.contents);
+                column += width;
+            }
+            break;
+        }
+        text.push_str(&cell.contents);
+        column += width;
+    }
+    (text, column - start)
 }
 
 fn style(source: CellStyle, selected: bool) -> Style {
@@ -4380,6 +4465,7 @@ mod tests {
                     base_revision: 1,
                     size,
                     rows: Vec::new(),
+                    hyperlinks: Vec::new(),
                     cursor: Cursor {
                         column: 0,
                         row: 0,
@@ -5462,6 +5548,7 @@ mod tests {
                         contents: contents.into(),
                         style: CellStyle::default(),
                         selected: false,
+                        hyperlink: None,
                     };
                     usize::from(columns) * 2
                 ],
@@ -5639,6 +5726,49 @@ mod tests {
             !style(CellStyle::new(None, None, false, false, false, true), true,)
                 .add_modifier
                 .contains(Modifier::REVERSED)
+        );
+    }
+
+    #[test]
+    fn screen_rendering_re_emits_explicit_hyperlinks_with_their_cell_width() {
+        let text = "Example link";
+        let mut screen = ScreenSnapshot::new(
+            1,
+            TerminalSize {
+                columns: text.len() as u16,
+                rows: 1,
+            },
+            text.chars()
+                .map(|character| crate::domain::Cell {
+                    contents: character.to_string().into(),
+                    hyperlink: Some(0),
+                    ..crate::domain::Cell::default()
+                })
+                .collect(),
+            Cursor {
+                column: 0,
+                row: 0,
+                visible: false,
+                shape: CursorShape::Block,
+                blinking: false,
+            },
+        )
+        .unwrap();
+        screen.hyperlinks.push("https://example.com".into());
+
+        let rendered = bench::render_snapshot(&screen);
+        let cell = &rendered[(0, 0)];
+        assert_eq!(
+            cell.symbol(),
+            "\x1b]8;;https://example.com\x1b\\Example link\x1b]8;;\x1b\\"
+        );
+        assert_eq!(
+            cell.diff_option,
+            CellDiffOption::ForcedWidth(NonZeroU16::new(text.len() as u16).unwrap())
+        );
+        assert!(
+            (1..text.len() as u16)
+                .all(|column| rendered[(column, 0)].diff_option == CellDiffOption::Skip)
         );
     }
 

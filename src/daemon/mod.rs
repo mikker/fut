@@ -1898,6 +1898,7 @@ fn snapshot_message(
             base_revision: previous.revision,
             size: screen.size,
             rows,
+            hyperlinks: screen.hyperlinks.clone(),
             cursor: screen.cursor,
             scroll: screen.scroll,
             mouse_tracking: screen.mouse_tracking,

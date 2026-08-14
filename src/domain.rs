@@ -25,6 +25,10 @@ pub const MAX_VISIBLE_CELLS: usize = 50_000;
 /// represented by a fixed marker.
 pub const MAX_CELL_CONTENT_BYTES: usize = 32;
 pub const OVERSIZED_CELL_CONTENT_MARKER: &str = "�";
+/// Maximum UTF-8 bytes retained for one explicit OSC 8 hyperlink URI.
+pub const MAX_HYPERLINK_URI_BYTES: usize = 4 * 1024;
+/// Maximum unique hyperlink URI bytes retained in one visible snapshot.
+pub const MAX_SCREEN_HYPERLINK_BYTES: usize = 512 * 1024;
 /// Maximum plain-text payload returned by a copy-mode request. At one MiB,
 /// this remains well below the eight-MiB frame limit.
 pub const MAX_COPY_BYTES: usize = 1024 * 1024;
@@ -721,23 +725,36 @@ pub struct Cell {
     pub contents: CompactString,
     pub style: CellStyle,
     pub selected: bool,
+    /// Index into [`ScreenSnapshot::hyperlinks`].
+    pub hyperlink: Option<u16>,
 }
 
 /// Cells dominate terminal frames, so their wire form avoids maps and nested
 /// containers. Plain unselected cells are encoded as just their string;
 /// styled cells are `[contents, packed_style]`, with a trailing `true` only
-/// for selected cells. Both 26-bit colors and four flags fit in one `u64`.
+/// for selected cells. Hyperlinked cells append `selected, hyperlink_index`.
+/// Both 26-bit colors and four flags fit in one `u64`.
 impl Serialize for Cell {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        if self.style.is_default() && !self.selected {
+        if self.style.is_default() && !self.selected && self.hyperlink.is_none() {
             return serializer.serialize_str(&self.contents);
         }
         use serde::ser::SerializeTuple;
-        let mut tuple = serializer.serialize_tuple(if self.selected { 3 } else { 2 })?;
+        let len = if self.hyperlink.is_some() {
+            4
+        } else if self.selected {
+            3
+        } else {
+            2
+        };
+        let mut tuple = serializer.serialize_tuple(len)?;
         tuple.serialize_element(&self.contents)?;
         tuple.serialize_element(&self.style.0)?;
-        if self.selected {
-            tuple.serialize_element(&true)?;
+        if self.selected || self.hyperlink.is_some() {
+            tuple.serialize_element(&self.selected)?;
+        }
+        if let Some(hyperlink) = self.hyperlink {
+            tuple.serialize_element(&hyperlink)?;
         }
         tuple.end()
     }
@@ -777,10 +794,12 @@ impl<'de> Deserialize<'de> for Cell {
                     .next_element()?
                     .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
                 let selected = seq.next_element()?.unwrap_or(false);
+                let hyperlink = seq.next_element()?;
                 Ok(Cell {
                     contents,
                     style: CellStyle(packed_style),
                     selected,
+                    hyperlink,
                 })
             }
         }
@@ -800,6 +819,7 @@ impl Default for Cell {
             contents: " ".into(),
             style: CellStyle::default(),
             selected: false,
+            hyperlink: None,
         }
     }
 }
@@ -881,6 +901,9 @@ pub struct ScreenSnapshot {
     pub size: TerminalSize,
     #[serde(rename = "c")]
     pub cells: Vec<Cell>,
+    /// Deduplicated OSC 8 hyperlink URIs referenced by cells.
+    #[serde(rename = "h", default, skip_serializing_if = "Vec::is_empty")]
+    pub hyperlinks: Vec<CompactString>,
     #[serde(rename = "p")]
     pub cursor: Cursor,
     // Defaulted so snapshots from daemons predating scroll metrics decode.
@@ -928,13 +951,16 @@ impl ScreenSnapshot {
         revision: u64,
         size: TerminalSize,
         mut cells: Vec<Cell>,
+        hyperlinks: Vec<CompactString>,
         cursor: Cursor,
     ) -> Result<Self, SnapshotError> {
         Self::check_bounds(size, &cells, cursor)?;
         for cell in &mut cells {
             cell.cap_length();
         }
-        Ok(Self::new_unchecked(revision, size, cells, cursor))
+        let mut snapshot = Self::new_unchecked(revision, size, cells, cursor);
+        snapshot.hyperlinks = hyperlinks;
+        Ok(snapshot)
     }
 
     fn check_bounds(
@@ -963,6 +989,7 @@ impl ScreenSnapshot {
             revision,
             size,
             cells,
+            hyperlinks: Vec::new(),
             cursor,
             scroll: ScrollPosition::default(),
             mouse_tracking: false,
@@ -994,6 +1021,8 @@ pub struct ScreenDelta {
     pub size: TerminalSize,
     #[serde(rename = "d")]
     pub rows: Vec<DeltaRow>,
+    #[serde(rename = "h", default, skip_serializing_if = "Vec::is_empty")]
+    pub hyperlinks: Vec<CompactString>,
     #[serde(rename = "p")]
     pub cursor: Cursor,
     #[serde(rename = "v")]
@@ -1250,6 +1279,7 @@ mod tests {
                 true,
             ),
             selected: true,
+            hyperlink: None,
         };
         // Pins Cell and CellStyle's Serialize/Deserialize shapes (format-agnostic: the
         // wire protocol itself uses MessagePack, see

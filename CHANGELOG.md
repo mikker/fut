@@ -3,6 +3,7 @@
 ## Unreleased
 
 - `Ctrl-b C` now creates a workspace; `Ctrl-b c` continues to create a tab.
+- Explicit OSC 8 hyperlinks from terminal applications now remain clickable through Fut.
 - Workspace lists now show the session name in a bold, padded header, abbreviated in the minimized rail.
 - Navigator resource shortcuts now filter sessions, scoped workspaces, tabs, or panes instead of cycling through them, and each resource level has a distinct configurable color.
 - Fixed independent daemons with different socket names in the same runtime directory blocking each other.
