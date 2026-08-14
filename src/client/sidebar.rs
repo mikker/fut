@@ -32,7 +32,8 @@ const SIDEBAR_HEADER_HEIGHT: u16 = 3;
 struct WorkspaceItem {
     id: WorkspaceId,
     name: String,
-    root: std::path::PathBuf,
+    /// The live location every open pane shares; `None` when panes disagree.
+    location: Option<std::path::PathBuf>,
     index: usize,
     tab_count: usize,
     current: bool,
@@ -96,7 +97,11 @@ impl WorkspaceModel {
                     WorkspaceItem {
                         id: workspace.id,
                         name: workspace.name.clone(),
-                        root: workspace.root.clone(),
+                        location: crate::resources::shared_live_location(
+                            &workspace.root,
+                            &workspace.tabs,
+                        )
+                        .map(std::path::Path::to_path_buf),
                         index,
                         tab_count: workspace.tabs.len(),
                         current: workspace.id == workspace_id,
@@ -625,7 +630,7 @@ fn render_model(
             id: WorkspaceId::new(),
             tokens: Default::default(),
             name: "workspace".into(),
-            root: std::path::PathBuf::new(),
+            location: Some(std::path::PathBuf::new()),
             index: 0,
             tab_count: 0,
             current: true,
@@ -949,13 +954,18 @@ fn render_workspace_row(
         "workspace.index" => TokenValue::plain((item.index + 1).to_string()),
         "workspace.name" => TokenValue::plain(sanitize(&item.name)),
         "workspace.id" => TokenValue::plain(item.id.to_string()),
-        "workspace.root" => TokenValue::plain(sanitize(&item.root.to_string_lossy())),
-        "workspace.root_name" => TokenValue::plain(sanitize(
-            &item
-                .root
-                .file_name()
-                .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
-        )),
+        "workspace.root" => match item.location.as_ref() {
+            Some(location) => TokenValue::plain(sanitize(&location.to_string_lossy())),
+            None => TokenValue::plain(crate::resources::MULTIPLE_LOCATIONS),
+        },
+        "workspace.root_name" => match item.location.as_ref() {
+            Some(location) => TokenValue::plain(sanitize(
+                &location
+                    .file_name()
+                    .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
+            )),
+            None => TokenValue::plain(crate::resources::MULTIPLE_LOCATIONS),
+        },
         "workspace.closing" if item.closing => {
             TokenValue::styled(icons.closing.clone(), SemanticStyle::Closing)
         }
@@ -1184,6 +1194,8 @@ mod tests {
                             terminal_id: TerminalId::new(),
                             closing: false,
                             activity: Default::default(),
+                            cwd: None,
+                            worktree: None,
                         }],
                     }],
                 }
@@ -1334,6 +1346,55 @@ mod tests {
     }
 
     #[test]
+    fn rows_show_the_shared_live_location_or_multiple() {
+        let (mut snapshot, focused) = fixture(&["main", "feature"], 0);
+        let worktree = PathBuf::from("/project/worktrees/feature");
+        {
+            let feature = &mut snapshot.sessions[0].workspaces[1];
+            feature.tabs[0].panes[0].cwd = Some(worktree.join("src"));
+            feature.tabs[0].panes[0].worktree = Some(worktree.clone());
+            let mut editor = feature.tabs[0].panes[0].clone();
+            editor.id = PaneId::new();
+            editor.terminal_id = TerminalId::new();
+            editor.cwd = Some(worktree.clone());
+            feature.tabs.push(TabSnapshot {
+                tokens: Default::default(),
+                id: TabId::new(),
+                name: "editor".into(),
+                closing: false,
+                layout: crate::splits::SplitTree::leaf(editor.id),
+                panes: vec![editor],
+            });
+        }
+        let model = WorkspaceModel::from_snapshot(
+            &snapshot,
+            &focused,
+            &NavigationHistory::default(),
+            &NotificationState::default(),
+        );
+        assert_eq!(
+            model.items[0].location,
+            Some(PathBuf::from("/project/0")),
+            "unobserved panes fall back to the workspace root"
+        );
+        assert_eq!(
+            model.items[1].location,
+            Some(worktree.clone()),
+            "subdirectories of one work tree are one location"
+        );
+
+        snapshot.sessions[0].workspaces[1].tabs[1].panes[0].cwd = Some(PathBuf::from("/elsewhere"));
+        snapshot.sessions[0].workspaces[1].tabs[1].panes[0].worktree = None;
+        let diverged = WorkspaceModel::from_snapshot(
+            &snapshot,
+            &focused,
+            &NavigationHistory::default(),
+            &NotificationState::default(),
+        );
+        assert_eq!(diverged.items[1].location, None, "disagreement is multiple");
+    }
+
+    #[test]
     fn model_uses_fresh_terminal_ancestry_and_remembered_destinations() {
         let (mut snapshot, mut focused) = fixture(&["main", "feature"], 1);
         focused.workspace_id = snapshot.sessions[0].workspaces[0].id;
@@ -1344,6 +1405,8 @@ mod tests {
             terminal_id: TerminalId::new(),
             closing: false,
             activity: Default::default(),
+            cwd: None,
+            worktree: None,
         };
         feature.tabs.push(TabSnapshot {
             tokens: Default::default(),

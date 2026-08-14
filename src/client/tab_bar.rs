@@ -285,6 +285,8 @@ mod tests {
                     terminal_id: first_terminal,
                     closing: false,
                     activity: Default::default(),
+                    cwd: None,
+                    worktree: None,
                 }],
             },
             TabSnapshot {
@@ -299,6 +301,8 @@ mod tests {
                     terminal_id: second_terminal,
                     closing: false,
                     activity: Default::default(),
+                    cwd: None,
+                    worktree: None,
                 }],
             },
         ];

@@ -53,7 +53,6 @@ pub struct ResolvedLocation {
     pub project: Project,
     pub workspace_root: PathBuf,
     pub suggested_session_name: String,
-    pub suggested_workspace_name: String,
     pub workspace_kind: WorkspaceKind,
 }
 
@@ -152,7 +151,6 @@ impl ProjectResolver {
 
         Ok(ResolvedLocation {
             suggested_session_name: git_session_name(&common_dir, &workspace_root),
-            suggested_workspace_name: basename(&workspace_root),
             cwd,
             project: Project {
                 identity: ProjectIdentity::GitCommonDir(common_dir),
@@ -395,8 +393,7 @@ fn directory_location(cwd: PathBuf) -> ResolvedLocation {
             identity: ProjectIdentity::CanonicalDirectory(cwd.clone()),
         },
         workspace_root: cwd.clone(),
-        suggested_session_name: name.clone(),
-        suggested_workspace_name: name,
+        suggested_session_name: name,
         cwd,
         workspace_kind: WorkspaceKind::Directory,
     }

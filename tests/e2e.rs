@@ -206,12 +206,12 @@ impl PtyChild {
     async fn wait_for(&mut self, needle: &str) {
         time::timeout(DEADLINE, async {
             loop {
-                let text = self.text();
                 assert!(
                     self.child.try_wait().unwrap().is_none(),
-                    "PTY child exited before {needle:?}; output={text:?}"
+                    "PTY child exited before {needle:?}; output={:?}",
+                    self.text()
                 );
-                if text.contains(needle) {
+                if self.sees(needle) {
                     return;
                 }
                 time::sleep(POLL_INTERVAL).await;
@@ -229,7 +229,12 @@ impl PtyChild {
                     self.child.try_wait().unwrap().is_none(),
                     "PTY child exited before {count} occurrences of {needle:?}; output={text:?}"
                 );
-                if text.matches(needle).count() >= count {
+                if text
+                    .matches(needle)
+                    .count()
+                    .max(self.screen_text().matches(needle).count())
+                    >= count
+                {
                     return;
                 }
                 time::sleep(POLL_INTERVAL).await;
@@ -260,6 +265,25 @@ impl PtyChild {
 
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.output.lock().unwrap()).into_owned()
+    }
+
+    /// Whether the raw output or the rendered screen contains `needle`.
+    /// Diff-based repaints may reuse cells already on screen, so a marker is
+    /// not guaranteed to appear contiguously in the byte stream; rendering the
+    /// output through the terminal reconstructs it.
+    fn sees(&self, needle: &str) -> bool {
+        self.text().contains(needle) || self.screen_text().contains(needle)
+    }
+
+    fn screen_text(&self) -> String {
+        let bytes = self.output.lock().unwrap().clone();
+        let mut terminal = fut::terminal::bench::VtBench::new(SIZE).expect("test terminal");
+        let snapshot = terminal
+            .feed(&bytes)
+            .ok()
+            .flatten()
+            .or_else(|| terminal.snapshot().ok().flatten());
+        snapshot.as_ref().map(snapshot_text).unwrap_or_default()
     }
 
     fn clear_output(&mut self) {
@@ -1992,7 +2016,10 @@ id = "lifecycle"
             "workspace.closed",
         ]
     );
-    assert_eq!(events[2]["previous_name"], "second");
+    // The workspace was never explicitly named; it presented its root's
+    // basename. Lifecycle events carry stored names, so the rename reports an
+    // empty previous name.
+    assert_eq!(events[2]["previous_name"], "");
     assert_eq!(events[3]["workspace"]["name"], "renamed");
     assert_eq!(
         events[3]["workspace"]["root"],
@@ -2898,7 +2925,6 @@ async fn public_pane_move_preserves_attachment_identity_order_and_cascades_empty
     .await;
     snapshot_containing(&mut attached_a, terminal_a, "MOVE_A_INPUT").await;
 
-    let revision = moved.revision;
     let retry = harness
         .cli()
         .args([
@@ -2918,7 +2944,10 @@ async fn public_pane_move_preserves_attachment_identity_order_and_cascades_empty
     );
     assert_eq!(retry_json["result"]["moved"], false);
     assert_eq!(retry_json["result"]["source_tab_closed"], false);
-    assert_eq!(harness.resources().await.revision, revision);
+    assert_eq!(
+        without_observations(harness.resources().await),
+        without_observations(moved.clone())
+    );
 
     let final_move = harness
         .cli()
@@ -3098,7 +3127,10 @@ async fn public_new_tab_rejections_are_pre_spawn_and_atomic() {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(harness.resources().await, before);
+        assert_eq!(
+            without_observations(harness.resources().await),
+            without_observations(before.clone())
+        );
         assert!(!marker.exists(), "rejected command for {name:?} ran");
     }
 
@@ -3112,7 +3144,10 @@ async fn public_new_tab_rejections_are_pre_spawn_and_atomic() {
             !output.stderr.is_empty(),
             "malformed parent had no parser diagnostic"
         );
-        assert_eq!(harness.resources().await, before);
+        assert_eq!(
+            without_observations(harness.resources().await),
+            without_observations(before.clone())
+        );
     }
     harness.shutdown().await;
 }
@@ -3800,7 +3835,10 @@ async fn public_pane_new_rejections_are_pre_spawn_and_atomic() {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(harness.resources().await, before);
+        assert_eq!(
+            without_observations(harness.resources().await),
+            without_observations(before.clone())
+        );
         assert!(!marker.exists());
     }
     harness.shutdown().await;
@@ -4843,7 +4881,10 @@ async fn top_level_attach_is_navigator_only_until_selection_then_attaches_normal
     drop(contender);
     cancelled.send(b"\x1b");
     cancelled.wait_success().await;
-    assert_eq!(harness.resources().await, before);
+    assert_eq!(
+        without_observations(harness.resources().await),
+        without_observations(before.clone())
+    );
 
     let mut selected = spawn_attach();
     selected.wait_for("other-session").await;
@@ -4851,7 +4892,10 @@ async fn top_level_attach_is_navigator_only_until_selection_then_attaches_normal
     selected.wait_for("SECONDARY_READY").await;
     selected.send(b"\x02d");
     selected.wait_success().await;
-    assert_eq!(harness.resources().await, before);
+    assert_eq!(
+        without_observations(harness.resources().await),
+        without_observations(before.clone())
+    );
 
     harness.shutdown().await;
 }
@@ -5050,7 +5094,10 @@ async fn inferred_layout_commands_fail_typed_without_a_live_terminal_and_do_not_
         assert!(!output.status.success());
         let error: Value = serde_json::from_slice(&output.stderr).unwrap();
         assert_eq!(error["error"]["code"], code);
-        assert_eq!(harness.resources().await, before);
+        assert_eq!(
+            without_observations(harness.resources().await),
+            without_observations(before.clone())
+        );
     }
     let tab_id = before.sessions[0].workspaces[0].tabs[0].id;
     let explicit = harness
@@ -5496,7 +5543,10 @@ async fn public_pane_split_preserves_target_direction_cwd_argv_focus_and_atomic_
             error["error"]["code"].as_str(),
             Some("not_found" | "spawn_failed" | "invalid_cwd")
         ));
-        assert_eq!(harness.resources().await, stable);
+        assert_eq!(
+            without_observations(harness.resources().await),
+            without_observations(stable.clone())
+        );
     }
 
     harness.shutdown().await;
@@ -6189,8 +6239,8 @@ async fn linked_git_worktree_is_a_peer_workspace_and_reopens_idempotently() {
     };
     assert_eq!(same, linked_target);
     assert_eq!(
-        without_workspace_git_tokens(harness.resources().await),
-        without_workspace_git_tokens(snapshot.clone()),
+        without_observations(harness.resources().await),
+        without_observations(snapshot.clone()),
         "reopening an existing worktree must not mutate resource structure"
     );
     assert!(!marker.exists());
@@ -6306,7 +6356,10 @@ async fn existing_reopen_is_idempotent_and_invalid_name_never_spawns() {
         }
     ));
     let after = harness.resources().await;
-    assert_eq!(after, before);
+    assert_eq!(
+        without_observations(after),
+        without_observations(before.clone())
+    );
     time::sleep(Duration::from_millis(100)).await;
     assert!(!pid_file.exists(), "rejected command wrote its PID file");
     assert!(
@@ -6329,7 +6382,10 @@ async fn existing_reopen_is_idempotent_and_invalid_name_never_spawns() {
     time::sleep(Duration::from_millis(100)).await;
     assert!(!blank_marker.exists(), "invalid-name command executed");
     let after_blank = harness.resources().await;
-    assert_eq!(after_blank, before);
+    assert_eq!(
+        without_observations(after_blank),
+        without_observations(before)
+    );
     harness.shutdown().await;
 }
 
@@ -9819,7 +9875,7 @@ async fn public_doctor_probes_a_running_daemon_without_mutating_resources() {
         serde_json::json!(PROTOCOL_VERSION)
     );
     let after = harness.resources().await;
-    assert_eq!(after, before);
+    assert_eq!(without_observations(after), without_observations(before));
     harness.shutdown().await;
 }
 
@@ -10765,15 +10821,14 @@ async fn public_rename_preserves_a_live_process_and_rejects_invalid_changes_atom
         );
     }
 
-    let mut after = harness.resources().await;
-    assert_eq!(after.revision, before.revision + 3);
+    let after = harness.resources().await;
+    assert_eq!(after.sessions[0].workspaces[0].tabs[0].name, "タブ 雪 v6");
     let mut expected = before.clone();
-    expected.revision += 3;
     expected.sessions[0].name = "セッション 六".into();
     expected.sessions[0].workspaces[0].name = "作業 空間 λ".into();
-    expected.sessions[0].workspaces[0].tabs[0].name = "タブ 雪 v6".into();
     assert_eq!(
-        after, expected,
+        without_observations(after.clone()),
+        without_observations(expected),
         "rename changed identity, order, roots, or process structure"
     );
     assert!(process_alive(child_pid));
@@ -10816,7 +10871,10 @@ async fn public_rename_preserves_a_live_process_and_rejects_invalid_changes_atom
         String::from_utf8_lossy(&no_op.stdout).trim(),
         "renamed=true"
     );
-    assert_eq!(harness.resources().await, after);
+    assert_eq!(
+        without_observations(harness.resources().await),
+        without_observations(after.clone())
+    );
 
     let mut control = harness.connect().await.unwrap();
     assert!(matches!(
@@ -10862,9 +10920,15 @@ async fn public_rename_preserves_a_live_process_and_rejects_invalid_changes_atom
         .await,
         ServerMessage::TargetRenamed { .. }
     ));
-    after.revision += 1;
-    after.sessions[0].workspaces[0].tabs[0].name = "interactive".into();
-    assert_eq!(harness.resources().await, after);
+    let renamed_tab = harness.resources().await;
+    assert_eq!(
+        renamed_tab.sessions[0].workspaces[0].tabs[0].name,
+        "interactive"
+    );
+    assert_eq!(
+        without_observations(renamed_tab),
+        without_observations(after.clone())
+    );
 
     let invalid = [
         vec![
@@ -10914,8 +10978,8 @@ async fn public_rename_preserves_a_live_process_and_rejects_invalid_changes_atom
             "invalid rename unexpectedly succeeded: {arguments:?}"
         );
         assert_eq!(
-            harness.resources().await,
-            after,
+            without_observations(harness.resources().await),
+            without_observations(after.clone()),
             "invalid rename mutated resources: {arguments:?}"
         );
     }
@@ -11419,21 +11483,26 @@ fn workspace_git_tokens(snapshot: &fut::resources::ResourceSnapshot) -> [Option<
     ]
 }
 
-fn without_workspace_git_tokens(
+/// Strip the state the daemon's background observers write on their own clock
+/// — the revision, pane locations, automatic tab names, and published tokens —
+/// so before/after snapshot comparisons only see the caller's mutations.
+fn without_observations(
     mut snapshot: fut::resources::ResourceSnapshot,
 ) -> fut::resources::ResourceSnapshot {
     snapshot.revision = 0;
-    for workspace in snapshot
-        .sessions
-        .iter_mut()
-        .flat_map(|session| &mut session.workspaces)
-    {
-        for name in [
-            "workspace.git_branch",
-            "workspace.git_added",
-            "workspace.git_deleted",
-        ] {
-            workspace.tokens.remove(name);
+    for session in &mut snapshot.sessions {
+        session.tokens.clear();
+        for workspace in &mut session.workspaces {
+            workspace.tokens.clear();
+            for tab in &mut workspace.tabs {
+                tab.name.clear();
+                tab.tokens.clear();
+                for pane in &mut tab.panes {
+                    pane.cwd = None;
+                    pane.worktree = None;
+                    pane.tokens.clear();
+                }
+            }
         }
     }
     snapshot
@@ -11832,7 +11901,7 @@ async fn process_completion_covers_live_resource_operations_and_refresh() {
     let first_pane = workspace.tabs[0].panes[0].id;
     let second_tab = workspace.tabs[1].id;
     let second_tab_pane = workspace.tabs[1].panes[0].id;
-    let completion_revision = expanded.revision;
+
     assert_eq!(
         completion_values(&env.complete(&harness.socket, &["pane", "move", ""])),
         [first_pane.to_string(), second_tab_pane.to_string()]
@@ -11870,7 +11939,10 @@ async fn process_completion_covers_live_resource_operations_and_refresh() {
         ))
         .is_empty()
     );
-    assert_eq!(harness.resources().await.revision, completion_revision);
+    assert_eq!(
+        without_observations(harness.resources().await),
+        without_observations(expanded.clone())
+    );
 
     let split = env.complete(&harness.socket, &["pane", "split", ""]);
     let split_text = String::from_utf8(split.stdout).unwrap();

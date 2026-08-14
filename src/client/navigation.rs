@@ -296,6 +296,8 @@ mod tests {
             terminal_id: TerminalId::new(),
             closing: false,
             activity: Default::default(),
+            cwd: None,
+            worktree: None,
         }
     }
 

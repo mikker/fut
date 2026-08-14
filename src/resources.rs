@@ -32,9 +32,38 @@ pub(crate) const WORKSPACE_GIT_BRANCH_TOKEN: &str = "workspace.git_branch";
 pub(crate) const WORKSPACE_GIT_ADDED_TOKEN: &str = "workspace.git_added";
 pub(crate) const WORKSPACE_GIT_DELETED_TOKEN: &str = "workspace.git_deleted";
 
-/// Tabs may be unnamed; any other name must carry visible characters and stay
-/// unique inside its workspace.
-fn check_tab_name(name: &str) -> Result<(), ResourceError> {
+/// Presented in place of a location when a workspace's panes disagree.
+pub const MULTIPLE_LOCATIONS: &str = "multiple";
+
+/// The single live location every open pane shares: the Git work tree
+/// containing a pane's observed working directory when there is one, the
+/// directory itself otherwise, and the creation `root` until the daemon has
+/// observed anything. `None` when panes disagree.
+pub fn shared_live_location<'a>(root: &'a Path, tabs: &'a [TabSnapshot]) -> Option<&'a Path> {
+    let mut location = None;
+    let panes = tabs
+        .iter()
+        .filter(|tab| !tab.closing)
+        .flat_map(|tab| &tab.panes)
+        .filter(|pane| !pane.closing);
+    for pane in panes {
+        let place = pane
+            .worktree
+            .as_deref()
+            .or(pane.cwd.as_deref())
+            .unwrap_or(root);
+        match location {
+            None => location = Some(place),
+            Some(current) if current == place => {}
+            Some(_) => return None,
+        }
+    }
+    Some(location.unwrap_or(root))
+}
+
+/// Workspaces and tabs may be unnamed (empty), in which case they present an
+/// automatic name; any other name must carry visible characters.
+fn check_optional_name(name: &str) -> Result<(), ResourceError> {
     if name.is_empty() || !name.trim().is_empty() {
         Ok(())
     } else {
@@ -187,6 +216,14 @@ pub struct PaneSnapshot {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tokens: MaterializedTokenMap,
     pub activity: AgentActivity,
+    /// Observed working directory of the pane's foreground process; absent
+    /// until the daemon's process observer has resolved one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+    /// Top level of the Git work tree containing `cwd`, when there is one, so
+    /// panes in different subdirectories of a checkout share a location.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -426,6 +463,8 @@ struct Pane {
     closing: bool,
     tokens: MaterializedTokenMap,
     activity: AgentActivity,
+    cwd: Option<PathBuf>,
+    worktree: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -605,17 +644,6 @@ impl ResourceTree {
     pub fn available_session_name(&self, suggested: &str) -> String {
         disambiguate(suggested, |name| {
             self.sessions.values().any(|item| item.name == name)
-        })
-    }
-
-    pub fn available_workspace_name(&self, session_id: SessionId, suggested: &str) -> String {
-        disambiguate(suggested, |name| {
-            self.sessions.get(&session_id).is_some_and(|session| {
-                session
-                    .workspaces
-                    .iter()
-                    .any(|id| self.workspaces[id].name == name)
-            })
         })
     }
 
@@ -954,6 +982,28 @@ impl ResourceTree {
         Ok(self.revision)
     }
 
+    /// Record the observed working directory of a pane's foreground process so
+    /// clients can present live locations without probing terminals themselves.
+    pub fn update_pane_cwd(
+        &mut self,
+        terminal_id: TerminalId,
+        cwd: PathBuf,
+        worktree: Option<PathBuf>,
+    ) -> Result<u64, ResourceError> {
+        let pane_id = *self
+            .terminals
+            .get(&terminal_id)
+            .ok_or(ResourceError::NotFound("terminal"))?;
+        let pane = self.panes.get_mut(&pane_id).expect("terminal pane exists");
+        if pane.cwd.as_ref() == Some(&cwd) && pane.worktree == worktree {
+            return Ok(self.revision);
+        }
+        pane.cwd = Some(cwd);
+        pane.worktree = worktree;
+        self.revision += 1;
+        Ok(self.revision)
+    }
+
     /// Select which pane supplies an unnamed tab's automatic title.
     pub fn focus_pane(&mut self, pane_id: PaneId) -> Result<u64, ResourceError> {
         let pane = self
@@ -1020,8 +1070,9 @@ impl ResourceTree {
     }
 
     pub fn create_session(&mut self, path: InitialPath) -> Result<Mutation, ResourceError> {
-        self.check_names([&path.session_name, &path.workspace_name])?;
-        check_tab_name(&path.tab_name)?;
+        self.check_names([&path.session_name])?;
+        check_optional_name(&path.workspace_name)?;
+        check_optional_name(&path.tab_name)?;
         if self.sessions.values().any(|s| s.name == path.session_name) {
             return Err(ResourceError::Duplicate("session name"));
         }
@@ -1156,7 +1207,7 @@ impl ResourceTree {
         workspace_id: WorkspaceId,
         new_name: String,
     ) -> Result<Mutation, ResourceError> {
-        self.check_names([&new_name])?;
+        check_optional_name(&new_name)?;
         let workspace = self
             .workspaces
             .get(&workspace_id)
@@ -1171,10 +1222,11 @@ impl ResourceTree {
         if workspace.name == new_name {
             return Ok(self.unchanged());
         }
-        if self.sessions[&session_id]
-            .workspaces
-            .iter()
-            .any(|id| *id != workspace_id && self.workspaces[id].name == new_name)
+        if !new_name.is_empty()
+            && self.sessions[&session_id]
+                .workspaces
+                .iter()
+                .any(|id| *id != workspace_id && self.workspaces[id].name == new_name)
         {
             return Err(ResourceError::Duplicate("workspace name"));
         }
@@ -1201,7 +1253,7 @@ impl ResourceTree {
         tab_id: TabId,
         new_name: String,
     ) -> Result<Mutation, ResourceError> {
-        check_tab_name(&new_name)?;
+        check_optional_name(&new_name)?;
         let tab = self
             .tabs
             .get(&tab_id)
@@ -1248,8 +1300,8 @@ impl ResourceTree {
         session_id: SessionId,
         path: WorkspacePath,
     ) -> Result<Mutation, ResourceError> {
-        self.check_names([&path.workspace_name])?;
-        check_tab_name(&path.tab_name)?;
+        check_optional_name(&path.workspace_name)?;
+        check_optional_name(&path.tab_name)?;
         let session = self
             .sessions
             .get(&session_id)
@@ -1257,10 +1309,11 @@ impl ResourceTree {
         if session.closing {
             return Err(ResourceError::Closing("session"));
         }
-        if session
-            .workspaces
-            .iter()
-            .any(|id| self.workspaces[id].name == path.workspace_name)
+        if !path.workspace_name.is_empty()
+            && session
+                .workspaces
+                .iter()
+                .any(|id| self.workspaces[id].name == path.workspace_name)
         {
             return Err(ResourceError::Duplicate("workspace name"));
         }
@@ -1338,7 +1391,7 @@ impl ResourceTree {
         workspace_id: WorkspaceId,
         path: TabPath,
     ) -> Result<Mutation, ResourceError> {
-        check_tab_name(&path.tab_name)?;
+        check_optional_name(&path.tab_name)?;
         let workspace = self
             .workspaces
             .get(&workspace_id)
@@ -1985,9 +2038,9 @@ impl ResourceTree {
                     return self.invalid("missing workspace");
                 };
                 if workspace.session_id != *sid
-                    || workspace.name.trim().is_empty()
+                    || check_optional_name(&workspace.name).is_err()
                     || workspace.tabs.is_empty()
-                    || !workspace_names.insert(&workspace.name)
+                    || (!workspace.name.is_empty() && !workspace_names.insert(&workspace.name))
                     || roots
                         .insert(&workspace.root, *sid)
                         .is_some_and(|owner| owner != *sid)
@@ -2002,7 +2055,7 @@ impl ResourceTree {
                         return self.invalid("missing tab");
                     };
                     if tab.workspace_id != *wid
-                        || check_tab_name(&tab.name).is_err()
+                        || check_optional_name(&tab.name).is_err()
                         || tab.panes.is_empty()
                         || !tab.layout.validate()
                         || tab.layout.leaf_ids() != tab.panes
@@ -2114,6 +2167,8 @@ impl ResourceTree {
                 closing: false,
                 tokens: BTreeMap::new(),
                 activity: AgentActivity::default(),
+                cwd: None,
+                worktree: None,
             },
         );
         self.terminals.insert(terminal_id, pane_id);
@@ -2156,13 +2211,32 @@ impl ResourceTree {
     }
     fn workspace_snapshot(&self, id: WorkspaceId) -> WorkspaceSnapshot {
         let w = &self.workspaces[&id];
+        let tabs = w
+            .tabs
+            .iter()
+            .map(|id| self.tab_snapshot(*id))
+            .collect::<Vec<_>>();
         WorkspaceSnapshot {
             id,
-            name: w.name.clone(),
+            // Unnamed workspaces present as the place they are: the final
+            // component of the location every open pane shares, or "multiple".
+            name: if w.name.is_empty() {
+                shared_live_location(&w.root, &tabs).map_or_else(
+                    || MULTIPLE_LOCATIONS.into(),
+                    |location| {
+                        location.file_name().map_or_else(
+                            || location.display().to_string(),
+                            |name| name.to_string_lossy().into_owned(),
+                        )
+                    },
+                )
+            } else {
+                w.name.clone()
+            },
             root: w.root.clone(),
             closing: w.closing,
             tokens: w.tokens.clone(),
-            tabs: w.tabs.iter().map(|id| self.tab_snapshot(*id)).collect(),
+            tabs,
         }
     }
     fn tab_snapshot(&self, id: TabId) -> TabSnapshot {
@@ -2188,6 +2262,8 @@ impl ResourceTree {
             closing: p.closing,
             tokens: p.tokens.clone(),
             activity: p.activity.clone(),
+            cwd: p.cwd.clone(),
+            worktree: p.worktree.clone(),
         }
     }
     fn session_for_workspace(&self, workspace_id: WorkspaceId) -> &Session {
@@ -2554,6 +2630,110 @@ mod tests {
             .unwrap()
             .changed
         );
+    }
+
+    #[test]
+    fn observed_pane_cwds_publish_once_per_change() {
+        let mut tree = ResourceTree::default();
+        let path = initial("cwds", "/cwds");
+        let terminal_id = path.terminal_id;
+        tree.create_session(path).unwrap();
+        assert_eq!(
+            tree.snapshot().sessions[0].workspaces[0].tabs[0].panes[0].cwd,
+            None
+        );
+
+        let revision = tree
+            .update_pane_cwd(
+                terminal_id,
+                "/cwds/feature/src".into(),
+                Some("/cwds/feature".into()),
+            )
+            .unwrap();
+        assert!(revision > 0);
+        let pane = tree.snapshot().sessions[0].workspaces[0].tabs[0].panes[0].clone();
+        assert_eq!(pane.cwd, Some(PathBuf::from("/cwds/feature/src")));
+        assert_eq!(pane.worktree, Some(PathBuf::from("/cwds/feature")));
+
+        let unchanged = tree
+            .update_pane_cwd(
+                terminal_id,
+                "/cwds/feature/src".into(),
+                Some("/cwds/feature".into()),
+            )
+            .unwrap();
+        assert_eq!(
+            unchanged, revision,
+            "same location does not bump the revision"
+        );
+
+        assert!(matches!(
+            tree.update_pane_cwd(TerminalId::new(), "/elsewhere".into(), None),
+            Err(ResourceError::NotFound("terminal"))
+        ));
+    }
+
+    #[test]
+    fn unnamed_workspaces_present_their_shared_location_or_multiple() {
+        let mut tree = ResourceTree::default();
+        let mut path = initial("places", "/places");
+        path.workspace_name = String::new();
+        let workspace_id = path.workspace_id;
+        let first_pane = path.pane_id;
+        let first_terminal = path.terminal_id;
+        tree.create_session(path).unwrap();
+        assert_eq!(
+            tree.snapshot().sessions[0].workspaces[0].name,
+            "main",
+            "unobserved unnamed workspaces present their root's basename"
+        );
+
+        tree.update_pane_cwd(
+            first_terminal,
+            "/places/worktrees/feature/src".into(),
+            Some("/places/worktrees/feature".into()),
+        )
+        .unwrap();
+        assert_eq!(tree.snapshot().sessions[0].workspaces[0].name, "feature");
+
+        let second_pane = PaneId::new();
+        let second_terminal = TerminalId::new();
+        tree.split_pane(
+            first_pane,
+            SplitDirection::Right,
+            second_pane,
+            second_terminal,
+        )
+        .unwrap();
+        tree.update_pane_cwd(second_terminal, "/elsewhere".into(), None)
+            .unwrap();
+        assert_eq!(
+            tree.snapshot().sessions[0].workspaces[0].name,
+            MULTIPLE_LOCATIONS
+        );
+
+        tree.rename_workspace(workspace_id, "pinned".into())
+            .unwrap();
+        assert_eq!(tree.snapshot().sessions[0].workspaces[0].name, "pinned");
+        tree.rename_workspace(workspace_id, String::new()).unwrap();
+        assert_eq!(
+            tree.snapshot().sessions[0].workspaces[0].name,
+            MULTIPLE_LOCATIONS,
+            "clearing the name resumes automatic presentation"
+        );
+
+        let sibling = WorkspacePath {
+            workspace_id: WorkspaceId::new(),
+            workspace_name: String::new(),
+            root: "/places/other".into(),
+            tab_id: TabId::new(),
+            tab_name: String::new(),
+            pane_id: PaneId::new(),
+            terminal_id: TerminalId::new(),
+        };
+        let session_id = tree.snapshot().sessions[0].id;
+        tree.add_workspace(session_id, sibling)
+            .expect("a second unnamed workspace is not a duplicate");
     }
 
     #[test]
@@ -3683,26 +3863,10 @@ mod tests {
     fn implicit_display_names_are_deterministically_disambiguated() {
         let mut tree = ResourceTree::default();
         let first = initial("project", "/first");
-        let session_id = first.session_id;
         tree.create_session(first).unwrap();
         let second = initial("project-2", "/second");
         tree.create_session(second).unwrap();
         assert_eq!(tree.available_session_name("project"), "project-3");
-
-        tree.add_workspace(
-            session_id,
-            WorkspacePath {
-                workspace_id: WorkspaceId::new(),
-                workspace_name: "main-2".into(),
-                root: "/first/peer".into(),
-                tab_id: TabId::new(),
-                tab_name: "shell".into(),
-                pane_id: PaneId::new(),
-                terminal_id: TerminalId::new(),
-            },
-        )
-        .unwrap();
-        assert_eq!(tree.available_workspace_name(session_id, "main"), "main-3");
     }
 
     #[test]

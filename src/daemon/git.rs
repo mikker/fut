@@ -155,17 +155,44 @@ async fn start_due_refreshes(
     refreshes: &mut RefreshState,
     tasks: &mut JoinSet<(Claim, Option<GitStatus>)>,
 ) {
-    let roots = {
+    // Status is resolved at each workspace's live location — the work tree
+    // (or directory) every open pane is inside — so branch and diff counts
+    // follow a `cd` instead of the creation-time root. Workspaces whose panes
+    // disagree have no single location; they read "multiple" until the panes
+    // converge again, and dropping them from the map prunes their entry so
+    // convergence refreshes immediately.
+    let (roots, divided) = {
         let snapshot = shared.lock().await.resources.snapshot();
-        snapshot
+        let mut roots = BTreeMap::new();
+        let mut divided = Vec::new();
+        for workspace in snapshot
             .sessions
             .iter()
             .filter(|session| !session.closing)
             .flat_map(|session| &session.workspaces)
             .filter(|workspace| !workspace.closing)
-            .map(|workspace| (workspace.id, workspace.root.clone()))
-            .collect::<BTreeMap<_, _>>()
+        {
+            match crate::resources::shared_live_location(&workspace.root, &workspace.tabs) {
+                Some(location) => {
+                    roots.insert(workspace.id, location.to_path_buf());
+                }
+                None => divided.push(workspace.id),
+            }
+        }
+        (roots, divided)
     };
+    for workspace_id in divided {
+        let mut state = shared.lock().await;
+        if let Ok(publication) = state.resources.publish_workspace_git_tokens(
+            workspace_id,
+            Some(crate::resources::MULTIPLE_LOCATIONS.into()),
+            None,
+            None,
+        ) && publication.changed
+        {
+            state.publish_resource_change(publication.revision);
+        }
+    }
     for claim in refreshes.reconcile(&roots) {
         tasks.spawn(async move {
             let status = status(&claim.root).await;
@@ -183,7 +210,16 @@ async fn publish(shared: &Shared, claim: Claim, status: Option<GitStatus>) {
         )
     });
     let mut state = shared.lock().await;
-    if state.resources.workspace_root(claim.workspace_id) != Ok(claim.root.as_path()) {
+    let snapshot = state.resources.snapshot();
+    let current = snapshot
+        .sessions
+        .iter()
+        .flat_map(|session| &session.workspaces)
+        .find(|workspace| workspace.id == claim.workspace_id)
+        .and_then(|workspace| {
+            crate::resources::shared_live_location(&workspace.root, &workspace.tabs)
+        });
+    if current != Some(claim.root.as_path()) {
         return;
     }
     if let Ok(publication) =

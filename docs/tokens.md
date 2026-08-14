@@ -25,7 +25,7 @@ These may appear in groups under `ui.tab_bar.left`, `center`, or `right`.
 | --- | --- |
 | `fut` | `fut ` when the tab bar is passive; empty while it is keyboard-active |
 | `session.name` | Current session name |
-| `workspace.name` | Current workspace name |
+| `workspace.name` | Current workspace name; unnamed workspaces present their live location |
 | `workspace.icon` | Workspace icon from the selected preset |
 | `tab.name` | Current tab name |
 | `tab.index` | One-based current tab index |
@@ -62,15 +62,15 @@ These may appear in `ui.workspace_sidebar.row.left`, `body`, `right`, or `detail
 | --- | --- |
 | `workspace.marker` | A bullet (`•`) for the active workspace, otherwise one blank cell |
 | `workspace.index` | One-based workspace index |
-| `workspace.name` | Workspace name |
+| `workspace.name` | Workspace name; unnamed workspaces present their live location, or `multiple` when panes disagree |
 | `workspace.id` | Full stable workspace UUID |
-| `workspace.root` | Complete, stable workspace root path |
-| `workspace.root_name` | Final component of the workspace root |
+| `workspace.root` | Live workspace location: the Git work tree (or directory) every open pane is inside, observed from pane working directories with the creation-time root as fallback; `multiple` when panes disagree |
+| `workspace.root_name` | Final component of the live workspace location; `multiple` when panes disagree |
 | `workspace.closing` | Closing icon while closing; otherwise empty |
 | `workspace.tab_count` | Number of tabs in the workspace |
 | `workspace.icon` | Workspace icon from the selected preset |
 | `workspace.activity` | A spinner for working, `!` for blocked, or `•` for unseen completion; empty when inactive |
-| `workspace.git_branch` | Current branch of the workspace root; empty outside a Git work tree or until resolved |
+| `workspace.git_branch` | Current branch at the live workspace location; `multiple` when panes disagree, empty outside a Git work tree or until resolved |
 | `workspace.git_added` | `+N` inserted lines against `HEAD`, styled `added`; empty when none |
 | `workspace.git_deleted` | `-N` deleted lines against `HEAD`, styled `deleted`; empty when none |
 
@@ -86,7 +86,7 @@ These may appear in `ui.workspace_sidebar.header` and `footer`:
 | --- | --- |
 | `fut` | `fut` |
 | `session.name` | Current session name |
-| `workspace.name` | Current workspace name |
+| `workspace.name` | Current workspace name; unnamed workspaces present their live location |
 | `workspace.icon` | Workspace icon from the selected preset |
 | `sidebar.display` | Current display label: `expanded` or `minimized` |
 | `sidebar.visibility` | Current compact visibility label: `visible`, `hide with one`, or `hidden` |

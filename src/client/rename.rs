@@ -61,7 +61,10 @@ impl RenameState {
                 RenameAction::Close
             }
             KeyCode::Enter => {
-                if self.name.trim().is_empty() {
+                let cleared = self.name.trim().is_empty();
+                // Sessions require a name; tabs and workspaces submit an empty
+                // name to return to automatic naming.
+                if cleared && matches!(self.selector, RenameSelector::Session(_)) {
                     self.error = Some("name cannot be empty".into());
                     return RenameAction::Stay;
                 }
@@ -72,8 +75,25 @@ impl RenameState {
                 RenameAction::Submit {
                     request_id,
                     selector: self.selector.clone(),
-                    name: self.name.clone(),
+                    name: if cleared {
+                        String::new()
+                    } else {
+                        self.name.clone()
+                    },
                 }
+            }
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::SUPER) => {
+                self.name.clear();
+                self.error = None;
+                RenameAction::Stay
+            }
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.remove_last_word();
+                RenameAction::Stay
+            }
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.remove_last_word();
+                RenameAction::Stay
             }
             KeyCode::Backspace | KeyCode::Delete => {
                 self.remove_last_grapheme();
@@ -173,10 +193,14 @@ impl RenameState {
         if area.height >= 3 {
             let status = if self.request_id.is_some() {
                 " renaming…"
+            } else if let Some(error) = self.error.as_deref() {
+                error
+            } else if self.name.trim().is_empty()
+                && !matches!(self.selector, RenameSelector::Session(_))
+            {
+                " enter clear name · esc cancel"
             } else {
-                self.error
-                    .as_deref()
-                    .unwrap_or(" enter rename · esc cancel")
+                " enter rename · esc cancel"
             };
             buffer.set_stringn(
                 area.x,
@@ -200,6 +224,20 @@ impl RenameState {
             self.name.truncate(index);
             self.error = None;
         }
+    }
+
+    /// Delete the last word and any whitespace after it, as Option-Backspace
+    /// (ESC DEL) and Ctrl-W do in a shell.
+    fn remove_last_word(&mut self) {
+        let end = self.name.trim_end().len();
+        let start = self.name[..end]
+            .char_indices()
+            .rev()
+            .take_while(|(_, character)| !character.is_whitespace())
+            .last()
+            .map_or(end, |(index, _)| index);
+        self.name.truncate(start);
+        self.error = None;
     }
 }
 
@@ -338,6 +376,51 @@ mod tests {
         snapshot.revision = 2;
         snapshot.sessions[0].workspaces[0].name = "feature".into();
         assert!(rename.accept_resources(&snapshot));
+    }
+
+    #[test]
+    fn empty_submissions_clear_tabs_and_workspaces_but_not_sessions() {
+        let mut workspace = RenameState::open(
+            RenameSelector::Workspace(WorkspaceId::new()),
+            "workspace",
+            "  ".into(),
+        );
+        let RenameAction::Submit { name, .. } =
+            workspace.key(key(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("blank workspace rename did not submit")
+        };
+        assert_eq!(name, "", "whitespace normalizes to a cleared name");
+
+        let mut session = RenameState::open(
+            RenameSelector::Session(crate::resources::SessionSelector::Id(SessionId::new())),
+            "session",
+            String::new(),
+        );
+        assert_eq!(
+            session.key(key(KeyCode::Enter, KeyModifiers::NONE)),
+            RenameAction::Stay,
+            "sessions still require a name"
+        );
+    }
+
+    #[test]
+    fn word_and_line_deletion_edit_like_a_shell() {
+        let mut rename = RenameState::open(
+            RenameSelector::Tab(crate::domain::TabId::new()),
+            "tab",
+            "several words  here   ".into(),
+        );
+        rename.key(key(KeyCode::Backspace, KeyModifiers::ALT));
+        assert_eq!(rename.name, "several words  ");
+        rename.key(key(KeyCode::Backspace, KeyModifiers::ALT));
+        assert_eq!(rename.name, "several ");
+        rename.key(key(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(rename.name, "");
+
+        rename.paste("whole line");
+        rename.key(key(KeyCode::Backspace, KeyModifiers::SUPER));
+        assert_eq!(rename.name, "");
     }
 
     #[test]

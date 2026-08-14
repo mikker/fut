@@ -7,6 +7,8 @@
 - Explicit OSC 8 hyperlinks from terminal applications now remain clickable through Fut.
 - Added explicit local extensions with bounded manifest loading, asynchronous workspace lifecycle hooks, and namespaced dynamic presentation tokens published through `fut token publish`.
 - Workspace Git branch and diff metadata now comes from one daemon-owned snapshot, keeping attached clients consistent.
+- Workspaces are now unnamed by default and present as where they actually are, like tabs: the Git work tree (or directory) every open pane is inside, updated live as you `cd`, or `multiple` when panes disagree. Git branch and diff counts follow the same live location instead of the creation-time directory.
+- The rename dialog can clear tab and workspace names back to automatic naming by submitting an empty name, and supports Option-Backspace/Ctrl-W word deletion and Cmd-Backspace/Ctrl-U line clearing.
 - Workspace lists now show the session name in a bold, padded header, abbreviated in the minimized rail.
 - Navigator resource shortcuts now filter sessions, scoped workspaces, tabs, or panes instead of cycling through them, and each resource level has a distinct configurable color.
 - Fixed independent daemons with different socket names in the same runtime directory blocking each other.

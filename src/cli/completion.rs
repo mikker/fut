@@ -455,6 +455,8 @@ mod tests {
             terminal_id: TerminalId::new(),
             closing,
             activity: Default::default(),
+            cwd: None,
+            worktree: None,
         };
         let first_pane = pane(false);
         let second_pane = pane(true);
@@ -901,6 +903,8 @@ mod tests {
             terminal_id: TerminalId::new(),
             closing: false,
             activity: Default::default(),
+            cwd: None,
+            worktree: None,
         };
         snapshot.sessions[0].workspaces[0].tabs[0]
             .panes

@@ -3185,6 +3185,8 @@ mod tests {
             terminal_id: TerminalId::new(),
             closing: false,
             activity: Default::default(),
+            cwd: None,
+            worktree: None,
         };
         let tab = TabSnapshot {
             tokens: Default::default(),

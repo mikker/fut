@@ -391,6 +391,8 @@ mod tests {
                     turn_id: None,
                 }),
             },
+            cwd: None,
+            worktree: None,
         }
     }
 
@@ -421,6 +423,8 @@ mod tests {
                     turn_id: None,
                 }),
             },
+            cwd: None,
+            worktree: None,
         };
         let mut notifications = NotificationState::default();
         assert!(notifications.is_unseen(&pane));
@@ -449,6 +453,8 @@ mod tests {
                     turn_id: None,
                 }),
             },
+            cwd: None,
+            worktree: None,
         };
         let mut notifications = NotificationState::default();
 

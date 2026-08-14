@@ -1447,6 +1447,7 @@ fn watch_process_names(shared: Shared, mut shutdown: watch::Receiver<bool>) -> J
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(500));
         let mut codex = HashMap::<TerminalId, CodexStabilizer>::new();
+        let mut worktrees = HashMap::<PathBuf, Option<PathBuf>>::new();
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
@@ -1455,7 +1456,7 @@ fn watch_process_names(shared: Shared, mut shutdown: watch::Receiver<bool>) -> J
                         return;
                     }
                 }
-                _ = interval.tick() => refresh_process_names(&shared, &mut codex).await,
+                _ = interval.tick() => refresh_process_names(&shared, &mut codex, &mut worktrees).await,
             }
         }
     })
@@ -1466,10 +1467,15 @@ struct ProcessObservation {
     pid: u32,
     name: String,
     command: String,
+    cwd: Option<PathBuf>,
     codex_screen: Option<String>,
 }
 
-async fn refresh_process_names(shared: &Shared, codex: &mut HashMap<TerminalId, CodexStabilizer>) {
+async fn refresh_process_names(
+    shared: &Shared,
+    codex: &mut HashMap<TerminalId, CodexStabilizer>,
+    worktrees: &mut HashMap<PathBuf, Option<PathBuf>>,
+) {
     let (terminals, automatic_names) = {
         let state = shared.lock().await;
         (
@@ -1491,6 +1497,7 @@ async fn refresh_process_names(shared: &Shared, codex: &mut HashMap<TerminalId, 
                 let pid = terminal.foreground_process_id().await.ok()?;
                 let name = process_name(pid).await?;
                 let command = process_command(pid).await.unwrap_or_default();
+                let cwd = process_cwd(pid).await;
                 let codex_screen = if is_codex_process(&name, &command) {
                     terminal
                         .read_output(TerminalOutputSource::Visible, 1, false)
@@ -1505,6 +1512,7 @@ async fn refresh_process_names(shared: &Shared, codex: &mut HashMap<TerminalId, 
                     pid,
                     name,
                     command,
+                    cwd,
                     codex_screen,
                 })
             })
@@ -1516,6 +1524,21 @@ async fn refresh_process_names(shared: &Shared, codex: &mut HashMap<TerminalId, 
         .filter_map(std::future::ready)
         .collect::<Vec<_>>()
         .await;
+
+    // Resolve each observed directory's Git work tree once and keep only the
+    // directories still in use, so long-lived daemons don't accumulate entries.
+    let mut live_cwds = HashSet::new();
+    for observation in &observations {
+        let Some(cwd) = observation.cwd.clone() else {
+            continue;
+        };
+        if !worktrees.contains_key(&cwd) {
+            let worktree = worktree_toplevel(&cwd).await;
+            worktrees.insert(cwd.clone(), worktree);
+        }
+        live_cwds.insert(cwd);
+    }
+    worktrees.retain(|cwd, _| live_cwds.contains(cwd));
 
     let mut state = shared.lock().await;
     let now_ms = SystemTime::now()
@@ -1535,8 +1558,15 @@ async fn refresh_process_names(shared: &Shared, codex: &mut HashMap<TerminalId, 
             pid,
             name,
             command,
+            cwd,
             codex_screen,
         } = observation;
+        if let Some(cwd) = cwd {
+            let worktree = worktrees.get(&cwd).cloned().flatten();
+            if let Ok(revision) = state.resources.update_pane_cwd(terminal_id, cwd, worktree) {
+                state.publish_resource_change(revision);
+            }
+        }
         if automatic_names.contains(&terminal_id)
             && let Ok(revision) = state
                 .resources
@@ -1657,7 +1687,7 @@ fn initial_path(resolved: &ResolvedLocation, name: String, terminal_id: Terminal
         session_name: name,
         project: resolved.project.clone(),
         workspace_id: WorkspaceId::new(),
-        workspace_name: resolved.suggested_workspace_name.clone(),
+        workspace_name: String::new(),
         root: resolved.workspace_root.clone(),
         tab_id: TabId::new(),
         tab_name: String::new(),
@@ -4015,13 +4045,12 @@ async fn open_location(
                 .resources
                 .available_session_name(&resolved.suggested_session_name)
         });
+        // `name` names the workspace only when it joins an existing session;
+        // on a fresh session it names the session and the workspace starts
+        // unnamed, presenting as its live location.
         let workspace_name = match destination {
-            CheckoutDestination::AddWorkspace { session_id } => name.clone().unwrap_or_else(|| {
-                state
-                    .resources
-                    .available_workspace_name(session_id, &resolved.suggested_workspace_name)
-            }),
-            _ => resolved.suggested_workspace_name.clone(),
+            CheckoutDestination::AddWorkspace { .. } => name.clone().unwrap_or_default(),
+            _ => String::new(),
         };
         let proposed_session = initial_path(&resolved, session_name, TerminalId::new());
         let proposed_workspace = WorkspacePath {
@@ -4241,16 +4270,7 @@ async fn create_workspace(
                 "workspace creation source exited during CWD lookup",
             ));
         }
-        let workspace_name = name.unwrap_or_else(|| {
-            let suggested = root
-                .file_name()
-                .and_then(|name| name.to_str())
-                .filter(|name| !name.trim().is_empty())
-                .unwrap_or("workspace");
-            state
-                .resources
-                .available_workspace_name(session_id, suggested)
-        });
+        let workspace_name = name.unwrap_or_default();
         let proposed = WorkspacePath {
             workspace_id: WorkspaceId::new(),
             workspace_name,
@@ -4660,26 +4680,54 @@ async fn resolve_creation_cwd(
     resolve_spawn_cwd(root, None).await
 }
 
+/// Top level of the Git work tree containing `cwd`, or nothing outside one.
+/// Bounded like every other observer probe so a hung git cannot stall naming.
+async fn worktree_toplevel(cwd: &Path) -> Option<PathBuf> {
+    let output = timeout(
+        Duration::from_millis(500),
+        tokio::process::Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::null())
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let toplevel = String::from_utf8(output.stdout).ok()?;
+    let toplevel = toplevel.trim();
+    (!toplevel.is_empty()).then(|| PathBuf::from(toplevel))
+}
+
 async fn process_cwd(pid: u32) -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        let output = timeout(
-            Duration::from_millis(500),
-            tokio::process::Command::new("/usr/sbin/lsof")
-                .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
-                .output(),
-        )
-        .await
-        .ok()?
-        .ok()?;
-        if !output.status.success() {
+        let mut info = std::mem::MaybeUninit::<libc::proc_vnodepathinfo>::uninit();
+        let size = i32::try_from(std::mem::size_of::<libc::proc_vnodepathinfo>())
+            .expect("proc_vnodepathinfo size fits i32");
+        // SAFETY: proc_pidinfo writes at most `size` bytes into this valid buffer
+        // and reports how many bytes it filled.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                i32::try_from(pid).ok()?,
+                libc::PROC_PIDVNODEPATHINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if written < size {
             return None;
         }
-        String::from_utf8(output.stdout)
-            .ok()?
-            .lines()
-            .find_map(|line| line.strip_prefix('n'))
-            .map(PathBuf::from)
+        // SAFETY: the kernel filled the whole struct, including a
+        // NUL-terminated current-directory path.
+        let info = unsafe { info.assume_init() };
+        let path = unsafe { std::ffi::CStr::from_ptr(info.pvi_cdir.vip_path.as_ptr().cast()) };
+        let path = path.to_str().ok()?;
+        (!path.is_empty()).then(|| PathBuf::from(path))
     }
     #[cfg(target_os = "linux")]
     {
@@ -5571,6 +5619,15 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn process_cwd_resolves_a_live_process_and_rejects_a_dead_pid() {
+        assert_eq!(
+            process_cwd(std::process::id()).await,
+            Some(std::env::current_dir().unwrap())
+        );
+        assert_eq!(process_cwd(u32::MAX).await, None);
+    }
+
     #[test]
     fn scoped_selection_rejects_a_pane_that_moved_before_acquisition() {
         let path = crate::resources::ResolvedTerminalPath {
@@ -6054,7 +6111,6 @@ mod tests {
             },
             workspace_root: "/".into(),
             suggested_session_name: "test".into(),
-            suggested_workspace_name: "root".into(),
             workspace_kind: crate::project::WorkspaceKind::Directory,
         };
         let path = initial_path(&resolved, "test".into(), TerminalId::new());
@@ -6378,7 +6434,6 @@ mod tests {
             },
             workspace_root: "/".into(),
             suggested_session_name: "test".into(),
-            suggested_workspace_name: "root".into(),
             workspace_kind: crate::project::WorkspaceKind::Directory,
         };
         let path = initial_path(&resolved, "test".into(), focused.id());

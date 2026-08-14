@@ -959,6 +959,8 @@ mod tests {
                                     terminal_id: current_terminal,
                                     closing: false,
                                     activity: Default::default(),
+                                    cwd: None,
+                                    worktree: None,
                                 },
                                 PaneSnapshot {
                                     tokens: Default::default(),
@@ -966,6 +968,8 @@ mod tests {
                                     terminal_id: TerminalId::new(),
                                     closing: true,
                                     activity: Default::default(),
+                                    cwd: None,
+                                    worktree: None,
                                 },
                             ],
                         }],
