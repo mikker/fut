@@ -91,6 +91,7 @@ where
 #[derive(Subcommand)]
 enum Command {
     /// Attach to an existing daemon with the global navigator open.
+    #[command(alias = "a")]
     Attach,
     /// Open a location through an existing daemon without attaching.
     Open {
@@ -155,6 +156,7 @@ enum Command {
         id: Uuid,
     },
     /// List resources from the existing daemon.
+    #[command(alias = "ls")]
     List,
     /// Stream resource changes from the existing daemon as JSON lines.
     ///
@@ -2955,8 +2957,10 @@ mod tests {
         let terminal = TerminalId::new().to_string();
         for args in [
             vec!["fut", "attach"],
+            vec!["fut", "a"],
             vec!["fut", "open"],
             vec!["fut", "list"],
+            vec!["fut", "ls"],
             vec!["fut", "events"],
             vec!["fut", "session", "attach", "a name"],
             vec!["fut", "session", "rename", &session, "new"],

@@ -23,6 +23,7 @@ const VERTICAL_MARGIN: u16 = 1;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum Toast {
     Info(String),
+    Prompt(String),
     Error(String),
 }
 
@@ -33,6 +34,10 @@ impl Toast {
 
     pub(super) fn error(message: impl Into<String>) -> Self {
         Self::Error(message.into())
+    }
+
+    pub(super) fn prompt(message: impl Into<String>) -> Self {
+        Self::Prompt(message.into())
     }
 }
 
@@ -93,6 +98,7 @@ impl ToastState {
         };
         let (message, role) = match &active.toast {
             Toast::Info(message) => (message.as_str(), SemanticStyle::Normal),
+            Toast::Prompt(message) => (message.as_str(), SemanticStyle::Normal),
             Toast::Error(message) => (message.as_str(), SemanticStyle::Error),
         };
         let message = sanitize(message);

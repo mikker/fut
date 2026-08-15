@@ -81,6 +81,7 @@ pub(super) enum ClientAction {
     FocusLast(NavigationScope),
     FocusTab(TabNumber),
     TogglePaneZoom,
+    ClosePane,
     Detach,
 }
 
@@ -97,7 +98,7 @@ pub(super) struct DirectBinding {
     pub action: ClientAction,
 }
 
-pub(super) const ALL_ACTIONS: [ClientAction; 38] = [
+pub(super) const ALL_ACTIONS: [ClientAction; 39] = [
     ClientAction::OpenCommandBar,
     ClientAction::ReloadConfig,
     ClientAction::EnterCopyMode,
@@ -135,10 +136,11 @@ pub(super) const ALL_ACTIONS: [ClientAction; 38] = [
     ClientAction::FocusTab(TabNumber::Nine),
     ClientAction::FocusTab(TabNumber::Ten),
     ClientAction::TogglePaneZoom,
+    ClientAction::ClosePane,
     ClientAction::Detach,
 ];
 
-pub(super) const COMMANDS: [ActionDefinition; 37] = [
+pub(super) const COMMANDS: [ActionDefinition; 38] = [
     ActionDefinition {
         action: ClientAction::ReloadConfig,
         title: "Reload configuration",
@@ -315,6 +317,11 @@ pub(super) const COMMANDS: [ActionDefinition; 37] = [
         keywords: "pane zoom maximize restore fullscreen",
     },
     ActionDefinition {
+        action: ClientAction::ClosePane,
+        title: "Close pane",
+        keywords: "close kill terminate pane terminal",
+    },
+    ActionDefinition {
         action: ClientAction::EnterCopyMode,
         title: "Enter copy mode",
         keywords: "copy select scrollback search clipboard",
@@ -329,7 +336,7 @@ pub(super) const COMMANDS: [ActionDefinition; 37] = [
 const UP: &[u8] = b"\x1b[A";
 const DOWN: &[u8] = b"\x1b[B";
 
-pub(super) const DIRECT_BINDINGS: [DirectBinding; 38] = [
+pub(super) const DIRECT_BINDINGS: [DirectBinding; 39] = [
     DirectBinding {
         suffix: b" ",
         action: ClientAction::OpenCommandBar,
@@ -479,6 +486,10 @@ pub(super) const DIRECT_BINDINGS: [DirectBinding; 38] = [
         action: ClientAction::TogglePaneZoom,
     },
     DirectBinding {
+        suffix: b"x",
+        action: ClientAction::ClosePane,
+    },
+    DirectBinding {
         suffix: b"d",
         action: ClientAction::Detach,
     },
@@ -533,6 +544,7 @@ pub(super) fn config_key(action: ClientAction) -> &'static str {
         ClientAction::FocusTab(TabNumber::Nine) => "focus_tab_9",
         ClientAction::FocusTab(TabNumber::Ten) => "focus_tab_10",
         ClientAction::TogglePaneZoom => "toggle_pane_zoom",
+        ClientAction::ClosePane => "close_pane",
         ClientAction::Detach => "detach",
     }
 }
@@ -619,6 +631,7 @@ const fn requires_launcher(action: ClientAction) -> bool {
         | ClientAction::FocusTab(TabNumber::Nine)
         | ClientAction::FocusTab(TabNumber::Ten)
         | ClientAction::TogglePaneZoom
+        | ClientAction::ClosePane
         | ClientAction::Detach => true,
     }
 }

@@ -44,7 +44,7 @@ use crossterm::{
     cursor::{Hide, SetCursorStyle, Show},
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, EventStream, KeyModifiers, MouseButton as HostMouseButton,
+        Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseButton as HostMouseButton,
         MouseEvent as HostMouseEvent, MouseEventKind as HostMouseEventKind,
     },
     execute,
@@ -409,6 +409,7 @@ async fn run(
     let mut create_workspace = CreateState::default();
     let mut create_tab = CreateState::default();
     let mut split_pane = CreateState::default();
+    let mut close_pane = ClosePaneState::default();
     let mut focus = FocusState::default();
     let mut toasts = ToastState::default();
     let mut pending_focused_exit: Option<Option<i32>> = None;
@@ -799,9 +800,14 @@ async fn run(
                             force_draw = true;
                         }
                     }
-                    ServerMessage::Pong { .. }
-                    | ServerMessage::CommandCompleted { .. }
-                    | ServerMessage::LocationOpened { .. } => {}
+                    ServerMessage::CommandCompleted { command } => {
+                        if command == crate::protocol::AcknowledgedCommand::CloseTarget
+                            && close_pane.complete(request_id)
+                        {
+                            force_draw = true;
+                        }
+                    }
+                    ServerMessage::Pong { .. } | ServerMessage::LocationOpened { .. } => {}
                     ServerMessage::TerminalExited { terminal_id, exit_code } => {
                         if copy_mode
                             .as_ref()
@@ -869,6 +875,11 @@ async fn run(
                             force_draw = true;
                             continue;
                         }
+                        if close_pane.fail(request_id) {
+                            toasts.error(format!("close pane failed · {message}"));
+                            force_draw = true;
+                            continue;
+                        }
                         let handled = match surface.as_mut() {
                             Some(ClientSurface::Navigator(nav)) => {
                                 nav.switch_error(request_id, message.clone())
@@ -921,7 +932,7 @@ async fn run(
                     }
                 }
             }
-            event = events.next(), if accepts_client_input(&focus, &create_workspace, &create_tab, &split_pane, &pending_focused_exit) => {
+            event = events.next(), if accepts_client_input(&focus, &create_workspace, &create_tab, &split_pane, &close_pane, &pending_focused_exit) => {
                 let Some(event) = event else {
                     release_captured_mouse_input(
                         framed,
@@ -935,6 +946,23 @@ async fn run(
                     mouse_input.cancel_local_drags();
                 }
                 match event {
+                    Event::Key(key) if close_pane.is_confirming() && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                        toasts.clear();
+                        if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                            if let Some(request_id) = close_pane.confirm() {
+                                send_request(
+                                    framed,
+                                    Some(request_id),
+                                    ClientMessage::CloseTarget {
+                                        selector: TargetSelector::Pane(view.focused().pane_id),
+                                    },
+                                ).await?;
+                            }
+                        } else {
+                            close_pane.cancel();
+                        }
+                        force_draw = true;
+                    }
                     Event::Key(key) if temporary_command.is_some() => {
                         if let Some(bytes) = encode_key(key) {
                             temporary_command.as_ref().expect("command exists").input(bytes).await?;
@@ -1327,6 +1355,7 @@ async fn run(
                                     &mut create_workspace,
                                     &mut create_tab,
                                     &mut split_pane,
+                                    &mut close_pane,
                                     &mut focus,
                                     &mut copy_mode,
                                     &mut prefix,
@@ -1710,6 +1739,7 @@ async fn run(
                                     &mut create_workspace,
                                     &mut create_tab,
                                     &mut split_pane,
+                                    &mut close_pane,
                                     &mut focus,
                                     &mut copy_mode,
                                     &mut prefix,
@@ -2049,12 +2079,14 @@ fn accepts_client_input(
     create_workspace: &CreateState,
     create_tab: &CreateState,
     split_pane: &CreateState,
+    close_pane: &ClosePaneState,
     pending_focused_exit: &Option<Option<i32>>,
 ) -> bool {
     focus.request_id.is_none()
         && !create_workspace.blocks_input()
         && !create_tab.blocks_input()
         && !split_pane.blocks_input()
+        && !close_pane.blocks_input()
         && pending_focused_exit.is_none()
 }
 
@@ -2619,6 +2651,7 @@ async fn dispatch_client_action(
     create_workspace: &mut CreateState,
     create_tab: &mut CreateState,
     split_pane: &mut CreateState,
+    close_pane: &mut ClosePaneState,
     focus: &mut FocusState,
     copy_mode: &mut Option<CopyModeState>,
     prefix: &mut PrefixState,
@@ -2956,6 +2989,11 @@ async fn dispatch_client_action(
             };
             resize_view(framed, host, view, resources, ui).await?;
         }
+        ClientAction::ClosePane => {
+            if close_pane.begin() {
+                return Ok(Some(Toast::prompt("Kill pane? (y/n)")));
+            }
+        }
         ClientAction::Detach => send(framed, ClientMessage::Detach).await?,
     }
     Ok(None)
@@ -3185,6 +3223,66 @@ impl CreateState {
 
     fn blocks_input(&self) -> bool {
         !matches!(self, Self::Idle)
+    }
+}
+
+#[derive(Default)]
+enum ClosePaneState {
+    #[default]
+    Idle,
+    Confirming,
+    Closing(Uuid),
+}
+
+impl ClosePaneState {
+    fn begin(&mut self) -> bool {
+        if !matches!(self, Self::Idle) {
+            return false;
+        }
+        *self = Self::Confirming;
+        true
+    }
+
+    fn is_confirming(&self) -> bool {
+        matches!(self, Self::Confirming)
+    }
+
+    fn confirm(&mut self) -> Option<Uuid> {
+        if !self.is_confirming() {
+            return None;
+        }
+        let request_id = Uuid::new_v4();
+        *self = Self::Closing(request_id);
+        Some(request_id)
+    }
+
+    fn cancel(&mut self) {
+        if self.is_confirming() {
+            *self = Self::Idle;
+        }
+    }
+
+    fn complete(&mut self, request_id: Option<Uuid>) -> bool {
+        self.finish(request_id)
+    }
+
+    fn fail(&mut self, request_id: Option<Uuid>) -> bool {
+        self.finish(request_id)
+    }
+
+    fn finish(&mut self, request_id: Option<Uuid>) -> bool {
+        let Self::Closing(expected) = self else {
+            return false;
+        };
+        if request_id != Some(*expected) {
+            return false;
+        }
+        *self = Self::Idle;
+        true
+    }
+
+    fn blocks_input(&self) -> bool {
+        matches!(self, Self::Closing(_))
     }
 }
 
@@ -4439,13 +4537,14 @@ mod tests {
         let workspace = CreateState::default();
         let mut state = CreateState::default();
         let split = CreateState::default();
+        let close = ClosePaneState::default();
         let focus = FocusState::default();
         let no_exit = None;
         let request = state.begin().expect("first request starts");
         assert!(state.begin().is_none());
         assert!(state.blocks_input());
         assert!(!accepts_client_input(
-            &focus, &workspace, &state, &split, &no_exit
+            &focus, &workspace, &state, &split, &close, &no_exit
         ));
         let target = targets(1).remove(0);
         assert!(!state.created(None, target.terminal_id));
@@ -4453,7 +4552,7 @@ mod tests {
         assert!(state.created(Some(request), target.terminal_id));
         assert!(state.blocks_input());
         assert!(!accepts_client_input(
-            &focus, &workspace, &state, &split, &no_exit
+            &focus, &workspace, &state, &split, &close, &no_exit
         ));
         let selected = selected_view(2, target.clone(), vec![target]);
         assert!(!state.selected(Some(Uuid::new_v4()), &selected, Some(1)));
@@ -4464,7 +4563,7 @@ mod tests {
         assert!(state.accept_resources(2));
         assert!(!state.blocks_input());
         assert!(accepts_client_input(
-            &focus, &workspace, &state, &split, &no_exit
+            &focus, &workspace, &state, &split, &close, &no_exit
         ));
         assert!(state.begin().is_some());
 
@@ -4474,8 +4573,25 @@ mod tests {
         assert!(failed.fail(Some(request)));
         assert!(!failed.blocks_input());
         assert!(accepts_client_input(
-            &focus, &workspace, &failed, &split, &no_exit
+            &focus, &workspace, &failed, &split, &close, &no_exit
         ));
+    }
+
+    #[test]
+    fn close_pane_state_waits_for_confirmation_and_correlated_completion() {
+        let mut state = ClosePaneState::default();
+        assert!(state.begin());
+        assert!(state.is_confirming());
+        assert!(!state.blocks_input());
+        state.cancel();
+        assert!(!state.is_confirming());
+
+        assert!(state.begin());
+        let request = state.confirm().unwrap();
+        assert!(state.blocks_input());
+        assert!(!state.complete(Some(Uuid::new_v4())));
+        assert!(state.complete(Some(request)));
+        assert!(!state.blocks_input());
     }
 
     #[test]

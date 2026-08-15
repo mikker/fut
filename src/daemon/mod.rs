@@ -2741,7 +2741,33 @@ async fn handle_connection(
                             Err(error) => send_error(&mut connection, envelope.request_id, error.code, &error.message).await?,
                         }
                     }
-                    ClientMessage::OpenLocation { .. } | ClientMessage::MovePane { .. } | ClientMessage::Contextual { .. } | ClientMessage::CloseTarget { .. } | ClientMessage::PublishToken { .. } | ClientMessage::ReportAgent { .. } | ClientMessage::TerminalInput { .. } | ClientMessage::ReadTerminalOutput { .. } | ClientMessage::WaitTerminalOutput { .. } | ClientMessage::PromptAgent { .. } | ClientMessage::WaitAgent { .. } | ClientMessage::WatchResources | ClientMessage::Shutdown => send_error(&mut connection, envelope.request_id, "control_only", "command requires a control connection").await?,
+                    ClientMessage::CloseTarget { selector } => {
+                        if selector != TargetSelector::Pane(attachment.focused.selected.pane_id) {
+                            send_error(
+                                &mut connection,
+                                envelope.request_id,
+                                "not_focused",
+                                "interactive closing requires the focused pane",
+                            ).await?;
+                            continue;
+                        }
+                        match close_target(&shared, selector, None).await {
+                            Ok(()) => send(
+                                &mut connection,
+                                envelope.request_id,
+                                ServerMessage::CommandCompleted {
+                                    command: AcknowledgedCommand::CloseTarget,
+                                },
+                            ).await?,
+                            Err(error) => send_error(
+                                &mut connection,
+                                envelope.request_id,
+                                error.code,
+                                &error.message,
+                            ).await?,
+                        }
+                    }
+                    ClientMessage::OpenLocation { .. } | ClientMessage::MovePane { .. } | ClientMessage::Contextual { .. } | ClientMessage::PublishToken { .. } | ClientMessage::ReportAgent { .. } | ClientMessage::TerminalInput { .. } | ClientMessage::ReadTerminalOutput { .. } | ClientMessage::WaitTerminalOutput { .. } | ClientMessage::PromptAgent { .. } | ClientMessage::WaitAgent { .. } | ClientMessage::WatchResources | ClientMessage::Shutdown => send_error(&mut connection, envelope.request_id, "control_only", "command requires a control connection").await?,
                     ClientMessage::Hello { .. } => send_error(&mut connection, envelope.request_id, "already_hello", "hello was already received").await?,
                 }
             },

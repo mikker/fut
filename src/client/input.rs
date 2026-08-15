@@ -260,7 +260,7 @@ mod tests {
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
         assert_eq!(
             prefix.feed(b"x".to_vec()),
-            PrefixAction::Send(vec![2, b'x'])
+            PrefixAction::Dispatch(ClientAction::ClosePane)
         );
     }
 }
