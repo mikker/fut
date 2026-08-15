@@ -131,21 +131,31 @@ pub(super) enum SemanticStyle {
 pub(super) struct BindingsConfig {
     values: BTreeMap<String, String>,
     #[serde(skip)]
-    commands: Vec<TrustedCommand>,
+    commands: Vec<PaletteCommand>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct TrustedCommand {
+pub(super) struct PaletteCommand {
     pub title: String,
-    pub binding: String,
+    #[serde(default)]
+    pub binding: Option<String>,
     pub program: PathBuf,
     #[serde(default)]
     pub args: Vec<String>,
+    #[serde(skip)]
+    pub extension: Option<ExtensionCommandIdentity>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ExtensionCommandIdentity {
+    pub id: String,
+    pub root: PathBuf,
+    pub command: String,
 }
 
 impl BindingsConfig {
-    pub(super) fn command(&self, index: usize) -> Option<&TrustedCommand> {
+    pub(super) fn command(&self, index: usize) -> Option<&PaletteCommand> {
         self.commands.get(index)
     }
 
@@ -168,17 +178,22 @@ impl BindingsConfig {
             return self.commands.get(index).map_or_else(
                 || "Unbound".into(),
                 |command| {
-                    format!(
-                        "Ctrl-b {}",
-                        parse_suffix(&command.binding)
-                            .expect("commands are validated")
-                            .1
-                    )
+                    command
+                        .binding
+                        .as_ref()
+                        .map_or_else(String::new, |binding| {
+                            format!(
+                                "Ctrl-b {}",
+                                parse_suffix(binding).expect("commands are validated").1
+                            )
+                        })
                 },
             );
         }
         if self.commands.iter().any(|command| {
-            parse_suffix(&command.binding).is_some_and(|(suffix, _)| suffix == self.suffix(action))
+            command.binding.as_ref().is_some_and(|binding| {
+                parse_suffix(binding).is_some_and(|(suffix, _)| suffix == self.suffix(action))
+            })
         }) {
             return "Unbound".into();
         }
@@ -187,7 +202,9 @@ impl BindingsConfig {
 
     pub(super) fn action_for_suffix(&self, suffix: &[u8]) -> Option<ClientAction> {
         if let Some(index) = self.commands.iter().position(|command| {
-            parse_suffix(&command.binding).is_some_and(|(bytes, _)| bytes == suffix)
+            command.binding.as_ref().is_some_and(|binding| {
+                parse_suffix(binding).is_some_and(|(bytes, _)| bytes == suffix)
+            })
         }) {
             return Some(ClientAction::RunCommand(index));
         }
@@ -196,7 +213,7 @@ impl BindingsConfig {
             .find(|action| self.suffix(*action) == suffix && self.label(*action) != "Unbound")
     }
 
-    pub(super) fn commands(&self) -> impl Iterator<Item = (usize, &TrustedCommand)> {
+    pub(super) fn commands(&self) -> impl Iterator<Item = (usize, &PaletteCommand)> {
         self.commands.iter().enumerate()
     }
 }
@@ -936,7 +953,7 @@ impl UiConfig {
 #[serde(default, deny_unknown_fields)]
 struct Config {
     ui: UiConfig,
-    trusted_commands: BTreeMap<String, TrustedCommand>,
+    trusted_commands: BTreeMap<String, PaletteCommand>,
     extensions: Vec<PathBuf>,
 }
 
@@ -1054,6 +1071,30 @@ fn load_path_outcome(path: &std::path::Path, explicit: bool) -> Result<LoadedCon
     let loaded_extensions = extensions::load(&config.extensions)
         .with_context(|| format!("load extensions from Fut config {}", path.display()))?;
     config.ui.bindings.commands = config.trusted_commands.into_values().collect();
+    for extension in &loaded_extensions {
+        for launcher in extension.commands() {
+            let argv = launcher.argv();
+            config.ui.bindings.commands.push(PaletteCommand {
+                title: launcher.title().to_owned(),
+                binding: None,
+                program: PathBuf::from(&argv[0]),
+                args: argv[1..]
+                    .iter()
+                    .map(|value| {
+                        value
+                            .to_str()
+                            .expect("extension manifest arguments are UTF-8")
+                            .to_owned()
+                    })
+                    .collect(),
+                extension: Some(ExtensionCommandIdentity {
+                    id: extension.id().to_owned(),
+                    root: extension.root().to_owned(),
+                    command: launcher.name().to_owned(),
+                }),
+            });
+        }
+    }
     validate(&config.ui, &loaded_extensions)
         .with_context(|| format!("validate Fut config {}", path.display()))?;
     Ok(LoadedConfig {
@@ -1136,16 +1177,19 @@ fn validate(ui: &UiConfig, extensions: &[Extension]) -> Result<()> {
         if command.title.is_empty() {
             bail!("trusted command titles must not be empty");
         }
-        let Some((suffix, _)) = parse_suffix(&command.binding) else {
-            bail!("trusted command bindings must be one character or a named key");
-        };
-        if !command_suffixes.insert(suffix.clone()) {
-            bail!("trusted_commands must not assign the same key to multiple commands");
-        }
-        if ALL_ACTIONS.into_iter().any(|action| {
-            explicitly_bound.contains(config_key(action)) && ui.bindings.suffix(action) == suffix
-        }) {
-            bail!("a trusted command conflicts with an explicitly configured ui binding");
+        if let Some(binding) = &command.binding {
+            let Some((suffix, _)) = parse_suffix(binding) else {
+                bail!("trusted command bindings must be one character or a named key");
+            };
+            if !command_suffixes.insert(suffix.clone()) {
+                bail!("trusted_commands must not assign the same key to multiple commands");
+            }
+            if ALL_ACTIONS.into_iter().any(|action| {
+                explicitly_bound.contains(config_key(action))
+                    && ui.bindings.suffix(action) == suffix
+            }) {
+                bail!("a trusted command conflicts with an explicitly configured ui binding");
+            }
         }
     }
     if !(MIN_SIDEBAR_WIDTH..=MAX_SIDEBAR_WIDTH).contains(&ui.workspace_sidebar.width) {
@@ -1705,7 +1749,7 @@ right = [{ token = "workspace.tab_count" }]
         fs::create_dir(&extension_root).unwrap();
         fs::write(
             extension_root.join(extensions::MANIFEST_FILE_NAME),
-            "id = 'configured'\n",
+            "id = 'configured'\n[commands.launch]\ntitle = 'Launch configured extension'\nargv = ['./bin/launch', '--ready']\n",
         )
         .unwrap();
         let path = temporary.path().join("config.toml");
@@ -1721,6 +1765,15 @@ right = [{ token = "workspace.tab_count" }]
         let loaded = load_path_outcome(&path, true).unwrap();
         assert_eq!(loaded.extensions.len(), 1);
         assert_eq!(loaded.extensions[0].id(), "configured");
+        let command = loaded.ui.bindings.command(0).unwrap();
+        assert_eq!(command.title, "Launch configured extension");
+        assert_eq!(command.binding, None);
+        assert_eq!(
+            command.program,
+            extension_root.canonicalize().unwrap().join("bin/launch")
+        );
+        assert_eq!(command.args, ["--ready"]);
+        assert_eq!(command.extension.as_ref().unwrap().id, "configured");
 
         let invalid_root = temporary.path().join("invalid");
         fs::create_dir(&invalid_root).unwrap();

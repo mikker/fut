@@ -119,6 +119,22 @@ fut --json terminal wait-output "$terminal_id" --regex 'done [0-9]+' --timeout 2
 Prefer one daemon-side `wait-output` deadline to polling. Treat `output_timeout`,
 `terminal_exited`, invalid regexes, and output limits as typed outcomes.
 
+## Retire a disposable workspace
+
+After an external tool has permanently removed the current workspace's backing
+directory, request asynchronous retirement instead of leaving the terminal in a
+deleted working directory:
+
+```sh
+fut --json workspace retire
+fut --json workspace retire "$workspace_id"
+```
+
+Retirement is acknowledged before Fut terminates the workspace's terminals.
+The inferred form validates the caller's live terminal context. Use ordinary
+`workspace close` when the caller must wait for confirmed process termination;
+use retirement when the caller is itself inside the target being closed.
+
 ## Coordinate an integrated agent
 
 An integrated agent is a terminal that has reported semantic lifecycle state.

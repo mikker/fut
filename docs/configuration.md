@@ -154,10 +154,14 @@ id = "review-status"
 
 IDs and declaration names are 1–64 bytes, start with a lowercase ASCII letter, end with a lowercase letter or digit, and otherwise use lowercase letters, digits, or single `.`, `_`, and `-` separators. Manifests are strict: unknown fields are errors.
 
-An extension may declare implemented workspace lifecycle hooks and dynamic presentation tokens:
+An extension may declare command-palette commands, implemented workspace lifecycle hooks, and dynamic presentation tokens:
 
 ```toml
 id = "review-status"
+
+[commands.open-review]
+title = "Open review"
+argv = ["./bin/open-review", "--interactive"]
 
 [hooks]
 "workspace.created" = ["./bin/refresh", "--quiet"]
@@ -169,9 +173,11 @@ name = "state"
 scope = "workspace"
 ```
 
+Each `[commands.NAME]` table requires `title` and a non-empty direct `argv` array. Commands appear in the command palette in configured extension order and command-name order. Choosing one opens the same temporary PTY surface as a trusted command, inherits the focused pane process's live working directory and the client's environment, and receives `FUT_BIN`, `FUT_EXTENSION_COMMAND`, `FUT_EXTENSION_ID`, `FUT_EXTENSION_ROOT`, and `FUT_SOCKET`. Packaged `./` executables are resolved against the canonical extension root. Extension commands do not claim global key bindings; use the command palette to launch them.
+
 The only accepted hook names are `workspace.created`, `workspace.renamed`, and `workspace.closed`; any other name rejects the complete extension configuration and prevents daemon setup. The daemon loads the global `extensions` list before creating its initial resources, so `workspace.created` observes the initial workspace too. Hooks are queued in committed mutation order and run one at a time, asynchronously and strictly after a successful resource commit. They cannot veto, delay, rewrite, or roll back the operation. The queue holds 128 events; enqueue never waits, and an event arriving while it is full is dropped with rate-limited diagnostics.
 
-Hook values are direct argv arrays, not shell strings. An executable beginning with `./` is resolved against the extension root and may not lexically escape it; otherwise it must be an absolute path or a single executable name for `PATH` lookup. Fut does not add a shell. The command's working directory is the canonical extension root. A manifest may declare at most 32 hooks and 64 presentation tokens. Commands are limited to 64 argv values of at most 4096 bytes each.
+Hook values and command `argv` values are direct argv arrays, not shell strings. An executable beginning with `./` is resolved against the extension root and may not lexically escape it; otherwise it must be an absolute path or a single executable name for `PATH` lookup. Fut does not add a shell. A hook's working directory is the canonical extension root. A manifest may declare at most 32 hooks, 32 commands, and 64 presentation tokens. Executable arrays are limited to 64 argv values of at most 4096 bytes each.
 
 Each hook inherits the daemon environment and receives these overrides: `FUT_BIN` (the exact running Fut executable), `FUT_EXTENSION_ID`, `FUT_EXTENSION_ROOT`, `FUT_EVENT`, `FUT_EVENT_VERSION=1`, `FUT_SOCKET`, `FUT_SESSION_ID`, and `FUT_WORKSPACE_ID`. Fut writes one UTF-8 JSON object plus a trailing newline to stdin, with a 64 KiB serialized limit. Version 1 has this exact shape (only `workspace.renamed` includes `previous_name`):
 
@@ -207,11 +213,21 @@ Values are strings only: they carry no style, action, service, or executable beh
 
 The checked-in `examples/extensions/example-workspace-status` extension is executable documentation for this complete path. Its packaged hook calls the exact `$FUT_BIN` through `$FUT_SOCKET` and publishes the latest workspace lifecycle event as a token. The end-to-end suite runs that same example to keep the documented contract from drifting.
 
+The checked-in `examples/extensions/wt` extension uses a palette command to create a `wt` worktree, open it as a peer Fut workspace, and launch an agent with its initial prompt. Its packaged `wt` removal handler calls `fut workspace retire`, so successful `wt done`, `wt ship`, and `wt rm` operations gracefully remove the disposable workspace. See its README for setup and agent overrides.
+
 Bindings are suffixes after the fixed `Ctrl-b` prefix. `Ctrl-b :` opens the command palette. Override any action under `ui.bindings`; accepted values are one printable character or the names `prefix`, `ctrl-s`, `space`, `enter`, `tab`, `esc`, `up`, and `down`. `prefix` means pressing `Ctrl-b` again. Keys must remain unique. Action names are `open_command_bar`, `reload_config`, `enter_copy_mode`, `open_navigator`, `open_workspace_sidebar`, `open_tab_bar`, `open_notifications`, `focus_next_notification`, `create_workspace`, `create_tab`, `focus_next_tab`, `focus_previous_tab`, `split_pane_right`, `split_pane_down`, `focus_next_pane`, `focus_previous_pane`, `focus_pane_left`, `focus_pane_down`, `focus_pane_up`, `focus_pane_right`, `focus_last_pane`, `focus_last_tab`, `focus_last_workspace`, `focus_last_session`, `focus_next_workspace`, `focus_previous_workspace`, `focus_tab_1` through `focus_tab_10`, `toggle_pane_zoom`, and `detach`. `Ctrl-b Ctrl-s` switches to the last active session, so repeating it toggles between the two most recent sessions. Rebinding `focus_next_notification` away from `prefix` restores `Ctrl-b Ctrl-b` as a literal prefix unless another action uses `prefix`. The palette displays tmux-style command names, descriptions, and configured bindings, and searches all three.
 
-Each `[trusted_commands.NAME]` table requires `title`, `binding`, and an executable `program`, plus an optional string array `args`. Running one opens a dashed frame containing a temporary PTY over the complete client terminal, inherits the focused pane process's live working directory, and sends normal terminal input to the command. The frame names the command and identifies the temporary surface; when the process exits, Fut restores the previous panes, focus, and geometry. A trusted command may take a built-in's default key, which unbinds that built-in unless it is explicitly rebound under `ui.bindings`. Explicit binding collisions and duplicate command keys are rejected. Commands appear in both the command palette and delayed which-key help, and configuration reload replaces them atomically.
+Each `[trusted_commands.NAME]` table requires `title` and an executable `program`, plus optional `binding` and string array `args` values. Running one opens a dashed frame containing a temporary PTY over the complete client terminal, inherits the focused pane process's live working directory, and sends normal terminal input to the command. The frame names the command and identifies the temporary surface; when the process exits, Fut restores the previous panes, focus, and geometry. A bound trusted command may take a built-in's default key, which unbinds that built-in unless it is explicitly rebound under `ui.bindings`. Explicit binding collisions and duplicate command keys are rejected. Commands appear in the command palette; bound commands also appear in delayed which-key help. Configuration reload replaces them atomically.
 
 `open_navigator` (default `Ctrl-b s`) opens the single cross-resource dialog. Printable text fuzzy-filters individual hierarchical rows against their full ancestor path; every query term must match. While filtering, each result shows that complete session › workspace › tab › pane path in muted text, with only the fuzzy-matched characters emphasized. Use arrows, Home/End, page keys, or `Ctrl-j`/`Ctrl-k` to move. `Ctrl-s` shows only sessions; `Ctrl-w`, `Ctrl-t`, and `Ctrl-p` show workspaces in the selected session, tabs in the selected workspace, or panes in the selected tab. The title breadcrumb names that enclosing scope with each resource name shortened to ten cells. Repeat the active filter to restore the complete tree, or press `Ctrl-a` to clear both the resource filter and text search. With no resource or text filter, Left/Right and Shift-arrows navigate the hierarchy. Enter switches and Escape closes. Plain `q` is search text. Tabs with one pane show a muted `· pane` inline; tabs with multiple panes keep one row per pane. A newly created tab briefly appears as positional `tab 1`, `tab 2`, and so on until its foreground process is available.
+
+Automation running inside a disposable workspace can use `fut workspace retire`
+to close that workspace without losing its own acknowledgement. Fut marks the
+workspace closing and replies first, then waits for the retiring control
+connection to disconnect before terminating the workspace's terminals. Pass a
+workspace UUID to retire an explicit target; inside Fut it defaults to the
+caller's current workspace and validates the caller's complete live context.
+Ordinary `workspace close` retains its synchronous confirmed-close behavior.
 
 `enter_copy_mode` (default `Ctrl-b [`) opens per-client scrollback navigation for the focused terminal. Move by physical terminal cells with arrows or `hjkl`, Home/End, and Page Up/Page Down. Space starts or clears a selection; movement extends it. `y` or Enter copies plain text through the local client's bounded `pbcopy` process and exits only after the clipboard write succeeds. A clipboard error leaves the selection active so `y` can retry. Escape or `q` cancels. `/` opens a literal-search prompt, where Escape closes only the prompt (`q` is ordinary query text); `n` and `N` repeat forward and backward after the prompt closes. Rapid actions are processed in key order; the copy cue reports if the bounded local queue cannot accept another action. Copy-mode keys and search paste never reach the terminal process.
 

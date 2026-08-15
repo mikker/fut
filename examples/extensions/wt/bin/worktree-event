@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+
+: "${FUT_BIN:?}"
+: "${FUT_SOCKET:?}"
+
+event=$(cat)
+case "$event" in
+  *'"version":1'*'"event":"worktree.removed"'*) ;;
+  *)
+    printf 'wt extension: unsupported lifecycle event\n' >&2
+    exit 64
+    ;;
+esac
+
+# Omitting the workspace ID deliberately asks Fut to validate the complete
+# live caller context inherited by the agent terminal.
+exec "$FUT_BIN" --socket "$FUT_SOCKET" workspace retire

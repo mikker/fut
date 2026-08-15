@@ -2096,6 +2096,98 @@ async fn checked_in_example_extension_smokes_hooks_cli_tokens_and_configuration(
     harness.shutdown().await;
 }
 
+#[test]
+fn checked_in_wt_extension_composes_create_and_retirement_commands() {
+    let extension = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/extensions/wt");
+    let temporary = tempfile::tempdir().unwrap();
+    let capture = temporary.path().join("create-argv");
+    let fake_wt = temporary.path().join("wt");
+    fs::write(
+        &fake_wt,
+        "#!/bin/sh\n: > \"$CAPTURE\"\nfor arg do printf '%s\\n' \"$arg\" >> \"$CAPTURE\"; done\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_wt, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut create = Command::new(extension.join("bin/create"))
+        .env("FUT_BIN", "/opt/fut")
+        .env("FUT_EXTENSION_ROOT", &extension)
+        .env("FUT_SOCKET", "/tmp/fut.sock")
+        .env("FUT_WT_BIN", &fake_wt)
+        .env("FUT_WT_AGENT", "test-agent")
+        .env("CAPTURE", &capture)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    create
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"feature-name\nImplement it carefully\n")
+        .unwrap();
+    assert!(create.wait().unwrap().success());
+    let expected = vec![
+        "create".to_owned(),
+        "feature-name".to_owned(),
+        "--".to_owned(),
+        "/opt/fut".to_owned(),
+        "--socket".to_owned(),
+        "/tmp/fut.sock".to_owned(),
+        "open".to_owned(),
+        ".".to_owned(),
+        "--name".to_owned(),
+        "feature-name".to_owned(),
+        "--".to_owned(),
+        "env".to_owned(),
+        "FUT_BIN=/opt/fut".to_owned(),
+        "FUT_SOCKET=/tmp/fut.sock".to_owned(),
+        format!(
+            "WT_EVENT_HANDLER={}",
+            extension.join("bin/worktree-event").display()
+        ),
+        "test-agent".to_owned(),
+        "Implement it carefully".to_owned(),
+    ];
+    assert_eq!(
+        fs::read_to_string(&capture)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>(),
+        expected
+    );
+
+    let retire_capture = temporary.path().join("retire-argv");
+    let fake_fut = temporary.path().join("fut");
+    fs::write(
+        &fake_fut,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CAPTURE\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_fut, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut retire = Command::new(extension.join("bin/worktree-event"))
+        .env("FUT_BIN", &fake_fut)
+        .env("FUT_SOCKET", "/tmp/fut.sock")
+        .env("CAPTURE", &retire_capture)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    retire
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"{\"version\":1,\"event\":\"worktree.removed\"}\n")
+        .unwrap();
+    assert!(retire.wait().unwrap().success());
+    assert_eq!(
+        fs::read_to_string(retire_capture)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        ["--socket", "/tmp/fut.sock", "workspace", "retire"]
+    );
+}
+
 #[tokio::test]
 async fn declared_extension_tokens_publish_authoritatively_through_cli_and_protocol() {
     let harness = Harness::start_with("while :; do sleep 1; done", |root| {
@@ -6300,6 +6392,145 @@ async fn linked_git_worktree_is_a_peer_workspace_and_reopens_idempotently() {
 }
 
 #[tokio::test]
+async fn workspace_retirement_waits_for_its_acknowledgement_connection() {
+    let mut harness = Harness::start_with("while :; do sleep 1; done", |root| {
+        let main = root.join("cwd");
+        git(&main, &["init", "-b", "main"]);
+        fs::write(main.join("tracked"), "x").unwrap();
+        git(&main, &["add", "tracked"]);
+        git(&main, &["commit", "-m", "initial"]);
+        let linked = root.join("linked");
+        git(
+            &main,
+            &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
+        );
+    })
+    .await;
+    let linked = harness.root.path().join("linked");
+    let ServerMessage::LocationOpened {
+        selected: target,
+        disposition: fut::protocol::OpenDisposition::WorkspaceCreated,
+    } = harness
+        .control_command(ClientMessage::OpenLocation {
+            name: Some("linked".into()),
+            cwd: linked,
+            program: Some("/bin/sh".into()),
+            argv: vec!["-c".into(), "while :; do sleep 1; done".into()],
+        })
+        .await
+    else {
+        panic!("linked worktree did not open as a workspace")
+    };
+
+    let mut retirement = harness.connect().await.unwrap();
+    assert!(matches!(
+        hello(&mut retirement, ClientMode::Control, PROTOCOL_VERSION)
+            .await
+            .unwrap(),
+        ServerMessage::Welcome { .. }
+    ));
+    send(
+        &mut retirement,
+        ClientMessage::RetireWorkspace {
+            workspace_id: target.workspace_id,
+            context: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        receive(&mut retirement).await.unwrap(),
+        ServerMessage::CommandCompleted {
+            command: fut::protocol::AcknowledgedCommand::RetireWorkspace,
+        }
+    );
+    assert!(process_alive(target.child_pid));
+    let closing = harness.resources().await;
+    let workspace = closing.sessions[0]
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == target.workspace_id)
+        .unwrap();
+    assert!(workspace.closing);
+
+    drop(retirement);
+    wait_for(DEADLINE, || !process_alive(target.child_pid)).await;
+    resources_when(&harness, |snapshot| {
+        snapshot.sessions[0]
+            .workspaces
+            .iter()
+            .all(|workspace| workspace.id != target.workspace_id)
+    })
+    .await;
+    let session_id = harness.resources().await.sessions[0].id;
+    harness.close_session(SessionSelector::Id(session_id)).await;
+    harness.wait_until_exited().await;
+}
+
+#[tokio::test]
+async fn public_open_resolves_relative_paths_from_its_calling_process() {
+    let mut harness = Harness::start_with("while :; do sleep 1; done", |root| {
+        let main = root.join("cwd");
+        git(&main, &["init", "-b", "main"]);
+        fs::write(main.join("tracked"), "x").unwrap();
+        git(&main, &["add", "tracked"]);
+        git(&main, &["commit", "-m", "initial"]);
+        let linked = root.join("linked");
+        git(
+            &main,
+            &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
+        );
+        fs::create_dir(linked.join("nested")).unwrap();
+    })
+    .await;
+    let linked = harness.root.path().join("linked");
+    let opened = harness
+        .cli()
+        .current_dir(linked.join("nested"))
+        .args([
+            "--json",
+            "open",
+            ".",
+            "--",
+            "/bin/sh",
+            "-c",
+            "while :; do sleep 1; done",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        opened.status.success(),
+        "{}",
+        String::from_utf8_lossy(&opened.stderr)
+    );
+    let response: Value = serde_json::from_slice(&opened.stdout).unwrap();
+    assert_eq!(response["result"]["disposition"], "workspace_created");
+    let workspace_id = response["result"]["selected"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let snapshot = harness.resources().await;
+    assert_eq!(snapshot.sessions.len(), 1);
+    assert_eq!(snapshot.sessions[0].workspaces.len(), 2);
+    assert_eq!(
+        snapshot.sessions[0].workspaces[1].root,
+        linked.canonicalize().unwrap()
+    );
+
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::CloseTarget {
+                selector: TargetSelector::Workspace(workspace_id),
+            })
+            .await,
+        ServerMessage::CommandCompleted { .. }
+    ));
+    let session_id = snapshot.sessions[0].id;
+    harness.close_session(SessionSelector::Id(session_id)).await;
+    harness.wait_until_exited().await;
+}
+
+#[tokio::test]
 async fn existing_reopen_is_idempotent_and_invalid_name_never_spawns() {
     let harness = Harness::start("while IFS= read -r line; do :; done").await;
     let tab_id = harness.resources().await.sessions[0].workspaces[0].tabs[0].id;
@@ -6774,7 +7005,7 @@ async fn public_held_mouse_releases_before_modal_focus_and_detach_transitions() 
     client.wait_for("HELD_A_READY").await;
     client.wait_for("HELD_B_READY").await;
 
-    client.send(&[sgr_mouse(0, 8, 6, false), b"\x02 ".to_vec()].concat());
+    client.send(&[sgr_mouse(0, 8, 6, false), b"\x02:".to_vec()].concat());
     client.wait_for("Search commands").await;
     wait_for(DEADLINE, || {
         fs::read(harness.root.path().join("cwd/held-modal.capture"))
@@ -6904,7 +7135,7 @@ async fn public_sgr_mouse_focuses_without_leaking_then_forwards_focused_app_inpu
 
     // Fut modal surfaces own mouse input. These gestures must not become the
     // first bytes captured by the focused application.
-    client.send(b"\x02 ");
+    client.send(b"\x02:");
     client.wait_for("Search commands").await;
     client.send(
         &[
@@ -7668,7 +7899,7 @@ async fn public_pane_zoom_toggles_full_width_and_matches_command_dispatch() {
     client.send(b"restored\n");
     client.wait_for("RESTORED_23_39").await;
 
-    client.send(b"\x02 ");
+    client.send(b"\x02:");
     client.send(b"pane zoom");
     client.send(b"\r");
     client.send(b"command\n");
@@ -7784,7 +8015,7 @@ async fn public_tab_navigation_and_right_down_splits_share_the_command_catalog()
     })
     .await;
 
-    client.send(b"\x02 ");
+    client.send(b"\x02:");
     client.send(b"split pane down\r");
     client.send(b": > down-split-marker\n");
     wait_for(DEADLINE, || {
@@ -7872,7 +8103,7 @@ async fn isolated_daily_driver_journey() {
     client.send(b"\x02|");
     client.send(b":>journey-right\n");
     wait_for_file(journey_marker("journey-right")).await;
-    client.send(b"\x02 ");
+    client.send(b"\x02:");
     client.send(b"split pane down\r");
     client.send(b":>journey-down\n");
     wait_for_file(journey_marker("journey-down")).await;
@@ -8077,7 +8308,7 @@ async fn isolated_keyboard_chaos_journey() {
                 "split-right"
             }
             1 => {
-                client.send(b"\x02 ");
+                client.send(b"\x02:");
                 client.send(b"split pane down\r");
                 let pane_count = tab.panes.len() + 1;
                 let snapshot = resources_when(&harness, |snapshot| {
@@ -8932,7 +9163,7 @@ async fn public_command_bar_filters_labels_actions_and_matches_direct_dispatch()
     client.wait_for("COMMAND_ALPHA_READY").await;
     client.wait_for("COMMAND_ZETA_READY").await;
 
-    client.send(b"\x02 ");
+    client.send(b"\x02:");
     client.wait_for("Search commands").await;
     client.wait_for("Ctrl-b s").await;
     client.send(b"\x1b[200~frobnicate\nzeta\x1b[201~");
@@ -8953,6 +9184,85 @@ async fn public_command_bar_filters_labels_actions_and_matches_direct_dispatch()
     assert!(client.text().contains("\x1b[?2004l"));
 
     assert!(process_alive(pane_b.child_pid));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn extension_commands_launch_from_the_palette_with_focused_context() {
+    let harness = Harness::start_with("printf 'HOST_READY\\r\\n'; while :; do sleep 1; done", |root| {
+        let extension = root.join("extension");
+        let bin = extension.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(
+            extension.join("fut-extension.toml"),
+            "id = 'palette-test'\n[commands.probe]\ntitle = 'Extension context probe'\nargv = ['./bin/probe']\n",
+        )
+        .unwrap();
+        let probe = bin.join("probe");
+        fs::write(
+            &probe,
+            "#!/bin/sh\nprintf 'ID=%s\\nCOMMAND=%s\\nROOT=%s\\nSOCKET=%s\\nCWD=%s\\n' \"$FUT_EXTENSION_ID\" \"$FUT_EXTENSION_COMMAND\" \"$FUT_EXTENSION_ROOT\" \"$FUT_SOCKET\" \"$PWD\" > \"$FUT_EXTENSION_ROOT/context\"\nprintf 'EXTENSION_COMMAND_READY\\r\\n'\nread -r _\n",
+        )
+        .unwrap();
+        fs::set_permissions(&probe, fs::Permissions::from_mode(0o755)).unwrap();
+        let config = root.join("home/.config/fut/config.toml");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(
+            config,
+            format!("extensions = [{:?}]\n", extension.display().to_string()),
+        )
+        .unwrap();
+    })
+    .await;
+    let snapshot = harness.resources().await;
+    let pane = snapshot.sessions[0].workspaces[0].tabs[0].panes[0].id;
+    let extension = harness
+        .root
+        .path()
+        .join("extension")
+        .canonicalize()
+        .unwrap();
+    let cwd = harness.root.path().join("cwd").canonicalize().unwrap();
+
+    let mut command = Command::new("/usr/bin/script");
+    command
+        .env_clear()
+        .env("HOME", harness.root.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", harness.root.path().join("runtime"))
+        .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+        .env("TERM", "xterm-256color")
+        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .arg(format!(
+            "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {pane}",
+            env!("CARGO_BIN_EXE_fut"),
+            harness.socket.display(),
+        ));
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("HOST_READY").await;
+    client.send(b"\x02:");
+    client.wait_for("Search commands").await;
+    client.send(b"extension context probe\r");
+    client.wait_for("EXTENSION_COMMAND_READY").await;
+    let context = fs::read_to_string(extension.join("context")).unwrap();
+    assert!(context.contains("ID=palette-test\n"), "{context:?}");
+    assert!(context.contains("COMMAND=probe\n"), "{context:?}");
+    assert!(
+        context.contains(&format!("ROOT={}\n", extension.display())),
+        "{context:?}"
+    );
+    assert!(
+        context.contains(&format!("SOCKET={}\n", harness.socket.display())),
+        "{context:?}"
+    );
+    assert!(
+        context.contains(&format!("CWD={}\n", cwd.display())),
+        "{context:?}"
+    );
+    client.send(b"\r");
+    time::sleep(Duration::from_millis(100)).await;
+    client.send(b"\x02d");
+    client.wait_success().await;
     harness.shutdown().await;
 }
 
@@ -9651,7 +9961,7 @@ async fn command_bar_create_failure_releases_input_to_the_original_terminal() {
         ));
     let mut client = PtyChild::spawn(command);
     client.wait_for("CREATE_FAILURE_READY").await;
-    client.send(b"\x02 create tab\r");
+    client.send(b"\x02:create tab\r");
     client.wait_for("create tab failed").await;
     client.send(b"after\n");
     client.wait_for("CREATE_FAILURE_RECOVERED").await;
@@ -10628,6 +10938,76 @@ async fn focused_exit_falls_back_through_previous_tabs_in_the_same_session() {
     )
     .await;
     snapshot_containing(&mut attached, terminal_a, "FALLBACK_A_INPUT").await;
+
+    harness.detach(&mut attached).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn focused_exit_falls_back_to_another_workspace_in_the_same_session() {
+    let harness = Harness::start(
+        "printf 'WORKSPACE_FALLBACK_READY\\r\\n'; while IFS= read -r line; do [ \"$line\" = fallback ] && printf 'WORKSPACE_FALLBACK_INPUT\\r\\n'; done",
+    )
+    .await;
+    let initial = harness.resources().await;
+    let session_id = initial.sessions[0].id;
+    let original_terminal = initial.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
+    let (mut attached, _) =
+        attach_once(&harness, TargetSelector::Terminal(original_terminal)).await;
+    snapshot_containing(&mut attached, original_terminal, "WORKSPACE_FALLBACK_READY").await;
+
+    send(
+        &mut attached,
+        ClientMessage::CreateWorkspace {
+            session_id,
+            name: Some("temporary".into()),
+            cwd: None,
+            program: Some("/bin/sh".into()),
+            argv: vec![
+                "-c".into(),
+                "printf 'EXITING_WORKSPACE_READY\\r\\n'; while IFS= read -r line; do :; done"
+                    .into(),
+            ],
+        },
+    )
+    .await;
+    let ServerMessage::WorkspaceCreated {
+        selected: temporary,
+    } = receive_matching(&mut attached, |message| {
+        matches!(message, ServerMessage::WorkspaceCreated { .. })
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    receive_matching(&mut attached, |message| {
+        matches!(message, ServerMessage::TargetSelected { selected } if selected.focused.terminal_id == temporary.terminal_id)
+    })
+    .await;
+    snapshot_containing(
+        &mut attached,
+        temporary.terminal_id,
+        "EXITING_WORKSPACE_READY",
+    )
+    .await;
+
+    send(&mut attached, ClientMessage::Input { bytes: vec![0x04] }).await;
+    receive_matching(&mut attached, |message| {
+        matches!(message, ServerMessage::TerminalExited { terminal_id, .. } if *terminal_id == temporary.terminal_id)
+    })
+    .await;
+    receive_matching(&mut attached, |message| {
+        matches!(message, ServerMessage::TargetSelected { selected } if selected.focused.terminal_id == original_terminal)
+    })
+    .await;
+    send(
+        &mut attached,
+        ClientMessage::Input {
+            bytes: b"fallback\n".to_vec(),
+        },
+    )
+    .await;
+    snapshot_containing(&mut attached, original_terminal, "WORKSPACE_FALLBACK_INPUT").await;
 
     harness.detach(&mut attached).await;
     harness.shutdown().await;

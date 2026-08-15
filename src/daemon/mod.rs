@@ -2767,7 +2767,7 @@ async fn handle_connection(
                             ).await?,
                         }
                     }
-                    ClientMessage::OpenLocation { .. } | ClientMessage::MovePane { .. } | ClientMessage::Contextual { .. } | ClientMessage::PublishToken { .. } | ClientMessage::ReportAgent { .. } | ClientMessage::TerminalInput { .. } | ClientMessage::ReadTerminalOutput { .. } | ClientMessage::WaitTerminalOutput { .. } | ClientMessage::PromptAgent { .. } | ClientMessage::WaitAgent { .. } | ClientMessage::WatchResources | ClientMessage::Shutdown => send_error(&mut connection, envelope.request_id, "control_only", "command requires a control connection").await?,
+                    ClientMessage::OpenLocation { .. } | ClientMessage::MovePane { .. } | ClientMessage::Contextual { .. } | ClientMessage::RetireWorkspace { .. } | ClientMessage::PublishToken { .. } | ClientMessage::ReportAgent { .. } | ClientMessage::TerminalInput { .. } | ClientMessage::ReadTerminalOutput { .. } | ClientMessage::WaitTerminalOutput { .. } | ClientMessage::PromptAgent { .. } | ClientMessage::WaitAgent { .. } | ClientMessage::WatchResources | ClientMessage::Shutdown => send_error(&mut connection, envelope.request_id, "control_only", "command requires a control connection").await?,
                     ClientMessage::Hello { .. } => send_error(&mut connection, envelope.request_id, "already_hello", "hello was already received").await?,
                 }
             },
@@ -2917,6 +2917,7 @@ async fn control_loop(
     shutdown: watch::Sender<bool>,
 ) -> Result<()> {
     let mut watched_changes: Option<watch::Receiver<u64>> = None;
+    let mut retirement = None;
     loop {
         let frame = tokio::select! {
             frame = connection.next() => frame,
@@ -3194,6 +3195,31 @@ async fn control_loop(
                     }
                 }
             }
+            ClientMessage::RetireWorkspace {
+                workspace_id,
+                context,
+            } => match prepare_workspace_retirement(&shared, workspace_id, context).await {
+                Ok(pending) => {
+                    retirement = Some(pending);
+                    send(
+                        connection,
+                        envelope.request_id,
+                        ServerMessage::CommandCompleted {
+                            command: AcknowledgedCommand::RetireWorkspace,
+                        },
+                    )
+                    .await?;
+                    // The writer task can deliver the acknowledgement while
+                    // this handler waits for the caller to receive it, flush
+                    // any user-facing output, and disconnect. Ignore any
+                    // further input: retirement is already committed.
+                    while matches!(connection.next().await, Some(Ok(_))) {}
+                    break;
+                }
+                Err(error) => {
+                    send_error(connection, envelope.request_id, error.code, &error.message).await?
+                }
+            },
             ClientMessage::RenameTarget { selector, name } => {
                 let result = shared.lock().await.rename_target(selector, name);
                 match result {
@@ -3401,6 +3427,11 @@ async fn control_loop(
                 .await?
             }
         }
+    }
+    if let Some(retirement) = retirement
+        && let Err(error) = finish_target_close(&shared, retirement).await
+    {
+        tracing::warn!(%error, "workspace retirement failed after acknowledgement");
     }
     Ok(())
 }
@@ -4780,11 +4811,35 @@ fn selected_target(
     }
 }
 
-async fn close_target(
+struct PendingClose {
+    scope: CloseScope,
+    handles: Vec<Arc<TerminalHandle>>,
+}
+
+async fn prepare_workspace_retirement(
+    shared: &Shared,
+    workspace_id: WorkspaceId,
+    context: Option<TerminalContext>,
+) -> Result<PendingClose, DaemonError> {
+    let mut state = shared.lock().await;
+    if let Some(context) = context {
+        state.validate_terminal_context(context)?;
+        if context.workspace_id != workspace_id {
+            return Err(DaemonError::new(
+                "context_changed",
+                "calling terminal is no longer in the workspace being retired",
+            ));
+        }
+    }
+    let (scope, handles) = state.begin_target_close(TargetSelector::Workspace(workspace_id))?;
+    Ok(PendingClose { scope, handles })
+}
+
+async fn prepare_target_close(
     shared: &Shared,
     selector: TargetSelector,
     context: Option<TerminalContext>,
-) -> Result<(), DaemonError> {
+) -> Result<PendingClose, DaemonError> {
     let (scope, handles) = {
         let mut state = shared.lock().await;
         if let Some(context) = context {
@@ -4792,14 +4847,27 @@ async fn close_target(
         }
         state.begin_target_close(selector)?
     };
-    for handle in handles {
+    Ok(PendingClose { scope, handles })
+}
+
+async fn finish_target_close(shared: &Shared, pending: PendingClose) -> Result<(), DaemonError> {
+    for handle in pending.handles {
         if let Err(error) = handle.close().await {
             let mut state = shared.lock().await;
-            state.cancel_target_close(scope);
+            state.cancel_target_close(pending.scope);
             return Err(DaemonError::command("close_failed", error));
         }
     }
     Ok(())
+}
+
+async fn close_target(
+    shared: &Shared,
+    selector: TargetSelector,
+    context: Option<TerminalContext>,
+) -> Result<(), DaemonError> {
+    let pending = prepare_target_close(shared, selector, context).await?;
+    finish_target_close(shared, pending).await
 }
 
 async fn command_response(

@@ -42,6 +42,7 @@ const MAX_OUTPUT_BYTES: usize = 16 * 1024;
 const MAX_EXTENSIONS: usize = 32;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_HOOKS: usize = 32;
+const MAX_COMMANDS: usize = 32;
 const MAX_PRESENTATION_TOKENS: usize = 64;
 const MAX_ARGV: usize = 64;
 const MAX_IDENTIFIER_BYTES: usize = 64;
@@ -53,12 +54,21 @@ pub(crate) struct Extension {
     id: String,
     root: PathBuf,
     hooks: BTreeMap<String, ExtensionCommand>,
+    commands: BTreeMap<String, ExtensionLauncher>,
     presentation_tokens: Vec<PresentationToken>,
 }
 
 impl Extension {
     pub(crate) fn id(&self) -> &str {
         &self.id
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn commands(&self) -> impl Iterator<Item = &ExtensionLauncher> {
+        self.commands.values()
     }
 
     pub(crate) fn presentation_tokens(&self) -> &[PresentationToken] {
@@ -86,6 +96,27 @@ impl Extension {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ExtensionCommand {
     argv: Vec<OsString>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExtensionLauncher {
+    name: String,
+    title: String,
+    command: ExtensionCommand,
+}
+
+impl ExtensionLauncher {
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub(crate) fn argv(&self) -> &[OsString] {
+        &self.command.argv
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -502,7 +533,16 @@ struct Manifest {
     #[serde(default)]
     hooks: BTreeMap<String, Vec<String>>,
     #[serde(default)]
+    commands: BTreeMap<String, CommandDeclaration>,
+    #[serde(default)]
     presentation_tokens: Vec<TokenDeclaration>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommandDeclaration {
+    title: String,
+    argv: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -583,6 +623,13 @@ fn load_one(root: &Path) -> Result<Extension> {
             manifest.hooks.len()
         );
     }
+    if manifest.commands.len() > MAX_COMMANDS {
+        bail!(
+            "extension {:?} declares {} commands; maximum is {MAX_COMMANDS}",
+            manifest.id,
+            manifest.commands.len()
+        );
+    }
     if manifest.presentation_tokens.len() > MAX_PRESENTATION_TOKENS {
         bail!(
             "extension {:?} declares {} presentation tokens; maximum is {MAX_PRESENTATION_TOKENS}",
@@ -608,6 +655,34 @@ fn load_one(root: &Path) -> Result<Extension> {
                 format!("validate extension {:?} hook {name:?} argv", manifest.id)
             })?;
             Ok((name, command))
+        })
+        .collect::<Result<_>>()?;
+
+    let commands = manifest
+        .commands
+        .into_iter()
+        .map(|(name, declaration)| {
+            validate_identifier("command name", &name).with_context(|| {
+                format!("validate extension {:?} command {name:?}", manifest.id)
+            })?;
+            validate_title(&declaration.title).with_context(|| {
+                format!(
+                    "validate extension {:?} command {name:?} title",
+                    manifest.id
+                )
+            })?;
+            let command = validate_command(root, declaration.argv).with_context(|| {
+                format!("validate extension {:?} command {name:?} argv", manifest.id)
+            })?;
+            let launcher_name = name.clone();
+            Ok((
+                name,
+                ExtensionLauncher {
+                    name: launcher_name,
+                    title: declaration.title,
+                    command,
+                },
+            ))
         })
         .collect::<Result<_>>()?;
 
@@ -644,6 +719,7 @@ fn load_one(root: &Path) -> Result<Extension> {
         id: manifest.id,
         root: root.to_owned(),
         hooks,
+        commands,
         presentation_tokens,
     })
 }
@@ -751,6 +827,26 @@ fn validate_identifier(label: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_title(value: &str) -> Result<()> {
+    if value.is_empty() || value.len() > MAX_ARG_BYTES {
+        bail!("title must be 1 through {MAX_ARG_BYTES} bytes");
+    }
+    if value.chars().any(|character| {
+        character.is_control()
+            || matches!(
+                character,
+                '\u{061c}'
+                    | '\u{200e}'
+                    | '\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2066}'..='\u{2069}'
+            )
+    }) {
+        bail!("title contains a control or bidirectional formatting character");
+    }
+    Ok(())
+}
+
 fn validate_os_value(label: &str, value: &OsStr, maximum: usize) -> Result<()> {
     let bytes = value.as_bytes();
     if bytes.len() > maximum {
@@ -794,6 +890,10 @@ id = "acme.git-status"
 "workspace.created" = ["./bin/refresh", "--quiet"]
 "workspace.closed" = ["helper", ""]
 
+[commands.open-review]
+title = "Open review"
+argv = ["./bin/review", "--interactive"]
+
 [[presentation_tokens]]
 name = "branch"
 scope = "workspace"
@@ -821,6 +921,15 @@ scope = "tab"
         assert_eq!(
             extension.hooks["workspace.closed"].argv,
             [OsString::from("helper"), OsString::from("")]
+        );
+        let launcher = &extension.commands["open-review"];
+        assert_eq!(launcher.title(), "Open review");
+        assert_eq!(
+            launcher.argv(),
+            [
+                canonical_root.join("bin/review").into_os_string(),
+                OsString::from("--interactive")
+            ]
         );
         assert_eq!(
             extension.presentation_tokens()[0].qualified_name(),
@@ -875,6 +984,14 @@ scope = "tab"
             (
                 "id = 'valid'\n[hooks]\n'workspace.created' = []\n",
                 "argv must contain an executable",
+            ),
+            (
+                "id = 'valid'\n[commands.launch]\ntitle = 'Launch'\nargv = []\n",
+                "argv must contain an executable",
+            ),
+            (
+                "id = 'valid'\n[commands.launch]\ntitle = ''\nargv = ['/bin/true']\n",
+                "title must be",
             ),
             (
                 "id = 'valid'\n[hooks]\n'workspace.created' = ['./../escape']\n",

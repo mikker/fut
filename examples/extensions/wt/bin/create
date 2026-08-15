@@ -1,0 +1,32 @@
+#!/bin/sh
+set -eu
+
+: "${FUT_BIN:?}"
+: "${FUT_EXTENSION_ROOT:?}"
+: "${FUT_SOCKET:?}"
+
+wt_bin=${FUT_WT_BIN:-wt}
+agent=${FUT_WT_AGENT:-pi}
+
+printf 'Worktree name: '
+IFS= read -r name || exit 0
+if [ -z "$name" ]; then
+  printf 'A worktree name is required.\n' >&2
+  exit 2
+fi
+
+printf 'Agent prompt: '
+IFS= read -r prompt || exit 0
+if [ -z "$prompt" ]; then
+  printf 'An agent prompt is required.\n' >&2
+  exit 2
+fi
+
+printf '\nCreating %s…\n' "$name"
+exec "$wt_bin" create "$name" -- \
+  "$FUT_BIN" --socket "$FUT_SOCKET" open . --name "$name" -- \
+  env \
+  FUT_BIN="$FUT_BIN" \
+  FUT_SOCKET="$FUT_SOCKET" \
+  WT_EVENT_HANDLER="$FUT_EXTENSION_ROOT/bin/worktree-event" \
+  "$agent" "$prompt"

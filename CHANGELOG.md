@@ -6,6 +6,9 @@
 - Added `fut a` and `fut ls` command aliases, plus a confirmed `Ctrl-b x` shortcut for closing the focused pane.
 - Fut now refuses to nest interactive clients by default; set `FUT_ALLOW_NESTED` to force intentional nesting.
 - Tabs and workspaces can now be activated directly with a left mouse click, and displayed tab and workspace hotkeys can be clicked like buttons.
+- Added acknowledged workspace retirement for tools that need to close their own disposable Fut workspace safely.
+- Fixed explicit relative `fut open` paths being resolved from the daemon instead of the invoking process.
+- Extensions can now contribute packaged interactive commands to Fut's command palette, and trusted commands may be palette-only without a binding.
 
 ## 0.6
 

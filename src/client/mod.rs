@@ -230,7 +230,7 @@ pub async fn attach_navigator(socket_path: &Path) -> anyhow::Result<()> {
     let (columns, rows) = crossterm::terminal::size().context("read terminal size")?;
     let size = TerminalSize { columns, rows };
     let (mut framed, selected) = connect_interactive(socket_path, Some(selector), size).await?;
-    let result = run(&mut terminal, &mut framed, selected, ui).await;
+    let result = run(&mut terminal, &mut framed, selected, ui, socket_path).await;
     drop(terminal);
     drop(guard);
     result
@@ -252,7 +252,7 @@ pub(crate) async fn attach_with_ui(
     // Host terminal state is changed only after a successful handshake.
     let guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let result = run(&mut terminal, &mut framed, selected, ui).await;
+    let result = run(&mut terminal, &mut framed, selected, ui, socket_path).await;
     drop(terminal);
     drop(guard);
     result
@@ -393,6 +393,7 @@ async fn run(
     framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     selected: SelectedView,
     mut ui: UiConfig,
+    socket_path: &Path,
 ) -> anyhow::Result<()> {
     let mut events = EventStream::new();
     let mut termination = TerminationSignals::subscribe()?;
@@ -1362,6 +1363,7 @@ async fn run(
                                     terminal.size()?.into(),
                                     &mut ui,
                                     &mut temporary_command,
+                                    socket_path,
                                 ).await?);
                                 force_draw = true;
                             }
@@ -1746,6 +1748,7 @@ async fn run(
                                     terminal.size()?.into(),
                                     &mut ui,
                                     &mut temporary_command,
+                                    socket_path,
                                 ).await?);
                                 force_draw = true;
                             }
@@ -2658,6 +2661,7 @@ async fn dispatch_client_action(
     host: Rect,
     ui: &mut UiConfig,
     temporary_command: &mut Option<TemporaryCommandSurface>,
+    socket_path: &Path,
 ) -> anyhow::Result<Option<Toast>> {
     match action {
         ClientAction::RunCommand(index) => {
@@ -2672,8 +2676,14 @@ async fn dispatch_client_action(
                 rows: content.height,
             };
             let fallback = std::env::current_dir().unwrap_or_else(|_| "/".into());
-            match TemporaryCommandSurface::spawn(command, view.focused().child_pid, &fallback, size)
-                .await
+            match TemporaryCommandSurface::spawn(
+                command,
+                view.focused().child_pid,
+                &fallback,
+                size,
+                socket_path,
+            )
+            .await
             {
                 Ok(command) => *temporary_command = Some(command),
                 Err(error) => {

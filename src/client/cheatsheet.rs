@@ -69,13 +69,15 @@ fn entries(bindings: &BindingsConfig) -> Vec<(String, String)> {
         .filter(|action| bindings.label(*action) != "Unbound")
         .map(|action| (bindings.suffix_label(action), title(action).to_owned()))
         .collect::<Vec<_>>();
-    entries.extend(bindings.commands().map(|(_, command)| {
-        (
-            super::actions::parse_suffix(&command.binding)
-                .expect("validated command binding")
-                .1,
-            command.title.clone(),
-        )
+    entries.extend(bindings.commands().filter_map(|(_, command)| {
+        command.binding.as_ref().map(|binding| {
+            (
+                super::actions::parse_suffix(binding)
+                    .expect("validated command binding")
+                    .1,
+                command.title.clone(),
+            )
+        })
     }));
     entries
 }

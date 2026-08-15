@@ -21,7 +21,7 @@ use crate::{
 /// Protocol version used by released Fut 0.1 builds.
 pub const PROTOCOL_VERSION_0_1: u16 = 0;
 /// Current clients and daemons require an exact protocol match.
-pub const PROTOCOL_VERSION: u16 = 20;
+pub const PROTOCOL_VERSION: u16 = 21;
 /// Enough for 50,000 individually styled MessagePack-encoded cells while
 /// remaining a firm pre-allocation bound for the length-delimited transport.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
@@ -52,6 +52,7 @@ pub enum AcknowledgedCommand {
     ReportAgent,
     TerminalInput,
     CloseTarget,
+    RetireWorkspace,
     RenameTarget,
     Shutdown,
 }
@@ -317,6 +318,13 @@ pub enum ClientMessage {
     WatchResources,
     CloseTarget {
         selector: TargetSelector,
+    },
+    /// Mark one workspace closing, acknowledge the control caller, then
+    /// terminate its terminals after that caller disconnects.
+    RetireWorkspace {
+        workspace_id: WorkspaceId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context: Option<TerminalContext>,
     },
     RenameTarget {
         selector: RenameSelector,
@@ -1077,6 +1085,21 @@ mod tests {
             decode_payload::<ClientMessage>(&encode_payload(&close).unwrap()).unwrap(),
             close
         );
+        let context = TerminalContext {
+            session_id: SessionId::new(),
+            workspace_id: WorkspaceId::new(),
+            tab_id: TabId::new(),
+            pane_id: PaneId::new(),
+            terminal_id: TerminalId::new(),
+        };
+        let retire = ClientMessage::RetireWorkspace {
+            workspace_id: context.workspace_id,
+            context: Some(context),
+        };
+        assert_eq!(
+            decode_payload::<ClientMessage>(&encode_payload(&retire).unwrap()).unwrap(),
+            retire
+        );
         let publish = ClientMessage::PublishToken {
             extension_id: "review-status".into(),
             token: "state".into(),
@@ -1137,7 +1160,7 @@ mod tests {
             switched
         );
         assert_eq!(PROTOCOL_VERSION_0_1, 0);
-        assert_eq!(PROTOCOL_VERSION, 20);
+        assert_eq!(PROTOCOL_VERSION, 21);
 
         let watch = ClientMessage::WatchResources;
         assert_eq!(

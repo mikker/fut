@@ -1,0 +1,5 @@
+id = "wt"
+
+[commands.new-agent-worktree]
+title = "New agent worktree"
+argv = ["./bin/create"]

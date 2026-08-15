@@ -1,4 +1,6 @@
-use std::{ffi::OsString, path::PathBuf, process::ExitCode, str::FromStr, time::Duration};
+use std::{
+    ffi::OsString, io::Write, path::PathBuf, process::ExitCode, str::FromStr, time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
@@ -216,6 +218,12 @@ enum WorkspaceCommand {
     /// Close a workspace by raw UUID, or infer the caller's workspace.
     Close {
         /// Raw workspace UUID.
+        #[arg(add = ArgValueCompleter::new(completion::workspace_close))]
+        workspace_id: Option<WorkspaceId>,
+    },
+    /// Acknowledge this workspace's retirement before terminating its terminals.
+    Retire {
+        /// Raw workspace UUID; defaults to the caller's workspace.
         #[arg(add = ArgValueCompleter::new(completion::workspace_close))]
         workspace_id: Option<WorkspaceId>,
     },
@@ -833,7 +841,8 @@ async fn execute(cli: Cli) -> Result<()> {
             name,
             command,
         }) => {
-            let cwd = path.unwrap_or(std::env::current_dir()?);
+            let current_dir = std::env::current_dir()?;
+            let cwd = resolve_open_path(path, &current_dir);
             let (program, argv) = child_command(command);
             match control(
                 &socket,
@@ -1661,12 +1670,68 @@ async fn execute(cli: Cli) -> Result<()> {
                 "shutdown=true",
             )
         }
+        Some(Command::Workspace {
+            command: WorkspaceCommand::Retire { workspace_id },
+        }) => retire_workspace(&socket, cli.json, workspace_id).await,
         Some(Command::Doctor) => unreachable!("doctor is handled before command execution"),
         Some(Command::Agent {
             command: AgentCommand::Skill,
         }) => unreachable!("agent skill is handled before daemon setup"),
         Some(command) => run_mutation(&socket, cli.json, command).await,
     }
+}
+
+fn resolve_open_path(path: Option<PathBuf>, current_dir: &std::path::Path) -> PathBuf {
+    match path {
+        Some(path) if path.is_relative() => current_dir.join(path),
+        Some(path) => path,
+        None => current_dir.to_owned(),
+    }
+}
+
+/// Keep the control connection open until the acceptance response has been
+/// rendered. The daemon deliberately waits for its EOF before it starts
+/// terminating the workspace that may contain this CLI process.
+async fn retire_workspace(
+    socket: &std::path::Path,
+    json_output: bool,
+    workspace_id: Option<WorkspaceId>,
+) -> Result<()> {
+    let (workspace_id, context) = match workspace_id {
+        Some(workspace_id) => (workspace_id, None),
+        None => {
+            let context = live_context(socket).await?;
+            (context.workspace_id, Some(context))
+        }
+    };
+    let mut framed = connected_control(socket).await?;
+    let request_id = send(
+        &mut framed,
+        ClientMessage::RetireWorkspace {
+            workspace_id,
+            context,
+        },
+    )
+    .await?;
+    let response = receive(
+        &mut framed,
+        request_id,
+        Duration::from_secs(15),
+        "daemon response timed out",
+    )
+    .await?;
+    response_ok(response, AcknowledgedCommand::RetireWorkspace)?;
+    output(
+        json_output,
+        "workspace.retire",
+        json!({ "workspace_id": workspace_id, "retiring": true }),
+        "retiring=true",
+    )?;
+    std::io::stdout()
+        .flush()
+        .context("flush retirement response")?;
+    drop(framed);
+    Ok(())
 }
 
 fn child_command(command: Vec<String>) -> (Option<PathBuf>, Vec<String>) {
@@ -2991,6 +3056,7 @@ mod tests {
             vec!["fut", "workspace", "attach", &workspace],
             vec!["fut", "workspace", "rename", &workspace, "new"],
             vec!["fut", "workspace", "close", &workspace],
+            vec!["fut", "workspace", "retire", &workspace],
             vec!["fut", "tab", "new", &workspace],
             vec!["fut", "tab", "list", &workspace],
             vec!["fut", "pane", "list", &tab],
@@ -3006,6 +3072,7 @@ mod tests {
             vec!["fut", "session", "close"],
             vec!["fut", "workspace", "rename", "new"],
             vec!["fut", "workspace", "close"],
+            vec!["fut", "workspace", "retire"],
             vec!["fut", "tab", "new"],
             vec!["fut", "tab", "list"],
             vec!["fut", "tab", "rename", "new"],
@@ -3078,6 +3145,20 @@ mod tests {
         ] {
             Cli::try_parse_from(args).unwrap();
         }
+    }
+
+    #[test]
+    fn relative_open_paths_are_anchored_to_the_calling_process() {
+        let current = std::path::Path::new("/caller/project");
+        assert_eq!(
+            resolve_open_path(Some(PathBuf::from("../feature")), current),
+            PathBuf::from("/caller/project/../feature")
+        );
+        assert_eq!(
+            resolve_open_path(Some(PathBuf::from("/absolute/feature")), current),
+            PathBuf::from("/absolute/feature")
+        );
+        assert_eq!(resolve_open_path(None, current), current);
     }
 
     #[test]

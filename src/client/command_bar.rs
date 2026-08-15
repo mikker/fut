@@ -251,7 +251,16 @@ impl CommandBarState {
                     ClientAction::RunCommand(index) => self
                         .bindings
                         .command(*index)
-                        .map(|command| (command.title.as_str(), "configured trusted command"))
+                        .map(|command| {
+                            (
+                                command.title.as_str(),
+                                if command.extension.is_some() {
+                                    "extension command"
+                                } else {
+                                    "configured trusted command"
+                                },
+                            )
+                        })
                         .unwrap_or(("", "")),
                     action => definition(*action)
                         .map(|definition| (definition.title, definition.keywords))
