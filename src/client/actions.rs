@@ -343,7 +343,7 @@ pub(super) const DIRECT_BINDINGS: [DirectBinding; 38] = [
         action: ClientAction::EnterCopyMode,
     },
     DirectBinding {
-        suffix: b"g",
+        suffix: b"s",
         action: ClientAction::OpenNavigator,
     },
     DirectBinding {

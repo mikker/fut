@@ -184,7 +184,7 @@ mod tests {
         );
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
         assert_eq!(
-            prefix.feed(b"g".to_vec()),
+            prefix.feed(b"s".to_vec()),
             PrefixAction::Dispatch(ClientAction::OpenNavigator)
         );
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);

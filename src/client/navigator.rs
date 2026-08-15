@@ -27,6 +27,7 @@ use super::notifications::{ActivityIndicator, NotificationState};
 const MAX_WIDTH: u16 = 80;
 const MAX_HEIGHT: u16 = 20;
 const MAX_QUERY_BYTES: usize = 512;
+const BREADCRUMB_WIDTH: usize = 10;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ResourceKey {
@@ -69,6 +70,7 @@ pub(super) struct NavigatorRow {
     pub key: ResourceKey,
     pub depth: u16,
     pub label: String,
+    pub inline_pane: Option<PaneId>,
     pub search_path: String,
     pub current: bool,
     pub closing: bool,
@@ -182,10 +184,10 @@ impl NavigatorState {
             .unwrap_or_else(|| old_index.min(self.rows.len().saturating_sub(1)));
         if old_key.is_none()
             && let Some(current) = current
-            && let Some(index) = self
-                .rows
-                .iter()
-                .position(|row| row.key == ResourceKey::Pane(current.pane_id))
+            && let Some(index) = self.rows.iter().position(|row| {
+                row.key == ResourceKey::Pane(current.pane_id)
+                    || row.inline_pane == Some(current.pane_id)
+            })
         {
             self.selected = index;
         }
@@ -490,6 +492,31 @@ impl NavigatorState {
         }
     }
 
+    fn title(&self) -> String {
+        let mut breadcrumbs = vec!["navigator".to_owned()];
+        if let Some(filter) = self.filter {
+            if let Some(scope) = filter.scope
+                && let Some(index) = self.rows.iter().position(|row| row.key == scope)
+            {
+                let scope_depth = self.rows[index].depth;
+                for depth in 0..=scope_depth {
+                    if let Some(row) = self.rows[..=index]
+                        .iter()
+                        .rev()
+                        .find(|row| row.depth == depth)
+                    {
+                        breadcrumbs.push(breadcrumb_label(&row.label));
+                    }
+                }
+            }
+            breadcrumbs.push(filter.label().to_owned());
+        }
+        if !self.query.is_empty() {
+            breadcrumbs.push(self.query.clone());
+        }
+        format!(" {}", breadcrumbs.join(" › "))
+    }
+
     pub fn render(
         &mut self,
         host: Rect,
@@ -503,14 +530,7 @@ impl NavigatorState {
         }
         let (header, footer) = chrome_rows(area.height);
         if header == 1 {
-            let filter = self
-                .filter
-                .map_or_else(String::new, |filter| format!("{} › ", filter.label()));
-            render_title(
-                area,
-                &format!(" navigator › {filter}{}", self.query),
-                buffer,
-            );
+            render_title(area, &self.title(), buffer);
         }
         if footer == 1 {
             let footer = match &self.status {
@@ -604,7 +624,14 @@ impl NavigatorState {
                                 marker,
                                 row.label
                             );
-                            put(buffer, area.x, y, area.width, &text, style);
+                            let mut spans = vec![Span::styled(text, style)];
+                            if row.inline_pane.is_some() {
+                                spans.push(Span::styled(
+                                    " · pane",
+                                    styles.apply(SemanticStyle::Muted, style),
+                                ));
+                            }
+                            buffer.set_line(area.x, y, &Line::from(spans), area.width);
                         } else {
                             render_fuzzy_path(
                                 buffer,
@@ -628,6 +655,25 @@ impl NavigatorState {
             }
         }
     }
+}
+
+fn breadcrumb_label(label: &str) -> String {
+    if label.width() <= BREADCRUMB_WIDTH {
+        return label.to_owned();
+    }
+
+    let mut clipped = String::new();
+    let mut width = 0;
+    for grapheme in label.graphemes(true) {
+        let grapheme_width = grapheme.width();
+        if width + grapheme_width > BREADCRUMB_WIDTH - 1 {
+            break;
+        }
+        clipped.push_str(grapheme);
+        width += grapheme_width;
+    }
+    clipped.push('…');
+    clipped
 }
 
 fn render_fuzzy_path(
@@ -818,6 +864,7 @@ fn flatten_optional(
             key: ResourceKey::Session(session.id),
             depth: 0,
             label: session.name.clone(),
+            inline_pane: None,
             search_path: session_path.clone(),
             current: session_current,
             closing: session.closing,
@@ -842,6 +889,7 @@ fn flatten_optional(
                 key: ResourceKey::Workspace(workspace.id),
                 depth: 1,
                 label: workspace.name.clone(),
+                inline_pane: None,
                 search_path: workspace_path.clone(),
                 current: workspace_current,
                 closing,
@@ -866,24 +914,35 @@ fn flatten_optional(
                 let tab_path = format!("{workspace_path} › {tab_label}");
                 let tab_current = workspace_current && Some(tab.id) == current_tab_id;
                 let tab_closing = closing || tab.closing;
+                let single_pane = match tab.panes.as_slice() {
+                    [pane] => Some(pane),
+                    _ => None,
+                };
+                let tab_row_closing = tab_closing || single_pane.is_some_and(|pane| pane.closing);
                 rows.push(NavigatorRow {
                     key: ResourceKey::Tab(tab.id),
                     depth: 2,
                     label: tab_label,
-                    search_path: tab_path.clone(),
+                    inline_pane: single_pane.map(|pane| pane.id),
+                    search_path: single_pane
+                        .map_or_else(|| tab_path.clone(), |_| format!("{tab_path} › pane")),
                     current: tab_current,
-                    closing: tab_closing,
-                    destination: (!tab_closing)
+                    closing: tab_row_closing,
+                    destination: (!tab_row_closing)
                         .then(|| history.tab_destination(tab))
                         .flatten(),
                     activity: notifications.indicator(&tab.panes),
                 });
+                if single_pane.is_some() {
+                    continue;
+                }
                 for (index, pane) in tab.panes.iter().enumerate() {
                     let pane_closing = tab_closing || pane.closing;
                     rows.push(NavigatorRow {
                         key: ResourceKey::Pane(pane.id),
                         depth: 3,
                         label: format!("pane {}", index + 1),
+                        inline_pane: None,
                         search_path: format!("{tab_path} › pane {}", index + 1),
                         current: Some(pane.id) == current_pane_id,
                         closing: pane_closing,
@@ -1028,6 +1087,25 @@ mod tests {
     }
 
     #[test]
+    fn single_pane_tabs_render_the_pane_inline_in_muted_text() {
+        let (mut snapshot, current, _) = fixture();
+        snapshot.sessions[0].workspaces[0].tabs[0].panes.truncate(1);
+        let mut nav = NavigatorState::open();
+
+        nav.accept_resources(&snapshot, &current);
+
+        assert_eq!(
+            nav.rows.iter().map(|row| row.depth).collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        assert_eq!(nav.selected, 2);
+        assert_eq!(nav.rows[2].inline_pane, Some(current.pane_id));
+        let (rendered, buffer) = rendered(&mut nav, 50, 8);
+        assert!(rendered.contains("tab · pane"));
+        assert!(buffer[(12, 4)].modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
     fn parent_destinations_use_the_most_recently_focused_pane() {
         let (mut snapshot, current, remembered_pane_id) = fixture();
         let remembered_pane = &mut snapshot.sessions[0].workspaces[0].tabs[0].panes[1];
@@ -1087,7 +1165,7 @@ mod tests {
         let rows = flatten(&snapshot, &current);
         let current_rows = rows.iter().filter(|row| row.current).collect::<Vec<_>>();
 
-        assert_eq!(current_rows.len(), 4);
+        assert_eq!(current_rows.len(), 3);
         assert!(
             current_rows
                 .iter()
@@ -1096,7 +1174,8 @@ mod tests {
         assert!(
             current_rows
                 .iter()
-                .any(|row| row.key == ResourceKey::Pane(current.pane_id))
+                .any(|row| row.destination == Some(current.pane_id)
+                    && row.inline_pane == Some(current.pane_id))
         );
         assert!(
             !rows
@@ -1397,6 +1476,7 @@ mod tests {
             key: ResourceKey::Pane(PaneId::new()),
             depth,
             label: String::new(),
+            inline_pane: None,
             search_path: String::new(),
             current: false,
             closing: false,
@@ -1450,6 +1530,25 @@ mod tests {
         nav.selected = 13;
         press_ctrl(&mut nav, 's');
         assert_eq!(nav.selected, 10, "keeps the enclosing session selected");
+    }
+
+    #[test]
+    fn filtered_title_breadcrumbs_name_the_truncated_scope() {
+        let (mut snapshot, current, _) = fixture();
+        snapshot.sessions[0].name = "long-session-name".into();
+        snapshot.sessions[0].workspaces[0].name = "long-workspace-name".into();
+        snapshot.sessions[0].workspaces[0].tabs[0].name = "long-tab-name".into();
+        let mut nav = NavigatorState::open();
+        nav.accept_resources(&snapshot, &current);
+
+        press_ctrl(&mut nav, 't');
+        assert_eq!(nav.title(), " navigator › long-sess… › long-work… › tabs");
+
+        press_ctrl(&mut nav, 'p');
+        assert_eq!(
+            nav.title(),
+            " navigator › long-sess… › long-work… › long-tab-… › panes"
+        );
     }
 
     #[test]

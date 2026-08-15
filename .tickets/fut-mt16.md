@@ -27,3 +27,7 @@ A user can configure prefix+g to launch the existing git_diff_popup.sh from the 
 **2026-08-11T09:58:21Z**
 
 Implemented trusted configured temporary full-area PTY commands with focused foreground-process CWD inheritance, binding displacement/collision validation, config reload, command palette and which-key discovery, lifecycle/error handling, docs, tests, and manual PTY verification.
+
+**2026-08-15T13:05:15Z**
+
+Follow-up: moved the built-in navigator default to prefix+s and configured the local repository-diff command on prefix+g, so the motivating command no longer displaces a built-in.

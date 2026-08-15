@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Navigator tabs with a single pane now show the pane inline in muted text, multi-pane tabs keep separate pane rows, and filtered breadcrumbs name their resource scope.
+- The global navigator now defaults to `Ctrl-b s`, leaving `Ctrl-b g` available for custom commands.
+
 ## 0.5
 
 - Render Kitty-protocol inline images through Fut in Ghostty, Kitty, and WezTerm.

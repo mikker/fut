@@ -521,7 +521,7 @@ mod tests {
         let rendered = text(&buffer);
         assert!(rendered.contains("Search commands…"));
         assert!(rendered.contains("Open global navigator"));
-        assert!(rendered.contains("Ctrl-b g"));
+        assert!(rendered.contains("Ctrl-b s"));
         assert!(rendered.contains("type to filter"));
         // Prompt and first result sit inside the border.
         let area = command_bar_area(host);

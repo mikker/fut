@@ -1646,7 +1646,7 @@ right = [{ token = "workspace.tab_count" }]
             "[ui.workspace_sidebar]\nwidth = 2\n",
             "[ui.tab_bar.item]\nmin_width = 8\n",
             "[ui.bindings]\nunknown = 'x'\n",
-            "[ui.bindings]\nopen_command_bar = 'g'\n",
+            "[ui.bindings]\nopen_command_bar = 's'\n",
             "[ui.bindings]\nopen_command_bar = 'ctrl-x'\n",
             "[ui.icons]\nvertical_divider = '||'\n",
             "[ui.styles.normal]\nforeground = '#aéabc'\n",
@@ -1795,7 +1795,7 @@ right = [{ token = "workspace.tab_count" }]
             r#"
 [trusted_commands.git_diff]
 title = "Repository diff"
-binding = "g"
+binding = "s"
 program = "/bin/sh"
 args = ["-c", "git diff"]
 "#,
@@ -1803,7 +1803,7 @@ args = ["-c", "git diff"]
         .unwrap();
         let config = load_path(&path, true).unwrap();
         assert_eq!(
-            config.bindings.action_for_suffix(b"g"),
+            config.bindings.action_for_suffix(b"s"),
             Some(ClientAction::RunCommand(0))
         );
         assert_eq!(
@@ -1816,10 +1816,10 @@ args = ["-c", "git diff"]
             &path,
             r#"
 [ui.bindings]
-open_navigator = "g"
+open_navigator = "s"
 [trusted_commands.git_diff]
 title = "Repository diff"
-binding = "g"
+binding = "s"
 program = "/bin/true"
 "#,
         )

@@ -6135,7 +6135,7 @@ async fn public_last_session_navigation_toggles_after_global_selection() {
         ));
     let mut client = PtyChild::spawn(command);
     client.wait_for("LAST_SESSION_A_READY").await;
-    client.send(b"\x02g");
+    client.send(b"\x02s");
     client.wait_for("second-project").await;
     client.send(b"\x1b[F\r");
     // The diff renderer may reuse the stale "LAST_" cells from marker A on
@@ -6546,7 +6546,7 @@ async fn public_client_navigator_switches_live_pty_and_preserves_terminal_isolat
         ));
     let mut client = PtyChild::spawn(command);
     client.wait_for("PUBLIC_A_READY").await;
-    client.send(b"\x02g");
+    client.send(b"\x02s");
     client.wait_for(" navigator").await;
     client.wait_for("public-b").await;
     client.send(b"\x1b[F\r");
@@ -8934,7 +8934,7 @@ async fn public_command_bar_filters_labels_actions_and_matches_direct_dispatch()
 
     client.send(b"\x02 ");
     client.wait_for("Search commands").await;
-    client.wait_for("Ctrl-b g").await;
+    client.wait_for("Ctrl-b s").await;
     client.send(b"\x1b[200~frobnicate\nzeta\x1b[201~");
     client.wait_for("No matching commands").await;
     client.send(b"\x15next pane\rzeta\n");
@@ -9984,7 +9984,7 @@ async fn public_client_ctrl_b_c_creates_routes_and_navigates_back() {
 
     client.send(b"printf 'CTRL_C_NEW_INPUT\\r\\n'\n");
     client.wait_for("CTRL_C_NEW_INPUT").await;
-    client.send(b"\x02g");
+    client.send(b"\x02s");
     client.wait_for(" navigator").await;
     client.send(b"\x14\x1b[A\r");
     client.wait_for_count("CTRL_C_A_READY", 2).await;
