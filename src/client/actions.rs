@@ -338,7 +338,7 @@ const DOWN: &[u8] = b"\x1b[B";
 
 pub(super) const DIRECT_BINDINGS: [DirectBinding; 39] = [
     DirectBinding {
-        suffix: b" ",
+        suffix: b":",
         action: ClientAction::OpenCommandBar,
     },
     DirectBinding {
@@ -502,6 +502,51 @@ pub(super) fn definition(action: ClientAction) -> Option<&'static ActionDefiniti
     COMMANDS
         .iter()
         .find(|definition| definition.action == action)
+}
+
+pub(super) const fn command_name(action: ClientAction) -> &'static str {
+    match action {
+        ClientAction::RunCommand(_) => "run-command",
+        ClientAction::OpenCommandBar => "command-palette",
+        ClientAction::ReloadConfig => "reload-config",
+        ClientAction::EnterCopyMode => "copy-mode",
+        ClientAction::OpenNavigator => "choose-tree",
+        ClientAction::OpenWorkspaceSidebar => "choose-workspace",
+        ClientAction::OpenTabBar => "choose-tab",
+        ClientAction::OpenNotifications => "show-notifications",
+        ClientAction::FocusNextNotification => "next-notification",
+        ClientAction::CreateWorkspace => "new-workspace",
+        ClientAction::CreateTab => "new-tab",
+        ClientAction::FocusNextTab => "next-tab",
+        ClientAction::FocusPreviousTab => "previous-tab",
+        ClientAction::FocusNextWorkspace => "next-workspace",
+        ClientAction::FocusPreviousWorkspace => "previous-workspace",
+        ClientAction::SplitPaneRight => "split-pane -h",
+        ClientAction::SplitPaneDown => "split-pane -v",
+        ClientAction::FocusNextPane => "next-pane",
+        ClientAction::FocusPreviousPane => "previous-pane",
+        ClientAction::FocusPane(FocusDirection::Left) => "select-pane -L",
+        ClientAction::FocusPane(FocusDirection::Down) => "select-pane -D",
+        ClientAction::FocusPane(FocusDirection::Up) => "select-pane -U",
+        ClientAction::FocusPane(FocusDirection::Right) => "select-pane -R",
+        ClientAction::FocusLast(NavigationScope::Pane) => "last-pane",
+        ClientAction::FocusLast(NavigationScope::Tab) => "last-tab",
+        ClientAction::FocusLast(NavigationScope::Workspace) => "last-workspace",
+        ClientAction::FocusLast(NavigationScope::Session) => "last-session",
+        ClientAction::FocusTab(TabNumber::One) => "select-tab -t 1",
+        ClientAction::FocusTab(TabNumber::Two) => "select-tab -t 2",
+        ClientAction::FocusTab(TabNumber::Three) => "select-tab -t 3",
+        ClientAction::FocusTab(TabNumber::Four) => "select-tab -t 4",
+        ClientAction::FocusTab(TabNumber::Five) => "select-tab -t 5",
+        ClientAction::FocusTab(TabNumber::Six) => "select-tab -t 6",
+        ClientAction::FocusTab(TabNumber::Seven) => "select-tab -t 7",
+        ClientAction::FocusTab(TabNumber::Eight) => "select-tab -t 8",
+        ClientAction::FocusTab(TabNumber::Nine) => "select-tab -t 9",
+        ClientAction::FocusTab(TabNumber::Ten) => "select-tab -t 10",
+        ClientAction::TogglePaneZoom => "resize-pane -Z",
+        ClientAction::ClosePane => "kill-pane",
+        ClientAction::Detach => "detach-client",
+    }
 }
 
 pub(super) fn config_key(action: ClientAction) -> &'static str {
@@ -698,5 +743,16 @@ mod tests {
             Some(ClientAction::TogglePaneZoom)
         );
         assert_eq!(bindings.label(ClientAction::TogglePaneZoom), "Ctrl-b z");
+    }
+
+    #[test]
+    fn every_action_has_a_unique_command_name() {
+        let names = ALL_ACTIONS.map(command_name);
+        assert_eq!(names.into_iter().collect::<HashSet<_>>().len(), names.len());
+        assert_eq!(command_name(ClientAction::CreateTab), "new-tab");
+        assert_eq!(
+            command_name(ClientAction::FocusPane(FocusDirection::Left)),
+            "select-pane -L"
+        );
     }
 }

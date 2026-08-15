@@ -234,7 +234,7 @@ mod tests {
         );
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
         assert_eq!(
-            prefix.feed(b" ".to_vec()),
+            prefix.feed(b":".to_vec()),
             PrefixAction::Dispatch(ClientAction::OpenCommandBar)
         );
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);

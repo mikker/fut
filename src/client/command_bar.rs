@@ -4,7 +4,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::{
-    actions::{COMMANDS, ClientAction, definition},
+    actions::{COMMANDS, ClientAction, command_name, definition},
     chrome::{sanitize, truncate},
     config::BindingsConfig,
     dialog::{
@@ -257,7 +257,11 @@ impl CommandBarState {
                         .map(|definition| (definition.title, definition.keywords))
                         .unwrap_or(("", "")),
                 };
-                format!("{title} {keywords} {}", self.bindings.label(*action))
+                format!(
+                    "{} {title} {keywords} {}",
+                    command_name(*action),
+                    self.bindings.label(*action)
+                )
             }),
         );
         self.filtered = ranked.into_iter().map(|index| catalog[index]).collect();
@@ -309,9 +313,9 @@ impl CommandBarState {
 
     fn render_tiny(&self, area: Rect, buffer: &mut Buffer) {
         let detail = if let Some(action) = self.selected_action() {
-            action_title(action, &self.bindings)
+            action_label(action, &self.bindings)
         } else {
-            "No matching commands"
+            "No matching commands".to_owned()
         };
         let text = if self.query.is_empty() {
             format!("› {detail}")
@@ -375,7 +379,7 @@ fn render_result(
 ) {
     let style = row_style(selected);
     fill_row(area, style, buffer);
-    let title = action_title(action, bindings);
+    let title = action_label(action, bindings);
     let full_binding = bindings.label(action);
     let binding = if area.width >= 56 {
         full_binding.as_str()
@@ -388,7 +392,7 @@ fn render_result(
     let title_width = usize::from(area.width)
         .saturating_sub(binding_width)
         .saturating_sub(2);
-    let title = format!(" {}", truncate(title, title_width.saturating_sub(1)));
+    let title = format!(" {}", truncate(&title, title_width.saturating_sub(1)));
     buffer.set_stringn(area.x, area.y, title, title_width, style);
     if !binding.is_empty() {
         buffer.set_stringn(
@@ -401,15 +405,15 @@ fn render_result(
     }
 }
 
-fn action_title(action: ClientAction, bindings: &BindingsConfig) -> &str {
+fn action_label(action: ClientAction, bindings: &BindingsConfig) -> String {
     match action {
         ClientAction::RunCommand(index) => bindings
             .command(index)
-            .map(|command| command.title.as_str())
-            .unwrap_or(""),
+            .map(|command| command.title.clone())
+            .unwrap_or_default(),
         action => definition(action)
-            .map(|command| command.title)
-            .unwrap_or(""),
+            .map(|command| format!("{}  {}", command_name(action), command.title))
+            .unwrap_or_default(),
     }
 }
 
@@ -520,7 +524,7 @@ mod tests {
         bar.render(host, &mut buffer);
         let rendered = text(&buffer);
         assert!(rendered.contains("Search commands…"));
-        assert!(rendered.contains("Open global navigator"));
+        assert!(rendered.contains("choose-tree  Open global navigator"));
         assert!(rendered.contains("Ctrl-b s"));
         assert!(rendered.contains("type to filter"));
         // Prompt and first result sit inside the border.

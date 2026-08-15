@@ -10,7 +10,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use super::{
-    actions::{ALL_ACTIONS, ClientAction, definition},
+    actions::{ALL_ACTIONS, ClientAction, command_name},
     chrome::truncate,
     config::BindingsConfig,
     dialog::{dialog_area, render_frame, render_title},
@@ -81,7 +81,7 @@ fn entries(bindings: &BindingsConfig) -> Vec<(String, String)> {
 }
 
 fn title(action: ClientAction) -> &'static str {
-    definition(action).map_or("Open command palette", |definition| definition.title)
+    command_name(action)
 }
 
 #[cfg(test)]
@@ -107,9 +107,9 @@ mod tests {
         render(&BindingsConfig::default(), host, &mut buffer);
         let rendered = text(&buffer);
         assert!(rendered.contains("Ctrl-b …"));
-        assert!(rendered.contains("Open command palette"));
-        assert!(rendered.contains("Open global navigator"));
-        assert!(rendered.contains("Detach"));
+        assert!(rendered.contains("command-palette"));
+        assert!(rendered.contains("choose-tree"));
+        assert!(rendered.contains("detach-client"));
     }
 
     #[test]
@@ -123,7 +123,7 @@ mod tests {
         let host = Rect::new(0, 0, 90, 12);
         let mut buffer = Buffer::empty(host);
         render(&BindingsConfig::default(), host, &mut buffer);
-        assert!(text(&buffer).contains("Space"));
-        assert!(text(&buffer).contains("Relo"));
+        assert!(text(&buffer).contains(':'));
+        assert!(text(&buffer).contains("relo"));
     }
 }
