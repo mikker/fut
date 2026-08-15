@@ -172,6 +172,11 @@ enum UiMouseRoute {
     Owned(Option<UiResizeAction>),
 }
 
+enum UiActivation {
+    Workspace(WorkspaceSidebarAction),
+    Tab(TabBarAction),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SidebarDivider {
     position: config::WorkspaceSidebarPosition,
@@ -1386,6 +1391,140 @@ async fn run(
                         } else {
                             Vec::new()
                         };
+                        let activation = matches!(mouse.kind, HostMouseEventKind::Down(HostMouseButton::Left))
+                            .then(|| {
+                                if visible_sidebar.is_some_and(|divider| {
+                                    rect_contains(divider.area, mouse.column, mouse.row)
+                                }) {
+                                    return None;
+                                }
+                                let snapshot = resources.snapshot()?;
+                                if let Some(ClientSurface::WorkspaceSidebar(sidebar)) = surface.as_mut() {
+                                    let area = workspace_sidebar_drawer(host, &ui)?;
+                                    if rect_contains(area, mouse.column, mouse.row) {
+                                        return Some(UiActivation::Workspace(sidebar.click(
+                                            area,
+                                            ui.workspace_sidebar.position,
+                                            &ui,
+                                            mouse.column,
+                                            mouse.row,
+                                        )));
+                                    }
+                                } else if surface.is_none()
+                                    && let Some(area) = layout.workspace_sidebar.and_then(|sidebar| sidebar.docked())
+                                    && rect_contains(area, mouse.column, mouse.row)
+                                {
+                                    let sidebar = WorkspaceSidebarState::open(
+                                        snapshot,
+                                        view.focused(),
+                                        &workspace_history,
+                                        resources.notifications(),
+                                    )?;
+                                    return Some(UiActivation::Workspace(sidebar.passive_click(
+                                        area,
+                                        ui.workspace_sidebar.position,
+                                        &ui,
+                                        mouse.column,
+                                        mouse.row,
+                                    )));
+                                }
+                                if matches!(surface.as_ref(), None | Some(ClientSurface::TabBar(_)))
+                                    && let Some(area) = layout.tab_bar
+                                    && rect_contains(area, mouse.column, mouse.row)
+                                {
+                                    let action = if let Some(ClientSurface::TabBar(tab_bar)) = surface.as_ref() {
+                                        tab_bar.click(
+                                            snapshot,
+                                            view.focused(),
+                                            &ui,
+                                            resources.notifications(),
+                                            spinner_frame,
+                                            area,
+                                            mouse.column,
+                                            mouse.row,
+                                        )
+                                    } else {
+                                        TabBarState::open(snapshot, view.focused(), &workspace_history)?.click(
+                                            snapshot,
+                                            view.focused(),
+                                            &ui,
+                                            resources.notifications(),
+                                            spinner_frame,
+                                            area,
+                                            mouse.column,
+                                            mouse.row,
+                                        )
+                                    };
+                                    return Some(UiActivation::Tab(action));
+                                }
+                                None
+                            })
+                            .flatten();
+                        if let Some(activation) = activation {
+                            mouse_input.discard(mouse);
+                            match activation {
+                                UiActivation::Workspace(WorkspaceSidebarAction::Select(pane_id)) => {
+                                    if let Some(request) = focus.begin(FocusOrigin::Workspace) {
+                                        if let Some(ClientSurface::WorkspaceSidebar(sidebar)) = surface.as_mut() {
+                                            sidebar.begin_switch();
+                                        }
+                                        send_request(
+                                            framed,
+                                            Some(request),
+                                            ClientMessage::SelectTarget {
+                                                selector: TargetSelector::Pane(pane_id),
+                                                expected: selection_expectation(
+                                                    resources.snapshot().expect("activation requires resources"),
+                                                    pane_id,
+                                                    NavigationScope::Workspace,
+                                                ),
+                                            },
+                                        ).await?;
+                                    }
+                                }
+                                UiActivation::Tab(TabBarAction::Select(pane_id)) => {
+                                    if let Some(request) = focus.begin(FocusOrigin::Tab) {
+                                        send_request(
+                                            framed,
+                                            Some(request),
+                                            ClientMessage::SelectTarget {
+                                                selector: TargetSelector::Pane(pane_id),
+                                                expected: selection_expectation(
+                                                    resources.snapshot().expect("activation requires resources"),
+                                                    pane_id,
+                                                    NavigationScope::Tab,
+                                                ),
+                                            },
+                                        ).await?;
+                                    }
+                                }
+                                UiActivation::Workspace(WorkspaceSidebarAction::CycleVisibility) => {
+                                    ui.workspace_sidebar.visibility.cycle();
+                                    resize_view(framed, host, &mut view, &resources, &ui).await?;
+                                    view.invalidate_drawn();
+                                }
+                                UiActivation::Workspace(WorkspaceSidebarAction::ToggleDisplay) => {
+                                    ui.workspace_sidebar.display.toggle();
+                                    resize_view(framed, host, &mut view, &resources, &ui).await?;
+                                    view.invalidate_drawn();
+                                }
+                                UiActivation::Workspace(WorkspaceSidebarAction::Close)
+                                    if matches!(surface.as_ref(), Some(ClientSurface::WorkspaceSidebar(_))) =>
+                                {
+                                    surface = None;
+                                    view.invalidate_drawn();
+                                }
+                                UiActivation::Tab(TabBarAction::Close)
+                                    if matches!(surface.as_ref(), Some(ClientSurface::TabBar(_))) =>
+                                {
+                                    surface = None;
+                                    view.invalidate_drawn();
+                                }
+                                _ => {}
+                            }
+                            force_draw = true;
+                            continue;
+                        }
                         if let MouseButtonState::Selecting {
                             terminal_id,
                             anchor,

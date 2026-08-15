@@ -9,7 +9,9 @@ use crate::{
 
 use super::config::UiConfig;
 use super::{
-    chrome::render_tab_bar, navigation::NavigationHistory, notifications::NotificationState,
+    chrome::{render_tab_bar, tab_bar_item_at},
+    navigation::NavigationHistory,
+    notifications::NotificationState,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -139,6 +141,50 @@ impl TabBarState {
                 }
             }
             _ => TabBarAction::Stay,
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "hit testing forwards the complete configurable tab renderer context"
+    )]
+    pub fn click(
+        &self,
+        snapshot: &ResourceSnapshot,
+        focused: &SelectedTarget,
+        ui: &UiConfig,
+        notifications: &NotificationState,
+        spinner_frame: usize,
+        area: Rect,
+        column: u16,
+        row: u16,
+    ) -> TabBarAction {
+        let Some(id) = tab_bar_item_at(
+            snapshot,
+            focused,
+            self.selected,
+            notifications,
+            spinner_frame,
+            ui,
+            area,
+            column,
+            row,
+        ) else {
+            return TabBarAction::Stay;
+        };
+        let Some(item) = self
+            .items
+            .iter()
+            .find(|item| item.id == id && !item.closing)
+        else {
+            return TabBarAction::Stay;
+        };
+        if item.id == self.focused_tab {
+            TabBarAction::Close
+        } else {
+            item.destination
+                .map(TabBarAction::Select)
+                .unwrap_or(TabBarAction::Stay)
         }
     }
 
@@ -366,6 +412,30 @@ mod tests {
             state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             TabBarAction::Close
         );
+    }
+
+    #[test]
+    fn clicks_activate_visible_tabs() {
+        let (snapshot, focused, history) = fixture();
+        let state = TabBarState::open(&snapshot, &focused, &history).unwrap();
+        let area = Rect::new(0, 0, 80, 1);
+        let second_pane = snapshot.sessions[0].workspaces[0].tabs[1].panes[0].id;
+        let actions = (0..area.width)
+            .map(|column| {
+                state.click(
+                    &snapshot,
+                    &focused,
+                    &UiConfig::default(),
+                    &NotificationState::default(),
+                    0,
+                    area,
+                    column,
+                    0,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(actions.contains(&TabBarAction::Close));
+        assert!(actions.contains(&TabBarAction::Select(second_pane)));
     }
 
     #[test]

@@ -358,42 +358,7 @@ pub(super) fn render_tab_bar(
             client_waiting: 0,
             session_waiting: 0,
         });
-    let mut groups = Vec::new();
-    for (lane, configured) in [
-        (Lane::Left, &ui.tab_bar.left),
-        (Lane::Center, &ui.tab_bar.center),
-        (Lane::Right, &ui.tab_bar.right),
-    ] {
-        for group in configured {
-            let tabs = group
-                .segments
-                .iter()
-                .any(|segment| segment.component.as_deref() == Some("tabs"));
-            let line = if tabs {
-                selected_line(
-                    &model,
-                    selected,
-                    0,
-                    model.tabs.len() - 1,
-                    group.style,
-                    spinner_frame,
-                    ui,
-                )
-            } else {
-                render_bar_group(group, &model, zoomed, selected, spinner_frame, ui)
-            };
-            if tabs || line.width() > 0 {
-                groups.push(ResolvedGroup {
-                    lane,
-                    line,
-                    tabs,
-                    style: group.style,
-                    priority: group.priority,
-                    allocation: 0,
-                });
-            }
-        }
-    }
+    let mut groups = resolved_groups(&model, zoomed, selected, spinner_frame, ui);
     allocate_groups(&mut groups, width);
     let lane_width = |lane| {
         groups
@@ -441,6 +406,113 @@ pub(super) fn render_tab_bar(
             x += group.allocation;
         }
     }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "hit testing must use the same configurable tab geometry as rendering"
+)]
+pub(super) fn tab_bar_item_at(
+    snapshot: &ResourceSnapshot,
+    focused: &SelectedTarget,
+    selected: Option<TabId>,
+    notifications: &NotificationState,
+    spinner_frame: usize,
+    ui: &UiConfig,
+    area: Rect,
+    column: u16,
+    row: u16,
+) -> Option<TabId> {
+    if row != area.y || column < area.x || column >= area.right() {
+        return None;
+    }
+    let model = TabBarModel::from_snapshot(snapshot, focused, notifications)?;
+    let width = usize::from(area.width);
+    let mut groups = resolved_groups(&model, false, selected, spinner_frame, ui);
+    allocate_groups(&mut groups, width);
+    let lane_width = |lane| {
+        groups
+            .iter()
+            .filter(|group| group.lane == lane)
+            .map(|group| group.allocation)
+            .sum::<usize>()
+    };
+    let left_width = lane_width(Lane::Left);
+    let center_width = lane_width(Lane::Center);
+    let right_width = lane_width(Lane::Right);
+    let center_x = width
+        .saturating_sub(center_width)
+        .checked_div(2)
+        .unwrap_or(0)
+        .clamp(left_width, width.saturating_sub(right_width + center_width));
+    let clicked = usize::from(column - area.x);
+    for (lane, mut x) in [
+        (Lane::Left, 0usize),
+        (Lane::Center, center_x),
+        (Lane::Right, width.saturating_sub(right_width)),
+    ] {
+        for group in groups.iter().filter(|group| group.lane == lane) {
+            if group.tabs && clicked >= x && clicked < x + group.allocation {
+                return visible_tab_at(
+                    &model,
+                    selected,
+                    group.allocation,
+                    group.style,
+                    spinner_frame,
+                    ui,
+                    clicked - x,
+                );
+            }
+            x += group.allocation;
+        }
+    }
+    None
+}
+
+fn resolved_groups(
+    model: &TabBarModel,
+    zoomed: bool,
+    selected: Option<TabId>,
+    spinner_frame: usize,
+    ui: &UiConfig,
+) -> Vec<ResolvedGroup> {
+    let mut groups = Vec::new();
+    for (lane, configured) in [
+        (Lane::Left, &ui.tab_bar.left),
+        (Lane::Center, &ui.tab_bar.center),
+        (Lane::Right, &ui.tab_bar.right),
+    ] {
+        for group in configured {
+            let tabs = group
+                .segments
+                .iter()
+                .any(|segment| segment.component.as_deref() == Some("tabs"));
+            let line = if tabs {
+                selected_line(
+                    model,
+                    selected,
+                    0,
+                    model.tabs.len() - 1,
+                    group.style,
+                    spinner_frame,
+                    ui,
+                )
+            } else {
+                render_bar_group(group, model, zoomed, selected, spinner_frame, ui)
+            };
+            if tabs || line.width() > 0 {
+                groups.push(ResolvedGroup {
+                    lane,
+                    line,
+                    tabs,
+                    style: group.style,
+                    priority: group.priority,
+                    allocation: 0,
+                });
+            }
+        }
+    }
+    groups
 }
 
 fn render_bar_group(
@@ -627,6 +699,84 @@ fn visible_tabs(
         }
     }
     (line, first == 0 && last + 1 == model.tabs.len())
+}
+
+fn visible_tab_at(
+    model: &TabBarModel,
+    selected: Option<TabId>,
+    width: usize,
+    component_style: Option<SemanticStyle>,
+    spinner_frame: usize,
+    ui: &UiConfig,
+    column: usize,
+) -> Option<TabId> {
+    if width == 0 || column >= width {
+        return None;
+    }
+    let anchor = selected
+        .and_then(|id| model.tabs.iter().position(|tab| tab.id == id))
+        .unwrap_or(model.active);
+    let mut first = anchor;
+    let mut last = anchor;
+    let line = selected_line(
+        model,
+        selected,
+        first,
+        last,
+        component_style,
+        spinner_frame,
+        ui,
+    );
+    if line.width() > width {
+        return Some(model.tabs[anchor].id);
+    }
+    loop {
+        let mut changed = false;
+        if first > 0 {
+            let candidate = selected_line(
+                model,
+                selected,
+                first - 1,
+                last,
+                component_style,
+                spinner_frame,
+                ui,
+            );
+            if candidate.width() <= width {
+                first -= 1;
+                changed = true;
+            }
+        }
+        if last + 1 < model.tabs.len() {
+            let candidate = selected_line(
+                model,
+                selected,
+                first,
+                last + 1,
+                component_style,
+                spinner_frame,
+                ui,
+            );
+            if candidate.width() <= width {
+                last += 1;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let overflow_width = format!(" {} ", ui.icons.resolve().overflow).width();
+    let mut x = if first > 0 { overflow_width } else { 0 };
+    for index in first..=last {
+        let item_width =
+            render_tab_item(model, index, selected, component_style, spinner_frame, ui).width();
+        if column >= x && column < x + item_width {
+            return Some(model.tabs[index].id);
+        }
+        x += item_width;
+    }
+    None
 }
 
 fn selected_line(

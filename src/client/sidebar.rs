@@ -348,6 +348,103 @@ impl WorkspaceSidebarState {
         }
     }
 
+    pub fn click(
+        &mut self,
+        area: Rect,
+        position: WorkspaceSidebarPosition,
+        ui: &UiConfig,
+        column: u16,
+        row: u16,
+    ) -> WorkspaceSidebarAction {
+        if self.help || matches!(self.status, WorkspaceStatus::Switching) {
+            return WorkspaceSidebarAction::Stay;
+        }
+        if let Some(hotkey) =
+            workspace_hotkey_at(&self.model, &self.status, area, position, ui, column, row)
+        {
+            return match hotkey {
+                'h' => WorkspaceSidebarAction::CycleVisibility,
+                'm' => WorkspaceSidebarAction::ToggleDisplay,
+                '?' => {
+                    self.help = true;
+                    WorkspaceSidebarAction::Stay
+                }
+                _ => unreachable!("workspace legend only exposes known hotkeys"),
+            };
+        }
+        workspace_item_at(
+            &self.model,
+            self.selected,
+            Some(&self.status),
+            area,
+            position,
+            ui,
+            column,
+            row,
+        )
+        .map(switch_to)
+        .unwrap_or(WorkspaceSidebarAction::Stay)
+    }
+
+    pub fn passive_click(
+        &self,
+        area: Rect,
+        position: WorkspaceSidebarPosition,
+        ui: &UiConfig,
+        column: u16,
+        row: u16,
+    ) -> WorkspaceSidebarAction {
+        if ui.workspace_sidebar.display == WorkspaceSidebarDisplay::Expanded {
+            return workspace_item_at(&self.model, None, None, area, position, ui, column, row)
+                .map(switch_to)
+                .unwrap_or(WorkspaceSidebarAction::Stay);
+        }
+        let Some(content) = sidebar_content(area, position) else {
+            return WorkspaceSidebarAction::Stay;
+        };
+        if column < content.x || column >= content.right() {
+            return WorkspaceSidebarAction::Stay;
+        }
+        let header = render_sidebar_chrome(&ui.workspace_sidebar.header, &self.model, None, ui);
+        let header_height = if header.spans.is_empty() || content.height <= SIDEBAR_HEADER_HEIGHT {
+            0
+        } else {
+            SIDEBAR_HEADER_HEIGHT
+        };
+        let rows_y = content.y.saturating_add(header_height);
+        let rows_height = content.height.saturating_sub(header_height);
+        let anchor = self
+            .model
+            .items
+            .iter()
+            .position(|item| item.current)
+            .unwrap_or(0);
+        let mut y = rows_y;
+        for visible in visible_rows_with_item_height(
+            self.model.items.len(),
+            anchor,
+            usize::from(rows_height),
+            1,
+        ) {
+            match visible {
+                VisibleRow::Ellipsis => y = y.saturating_add(1),
+                VisibleRow::Item(index) => {
+                    if row == y {
+                        return self
+                            .model
+                            .items
+                            .get(index)
+                            .filter(|item| !item.closing)
+                            .map(switch_to)
+                            .unwrap_or(WorkspaceSidebarAction::Stay);
+                    }
+                    y = y.saturating_add(1);
+                }
+            }
+        }
+        WorkspaceSidebarAction::Stay
+    }
+
     pub fn begin_switch(&mut self) {
         self.status = WorkspaceStatus::Switching;
     }
@@ -420,6 +517,138 @@ impl WorkspaceSidebarState {
         self.selected = Some(available[next]);
         self.status = WorkspaceStatus::Ready;
     }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "hotkey hit testing uses the renderer's complete configurable geometry"
+)]
+fn workspace_hotkey_at(
+    model: &WorkspaceModel,
+    status: &WorkspaceStatus,
+    area: Rect,
+    position: WorkspaceSidebarPosition,
+    ui: &UiConfig,
+    column: u16,
+    row: u16,
+) -> Option<char> {
+    if !matches!(status, WorkspaceStatus::Ready) || !ui.workspace_sidebar.uses_default_footer() {
+        return None;
+    }
+    let content = sidebar_content(area, position)?;
+    if column < content.x || column >= content.right() {
+        return None;
+    }
+    let header = render_sidebar_chrome(&ui.workspace_sidebar.header, model, Some(status), ui);
+    let header_height = if header.spans.is_empty() || content.height <= SIDEBAR_HEADER_HEIGHT {
+        0
+    } else {
+        SIDEBAR_HEADER_HEIGHT
+    };
+    if content.height < 5 {
+        return None;
+    }
+    let footer_height = 3_u16.min(content.height.saturating_sub(header_height + 1));
+    let footer_y = content.bottom().saturating_sub(footer_height);
+    if row < footer_y || row >= content.bottom() {
+        return None;
+    }
+    ['h', 'm', '?'].get(usize::from(row - footer_y)).copied()
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "hit testing uses the renderer's complete configurable geometry"
+)]
+fn workspace_item_at<'a>(
+    model: &'a WorkspaceModel,
+    selected: Option<WorkspaceId>,
+    status: Option<&WorkspaceStatus>,
+    area: Rect,
+    position: WorkspaceSidebarPosition,
+    ui: &UiConfig,
+    column: u16,
+    row: u16,
+) -> Option<&'a WorkspaceItem> {
+    let content = sidebar_content(area, position)?;
+    if column < content.x || column >= content.right() || row < content.y || row >= content.bottom()
+    {
+        return None;
+    }
+    let header = render_sidebar_chrome(&ui.workspace_sidebar.header, model, status, ui);
+    let header_height = if header.spans.is_empty() || content.height <= SIDEBAR_HEADER_HEIGHT {
+        0
+    } else {
+        SIDEBAR_HEADER_HEIGHT
+    };
+    let footer_lines = render_sidebar_footer(model, status, false, ui);
+    let footer_allowed = status
+        .is_none_or(|status| content.height >= 5 || !matches!(status, WorkspaceStatus::Ready));
+    let urgent_footer = matches!(
+        status,
+        Some(WorkspaceStatus::Switching | WorkspaceStatus::Error(_))
+    );
+    let footer_capacity = if urgent_footer {
+        content.height
+    } else {
+        content.height.saturating_sub(header_height + 1)
+    };
+    let footer_height = if footer_allowed && (content.height >= 2 || urgent_footer) {
+        u16::try_from(footer_lines.len().min(usize::from(footer_capacity))).unwrap_or(u16::MAX)
+    } else {
+        0
+    };
+    let rows_y = content.y.saturating_add(header_height);
+    let rows_height = content.height.saturating_sub(header_height + footer_height);
+    if row < rows_y || row >= rows_y.saturating_add(rows_height) {
+        return None;
+    }
+    let item_height = if ui.workspace_sidebar.row.detail.is_empty() {
+        1
+    } else {
+        2
+    };
+    let anchor = selected
+        .and_then(|id| model.items.iter().position(|item| item.id == id))
+        .or_else(|| model.items.iter().position(|item| item.current))
+        .unwrap_or(0);
+    let mut y = rows_y;
+    for visible in visible_rows_with_item_height(
+        model.items.len(),
+        anchor,
+        usize::from(rows_height),
+        item_height,
+    ) {
+        match visible {
+            VisibleRow::Ellipsis => y = y.saturating_add(1),
+            VisibleRow::Item(index) => {
+                let height = u16::try_from(item_height).unwrap_or(u16::MAX);
+                if row >= y && row < y.saturating_add(height) {
+                    return model.items.get(index).filter(|item| !item.closing);
+                }
+                y = y.saturating_add(height);
+            }
+        }
+    }
+    None
+}
+
+fn sidebar_content(area: Rect, position: WorkspaceSidebarPosition) -> Option<Rect> {
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    if area.width == 1 {
+        return Some(area);
+    }
+    Some(match position {
+        WorkspaceSidebarPosition::Left => Rect::new(area.x, area.y, area.width - 1, area.height),
+        WorkspaceSidebarPosition::Right => Rect::new(
+            area.x.saturating_add(1),
+            area.y,
+            area.width - 1,
+            area.height,
+        ),
+    })
 }
 
 #[allow(
@@ -1444,6 +1673,75 @@ mod tests {
         assert_eq!(
             fallback.items[1].destination,
             Some(snapshot.sessions[0].workspaces[1].tabs[0].panes[0].id)
+        );
+    }
+
+    #[test]
+    fn clicks_activate_expanded_and_minimized_workspaces() {
+        let (snapshot, focused) = fixture(&["main", "feature"], 0);
+        let mut state = WorkspaceSidebarState::open(
+            &snapshot,
+            &focused,
+            &NavigationHistory::default(),
+            &NotificationState::default(),
+        )
+        .unwrap();
+        let feature_pane = snapshot.sessions[0].workspaces[1].tabs[0].panes[0].id;
+        let area = Rect::new(0, 0, 28, 24);
+        assert_eq!(
+            state.passive_click(
+                area,
+                WorkspaceSidebarPosition::Left,
+                &UiConfig::default(),
+                5,
+                5,
+            ),
+            WorkspaceSidebarAction::Select(feature_pane)
+        );
+
+        assert_eq!(
+            state.click(
+                area,
+                WorkspaceSidebarPosition::Left,
+                &UiConfig::default(),
+                5,
+                21,
+            ),
+            WorkspaceSidebarAction::CycleVisibility
+        );
+        assert_eq!(
+            state.click(
+                area,
+                WorkspaceSidebarPosition::Left,
+                &UiConfig::default(),
+                5,
+                22,
+            ),
+            WorkspaceSidebarAction::ToggleDisplay
+        );
+        assert_eq!(
+            state.click(
+                area,
+                WorkspaceSidebarPosition::Left,
+                &UiConfig::default(),
+                5,
+                23,
+            ),
+            WorkspaceSidebarAction::Stay
+        );
+        assert!(state.help);
+
+        let mut minimized = UiConfig::default();
+        minimized.workspace_sidebar.display = WorkspaceSidebarDisplay::Minimized;
+        assert_eq!(
+            state.passive_click(
+                Rect::new(0, 0, 5, 24),
+                WorkspaceSidebarPosition::Left,
+                &minimized,
+                2,
+                4,
+            ),
+            WorkspaceSidebarAction::Select(feature_pane)
         );
     }
 

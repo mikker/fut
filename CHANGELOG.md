@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Tabs and workspaces can now be activated directly with a left mouse click, and workspace settings can be cycled by clicking their hotkey legend.
+
 ## 0.6
 
 - Refined the global navigator hierarchy with inline single-pane tabs and resource-scoped filtered breadcrumbs.
