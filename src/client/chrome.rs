@@ -18,6 +18,7 @@ use super::{
         GroupConfig, MINIMIZED_SIDEBAR_WIDTH, SemanticStyle, TabBarPosition, UiConfig,
         WorkspaceSidebarDisplay, WorkspaceSidebarPosition, WorkspaceSidebarVisibility,
     },
+    hotkey::{HotkeyButton, HotkeyLine},
     notifications::{ActivityIndicator, NotificationState},
     presentation::{ItemState, TokenValue, apply_item_state, render_token_segments, truncate_line},
 };
@@ -309,9 +310,23 @@ struct ResolvedGroup {
     lane: Lane,
     line: Line<'static>,
     tabs: bool,
+    hotkeys: bool,
     style: Option<SemanticStyle>,
     priority: u8,
     allocation: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum TabBarHotkey {
+    Create,
+    Rename,
+    Close,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum TabBarHit {
+    Item(TabId),
+    Hotkey(TabBarHotkey),
 }
 
 #[allow(
@@ -412,9 +427,10 @@ pub(super) fn render_tab_bar(
     clippy::too_many_arguments,
     reason = "hit testing must use the same configurable tab geometry as rendering"
 )]
-pub(super) fn tab_bar_item_at(
+pub(super) fn tab_bar_hit_at(
     snapshot: &ResourceSnapshot,
     focused: &SelectedTarget,
+    zoomed: bool,
     selected: Option<TabId>,
     notifications: &NotificationState,
     spinner_frame: usize,
@@ -422,13 +438,13 @@ pub(super) fn tab_bar_item_at(
     area: Rect,
     column: u16,
     row: u16,
-) -> Option<TabId> {
+) -> Option<TabBarHit> {
     if row != area.y || column < area.x || column >= area.right() {
         return None;
     }
     let model = TabBarModel::from_snapshot(snapshot, focused, notifications)?;
     let width = usize::from(area.width);
-    let mut groups = resolved_groups(&model, false, selected, spinner_frame, ui);
+    let mut groups = resolved_groups(&model, zoomed, selected, spinner_frame, ui);
     allocate_groups(&mut groups, width);
     let lane_width = |lane| {
         groups
@@ -452,16 +468,33 @@ pub(super) fn tab_bar_item_at(
         (Lane::Right, width.saturating_sub(right_width)),
     ] {
         for group in groups.iter().filter(|group| group.lane == lane) {
-            if group.tabs && clicked >= x && clicked < x + group.allocation {
-                return visible_tab_at(
-                    &model,
-                    selected,
-                    group.allocation,
-                    group.style,
-                    spinner_frame,
-                    ui,
-                    clicked - x,
-                );
+            if clicked >= x && clicked < x + group.allocation {
+                if group.tabs
+                    && let Some(tab) = visible_tab_at(
+                        &model,
+                        selected,
+                        group.allocation,
+                        group.style,
+                        spinner_frame,
+                        ui,
+                        clicked - x,
+                    )
+                {
+                    return Some(TabBarHit::Item(tab));
+                }
+                if group.hotkeys {
+                    let hotkeys = tab_bar_hotkeys(group.style, ui);
+                    let rendered = group.line.to_string();
+                    let needle = hotkeys.line.to_string();
+                    if let Some(byte_offset) = rendered.find(&needle) {
+                        let cell_offset = UnicodeWidthStr::width(&rendered[..byte_offset]);
+                        if let Some(action) =
+                            hotkeys.action_at(clicked.saturating_sub(x + cell_offset))
+                        {
+                            return Some(TabBarHit::Hotkey(action));
+                        }
+                    }
+                }
             }
             x += group.allocation;
         }
@@ -487,6 +520,10 @@ fn resolved_groups(
                 .segments
                 .iter()
                 .any(|segment| segment.component.as_deref() == Some("tabs"));
+            let hotkeys = group
+                .segments
+                .iter()
+                .any(|segment| segment.token.as_deref() == Some("client.help"));
             let line = if tabs {
                 selected_line(
                     model,
@@ -505,6 +542,7 @@ fn resolved_groups(
                     lane,
                     line,
                     tabs,
+                    hotkeys,
                     style: group.style,
                     priority: group.priority,
                     allocation: 0,
@@ -539,7 +577,9 @@ fn render_bar_group(
             "tab.index" => TokenValue::plain((model.active + 1).to_string()),
             "tab.pane_count" => TokenValue::plain(active.pane_count.to_string()),
             "client.zoom" if zoomed => TokenValue::plain(icons.zoom.clone()),
-            "client.help" if selected.is_some() => TokenValue::plain("c new · r rename · esc "),
+            "client.help" if selected.is_some() => {
+                TokenValue::plain(tab_bar_hotkeys(group.style, ui).line.to_string())
+            }
             "client.waiting" if model.client_waiting > 0 => TokenValue::styled(
                 format!("• {}", model.client_waiting),
                 SemanticStyle::Attention,
@@ -554,6 +594,25 @@ fn render_bar_group(
             ),
             _ => TokenValue::plain(model.extension_value(token)),
         },
+    )
+}
+
+fn tab_bar_hotkeys(group_style: Option<SemanticStyle>, ui: &UiConfig) -> HotkeyLine<TabBarHotkey> {
+    let mut style = ui.styles.apply(SemanticStyle::Normal, Style::default());
+    if let Some(role) = group_style {
+        style = ui.styles.apply(role, style);
+    }
+    HotkeyLine::inline(
+        &[
+            HotkeyButton::new("c", "new", TabBarHotkey::Create),
+            HotkeyButton::new("r", "rename", TabBarHotkey::Rename),
+            HotkeyButton::new("esc", "", TabBarHotkey::Close),
+        ],
+        "",
+        " · ",
+        " ",
+        style,
+        style,
     )
 }
 
@@ -1298,6 +1357,7 @@ mod tests {
                     lane: Lane::Left,
                     line: Line::raw("tabs preferred content"),
                     tabs: true,
+                    hotkeys: false,
                     style: None,
                     priority: 100,
                     allocation: 0,
@@ -1306,6 +1366,7 @@ mod tests {
                     lane: Lane::Center,
                     line: Line::raw("CENTER"),
                     tabs: false,
+                    hotkeys: false,
                     style: None,
                     priority: 20,
                     allocation: 0,
@@ -1314,6 +1375,7 @@ mod tests {
                     lane: Lane::Right,
                     line: Line::raw("ZOOM"),
                     tabs: false,
+                    hotkeys: false,
                     style: None,
                     priority: 255,
                     allocation: 0,

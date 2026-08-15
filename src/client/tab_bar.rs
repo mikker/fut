@@ -9,7 +9,7 @@ use crate::{
 
 use super::config::UiConfig;
 use super::{
-    chrome::{render_tab_bar, tab_bar_item_at},
+    chrome::{TabBarHit, TabBarHotkey, render_tab_bar, tab_bar_hit_at},
     navigation::NavigationHistory,
     notifications::NotificationState,
 };
@@ -152,6 +152,7 @@ impl TabBarState {
         &self,
         snapshot: &ResourceSnapshot,
         focused: &SelectedTarget,
+        zoomed: bool,
         ui: &UiConfig,
         notifications: &NotificationState,
         spinner_frame: usize,
@@ -159,9 +160,10 @@ impl TabBarState {
         column: u16,
         row: u16,
     ) -> TabBarAction {
-        let Some(id) = tab_bar_item_at(
+        let Some(hit) = tab_bar_hit_at(
             snapshot,
             focused,
+            zoomed,
             self.selected,
             notifications,
             spinner_frame,
@@ -172,19 +174,31 @@ impl TabBarState {
         ) else {
             return TabBarAction::Stay;
         };
-        let Some(item) = self
-            .items
-            .iter()
-            .find(|item| item.id == id && !item.closing)
-        else {
-            return TabBarAction::Stay;
-        };
-        if item.id == self.focused_tab {
-            TabBarAction::Close
-        } else {
-            item.destination
-                .map(TabBarAction::Select)
-                .unwrap_or(TabBarAction::Stay)
+        match hit {
+            TabBarHit::Hotkey(hotkey) => match hotkey {
+                TabBarHotkey::Create => TabBarAction::Create,
+                TabBarHotkey::Rename => self
+                    .selected_item()
+                    .map(|item| TabBarAction::Rename(item.id, item.name.clone()))
+                    .unwrap_or(TabBarAction::Stay),
+                TabBarHotkey::Close => TabBarAction::Close,
+            },
+            TabBarHit::Item(id) => {
+                let Some(item) = self
+                    .items
+                    .iter()
+                    .find(|item| item.id == id && !item.closing)
+                else {
+                    return TabBarAction::Stay;
+                };
+                if item.id == self.focused_tab {
+                    TabBarAction::Close
+                } else {
+                    item.destination
+                        .map(TabBarAction::Select)
+                        .unwrap_or(TabBarAction::Stay)
+                }
+            }
         }
     }
 
@@ -425,6 +439,7 @@ mod tests {
                 state.click(
                     &snapshot,
                     &focused,
+                    false,
                     &UiConfig::default(),
                     &NotificationState::default(),
                     0,
@@ -436,6 +451,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(actions.contains(&TabBarAction::Close));
         assert!(actions.contains(&TabBarAction::Select(second_pane)));
+        assert!(actions.contains(&TabBarAction::Create));
+        assert!(actions.contains(&TabBarAction::Rename(focused.tab_id, "shell".into())));
     }
 
     #[test]

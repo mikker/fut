@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Tabs and workspaces can now be activated directly with a left mouse click, and workspace settings can be cycled by clicking their hotkey legend.
+- Tabs and workspaces can now be activated directly with a left mouse click, and displayed tab and workspace hotkeys can be clicked like buttons.
 
 ## 0.6
 

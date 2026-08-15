@@ -18,6 +18,7 @@ use super::{
         IconPreset, SemanticStyle, UiConfig, WorkspaceSidebarDisplay, WorkspaceSidebarPosition,
         WorkspaceSidebarVisibility,
     },
+    hotkey::{HotkeyButton, HotkeyLine},
     navigation::NavigationHistory,
     notifications::{ActivityIndicator, NotificationState},
     presentation::{ItemState, TokenValue, apply_item_state, render_token_segments, truncate_line},
@@ -174,6 +175,14 @@ enum WorkspaceStatus {
     Ready,
     Switching,
     Error(String),
+}
+
+#[derive(Clone, Copy)]
+enum WorkspaceHotkey {
+    CycleVisibility,
+    ToggleDisplay,
+    OpenHelp,
+    Back,
 }
 
 pub(super) struct WorkspaceSidebarState {
@@ -356,21 +365,34 @@ impl WorkspaceSidebarState {
         column: u16,
         row: u16,
     ) -> WorkspaceSidebarAction {
-        if self.help || matches!(self.status, WorkspaceStatus::Switching) {
+        if matches!(self.status, WorkspaceStatus::Switching) {
             return WorkspaceSidebarAction::Stay;
         }
-        if let Some(hotkey) =
-            workspace_hotkey_at(&self.model, &self.status, area, position, ui, column, row)
-        {
+        if let Some(hotkey) = workspace_hotkey_at(
+            &self.model,
+            &self.status,
+            self.help,
+            area,
+            position,
+            ui,
+            column,
+            row,
+        ) {
             return match hotkey {
-                'h' => WorkspaceSidebarAction::CycleVisibility,
-                'm' => WorkspaceSidebarAction::ToggleDisplay,
-                '?' => {
+                WorkspaceHotkey::CycleVisibility => WorkspaceSidebarAction::CycleVisibility,
+                WorkspaceHotkey::ToggleDisplay => WorkspaceSidebarAction::ToggleDisplay,
+                WorkspaceHotkey::OpenHelp => {
                     self.help = true;
                     WorkspaceSidebarAction::Stay
                 }
-                _ => unreachable!("workspace legend only exposes known hotkeys"),
+                WorkspaceHotkey::Back => {
+                    self.help = false;
+                    WorkspaceSidebarAction::Stay
+                }
             };
+        }
+        if self.help {
+            return WorkspaceSidebarAction::Stay;
         }
         workspace_item_at(
             &self.model,
@@ -526,13 +548,18 @@ impl WorkspaceSidebarState {
 fn workspace_hotkey_at(
     model: &WorkspaceModel,
     status: &WorkspaceStatus,
+    help: bool,
     area: Rect,
     position: WorkspaceSidebarPosition,
     ui: &UiConfig,
     column: u16,
     row: u16,
-) -> Option<char> {
-    if !matches!(status, WorkspaceStatus::Ready) || !ui.workspace_sidebar.uses_default_footer() {
+) -> Option<WorkspaceHotkey> {
+    if !matches!(status, WorkspaceStatus::Ready) {
+        return None;
+    }
+    let lines = workspace_hotkey_lines(help, ui);
+    if lines.is_empty() {
         return None;
     }
     let content = sidebar_content(area, position)?;
@@ -548,12 +575,16 @@ fn workspace_hotkey_at(
     if content.height < 5 {
         return None;
     }
-    let footer_height = 3_u16.min(content.height.saturating_sub(header_height + 1));
+    let footer_height = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .min(content.height.saturating_sub(header_height + 1));
     let footer_y = content.bottom().saturating_sub(footer_height);
     if row < footer_y || row >= content.bottom() {
         return None;
     }
-    ['h', 'm', '?'].get(usize::from(row - footer_y)).copied()
+    lines
+        .get(usize::from(row - footer_y))?
+        .action_at(usize::from(column - content.x))
 }
 
 #[allow(
@@ -952,18 +983,14 @@ fn render_sidebar_footer(
     help: bool,
     ui: &UiConfig,
 ) -> Vec<Line<'static>> {
-    if help {
-        return vec![Line::from(Span::styled(
-            " esc back",
-            ui.styles.apply(
-                SemanticStyle::Muted,
-                ui.styles.apply(SemanticStyle::Normal, Style::default()),
-            ),
-        ))];
-    }
-    if matches!(status, Some(WorkspaceStatus::Ready)) && ui.workspace_sidebar.uses_default_footer()
+    if help
+        || matches!(status, Some(WorkspaceStatus::Ready))
+            && ui.workspace_sidebar.uses_default_footer()
     {
-        return render_sidebar_hotkeys(ui);
+        return workspace_hotkey_lines(help, ui)
+            .into_iter()
+            .map(|hotkey| hotkey.line)
+            .collect();
     }
     let footer = render_sidebar_chrome(&ui.workspace_sidebar.footer, model, status, ui);
     (!footer.spans.is_empty())
@@ -972,7 +999,22 @@ fn render_sidebar_footer(
         .collect()
 }
 
-fn render_sidebar_hotkeys(ui: &UiConfig) -> Vec<Line<'static>> {
+fn workspace_hotkey_lines(help: bool, ui: &UiConfig) -> Vec<HotkeyLine<WorkspaceHotkey>> {
+    let normal = ui.styles.apply(SemanticStyle::Normal, Style::default());
+    let muted = ui.styles.apply(SemanticStyle::Muted, normal);
+    if help {
+        return vec![HotkeyLine::inline(
+            &[HotkeyButton::new("esc", "back", WorkspaceHotkey::Back)],
+            " ",
+            "",
+            "",
+            normal,
+            muted,
+        )];
+    }
+    if !ui.workspace_sidebar.uses_default_footer() {
+        return Vec::new();
+    }
     let nerd_font = ui.icons.preset == IconPreset::NerdFont;
     let visibility_icon = if nerd_font {
         match ui.workspace_sidebar.visibility {
@@ -993,37 +1035,29 @@ fn render_sidebar_hotkeys(ui: &UiConfig) -> Vec<Line<'static>> {
     };
     [
         (
-            "h",
+            HotkeyButton::new(
+                "h",
+                ui.workspace_sidebar.visibility.label(),
+                WorkspaceHotkey::CycleVisibility,
+            ),
             visibility_icon,
-            ui.workspace_sidebar.visibility.label(),
         ),
-        ("m", display_icon, ui.workspace_sidebar.display.label()),
-        ("?", if nerd_font { "󰘥" } else { "" }, "hotkeys"),
+        (
+            HotkeyButton::new(
+                "m",
+                ui.workspace_sidebar.display.label(),
+                WorkspaceHotkey::ToggleDisplay,
+            ),
+            display_icon,
+        ),
+        (
+            HotkeyButton::new("?", "hotkeys", WorkspaceHotkey::OpenHelp),
+            if nerd_font { "󰘥" } else { "" },
+        ),
     ]
     .into_iter()
-    .map(|(key, icon, label)| render_sidebar_hotkey(key, icon, label, ui))
+    .map(|(button, icon)| HotkeyLine::row(&button, icon, normal, muted))
     .collect()
-}
-
-fn render_sidebar_hotkey(
-    key: &'static str,
-    icon: &'static str,
-    label: &'static str,
-    ui: &UiConfig,
-) -> Line<'static> {
-    let normal = ui.styles.apply(SemanticStyle::Normal, Style::default());
-    let muted = ui.styles.apply(SemanticStyle::Muted, normal);
-    let icon = (!icon.is_empty()).then(|| Span::styled(format!("{icon}  "), muted));
-    Line::from(
-        [
-            Some(Span::styled(format!(" {key}  "), normal)),
-            icon,
-            Some(Span::styled(label, muted)),
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>(),
-    )
 }
 
 fn render_sidebar_frame(
@@ -1730,6 +1764,17 @@ mod tests {
             WorkspaceSidebarAction::Stay
         );
         assert!(state.help);
+        assert_eq!(
+            state.click(
+                area,
+                WorkspaceSidebarPosition::Left,
+                &UiConfig::default(),
+                2,
+                23,
+            ),
+            WorkspaceSidebarAction::Stay
+        );
+        assert!(!state.help);
 
         let mut minimized = UiConfig::default();
         minimized.workspace_sidebar.display = WorkspaceSidebarDisplay::Minimized;
@@ -2025,16 +2070,16 @@ mod tests {
     #[test]
     fn nerd_font_footer_uses_stateful_visibility_and_display_icons() {
         let mut ui: UiConfig = toml::from_str("[icons]\npreset = 'nerd_font'\n").unwrap();
-        let lines = render_sidebar_hotkeys(&ui);
-        assert_eq!(lines[0].spans[1].content, "󱥼  ");
-        assert_eq!(lines[1].spans[1].content, "󰡎  ");
-        assert_eq!(lines[2].spans[1].content, "󰘥  ");
+        let lines = workspace_hotkey_lines(false, &ui);
+        assert_eq!(lines[0].line.spans[1].content, "󱥼  ");
+        assert_eq!(lines[1].line.spans[1].content, "󰡎  ");
+        assert_eq!(lines[2].line.spans[1].content, "󰘥  ");
 
         ui.workspace_sidebar.visibility = WorkspaceSidebarVisibility::Hidden;
         ui.workspace_sidebar.display = WorkspaceSidebarDisplay::Minimized;
-        let lines = render_sidebar_hotkeys(&ui);
-        assert_eq!(lines[0].spans[1].content, "󰈉  ");
-        assert_eq!(lines[1].spans[1].content, "󰡌  ");
+        let lines = workspace_hotkey_lines(false, &ui);
+        assert_eq!(lines[0].line.spans[1].content, "󰈉  ");
+        assert_eq!(lines[1].line.spans[1].content, "󰡌  ");
     }
 
     #[test]

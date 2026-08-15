@@ -9,6 +9,7 @@ mod copy_mode;
 mod dialog;
 mod fuzzy;
 mod graphics;
+mod hotkey;
 pub(crate) mod input;
 mod layout;
 mod navigation;
@@ -1436,6 +1437,7 @@ async fn run(
                                         tab_bar.click(
                                             snapshot,
                                             view.focused(),
+                                            view.is_zoomed(),
                                             &ui,
                                             resources.notifications(),
                                             spinner_frame,
@@ -1447,6 +1449,7 @@ async fn run(
                                         TabBarState::open(snapshot, view.focused(), &workspace_history)?.click(
                                             snapshot,
                                             view.focused(),
+                                            view.is_zoomed(),
                                             &ui,
                                             resources.notifications(),
                                             spinner_frame,
@@ -1497,6 +1500,28 @@ async fn run(
                                             },
                                         ).await?;
                                     }
+                                }
+                                UiActivation::Tab(TabBarAction::Create) => {
+                                    if let Some(request) = create_tab.begin() {
+                                        send_request(
+                                            framed,
+                                            Some(request),
+                                            ClientMessage::CreateTab {
+                                                workspace_id: view.focused().workspace_id,
+                                                name: None,
+                                                cwd: None,
+                                                program: None,
+                                                argv: Vec::new(),
+                                            },
+                                        ).await?;
+                                    }
+                                }
+                                UiActivation::Tab(TabBarAction::Rename(tab_id, name)) => {
+                                    rename = Some(RenameState::open(
+                                        crate::protocol::RenameSelector::Tab(tab_id),
+                                        "tab",
+                                        name,
+                                    ));
                                 }
                                 UiActivation::Workspace(WorkspaceSidebarAction::CycleVisibility) => {
                                     ui.workspace_sidebar.visibility.cycle();
