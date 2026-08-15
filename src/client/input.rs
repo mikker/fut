@@ -1,7 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 #[cfg(test)]
-use super::actions::FocusDirection;
+use super::actions::{FocusDirection, NavigationScope};
 use super::{actions::ClientAction, config::BindingsConfig};
 
 pub(crate) fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
@@ -246,6 +246,11 @@ mod tests {
         assert_eq!(
             prefix.feed(b"\x1b[A".to_vec()),
             PrefixAction::Dispatch(ClientAction::FocusPreviousWorkspace)
+        );
+        assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
+        assert_eq!(
+            prefix.feed(vec![19]),
+            PrefixAction::Dispatch(ClientAction::FocusLast(NavigationScope::Session))
         );
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
         assert_eq!(

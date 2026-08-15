@@ -431,7 +431,7 @@ pub(super) const DIRECT_BINDINGS: [DirectBinding; 38] = [
         action: ClientAction::FocusLast(NavigationScope::Workspace),
     },
     DirectBinding {
-        suffix: b"S",
+        suffix: b"\x13",
         action: ClientAction::FocusLast(NavigationScope::Session),
     },
     DirectBinding {
@@ -548,6 +548,7 @@ pub(super) fn default_suffix(action: ClientAction) -> &'static [u8] {
 pub(super) fn parse_suffix(value: &str) -> Option<(Vec<u8>, String)> {
     let bytes = match value {
         "prefix" => b"\x02".to_vec(),
+        "ctrl-s" => b"\x13".to_vec(),
         "space" => b" ".to_vec(),
         "enter" => b"\r".to_vec(),
         "tab" => b"\t".to_vec(),
@@ -566,6 +567,7 @@ pub(super) fn parse_suffix(value: &str) -> Option<(Vec<u8>, String)> {
 pub(super) fn suffix_name(suffix: &[u8]) -> String {
     match suffix {
         b"\x02" => "Ctrl-b".into(),
+        b"\x13" => "Ctrl-s".into(),
         b" " => "Space".into(),
         b"\r" => "Enter".into(),
         b"\t" => "Tab".into(),

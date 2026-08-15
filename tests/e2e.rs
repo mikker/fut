@@ -6143,9 +6143,9 @@ async fn public_last_session_navigation_toggles_after_global_selection() {
     client.wait_for("SESSION_B_READY").await;
     client.send(b"b\n");
     wait_for(DEADLINE, || second_input.exists()).await;
-    client.send(b"\x02Sa\n");
+    client.send(b"\x02\x13a\n");
     wait_for(DEADLINE, || first_input.exists()).await;
-    client.send(b"\x02Sb\n");
+    client.send(b"\x02\x13b\n");
     wait_for(DEADLINE, || {
         fs::metadata(&second_input).is_ok_and(|metadata| metadata.len() >= 2)
     })

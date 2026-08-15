@@ -1115,7 +1115,7 @@ fn validate(ui: &UiConfig, extensions: &[Extension]) -> Result<()> {
         }
         if parse_suffix(value).is_none() {
             bail!(
-                "ui.bindings.{key} must be one character or prefix, space, enter, tab, esc, up, or down"
+                "ui.bindings.{key} must be one character or prefix, ctrl-s, space, enter, tab, esc, up, or down"
             );
         }
     }

@@ -4,6 +4,7 @@
 
 - Navigator tabs with a single pane now show the pane inline in muted text, multi-pane tabs keep separate pane rows, and filtered breadcrumbs name their resource scope.
 - The global navigator now defaults to `Ctrl-b s`, leaving `Ctrl-b g` available for custom commands.
+- `Ctrl-b Ctrl-s` now toggles between the current and last active session.
 
 ## 0.5
 
