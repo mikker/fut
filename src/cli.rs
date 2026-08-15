@@ -821,6 +821,7 @@ async fn execute(cli: Cli) -> Result<()> {
 
     let socket = socket_path(cli.socket.as_deref())?;
     reject_interactive_json(&cli)?;
+    reject_nested_client(&cli)?;
     match cli.command {
         None => {
             let cwd = std::env::current_dir().context("read current directory")?;
@@ -1804,10 +1805,28 @@ fn reject_interactive_json(cli: &Cli) -> Result<()> {
     if !cli.json {
         return Ok(());
     }
-    let interactive = cli.command.is_none()
-        || matches!(cli.command, Some(Command::Attach))
+    let interactive = attaches_client(&cli.command)
         || matches!(
             cli.command,
+            Some(Command::Daemon {
+                command: DaemonCommand::Run { .. }
+            })
+        );
+    if interactive {
+        return Err(CliError::new(
+            "invalid_arguments",
+            "--json is not supported for interactive commands",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn attaches_client(command: &Option<Command>) -> bool {
+    command.is_none()
+        || matches!(command, Some(Command::Attach))
+        || matches!(
+            command,
             Some(Command::Session {
                 command: SessionCommand::Attach { .. }
             }) | Some(Command::Workspace {
@@ -1818,14 +1837,18 @@ fn reject_interactive_json(cli: &Cli) -> Result<()> {
                 command: PaneCommand::Attach { .. }
             }) | Some(Command::Terminal {
                 command: TerminalCommand::Attach { .. }
-            }) | Some(Command::Daemon {
-                command: DaemonCommand::Run { .. }
             })
-        );
-    if interactive {
+        )
+}
+
+fn reject_nested_client(cli: &Cli) -> Result<()> {
+    if attaches_client(&cli.command)
+        && std::env::var_os("FUT_TERMINAL_ID").is_some()
+        && std::env::var_os("FUT_ALLOW_NESTED").is_none()
+    {
         return Err(CliError::new(
-            "invalid_arguments",
-            "--json is not supported for interactive commands",
+            "nested_client",
+            "clients should be nested with care, set $FUT_ALLOW_NESTED to force",
         )
         .into());
     }
@@ -3345,6 +3368,36 @@ mod tests {
         let tab = TabId::new().to_string();
         let cli = Cli::try_parse_from(["fut", "--json", "pane", "new", &tab]).unwrap();
         assert!(reject_interactive_json(&cli).is_ok());
+    }
+
+    #[test]
+    fn identifies_only_client_attaching_commands_as_clients() {
+        let session = SessionId::new().to_string();
+        let workspace = WorkspaceId::new().to_string();
+        let tab = TabId::new().to_string();
+        let pane = PaneId::new().to_string();
+        let terminal = TerminalId::new().to_string();
+        for args in [
+            vec!["fut"],
+            vec!["fut", "attach"],
+            vec!["fut", "session", "attach", &session],
+            vec!["fut", "workspace", "attach", &workspace],
+            vec!["fut", "tab", "attach", &tab],
+            vec!["fut", "pane", "attach", &pane],
+            vec!["fut", "terminal", "attach", &terminal],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(attaches_client(&cli.command));
+        }
+
+        for args in [
+            vec!["fut", "list"],
+            vec!["fut", "open"],
+            vec!["fut", "daemon", "run"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(!attaches_client(&cli.command));
+        }
     }
 
     #[test]

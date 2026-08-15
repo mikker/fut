@@ -9,6 +9,8 @@ permalink: /configuration/
 
 Fut's global presentation configuration is safe, declarative, and non-executable. Separately, `trusted_commands` and explicitly configured local extension directories are executable trust boundaries; see [Security boundary](#security-boundary). Multiple terminal windows may attach to the same session at once. They share terminal input and output, while focus, dialogs, scrollback, and configuration remain local to each client. Shared PTYs use the smallest attached client's dimensions; resizing or detaching a client immediately recalculates that geometry, and larger clients separate the shared content from its unused margin with a subtle line and sparse muted star field.
 
+Fut refuses to start or attach another interactive Fut client from inside one of its terminals. If nesting is intentional, set `FUT_ALLOW_NESTED` in the command's environment to force it, for example `FUT_ALLOW_NESTED=1 fut`.
+
 ## Location and lifecycle
 
 Fut checks, in order:
