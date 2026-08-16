@@ -3,5 +3,5 @@ id = "wt"
 [commands.new-agent-worktree]
 title = "New worktree"
 argv = ["./bin/create", "pi"]
-size = { width = 64, height = 10 }
-activate_opened = true
+# size = { width = 64, height = 10 }
+# activate_opened = true
