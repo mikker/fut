@@ -163,6 +163,7 @@ fut agent report working --source codex --agent-session-id SESSION --turn-id TUR
 fut agent report blocked --turn-id TURN
 fut agent report completed --turn-id TURN
 fut agent report idle
+fut agent report exited
 ```
 
 The terminal defaults to `FUT_TERMINAL_ID`; outside that environment pass
@@ -195,5 +196,5 @@ Install Fut's Pi extension directly from the repository:
 pi install git:github.com/mikker/fut
 ```
 
-The extension reports Pi's working, blocked, completed, and idle transitions when
-Pi runs inside Fut.
+The extension reports Pi's working, blocked, completed, idle, and exited transitions
+when Pi runs inside Fut. Exiting Pi removes that terminal from the Agents sidebar.

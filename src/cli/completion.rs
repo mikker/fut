@@ -371,7 +371,7 @@ fn candidates(snapshot: &ResourceSnapshot, operation: Operation) -> Vec<Candidat
                     }
                     if matches!(operation, Operation::Agent)
                         && pane_live
-                        && pane.activity.integration.is_some()
+                        && pane.activity.has_active_integration()
                     {
                         push(
                             &mut result,

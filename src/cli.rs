@@ -682,6 +682,7 @@ enum AgentReportArg {
     Working,
     Blocked,
     Completed,
+    Exited,
 }
 
 impl From<AgentReportArg> for AgentReport {
@@ -691,6 +692,7 @@ impl From<AgentReportArg> for AgentReport {
             AgentReportArg::Working => Self::Working,
             AgentReportArg::Blocked => Self::Blocked,
             AgentReportArg::Completed => Self::Completed,
+            AgentReportArg::Exited => Self::Exited,
         }
     }
 }
@@ -1938,7 +1940,8 @@ struct AgentReadWire<'a> {
 fn integrated_agents(snapshot: &ResourceSnapshot) -> impl Iterator<Item = AgentWire<'_>> {
     snapshot
         .pane_paths()
-        .filter_map(|path| path.pane.activity.integration.as_ref().map(|_| path.into()))
+        .filter(|path| path.pane.activity.has_active_integration())
+        .map(Into::into)
 }
 
 fn resolve_agent<'a>(
@@ -1953,7 +1956,7 @@ fn resolve_agent<'a>(
             CliError::new("not_found", format!("terminal {terminal_id} was not found")).into(),
         );
     };
-    if path.pane.activity.integration.is_none() {
+    if !path.pane.activity.has_active_integration() {
         Err(CliError::new(
             "not_an_agent",
             format!("terminal {terminal_id} has no agent integration"),
@@ -2965,7 +2968,7 @@ mod tests {
                             activity: AgentActivity {
                                 integration: Some(AgentIntegration {
                                     source: Some("codex".into()),
-                                    agent_session_id: None,
+                                    ..AgentIntegration::default()
                                 }),
                                 detection: None,
                                 state: AgentState::Blocked,
@@ -3121,6 +3124,30 @@ mod tests {
             .state = AgentState::Working;
         assert!(!resolve_agent(&snapshot, terminal_id).unwrap().available);
 
+        snapshot.sessions[0].workspaces[0].tabs[0].panes[0]
+            .activity
+            .last_event = Some(crate::domain::AgentEvent {
+            revision: 10,
+            kind: AgentReport::Exited,
+            occurred_at_ms: 1235,
+            turn_id: None,
+        });
+        snapshot.sessions[0].workspaces[0].tabs[0].panes[0]
+            .activity
+            .integration
+            .as_mut()
+            .unwrap()
+            .active = false;
+        assert!(integrated_agents(&snapshot).next().is_none());
+        let error = resolve_agent(&snapshot, terminal_id).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<CliError>().unwrap().code,
+            "not_an_agent"
+        );
+
+        snapshot.sessions[0].workspaces[0].tabs[0].panes[0]
+            .activity
+            .last_event = None;
         snapshot.sessions[0].workspaces[0].tabs[0].panes[0]
             .activity
             .integration = None;

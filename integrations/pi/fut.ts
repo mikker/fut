@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-type Report = "idle" | "working" | "blocked" | "completed";
+type Report = "idle" | "working" | "blocked" | "completed" | "exited";
 
 export default function fut(pi: ExtensionAPI) {
   const terminalId = process.env.FUT_TERMINAL_ID;
@@ -36,5 +36,5 @@ export default function fut(pi: ExtensionAPI) {
   pi.on("tool_execution_end", (event, ctx) => {
     if (event.toolName === "ask_user" && !ctx.isIdle()) return report("working", ctx);
   });
-  pi.on("session_shutdown", (_event, ctx) => report("idle", ctx));
+  pi.on("session_shutdown", (_event, ctx) => report("exited", ctx));
 }

@@ -310,6 +310,7 @@ pub enum AgentReport {
     Working,
     Blocked,
     Completed,
+    Exited,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -387,12 +388,32 @@ impl AgentReportMetadata {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgentIntegration {
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub active: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session_id: Option<String>,
+}
+
+impl Default for AgentIntegration {
+    fn default() -> Self {
+        Self {
+            active: true,
+            source: None,
+            agent_session_id: None,
+        }
+    }
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+const fn is_true(value: &bool) -> bool {
+    *value
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -450,12 +471,21 @@ fn is_zero(value: &u64) -> bool {
 }
 
 impl AgentActivity {
+    /// Whether an integration currently owns this terminal. Exited sessions
+    /// retain inactive integration metadata independently from screen-inferred
+    /// events, and a later explicit report reactivates the terminal.
+    pub fn has_active_integration(&self) -> bool {
+        self.integration
+            .as_ref()
+            .is_some_and(|integration| integration.active)
+    }
+
     pub fn attention(&self) -> Option<AgentAttention> {
         let event = self.last_event.as_ref()?;
         let kind = match event.kind {
             AgentReport::Blocked => AttentionKind::Blocked,
             AgentReport::Completed => AttentionKind::Completed,
-            AgentReport::Idle | AgentReport::Working => return None,
+            AgentReport::Idle | AgentReport::Working | AgentReport::Exited => return None,
         };
         Some(AgentAttention {
             revision: event.revision,

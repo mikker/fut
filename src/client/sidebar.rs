@@ -103,7 +103,7 @@ fn focused_ancestry(snapshot: &ResourceSnapshot, focused: &SelectedTarget) -> Fo
 
 fn agent_path_in_scope(path: PanePathRef<'_>, focused: FocusedAncestry, scope: AgentScope) -> bool {
     path_is_live(path)
-        && path.pane.activity.integration.is_some()
+        && path.pane.activity.has_active_integration()
         && match scope {
             AgentScope::Tab => path.tab.id == focused.tab_id,
             AgentScope::Workspace => path.workspace.id == focused.workspace_id,
@@ -2383,7 +2383,7 @@ mod tests {
         pane.activity = AgentActivity {
             integration: Some(AgentIntegration {
                 source: Some(source.into()),
-                agent_session_id: None,
+                ..AgentIntegration::default()
             }),
             detection: None,
             state,

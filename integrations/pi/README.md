@@ -40,10 +40,11 @@ event handler.
 
 | Fut state | Authoritative Pi evidence |
 | --- | --- |
-| `idle` | `session_start`; `session_shutdown` |
+| `idle` | `session_start` |
 | `working` | `agent_start`; end of an `ask_user` tool while Pi is still active |
 | `blocked` | start of an `ask_user` tool execution |
 | `completed` | `agent_settled`, after retries, compaction retries, and queued continuations are exhausted |
+| `exited` | `session_shutdown` |
 
 Every report includes `source=pi`, the explicit Fut terminal ID, and Pi's
 `SessionManager.getSessionId()` value as the agent session ID. Pi exposes a

@@ -79,7 +79,7 @@ test("reports the complete lifecycle in native event order", async () => {
 
   assert.deepEqual(
     testHarness.calls.map(({ args }) => args[2]),
-    ["idle", "working", "blocked", "working", "completed", "idle"],
+    ["idle", "working", "blocked", "working", "completed", "exited"],
   );
   for (const call of testHarness.calls) {
     assert.equal(call.command, "fut");

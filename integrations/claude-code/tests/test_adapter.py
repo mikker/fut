@@ -35,7 +35,7 @@ def test_plugin_shape_and_mapping():
         ],
         "Stop": [(None, "completed")],
         "StopFailure": [(None, "blocked")],
-        "SessionEnd": [(None, "idle")],
+        "SessionEnd": [(None, "exited")],
     }
     actual = {}
     for event in config["hooks"]:

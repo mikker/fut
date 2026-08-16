@@ -128,7 +128,7 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/scripts/report.sh",
-            "args": ["idle"],
+            "args": ["exited"],
             "timeout": 2
           }
         ]

@@ -1593,7 +1593,7 @@ async fn refresh_process_names(
         let integrated = state
             .resources
             .agent_activity(terminal_id)
-            .is_ok_and(|activity| activity.integration.is_some());
+            .is_ok_and(crate::domain::AgentActivity::has_active_integration);
         if integrated {
             codex.remove(&terminal_id);
             continue;
@@ -5249,7 +5249,7 @@ async fn prompt_agent(
             .resources
             .resolve_terminal_target(Some(TargetSelector::Terminal(terminal_id)))?;
         let activity = state.resources.agent_activity(terminal_id)?;
-        if activity.integration.is_none() {
+        if !activity.has_active_integration() {
             return Err(DaemonError::new(
                 "not_an_agent",
                 format!("terminal {terminal_id} has no agent integration"),
@@ -5316,7 +5316,7 @@ async fn wait_agent(
             .resources
             .resolve_terminal_target(Some(TargetSelector::Terminal(terminal_id)))?;
         let activity = state.resources.agent_activity(terminal_id)?.clone();
-        if activity.integration.is_none() {
+        if !activity.has_active_integration() {
             return Err(DaemonError::new(
                 "not_an_agent",
                 format!("terminal {terminal_id} has no agent integration"),
@@ -5372,6 +5372,12 @@ async fn wait_for_agent_events(
                 Ok(update) if update.activity.revision <= barrier_revision => {}
                 Ok(update) => {
                     let Some(event) = update.activity.last_event.as_ref() else { continue };
+                    if event.kind == AgentReport::Exited {
+                        return Err(DaemonError::new(
+                            "agent_exited",
+                            format!("agent {terminal_id} exited before it settled"),
+                        ));
+                    }
                     if event.kind == AgentReport::Working {
                         working_revision = Some(event.revision);
                         continue;

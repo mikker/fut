@@ -47,10 +47,11 @@ the common hook input, so the adapter does not invent one.
 
 | Fut state | Authoritative Claude Code evidence |
 | --- | --- |
-| `idle` | `SessionStart` for startup, resume, clear, or fork; `SessionEnd` |
+| `idle` | `SessionStart` for startup, resume, clear, or fork |
 | `working` | `UserPromptSubmit`; `PostToolUse`; `PostToolUseFailure`; `PermissionDenied`; `ElicitationResult` |
 | `blocked` | `Notification` with `permission_prompt`, `elicitation_dialog`, or `agent_needs_input`; `StopFailure` |
 | `completed` | `Stop`; `Notification` with `idle_prompt` |
+| `exited` | `SessionEnd` |
 
 These events and inputs come from the official
 [Hooks reference](https://code.claude.com/docs/en/hooks): `UserPromptSubmit`

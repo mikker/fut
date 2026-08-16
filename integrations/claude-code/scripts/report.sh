@@ -5,7 +5,7 @@
 
 state=${1-}
 case "$state" in
-  idle|working|blocked|completed) ;;
+  idle|working|blocked|completed|exited) ;;
   *) exit 0 ;;
 esac
 

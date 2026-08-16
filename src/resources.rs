@@ -981,7 +981,7 @@ impl ResourceTree {
             .get_mut(&pane_id)
             .expect("terminal pane exists")
             .activity;
-        if activity.integration.is_some()
+        if activity.has_active_integration()
             || (activity.detection == detection && activity.state == state)
         {
             return Ok(self.revision);
@@ -1091,6 +1091,7 @@ impl ResourceTree {
         let integration = activity
             .integration
             .get_or_insert_with(AgentIntegration::default);
+        integration.active = report != AgentReport::Exited;
         activity.detection = None;
         if metadata.source.is_some() {
             integration.source.clone_from(&metadata.source);
@@ -1101,7 +1102,7 @@ impl ResourceTree {
                 .clone_from(&metadata.agent_session_id);
         }
         activity.state = match report {
-            AgentReport::Idle | AgentReport::Completed => AgentState::Idle,
+            AgentReport::Idle | AgentReport::Completed | AgentReport::Exited => AgentState::Idle,
             AgentReport::Working => AgentState::Working,
             AgentReport::Blocked => AgentState::Blocked,
         };
@@ -3030,6 +3031,90 @@ mod tests {
             AgentReport::Blocked
         );
     }
+
+    #[test]
+    fn exited_agent_integration_becomes_inactive_until_the_next_report() {
+        let mut tree = ResourceTree::default();
+        let path = initial("agent", "/agent");
+        let terminal_id = path.terminal_id;
+        tree.create_session(path).unwrap();
+
+        tree.report_agent_with_metadata(
+            terminal_id,
+            AgentReport::Idle,
+            AgentReportMetadata {
+                source: Some("pi".into()),
+                agent_session_id: Some("session-1".into()),
+                turn_id: None,
+            },
+            10,
+        )
+        .unwrap();
+        assert!(
+            tree.agent_activity(terminal_id)
+                .unwrap()
+                .has_active_integration()
+        );
+
+        tree.report_agent(terminal_id, AgentReport::Exited, 20)
+            .unwrap();
+        let exited = tree.agent_activity(terminal_id).unwrap();
+        assert!(!exited.has_active_integration());
+        assert_eq!(exited.state, AgentState::Idle);
+        assert_eq!(
+            exited.last_event.as_ref().unwrap().kind,
+            AgentReport::Exited
+        );
+        assert_eq!(
+            exited.integration.as_ref().unwrap().source.as_deref(),
+            Some("pi")
+        );
+
+        tree.update_agent_detection(
+            terminal_id,
+            Some(AgentDetection {
+                agent: "codex".into(),
+                rule: "working_indicator".into(),
+            }),
+            AgentState::Working,
+            25,
+        )
+        .unwrap();
+        tree.update_agent_detection(
+            terminal_id,
+            Some(AgentDetection {
+                agent: "codex".into(),
+                rule: "idle_fallback".into(),
+            }),
+            AgentState::Idle,
+            26,
+        )
+        .unwrap();
+        assert!(matches!(
+            tree.agent_activity(terminal_id)
+                .unwrap()
+                .last_event
+                .as_ref()
+                .map(|event| event.kind),
+            Some(AgentReport::Completed)
+        ));
+        assert!(
+            !tree
+                .agent_activity(terminal_id)
+                .unwrap()
+                .has_active_integration(),
+            "screen inference must not reactivate exited integration metadata"
+        );
+
+        tree.report_agent(terminal_id, AgentReport::Idle, 30)
+            .unwrap();
+        assert!(
+            tree.agent_activity(terminal_id)
+                .unwrap()
+                .has_active_integration()
+        );
+    }
+
     fn assert_valid<T>(tree: &ResourceTree, result: &Result<T, ResourceError>) {
         tree.validate().unwrap();
         if result.is_err() {
