@@ -6,6 +6,12 @@ zig = "0.16.0"
 [tasks.check]
 depends = ["fmt", "clippy", "test"]
 
+[tasks.build]
+run = "cargo build"
+
+[tasks."build:all"]
+run = "cargo build --all-targets --all-features"
+
 [tasks.fmt]
 run = "cargo fmt --check"
 
