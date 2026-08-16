@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added `--config-dir` for launching Fut with configuration from an alternate directory, including an empty directory for stock defaults.
 - Agent notification read status is now shared daemon-wide, and `fut agent list` reports per-agent unread state plus a total unread count for external status bars.
 - Close confirmations are now centered, can be disabled with `ui.confirm_close = false`, and closing the final successful terminal exits cleanly.
 - Tabs and workspace rows now have right-click menus for switching, creating, renaming, closing, and changing workspace display and visibility.

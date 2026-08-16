@@ -28,7 +28,7 @@ The demo builds the current binary, creates its fixture under `target/fut-demo`,
 
 `mise run journey` runs one deterministic keyboard-driven workflow in a temporary home, runtime, workspace, socket, daemon, and PTY. `mise run journey:chaos` runs a seeded state-machine variant that checks input routing and resource/layout invariants after every action. Reproduce or extend a run with `FUT_CHAOS_SEED=123` and `FUT_CHAOS_STEPS=1000`; step counts are bounded at 2,000.
 
-Interactive UI preferences are safe, non-executable global configuration. Fut reads `$XDG_CONFIG_HOME/fut/config.toml` when `XDG_CONFIG_HOME` is absolute and otherwise `~/.config/fut/config.toml`; `FUT_CONFIG` may select an explicit absolute file. Configuration controls tab-bar and workspace-row tokens, left/center/right groups, semantic styles, indexed or RGB colors, icon presets and overrides, independent sidebar slots, and pane layout. The Unicode preset is the default; Nerd Fonts are an explicit opt-in because Fut cannot reliably detect the active terminal font.
+Interactive UI preferences are safe, non-executable global configuration. Fut reads `$XDG_CONFIG_HOME/fut/config.toml` when `XDG_CONFIG_HOME` is absolute and otherwise `~/.config/fut/config.toml`; `FUT_CONFIG` may select an explicit absolute file, while `--config-dir` selects a directory containing an optional `config.toml`. Configuration controls tab-bar and workspace-row tokens, left/center/right groups, semantic styles, indexed or RGB colors, icon presets and overrides, independent sidebar slots, and pane layout. The Unicode preset is the default; Nerd Fonts are an explicit opt-in because Fut cannot reliably detect the active terminal font.
 
 ```toml
 [ui]

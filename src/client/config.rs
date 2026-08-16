@@ -1169,7 +1169,17 @@ pub(crate) struct LoadedConfig {
     pub present: bool,
 }
 
-pub(crate) fn resolve_location() -> Result<ConfigLocation> {
+pub(crate) fn resolve_location(config_dir: Option<&std::path::Path>) -> Result<ConfigLocation> {
+    if let Some(directory) = config_dir {
+        if !directory.is_absolute() {
+            bail!("--config-dir must be an absolute path");
+        }
+        return Ok(ConfigLocation {
+            path: Some(directory.join("config.toml")),
+            explicit: false,
+            source: "--config-dir",
+        });
+    }
     if let Some(path) = env::var_os("FUT_CONFIG") {
         let path = PathBuf::from(path);
         if !path.is_absolute() {
@@ -1209,8 +1219,8 @@ pub(crate) fn resolve_location() -> Result<ConfigLocation> {
     })
 }
 
-pub(super) fn load() -> Result<UiConfig> {
-    let location = resolve_location()?;
+pub(super) fn load(config_dir: Option<&std::path::Path>) -> Result<UiConfig> {
+    let location = resolve_location(config_dir)?;
     Ok(load_location(&location)?.ui)
 }
 

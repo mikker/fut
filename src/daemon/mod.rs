@@ -70,6 +70,7 @@ use path::prepare_runtime_dir;
 pub struct DaemonConfig {
     pub socket_path: PathBuf,
     pub spawn: SpawnSpec,
+    pub config_dir: Option<PathBuf>,
 }
 
 impl DaemonConfig {
@@ -81,6 +82,7 @@ impl DaemonConfig {
         env.insert("FUT_SOCKET".into(), socket_path.display().to_string());
         Self {
             socket_path,
+            config_dir: None,
             spawn: SpawnSpec {
                 id: TerminalId::new(),
                 program,
@@ -1318,7 +1320,7 @@ fn watch_attachment(
 
 /// Bind Fut's sole socket and run while at least one session is alive.
 pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
-    let config_location = global_config::resolve_location()?;
+    let config_location = global_config::resolve_location(config.config_dir.as_deref())?;
     let extensions = global_config::load_extensions_location(&config_location)?;
     let fut_bin = std::env::current_exe().context("resolve current Fut executable")?;
     let (hook_queue, hook_receiver) = crate::extensions::hook_queue();

@@ -10213,6 +10213,31 @@ fn public_doctor_is_read_only_and_json_reports_configuration_errors() {
         "doctor created state after a config error"
     );
 
+    let stock_config = root.path().join("stock-config");
+    fs::create_dir(&stock_config).unwrap();
+    let overridden = Command::new(env!("CARGO_BIN_EXE_fut"))
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", "/usr/bin:/bin")
+        .env("LANG", "en_US.UTF-8")
+        .env("TERM", "xterm-256color")
+        .env("FUT_RUNTIME_DIR", &runtime)
+        .arg("--config-dir")
+        .arg(&stock_config)
+        .args(["--json", "doctor"])
+        .output()
+        .unwrap();
+    assert!(overridden.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&overridden.stdout).unwrap();
+    let config = envelope["result"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["id"] == "config")
+        .unwrap();
+    assert_eq!(config["details"]["source"], "--config-dir");
+    assert_eq!(config["details"]["present"], false);
+
     let non_utf8 = root
         .path()
         .join(std::ffi::OsString::from_vec(b"config-\xff.toml".to_vec()));

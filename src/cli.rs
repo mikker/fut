@@ -64,6 +64,9 @@ pub struct Cli {
     /// Override the Unix socket used to contact the daemon.
     #[arg(long, global = true, value_hint = ValueHint::FilePath)]
     socket: Option<PathBuf>,
+    /// Read config.toml from this directory instead of the standard location.
+    #[arg(long, global = true, value_hint = ValueHint::DirPath)]
+    config_dir: Option<PathBuf>,
     /// Emit versioned JSON for noninteractive commands only.
     #[arg(long, global = true)]
     json: bool,
@@ -780,7 +783,7 @@ async fn run_from(args: impl IntoIterator<Item = OsString>) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let report = crate::doctor::run(&socket).await;
+        let report = crate::doctor::run(&socket, cli.config_dir.as_deref()).await;
         if json_output {
             if let Err(error) = output(true, "doctor", &report, "") {
                 render_json_error("command_failed", format!("{error:#}"));
@@ -832,12 +835,13 @@ async fn execute(cli: Cli) -> Result<()> {
     let socket = socket_path(cli.socket.as_deref())?;
     reject_interactive_json(&cli)?;
     reject_nested_client(&cli)?;
+    let config_dir = cli.config_dir.clone();
     match cli.command {
         None => {
             let cwd = std::env::current_dir().context("read current directory")?;
-            open_and_attach(&socket, cwd).await
+            open_and_attach(&socket, cwd, config_dir.as_deref()).await
         }
-        Some(Command::Attach) => client::attach_navigator(&socket).await,
+        Some(Command::Attach) => client::attach_navigator(&socket, config_dir.as_deref()).await,
         Some(Command::Open {
             path,
             name,
@@ -886,18 +890,40 @@ async fn execute(cli: Cli) -> Result<()> {
             client::attach(
                 &socket,
                 Some(TargetSelector::Session(session_selector(&session))),
+                config_dir.as_deref(),
             )
             .await
         }
         Some(Command::Workspace {
             command: WorkspaceCommand::Attach { workspace_id },
-        }) => client::attach(&socket, Some(TargetSelector::Workspace(workspace_id))).await,
+        }) => {
+            client::attach(
+                &socket,
+                Some(TargetSelector::Workspace(workspace_id)),
+                config_dir.as_deref(),
+            )
+            .await
+        }
         Some(Command::Tab {
             command: TabCommand::Attach { tab_id },
-        }) => client::attach(&socket, Some(TargetSelector::Tab(tab_id))).await,
+        }) => {
+            client::attach(
+                &socket,
+                Some(TargetSelector::Tab(tab_id)),
+                config_dir.as_deref(),
+            )
+            .await
+        }
         Some(Command::Pane {
             command: PaneCommand::Attach { pane_id },
-        }) => client::attach(&socket, Some(TargetSelector::Pane(pane_id))).await,
+        }) => {
+            client::attach(
+                &socket,
+                Some(TargetSelector::Pane(pane_id)),
+                config_dir.as_deref(),
+            )
+            .await
+        }
         Some(Command::Pane {
             command:
                 PaneCommand::New {
@@ -1280,7 +1306,14 @@ async fn execute(cli: Cli) -> Result<()> {
         }
         Some(Command::Terminal {
             command: TerminalCommand::Attach { terminal_id },
-        }) => client::attach(&socket, Some(TargetSelector::Terminal(terminal_id))).await,
+        }) => {
+            client::attach(
+                &socket,
+                Some(TargetSelector::Terminal(terminal_id)),
+                config_dir.as_deref(),
+            )
+            .await
+        }
         Some(Command::Terminal {
             command: TerminalCommand::SendText { terminal_id, text },
         }) => {
@@ -1650,6 +1683,7 @@ async fn execute(cli: Cli) -> Result<()> {
                 config.spawn.program = program.into();
                 config.spawn.argv = command[1..].to_vec();
             }
+            config.config_dir = config_dir;
             run_daemon(config).await
         }
         Some(Command::Daemon {
@@ -2319,13 +2353,18 @@ fn render_json_error(code: &str, message: impl Into<String>) {
     );
 }
 
-async fn open_and_attach(socket: &std::path::Path, cwd: PathBuf) -> Result<()> {
-    let ui = client::load_ui_config()?;
-    let selected = open_current_location(socket, &cwd).await?;
+async fn open_and_attach(
+    socket: &std::path::Path,
+    cwd: PathBuf,
+    config_dir: Option<&std::path::Path>,
+) -> Result<()> {
+    let ui = client::load_ui_config(config_dir)?;
+    let selected = open_current_location_with_config(socket, &cwd, config_dir).await?;
     client::attach_with_ui(
         socket,
         Some(TargetSelector::Terminal(selected.terminal_id)),
         ui,
+        config_dir,
     )
     .await
 }
@@ -2339,9 +2378,17 @@ pub async fn open_current_location(
     socket: &std::path::Path,
     cwd: &std::path::Path,
 ) -> Result<crate::protocol::SelectedTarget> {
+    open_current_location_with_config(socket, cwd, None).await
+}
+
+async fn open_current_location_with_config(
+    socket: &std::path::Path,
+    cwd: &std::path::Path,
+    config_dir: Option<&std::path::Path>,
+) -> Result<crate::protocol::SelectedTarget> {
     const RETRIES: usize = 2;
 
-    ensure_daemon(socket, cwd).await?;
+    ensure_daemon(socket, cwd, config_dir).await?;
     for attempt in 0..=RETRIES {
         let response = control(
             socket,
@@ -2374,7 +2421,7 @@ pub async fn open_current_location(
             );
         }
         wait_until_protocol_stops(socket).await;
-        ensure_daemon(socket, cwd).await?;
+        ensure_daemon(socket, cwd, config_dir).await?;
     }
     unreachable!()
 }

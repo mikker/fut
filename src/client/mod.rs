@@ -200,14 +200,24 @@ const PBCOPY_TIMEOUT: Duration = Duration::from_secs(2);
 const PBCOPY_REAP_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Attach an interactive full-screen client to an already-running daemon.
-pub async fn attach(socket_path: &Path, selector: Option<TargetSelector>) -> anyhow::Result<()> {
-    attach_with_ui(socket_path, selector, load_ui_config()?).await
+pub async fn attach(
+    socket_path: &Path,
+    selector: Option<TargetSelector>,
+    config_dir: Option<&Path>,
+) -> anyhow::Result<()> {
+    attach_with_ui(
+        socket_path,
+        selector,
+        load_ui_config(config_dir)?,
+        config_dir,
+    )
+    .await
 }
 
 /// Open a lease-free global navigator on an existing daemon, then attach only
 /// after the user chooses a destination.
-pub async fn attach_navigator(socket_path: &Path) -> anyhow::Result<()> {
-    let ui = load_ui_config()?;
+pub async fn attach_navigator(socket_path: &Path, config_dir: Option<&Path>) -> anyhow::Result<()> {
+    let ui = load_ui_config(config_dir)?;
     let mut navigator_connection = connect_control_navigator(socket_path).await?;
     let snapshot = match time::timeout(Duration::from_secs(2), receive(&mut navigator_connection))
         .await
@@ -232,20 +242,29 @@ pub async fn attach_navigator(socket_path: &Path) -> anyhow::Result<()> {
     let (columns, rows) = crossterm::terminal::size().context("read terminal size")?;
     let size = TerminalSize { columns, rows };
     let (mut framed, selected) = connect_interactive(socket_path, Some(selector), size).await?;
-    let result = run(&mut terminal, &mut framed, selected, ui, socket_path).await;
+    let result = run(
+        &mut terminal,
+        &mut framed,
+        selected,
+        ui,
+        socket_path,
+        config_dir,
+    )
+    .await;
     drop(terminal);
     drop(guard);
     result
 }
 
-pub(crate) fn load_ui_config() -> anyhow::Result<UiConfig> {
-    config::load()
+pub(crate) fn load_ui_config(config_dir: Option<&Path>) -> anyhow::Result<UiConfig> {
+    config::load(config_dir)
 }
 
 pub(crate) async fn attach_with_ui(
     socket_path: &Path,
     selector: Option<TargetSelector>,
     ui: UiConfig,
+    config_dir: Option<&Path>,
 ) -> anyhow::Result<()> {
     let (columns, rows) = crossterm::terminal::size().context("read terminal size")?;
     let (mut framed, selected) =
@@ -254,7 +273,15 @@ pub(crate) async fn attach_with_ui(
     // Host terminal state is changed only after a successful handshake.
     let guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let result = run(&mut terminal, &mut framed, selected, ui, socket_path).await;
+    let result = run(
+        &mut terminal,
+        &mut framed,
+        selected,
+        ui,
+        socket_path,
+        config_dir,
+    )
+    .await;
     drop(terminal);
     drop(guard);
     result
@@ -396,6 +423,7 @@ async fn run(
     selected: SelectedView,
     mut ui: UiConfig,
     socket_path: &Path,
+    config_dir: Option<&Path>,
 ) -> anyhow::Result<()> {
     let mut events = EventStream::new();
     let mut termination = TerminationSignals::subscribe()?;
@@ -1493,6 +1521,7 @@ async fn run(
                                     &mut ui,
                                     &mut temporary_command,
                                     socket_path,
+                                    config_dir,
                                 ).await?);
                                 force_draw = true;
                             }
@@ -2026,6 +2055,7 @@ async fn run(
                                     &mut ui,
                                     &mut temporary_command,
                                     socket_path,
+                                    config_dir,
                                 ).await?);
                                 force_draw = true;
                             }
@@ -3081,6 +3111,7 @@ async fn dispatch_client_action(
     ui: &mut UiConfig,
     temporary_command: &mut Option<TemporaryCommandSurface>,
     socket_path: &Path,
+    config_dir: Option<&Path>,
 ) -> anyhow::Result<Option<Toast>> {
     match action {
         ClientAction::RunCommand(index) => {
@@ -3118,7 +3149,7 @@ async fn dispatch_client_action(
                 CommandBarState::open_with_bindings(ui.bindings.clone()),
             ));
         }
-        ClientAction::ReloadConfig => match load_ui_config() {
+        ClientAction::ReloadConfig => match load_ui_config(config_dir) {
             Ok(reloaded) => {
                 prefix.replace_bindings(reloaded.bindings.clone());
                 *ui = reloaded;

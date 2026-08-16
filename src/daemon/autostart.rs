@@ -31,7 +31,7 @@ enum ProtocolProbe {
 }
 
 /// Start a detached daemon if needed and wait until its real protocol responds.
-pub async fn ensure_daemon(socket: &Path, cwd: &Path) -> Result<()> {
+pub async fn ensure_daemon(socket: &Path, cwd: &Path, config_dir: Option<&Path>) -> Result<()> {
     let should_start = match probe_protocol(socket).await {
         ProtocolProbe::Ready => return Ok(()),
         ProtocolProbe::Incompatible { server } => {
@@ -54,9 +54,11 @@ pub async fn ensure_daemon(socket: &Path, cwd: &Path) -> Result<()> {
             .with_context(|| format!("open daemon log {}", log_path.display()))?;
         let stderr = stdout.try_clone()?;
         let mut command = Command::new(std::env::current_exe().context("locate fut executable")?);
+        command.arg("--socket").arg(socket);
+        if let Some(config_dir) = config_dir {
+            command.arg("--config-dir").arg(config_dir);
+        }
         command
-            .arg("--socket")
-            .arg(socket)
             .arg("daemon")
             .arg("run")
             .arg("--cwd")
@@ -189,7 +191,9 @@ mod tests {
                 .unwrap();
         });
 
-        let error = ensure_daemon(&socket, temporary.path()).await.unwrap_err();
+        let error = ensure_daemon(&socket, temporary.path(), None)
+            .await
+            .unwrap_err();
 
         assert!(
             error

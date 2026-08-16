@@ -23,6 +23,10 @@ description = "Restart the debug daemon and attach without rebuilding"
 run = '''
 socket="${TMPDIR:-/tmp}"
 socket="${socket%/}/fut-debug.sock"
+config_dir="${TMPDIR:-/tmp}"
+config_dir="${config_dir%/}/fut-debug-config"
+rm -rf -- "$config_dir"
+mkdir -p -- "$config_dir"
 
 # Prefer a graceful stop when the daemon speaks this build's protocol. Fall
 # back to its socket owner so `fresh` also replaces an older debug daemon.
@@ -33,7 +37,7 @@ if [ -S "$socket" ]; then
   }
 fi
 
-exec target/debug/fut --socket "$socket"
+exec target/debug/fut --socket "$socket" --config-dir "$config_dir"
 '''
 
 [tasks.test]

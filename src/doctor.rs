@@ -78,11 +78,11 @@ impl DoctorReport {
     }
 }
 
-pub async fn run(socket: &Path) -> DoctorReport {
+pub async fn run(socket: &Path, config_dir: Option<&Path>) -> DoctorReport {
     let mut checks = Vec::new();
     let mut configured_icons = None;
 
-    match config::resolve_location() {
+    match config::resolve_location(config_dir) {
         Ok(location) => match config::load_location(&location) {
             Ok(loaded) => {
                 configured_icons = Some((
