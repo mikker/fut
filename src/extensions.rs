@@ -23,6 +23,7 @@ use tokio::{
 };
 
 use crate::{
+    command::PopupSize,
     domain::{SessionId, WorkspaceId},
     resources::{MAX_MATERIALIZED_TOKEN_VALUE_BYTES, Mutation, ResourceEvent},
 };
@@ -103,6 +104,8 @@ pub(crate) struct ExtensionLauncher {
     name: String,
     title: String,
     command: ExtensionCommand,
+    size: PopupSize,
+    activate_opened: bool,
 }
 
 impl ExtensionLauncher {
@@ -116,6 +119,14 @@ impl ExtensionLauncher {
 
     pub(crate) fn argv(&self) -> &[OsString] {
         &self.command.argv
+    }
+
+    pub(crate) fn size(&self) -> PopupSize {
+        self.size
+    }
+
+    pub(crate) fn activate_opened(&self) -> bool {
+        self.activate_opened
     }
 }
 
@@ -543,6 +554,10 @@ struct Manifest {
 struct CommandDeclaration {
     title: String,
     argv: Vec<String>,
+    #[serde(default)]
+    size: PopupSize,
+    #[serde(default)]
+    activate_opened: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -671,6 +686,9 @@ fn load_one(root: &Path) -> Result<Extension> {
                     manifest.id
                 )
             })?;
+            declaration.size.validate().with_context(|| {
+                format!("validate extension {:?} command {name:?} size", manifest.id)
+            })?;
             let command = validate_command(root, declaration.argv).with_context(|| {
                 format!("validate extension {:?} command {name:?} argv", manifest.id)
             })?;
@@ -681,6 +699,8 @@ fn load_one(root: &Path) -> Result<Extension> {
                     name: launcher_name,
                     title: declaration.title,
                     command,
+                    size: declaration.size,
+                    activate_opened: declaration.activate_opened,
                 },
             ))
         })
@@ -893,6 +913,8 @@ id = "acme.git-status"
 [commands.open-review]
 title = "Open review"
 argv = ["./bin/review", "--interactive"]
+size = { width = 100, height = 30 }
+activate_opened = true
 
 [[presentation_tokens]]
 name = "branch"
@@ -924,6 +946,9 @@ scope = "tab"
         );
         let launcher = &extension.commands["open-review"];
         assert_eq!(launcher.title(), "Open review");
+        assert_eq!(launcher.size().width, Some(100));
+        assert_eq!(launcher.size().height, Some(30));
+        assert!(launcher.activate_opened());
         assert_eq!(
             launcher.argv(),
             [
@@ -992,6 +1017,10 @@ scope = "tab"
             (
                 "id = 'valid'\n[commands.launch]\ntitle = ''\nargv = ['/bin/true']\n",
                 "title must be",
+            ),
+            (
+                "id = 'valid'\n[commands.launch]\ntitle = 'Launch'\nargv = ['/bin/true']\nsize = { width = 3 }\n",
+                "size.width must be at least 4",
             ),
             (
                 "id = 'valid'\n[hooks]\n'workspace.created' = ['./../escape']\n",

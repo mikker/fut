@@ -32,6 +32,7 @@ brew install mikker/tap/fut
 
 - [Agent activity](agents.md)
 - [Configuration](configuration.md)
+- [Extensions](extensions.md)
 - [Presentation tokens](tokens.md)
 - [Diagnostics](doctor.md)
 - [Changelog](changelog.md)

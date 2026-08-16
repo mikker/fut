@@ -2109,11 +2109,11 @@ fn checked_in_wt_extension_composes_create_and_retirement_commands() {
     .unwrap();
     fs::set_permissions(&fake_wt, fs::Permissions::from_mode(0o755)).unwrap();
     let mut create = Command::new(extension.join("bin/create"))
+        .args(["test-agent", "--automatic"])
         .env("FUT_BIN", "/opt/fut")
         .env("FUT_EXTENSION_ROOT", &extension)
         .env("FUT_SOCKET", "/tmp/fut.sock")
         .env("FUT_WT_BIN", &fake_wt)
-        .env("FUT_WT_AGENT", "test-agent")
         .env("CAPTURE", &capture)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -2123,7 +2123,7 @@ fn checked_in_wt_extension_composes_create_and_retirement_commands() {
         .stdin
         .take()
         .unwrap()
-        .write_all(b"feature-name\nImplement it carefully\n")
+        .write_all(b"feature-name\n")
         .unwrap();
     assert!(create.wait().unwrap().success());
     let expected = vec![
@@ -2146,7 +2146,7 @@ fn checked_in_wt_extension_composes_create_and_retirement_commands() {
             extension.join("bin/worktree-event").display()
         ),
         "test-agent".to_owned(),
-        "Implement it carefully".to_owned(),
+        "--automatic".to_owned(),
     ];
     assert_eq!(
         fs::read_to_string(&capture)
@@ -9261,6 +9261,60 @@ async fn extension_commands_launch_from_the_palette_with_focused_context() {
     );
     client.send(b"\r");
     time::sleep(Duration::from_millis(100)).await;
+    client.send(b"\x02d");
+    client.wait_success().await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn extension_command_can_activate_the_target_opened_by_its_child() {
+    let harness = Harness::start_with("printf 'HOST_READY\r\n'; while :; do sleep 1; done", |root| {
+        let extension = root.join("extension");
+        let bin = extension.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir(extension.join("opened")).unwrap();
+        fs::write(
+            extension.join("fut-extension.toml"),
+            "id = 'activate-test'\n[commands.open]\ntitle = 'Open and activate'\nargv = ['./bin/open']\nactivate_opened = true\n",
+        )
+        .unwrap();
+        let open = bin.join("open");
+        fs::write(
+            &open,
+            "#!/bin/sh\nexec \"$FUT_BIN\" --socket \"$FUT_SOCKET\" open \"$FUT_EXTENSION_ROOT/opened\" --name activated -- /bin/sh -c \"printf 'ACTIVATED_READY\\r\\n'; while :; do sleep 1; done\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&open, fs::Permissions::from_mode(0o755)).unwrap();
+        let config = root.join("home/.config/fut/config.toml");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(
+            config,
+            format!("extensions = [{:?}]\n", extension.display().to_string()),
+        )
+        .unwrap();
+    })
+    .await;
+    let snapshot = harness.resources().await;
+    let pane = snapshot.sessions[0].workspaces[0].tabs[0].panes[0].id;
+
+    let mut command = Command::new("/usr/bin/script");
+    command
+        .env_clear()
+        .env("HOME", harness.root.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", harness.root.path().join("runtime"))
+        .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+        .env("TERM", "xterm-256color")
+        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .arg(format!(
+            "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {pane}",
+            env!("CARGO_BIN_EXE_fut"),
+            harness.socket.display(),
+        ));
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("HOST_READY").await;
+    client.send(b"\x02:open and activate\r");
+    client.wait_for("ACTIVATED_READY").await;
     client.send(b"\x02d");
     client.wait_success().await;
     harness.shutdown().await;

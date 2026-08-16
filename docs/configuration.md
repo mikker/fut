@@ -50,6 +50,7 @@ title = "Repository diff"
 binding = "g"
 program = "/Users/me/.dotfiles/tmux/tmux.symlink/git_diff_popup.sh"
 # args = ["--optional-argument"]
+size = { width = 120, height = 40 }
 
 [ui.icons]
 preset = "nerd_font" # "ascii", "unicode", or "nerd_font"
@@ -147,6 +148,9 @@ Omitted fields use defaults. An explicitly empty array hides that lane or format
 
 ## Local extensions
 
+See the dedicated [Extensions](extensions.md) guide for the manifest API,
+runtime environment, lifecycle payloads, limits, and complete examples.
+
 `extensions` is an explicit list of absolute local directory paths. Fut loads the directories in listed order; it does not discover project extensions, search additional paths, download packages, or provide an installer or registry. Every directory must contain a regular UTF-8 `fut-extension.toml` no larger than 64 KiB. At most 32 extensions may be configured, and the complete set is accepted or rejected atomically. Duplicate canonical roots and duplicate extension IDs are errors.
 
 The smallest complete manifest is:
@@ -165,6 +169,8 @@ id = "review-status"
 [commands.open-review]
 title = "Open review"
 argv = ["./bin/open-review", "--interactive"]
+size = { width = 100, height = 30 }
+activate_opened = true
 
 [hooks]
 "workspace.created" = ["./bin/refresh", "--quiet"]
@@ -176,7 +182,7 @@ name = "state"
 scope = "workspace"
 ```
 
-Each `[commands.NAME]` table requires `title` and a non-empty direct `argv` array. Commands appear in the command palette in configured extension order and command-name order. Choosing one opens the same temporary PTY surface as a trusted command, inherits the focused pane process's live working directory and the client's environment, and receives `FUT_BIN`, `FUT_EXTENSION_COMMAND`, `FUT_EXTENSION_ID`, `FUT_EXTENSION_ROOT`, and `FUT_SOCKET`. Packaged `./` executables are resolved against the canonical extension root. Extension commands do not claim global key bindings; use the command palette to launch them.
+Each `[commands.NAME]` table requires `title` and a non-empty direct `argv` array. An optional `size = { width = COLUMNS, height = ROWS }` requests the outer dimensions of its centered temporary surface. Either dimension may be omitted to fill the available space in that direction, and Fut clamps requested dimensions to the host terminal. Width must be at least 4 columns and height at least 3 rows. The requested size is the ideal and the host is the implicit maximum, so the API does not add redundant minimum or maximum fields. `activate_opened = true` switches the parent client to the most recent target opened by a descendant `fut open` after the command exits successfully; it defaults to false. Commands appear in the command palette in configured extension order and command-name order as `<extension-id>:<command-name>  <title>`; both the qualified slug and title are searchable. Choosing one opens the same temporary PTY surface as a trusted command, inherits the focused pane process's live working directory and the client's environment, and receives `FUT_BIN`, `FUT_EXTENSION_COMMAND`, `FUT_EXTENSION_ID`, `FUT_EXTENSION_ROOT`, and `FUT_SOCKET`. Packaged `./` executables are resolved against the canonical extension root. Extension commands do not claim global key bindings; use the command palette to launch them.
 
 The only accepted hook names are `workspace.created`, `workspace.renamed`, and `workspace.closed`; any other name rejects the complete extension configuration and prevents daemon setup. The daemon loads the global `extensions` list before creating its initial resources, so `workspace.created` observes the initial workspace too. Hooks are queued in committed mutation order and run one at a time, asynchronously and strictly after a successful resource commit. They cannot veto, delay, rewrite, or roll back the operation. The queue holds 128 events; enqueue never waits, and an event arriving while it is full is dropped with rate-limited diagnostics.
 
@@ -216,11 +222,11 @@ Values are strings only: they carry no style, action, service, or executable beh
 
 The checked-in `examples/extensions/example-workspace-status` extension is executable documentation for this complete path. Its packaged hook calls the exact `$FUT_BIN` through `$FUT_SOCKET` and publishes the latest workspace lifecycle event as a token. The end-to-end suite runs that same example to keep the documented contract from drifting.
 
-The checked-in `examples/extensions/wt` extension uses a palette command to create a `wt` worktree, open it as a peer Fut workspace, and launch an agent with its initial prompt. Its packaged `wt` removal handler calls `fut workspace retire`, so successful `wt done`, `wt ship`, and `wt rm` operations gracefully remove the disposable workspace. See its README for setup and agent overrides.
+The checked-in `examples/extensions/wt` extension uses a palette command to create a `wt` worktree, open it as a peer Fut workspace, and run a configurable post-open action without requiring an initial agent prompt. Its packaged `wt` removal handler calls `fut workspace retire`, so successful `wt done`, `wt ship`, and `wt rm` operations gracefully remove the disposable workspace. See its README for setup and action configuration.
 
 Bindings are suffixes after the fixed `Ctrl-b` prefix. `Ctrl-b :` opens the command palette. Override any action under `ui.bindings`; accepted values are one printable character or the names `prefix`, `ctrl-s`, `space`, `enter`, `tab`, `esc`, `up`, and `down`. `prefix` means pressing `Ctrl-b` again. Keys must remain unique. Action names are `open_command_bar`, `reload_config`, `enter_copy_mode`, `open_navigator`, `open_workspace_sidebar`, `open_tab_bar`, `open_notifications`, `focus_next_notification`, `create_workspace`, `create_tab`, `focus_next_tab`, `focus_previous_tab`, `split_pane_right`, `split_pane_down`, `focus_next_pane`, `focus_previous_pane`, `focus_pane_left`, `focus_pane_down`, `focus_pane_up`, `focus_pane_right`, `focus_last_pane`, `focus_last_tab`, `focus_last_workspace`, `focus_last_session`, `focus_next_workspace`, `focus_previous_workspace`, `focus_tab_1` through `focus_tab_10`, `toggle_pane_zoom`, and `detach`. `Ctrl-b Ctrl-s` switches to the last active session, so repeating it toggles between the two most recent sessions. Rebinding `focus_next_notification` away from `prefix` restores `Ctrl-b Ctrl-b` as a literal prefix unless another action uses `prefix`. The palette displays tmux-style command names, descriptions, and configured bindings, and searches all three.
 
-Each `[trusted_commands.NAME]` table requires `title` and an executable `program`, plus optional `binding` and string array `args` values. Running one opens a dashed frame containing a temporary PTY over the complete client terminal, inherits the focused pane process's live working directory, and sends normal terminal input to the command. The frame names the command and identifies the temporary surface; when the process exits, Fut restores the previous panes, focus, and geometry. A bound trusted command may take a built-in's default key, which unbinds that built-in unless it is explicitly rebound under `ui.bindings`. Explicit binding collisions and duplicate command keys are rejected. Commands appear in the command palette; bound commands also appear in delayed which-key help. Configuration reload replaces them atomically.
+Each `[trusted_commands.NAME]` table requires `title` and an executable `program`, plus optional `binding`, string array `args`, `size`, and `activate_opened` values. `size` and `activate_opened` have the same semantics as an extension command; omitting size preserves the full-terminal surface, while activation defaults to false. Running a command opens a dashed frame containing a temporary PTY, inherits the focused pane process's live working directory, and sends normal terminal input to the command. The frame names the command and identifies the temporary surface; when the process exits, Fut restores the previous panes, focus, and geometry. A bound trusted command may take a built-in's default key, which unbinds that built-in unless it is explicitly rebound under `ui.bindings`. Explicit binding collisions and duplicate command keys are rejected. Commands appear in the command palette; bound commands also appear in delayed which-key help. Configuration reload replaces them atomically.
 
 `open_navigator` (default `Ctrl-b s`) opens the single cross-resource dialog. Printable text fuzzy-filters individual hierarchical rows against their full ancestor path; every query term must match. While filtering, each result shows that complete session › workspace › tab › pane path in muted text, with only the fuzzy-matched characters emphasized. Use arrows, Home/End, page keys, or `Ctrl-j`/`Ctrl-k` to move. `Ctrl-s` shows only sessions; `Ctrl-w`, `Ctrl-t`, and `Ctrl-p` show workspaces in the selected session, tabs in the selected workspace, or panes in the selected tab. The title breadcrumb names that enclosing scope with each resource name shortened to ten cells. Repeat the active filter to restore the complete tree, or press `Ctrl-a` to clear both the resource filter and text search. With no resource or text filter, Left/Right and Shift-arrows navigate the hierarchy. Enter switches and Escape closes. Plain `q` is search text. Tabs with one pane show a muted `· pane` inline; tabs with multiple panes keep one row per pane. A newly created tab briefly appears as positional `tab 1`, `tab 2`, and so on until its foreground process is available.
 

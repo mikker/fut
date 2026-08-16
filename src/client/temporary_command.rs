@@ -1,13 +1,17 @@
 use std::{
     collections::HashMap,
+    fs,
+    io::ErrorKind,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use anyhow::Context;
 use tokio::sync::{broadcast, watch};
 
 use crate::{
-    domain::{ScreenSnapshot, TerminalId, TerminalSize},
+    command::{ACTIVATE_OPENED_SOCKET_ENV, PopupSize},
+    domain::{PaneId, ScreenSnapshot, TerminalId, TerminalSize},
     terminal::{SpawnSpec, TerminalEvent, TerminalHandle, TerminalLifecycle, spawn_terminal},
 };
 
@@ -15,10 +19,12 @@ use super::config::PaletteCommand;
 
 pub(super) struct TemporaryCommandSurface {
     title: String,
+    size: PopupSize,
     handle: TerminalHandle,
     snapshots: watch::Receiver<ScreenSnapshot>,
     events: broadcast::Receiver<TerminalEvent>,
     lifecycle: watch::Receiver<TerminalLifecycle>,
+    activation: Option<ActivationSocket>,
     pub screen: ScreenSnapshot,
 }
 
@@ -54,8 +60,19 @@ impl TemporaryCommandSurface {
             );
             env.insert("FUT_SOCKET".into(), socket_path.display().to_string());
         }
+        let terminal_id = TerminalId::new();
+        let activation = command
+            .activate_opened
+            .then(|| ActivationSocket::bind(socket_path))
+            .transpose()?;
+        if let Some(activation) = &activation {
+            env.insert(
+                ACTIVATE_OPENED_SOCKET_ENV.into(),
+                activation.path.display().to_string(),
+            );
+        }
         let handle = spawn_terminal(SpawnSpec {
-            id: TerminalId::new(),
+            id: terminal_id,
             program: command.program.clone(),
             argv: command.args.clone(),
             cwd,
@@ -69,16 +86,30 @@ impl TemporaryCommandSurface {
         let lifecycle = handle.subscribe_lifecycle();
         Ok(Self {
             title: command.title.clone(),
+            size: command.size,
             handle,
             snapshots,
             events,
             lifecycle,
+            activation,
             screen,
         })
     }
 
     pub(super) fn title(&self) -> &str {
         &self.title
+    }
+
+    pub(super) fn size(&self) -> PopupSize {
+        self.size
+    }
+
+    pub(super) fn activated_target(&self) -> anyhow::Result<Option<PaneId>> {
+        self.activation
+            .as_ref()
+            .map(ActivationSocket::target)
+            .transpose()
+            .map(Option::flatten)
     }
 
     pub(super) async fn input(&self, bytes: Vec<u8>) -> anyhow::Result<()> {
@@ -125,6 +156,57 @@ impl TemporaryCommandSurface {
                 }
             }
         }
+    }
+}
+
+struct ActivationSocket {
+    socket: std::os::unix::net::UnixDatagram,
+    path: PathBuf,
+}
+
+impl ActivationSocket {
+    fn bind(daemon_socket: &Path) -> anyhow::Result<Self> {
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+        let directory = daemon_socket
+            .parent()
+            .context("resolve activation socket directory")?;
+        let path = directory.join(format!(
+            ".fut-a-{}-{}.sock",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let socket = std::os::unix::net::UnixDatagram::bind(&path)
+            .with_context(|| format!("bind command activation socket {}", path.display()))?;
+        socket
+            .set_nonblocking(true)
+            .context("make command activation socket nonblocking")?;
+        Ok(Self { socket, path })
+    }
+
+    fn target(&self) -> anyhow::Result<Option<PaneId>> {
+        let mut payload = [0_u8; 128];
+        let mut target = None;
+        loop {
+            match self.socket.recv(&mut payload) {
+                Ok(length) => {
+                    target = Some(
+                        std::str::from_utf8(&payload[..length])
+                            .context("command activation target is not UTF-8")?
+                            .parse()
+                            .context("command activation target is not a pane ID")?,
+                    );
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(target),
+                Err(error) => return Err(error).context("read command activation target"),
+            }
+        }
+    }
+}
+
+impl Drop for ActivationSocket {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -199,12 +281,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn activation_socket_returns_the_most_recent_opened_pane_and_cleans_up() {
+        let temporary = tempfile::tempdir().unwrap();
+        let listener = ActivationSocket::bind(&temporary.path().join("daemon.sock")).unwrap();
+        let path = listener.path.clone();
+        let sender = std::os::unix::net::UnixDatagram::unbound().unwrap();
+        let first = PaneId::new();
+        let second = PaneId::new();
+        sender.send_to(first.to_string().as_bytes(), &path).unwrap();
+        sender
+            .send_to(second.to_string().as_bytes(), &path)
+            .unwrap();
+
+        assert_eq!(listener.target().unwrap(), Some(second));
+        drop(listener);
+        assert!(!path.exists());
+    }
+
     fn command(program: &str, args: &[&str]) -> PaletteCommand {
         PaletteCommand {
             title: "Test command".into(),
             binding: Some("x".into()),
             program: program.into(),
             args: args.iter().map(|arg| (*arg).into()).collect(),
+            size: PopupSize::default(),
+            activate_opened: false,
             extension: None,
         }
     }

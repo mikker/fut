@@ -447,6 +447,24 @@ async fn run(
                         force_draw = true;
                     }
                     TemporaryCommandUpdate::Exited(exit_code) => {
+                        let activated_target = if exit_code == Some(0) {
+                            match temporary_command
+                                .as_ref()
+                                .expect("command exists")
+                                .activated_target()
+                            {
+                                Ok(target) => target,
+                                Err(error) => {
+                                    toasts.error(format!(
+                                        "command activation failed · {}",
+                                        one_line_error(&error)
+                                    ));
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
                         temporary_command = None;
                         view.invalidate_drawn();
                         match exit_code {
@@ -455,6 +473,19 @@ async fn run(
                             None => toasts.error("command exited · status unknown"),
                         }
                         resize_view(framed, terminal.size()?.into(), &mut view, &resources, &ui).await?;
+                        if let Some(pane_id) = activated_target
+                            && let Some(request) = focus.begin(FocusOrigin::Workspace)
+                        {
+                            send_request(
+                                framed,
+                                Some(request),
+                                ClientMessage::SelectTarget {
+                                    selector: TargetSelector::Pane(pane_id),
+                                    expected: None,
+                                },
+                            )
+                            .await?;
+                        }
                         force_draw = true;
                     }
                     TemporaryCommandUpdate::Stopped => {
@@ -974,8 +1005,10 @@ async fn run(
                         temporary_command.as_ref().expect("command exists").paste(text).await?;
                     }
                     Event::Resize(columns, rows) if temporary_command.is_some() && columns > 0 && rows > 0 => {
-                        let content = temporary_command_content(Rect::new(0, 0, columns, rows));
-                        temporary_command.as_ref().expect("command exists").resize(TerminalSize {
+                        let host = Rect::new(0, 0, columns, rows);
+                        let command = temporary_command.as_ref().expect("command exists");
+                        let content = temporary_command_content(command.size().area(host));
+                        command.resize(TerminalSize {
                             columns: content.width,
                             rows: content.height,
                         }).await?;
@@ -1982,8 +2015,9 @@ async fn run(
                     terminal.draw(|frame| {
                         let area = frame.area();
                         if let Some(command) = temporary_command.as_ref() {
+                            let command_area = command.size().area(area);
                             let content = render_temporary_command_frame(
-                                area,
+                                command_area,
                                 command.title(),
                                 &ui.styles,
                                 frame.buffer_mut(),
@@ -2916,7 +2950,7 @@ async fn dispatch_client_action(
                     "configured command is no longer available",
                 )));
             };
-            let content = temporary_command_content(host);
+            let content = temporary_command_content(command.size.area(host));
             let size = TerminalSize {
                 columns: content.width,
                 rows: content.height,
@@ -6419,8 +6453,13 @@ mod tests {
 
     #[test]
     fn temporary_commands_have_one_dashed_frame_and_an_inset_pty() {
-        let area = Rect::new(0, 0, 48, 8);
-        let mut buffer = Buffer::empty(area);
+        let host = Rect::new(0, 0, 80, 24);
+        let area = crate::command::PopupSize {
+            width: Some(48),
+            height: Some(8),
+        }
+        .area(host);
+        let mut buffer = Buffer::empty(host);
         let content = render_temporary_command_frame(
             area,
             "Repository diff",
@@ -6428,10 +6467,11 @@ mod tests {
             &mut buffer,
         );
 
-        assert_eq!(content, Rect::new(1, 1, 46, 6));
-        let text = (0..area.height)
+        assert_eq!(area, Rect::new(16, 8, 48, 8));
+        assert_eq!(content, Rect::new(17, 9, 46, 6));
+        let text = (area.y..area.bottom())
             .map(|row| {
-                (0..area.width)
+                (area.x..area.right())
                     .map(|column| buffer[(column, row)].symbol())
                     .collect::<String>()
             })
@@ -6439,9 +6479,9 @@ mod tests {
             .join("\n");
         assert!(text.contains("Repository diff"));
         assert!(text.contains("temporary · returns when command exits"));
-        assert_eq!(buffer[(0, 0)].symbol(), "·");
-        assert_eq!(buffer[(1, 0)].symbol(), "┄");
-        assert_eq!(buffer[(0, 1)].symbol(), "┆");
+        assert_eq!(buffer[(area.x, area.y)].symbol(), "·");
+        assert_eq!(buffer[(area.x + 1, area.y)].symbol(), "┄");
+        assert_eq!(buffer[(area.x, area.y + 1)].symbol(), "┆");
     }
 
     #[test]

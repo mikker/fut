@@ -15,7 +15,10 @@ use unicode_width::UnicodeWidthStr;
 use super::actions::{
     ALL_ACTIONS, ClientAction, config_key, default_suffix, parse_suffix, suffix_name,
 };
-use crate::extensions::{self, Extension};
+use crate::{
+    command::PopupSize,
+    extensions::{self, Extension},
+};
 
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_SEGMENTS: usize = 64;
@@ -151,6 +154,10 @@ pub(super) struct PaletteCommand {
     pub program: PathBuf,
     #[serde(default)]
     pub args: Vec<String>,
+    #[serde(default)]
+    pub size: PopupSize,
+    #[serde(default)]
+    pub activate_opened: bool,
     #[serde(skip)]
     pub extension: Option<ExtensionCommandIdentity>,
 }
@@ -160,6 +167,14 @@ pub(super) struct ExtensionCommandIdentity {
     pub id: String,
     pub root: PathBuf,
     pub command: String,
+}
+
+impl PaletteCommand {
+    pub(super) fn slug(&self) -> Option<String> {
+        self.extension
+            .as_ref()
+            .map(|extension| format!("{}:{}", extension.id, extension.command))
+    }
 }
 
 impl BindingsConfig {
@@ -1097,6 +1112,8 @@ fn load_path_outcome(path: &std::path::Path, explicit: bool) -> Result<LoadedCon
                             .to_owned()
                     })
                     .collect(),
+                size: launcher.size(),
+                activate_opened: launcher.activate_opened(),
                 extension: Some(ExtensionCommandIdentity {
                     id: extension.id().to_owned(),
                     root: extension.root().to_owned(),
@@ -1187,6 +1204,10 @@ fn validate(ui: &UiConfig, extensions: &[Extension]) -> Result<()> {
         if command.title.is_empty() {
             bail!("trusted command titles must not be empty");
         }
+        command
+            .size
+            .validate()
+            .context("validate command popup size")?;
         if let Some(binding) = &command.binding {
             let Some((suffix, _)) = parse_suffix(binding) else {
                 bail!("trusted command bindings must be one character or a named key");
@@ -1761,7 +1782,7 @@ right = [{ token = "workspace.tab_count" }]
         fs::create_dir(&extension_root).unwrap();
         fs::write(
             extension_root.join(extensions::MANIFEST_FILE_NAME),
-            "id = 'configured'\n[commands.launch]\ntitle = 'Launch configured extension'\nargv = ['./bin/launch', '--ready']\n",
+            "id = 'configured'\n[commands.launch]\ntitle = 'Launch configured extension'\nargv = ['./bin/launch', '--ready']\nsize = { width = 90, height = 24 }\nactivate_opened = true\n",
         )
         .unwrap();
         let path = temporary.path().join("config.toml");
@@ -1785,7 +1806,11 @@ right = [{ token = "workspace.tab_count" }]
             extension_root.canonicalize().unwrap().join("bin/launch")
         );
         assert_eq!(command.args, ["--ready"]);
+        assert_eq!(command.size.width, Some(90));
+        assert_eq!(command.size.height, Some(24));
+        assert!(command.activate_opened);
         assert_eq!(command.extension.as_ref().unwrap().id, "configured");
+        assert_eq!(command.slug().as_deref(), Some("configured:launch"));
 
         let invalid_root = temporary.path().join("invalid");
         fs::create_dir(&invalid_root).unwrap();
@@ -1863,6 +1888,7 @@ title = "Repository diff"
 binding = "s"
 program = "/bin/sh"
 args = ["-c", "git diff"]
+size = { width = 120, height = 40 }
 "#,
         )
         .unwrap();
@@ -1876,6 +1902,8 @@ args = ["-c", "git diff"]
             "Unbound"
         );
         assert_eq!(config.bindings.command(0).unwrap().args, ["-c", "git diff"]);
+        assert_eq!(config.bindings.command(0).unwrap().size.width, Some(120));
+        assert_eq!(config.bindings.command(0).unwrap().size.height, Some(40));
 
         fs::write(
             &path,

@@ -104,7 +104,8 @@ Compatibility follows the resource represented by each format:
 
 A declared value that has not been published is empty, including its configured prefix and suffix. Published values are plain text and receive only the normal group, segment, and item styles already configured by the user; a value cannot inject a style. Values are stored in the authoritative resource snapshot, shared by every client, and removed with their target. Rendering never invokes an extension or performs publication I/O.
 
-See [Local extensions](configuration.md#local-extensions) for declarations, publication syntax, limits, and the security boundary.
+See [Extensions](extensions.md#presentation-tokens) for declarations,
+publication syntax, limits, and the security boundary.
 
 ## Related
 

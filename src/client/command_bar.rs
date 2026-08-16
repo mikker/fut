@@ -247,12 +247,15 @@ impl CommandBarState {
         let ranked = fuzzy::ranked(
             &self.query,
             catalog.iter().map(|action| {
-                let (title, keywords) = match action {
+                let (slug, title, keywords) = match action {
                     ClientAction::RunCommand(index) => self
                         .bindings
                         .command(*index)
                         .map(|command| {
                             (
+                                command
+                                    .slug()
+                                    .unwrap_or_else(|| command_name(*action).to_owned()),
                                 command.title.as_str(),
                                 if command.extension.is_some() {
                                     "extension command"
@@ -261,16 +264,18 @@ impl CommandBarState {
                                 },
                             )
                         })
-                        .unwrap_or(("", "")),
+                        .unwrap_or_default(),
                     action => definition(*action)
-                        .map(|definition| (definition.title, definition.keywords))
-                        .unwrap_or(("", "")),
+                        .map(|definition| {
+                            (
+                                command_name(*action).to_owned(),
+                                definition.title,
+                                definition.keywords,
+                            )
+                        })
+                        .unwrap_or_default(),
                 };
-                format!(
-                    "{} {title} {keywords} {}",
-                    command_name(*action),
-                    self.bindings.label(*action)
-                )
+                format!("{slug} {title} {keywords} {}", self.bindings.label(*action))
             }),
         );
         self.filtered = ranked.into_iter().map(|index| catalog[index]).collect();
@@ -418,7 +423,12 @@ fn action_label(action: ClientAction, bindings: &BindingsConfig) -> String {
     match action {
         ClientAction::RunCommand(index) => bindings
             .command(index)
-            .map(|command| command.title.clone())
+            .map(|command| {
+                command.slug().map_or_else(
+                    || command.title.clone(),
+                    |slug| format!("{slug}  {}", command.title),
+                )
+            })
             .unwrap_or_default(),
         action => definition(action)
             .map(|command| format!("{}  {}", command_name(action), command.title))

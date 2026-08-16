@@ -858,20 +858,23 @@ async fn execute(cli: Cli) -> Result<()> {
                 ServerMessage::LocationOpened {
                     selected,
                     disposition,
-                } => output(
-                    cli.json,
-                    "open",
-                    json!({ "disposition": disposition, "selected": selected }),
-                    format!(
-                        "disposition={disposition:?} session={} workspace={} tab={} pane={} terminal={} pid={}",
-                        selected.session_id,
-                        selected.workspace_id,
-                        selected.tab_id,
-                        selected.pane_id,
-                        selected.terminal_id,
-                        selected.child_pid
-                    ),
-                ),
+                } => {
+                    notify_command_activation(selected.pane_id)?;
+                    output(
+                        cli.json,
+                        "open",
+                        json!({ "disposition": disposition, "selected": selected }),
+                        format!(
+                            "disposition={disposition:?} session={} workspace={} tab={} pane={} terminal={} pid={}",
+                            selected.session_id,
+                            selected.workspace_id,
+                            selected.tab_id,
+                            selected.pane_id,
+                            selected.terminal_id,
+                            selected.child_pid
+                        ),
+                    )
+                }
                 other => unexpected(other),
             }
         }
@@ -1679,6 +1682,23 @@ async fn execute(cli: Cli) -> Result<()> {
         }) => unreachable!("agent skill is handled before daemon setup"),
         Some(command) => run_mutation(&socket, cli.json, command).await,
     }
+}
+
+fn notify_command_activation(pane_id: PaneId) -> anyhow::Result<()> {
+    let Some(path) = std::env::var_os(crate::command::ACTIVATE_OPENED_SOCKET_ENV) else {
+        return Ok(());
+    };
+    let socket =
+        std::os::unix::net::UnixDatagram::unbound().context("create command activation socket")?;
+    socket
+        .send_to(pane_id.to_string().as_bytes(), &path)
+        .with_context(|| {
+            format!(
+                "notify parent Fut client through activation socket {}",
+                PathBuf::from(path).display()
+            )
+        })?;
+    Ok(())
 }
 
 fn resolve_open_path(path: Option<PathBuf>, current_dir: &std::path::Path) -> PathBuf {

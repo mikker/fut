@@ -3,6 +3,7 @@
 mod agent_detection;
 pub mod cli;
 pub mod client;
+pub(crate) mod command;
 pub mod daemon;
 pub mod doctor;
 pub mod domain;
