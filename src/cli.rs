@@ -37,8 +37,9 @@ use crate::{
         run_daemon,
     },
     domain::{
-        AgentReport, AgentReportMetadata, AgentState, MAX_TERMINAL_OUTPUT_ROWS, PaneId, SessionId,
-        TabId, TerminalId, TerminalOutputMatcher, TerminalOutputSource, WorkspaceId,
+        AgentActivity, AgentReport, AgentReportMetadata, AgentState, MAX_TERMINAL_OUTPUT_ROWS,
+        PaneId, SessionId, TabId, TerminalId, TerminalOutput, TerminalOutputMatcher,
+        TerminalOutputSource, WorkspaceId,
     },
     protocol::{
         AcknowledgedCommand, ClientMessage, ClientMode, ContextScope, ContextualCommand, Envelope,
@@ -46,7 +47,8 @@ use crate::{
         TerminalInputOperation, codec, decode_payload, encode_payload,
     },
     resources::{
-        PresentationTokenTarget, ResourceSnapshot, SessionSelector, TabSnapshot, TargetSelector,
+        PanePathRef, PresentationTokenTarget, ResourceSnapshot, SessionSelector, TabSnapshot,
+        TargetSelector,
     },
     splits::{SplitAxis, SplitDirection, SplitTree},
 };
@@ -1073,11 +1075,8 @@ async fn execute(cli: Cli) -> Result<()> {
             command: AgentCommand::List,
         }) => {
             let snapshot = list_resources(&socket).await?;
-            let agents = integrated_agents(&snapshot);
-            let unread_count = agents
-                .iter()
-                .filter(|agent| agent["unread"].as_bool() == Some(true))
-                .count();
+            let agents = integrated_agents(&snapshot).collect::<Vec<_>>();
+            let unread_count = agents.iter().filter(|agent| agent.unread).count();
             let human = agents
                 .iter()
                 .map(render_agent)
@@ -1086,11 +1085,11 @@ async fn execute(cli: Cli) -> Result<()> {
             output(
                 cli.json,
                 "agent.list",
-                json!({
-                    "revision": snapshot.revision,
-                    "unread_count": unread_count,
-                    "agents": agents,
-                }),
+                AgentListWire {
+                    agents,
+                    revision: snapshot.revision,
+                    unread_count,
+                },
                 human,
             )
         }
@@ -1102,7 +1101,10 @@ async fn execute(cli: Cli) -> Result<()> {
             output(
                 cli.json,
                 "agent.get",
-                json!({ "revision": snapshot.revision, "agent": agent }),
+                AgentGetWire {
+                    agent,
+                    revision: snapshot.revision,
+                },
                 render_agent(&agent),
             )
         }
@@ -1244,11 +1246,11 @@ async fn execute(cli: Cli) -> Result<()> {
             output(
                 cli.json,
                 "agent.read",
-                json!({
-                    "revision": snapshot.revision,
-                    "agent": agent,
-                    "output": captured,
-                }),
+                AgentReadWire {
+                    agent,
+                    output: captured,
+                    revision: snapshot.revision,
+                },
                 human,
             )
         }
@@ -1819,81 +1821,134 @@ async fn report_agent_command(
     )
 }
 
-fn integrated_agents(snapshot: &ResourceSnapshot) -> Vec<serde_json::Value> {
-    let mut agents = Vec::new();
-    for session in &snapshot.sessions {
-        for workspace in &session.workspaces {
-            for tab in &workspace.tabs {
-                for pane in &tab.panes {
-                    if pane.activity.integration.is_none() {
-                        continue;
-                    }
-                    let available = !session.closing
-                        && !workspace.closing
-                        && !tab.closing
-                        && !pane.closing
-                        && pane.activity.state != AgentState::Working;
-                    let unread = pane.activity.has_unread_attention();
-                    agents.push(json!({
-                        "terminal_id": pane.terminal_id,
-                        "pane_id": pane.id,
-                        "tab": { "id": tab.id, "name": tab.name },
-                        "workspace": {
-                            "id": workspace.id,
-                            "name": workspace.name,
-                            "root": workspace.root,
-                        },
-                        "session": { "id": session.id, "name": session.name },
-                        "available": available,
-                        "unread": unread,
-                        "activity": pane.activity,
-                    }));
-                }
-            }
-        }
-    }
-    agents
+#[derive(Clone, Copy, Debug, Serialize)]
+struct AgentWire<'a> {
+    activity: &'a AgentActivity,
+    available: bool,
+    pane_id: PaneId,
+    session: AgentSessionWire<'a>,
+    tab: AgentTabWire<'a>,
+    terminal_id: TerminalId,
+    unread: bool,
+    workspace: AgentWorkspaceWire<'a>,
 }
 
-fn resolve_agent(
-    snapshot: &ResourceSnapshot,
-    terminal_id: TerminalId,
-) -> Result<serde_json::Value> {
-    if let Some(agent) = integrated_agents(snapshot)
-        .into_iter()
-        .find(|agent| agent["terminal_id"] == terminal_id.to_string())
-    {
-        return Ok(agent);
+impl<'a> From<PanePathRef<'a>> for AgentWire<'a> {
+    fn from(path: PanePathRef<'a>) -> Self {
+        Self {
+            activity: &path.pane.activity,
+            available: !path.session.closing
+                && !path.workspace.closing
+                && !path.tab.closing
+                && !path.pane.closing
+                && path.pane.activity.state != AgentState::Working,
+            pane_id: path.pane.id,
+            session: AgentSessionWire {
+                id: path.session.id,
+                name: &path.session.name,
+            },
+            tab: AgentTabWire {
+                id: path.tab.id,
+                name: &path.tab.name,
+            },
+            terminal_id: path.pane.terminal_id,
+            unread: path.pane.activity.has_unread_attention(),
+            workspace: AgentWorkspaceWire {
+                id: path.workspace.id,
+                name: &path.workspace.name,
+                root: &path.workspace.root,
+            },
+        }
     }
-    let terminal_exists = snapshot
-        .sessions
-        .iter()
-        .flat_map(|session| &session.workspaces)
-        .flat_map(|workspace| &workspace.tabs)
-        .flat_map(|tab| &tab.panes)
-        .any(|pane| pane.terminal_id == terminal_id);
-    let (code, message) = if terminal_exists {
-        (
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+struct AgentSessionWire<'a> {
+    id: SessionId,
+    name: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+struct AgentTabWire<'a> {
+    id: TabId,
+    name: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+struct AgentWorkspaceWire<'a> {
+    id: WorkspaceId,
+    name: &'a str,
+    root: &'a std::path::Path,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentListWire<'a> {
+    agents: Vec<AgentWire<'a>>,
+    revision: u64,
+    unread_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+struct AgentGetWire<'a> {
+    agent: AgentWire<'a>,
+    revision: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentReadWire<'a> {
+    agent: AgentWire<'a>,
+    output: TerminalOutput,
+    revision: u64,
+}
+
+fn integrated_agents(snapshot: &ResourceSnapshot) -> impl Iterator<Item = AgentWire<'_>> {
+    snapshot
+        .pane_paths()
+        .filter_map(|path| path.pane.activity.integration.as_ref().map(|_| path.into()))
+}
+
+fn resolve_agent<'a>(
+    snapshot: &'a ResourceSnapshot,
+    terminal_id: TerminalId,
+) -> Result<AgentWire<'a>> {
+    let Some(path) = snapshot
+        .pane_paths()
+        .find(|path| path.pane.terminal_id == terminal_id)
+    else {
+        return Err(
+            CliError::new("not_found", format!("terminal {terminal_id} was not found")).into(),
+        );
+    };
+    if path.pane.activity.integration.is_none() {
+        Err(CliError::new(
             "not_an_agent",
             format!("terminal {terminal_id} has no agent integration"),
         )
+        .into())
     } else {
-        ("not_found", format!("terminal {terminal_id} was not found"))
-    };
-    Err(CliError::new(code, message).into())
+        Ok(path.into())
+    }
 }
 
-fn render_agent(agent: &serde_json::Value) -> String {
+fn agent_state_name(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Idle => "idle",
+        AgentState::Working => "working",
+        AgentState::Blocked => "blocked",
+    }
+}
+
+fn render_agent(agent: &AgentWire<'_>) -> String {
     format!(
         "agent={} state={} available={} unread={} session={} workspace={} tab={} pane={}",
-        agent["terminal_id"].as_str().unwrap_or("-"),
-        agent["activity"]["state"].as_str().unwrap_or("-"),
-        agent["available"].as_bool().unwrap_or(false),
-        agent["unread"].as_bool().unwrap_or(false),
-        agent["session"]["id"].as_str().unwrap_or("-"),
-        agent["workspace"]["id"].as_str().unwrap_or("-"),
-        agent["tab"]["id"].as_str().unwrap_or("-"),
-        agent["pane_id"].as_str().unwrap_or("-"),
+        agent.terminal_id,
+        agent_state_name(agent.activity.state),
+        agent.available,
+        agent.unread,
+        agent.session.id,
+        agent.workspace.id,
+        agent.tab.id,
+        agent.pane_id,
     )
 }
 
@@ -2194,16 +2249,27 @@ async fn run_mutation(socket: &std::path::Path, json_output: bool, command: Comm
     output(json_output, command_name, result, human)
 }
 
+#[derive(Debug, Serialize)]
+struct OutputEnvelope<T> {
+    command: &'static str,
+    result: T,
+    version: u8,
+}
+
 fn output(
     result_as_json: bool,
-    command: &str,
+    command: &'static str,
     result: impl Serialize,
     human: impl AsRef<str>,
 ) -> Result<()> {
     if result_as_json {
         println!(
             "{}",
-            serde_json::to_string(&json!({ "version": 1, "command": command, "result": result }))?
+            serde_json::to_string(&OutputEnvelope {
+                command,
+                result,
+                version: 1,
+            })?
         );
     } else {
         println!("{}", human.as_ref());
@@ -2809,6 +2875,66 @@ fn unexpected<T>(message: ServerMessage) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        domain::AgentIntegration,
+        resources::{
+            PaneSnapshot, Project, ProjectIdentity, SessionSnapshot, TabSnapshot, WorkspaceSnapshot,
+        },
+    };
+
+    fn agent_fixture() -> ResourceSnapshot {
+        let session_id = "11111111-1111-1111-1111-111111111111".parse().unwrap();
+        let workspace_id = "22222222-2222-2222-2222-222222222222".parse().unwrap();
+        let tab_id = "33333333-3333-3333-3333-333333333333".parse().unwrap();
+        let pane_id = "44444444-4444-4444-4444-444444444444".parse().unwrap();
+        let terminal_id = "55555555-5555-5555-5555-555555555555".parse().unwrap();
+        ResourceSnapshot {
+            revision: 42,
+            sessions: vec![SessionSnapshot {
+                id: session_id,
+                name: "session".into(),
+                project: Project {
+                    identity: ProjectIdentity::CanonicalDirectory("/project".into()),
+                },
+                closing: false,
+                tokens: Default::default(),
+                workspaces: vec![WorkspaceSnapshot {
+                    id: workspace_id,
+                    name: "workspace".into(),
+                    root: "/project".into(),
+                    closing: false,
+                    tokens: Default::default(),
+                    tabs: vec![TabSnapshot {
+                        id: tab_id,
+                        name: "tab".into(),
+                        closing: false,
+                        tokens: Default::default(),
+                        layout: SplitTree::leaf(pane_id),
+                        panes: vec![PaneSnapshot {
+                            id: pane_id,
+                            terminal_id,
+                            closing: false,
+                            tokens: Default::default(),
+                            activity: AgentActivity {
+                                integration: Some(AgentIntegration {
+                                    source: Some("codex".into()),
+                                    agent_session_id: None,
+                                }),
+                                detection: None,
+                                state: AgentState::Blocked,
+                                revision: 9,
+                                updated_at_ms: 1234,
+                                last_event: None,
+                                read_revision: 0,
+                            },
+                            cwd: None,
+                            worktree: None,
+                        }],
+                    }],
+                }],
+            }],
+        }
+    }
 
     #[test]
     fn token_publish_accepts_hyphen_leading_presentation_text() {
@@ -2893,6 +3019,72 @@ mod tests {
             error_envelope("invalid_arguments", "bad input"),
             json!({"version": 1, "error": {"code": "invalid_arguments", "message": "bad input"}})
         );
+    }
+
+    #[test]
+    fn agent_list_and_get_keep_the_versioned_json_golden_shape() {
+        let snapshot = agent_fixture();
+        let agents = integrated_agents(&snapshot).collect::<Vec<_>>();
+        let list = serde_json::to_string(&OutputEnvelope {
+            command: "agent.list",
+            result: AgentListWire {
+                agents,
+                revision: snapshot.revision,
+                unread_count: 0,
+            },
+            version: 1,
+        })
+        .unwrap();
+        assert_eq!(
+            list,
+            r#"{"command":"agent.list","result":{"agents":[{"activity":{"integration":{"source":"codex"},"state":"blocked","revision":9,"updated_at_ms":1234},"available":true,"pane_id":"44444444-4444-4444-4444-444444444444","session":{"id":"11111111-1111-1111-1111-111111111111","name":"session"},"tab":{"id":"33333333-3333-3333-3333-333333333333","name":"tab"},"terminal_id":"55555555-5555-5555-5555-555555555555","unread":false,"workspace":{"id":"22222222-2222-2222-2222-222222222222","name":"workspace","root":"/project"}}],"revision":42,"unread_count":0},"version":1}"#
+        );
+
+        let agent = resolve_agent(
+            &snapshot,
+            "55555555-5555-5555-5555-555555555555".parse().unwrap(),
+        )
+        .unwrap();
+        let get = serde_json::to_string(&OutputEnvelope {
+            command: "agent.get",
+            result: AgentGetWire {
+                agent,
+                revision: snapshot.revision,
+            },
+            version: 1,
+        })
+        .unwrap();
+        assert_eq!(
+            get,
+            r#"{"command":"agent.get","result":{"agent":{"activity":{"integration":{"source":"codex"},"state":"blocked","revision":9,"updated_at_ms":1234},"available":true,"pane_id":"44444444-4444-4444-4444-444444444444","session":{"id":"11111111-1111-1111-1111-111111111111","name":"session"},"tab":{"id":"33333333-3333-3333-3333-333333333333","name":"tab"},"terminal_id":"55555555-5555-5555-5555-555555555555","unread":false,"workspace":{"id":"22222222-2222-2222-2222-222222222222","name":"workspace","root":"/project"}},"revision":42},"version":1}"#
+        );
+    }
+
+    #[test]
+    fn agent_projection_derives_availability_and_resolution_from_typed_paths() {
+        let mut snapshot = agent_fixture();
+        let terminal_id = snapshot.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
+        assert!(resolve_agent(&snapshot, terminal_id).unwrap().available);
+
+        snapshot.sessions[0].closing = true;
+        assert!(!resolve_agent(&snapshot, terminal_id).unwrap().available);
+        snapshot.sessions[0].closing = false;
+        snapshot.sessions[0].workspaces[0].tabs[0].panes[0]
+            .activity
+            .state = AgentState::Working;
+        assert!(!resolve_agent(&snapshot, terminal_id).unwrap().available);
+
+        snapshot.sessions[0].workspaces[0].tabs[0].panes[0]
+            .activity
+            .integration = None;
+        let error = resolve_agent(&snapshot, terminal_id).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<CliError>().unwrap().code,
+            "not_an_agent"
+        );
+
+        let error = resolve_agent(&snapshot, TerminalId::new()).unwrap_err();
+        assert_eq!(error.downcast_ref::<CliError>().unwrap().code, "not_found");
     }
 
     #[test]

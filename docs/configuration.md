@@ -41,6 +41,8 @@ open_command_bar = "space"
 # reload_config = "R"
 # enter_copy_mode = "["
 # open_navigator = "s"
+# open_left_sidebar = "w"
+# open_right_sidebar = "]"
 # focus_next_notification = "prefix"
 # create_workspace = "C"
 # create_tab = "c"
@@ -124,23 +126,20 @@ segments = [
   { text = " " },
 ]
 
-[ui.workspace_sidebar]
-position = "left" # "left" or "right"
+[ui.sidebar.left]
 width = 28
 display = "expanded" # "expanded" or "minimized"
-visibility = "auto_hide_when_single" # "visible", "auto_hide_when_single", or "hidden"
-header = [{ token = "session.name", style = "current" }]
-footer = [{ token = "sidebar.status", style = "muted" }]
+visibility = "automatic" # "visible", "automatic", or "hidden"
+components = [
+  { component = "workspaces", size = "fill", header = [{ token = "session.name", style = "current" }], footer = [{ token = "sidebar.status", style = "muted" }], row = { left = [{ token = "workspace.marker" }, { text = " " }], body = [{ token = "workspace.index" }, { token = "workspace.name", prefix = " " }], right = [{ token = "workspace.tab_count" }, { token = "workspace.closing", prefix = " " }, { text = " " }], detail = [{ text = "    " }, { token = "workspace.git_branch", style = "muted" }, { token = "workspace.git_added", prefix = " " }, { token = "workspace.git_deleted", prefix = " " }] } },
+]
 
-[ui.workspace_sidebar.row]
-left = [{ token = "workspace.marker" }, { text = " " }]
-body = [{ token = "workspace.index" }, { token = "workspace.name", prefix = " " }]
-right = [{ token = "workspace.tab_count" }, { token = "workspace.closing", prefix = " " }, { text = " " }]
-detail = [
-  { text = "    " },
-  { token = "workspace.git_branch", style = "muted" },
-  { token = "workspace.git_added", prefix = " " },
-  { token = "workspace.git_deleted", prefix = " " },
+[ui.sidebar.right]
+width = 28
+display = "expanded"
+visibility = "automatic"
+components = [
+  { component = "agents", size = "fill", scope = "session" },
 ]
 ```
 
@@ -224,7 +223,7 @@ The checked-in `examples/extensions/example-workspace-status` extension is execu
 
 The checked-in `examples/extensions/wt` extension uses a palette command to create a `wt` worktree, open it as a peer Fut workspace, and run a configurable post-open action without requiring an initial agent prompt. Its packaged `wt` removal handler calls `fut workspace retire`, so successful `wt done`, `wt ship`, and `wt rm` operations gracefully remove the disposable workspace. See its README for setup and action configuration.
 
-Bindings are suffixes after the fixed `Ctrl-b` prefix. `Ctrl-b :` opens the command palette. Override any action under `ui.bindings`; accepted values are one printable character or the names `prefix`, `ctrl-s`, `space`, `enter`, `tab`, `esc`, `up`, and `down`. `prefix` means pressing `Ctrl-b` again. Keys must remain unique. Action names are `open_command_bar`, `reload_config`, `enter_copy_mode`, `open_navigator`, `open_workspace_sidebar`, `open_tab_bar`, `open_notifications`, `focus_next_notification`, `create_workspace`, `create_tab`, `focus_next_tab`, `focus_previous_tab`, `split_pane_right`, `split_pane_down`, `focus_next_pane`, `focus_previous_pane`, `focus_pane_left`, `focus_pane_down`, `focus_pane_up`, `focus_pane_right`, `focus_last_pane`, `focus_last_tab`, `focus_last_workspace`, `focus_last_session`, `focus_next_workspace`, `focus_previous_workspace`, `focus_tab_1` through `focus_tab_10`, `toggle_pane_zoom`, and `detach`. `Ctrl-b Ctrl-s` switches to the last active session, so repeating it toggles between the two most recent sessions. Rebinding `focus_next_notification` away from `prefix` restores `Ctrl-b Ctrl-b` as a literal prefix unless another action uses `prefix`. The palette displays tmux-style command names, descriptions, and configured bindings, and searches all three.
+Bindings are suffixes after the fixed `Ctrl-b` prefix. `Ctrl-b :` opens the command palette. Override any action under `ui.bindings`; accepted values are one printable character or the names `prefix`, `ctrl-s`, `space`, `enter`, `tab`, `esc`, `up`, and `down`. `prefix` means pressing `Ctrl-b` again. Keys must remain unique. Action names are `open_command_bar`, `reload_config`, `enter_copy_mode`, `open_navigator`, `open_left_sidebar`, `open_right_sidebar`, `open_tab_bar`, `open_notifications`, `focus_next_notification`, `create_workspace`, `create_tab`, `focus_next_tab`, `focus_previous_tab`, `split_pane_right`, `split_pane_down`, `focus_next_pane`, `focus_previous_pane`, `focus_pane_left`, `focus_pane_down`, `focus_pane_up`, `focus_pane_right`, `focus_last_pane`, `focus_last_tab`, `focus_last_workspace`, `focus_last_session`, `focus_next_workspace`, `focus_previous_workspace`, `focus_tab_1` through `focus_tab_10`, `toggle_pane_zoom`, and `detach`. `Ctrl-b Ctrl-s` switches to the last active session, so repeating it toggles between the two most recent sessions. Rebinding `focus_next_notification` away from `prefix` restores `Ctrl-b Ctrl-b` as a literal prefix unless another action uses `prefix`. The palette displays tmux-style command names, descriptions, and configured bindings, and searches all three.
 
 Each `[trusted_commands.NAME]` table requires `title` and an executable `program`, plus optional `binding`, string array `args`, `size`, and `activate_opened` values. `size` and `activate_opened` have the same semantics as an extension command; omitting size preserves the full-terminal surface, while activation defaults to false. Running a command opens a dashed frame containing a temporary PTY, inherits the focused pane process's live working directory, and sends normal terminal input to the command. The frame names the command and identifies the temporary surface; when the process exits, Fut restores the previous panes, focus, and geometry. A bound trusted command may take a built-in's default key, which unbinds that built-in unless it is explicitly rebound under `ui.bindings`. Explicit binding collisions and duplicate command keys are rejected. Commands appear in the command palette; bound commands also appear in delayed which-key help. Configuration reload replaces them atomically.
 
@@ -242,15 +241,17 @@ Ordinary `workspace close` retains its synchronous confirmed-close behavior.
 
 Mouse input uses pane-local cells. The first left click on an unfocused pane changes focus without reaching either application. Focused applications receive only the press, release, drag, motion, and wheel reports enabled by their terminal mouse modes. Without mouse reporting, a wheel uses DEC alternate scroll on an alternate screen and otherwise changes only that client's scrollback viewport. In the default `splits` layout, left-drag a visible pane divider to resize that authored split cell by cell; the shared layout remains in the daemon across detach and updates other clients. Recursive pane minimums still apply. Accordion, zoom, and focused-only fallback layouts have no draggable pane dividers. A gesture keeps its initial owner, so a drag that starts in an application never becomes a Fut resize and a divider drag never reaches the application. Copy mode and modal surfaces suppress new application and divider gestures.
 
-`open_notifications` (default `Ctrl-b u`) opens the per-client list of terminals with unseen blocked or completed reports. `focus_next_notification` (default `Ctrl-b Ctrl-b`) switches to the next such terminal in resource order, wrapping and skipping the current, seen, or closing terminals. It does nothing when none is waiting. Selecting or viewing that terminal marks its current attention seen only for that client.
+`open_notifications` (default `Ctrl-b u`) opens the list of terminals with daemon-wide unread blocked or completed reports. `focus_next_notification` (default `Ctrl-b Ctrl-b`) switches to the next such terminal in resource order, wrapping and skipping the current, read, or closing terminals. It does nothing when none is waiting. Rendering that terminal marks its current attention read for every attached client and later CLI calls.
 
-Inside the workspace sidebar, `1` through `9` and `0` switch straight to that workspace in session order, exactly as Enter switches to the highlighted row. Press `?` for the sidebar's hotkey list; any key returns to the workspaces.
+`open_left_sidebar` (default `Ctrl-b w`) and `open_right_sidebar` (default `Ctrl-b ]`) open the corresponding edge drawer and focus that side's configured component stack. `Ctrl-b W` remains the last-workspace binding. Only one modal sidebar surface is open at a time. `Tab` and `BackTab` move focus between its components; all other keys go only to the focused component. In Workspaces, `1` through `9` and `0` switch directly in session order, exactly as Enter switches to the highlighted row. Press `?` for its hotkey list; any key returns to the workspaces.
 
-Sidebar width is 4 through 80 cells and includes its one-cell divider. Left-drag the visible divider from either edge to resize it cell by cell. A docked drag preserves at least 40 terminal columns; an open drawer's divider is also draggable, while a hidden drawer is not. The dragged width belongs only to that attached client: it is not written to configuration and the configured width returns on reattach or configuration reload. The active workspace is marked with a bullet.
+Agents is a read-only projection of terminals with an explicit agent integration. Its `scope` is `tab`, `workspace`, `session`, or `global`. Tab, workspace, and session filters use fresh live focus ancestry when available and otherwise fall back to the selected IDs; global needs no focus anchor. Rows under any closing session, workspace, tab, or pane are omitted; screen detection alone does not add a row. Rows show idle, working, blocked, and daemon-wide unread-completed activity plus session/workspace/tab context. Enter navigates with the row's typed pane ID; `global` safely permits cross-session destinations. The separate Notifications dialog remains the unread-attention surface.
 
-Display and visibility are independent. `display = "expanded"` uses the configured width, while `display = "minimized"` uses a fixed six-cell rail with each workspace's active marker, number, and status. The marker reserves a trailing cell so round glyphs remain visually separate from the number in fonts such as Iosevka. Opening a minimized sidebar temporarily expands its drawer to the configured width; the rail itself is not draggable, but its open drawer remains resizable. Press `m` inside the sidebar to toggle expanded/minimized. `visibility = "visible"` keeps the chosen display docked whenever the terminal is wide enough. `visibility = "auto_hide_when_single"` (the default) docks it only when the current session has more than one workspace, and `visibility = "hidden"` leaves it as an on-demand drawer. Press `h` to cycle visible → auto-hide when single → hidden. This allows combinations such as a minimized sidebar that also hides when only one workspace exists. With the default footer, an open sidebar shows `h`, `m`, and `?` on separate lines with their current states; the `nerd_font` preset adds matching visibility, width, and help icons.
+Each sidebar width is independently 4 through 80 cells and includes its one-cell inner divider. Each tagged built-in entry uses `component = "workspaces"` or `component = "agents"` and has either `size = "fill"` or a positive fixed row count; each side may contain at most one `fill` and at most one Workspaces component. Left-drag either visible divider to resize only that side. A docked drag preserves at least 40 terminal columns after accounting for the other docked side; an open drawer's divider is also draggable, while a hidden drawer is not. Dragged widths belong only to that attached client: they are not written to configuration, and both configured widths return on reattach or configuration reload. The active workspace is marked with a bullet.
 
-When not docked or below the sidebar width plus 40 terminal columns, the sidebar remains available as an edge drawer without reducing terminal geometry. The current display and visibility appear in the default footer. `sidebar.display` and `sidebar.visibility` expose their labels to custom sidebar chrome. `vertical_divider` must be exactly one grapheme and one display cell.
+Display, visibility, components, and relevance are independent per side. `display = "expanded"` uses that side's configured width, while `display = "minimized"` uses a fixed six-cell rail. Minimized Workspaces and Agents rows keep stable numeric positions plus current/activity markers. Opening a minimized sidebar temporarily expands its drawer to the configured width; the rail itself is not draggable, but its open drawer remains resizable. Press `m` inside a component to toggle its side. `visibility = "visible"` docks when geometry permits. `visibility = "automatic"` docks when that side has a relevant configured component: Workspaces with multiple live workspaces, or Agents with an integrated terminal in their configured scope. `visibility = "hidden"` leaves the side as an on-demand drawer. Press `h` to cycle that side through visible → automatic → hidden. With the default Workspaces footer, an open sidebar shows `h`, `m`, and `?` on separate lines with their current states; the `nerd_font` preset adds matching visibility, width, and help icons.
+
+The defaults are left Automatic with one Workspaces `fill`, and right Automatic with one session-scoped Agents `fill`; an empty Agents projection therefore consumes no right-side width. Both sides dock when their combined widths leave 40 terminal columns. If only one can fit, allocation is deterministic: left is considered before right. Any hidden, irrelevant, or non-fitting side remains available as its own edge drawer without reducing terminal geometry. The current side's display and visibility appear in the default footer. `sidebar.display` and `sidebar.visibility` expose those labels to custom sidebar chrome. `vertical_divider` must be exactly one grapheme and one display cell.
 
 ## Segments, groups, and components
 

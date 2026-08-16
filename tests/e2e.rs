@@ -2051,7 +2051,7 @@ async fn checked_in_example_extension_smokes_hooks_cli_tokens_and_configuration(
         fs::write(
             root.join("home/.config/fut/config.toml"),
             format!(
-                "extensions = [{:?}]\n[ui.workspace_sidebar.row]\nright = [{{ token = 'workspace.extension.example-workspace-status.last_event' }}]\n",
+                "extensions = [{:?}]\n[ui.sidebar.left]\ncomponents = [{{ component = 'workspaces', row = {{ right = [{{ token = 'workspace.extension.example-workspace-status.last_event' }}] }} }}]\n",
                 example.display().to_string()
             ),
         )
@@ -2213,7 +2213,7 @@ scope = "pane"
         fs::write(
             root.join("home/.config/fut/config.toml"),
             format!(
-                "extensions = [{:?}]\n[ui.workspace_sidebar.row]\nright = [{{ token = 'workspace.extension.status.state' }}]\n",
+                "extensions = [{:?}]\n[ui.sidebar.left]\ncomponents = [{{ component = 'workspaces', row = {{ right = [{{ token = 'workspace.extension.status.state' }}] }} }}]\n",
                 extension.display().to_string()
             ),
         )
@@ -8634,8 +8634,6 @@ right = [{ segments = [{ text = " RIGHT" }], priority = 200 }]
 [ui.tab_bar.item]
 segments = [{ text = "{" }, { token = "tab.marker" }, { text = ":" }, { token = "tab.name" }, { text = "}" }]
 
-[ui.workspace_sidebar]
-position = "right"
 "#,
     )
     .unwrap();
@@ -8692,7 +8690,7 @@ position = "right"
 }
 
 #[tokio::test]
-async fn public_workspace_sidebar_docks_navigates_and_collapses_responsively() {
+async fn public_component_sidebar_docks_navigates_and_collapses_responsively() {
     let main_script = r#"
 printf 'ALPHA_READY\r\n'
 while IFS= read -r line; do
@@ -8800,22 +8798,21 @@ done
     fs::write(
         config_directory.join("config.toml"),
         r#"
-[ui.workspace_sidebar]
-position = "right"
-header = [{ text = "WORKSPACES" }]
-footer = [{ text = "MODE:" }, { token = "sidebar.visibility" }]
+[ui.sidebar.left]
+visibility = "hidden"
 
-[ui.workspace_sidebar.row]
-left = [{ text = "WS[" }]
-body = [{ token = "workspace.name" }]
-right = [{ text = "]" }, { token = "workspace.tab_count" }]
+[ui.sidebar.right]
+visibility = "visible"
+components = [
+  { component = "workspaces", size = "fill", header = [{ text = "WORKSPACES" }], footer = [{ text = "MODE:" }, { token = "sidebar.visibility" }], row = { left = [{ text = "WS[" }], body = [{ token = "workspace.name" }], right = [{ text = "]" }, { token = "workspace.tab_count" }] } },
+]
 "#,
     )
     .unwrap();
-    let mut right = spawn_client(124, linked_target.pane_id);
-    right.wait_for("WORKSPACES").await;
-    right.wait_for("WS[").await;
-    right.wait_for("feature").await;
+    let mut configured = spawn_client(124, linked_target.pane_id);
+    configured.wait_for("WORKSPACES").await;
+    configured.wait_for("WS[").await;
+    configured.wait_for("feature").await;
     assert!(matches!(
         harness
             .control_command(ClientMessage::RenameTarget {
@@ -8825,10 +8822,11 @@ right = [{ text = "]" }, { token = "workspace.tab_count" }]
             .await,
         ServerMessage::CommandCompleted { .. }
     ));
-    right.wait_for("λ").await;
-    right.send(b"size-linked\n");
-    right.wait_for("ZETA_SIZE_23_96").await;
-    right.send(
+    configured.wait_for("λ").await;
+    configured.send(b"\x02]q");
+    configured.send(b"size-linked\n");
+    configured.wait_for("ZETA_SIZE_23_96").await;
+    configured.send(
         &[
             sgr_mouse(0, 97, 6, false),
             sgr_mouse(32, 105, 6, false),
@@ -8836,17 +8834,28 @@ right = [{ text = "]" }, { token = "workspace.tab_count" }]
         ]
         .concat(),
     );
-    right.send(b"size-linked\n");
-    right.wait_for("ZETA_SIZE_23_104").await;
-    right.send(b"\x02d");
-    right.wait_success().await;
+    configured.send(b"size-linked\n");
+    configured.wait_for("ZETA_SIZE_23_104").await;
+    configured.send(b"\x02d");
+    configured.wait_success().await;
 
-    let mut right_reset = spawn_client(124, linked_target.pane_id);
-    right_reset.wait_for("ZETA_READY").await;
-    right_reset.send(b"size-linked\n");
-    right_reset.wait_for("ZETA_SIZE_23_96").await;
-    right_reset.send(b"\x02d");
-    right_reset.wait_success().await;
+    let mut configured_reset = spawn_client(124, linked_target.pane_id);
+    configured_reset.wait_for("ZETA_READY").await;
+    configured_reset.send(b"size-linked\n");
+    configured_reset.wait_for("ZETA_SIZE_23_96").await;
+    configured_reset.send(b"\x02d");
+    configured_reset.wait_success().await;
+
+    fs::write(
+        config_directory.join("config.toml"),
+        r#"
+[ui.sidebar.left]
+components = [
+  { component = "workspaces", size = "fill", header = [{ text = "WORKSPACES" }], footer = [{ text = "MODE:" }, { token = "sidebar.visibility" }], row = { left = [{ text = "WS[" }], body = [{ token = "workspace.name" }], right = [{ text = "]" }, { token = "workspace.tab_count" }] } },
+]
+"#,
+    )
+    .unwrap();
 
     let mut narrow = spawn_client(123, main_pane);
     narrow.wait_for("ALPHA_READY").await;
@@ -8857,9 +8866,9 @@ right = [{ text = "]" }, { token = "workspace.tab_count" }]
     narrow.wait_for("λ").await;
     narrow.send(
         &[
-            sgr_mouse(0, 96, 6, false),
-            sgr_mouse(32, 104, 6, false),
-            sgr_mouse(0, 104, 6, true),
+            sgr_mouse(0, 28, 6, false),
+            sgr_mouse(32, 20, 6, false),
+            sgr_mouse(0, 20, 6, true),
         ]
         .concat(),
     );
@@ -8904,12 +8913,10 @@ right = [{ text = "]" }, { token = "workspace.tab_count" }]
     live_close.wait_for("ZETA_SIZE_23_124").await;
     live_close.send(b"\x02w");
     live_close.wait_for("done").await;
-    live_close.wait_for("MODE:hide").await;
-    live_close.wait_for("with").await;
-    live_close.wait_for("one").await;
+    live_close.wait_for("MODE:automatic").await;
     live_close.clear_output();
     live_close.send(b"h");
-    // A concurrent resource redraw may preserve the unchanged `MODE:hide`
+    // A concurrent resource redraw may preserve the unchanged `MODE:`
     // prefix and emit only the changed suffix through the terminal diff.
     live_close.wait_for("den").await;
     live_close.clear_output();

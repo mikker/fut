@@ -262,7 +262,7 @@ setup_demo() {
   trap 'clean_demo' ERR INT TERM
   "$FUT_BIN" --socket "$SOCKET" daemon run --cwd "$MAIN" -- \
     /bin/sh -c \
-      'printf "\033[1;36mFut demo · main / shell\033[0m\r\nTry Ctrl-b k, Ctrl-b w, and Ctrl-b g.\r\n"; exec "$1"' \
+      'printf "\033[1;36mFut demo · main / shell\033[0m\r\nTry Ctrl-b w, Ctrl-b ], and Ctrl-b s.\r\n"; exec "$1"' \
       fut-demo "$DEMO_SHELL" >"$DAEMON_LOG" 2>&1 &
   local daemon_pid=$!
   DEMO_DAEMON_PID=$daemon_pid
@@ -333,7 +333,7 @@ Fut demo is ready.
   reattach: mise run demo:attach
   clean up: mise run demo:clean
 
-Inside Fut try Ctrl-b k, Ctrl-b w, Ctrl-b g, and the pane focus bindings.
+Inside Fut try Ctrl-b w, Ctrl-b ], Ctrl-b s, and the pane focus bindings.
 EOF
 }
 

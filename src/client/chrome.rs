@@ -15,12 +15,13 @@ use crate::{
 
 use super::{
     config::{
-        GroupConfig, MINIMIZED_SIDEBAR_WIDTH, SemanticStyle, TabBarPosition, UiConfig,
-        WorkspaceSidebarDisplay, WorkspaceSidebarPosition, WorkspaceSidebarVisibility,
+        GroupConfig, MINIMIZED_SIDEBAR_WIDTH, SemanticStyle, SidebarDisplay, SidebarVisibility,
+        TabBarPosition, UiConfig,
     },
     hotkey::{HotkeyButton, HotkeyLine},
     notifications::{ActivityIndicator, NotificationState},
     presentation::{ItemState, TokenValue, apply_item_state, render_token_segments, truncate_line},
+    sidebar::{SidebarSide, slot_relevant},
 };
 
 pub(super) const MIN_DOCKED_TERMINAL_WIDTH: u16 = 40;
@@ -29,16 +30,26 @@ pub(super) const MIN_DOCKED_TERMINAL_WIDTH: u16 = 40;
 pub(super) struct ClientLayout {
     pub terminal: Rect,
     pub tab_bar: Option<Rect>,
-    pub workspace_sidebar: Option<WorkspaceSidebarLayout>,
+    pub left_sidebar: Option<SidebarLayout>,
+    pub right_sidebar: Option<SidebarLayout>,
+}
+
+impl ClientLayout {
+    pub(super) const fn sidebar(self, side: SidebarSide) -> Option<SidebarLayout> {
+        match side {
+            SidebarSide::Left => self.left_sidebar,
+            SidebarSide::Right => self.right_sidebar,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum WorkspaceSidebarLayout {
+pub(super) enum SidebarLayout {
     Docked(Rect),
     Drawer(Rect),
 }
 
-impl WorkspaceSidebarLayout {
+impl SidebarLayout {
     pub fn docked(self) -> Option<Rect> {
         match self {
             Self::Docked(area) => Some(area),
@@ -50,52 +61,57 @@ impl WorkspaceSidebarLayout {
 pub(super) fn client_layout(
     host: Rect,
     ui: &UiConfig,
-    workspace_count: Option<usize>,
+    sidebar_relevance: SidebarRelevance,
 ) -> ClientLayout {
     if host.width == 0 || host.height < 2 {
         return ClientLayout {
             terminal: host,
             tab_bar: None,
-            workspace_sidebar: sidebar_rect(
-                host,
-                ui.workspace_sidebar.position,
-                ui.workspace_sidebar.width,
-            )
-            .map(WorkspaceSidebarLayout::Drawer),
+            left_sidebar: sidebar_drawer(host, ui, SidebarSide::Left).map(SidebarLayout::Drawer),
+            right_sidebar: sidebar_drawer(host, ui, SidebarSide::Right).map(SidebarLayout::Drawer),
         };
     }
 
-    let sidebar_width = match ui.workspace_sidebar.display {
-        WorkspaceSidebarDisplay::Expanded => ui.workspace_sidebar.width,
-        WorkspaceSidebarDisplay::Minimized => MINIMIZED_SIDEBAR_WIDTH,
-    };
-    let sidebar_needed = match ui.workspace_sidebar.visibility {
-        WorkspaceSidebarVisibility::Visible => true,
-        WorkspaceSidebarVisibility::AutoHideWhenSingle => {
-            workspace_count.is_none_or(|count| count > 1)
-        }
-        WorkspaceSidebarVisibility::Hidden => false,
-    };
-    let docked =
-        sidebar_needed && host.width >= sidebar_width.saturating_add(MIN_DOCKED_TERMINAL_WIDTH);
-    let (workspace, docked_sidebar) = if docked {
-        let sidebar = sidebar_rect(host, ui.workspace_sidebar.position, sidebar_width)
-            .expect("nonempty host has a sidebar rectangle");
-        let workspace = match ui.workspace_sidebar.position {
-            WorkspaceSidebarPosition::Left => Rect::new(
-                host.x.saturating_add(sidebar_width),
-                host.y,
-                host.width - sidebar_width,
-                host.height,
-            ),
-            WorkspaceSidebarPosition::Right => {
-                Rect::new(host.x, host.y, host.width - sidebar_width, host.height)
-            }
+    let mut available = host.width.saturating_sub(MIN_DOCKED_TERMINAL_WIDTH);
+    let mut docked = [None, None];
+    for (index, side) in SidebarSide::ALL.into_iter().enumerate() {
+        let slot = side.config(ui);
+        let width = match slot.display {
+            SidebarDisplay::Expanded => slot.width,
+            SidebarDisplay::Minimized => MINIMIZED_SIDEBAR_WIDTH,
         };
-        (workspace, Some(sidebar))
-    } else {
-        (host, None)
-    };
+        let relevant = match side {
+            SidebarSide::Left => sidebar_relevance.left,
+            SidebarSide::Right => sidebar_relevance.right,
+        };
+        let needed = match slot.visibility {
+            SidebarVisibility::Visible => true,
+            SidebarVisibility::Automatic => relevant.unwrap_or(true),
+            SidebarVisibility::Hidden => false,
+        };
+        if needed && width <= available {
+            docked[index] = Some(width);
+            available -= width;
+        }
+    }
+
+    let left_width = docked[0].unwrap_or(0);
+    let right_width = docked[1].unwrap_or(0);
+    let workspace = Rect::new(
+        host.x.saturating_add(left_width),
+        host.y,
+        host.width.saturating_sub(left_width + right_width),
+        host.height,
+    );
+    let docked_left = docked[0].map(|width| Rect::new(host.x, host.y, width, host.height));
+    let docked_right = docked[1].map(|width| {
+        Rect::new(
+            host.right().saturating_sub(width),
+            host.y,
+            width,
+            host.height,
+        )
+    });
 
     let (terminal, tab_bar) = match ui.tab_bar.position {
         TabBarPosition::Top => (
@@ -126,32 +142,33 @@ pub(super) fn client_layout(
     ClientLayout {
         terminal,
         tab_bar,
-        workspace_sidebar: docked_sidebar
-            .map(WorkspaceSidebarLayout::Docked)
-            .or_else(|| workspace_sidebar_drawer(host, ui).map(WorkspaceSidebarLayout::Drawer)),
+        left_sidebar: docked_left
+            .map(SidebarLayout::Docked)
+            .or_else(|| sidebar_drawer(host, ui, SidebarSide::Left).map(SidebarLayout::Drawer)),
+        right_sidebar: docked_right
+            .map(SidebarLayout::Docked)
+            .or_else(|| sidebar_drawer(host, ui, SidebarSide::Right).map(SidebarLayout::Drawer)),
     }
 }
 
-pub(super) fn workspace_sidebar_drawer(host: Rect, ui: &UiConfig) -> Option<Rect> {
-    sidebar_rect(
-        host,
-        ui.workspace_sidebar.position,
-        ui.workspace_sidebar.width,
-    )
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct SidebarRelevance {
+    pub left: Option<bool>,
+    pub right: Option<bool>,
 }
 
-fn sidebar_rect(
-    body: Rect,
-    position: WorkspaceSidebarPosition,
-    configured_width: u16,
-) -> Option<Rect> {
+pub(super) fn sidebar_drawer(host: Rect, ui: &UiConfig, side: SidebarSide) -> Option<Rect> {
+    sidebar_rect(host, side.config(ui).width, side)
+}
+
+fn sidebar_rect(body: Rect, configured_width: u16, side: SidebarSide) -> Option<Rect> {
     if body.width == 0 || body.height == 0 {
         return None;
     }
     let width = body.width.min(configured_width);
-    let x = match position {
-        WorkspaceSidebarPosition::Left => body.x,
-        WorkspaceSidebarPosition::Right => body.x.saturating_add(body.width - width),
+    let x = match side {
+        SidebarSide::Left => body.x,
+        SidebarSide::Right => body.right().saturating_sub(width),
     };
     Some(Rect::new(x, body.y, width, body.height))
 }
@@ -188,12 +205,9 @@ impl ResourceState {
         let pane = self
             .snapshot
             .as_ref()?
-            .sessions
-            .iter()
-            .flat_map(|session| &session.workspaces)
-            .flat_map(|workspace| &workspace.tabs)
-            .flat_map(|tab| &tab.panes)
-            .find(|pane| pane.terminal_id == terminal_id)?;
+            .pane_paths()
+            .find(|path| path.pane.terminal_id == terminal_id)?
+            .pane;
         if !pane.activity.has_unread_attention() {
             return None;
         }
@@ -208,14 +222,14 @@ impl ResourceState {
             .is_some_and(|snapshot| self.notifications().has_working(snapshot))
     }
 
-    pub fn workspace_count(&self, focused: &SelectedTarget) -> Option<usize> {
-        self.snapshot.as_ref().and_then(|snapshot| {
-            snapshot
-                .sessions
-                .iter()
-                .find(|session| session.id == focused.session_id)
-                .map(|session| session.workspaces.len())
-        })
+    pub fn sidebar_relevance(&self, focused: &SelectedTarget, ui: &UiConfig) -> SidebarRelevance {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return SidebarRelevance::default();
+        };
+        SidebarRelevance {
+            left: Some(slot_relevant(snapshot, focused, SidebarSide::Left, ui)),
+            right: Some(slot_relevant(snapshot, focused, SidebarSide::Right, ui)),
+        }
     }
 }
 
@@ -1073,7 +1087,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        domain::{PaneId, SessionId, TabId, TerminalId, WorkspaceId},
+        domain::{AgentIntegration, PaneId, SessionId, TabId, TerminalId, WorkspaceId},
         resources::{
             PaneSnapshot, Project, ProjectIdentity, SessionSnapshot, TabSnapshot, WorkspaceSnapshot,
         },
@@ -1224,83 +1238,116 @@ mod tests {
     }
 
     #[test]
-    fn chrome_layout_composes_tab_and_sidebar_positions_at_the_exact_breakpoint() {
-        let top_left = UiConfig::default();
+    fn chrome_layout_docks_both_sides_at_exact_deterministic_breakpoints() {
+        let ui = UiConfig::default();
+        let both = SidebarRelevance {
+            left: Some(true),
+            right: Some(true),
+        };
         assert_eq!(
-            client_layout(Rect::new(3, 4, 67, 24), &top_left, Some(2)),
+            client_layout(Rect::new(3, 4, 67, 24), &ui, both),
             ClientLayout {
                 tab_bar: Some(Rect::new(3, 4, 67, 1)),
                 terminal: Rect::new(3, 5, 67, 23),
-                workspace_sidebar: Some(WorkspaceSidebarLayout::Drawer(Rect::new(3, 4, 28, 24,))),
+                left_sidebar: Some(SidebarLayout::Drawer(Rect::new(3, 4, 28, 24))),
+                right_sidebar: Some(SidebarLayout::Drawer(Rect::new(42, 4, 28, 24))),
             }
         );
         assert_eq!(
-            client_layout(Rect::new(3, 4, 68, 24), &top_left, Some(2)),
+            client_layout(Rect::new(3, 4, 95, 24), &ui, both),
+            ClientLayout {
+                tab_bar: Some(Rect::new(31, 4, 67, 1)),
+                terminal: Rect::new(31, 5, 67, 23),
+                left_sidebar: Some(SidebarLayout::Docked(Rect::new(3, 4, 28, 24))),
+                right_sidebar: Some(SidebarLayout::Drawer(Rect::new(70, 4, 28, 24))),
+            }
+        );
+        assert_eq!(
+            client_layout(Rect::new(3, 4, 96, 24), &ui, both),
             ClientLayout {
                 tab_bar: Some(Rect::new(31, 4, 40, 1)),
                 terminal: Rect::new(31, 5, 40, 23),
-                workspace_sidebar: Some(WorkspaceSidebarLayout::Docked(Rect::new(3, 4, 28, 24,))),
+                left_sidebar: Some(SidebarLayout::Docked(Rect::new(3, 4, 28, 24))),
+                right_sidebar: Some(SidebarLayout::Docked(Rect::new(71, 4, 28, 24))),
             }
         );
-        let mut bottom_right = UiConfig::default();
-        bottom_right.tab_bar.position = TabBarPosition::Bottom;
-        bottom_right.workspace_sidebar.position = WorkspaceSidebarPosition::Right;
+        let mut bottom = UiConfig::default();
+        bottom.tab_bar.position = TabBarPosition::Bottom;
         assert_eq!(
-            client_layout(Rect::new(3, 4, 68, 24), &bottom_right, Some(2)),
+            client_layout(Rect::new(3, 4, 96, 24), &bottom, both),
             ClientLayout {
-                tab_bar: Some(Rect::new(3, 27, 40, 1)),
-                terminal: Rect::new(3, 4, 40, 23),
-                workspace_sidebar: Some(WorkspaceSidebarLayout::Docked(Rect::new(43, 4, 28, 24,))),
+                tab_bar: Some(Rect::new(31, 27, 40, 1)),
+                terminal: Rect::new(31, 4, 40, 23),
+                left_sidebar: Some(SidebarLayout::Docked(Rect::new(3, 4, 28, 24))),
+                right_sidebar: Some(SidebarLayout::Docked(Rect::new(71, 4, 28, 24))),
             }
         );
     }
 
     #[test]
-    fn workspace_sidebar_visibility_controls_docking() {
+    fn sidebar_visibility_uses_component_relevance() {
         let ui = UiConfig::default();
-        let layout = client_layout(Rect::new(0, 0, 124, 24), &ui, Some(1));
+        let irrelevant = SidebarRelevance {
+            left: Some(false),
+            right: Some(false),
+        };
+        let layout = client_layout(Rect::new(0, 0, 124, 24), &ui, irrelevant);
         assert_eq!(layout.terminal, Rect::new(0, 1, 124, 23));
         assert_eq!(
-            layout.workspace_sidebar,
-            Some(WorkspaceSidebarLayout::Drawer(Rect::new(0, 0, 28, 24)))
+            layout.left_sidebar,
+            Some(SidebarLayout::Drawer(Rect::new(0, 0, 28, 24)))
         );
 
         let mut always_visible = UiConfig::default();
-        always_visible.workspace_sidebar.visibility = WorkspaceSidebarVisibility::Visible;
+        always_visible.sidebar.left.visibility = SidebarVisibility::Visible;
         assert!(matches!(
-            client_layout(Rect::new(0, 0, 124, 24), &always_visible, Some(1)).workspace_sidebar,
-            Some(WorkspaceSidebarLayout::Docked(_))
+            client_layout(Rect::new(0, 0, 124, 24), &always_visible, irrelevant).left_sidebar,
+            Some(SidebarLayout::Docked(_))
         ));
 
         let mut minimized = UiConfig::default();
-        minimized.workspace_sidebar.display = WorkspaceSidebarDisplay::Minimized;
-        let single = client_layout(Rect::new(0, 0, 46, 24), &minimized, Some(1));
-        assert_eq!(single.terminal, Rect::new(0, 1, 46, 23));
+        minimized.sidebar.left.display = SidebarDisplay::Minimized;
+        let narrow = client_layout(Rect::new(0, 0, 46, 24), &minimized, irrelevant);
+        assert_eq!(narrow.terminal, Rect::new(0, 1, 46, 23));
         assert_eq!(
-            single.workspace_sidebar,
-            Some(WorkspaceSidebarLayout::Drawer(Rect::new(0, 0, 28, 24)))
+            narrow.left_sidebar,
+            Some(SidebarLayout::Drawer(Rect::new(0, 0, 28, 24)))
         );
-        let layout = client_layout(Rect::new(0, 0, 46, 24), &minimized, Some(2));
+        let layout = client_layout(
+            Rect::new(0, 0, 46, 24),
+            &minimized,
+            SidebarRelevance {
+                left: Some(true),
+                right: Some(false),
+            },
+        );
         assert_eq!(layout.terminal, Rect::new(6, 1, 40, 23));
         assert_eq!(
-            layout.workspace_sidebar,
-            Some(WorkspaceSidebarLayout::Docked(Rect::new(0, 0, 6, 24)))
+            layout.left_sidebar,
+            Some(SidebarLayout::Docked(Rect::new(0, 0, 6, 24)))
         );
         assert_eq!(
-            workspace_sidebar_drawer(Rect::new(0, 0, 46, 24), &minimized),
+            sidebar_drawer(Rect::new(0, 0, 46, 24), &minimized, SidebarSide::Left),
             Some(Rect::new(0, 0, 28, 24))
         );
     }
 
     #[test]
-    fn hidden_workspace_sidebar_is_available_as_a_drawer() {
+    fn hidden_sidebar_is_available_as_a_drawer() {
         let mut ui = UiConfig::default();
-        ui.workspace_sidebar.visibility = WorkspaceSidebarVisibility::Hidden;
-        let layout = client_layout(Rect::new(0, 0, 124, 24), &ui, Some(3));
+        ui.sidebar.left.visibility = SidebarVisibility::Hidden;
+        let layout = client_layout(
+            Rect::new(0, 0, 124, 24),
+            &ui,
+            SidebarRelevance {
+                left: Some(true),
+                right: Some(false),
+            },
+        );
         assert_eq!(layout.terminal, Rect::new(0, 1, 124, 23));
         assert_eq!(
-            layout.workspace_sidebar,
-            Some(WorkspaceSidebarLayout::Drawer(Rect::new(0, 0, 28, 24)))
+            layout.left_sidebar,
+            Some(SidebarLayout::Drawer(Rect::new(0, 0, 28, 24)))
         );
     }
 
@@ -1318,19 +1365,29 @@ mod tests {
     #[test]
     fn chrome_layout_returns_tiny_hosts_to_the_terminal_but_keeps_a_drawer_overlay() {
         assert_eq!(
-            client_layout(Rect::new(3, 4, 80, 0), &UiConfig::default(), Some(2)),
+            client_layout(
+                Rect::new(3, 4, 80, 0),
+                &UiConfig::default(),
+                SidebarRelevance::default(),
+            ),
             ClientLayout {
                 tab_bar: None,
                 terminal: Rect::new(3, 4, 80, 0),
-                workspace_sidebar: None,
+                left_sidebar: None,
+                right_sidebar: None,
             }
         );
         assert_eq!(
-            client_layout(Rect::new(3, 4, 124, 1), &UiConfig::default(), Some(2)),
+            client_layout(
+                Rect::new(3, 4, 124, 1),
+                &UiConfig::default(),
+                SidebarRelevance::default(),
+            ),
             ClientLayout {
                 tab_bar: None,
                 terminal: Rect::new(3, 4, 124, 1),
-                workspace_sidebar: Some(WorkspaceSidebarLayout::Drawer(Rect::new(3, 4, 28, 1,))),
+                left_sidebar: Some(SidebarLayout::Drawer(Rect::new(3, 4, 28, 1))),
+                right_sidebar: Some(SidebarLayout::Drawer(Rect::new(99, 4, 28, 1))),
             }
         );
     }
@@ -1346,6 +1403,59 @@ mod tests {
         first.revision = 2;
         assert!(state.accept(first));
         assert_eq!(state.snapshot().unwrap().revision, 2);
+    }
+
+    #[test]
+    fn resource_state_combines_workspace_and_agent_component_relevance() {
+        let (mut snapshot, focused) = fixture(&["one"], 0);
+        let mut state = ResourceState::default();
+        assert!(state.accept(snapshot.clone()));
+        assert_eq!(
+            state.sidebar_relevance(&focused, &UiConfig::default()),
+            SidebarRelevance {
+                left: Some(false),
+                right: Some(false),
+            }
+        );
+
+        snapshot.revision += 1;
+        snapshot.sessions[0].workspaces[0].tabs[0].panes[0]
+            .activity
+            .integration = Some(AgentIntegration::default());
+        assert!(state.accept(snapshot.clone()));
+        assert_eq!(
+            state.sidebar_relevance(&focused, &UiConfig::default()),
+            SidebarRelevance {
+                left: Some(false),
+                right: Some(true),
+            }
+        );
+
+        snapshot.revision += 1;
+        snapshot.sessions[0].workspaces[0].tabs[0].panes[0].closing = true;
+        assert!(state.accept(snapshot.clone()));
+        assert_eq!(
+            state.sidebar_relevance(&focused, &UiConfig::default()),
+            SidebarRelevance {
+                left: Some(false),
+                right: Some(false),
+            }
+        );
+
+        snapshot.revision += 1;
+        snapshot.sessions[0].workspaces[0].tabs[0].panes[0].closing = false;
+        let mut second = snapshot.sessions[0].workspaces[0].clone();
+        second.id = WorkspaceId::new();
+        second.closing = false;
+        snapshot.sessions[0].workspaces.push(second);
+        assert!(state.accept(snapshot));
+        assert_eq!(
+            state.sidebar_relevance(&focused, &UiConfig::default()),
+            SidebarRelevance {
+                left: Some(true),
+                right: Some(true),
+            }
+        );
     }
 
     #[test]

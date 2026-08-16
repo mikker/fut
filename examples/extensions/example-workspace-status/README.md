@@ -7,8 +7,10 @@ Load this directory by absolute path:
 ```toml
 extensions = ["/absolute/path/to/fut/examples/extensions/example-workspace-status"]
 
-[ui.workspace_sidebar.row]
-right = [{ token = "workspace.extension.example-workspace-status.last_event" }]
+[ui.sidebar.left]
+components = [
+  { component = "workspaces", row = { right = [{ token = "workspace.extension.example-workspace-status.last_event" }] } },
+]
 ```
 
 The example has no installer, dependencies, background service, action, or native UI.

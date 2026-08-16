@@ -226,6 +226,18 @@ pub struct PaneSnapshot {
     pub worktree: Option<PathBuf>,
 }
 
+/// A pane together with its borrowed ancestry in a resource snapshot.
+///
+/// Projectors can filter this traversal without cloning resource collections
+/// or materialized presentation tokens.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PanePathRef<'a> {
+    pub session: &'a SessionSnapshot,
+    pub workspace: &'a WorkspaceSnapshot,
+    pub tab: &'a TabSnapshot,
+    pub pane: &'a PaneSnapshot,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "scope", content = "id", rename_all = "snake_case")]
 pub enum PresentationTokenTarget {
@@ -242,6 +254,22 @@ pub struct TokenPublication {
 }
 
 impl ResourceSnapshot {
+    /// Traverse every pane together with its session, workspace, and tab.
+    pub fn pane_paths(&self) -> impl Iterator<Item = PanePathRef<'_>> {
+        self.sessions.iter().flat_map(|session| {
+            session.workspaces.iter().flat_map(move |workspace| {
+                workspace.tabs.iter().flat_map(move |tab| {
+                    tab.panes.iter().map(move |pane| PanePathRef {
+                        session,
+                        workspace,
+                        tab,
+                        pane,
+                    })
+                })
+            })
+        })
+    }
+
     /// Resolve a terminal's current live ancestry from this snapshot. Terminal
     /// identity is stable across pane moves; ancestor IDs captured in a child
     /// environment are not.
@@ -250,40 +278,34 @@ impl ResourceSnapshot {
         terminal_id: TerminalId,
     ) -> Result<ResolvedTerminalPath, ResourceError> {
         let mut found = None;
-        for session in &self.sessions {
-            for workspace in &session.workspaces {
-                for tab in &workspace.tabs {
-                    for pane in &tab.panes {
-                        if pane.terminal_id != terminal_id {
-                            continue;
-                        }
-                        if found.is_some() {
-                            return Err(ResourceError::Invariant(
-                                "terminal appears more than once in resource snapshot".into(),
-                            ));
-                        }
-                        if session.closing {
-                            return Err(ResourceError::Closing("session"));
-                        }
-                        if workspace.closing {
-                            return Err(ResourceError::Closing("workspace"));
-                        }
-                        if tab.closing {
-                            return Err(ResourceError::Closing("tab"));
-                        }
-                        if pane.closing {
-                            return Err(ResourceError::Closing("pane"));
-                        }
-                        found = Some(ResolvedTerminalPath {
-                            session_id: session.id,
-                            workspace_id: workspace.id,
-                            tab_id: tab.id,
-                            pane_id: pane.id,
-                            terminal_id,
-                        });
-                    }
-                }
+        for path in self.pane_paths() {
+            if path.pane.terminal_id != terminal_id {
+                continue;
             }
+            if found.is_some() {
+                return Err(ResourceError::Invariant(
+                    "terminal appears more than once in resource snapshot".into(),
+                ));
+            }
+            if path.session.closing {
+                return Err(ResourceError::Closing("session"));
+            }
+            if path.workspace.closing {
+                return Err(ResourceError::Closing("workspace"));
+            }
+            if path.tab.closing {
+                return Err(ResourceError::Closing("tab"));
+            }
+            if path.pane.closing {
+                return Err(ResourceError::Closing("pane"));
+            }
+            found = Some(ResolvedTerminalPath {
+                session_id: path.session.id,
+                workspace_id: path.workspace.id,
+                tab_id: path.tab.id,
+                pane_id: path.pane.id,
+                terminal_id,
+            });
         }
         found.ok_or(ResourceError::NotFound("terminal"))
     }
@@ -4391,6 +4413,49 @@ mod tests {
 
         tree.tabs.get_mut(&tab_id).unwrap().closing = true;
         assert!(matches!(tree.validate(), Err(ResourceError::Invariant(_))));
+    }
+
+    #[test]
+    fn pane_paths_borrow_each_pane_and_its_snapshot_ancestry() {
+        let mut tree = ResourceTree::default();
+        let path = initial("session", "/project");
+        let first_pane_id = path.pane_id;
+        let tab_id = path.tab_id;
+        tree.create_session(path).unwrap();
+        let second_pane_id = PaneId::new();
+        tree.add_pane(tab_id, second_pane_id, TerminalId::new())
+            .unwrap();
+
+        let mut snapshot = tree.snapshot();
+        snapshot.sessions[0]
+            .tokens
+            .insert("session.test".into(), "borrowed".into());
+        snapshot.sessions[0].workspaces[0].tabs[0].panes[0]
+            .tokens
+            .insert("pane.test".into(), "borrowed".into());
+
+        let paths = snapshot.pane_paths().collect::<Vec<_>>();
+        assert_eq!(
+            paths.iter().map(|path| path.pane.id).collect::<Vec<_>>(),
+            vec![first_pane_id, second_pane_id]
+        );
+        for path in &paths {
+            assert!(std::ptr::eq(path.session, &snapshot.sessions[0]));
+            assert!(std::ptr::eq(
+                path.workspace,
+                &snapshot.sessions[0].workspaces[0]
+            ));
+            assert!(std::ptr::eq(
+                path.tab,
+                &snapshot.sessions[0].workspaces[0].tabs[0]
+            ));
+        }
+        assert!(std::ptr::eq(
+            paths[0].pane,
+            &snapshot.sessions[0].workspaces[0].tabs[0].panes[0]
+        ));
+        assert_eq!(paths[0].session.tokens["session.test"], "borrowed");
+        assert_eq!(paths[0].pane.tokens["pane.test"], "borrowed");
     }
 
     #[test]

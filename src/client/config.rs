@@ -32,32 +32,24 @@ pub(super) enum TabBarPosition {
     Bottom,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum WorkspaceSidebarPosition {
-    #[default]
-    Left,
-    Right,
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum WorkspaceSidebarVisibility {
+pub(super) enum SidebarVisibility {
     Visible,
     #[default]
-    AutoHideWhenSingle,
+    Automatic,
     Hidden,
 }
 
-impl WorkspaceSidebarVisibility {
+impl SidebarVisibility {
     pub fn set(&mut self, visibility: Self) {
         *self = visibility;
     }
 
     pub fn cycle(&mut self) {
         *self = match self {
-            Self::Visible => Self::AutoHideWhenSingle,
-            Self::AutoHideWhenSingle => Self::Hidden,
+            Self::Visible => Self::Automatic,
+            Self::Automatic => Self::Hidden,
             Self::Hidden => Self::Visible,
         };
     }
@@ -65,7 +57,7 @@ impl WorkspaceSidebarVisibility {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Visible => "visible",
-            Self::AutoHideWhenSingle => "hide with one",
+            Self::Automatic => "automatic",
             Self::Hidden => "hidden",
         }
     }
@@ -73,13 +65,13 @@ impl WorkspaceSidebarVisibility {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum WorkspaceSidebarDisplay {
+pub(super) enum SidebarDisplay {
     #[default]
     Expanded,
     Minimized,
 }
 
-impl WorkspaceSidebarDisplay {
+impl SidebarDisplay {
     pub fn set(&mut self, display: Self) {
         *self = display;
     }
@@ -875,17 +867,12 @@ impl Default for SidebarRowConfig {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub(super) struct WorkspaceSidebarConfig {
-    pub position: WorkspaceSidebarPosition,
-    #[serde(default = "default_sidebar_width")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SidebarSlotConfig {
     pub width: u16,
-    pub display: WorkspaceSidebarDisplay,
-    pub visibility: WorkspaceSidebarVisibility,
-    pub header: Vec<SegmentConfig>,
-    pub footer: Vec<SegmentConfig>,
-    pub row: SidebarRowConfig,
+    pub display: SidebarDisplay,
+    pub visibility: SidebarVisibility,
+    pub components: Vec<SidebarComponentConfig>,
 }
 
 fn default_sidebar_footer() -> Vec<SegmentConfig> {
@@ -900,24 +887,210 @@ fn default_sidebar_header() -> Vec<SegmentConfig> {
     vec![SegmentConfig::token("session.name")]
 }
 
-impl Default for WorkspaceSidebarConfig {
+impl Default for SidebarSlotConfig {
     fn default() -> Self {
-        Self {
-            position: WorkspaceSidebarPosition::Left,
-            width: default_sidebar_width(),
-            display: WorkspaceSidebarDisplay::Expanded,
-            visibility: WorkspaceSidebarVisibility::AutoHideWhenSingle,
+        default_left_sidebar()
+    }
+}
+
+fn default_left_sidebar() -> SidebarSlotConfig {
+    SidebarSlotConfig {
+        width: default_sidebar_width(),
+        display: SidebarDisplay::Expanded,
+        visibility: SidebarVisibility::Automatic,
+        components: vec![SidebarComponentConfig::Workspaces {
+            size: SidebarComponentSize::Fill,
             header: default_sidebar_header(),
             footer: default_sidebar_footer(),
             row: SidebarRowConfig::default(),
+        }],
+    }
+}
+
+fn default_right_sidebar() -> SidebarSlotConfig {
+    SidebarSlotConfig {
+        width: default_sidebar_width(),
+        display: SidebarDisplay::Expanded,
+        visibility: SidebarVisibility::Automatic,
+        components: vec![SidebarComponentConfig::Agents {
+            size: SidebarComponentSize::Fill,
+            scope: AgentScope::Session,
+        }],
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct SidebarSlotOverrides {
+    width: Option<u16>,
+    display: Option<SidebarDisplay>,
+    visibility: Option<SidebarVisibility>,
+    components: Option<Vec<SidebarComponentConfig>>,
+}
+
+impl SidebarSlotOverrides {
+    fn apply(self, slot: &mut SidebarSlotConfig) {
+        if let Some(width) = self.width {
+            slot.width = width;
+        }
+        if let Some(display) = self.display {
+            slot.display = display;
+        }
+        if let Some(visibility) = self.visibility {
+            slot.visibility = visibility;
+        }
+        if let Some(components) = self.components {
+            slot.components = components;
         }
     }
 }
 
-impl WorkspaceSidebarConfig {
-    pub fn uses_default_footer(&self) -> bool {
-        self.footer == default_sidebar_footer()
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct SidebarConfigOverrides {
+    left: Option<SidebarSlotOverrides>,
+    right: Option<SidebarSlotOverrides>,
+}
+
+impl<'de> Deserialize<'de> for SidebarConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let overrides = SidebarConfigOverrides::deserialize(deserializer)?;
+        let mut config = Self::default();
+        if let Some(left) = overrides.left {
+            left.apply(&mut config.left);
+        }
+        if let Some(right) = overrides.right {
+            right.apply(&mut config.right);
+        }
+        Ok(config)
     }
+}
+
+impl Default for SidebarConfig {
+    fn default() -> Self {
+        Self {
+            left: default_left_sidebar(),
+            right: default_right_sidebar(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SidebarComponentSize {
+    Fixed(u16),
+    Fill,
+}
+
+impl<'de> Deserialize<'de> for SidebarComponentSize {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Value {
+            Fixed(u16),
+            Fill(String),
+        }
+
+        match Value::deserialize(deserializer)? {
+            Value::Fixed(rows) => Ok(Self::Fixed(rows)),
+            Value::Fill(value) if value == "fill" => Ok(Self::Fill),
+            Value::Fill(_) => Err(serde::de::Error::custom(
+                "component size must be a row count or 'fill'",
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum AgentScope {
+    Tab,
+    Workspace,
+    #[default]
+    Session,
+    Global,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(tag = "component", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum SidebarComponentConfig {
+    Workspaces {
+        #[serde(default = "default_workspace_component_size")]
+        size: SidebarComponentSize,
+        #[serde(default = "default_sidebar_header")]
+        header: Vec<SegmentConfig>,
+        #[serde(default = "default_sidebar_footer")]
+        footer: Vec<SegmentConfig>,
+        #[serde(default)]
+        row: SidebarRowConfig,
+    },
+    Agents {
+        #[serde(default = "default_agents_component_size")]
+        size: SidebarComponentSize,
+        #[serde(default)]
+        scope: AgentScope,
+    },
+}
+
+impl SidebarComponentConfig {
+    pub(super) fn size(&self) -> SidebarComponentSize {
+        match self {
+            Self::Workspaces { size, .. } | Self::Agents { size, .. } => *size,
+        }
+    }
+
+    pub(super) fn uses_default_workspace_footer(&self) -> bool {
+        matches!(self, Self::Workspaces { footer, .. } if *footer == default_sidebar_footer())
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct WorkspaceComponentConfigRef<'a> {
+    pub header: &'a [SegmentConfig],
+    pub footer: &'a [SegmentConfig],
+    pub row: &'a SidebarRowConfig,
+    pub uses_default_footer: bool,
+}
+
+impl SidebarSlotConfig {
+    pub(super) fn workspaces(&self) -> Option<WorkspaceComponentConfigRef<'_>> {
+        self.components.iter().find_map(|component| {
+            let SidebarComponentConfig::Workspaces {
+                header,
+                footer,
+                row,
+                ..
+            } = component
+            else {
+                return None;
+            };
+            Some(WorkspaceComponentConfigRef {
+                header,
+                footer,
+                row,
+                uses_default_footer: component.uses_default_workspace_footer(),
+            })
+        })
+    }
+}
+
+fn default_workspace_component_size() -> SidebarComponentSize {
+    SidebarComponentSize::Fill
+}
+
+fn default_agents_component_size() -> SidebarComponentSize {
+    SidebarComponentSize::Fill
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SidebarConfig {
+    pub left: SidebarSlotConfig,
+    pub right: SidebarSlotConfig,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
@@ -929,7 +1102,7 @@ pub(crate) struct UiConfig {
     pub(super) icons: IconsConfig,
     pub(super) styles: StylesConfig,
     pub(super) tab_bar: TabBarConfig,
-    pub(super) workspace_sidebar: WorkspaceSidebarConfig,
+    pub(super) sidebar: SidebarConfig,
 }
 
 impl Default for UiConfig {
@@ -941,7 +1114,7 @@ impl Default for UiConfig {
             icons: IconsConfig::default(),
             styles: StylesConfig::default(),
             tab_bar: TabBarConfig::default(),
-            workspace_sidebar: WorkspaceSidebarConfig::default(),
+            sidebar: SidebarConfig::default(),
         }
     }
 }
@@ -1223,8 +1396,33 @@ fn validate(ui: &UiConfig, extensions: &[Extension]) -> Result<()> {
             }
         }
     }
-    if !(MIN_SIDEBAR_WIDTH..=MAX_SIDEBAR_WIDTH).contains(&ui.workspace_sidebar.width) {
-        bail!("ui.workspace_sidebar.width must be between 4 and 80");
+    for (side, sidebar) in [("left", &ui.sidebar.left), ("right", &ui.sidebar.right)] {
+        if !(MIN_SIDEBAR_WIDTH..=MAX_SIDEBAR_WIDTH).contains(&sidebar.width) {
+            bail!("ui.sidebar.{side}.width must be between 4 and 80");
+        }
+        let fill_count = sidebar
+            .components
+            .iter()
+            .filter(|component| component.size() == SidebarComponentSize::Fill)
+            .count();
+        if fill_count > 1 {
+            bail!("ui.sidebar.{side}.components may contain at most one fill component");
+        }
+        let workspace_count = sidebar
+            .components
+            .iter()
+            .filter(|component| matches!(component, SidebarComponentConfig::Workspaces { .. }))
+            .count();
+        if workspace_count > 1 {
+            bail!("ui.sidebar.{side}.components may contain at most one workspaces component");
+        }
+        if sidebar
+            .components
+            .iter()
+            .any(|component| matches!(component.size(), SidebarComponentSize::Fixed(0)))
+        {
+            bail!("ui.sidebar.{side} component fixed row counts must be greater than zero");
+        }
     }
     for (name, value) in [
         ("current", &ui.icons.current),
@@ -1284,38 +1482,35 @@ fn validate(ui: &UiConfig, extensions: &[Extension]) -> Result<()> {
         &mut 0,
         extensions,
     )?;
-    for (name, segments, scope) in [
-        ("header", &ui.workspace_sidebar.header, TokenScope::Sidebar),
-        ("footer", &ui.workspace_sidebar.footer, TokenScope::Sidebar),
-        (
-            "row.left",
-            &ui.workspace_sidebar.row.left,
-            TokenScope::Workspace,
-        ),
-        (
-            "row.body",
-            &ui.workspace_sidebar.row.body,
-            TokenScope::Workspace,
-        ),
-        (
-            "row.right",
-            &ui.workspace_sidebar.row.right,
-            TokenScope::Workspace,
-        ),
-        (
-            "row.detail",
-            &ui.workspace_sidebar.row.detail,
-            TokenScope::Workspace,
-        ),
-    ] {
-        validate_segments(
-            &format!("ui.workspace_sidebar.{name}"),
-            segments,
-            scope,
-            false,
-            &mut 0,
-            extensions,
-        )?;
+    for (side, sidebar) in [("left", &ui.sidebar.left), ("right", &ui.sidebar.right)] {
+        for (index, component) in sidebar.components.iter().enumerate() {
+            let SidebarComponentConfig::Workspaces {
+                header,
+                footer,
+                row,
+                ..
+            } = component
+            else {
+                continue;
+            };
+            for (name, segments, scope) in [
+                ("header", header, TokenScope::Sidebar),
+                ("footer", footer, TokenScope::Sidebar),
+                ("row.left", &row.left, TokenScope::Workspace),
+                ("row.body", &row.body, TokenScope::Workspace),
+                ("row.right", &row.right, TokenScope::Workspace),
+                ("row.detail", &row.detail, TokenScope::Workspace),
+            ] {
+                validate_segments(
+                    &format!("ui.sidebar.{side}.components[{index}].{name}"),
+                    segments,
+                    scope,
+                    false,
+                    &mut 0,
+                    extensions,
+                )?;
+            }
+        }
     }
     Ok(())
 }
@@ -1497,6 +1692,52 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_defaults_are_independent_and_partial_sides_keep_their_composition() {
+        let defaults = UiConfig::default();
+        assert_eq!(defaults.sidebar.left.width, 28);
+        assert_eq!(defaults.sidebar.right.width, 28);
+        assert_eq!(
+            defaults.sidebar.left.visibility,
+            SidebarVisibility::Automatic
+        );
+        assert_eq!(
+            defaults.sidebar.right.visibility,
+            SidebarVisibility::Automatic
+        );
+        assert!(matches!(
+            defaults.sidebar.left.components.as_slice(),
+            [SidebarComponentConfig::Workspaces {
+                size: SidebarComponentSize::Fill,
+                ..
+            }]
+        ));
+        assert!(matches!(
+            defaults.sidebar.right.components.as_slice(),
+            [SidebarComponentConfig::Agents {
+                size: SidebarComponentSize::Fill,
+                scope: AgentScope::Session,
+            }]
+        ));
+
+        let partial: UiConfig =
+            toml::from_str("[sidebar.left]\nwidth = 31\n[sidebar.right]\nvisibility = 'hidden'\n")
+                .unwrap();
+        assert_eq!(partial.sidebar.left.width, 31);
+        assert!(matches!(
+            partial.sidebar.left.components.as_slice(),
+            [SidebarComponentConfig::Workspaces { .. }]
+        ));
+        assert_eq!(partial.sidebar.right.visibility, SidebarVisibility::Hidden);
+        assert!(matches!(
+            partial.sidebar.right.components.as_slice(),
+            [SidebarComponentConfig::Agents {
+                scope: AgentScope::Session,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
     fn parses_complete_chrome_configuration_and_exact_colors() {
         let temporary = tempfile::tempdir().unwrap();
         let path = temporary.path().join("config.toml");
@@ -1524,18 +1765,14 @@ right = [{ segments = [{ token = "client.zoom", prefix = " " }], style = "curren
 [ui.tab_bar.item]
 segments = [{ token = "tab.icon" }, { text = " " }, { token = "tab.name" }]
 
-[ui.workspace_sidebar]
-position = "right"
+[ui.sidebar.left]
 width = 30
 display = "minimized"
 visibility = "visible"
-header = [{ token = "session.name" }]
-footer = [{ token = "sidebar.status" }]
-
-[ui.workspace_sidebar.row]
-left = [{ token = "workspace.marker" }]
-body = [{ token = "workspace.name" }]
-right = [{ token = "workspace.tab_count" }]
+components = [
+  { component = "workspaces", size = "fill", header = [{ token = "session.name" }], footer = [{ token = "sidebar.status" }], row = { left = [{ token = "workspace.marker" }], body = [{ token = "workspace.name" }], right = [{ token = "workspace.tab_count" }] } },
+  { component = "agents", size = 6, scope = "workspace" },
+]
 "##,
         )
         .unwrap();
@@ -1543,19 +1780,24 @@ right = [{ token = "workspace.tab_count" }]
         assert_eq!(config.pane_layout, PaneLayoutPolicy::Accordion);
         assert!(!config.confirm_close);
         assert_eq!(config.tab_bar.position, TabBarPosition::Bottom);
+        assert_eq!(config.sidebar.left.width, 30);
+        assert_eq!(config.sidebar.left.display, SidebarDisplay::Minimized);
+        assert_eq!(config.sidebar.left.visibility, SidebarVisibility::Visible);
         assert_eq!(
-            config.workspace_sidebar.position,
-            WorkspaceSidebarPosition::Right
-        );
-        assert_eq!(config.workspace_sidebar.width, 30);
-        assert_eq!(
-            config.workspace_sidebar.display,
-            WorkspaceSidebarDisplay::Minimized
+            config.sidebar.left.components[0].size(),
+            SidebarComponentSize::Fill
         );
         assert_eq!(
-            config.workspace_sidebar.visibility,
-            WorkspaceSidebarVisibility::Visible
+            config.sidebar.left.components[1].size(),
+            SidebarComponentSize::Fixed(6)
         );
+        assert!(matches!(
+            config.sidebar.left.components[1],
+            SidebarComponentConfig::Agents {
+                scope: AgentScope::Workspace,
+                ..
+            }
+        ));
         assert_eq!(config.icons.resolve().workspace, "W");
         assert_eq!(config.icons.resolve().pill_left, "\u{e0b6}");
         assert_eq!(config.icons.resolve().pill_right, "\u{e0b4}");
@@ -1572,7 +1814,7 @@ right = [{ token = "workspace.tab_count" }]
         let path = temporary.path().join("config.toml");
         fs::write(
             &path,
-            "[ui.bindings]\nopen_command_bar = ':'\n\n[ui.tab_bar]\nposition = 'bottom'\n\n[ui.styles.current]\nforeground = 'red'\n\n[ui.styles.attention]\nforeground = 'blue'\n\n[ui.workspace_sidebar.row]\nbody = [{ text = 'custom' }]\n",
+            "[ui.bindings]\nopen_command_bar = ':'\n\n[ui.tab_bar]\nposition = 'bottom'\n\n[ui.styles.current]\nforeground = 'red'\n\n[ui.styles.attention]\nforeground = 'blue'\n\n[ui.sidebar.left]\ncomponents = [{ component = 'workspaces', row = { body = [{ text = 'custom' }] } }]\n",
         )
         .unwrap();
         let config = load_path(&path, true).unwrap();
@@ -1605,70 +1847,58 @@ right = [{ token = "workspace.tab_count" }]
         );
         assert_eq!(config.styles.current.foreground, Some(UiColor::Red));
         assert_eq!(config.styles.attention.foreground, Some(UiColor::Blue));
-        assert_eq!(
-            config.workspace_sidebar.row.left,
-            SidebarRowConfig::default().left
-        );
-        assert_eq!(
-            config.workspace_sidebar.row.right,
-            SidebarRowConfig::default().right
-        );
+        let workspaces = config.sidebar.left.workspaces().unwrap();
+        assert_eq!(workspaces.row.left, SidebarRowConfig::default().left);
+        assert_eq!(workspaces.row.right, SidebarRowConfig::default().right);
     }
 
     #[test]
-    fn workspace_sidebar_visibility_parses_serializes_and_rejects_obsolete_settings() {
+    fn sidebar_visibility_parses_serializes_and_rejects_obsolete_settings() {
         for (value, visibility) in [
-            ("visible", WorkspaceSidebarVisibility::Visible),
-            (
-                "auto_hide_when_single",
-                WorkspaceSidebarVisibility::AutoHideWhenSingle,
-            ),
-            ("hidden", WorkspaceSidebarVisibility::Hidden),
+            ("visible", SidebarVisibility::Visible),
+            ("automatic", SidebarVisibility::Automatic),
+            ("hidden", SidebarVisibility::Hidden),
         ] {
             let config: UiConfig =
-                toml::from_str(&format!("[workspace_sidebar]\nvisibility = {value:?}\n")).unwrap();
-            assert_eq!(config.workspace_sidebar.visibility, visibility);
+                toml::from_str(&format!("[sidebar.left]\nvisibility = {value:?}\n")).unwrap();
+            assert_eq!(config.sidebar.left.visibility, visibility);
             assert_eq!(
                 serde_json::to_string(&visibility).unwrap(),
                 format!("{value:?}")
             );
         }
 
-        let mut visibility = WorkspaceSidebarVisibility::Visible;
+        let mut visibility = SidebarVisibility::Visible;
         visibility.cycle();
-        assert_eq!(visibility, WorkspaceSidebarVisibility::AutoHideWhenSingle);
+        assert_eq!(visibility, SidebarVisibility::Automatic);
         visibility.cycle();
-        assert_eq!(visibility, WorkspaceSidebarVisibility::Hidden);
+        assert_eq!(visibility, SidebarVisibility::Hidden);
         visibility.cycle();
-        assert_eq!(visibility, WorkspaceSidebarVisibility::Visible);
+        assert_eq!(visibility, SidebarVisibility::Visible);
+        visibility.set(SidebarVisibility::Hidden);
+        assert_eq!(visibility, SidebarVisibility::Hidden);
 
-        for obsolete in ["hide_when_single = false", "auto_hide = true"] {
-            assert!(
-                toml::from_str::<UiConfig>(&format!("[workspace_sidebar]\n{obsolete}\n")).is_err()
-            );
+        for obsolete in ["hide_when_single = false", "auto_hide_when_single = true"] {
+            assert!(toml::from_str::<UiConfig>(&format!("[sidebar.left]\n{obsolete}\n")).is_err());
         }
+        assert!(toml::from_str::<UiConfig>("[workspace_sidebar]\nwidth = 20\n").is_err());
     }
 
     #[test]
-    fn workspace_sidebar_display_parses_and_toggles_independently() {
-        let config: UiConfig = toml::from_str(
-            "[workspace_sidebar]\ndisplay = 'minimized'\nvisibility = 'auto_hide_when_single'\n",
-        )
-        .unwrap();
-        assert_eq!(
-            config.workspace_sidebar.display,
-            WorkspaceSidebarDisplay::Minimized
-        );
-        assert_eq!(
-            config.workspace_sidebar.visibility,
-            WorkspaceSidebarVisibility::AutoHideWhenSingle
-        );
+    fn sidebar_display_parses_and_toggles_independently() {
+        let config: UiConfig =
+            toml::from_str("[sidebar.left]\ndisplay = 'minimized'\nvisibility = 'automatic'\n")
+                .unwrap();
+        assert_eq!(config.sidebar.left.display, SidebarDisplay::Minimized);
+        assert_eq!(config.sidebar.left.visibility, SidebarVisibility::Automatic);
 
-        let mut display = WorkspaceSidebarDisplay::Expanded;
+        let mut display = SidebarDisplay::Expanded;
         display.toggle();
-        assert_eq!(display, WorkspaceSidebarDisplay::Minimized);
+        assert_eq!(display, SidebarDisplay::Minimized);
         display.toggle();
-        assert_eq!(display, WorkspaceSidebarDisplay::Expanded);
+        assert_eq!(display, SidebarDisplay::Expanded);
+        display.set(SidebarDisplay::Minimized);
+        assert_eq!(display, SidebarDisplay::Minimized);
     }
 
     #[test]
@@ -1720,7 +1950,12 @@ right = [{ token = "workspace.tab_count" }]
             "[ui.tab_bar.item]\nsegments = [{ component = 'tabs' }]\n",
             "[ui.tab_bar]\nleft = [{ segments = [{ text = \"x\\n\" }] }]\n",
             "[ui]\nexecute = 'surprise'\n",
-            "[ui.workspace_sidebar]\nwidth = 2\n",
+            "[ui.sidebar.left]\nwidth = 2\n",
+            "[ui.sidebar.left]\ncomponents = [{ component = 'workspaces', size = 'fill' }, { component = 'agents', size = 'fill' }]\n",
+            "[ui.sidebar.left]\ncomponents = [{ component = 'agents', size = 0 }]\n",
+            "[ui.sidebar.left]\ncomponents = [{ component = 'agents', size = 'half' }]\n",
+            "[ui.sidebar.right]\ncomponents = [{ component = 'agents', size = 'fill' }, { component = 'workspaces', size = 'fill' }]\n",
+            "[ui.sidebar.left]\ncomponents = [{ component = 'workspaces', size = 2 }, { component = 'agents', size = 2 }, { component = 'workspaces', size = 2 }]\n",
             "[ui.tab_bar.item]\nmin_width = 8\n",
             "[ui.bindings]\nunknown = 'x'\n",
             "[ui.bindings]\nopen_command_bar = 's'\n",
@@ -1731,6 +1966,28 @@ right = [{ token = "workspace.tab_count" }]
             let path = temporary.path().join(format!("bad-{}.toml", source.len()));
             fs::write(&path, source).unwrap();
             assert!(load_path(&path, true).is_err(), "accepted {source:?}");
+        }
+    }
+
+    #[test]
+    fn each_sidebar_side_rejects_more_than_one_workspaces_component() {
+        let temporary = tempfile::tempdir().unwrap();
+        for side in ["left", "right"] {
+            let path = temporary.path().join(format!("duplicate-{side}.toml"));
+            fs::write(
+                &path,
+                format!(
+                    "[ui.sidebar.{side}]\ncomponents = [{{ component = 'workspaces', size = 2 }}, {{ component = 'agents', size = 2 }}, {{ component = 'workspaces', size = 2 }}]\n"
+                ),
+            )
+            .unwrap();
+            let error = format!("{:#}", load_path(&path, true).unwrap_err());
+            assert!(
+                error.contains(&format!(
+                    "ui.sidebar.{side}.components may contain at most one workspaces component"
+                )),
+                "{error}"
+            );
         }
     }
 
@@ -1848,7 +2105,7 @@ right = [{ token = "workspace.tab_count" }]
         fs::write(
             &path,
             format!(
-                "extensions = [{:?}]\n[ui.tab_bar]\nright = [{{ segments = [{{ token = 'session.extension.status.whole' }}, {{ token = 'pane.extension.status.mark' }}] }}]\n[ui.workspace_sidebar.row]\nbody = [{{ token = 'workspace.extension.status.state' }}]\n[ui.tab_bar.item]\nsegments = [{{ token = 'tab.extension.status.badge' }}]\n",
+                "extensions = [{:?}]\n[ui.tab_bar]\nright = [{{ segments = [{{ token = 'session.extension.status.whole' }}, {{ token = 'pane.extension.status.mark' }}] }}]\n[ui.sidebar.left]\ncomponents = [{{ component = 'workspaces', row = {{ body = [{{ token = 'workspace.extension.status.state' }}] }} }}]\n[ui.tab_bar.item]\nsegments = [{{ token = 'tab.extension.status.badge' }}]\n",
                 extension_root.display().to_string()
             ),
         )

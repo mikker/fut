@@ -8,9 +8,10 @@ use crate::{
 };
 
 use super::{
-    config::{SemanticStyle, StylesConfig, WorkspaceSidebarDisplay, WorkspaceSidebarVisibility},
+    config::{SemanticStyle, SidebarDisplay, SidebarSlotConfig, SidebarVisibility, StylesConfig},
     dialog::{frame_inner, render_frame},
     navigation::NavigationHistory,
+    sidebar::SidebarSide,
 };
 
 const MAX_WIDTH: u16 = 30;
@@ -25,8 +26,8 @@ pub(super) enum ContextMenuAction {
     CreateWorkspace(crate::domain::SessionId),
     Rename(RenameSelector, String),
     Close(TargetSelector, &'static str),
-    SetDisplay(WorkspaceSidebarDisplay),
-    SetVisibility(WorkspaceSidebarVisibility),
+    SetDisplay(SidebarSide, SidebarDisplay),
+    SetVisibility(SidebarSide, SidebarVisibility),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -109,8 +110,8 @@ impl ContextMenuState {
         focused: &SelectedTarget,
         history: &NavigationHistory,
         workspace_id: WorkspaceId,
-        display: WorkspaceSidebarDisplay,
-        visibility: WorkspaceSidebarVisibility,
+        side: SidebarSide,
+        sidebar: &SidebarSlotConfig,
         anchor: (u16, u16),
     ) -> Option<Self> {
         let (session, workspace) = snapshot.sessions.iter().find_map(|session| {
@@ -149,35 +150,12 @@ impl ContextMenuState {
                 "Close",
                 ContextMenuAction::Close(TargetSelector::Workspace(workspace.id), "workspace"),
             ),
-            MenuRow::Separator,
-            MenuRow::Heading("Display"),
-            checked_action(
-                "Expanded",
-                display == WorkspaceSidebarDisplay::Expanded,
-                ContextMenuAction::SetDisplay(WorkspaceSidebarDisplay::Expanded),
-            ),
-            checked_action(
-                "Minimized",
-                display == WorkspaceSidebarDisplay::Minimized,
-                ContextMenuAction::SetDisplay(WorkspaceSidebarDisplay::Minimized),
-            ),
-            MenuRow::Heading("Visibility"),
-            checked_action(
-                "Visible",
-                visibility == WorkspaceSidebarVisibility::Visible,
-                ContextMenuAction::SetVisibility(WorkspaceSidebarVisibility::Visible),
-            ),
-            checked_action(
-                "Auto-hide",
-                visibility == WorkspaceSidebarVisibility::AutoHideWhenSingle,
-                ContextMenuAction::SetVisibility(WorkspaceSidebarVisibility::AutoHideWhenSingle),
-            ),
-            checked_action(
-                "Hidden",
-                visibility == WorkspaceSidebarVisibility::Hidden,
-                ContextMenuAction::SetVisibility(WorkspaceSidebarVisibility::Hidden),
-            ),
         ]);
+        rows.extend(sidebar_settings_rows(
+            side,
+            sidebar.display,
+            sidebar.visibility,
+        ));
         Self::new(anchor, rows)
     }
 
@@ -346,6 +324,43 @@ fn checked_action(label: &'static str, checked: bool, action: ContextMenuAction)
     }
 }
 
+fn sidebar_settings_rows(
+    side: SidebarSide,
+    display: SidebarDisplay,
+    visibility: SidebarVisibility,
+) -> [MenuRow; 8] {
+    [
+        MenuRow::Separator,
+        MenuRow::Heading("Display"),
+        checked_action(
+            "Expanded",
+            display == SidebarDisplay::Expanded,
+            ContextMenuAction::SetDisplay(side, SidebarDisplay::Expanded),
+        ),
+        checked_action(
+            "Minimized",
+            display == SidebarDisplay::Minimized,
+            ContextMenuAction::SetDisplay(side, SidebarDisplay::Minimized),
+        ),
+        MenuRow::Heading("Visibility"),
+        checked_action(
+            "Visible",
+            visibility == SidebarVisibility::Visible,
+            ContextMenuAction::SetVisibility(side, SidebarVisibility::Visible),
+        ),
+        checked_action(
+            "Auto-hide",
+            visibility == SidebarVisibility::Automatic,
+            ContextMenuAction::SetVisibility(side, SidebarVisibility::Automatic),
+        ),
+        checked_action(
+            "Hidden",
+            visibility == SidebarVisibility::Hidden,
+            ContextMenuAction::SetVisibility(side, SidebarVisibility::Hidden),
+        ),
+    ]
+}
+
 fn place_axis(origin: u16, available: u16, anchor: u16, size: u16) -> u16 {
     let end = origin.saturating_add(available);
     let max_start = end.saturating_sub(size).max(origin);
@@ -419,13 +434,62 @@ mod tests {
     }
 
     #[test]
+    fn workspace_settings_actions_keep_the_right_clicked_side() {
+        let rows = sidebar_settings_rows(
+            SidebarSide::Right,
+            SidebarDisplay::Minimized,
+            SidebarVisibility::Hidden,
+        );
+        let actions = rows
+            .iter()
+            .filter_map(|row| match row {
+                MenuRow::Action {
+                    checked, action, ..
+                } => Some((*checked, action.clone())),
+                MenuRow::Heading(_) | MenuRow::Separator => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actions,
+            vec![
+                (
+                    false,
+                    ContextMenuAction::SetDisplay(SidebarSide::Right, SidebarDisplay::Expanded),
+                ),
+                (
+                    true,
+                    ContextMenuAction::SetDisplay(SidebarSide::Right, SidebarDisplay::Minimized),
+                ),
+                (
+                    false,
+                    ContextMenuAction::SetVisibility(
+                        SidebarSide::Right,
+                        SidebarVisibility::Visible,
+                    ),
+                ),
+                (
+                    false,
+                    ContextMenuAction::SetVisibility(
+                        SidebarSide::Right,
+                        SidebarVisibility::Automatic,
+                    ),
+                ),
+                (
+                    true,
+                    ContextMenuAction::SetVisibility(SidebarSide::Right, SidebarVisibility::Hidden,),
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn rendering_shows_checks_and_keeps_tiny_clients_safe() {
         let state = ContextMenuState::new(
             (2, 2),
             vec![checked_action(
                 "Visible",
                 true,
-                ContextMenuAction::SetVisibility(WorkspaceSidebarVisibility::Visible),
+                ContextMenuAction::SetVisibility(SidebarSide::Left, SidebarVisibility::Visible),
             )],
         )
         .unwrap();

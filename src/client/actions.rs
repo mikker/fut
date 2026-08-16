@@ -12,6 +12,30 @@ pub(super) enum NavigationScope {
     Tab,
     Workspace,
     Session,
+    Global,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) enum HistoryScope {
+    Pane,
+    Tab,
+    Workspace,
+    Session,
+}
+
+impl HistoryScope {
+    pub(super) const fn navigation_scope(self) -> NavigationScope {
+        match self {
+            Self::Pane => NavigationScope::Pane,
+            Self::Tab => NavigationScope::Tab,
+            Self::Workspace => NavigationScope::Workspace,
+            Self::Session => NavigationScope::Session,
+        }
+    }
+
+    pub(super) const fn label(self) -> &'static str {
+        self.navigation_scope().label()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -52,6 +76,7 @@ impl NavigationScope {
             Self::Tab => "tab",
             Self::Workspace => "workspace",
             Self::Session => "session",
+            Self::Global => "global",
         }
     }
 }
@@ -63,7 +88,8 @@ pub(super) enum ClientAction {
     ReloadConfig,
     EnterCopyMode,
     OpenNavigator,
-    OpenWorkspaceSidebar,
+    OpenLeftSidebar,
+    OpenRightSidebar,
     OpenTabBar,
     OpenNotifications,
     FocusNextNotification,
@@ -78,7 +104,7 @@ pub(super) enum ClientAction {
     FocusNextPane,
     FocusPreviousPane,
     FocusPane(FocusDirection),
-    FocusLast(NavigationScope),
+    FocusLast(HistoryScope),
     FocusTab(TabNumber),
     TogglePaneZoom,
     ClosePane,
@@ -98,12 +124,13 @@ pub(super) struct DirectBinding {
     pub action: ClientAction,
 }
 
-pub(super) const ALL_ACTIONS: [ClientAction; 39] = [
+pub(super) const ALL_ACTIONS: [ClientAction; 40] = [
     ClientAction::OpenCommandBar,
     ClientAction::ReloadConfig,
     ClientAction::EnterCopyMode,
     ClientAction::OpenNavigator,
-    ClientAction::OpenWorkspaceSidebar,
+    ClientAction::OpenLeftSidebar,
+    ClientAction::OpenRightSidebar,
     ClientAction::OpenTabBar,
     ClientAction::OpenNotifications,
     ClientAction::FocusNextNotification,
@@ -121,10 +148,10 @@ pub(super) const ALL_ACTIONS: [ClientAction; 39] = [
     ClientAction::FocusPane(FocusDirection::Down),
     ClientAction::FocusPane(FocusDirection::Up),
     ClientAction::FocusPane(FocusDirection::Right),
-    ClientAction::FocusLast(NavigationScope::Pane),
-    ClientAction::FocusLast(NavigationScope::Tab),
-    ClientAction::FocusLast(NavigationScope::Workspace),
-    ClientAction::FocusLast(NavigationScope::Session),
+    ClientAction::FocusLast(HistoryScope::Pane),
+    ClientAction::FocusLast(HistoryScope::Tab),
+    ClientAction::FocusLast(HistoryScope::Workspace),
+    ClientAction::FocusLast(HistoryScope::Session),
     ClientAction::FocusTab(TabNumber::One),
     ClientAction::FocusTab(TabNumber::Two),
     ClientAction::FocusTab(TabNumber::Three),
@@ -140,7 +167,7 @@ pub(super) const ALL_ACTIONS: [ClientAction; 39] = [
     ClientAction::Detach,
 ];
 
-pub(super) const COMMANDS: [ActionDefinition; 38] = [
+pub(super) const COMMANDS: [ActionDefinition; 39] = [
     ActionDefinition {
         action: ClientAction::ReloadConfig,
         title: "Reload configuration",
@@ -152,9 +179,14 @@ pub(super) const COMMANDS: [ActionDefinition; 38] = [
         keywords: "global resources sessions tabs panes switch go",
     },
     ActionDefinition {
-        action: ClientAction::OpenWorkspaceSidebar,
-        title: "Switch workspace",
-        keywords: "workspace worktree checkout sidebar drawer switch",
+        action: ClientAction::OpenLeftSidebar,
+        title: "Open left sidebar",
+        keywords: "sidebar drawer workspaces agents switch navigate",
+    },
+    ActionDefinition {
+        action: ClientAction::OpenRightSidebar,
+        title: "Open right sidebar",
+        keywords: "sidebar drawer agents workspaces switch navigate",
     },
     ActionDefinition {
         action: ClientAction::OpenTabBar,
@@ -242,22 +274,22 @@ pub(super) const COMMANDS: [ActionDefinition; 38] = [
         keywords: "focus pane right vim direction",
     },
     ActionDefinition {
-        action: ClientAction::FocusLast(NavigationScope::Pane),
+        action: ClientAction::FocusLast(HistoryScope::Pane),
         title: "Switch to last pane",
         keywords: "focus switch last previous pane history",
     },
     ActionDefinition {
-        action: ClientAction::FocusLast(NavigationScope::Tab),
+        action: ClientAction::FocusLast(HistoryScope::Tab),
         title: "Switch to last tab",
         keywords: "focus switch last previous tab history",
     },
     ActionDefinition {
-        action: ClientAction::FocusLast(NavigationScope::Workspace),
+        action: ClientAction::FocusLast(HistoryScope::Workspace),
         title: "Switch to last workspace",
         keywords: "focus switch last previous workspace worktree history",
     },
     ActionDefinition {
-        action: ClientAction::FocusLast(NavigationScope::Session),
+        action: ClientAction::FocusLast(HistoryScope::Session),
         title: "Switch to last session",
         keywords: "focus switch last previous session project history",
     },
@@ -336,7 +368,7 @@ pub(super) const COMMANDS: [ActionDefinition; 38] = [
 const UP: &[u8] = b"\x1b[A";
 const DOWN: &[u8] = b"\x1b[B";
 
-pub(super) const DIRECT_BINDINGS: [DirectBinding; 39] = [
+pub(super) const DIRECT_BINDINGS: [DirectBinding; 40] = [
     DirectBinding {
         suffix: b":",
         action: ClientAction::OpenCommandBar,
@@ -355,7 +387,11 @@ pub(super) const DIRECT_BINDINGS: [DirectBinding; 39] = [
     },
     DirectBinding {
         suffix: b"w",
-        action: ClientAction::OpenWorkspaceSidebar,
+        action: ClientAction::OpenLeftSidebar,
+    },
+    DirectBinding {
+        suffix: b"]",
+        action: ClientAction::OpenRightSidebar,
     },
     DirectBinding {
         suffix: b"t",
@@ -427,19 +463,19 @@ pub(super) const DIRECT_BINDINGS: [DirectBinding; 39] = [
     },
     DirectBinding {
         suffix: b"P",
-        action: ClientAction::FocusLast(NavigationScope::Pane),
+        action: ClientAction::FocusLast(HistoryScope::Pane),
     },
     DirectBinding {
         suffix: b"T",
-        action: ClientAction::FocusLast(NavigationScope::Tab),
+        action: ClientAction::FocusLast(HistoryScope::Tab),
     },
     DirectBinding {
         suffix: b"W",
-        action: ClientAction::FocusLast(NavigationScope::Workspace),
+        action: ClientAction::FocusLast(HistoryScope::Workspace),
     },
     DirectBinding {
         suffix: b"\x13",
-        action: ClientAction::FocusLast(NavigationScope::Session),
+        action: ClientAction::FocusLast(HistoryScope::Session),
     },
     DirectBinding {
         suffix: b"1",
@@ -511,7 +547,8 @@ pub(super) const fn command_name(action: ClientAction) -> &'static str {
         ClientAction::ReloadConfig => "reload-config",
         ClientAction::EnterCopyMode => "copy-mode",
         ClientAction::OpenNavigator => "choose-tree",
-        ClientAction::OpenWorkspaceSidebar => "choose-workspace",
+        ClientAction::OpenLeftSidebar => "choose-left-sidebar",
+        ClientAction::OpenRightSidebar => "choose-right-sidebar",
         ClientAction::OpenTabBar => "choose-tab",
         ClientAction::OpenNotifications => "show-notifications",
         ClientAction::FocusNextNotification => "next-notification",
@@ -529,10 +566,10 @@ pub(super) const fn command_name(action: ClientAction) -> &'static str {
         ClientAction::FocusPane(FocusDirection::Down) => "select-pane -D",
         ClientAction::FocusPane(FocusDirection::Up) => "select-pane -U",
         ClientAction::FocusPane(FocusDirection::Right) => "select-pane -R",
-        ClientAction::FocusLast(NavigationScope::Pane) => "last-pane",
-        ClientAction::FocusLast(NavigationScope::Tab) => "last-tab",
-        ClientAction::FocusLast(NavigationScope::Workspace) => "last-workspace",
-        ClientAction::FocusLast(NavigationScope::Session) => "last-session",
+        ClientAction::FocusLast(HistoryScope::Pane) => "last-pane",
+        ClientAction::FocusLast(HistoryScope::Tab) => "last-tab",
+        ClientAction::FocusLast(HistoryScope::Workspace) => "last-workspace",
+        ClientAction::FocusLast(HistoryScope::Session) => "last-session",
         ClientAction::FocusTab(TabNumber::One) => "select-tab -t 1",
         ClientAction::FocusTab(TabNumber::Two) => "select-tab -t 2",
         ClientAction::FocusTab(TabNumber::Three) => "select-tab -t 3",
@@ -556,7 +593,8 @@ pub(super) fn config_key(action: ClientAction) -> &'static str {
         ClientAction::ReloadConfig => "reload_config",
         ClientAction::EnterCopyMode => "enter_copy_mode",
         ClientAction::OpenNavigator => "open_navigator",
-        ClientAction::OpenWorkspaceSidebar => "open_workspace_sidebar",
+        ClientAction::OpenLeftSidebar => "open_left_sidebar",
+        ClientAction::OpenRightSidebar => "open_right_sidebar",
         ClientAction::OpenTabBar => "open_tab_bar",
         ClientAction::OpenNotifications => "open_notifications",
         ClientAction::FocusNextNotification => "focus_next_notification",
@@ -574,10 +612,10 @@ pub(super) fn config_key(action: ClientAction) -> &'static str {
         ClientAction::FocusPane(FocusDirection::Down) => "focus_pane_down",
         ClientAction::FocusPane(FocusDirection::Up) => "focus_pane_up",
         ClientAction::FocusPane(FocusDirection::Right) => "focus_pane_right",
-        ClientAction::FocusLast(NavigationScope::Pane) => "focus_last_pane",
-        ClientAction::FocusLast(NavigationScope::Tab) => "focus_last_tab",
-        ClientAction::FocusLast(NavigationScope::Workspace) => "focus_last_workspace",
-        ClientAction::FocusLast(NavigationScope::Session) => "focus_last_session",
+        ClientAction::FocusLast(HistoryScope::Pane) => "focus_last_pane",
+        ClientAction::FocusLast(HistoryScope::Tab) => "focus_last_tab",
+        ClientAction::FocusLast(HistoryScope::Workspace) => "focus_last_workspace",
+        ClientAction::FocusLast(HistoryScope::Session) => "focus_last_session",
         ClientAction::FocusTab(TabNumber::One) => "focus_tab_1",
         ClientAction::FocusTab(TabNumber::Two) => "focus_tab_2",
         ClientAction::FocusTab(TabNumber::Three) => "focus_tab_3",
@@ -643,7 +681,8 @@ const fn requires_launcher(action: ClientAction) -> bool {
         ClientAction::ReloadConfig
         | ClientAction::EnterCopyMode
         | ClientAction::OpenNavigator
-        | ClientAction::OpenWorkspaceSidebar
+        | ClientAction::OpenLeftSidebar
+        | ClientAction::OpenRightSidebar
         | ClientAction::OpenTabBar
         | ClientAction::OpenNotifications
         | ClientAction::FocusNextNotification
@@ -661,10 +700,10 @@ const fn requires_launcher(action: ClientAction) -> bool {
         | ClientAction::FocusPane(FocusDirection::Down)
         | ClientAction::FocusPane(FocusDirection::Up)
         | ClientAction::FocusPane(FocusDirection::Right)
-        | ClientAction::FocusLast(NavigationScope::Pane)
-        | ClientAction::FocusLast(NavigationScope::Tab)
-        | ClientAction::FocusLast(NavigationScope::Workspace)
-        | ClientAction::FocusLast(NavigationScope::Session)
+        | ClientAction::FocusLast(HistoryScope::Pane)
+        | ClientAction::FocusLast(HistoryScope::Tab)
+        | ClientAction::FocusLast(HistoryScope::Workspace)
+        | ClientAction::FocusLast(HistoryScope::Session)
         | ClientAction::FocusTab(TabNumber::One)
         | ClientAction::FocusTab(TabNumber::Two)
         | ClientAction::FocusTab(TabNumber::Three)
@@ -743,6 +782,12 @@ mod tests {
             Some(ClientAction::TogglePaneZoom)
         );
         assert_eq!(bindings.label(ClientAction::TogglePaneZoom), "Ctrl-b z");
+        assert_eq!(bindings.label(ClientAction::OpenLeftSidebar), "Ctrl-b w");
+        assert_eq!(bindings.label(ClientAction::OpenRightSidebar), "Ctrl-b ]");
+        assert_eq!(
+            bindings.label(ClientAction::FocusLast(HistoryScope::Workspace)),
+            "Ctrl-b W"
+        );
     }
 
     #[test]

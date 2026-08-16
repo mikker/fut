@@ -501,7 +501,7 @@ mod tests {
         bar.key(key(KeyCode::Home, KeyModifiers::NONE));
         assert_eq!(bar.selected_action(), Some(ClientAction::ReloadConfig));
 
-        bar.paste("frobnicate");
+        bar.paste("💩");
         assert!(bar.filtered.is_empty());
         assert_eq!(
             bar.key(key(KeyCode::Enter, KeyModifiers::NONE)),

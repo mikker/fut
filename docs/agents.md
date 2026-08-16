@@ -83,6 +83,19 @@ fut --json agent read TERMINAL_ID --source recent-unwrapped --lines 200
 `available` means the integrated terminal is open and not currently working.
 Blocked agents remain available for a follow-up prompt.
 
+## Client sidebar
+
+The default right sidebar lists live explicitly integrated terminals in the
+focused session and stays undocked when that projection is empty. Configure an
+Agents component on either side with `scope = "tab"`, `"workspace"`,
+`"session"`, or `"global"`. Tab, workspace, and session scope use fresh live
+focus ancestry when available and otherwise fall back to the selected IDs;
+global scope needs no focus anchor. Any closing agent-row ancestor excludes the
+row, and detection-only activity does not qualify. Global rows navigate directly
+across sessions by pane ID. The
+Notifications dialog remains separate and tracks daemon-wide unread blocked or
+completed attention.
+
 ## Terminal output
 
 Read one terminal without attaching or changing another client's focus:
@@ -135,7 +148,7 @@ plugins first. A plugin report intentionally takes precedence and prevents the
 screen detector from affecting state. Inference stops and clears when Codex is
 no longer the foreground process.
 
-A detected transition from working to idle creates the same per-client unread
+A detected transition from working to idle creates the same daemon-wide unread
 completion attention as a lifecycle `completed` report.
 
 Set `FUT_AGENT_DETECTION_LOG=1` on the Fut daemon to print each Codex process,
@@ -156,9 +169,10 @@ The terminal defaults to `FUT_TERMINAL_ID`; outside that environment pass
 `--terminal-id`. `fut terminal report` remains a compatibility alias and
 accepts the same metadata.
 
-Completion and blocked reports create per-client attention. Use `Ctrl-b u` to list
-waiting terminals and `Ctrl-b Ctrl-b` to jump to the next one. Viewing a terminal marks
-its current attention as seen only for that client.
+Completion and blocked reports create daemon-wide unread attention. Use `Ctrl-b u`
+to list waiting terminals and `Ctrl-b Ctrl-b` to jump to the next one. Rendering a
+terminal marks its current attention as read for every attached client and later CLI
+calls.
 
 ## Event stream
 

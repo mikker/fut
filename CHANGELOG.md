@@ -15,6 +15,7 @@
 - Added acknowledged workspace retirement for tools that need to close their own disposable Fut workspace safely.
 - Fixed explicit relative `fut open` paths being resolved from the daemon instead of the invoking process.
 - Extensions can now contribute packaged interactive commands to Fut's command palette, and trusted commands may be palette-only without a binding.
+- Independent left and right sidebars now compose scoped Workspaces and Agents lists, with automatic relevance, compact rails, drawers, and per-side resizing.
 
 ## 0.6
 

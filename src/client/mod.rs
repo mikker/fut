@@ -26,17 +26,15 @@ mod toast;
 
 use std::{collections::HashMap, io, num::NonZeroU16, path::Path, process::Stdio, time::Duration};
 
-use actions::{ClientAction, FocusDirection, NavigationScope};
+use actions::{ClientAction, FocusDirection, HistoryScope, NavigationScope};
 use anyhow::{Context, bail};
 use bytes::Bytes;
 use chrome::{
-    MIN_DOCKED_TERMINAL_WIDTH, ResourceState, client_layout, render_tab_bar, sanitize,
-    workspace_sidebar_drawer,
+    ClientLayout, MIN_DOCKED_TERMINAL_WIDTH, ResourceState, client_layout, render_tab_bar,
+    sanitize, sidebar_drawer,
 };
 use command_bar::{CommandBarAction, CommandBarState};
-use config::{
-    MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH, PaneLayoutPolicy, UiConfig, WorkspaceSidebarDisplay,
-};
+use config::{MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH, PaneLayoutPolicy, SidebarDisplay, UiConfig};
 use context_menu::{ContextMenuAction, ContextMenuState};
 use copy_mode::{
     CopyModeErrorDisposition, CopyModeInput, CopyModePaste, CopyModeReply, CopyModeState,
@@ -84,7 +82,7 @@ use tokio_util::codec::Framed;
 use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
-use sidebar::{WorkspaceSidebarAction, WorkspaceSidebarState, render_workspace_sidebar};
+use sidebar::{ComponentEffect, SidebarComponentKind, SidebarSide, SidebarState, render_sidebar};
 use tab_bar::{TabBarAction, TabBarState};
 use temporary_command::{TemporaryCommandSurface, TemporaryCommandUpdate};
 use toast::{Toast, ToastState};
@@ -106,7 +104,7 @@ use crate::{
 enum ClientSurface {
     Navigator(NavigatorState),
     Notifications(NotificationsDialog),
-    WorkspaceSidebar(WorkspaceSidebarState),
+    Sidebar(SidebarState),
     TabBar(TabBarState),
     CommandBar(CommandBarState),
     ContextMenu(ContextMenuState),
@@ -147,7 +145,7 @@ struct MouseInputState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UiDrag {
     Sidebar {
-        position: config::WorkspaceSidebarPosition,
+        position: sidebar::SidebarSide,
         last_width: u16,
         max_width: u16,
     },
@@ -161,6 +159,7 @@ enum UiDrag {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UiResizeAction {
     Sidebar {
+        side: sidebar::SidebarSide,
         width: u16,
     },
     Split {
@@ -177,13 +176,13 @@ enum UiMouseRoute {
 }
 
 enum UiActivation {
-    Workspace(WorkspaceSidebarAction),
+    Sidebar(ComponentEffect),
     Tab(TabBarAction),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SidebarDivider {
-    position: config::WorkspaceSidebarPosition,
+    position: sidebar::SidebarSide,
     area: Rect,
     current_width: u16,
     max_width: u16,
@@ -714,6 +713,7 @@ async fn run(
                         let focus_origin = focus.complete(request_id);
                         let workspace_selected = matches!(focus_origin, Some(FocusOrigin::Workspace));
                         let tab_selected = matches!(focus_origin, Some(FocusOrigin::Tab));
+                        let sidebar_selected = matches!(focus_origin, Some(FocusOrigin::Sidebar { .. }));
                         let notification_selected =
                             matches!(focus_origin, Some(FocusOrigin::Notification));
                         let observed_revision = resources.snapshot().map(|snapshot| snapshot.revision);
@@ -727,7 +727,11 @@ async fn run(
                         let split_selected =
                             split_pane.selected(request_id, &target, observed_revision);
                         if !view.replace(target)? {
-                            if navigator_selected || workspace_selected || tab_selected {
+                            if navigator_selected
+                                || workspace_selected
+                                || tab_selected
+                                || sidebar_selected
+                            {
                                 surface = None;
                                 view.invalidate_drawn();
                                 force_draw = true;
@@ -785,6 +789,10 @@ async fn run(
                             view.invalidate_drawn();
                         }
                         if tab_selected {
+                            surface = None;
+                            view.invalidate_drawn();
+                        }
+                        if sidebar_selected {
                             surface = None;
                             view.invalidate_drawn();
                         }
@@ -925,14 +933,26 @@ async fn run(
                             force_draw = true;
                         } else {
                             match focus.complete(request_id) {
-                                Some(FocusOrigin::Workspace) => {
-                                    if let Some(ClientSurface::WorkspaceSidebar(sidebar)) = surface.as_mut() {
-                                        sidebar.switch_error(message);
+                                Some(FocusOrigin::Sidebar { scope, component }) => {
+                                    if component == SidebarComponentKind::Workspaces
+                                        && let Some(ClientSurface::Sidebar(sidebar)) = surface.as_mut()
+                                        && sidebar.switch_error(message.clone())
+                                    {
                                         force_draw = true;
-                                    } else {
-                                        toasts.error(format!("workspace unavailable · {message}"));
-                                        force_draw = true;
+                                        continue;
                                     }
+                                    let label = match component {
+                                        SidebarComponentKind::Workspaces => "workspace".into(),
+                                        SidebarComponentKind::Agents => {
+                                            format!("{} agent", scope.label())
+                                        }
+                                    };
+                                    toasts.error(format!("{label} unavailable · {message}"));
+                                    force_draw = true;
+                                }
+                                Some(FocusOrigin::Workspace) => {
+                                    toasts.error(format!("workspace unavailable · {message}"));
+                                    force_draw = true;
                                 }
                                 Some(FocusOrigin::Pane) => {
                                     toasts.error(format!("pane unavailable · {message}"));
@@ -1052,7 +1072,7 @@ async fn run(
                         let layout = client_layout(
                             host,
                             &ui,
-                            resources.workspace_count(view.focused()),
+                            resources.sidebar_relevance(view.focused(), &ui),
                         );
                         let state = copy_mode.as_mut().expect("mouse copy mode exists");
                         let terminal_id = state.terminal_id();
@@ -1262,20 +1282,26 @@ async fn run(
                             force_draw = true;
                         }
                     }
-                    Event::Key(key) if matches!(surface.as_ref(), Some(ClientSurface::WorkspaceSidebar(_))) => {
+                    Event::Key(key) if matches!(surface.as_ref(), Some(ClientSurface::Sidebar(_))) => {
                         toasts.clear();
-                        let action = match surface.as_mut().expect("workspace sidebar exists") {
-                            ClientSurface::WorkspaceSidebar(sidebar) => sidebar.key(key),
-                            _ => unreachable!("surface guard ensures workspace sidebar"),
+                        let size = terminal.size()?;
+                        let action = match surface.as_mut().expect("sidebar exists") {
+                            ClientSurface::Sidebar(sidebar) => {
+                                let host = Rect::new(0, 0, size.width, size.height);
+                                let area = sidebar_drawer(host, &ui, sidebar.side())
+                                    .unwrap_or(Rect::new(0, 0, 0, 0));
+                                sidebar.key(key, area, &ui)
+                            }
+                            _ => unreachable!("surface guard ensures sidebar"),
                         };
                         match action {
-                            WorkspaceSidebarAction::Stay => force_draw = true,
-                            WorkspaceSidebarAction::Close => {
+                            ComponentEffect::Stay => force_draw = true,
+                            ComponentEffect::CloseSidebar => {
                                 surface = None;
                                 view.invalidate_drawn();
                                 force_draw = true;
                             }
-                            WorkspaceSidebarAction::Create => {
+                            ComponentEffect::CreateWorkspace => {
                                 if let Some(request) = create_workspace.begin() {
                                     send_request(
                                         framed,
@@ -1291,8 +1317,12 @@ async fn run(
                                 }
                                 force_draw = true;
                             }
-                            WorkspaceSidebarAction::CycleVisibility => {
-                                ui.workspace_sidebar.visibility.cycle();
+                            ComponentEffect::CycleVisibility => {
+                                if let ClientSurface::Sidebar(sidebar) =
+                                    surface.as_ref().expect("sidebar exists")
+                                {
+                                    sidebar.side().config_mut(&mut ui).visibility.cycle();
+                                }
                                 resize_view(
                                     framed,
                                     terminal.size()?.into(),
@@ -1303,8 +1333,12 @@ async fn run(
                                 view.invalidate_drawn();
                                 force_draw = true;
                             }
-                            WorkspaceSidebarAction::ToggleDisplay => {
-                                ui.workspace_sidebar.display.toggle();
+                            ComponentEffect::ToggleDisplay => {
+                                if let ClientSurface::Sidebar(sidebar) =
+                                    surface.as_ref().expect("sidebar exists")
+                                {
+                                    sidebar.side().config_mut(&mut ui).display.toggle();
+                                }
                                 resize_view(
                                     framed,
                                     terminal.size()?.into(),
@@ -1315,7 +1349,7 @@ async fn run(
                                 view.invalidate_drawn();
                                 force_draw = true;
                             }
-                            WorkspaceSidebarAction::Rename(workspace_id, name) => {
+                            ComponentEffect::RenameWorkspace(workspace_id, name) => {
                                 rename = Some(RenameState::open(
                                     crate::protocol::RenameSelector::Workspace(workspace_id),
                                     "workspace",
@@ -1323,16 +1357,19 @@ async fn run(
                                 ));
                                 force_draw = true;
                             }
-                            WorkspaceSidebarAction::Select(pane_id) => {
+                            ComponentEffect::Navigate(pane_id, scope, component) => {
                                 release_captured_mouse_input(
                                     framed,
                                     &mut mouse_input,
                                     view.focused().terminal_id,
                                 ).await?;
-                                if let Some(request) = focus.begin(FocusOrigin::Workspace) {
-                                    match surface.as_mut().expect("workspace sidebar exists") {
-                                        ClientSurface::WorkspaceSidebar(sidebar) => sidebar.begin_switch(),
-                                        _ => unreachable!("surface guard ensures workspace sidebar"),
+                                if let Some(request) = focus.begin(FocusOrigin::Sidebar {
+                                    scope,
+                                    component,
+                                }) {
+                                    match surface.as_mut().expect("sidebar exists") {
+                                        ClientSurface::Sidebar(sidebar) => sidebar.begin_switch(),
+                                        _ => unreachable!("surface guard ensures sidebar"),
                                     }
                                     send_request(
                                         framed,
@@ -1343,7 +1380,7 @@ async fn run(
                                                 selection_expectation(
                                                     snapshot,
                                                     pane_id,
-                                                    NavigationScope::Workspace,
+                                                    scope,
                                                 )
                                             }),
                                         },
@@ -1472,7 +1509,7 @@ async fn run(
                         let layout = client_layout(
                             host,
                             &ui,
-                            resources.workspace_count(view.focused()),
+                            resources.sidebar_relevance(view.focused(), &ui),
                         );
                         let unobstructed = app_overlay_clear(
                             surface.is_none(),
@@ -1482,33 +1519,36 @@ async fn run(
                         );
                         let open_sidebar = rename.is_none()
                             && copy_mode.is_none()
-                            && matches!(surface.as_ref(), Some(ClientSurface::WorkspaceSidebar(_)));
-                        let visible_sidebar = if open_sidebar {
-                            workspace_sidebar_drawer(host, &ui).and_then(|area| {
-                                sidebar_divider(
-                                    area,
-                                    ui.workspace_sidebar.position,
-                                    MAX_SIDEBAR_WIDTH,
-                                )
-                            })
-                        } else if unobstructed
-                            && ui.workspace_sidebar.display != WorkspaceSidebarDisplay::Minimized
-                        {
-                            layout.workspace_sidebar.and_then(|sidebar| {
-                                sidebar.docked().and_then(|area| {
-                                    let max_width = host
-                                        .width
-                                        .saturating_sub(MIN_DOCKED_TERMINAL_WIDTH)
-                                        .clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
-                                    sidebar_divider(
-                                        area,
-                                        ui.workspace_sidebar.position,
-                                        max_width,
-                                    )
+                            && matches!(surface.as_ref(), Some(ClientSurface::Sidebar(_)));
+                        let visible_sidebars = if open_sidebar {
+                            surface
+                                .as_ref()
+                                .and_then(|surface| match surface {
+                                    ClientSurface::Sidebar(sidebar) => Some(sidebar.side()),
+                                    _ => None,
                                 })
-                            })
+                                .and_then(|side| {
+                                    sidebar_drawer(host, &ui, side).and_then(|area| {
+                                        sidebar_divider(area, side, MAX_SIDEBAR_WIDTH)
+                                    })
+                                })
+                                .into_iter()
+                                .collect::<Vec<_>>()
+                        } else if unobstructed {
+                            SidebarSide::ALL
+                                .into_iter()
+                                .filter(|side| {
+                                    side.config(&ui).display != SidebarDisplay::Minimized
+                                })
+                                .filter_map(|side| {
+                                    let area = layout.sidebar(side)?.docked()?;
+                                    let max_width =
+                                        docked_sidebar_max_width(host, layout, side);
+                                    sidebar_divider(area, side, max_width)
+                                })
+                                .collect()
                         } else {
-                            None
+                            Vec::new()
                         };
                         let split_dividers = if unobstructed {
                             view.pane_layouts(layout.terminal, ui.pane_layout).1
@@ -1516,112 +1556,148 @@ async fn run(
                             Vec::new()
                         };
                         if matches!(mouse.kind, HostMouseEventKind::Down(HostMouseButton::Right))
-                            && matches!(surface.as_ref(), None | Some(ClientSurface::WorkspaceSidebar(_)) | Some(ClientSurface::TabBar(_)))
+                            && matches!(
+                                surface.as_ref(),
+                                None
+                                    | Some(ClientSurface::Sidebar(_))
+                                    | Some(ClientSurface::TabBar(_))
+                            )
                             && let Some(snapshot) = resources.snapshot()
                         {
                             let anchor = (mouse.column, mouse.row);
-                            let workspace_id = if let Some(ClientSurface::WorkspaceSidebar(sidebar)) = surface.as_ref() {
-                                workspace_sidebar_drawer(host, &ui).and_then(|area| {
-                                    sidebar.item_id_at(
-                                        area,
-                                        ui.workspace_sidebar.position,
-                                        &ui,
-                                        mouse.column,
-                                        mouse.row,
-                                    )
-                                })
+                            let (sidebar_hit, workspace_target) = if let Some(
+                                ClientSurface::Sidebar(sidebar),
+                            ) = surface.as_ref()
+                            {
+                                let area = sidebar_drawer(host, &ui, sidebar.side());
+                                let hit = area.is_some_and(|area| {
+                                    rect_contains(area, mouse.column, mouse.row)
+                                });
+                                let target = area
+                                    .filter(|_| hit)
+                                    .and_then(|area| {
+                                        sidebar.workspace_item_id_at(
+                                            area,
+                                            &ui,
+                                            mouse.column,
+                                            mouse.row,
+                                        )
+                                    })
+                                    .map(|workspace_id| (sidebar.side(), workspace_id));
+                                (hit, target)
                             } else {
-                                layout.workspace_sidebar.and_then(|sidebar_layout| {
-                                    let area = sidebar_layout.docked()?;
-                                    let sidebar = WorkspaceSidebarState::open(
+                                let hit = SidebarSide::ALL.into_iter().find_map(|side| {
+                                    let area = layout.sidebar(side)?.docked()?;
+                                    rect_contains(area, mouse.column, mouse.row)
+                                        .then_some((side, area))
+                                });
+                                let target = hit.and_then(|(side, area)| {
+                                    SidebarState::open(
                                         snapshot,
                                         view.focused(),
                                         &workspace_history,
                                         resources.notifications(),
-                                    )?;
-                                    sidebar.item_id_at(
-                                        area,
-                                        ui.workspace_sidebar.position,
+                                        side,
                                         &ui,
-                                        mouse.column,
-                                        mouse.row,
-                                    )
-                                })
+                                    )?
+                                    .workspace_item_id_at(area, &ui, mouse.column, mouse.row)
+                                    .map(|workspace_id| (side, workspace_id))
+                                });
+                                (hit.is_some(), target)
                             };
-                            let menu = workspace_id.and_then(|workspace_id| {
+                            let workspace_menu = workspace_target.and_then(|(side, workspace_id)| {
+                                let sidebar = side.config(&ui);
                                 ContextMenuState::for_workspace(
                                     snapshot,
                                     view.focused(),
                                     &workspace_history,
                                     workspace_id,
-                                    ui.workspace_sidebar.display,
-                                    ui.workspace_sidebar.visibility,
-                                    anchor,
-                                )
-                            }).or_else(|| {
-                                let area = layout.tab_bar?;
-                                let tab_id = TabBarState::item_at(
-                                    snapshot,
-                                    view.focused(),
-                                    view.is_zoomed(),
-                                    &ui,
-                                    resources.notifications(),
-                                    spinner_frame,
-                                    area,
-                                    mouse.column,
-                                    mouse.row,
-                                )?;
-                                ContextMenuState::for_tab(
-                                    snapshot,
-                                    view.focused(),
-                                    &workspace_history,
-                                    tab_id,
+                                    side,
+                                    sidebar,
                                     anchor,
                                 )
                             });
+                            let menu = if sidebar_hit {
+                                workspace_menu
+                            } else {
+                                workspace_menu.or_else(|| {
+                                    let area = layout.tab_bar?;
+                                    let tab_id = TabBarState::item_at(
+                                        snapshot,
+                                        view.focused(),
+                                        view.is_zoomed(),
+                                        &ui,
+                                        resources.notifications(),
+                                        spinner_frame,
+                                        area,
+                                        mouse.column,
+                                        mouse.row,
+                                    )?;
+                                    ContextMenuState::for_tab(
+                                        snapshot,
+                                        view.focused(),
+                                        &workspace_history,
+                                        tab_id,
+                                        anchor,
+                                    )
+                                })
+                            };
                             if let Some(menu) = menu {
                                 mouse_input.discard(mouse);
                                 surface = Some(ClientSurface::ContextMenu(menu));
                                 force_draw = true;
                                 continue;
                             }
+                            if sidebar_hit {
+                                mouse_input.discard(mouse);
+                                force_draw = true;
+                                continue;
+                            }
                         }
                         let activation = matches!(mouse.kind, HostMouseEventKind::Down(HostMouseButton::Left))
                             .then(|| {
-                                if visible_sidebar.is_some_and(|divider| {
+                                if visible_sidebars.iter().any(|divider| {
                                     rect_contains(divider.area, mouse.column, mouse.row)
                                 }) {
                                     return None;
                                 }
                                 let snapshot = resources.snapshot()?;
-                                if let Some(ClientSurface::WorkspaceSidebar(sidebar)) = surface.as_mut() {
-                                    let area = workspace_sidebar_drawer(host, &ui)?;
+                                if let Some(ClientSurface::Sidebar(sidebar)) = surface.as_mut() {
+                                    let area = sidebar_drawer(host, &ui, sidebar.side())?;
                                     if rect_contains(area, mouse.column, mouse.row) {
-                                        return Some(UiActivation::Workspace(sidebar.click(
+                                        return Some(UiActivation::Sidebar(sidebar.click(
                                             area,
-                                            ui.workspace_sidebar.position,
                                             &ui,
                                             mouse.column,
                                             mouse.row,
                                         )));
                                     }
-                                } else if surface.is_none()
-                                    && let Some(area) = layout.workspace_sidebar.and_then(|sidebar| sidebar.docked())
-                                    && rect_contains(area, mouse.column, mouse.row)
-                                {
-                                    let sidebar = WorkspaceSidebarState::open(
-                                        snapshot,
-                                        view.focused(),
-                                        &workspace_history,
-                                        resources.notifications(),
-                                    )?;
-                                    return Some(UiActivation::Workspace(sidebar.passive_click(
-                                        area,
-                                        ui.workspace_sidebar.position,
-                                        &ui,
-                                        mouse.column,
-                                        mouse.row,
-                                    )));
+                                } else if surface.is_none() {
+                                    for side in SidebarSide::ALL {
+                                        let Some(area) = layout
+                                            .sidebar(side)
+                                            .and_then(|sidebar| sidebar.docked())
+                                        else {
+                                            continue;
+                                        };
+                                        if !rect_contains(area, mouse.column, mouse.row) {
+                                            continue;
+                                        }
+                                        let sidebar = SidebarState::open(
+                                            snapshot,
+                                            view.focused(),
+                                            &workspace_history,
+                                            resources.notifications(),
+                                            side,
+                                            &ui,
+                                        )?;
+                                        return Some(UiActivation::Sidebar(sidebar.passive_click(
+                                            area,
+                                            &ui,
+                                            mouse.column,
+                                            mouse.row,
+                                        )));
+                                    }
                                 }
                                 if matches!(surface.as_ref(), None | Some(ClientSurface::TabBar(_)))
                                     && let Some(area) = layout.tab_bar
@@ -1660,9 +1736,16 @@ async fn run(
                         if let Some(activation) = activation {
                             mouse_input.discard(mouse);
                             match activation {
-                                UiActivation::Workspace(WorkspaceSidebarAction::Select(pane_id)) => {
-                                    if let Some(request) = focus.begin(FocusOrigin::Workspace) {
-                                        if let Some(ClientSurface::WorkspaceSidebar(sidebar)) = surface.as_mut() {
+                                UiActivation::Sidebar(ComponentEffect::Navigate(
+                                    pane_id,
+                                    scope,
+                                    component,
+                                )) => {
+                                    if let Some(request) = focus.begin(FocusOrigin::Sidebar {
+                                        scope,
+                                        component,
+                                    }) {
+                                        if let Some(ClientSurface::Sidebar(sidebar)) = surface.as_mut() {
                                             sidebar.begin_switch();
                                         }
                                         send_request(
@@ -1673,7 +1756,7 @@ async fn run(
                                                 expected: selection_expectation(
                                                     resources.snapshot().expect("activation requires resources"),
                                                     pane_id,
-                                                    NavigationScope::Workspace,
+                                                    scope,
                                                 ),
                                             },
                                         ).await?;
@@ -1717,29 +1800,60 @@ async fn run(
                                         name,
                                     ));
                                 }
-                                UiActivation::Workspace(WorkspaceSidebarAction::CycleVisibility) => {
-                                    ui.workspace_sidebar.visibility.cycle();
+                                UiActivation::Sidebar(ComponentEffect::CycleVisibility) => {
+                                    if let Some(ClientSurface::Sidebar(sidebar)) = surface.as_ref() {
+                                        sidebar.side().config_mut(&mut ui).visibility.cycle();
+                                    }
                                     resize_view(framed, host, &mut view, &resources, &ui).await?;
                                     view.invalidate_drawn();
                                 }
-                                UiActivation::Workspace(WorkspaceSidebarAction::ToggleDisplay) => {
-                                    ui.workspace_sidebar.display.toggle();
+                                UiActivation::Sidebar(ComponentEffect::ToggleDisplay) => {
+                                    if let Some(ClientSurface::Sidebar(sidebar)) = surface.as_ref() {
+                                        sidebar.side().config_mut(&mut ui).display.toggle();
+                                    }
                                     resize_view(framed, host, &mut view, &resources, &ui).await?;
                                     view.invalidate_drawn();
                                 }
-                                UiActivation::Workspace(WorkspaceSidebarAction::Close)
-                                    if matches!(surface.as_ref(), Some(ClientSurface::WorkspaceSidebar(_))) =>
-                                {
-                                    surface = None;
-                                    view.invalidate_drawn();
+                                UiActivation::Sidebar(ComponentEffect::CreateWorkspace) => {
+                                    if let Some(request) = create_workspace.begin() {
+                                        send_request(
+                                            framed,
+                                            Some(request),
+                                            ClientMessage::CreateWorkspace {
+                                                session_id: view.focused().session_id,
+                                                name: None,
+                                                cwd: None,
+                                                program: None,
+                                                argv: Vec::new(),
+                                            },
+                                        )
+                                        .await?;
+                                    }
                                 }
-                                UiActivation::Tab(TabBarAction::Close)
-                                    if matches!(surface.as_ref(), Some(ClientSurface::TabBar(_))) =>
-                                {
-                                    surface = None;
-                                    view.invalidate_drawn();
+                                UiActivation::Sidebar(ComponentEffect::RenameWorkspace(
+                                    workspace_id,
+                                    name,
+                                )) => {
+                                    rename = Some(RenameState::open(
+                                        crate::protocol::RenameSelector::Workspace(workspace_id),
+                                        "workspace",
+                                        name,
+                                    ));
                                 }
-                                _ => {}
+                                UiActivation::Sidebar(ComponentEffect::CloseSidebar) => {
+                                    if matches!(surface.as_ref(), Some(ClientSurface::Sidebar(_))) {
+                                        surface = None;
+                                        view.invalidate_drawn();
+                                    }
+                                }
+                                UiActivation::Sidebar(ComponentEffect::Stay)
+                                | UiActivation::Tab(TabBarAction::Stay) => {}
+                                UiActivation::Tab(TabBarAction::Close) => {
+                                    if matches!(surface.as_ref(), Some(ClientSurface::TabBar(_))) {
+                                        surface = None;
+                                        view.invalidate_drawn();
+                                    }
+                                }
                             }
                             force_draw = true;
                             continue;
@@ -1781,12 +1895,12 @@ async fn run(
                         match mouse_input.route_ui(
                             mouse,
                             host,
-                            visible_sidebar,
+                            &visible_sidebars,
                             view.focused().tab_id,
                             &split_dividers,
                         ) {
-                            UiMouseRoute::Owned(Some(UiResizeAction::Sidebar { width })) => {
-                                ui.workspace_sidebar.width = width;
+                            UiMouseRoute::Owned(Some(UiResizeAction::Sidebar { side, width })) => {
+                                side.config_mut(&mut ui).width = width;
                                 resize_view(framed, host, &mut view, &resources, &ui).await?;
                                 view.invalidate_drawn();
                                 force_draw = true;
@@ -2001,7 +2115,7 @@ async fn run(
                 let rendered_attention = matches!(
                     surface.as_ref(),
                     None
-                        | Some(ClientSurface::WorkspaceSidebar(_))
+                        | Some(ClientSurface::Sidebar(_))
                         | Some(ClientSurface::TabBar(_))
                         | Some(ClientSurface::ContextMenu(_))
                 )
@@ -2043,7 +2157,7 @@ async fn run(
                         let layout = client_layout(
                             area,
                             &ui,
-                            resources.workspace_count(view.focused()),
+                            resources.sidebar_relevance(view.focused(), &ui),
                         );
                         graphics_area = Some(layout.terminal);
                         let cursor = render_view(
@@ -2079,28 +2193,30 @@ async fn run(
                                 );
                             }
                         }
-                        if let Some(ClientSurface::WorkspaceSidebar(sidebar)) = surface.as_ref() {
-                            if let Some(sidebar_area) = workspace_sidebar_drawer(area, &ui) {
-                                sidebar.render(
-                                    sidebar_area,
-                                    ui.workspace_sidebar.position,
-                                    &ui,
+                        for side in SidebarSide::ALL {
+                            if let Some(sidebar_area) =
+                                layout.sidebar(side).and_then(|sidebar| sidebar.docked())
+                            {
+                                render_sidebar(
+                                    resources.snapshot(),
+                                    view.focused(),
+                                    &workspace_history,
+                                    resources.notifications(),
                                     spinner_frame,
+                                    sidebar_area,
+                                    side,
+                                    &ui,
                                     frame.buffer_mut(),
                                 );
                             }
-                        } else if let Some(sidebar_area) =
-                            layout.workspace_sidebar.and_then(|sidebar| sidebar.docked())
+                        }
+                        if let Some(ClientSurface::Sidebar(sidebar)) = surface.as_ref()
+                            && let Some(sidebar_area) = sidebar_drawer(area, &ui, sidebar.side())
                         {
-                            render_workspace_sidebar(
-                                resources.snapshot(),
-                                view.focused(),
-                                &workspace_history,
-                                resources.notifications(),
-                                spinner_frame,
+                            sidebar.render(
                                 sidebar_area,
-                                ui.workspace_sidebar.position,
                                 &ui,
+                                spinner_frame,
                                 frame.buffer_mut(),
                             );
                         }
@@ -2117,7 +2233,7 @@ async fn run(
                             Some(ClientSurface::ContextMenu(menu)) => {
                                 menu.render(area, &ui.styles, frame.buffer_mut());
                             }
-                            Some(ClientSurface::WorkspaceSidebar(_))
+                            Some(ClientSurface::Sidebar(_))
                             | Some(ClientSurface::TabBar(_))
                             | None => {}
                         }
@@ -2282,12 +2398,12 @@ async fn dispatch_context_menu_action(
                 start_target_close(framed, close_target, selector, label, ui.confirm_close).await?,
             );
         }
-        ContextMenuAction::SetDisplay(display) => {
-            ui.workspace_sidebar.display.set(display);
+        ContextMenuAction::SetDisplay(side, display) => {
+            side.config_mut(ui).display.set(display);
             resize_view(framed, host, view, resources, ui).await?;
         }
-        ContextMenuAction::SetVisibility(visibility) => {
-            ui.workspace_sidebar.visibility.set(visibility);
+        ContextMenuAction::SetVisibility(side, visibility) => {
+            side.config_mut(ui).visibility.set(visibility);
             resize_view(framed, host, view, resources, ui).await?;
         }
     }
@@ -2312,7 +2428,7 @@ fn refresh_surface_resources(
                 notifications,
             );
         }
-        Some(ClientSurface::WorkspaceSidebar(sidebar)) => {
+        Some(ClientSurface::Sidebar(sidebar)) => {
             sidebar.accept_resources(snapshot, focused, workspace_history, notifications);
         }
         Some(ClientSurface::TabBar(tab_bar)) => {
@@ -2348,22 +2464,18 @@ fn selection_expectation(
     pane_id: crate::domain::PaneId,
     scope: NavigationScope,
 ) -> Option<SelectionExpectation> {
-    snapshot.sessions.iter().find_map(|session| {
-        session.workspaces.iter().find_map(|workspace| {
-            workspace.tabs.iter().find_map(|tab| {
-                tab.panes
-                    .iter()
-                    .any(|pane| pane.id == pane_id)
-                    .then_some(match scope {
-                        NavigationScope::Pane | NavigationScope::Tab => {
-                            SelectionExpectation::Tab(tab.id)
-                        }
-                        NavigationScope::Workspace => SelectionExpectation::Workspace(workspace.id),
-                        NavigationScope::Session => SelectionExpectation::Session(session.id),
-                    })
-            })
+    if scope == NavigationScope::Global {
+        return None;
+    }
+    snapshot
+        .pane_paths()
+        .find(|path| path.pane.id == pane_id)
+        .map(|path| match scope {
+            NavigationScope::Pane | NavigationScope::Tab => SelectionExpectation::Tab(path.tab.id),
+            NavigationScope::Workspace => SelectionExpectation::Workspace(path.workspace.id),
+            NavigationScope::Session => SelectionExpectation::Session(path.session.id),
+            NavigationScope::Global => unreachable!("handled before ancestry lookup"),
         })
-    })
 }
 
 fn accepts_client_input(
@@ -2403,7 +2515,7 @@ impl MouseInputState {
         &mut self,
         mouse: HostMouseEvent,
         host: Rect,
-        sidebar: Option<SidebarDivider>,
+        sidebars: &[SidebarDivider],
         tab_id: crate::domain::TabId,
         split_dividers: &[SplitDivider],
     ) -> UiMouseRoute {
@@ -2422,7 +2534,10 @@ impl MouseInputState {
                 )
                 .then(|| {
                     let width = sidebar_width_at(host, position, mouse.column, max_width);
-                    (width != last_width).then_some(UiResizeAction::Sidebar { width })
+                    (width != last_width).then_some(UiResizeAction::Sidebar {
+                        side: position,
+                        width,
+                    })
                 })
                 .flatten(),
                 UiDrag::Split {
@@ -2456,7 +2571,7 @@ impl MouseInputState {
                 match (&mut self.ui_drag, resize) {
                     (
                         Some(UiDrag::Sidebar { last_width, .. }),
-                        UiResizeAction::Sidebar { width },
+                        UiResizeAction::Sidebar { width, .. },
                     ) => {
                         *last_width = width;
                     }
@@ -2490,8 +2605,10 @@ impl MouseInputState {
         {
             return UiMouseRoute::NotOwned;
         }
-        if let Some(sidebar) = sidebar
-            && rect_contains(sidebar.area, mouse.column, mouse.row)
+        if let Some(sidebar) = sidebars
+            .iter()
+            .copied()
+            .find(|sidebar| rect_contains(sidebar.area, mouse.column, mouse.row))
         {
             self.ui_drag = Some(UiDrag::Sidebar {
                 position: sidebar.position,
@@ -2843,28 +2960,28 @@ fn app_overlay_clear(
 
 fn sidebar_width_at(
     host: Rect,
-    position: config::WorkspaceSidebarPosition,
+    position: sidebar::SidebarSide,
     column: u16,
     max_width: u16,
 ) -> u16 {
     let width = match position {
-        config::WorkspaceSidebarPosition::Left => column.saturating_sub(host.x).saturating_add(1),
-        config::WorkspaceSidebarPosition::Right => host.right().saturating_sub(column),
+        sidebar::SidebarSide::Left => column.saturating_sub(host.x).saturating_add(1),
+        sidebar::SidebarSide::Right => host.right().saturating_sub(column),
     };
     width.clamp(MIN_SIDEBAR_WIDTH, max_width)
 }
 
 fn sidebar_divider(
     sidebar: Rect,
-    position: config::WorkspaceSidebarPosition,
+    position: sidebar::SidebarSide,
     max_width: u16,
 ) -> Option<SidebarDivider> {
     if sidebar.width < MIN_SIDEBAR_WIDTH || sidebar.height == 0 {
         return None;
     }
     let x = match position {
-        config::WorkspaceSidebarPosition::Left => sidebar.right() - 1,
-        config::WorkspaceSidebarPosition::Right => sidebar.x,
+        sidebar::SidebarSide::Left => sidebar.right() - 1,
+        sidebar::SidebarSide::Right => sidebar.x,
     };
     Some(SidebarDivider {
         position,
@@ -2872,6 +2989,19 @@ fn sidebar_divider(
         current_width: sidebar.width,
         max_width,
     })
+}
+
+fn docked_sidebar_max_width(host: Rect, layout: ClientLayout, side: SidebarSide) -> u16 {
+    let other_width = SidebarSide::ALL
+        .into_iter()
+        .find(|other| *other != side)
+        .and_then(|other| layout.sidebar(other))
+        .and_then(|sidebar| sidebar.docked())
+        .map_or(0, |area| area.width);
+    host.width
+        .saturating_sub(MIN_DOCKED_TERMINAL_WIDTH)
+        .saturating_sub(other_width)
+        .clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH)
 }
 
 fn normalized_mouse_event(
@@ -2992,6 +3122,22 @@ async fn dispatch_client_action(
             Ok(reloaded) => {
                 prefix.replace_bindings(reloaded.bindings.clone());
                 *ui = reloaded;
+                let close_sidebar = if let (Some(ClientSurface::Sidebar(sidebar)), Some(snapshot)) =
+                    (surface.as_mut(), resources.snapshot())
+                {
+                    !sidebar.reconfigure(
+                        snapshot,
+                        view.focused(),
+                        workspace_history,
+                        resources.notifications(),
+                        ui,
+                    )
+                } else {
+                    false
+                };
+                if close_sidebar {
+                    *surface = None;
+                }
                 resize_view(framed, host, view, resources, ui).await?;
                 view.invalidate_drawn();
                 return Ok(Some(Toast::info("config reloaded")));
@@ -3022,22 +3168,29 @@ async fn dispatch_client_action(
             }
             *surface = Some(ClientSurface::Navigator(navigator));
         }
-        ClientAction::OpenWorkspaceSidebar => {
+        ClientAction::OpenLeftSidebar | ClientAction::OpenRightSidebar => {
+            let side = if action == ClientAction::OpenLeftSidebar {
+                SidebarSide::Left
+            } else {
+                SidebarSide::Right
+            };
             let Some(snapshot) = resources.snapshot() else {
                 return Ok(Some(Toast::error("workspaces are still loading")));
             };
             if !view.resources_are_current(snapshot) {
                 return Ok(Some(Toast::error("navigation is syncing")));
             }
-            let Some(sidebar) = WorkspaceSidebarState::open(
+            let Some(sidebar) = SidebarState::open(
                 snapshot,
                 view.focused(),
                 workspace_history,
                 resources.notifications(),
+                side,
+                ui,
             ) else {
-                return Ok(Some(Toast::error("no workspace available")));
+                return Ok(Some(Toast::error("sidebar has no components")));
             };
-            *surface = Some(ClientSurface::WorkspaceSidebar(sidebar));
+            *surface = Some(ClientSurface::Sidebar(sidebar));
         }
         ClientAction::OpenTabBar => {
             let Some(snapshot) = resources.snapshot() else {
@@ -3046,7 +3199,7 @@ async fn dispatch_client_action(
             if !view.resources_are_current(snapshot) {
                 return Ok(Some(Toast::error("navigation is syncing")));
             }
-            if client_layout(host, ui, resources.workspace_count(view.focused()))
+            if client_layout(host, ui, resources.sidebar_relevance(view.focused(), ui))
                 .tab_bar
                 .is_none()
             {
@@ -3211,7 +3364,7 @@ async fn dispatch_client_action(
         }
         ClientAction::FocusPane(direction) => {
             let terminal =
-                client_layout(host, ui, resources.workspace_count(view.focused())).terminal;
+                client_layout(host, ui, resources.sidebar_relevance(view.focused(), ui)).terminal;
             if let Some(target) = view.directional(direction, terminal, ui.pane_layout)
                 && let Some(request) = focus.begin(FocusOrigin::Pane)
             {
@@ -3234,25 +3387,24 @@ async fn dispatch_client_action(
                 return Ok(Some(Toast::error("navigation is syncing")));
             }
             let pane_id = match scope {
-                NavigationScope::Pane => workspace_history.last_pane(snapshot, view.focused()),
-                NavigationScope::Tab => workspace_history.last_tab(snapshot, view.focused()),
-                NavigationScope::Workspace => {
+                HistoryScope::Pane => workspace_history.last_pane(snapshot, view.focused()),
+                HistoryScope::Tab => workspace_history.last_tab(snapshot, view.focused()),
+                HistoryScope::Workspace => {
                     workspace_history.last_workspace(snapshot, view.focused())
                 }
-                NavigationScope::Session => {
-                    workspace_history.last_session(snapshot, view.focused())
-                }
+                HistoryScope::Session => workspace_history.last_session(snapshot, view.focused()),
             };
             let Some(pane_id) = pane_id else {
                 return Ok(Some(Toast::error(format!("no previous {}", scope.label()))));
             };
-            if let Some(request) = focus.begin(FocusOrigin::for_scope(scope)) {
+            let navigation_scope = scope.navigation_scope();
+            if let Some(request) = focus.begin(FocusOrigin::for_history_scope(scope)) {
                 send_request(
                     framed,
                     Some(request),
                     ClientMessage::SelectTarget {
                         selector: TargetSelector::Pane(pane_id),
-                        expected: selection_expectation(snapshot, pane_id, scope),
+                        expected: selection_expectation(snapshot, pane_id, navigation_scope),
                     },
                 )
                 .await?;
@@ -3647,16 +3799,20 @@ enum FocusOrigin {
     Tab,
     Workspace,
     Session,
+    Sidebar {
+        scope: NavigationScope,
+        component: SidebarComponentKind,
+    },
     Notification,
 }
 
 impl FocusOrigin {
-    fn for_scope(scope: NavigationScope) -> Self {
+    fn for_history_scope(scope: HistoryScope) -> Self {
         match scope {
-            NavigationScope::Pane => Self::Pane,
-            NavigationScope::Tab => Self::Tab,
-            NavigationScope::Workspace => Self::Workspace,
-            NavigationScope::Session => Self::Session,
+            HistoryScope::Pane => Self::Pane,
+            HistoryScope::Tab => Self::Tab,
+            HistoryScope::Workspace => Self::Workspace,
+            HistoryScope::Session => Self::Session,
         }
     }
 }
@@ -4286,7 +4442,8 @@ async fn resize_view(
     resources: &ResourceState,
     ui: &UiConfig,
 ) -> anyhow::Result<()> {
-    let terminal = client_layout(area, ui, resources.workspace_count(view.focused())).terminal;
+    let terminal =
+        client_layout(area, ui, resources.sidebar_relevance(view.focused(), ui)).terminal;
     for (terminal_id, size) in view.resize_requests(terminal, ui.pane_layout) {
         let request_id = Uuid::new_v4();
         view.mark_resize_requested(terminal_id, request_id);
@@ -4997,6 +5154,26 @@ mod tests {
         assert_eq!(state.complete(Some(request)), Some(FocusOrigin::Workspace));
         let pane = state.begin(FocusOrigin::Pane).expect("focus gate released");
         assert_eq!(state.complete(Some(pane)), Some(FocusOrigin::Pane));
+        for scope in [
+            NavigationScope::Tab,
+            NavigationScope::Workspace,
+            NavigationScope::Session,
+            NavigationScope::Global,
+        ] {
+            let request = state
+                .begin(FocusOrigin::Sidebar {
+                    scope,
+                    component: SidebarComponentKind::Agents,
+                })
+                .unwrap();
+            assert_eq!(
+                state.complete(Some(request)),
+                Some(FocusOrigin::Sidebar {
+                    scope,
+                    component: SidebarComponentKind::Agents,
+                })
+            );
+        }
     }
 
     #[test]
@@ -5894,7 +6071,7 @@ mod tests {
                     modifiers: KeyModifiers::NONE,
                 },
                 host,
-                None,
+                &[],
                 panes[0].tab_id,
                 &dividers,
             ),
@@ -5909,7 +6086,7 @@ mod tests {
                     modifiers: KeyModifiers::NONE,
                 },
                 host,
-                None,
+                &[],
                 panes[0].tab_id,
                 &dividers,
             ),
@@ -5927,7 +6104,7 @@ mod tests {
                     modifiers: KeyModifiers::NONE,
                 },
                 host,
-                None,
+                &[],
                 panes[0].tab_id,
                 &dividers,
             ),
@@ -5981,7 +6158,7 @@ mod tests {
                     modifiers: KeyModifiers::NONE,
                 },
                 host,
-                None,
+                &[],
                 panes[0].tab_id,
                 &dividers,
             ),
@@ -6013,14 +6190,14 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_precedes_panes_and_both_sidebar_edges_resize_without_app_capture() {
+    fn sidebar_drags_are_side_specific_and_resize_from_their_own_edge() {
         let panes = targets(2);
         let state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
         let host = Rect::new(0, 0, 140, 24);
         let dividers = state.pane_layouts(host, PaneLayoutPolicy::Splits).1;
         let pane_divider = dividers[0];
         let sidebar = SidebarDivider {
-            position: config::WorkspaceSidebarPosition::Left,
+            position: sidebar::SidebarSide::Left,
             area: pane_divider.area,
             current_width: 28,
             max_width: 44,
@@ -6035,7 +6212,7 @@ mod tests {
                     modifiers: KeyModifiers::NONE,
                 },
                 host,
-                Some(sidebar),
+                &[sidebar],
                 panes[0].tab_id,
                 &dividers,
             ),
@@ -6051,57 +6228,81 @@ mod tests {
                     modifiers: KeyModifiers::NONE,
                 },
                 host,
-                None,
+                &[],
                 panes[0].tab_id,
                 &[],
             ),
-            UiMouseRoute::Owned(Some(UiResizeAction::Sidebar { width: 44 }))
+            UiMouseRoute::Owned(Some(UiResizeAction::Sidebar {
+                side: SidebarSide::Left,
+                width: 44,
+            }))
         );
         input.clear();
 
-        let right = SidebarDivider {
-            position: config::WorkspaceSidebarPosition::Right,
-            area: Rect::new(112, 0, 1, 24),
-            current_width: 28,
-            max_width: 80,
-        };
-        input.route_ui(
-            HostMouseEvent {
-                kind: HostMouseEventKind::Down(HostMouseButton::Left),
-                column: right.area.x,
-                row: 3,
-                modifiers: KeyModifiers::NONE,
-            },
-            host,
-            Some(right),
-            panes[0].tab_id,
-            &dividers,
+        let right = sidebar_divider(Rect::new(112, 0, 28, 24), SidebarSide::Right, 44).unwrap();
+        assert_eq!(
+            input.route_ui(
+                HostMouseEvent {
+                    kind: HostMouseEventKind::Down(HostMouseButton::Left),
+                    column: right.area.x,
+                    row: right.area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                host,
+                &[sidebar, right],
+                panes[0].tab_id,
+                &dividers,
+            ),
+            UiMouseRoute::Owned(None)
         );
         assert_eq!(
             input.route_ui(
                 HostMouseEvent {
-                    kind: HostMouseEventKind::Up(HostMouseButton::Left),
-                    column: 119,
-                    row: 3,
+                    kind: HostMouseEventKind::Drag(HostMouseButton::Left),
+                    column: 99,
+                    row: 23,
                     modifiers: KeyModifiers::NONE,
                 },
                 host,
-                None,
+                &[],
                 panes[0].tab_id,
-                &dividers,
+                &[],
             ),
-            UiMouseRoute::Owned(Some(UiResizeAction::Sidebar { width: 21 }))
+            UiMouseRoute::Owned(Some(UiResizeAction::Sidebar {
+                side: SidebarSide::Right,
+                width: 41,
+            }))
         );
+        input.clear();
+
         assert!(input.synthetic_releases(panes[0].terminal_id).is_empty());
 
         assert_eq!(
             sidebar_divider(
                 Rect::new(0, 0, MIN_SIDEBAR_WIDTH - 1, 24),
-                config::WorkspaceSidebarPosition::Left,
+                sidebar::SidebarSide::Left,
                 MAX_SIDEBAR_WIDTH,
             ),
             None,
             "a host-clipped drawer cannot replace the configured width on click"
+        );
+    }
+
+    #[test]
+    fn docked_sidebar_drag_maximum_reserves_the_other_side_and_terminal() {
+        let host = Rect::new(5, 2, 120, 24);
+        let mut ui = UiConfig::default();
+        ui.sidebar.left.width = 30;
+        ui.sidebar.right.width = 20;
+        let layout = client_layout(host, &ui, chrome::SidebarRelevance::default());
+        assert_eq!(layout.terminal.width, 70);
+        assert_eq!(
+            docked_sidebar_max_width(host, layout, SidebarSide::Left),
+            60
+        );
+        assert_eq!(
+            docked_sidebar_max_width(host, layout, SidebarSide::Right),
+            50
         );
     }
 
@@ -6141,7 +6342,7 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         assert_eq!(
-            input.route_ui(drag, host, None, panes[0].tab_id, &dividers),
+            input.route_ui(drag, host, &[], panes[0].tab_id, &dividers),
             UiMouseRoute::NotOwned
         );
         assert!(matches!(

@@ -32,8 +32,8 @@ These may appear in groups under `ui.tab_bar.left`, `center`, or `right`.
 | `tab.pane_count` | Number of panes in the current tab |
 | `client.zoom` | Configured zoom icon while zoomed; otherwise empty |
 | `client.help` | Contextual create/rename/close help while the tab bar is keyboard-active |
-| `client.waiting` | `•` and this client's count of terminals with unseen blocked or completed attention across Fut; empty when zero |
-| `session.waiting` | `•` and this client's count of terminals with unseen blocked or completed attention in the current session; empty when zero |
+| `client.waiting` | `•` and the count of terminals with daemon-wide unread blocked or completed attention across Fut; empty when zero |
+| `session.waiting` | `•` and the count of terminals with daemon-wide unread blocked or completed attention in the current session; empty when zero |
 
 The special `{ component = "tabs" }` segment renders the focus-aware repeated tab collection. At most one may occur in a tab bar.
 
@@ -56,7 +56,7 @@ Current, closing, and keyboard-selected styles are composed over every item segm
 
 ## Workspace-row tokens
 
-These may appear in `ui.workspace_sidebar.row.left`, `body`, `right`, or `detail`.
+These may appear in the `row.left`, `body`, `right`, or `detail` fields of a `component = "workspaces"` entry under either `ui.sidebar.left.components` or `ui.sidebar.right.components`.
 
 | Token | Value |
 | --- | --- |
@@ -80,7 +80,7 @@ The daemon resolves Git tokens with bounded background `git` processes and refre
 
 ## Sidebar header and footer tokens
 
-These may appear in `ui.workspace_sidebar.header` and `footer`:
+These may appear in the `header` and `footer` fields of a `component = "workspaces"` entry under either sidebar side:
 
 | Token | Value |
 | --- | --- |
@@ -89,7 +89,7 @@ These may appear in `ui.workspace_sidebar.header` and `footer`:
 | `workspace.name` | Current workspace name; unnamed workspaces present their live location |
 | `workspace.icon` | Workspace icon from the selected preset |
 | `sidebar.display` | Current display label: `expanded` or `minimized` |
-| `sidebar.visibility` | Current compact visibility label: `visible`, `hide with one`, or `hidden` |
+| `sidebar.visibility` | Current compact visibility label: `visible`, `automatic`, or `hidden` |
 | `sidebar.status` | Current display and visibility plus contextual controls, switching progress, or a retryable error |
 
 ## Extension tokens
