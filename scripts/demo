@@ -13,6 +13,7 @@ RUNTIME_DIR="$DEMO_ROOT/runtime"
 SOCKET="$RUNTIME_DIR/fut.sock"
 STATE_FILE="$DEMO_ROOT/demo.env"
 DAEMON_LOG="$DEMO_ROOT/daemon.log"
+CLIENT_LOG="$DEMO_ROOT/client.log"
 DAEMON_PID_FILE="$DEMO_ROOT/daemon.pid"
 OWNERSHIP_FILE="$DEMO_ROOT/.fut-demo-owned"
 # Dogfood the current development build so local changes are always represented.
@@ -255,6 +256,7 @@ setup_demo() {
   printf 'fut-demo-v1\n' >"$OWNERSHIP_FILE"
   mkdir -p "$RUNTIME_DIR"
   chmod 700 "$RUNTIME_DIR"
+  : >"$CLIENT_LOG"
   setup_repository
 
   trap 'clean_demo' ERR INT TERM
@@ -325,6 +327,7 @@ Fut demo is ready.
 
   socket:   $SOCKET
   project:  $MAIN
+  logs:     $DAEMON_LOG · $CLIENT_LOG
   layout:   3 workspaces · 7 tabs · 9 panes
 
   reattach: mise run demo:attach
@@ -342,7 +345,9 @@ attach_demo() {
   fi
   local main_pane_id
   main_pane_id=$(state_field MAIN_PANE_ID)
-  "$FUT_BIN" --socket "$SOCKET" pane attach "$main_pane_id"
+  printf '\n--- attach %s ---\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$CLIENT_LOG"
+  "$FUT_BIN" --socket "$SOCKET" pane attach "$main_pane_id" \
+    2> >(tee -a "$CLIENT_LOG" >&2)
 }
 
 case ${1:-run} in

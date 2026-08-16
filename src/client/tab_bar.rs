@@ -204,6 +204,38 @@ impl TabBarState {
 
     #[allow(
         clippy::too_many_arguments,
+        reason = "hit testing forwards the complete configurable tab renderer context"
+    )]
+    pub fn item_at(
+        snapshot: &ResourceSnapshot,
+        focused: &SelectedTarget,
+        zoomed: bool,
+        ui: &UiConfig,
+        notifications: &NotificationState,
+        spinner_frame: usize,
+        area: Rect,
+        column: u16,
+        row: u16,
+    ) -> Option<TabId> {
+        match tab_bar_hit_at(
+            snapshot,
+            focused,
+            zoomed,
+            None,
+            notifications,
+            spinner_frame,
+            ui,
+            area,
+            column,
+            row,
+        )? {
+            TabBarHit::Item(id) => Some(id),
+            TabBarHit::Hotkey(_) => None,
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
         reason = "the active tab bar forwards the complete passive renderer context"
     )]
     pub fn render(

@@ -96,13 +96,17 @@ impl ToastState {
         let Some(active) = self.current.as_ref() else {
             return;
         };
-        let (message, role) = match &active.toast {
-            Toast::Info(message) => (message.as_str(), SemanticStyle::Normal),
-            Toast::Prompt(message) => (message.as_str(), SemanticStyle::Normal),
-            Toast::Error(message) => (message.as_str(), SemanticStyle::Error),
+        let (message, role, centered) = match &active.toast {
+            Toast::Info(message) => (message.as_str(), SemanticStyle::Normal, false),
+            Toast::Prompt(message) => (message.as_str(), SemanticStyle::Normal, true),
+            Toast::Error(message) => (message.as_str(), SemanticStyle::Error, false),
         };
         let message = sanitize(message);
-        let area = toast_area(host, tab_bar_position, &message);
+        let area = if centered {
+            prompt_area(host, &message)
+        } else {
+            toast_area(host, tab_bar_position, &message)
+        };
         let content = dialog::render_frame(area, buffer);
         if content.width == 0 || content.height == 0 {
             return;
@@ -151,6 +155,24 @@ fn toast_area(host: Rect, tab_bar_position: TabBarPosition, message: &str) -> Re
         TabBarPosition::Bottom => host.y.saturating_add(vertical_margin),
     };
     Rect::new(x, y, width, height)
+}
+
+fn prompt_area(host: Rect, message: &str) -> Rect {
+    if host.width == 0 || host.height == 0 {
+        return host;
+    }
+    let message_width = u16::try_from(UnicodeWidthStr::width(message)).unwrap_or(u16::MAX);
+    let width = message_width
+        .saturating_add(4)
+        .min(MAX_WIDTH)
+        .min(host.width);
+    let height = 3.min(host.height);
+    Rect::new(
+        host.x.saturating_add((host.width - width) / 2),
+        host.y.saturating_add((host.height - height) / 2),
+        width,
+        height,
+    )
 }
 
 #[cfg(test)]
@@ -207,6 +229,18 @@ mod tests {
             buffer[(area.x + 1, area.y + 1)]
                 .modifier
                 .contains(ratatui::style::Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn prompts_are_dead_center_even_with_offset_and_tiny_hosts() {
+        assert_eq!(
+            prompt_area(Rect::new(3, 4, 80, 24), "Close workspace? (y/n)"),
+            Rect::new(30, 14, 26, 3)
+        );
+        assert_eq!(
+            prompt_area(Rect::new(3, 4, 2, 1), "Close workspace? (y/n)"),
+            Rect::new(3, 4, 2, 1)
         );
     }
 }

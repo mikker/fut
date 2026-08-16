@@ -47,6 +47,10 @@ pub(super) enum WorkspaceSidebarVisibility {
 }
 
 impl WorkspaceSidebarVisibility {
+    pub fn set(&mut self, visibility: Self) {
+        *self = visibility;
+    }
+
     pub fn cycle(&mut self) {
         *self = match self {
             Self::Visible => Self::AutoHideWhenSingle,
@@ -73,6 +77,10 @@ pub(super) enum WorkspaceSidebarDisplay {
 }
 
 impl WorkspaceSidebarDisplay {
+    pub fn set(&mut self, display: Self) {
+        *self = display;
+    }
+
     pub fn toggle(&mut self) {
         *self = match self {
             Self::Expanded => Self::Minimized,
@@ -901,6 +909,7 @@ impl WorkspaceSidebarConfig {
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct UiConfig {
     pub(super) pane_layout: PaneLayoutPolicy,
+    pub(super) confirm_close: bool,
     pub(super) bindings: BindingsConfig,
     pub(super) icons: IconsConfig,
     pub(super) styles: StylesConfig,
@@ -912,6 +921,7 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             pane_layout: PaneLayoutPolicy::Splits,
+            confirm_close: true,
             bindings: BindingsConfig::default(),
             icons: IconsConfig::default(),
             styles: StylesConfig::default(),
@@ -1474,6 +1484,7 @@ mod tests {
             r##"
 [ui]
 pane_layout = "accordion"
+confirm_close = false
 
 [ui.icons]
 preset = "nerd_font"
@@ -1509,6 +1520,7 @@ right = [{ token = "workspace.tab_count" }]
         .unwrap();
         let config = load_path(&path, true).unwrap();
         assert_eq!(config.pane_layout, PaneLayoutPolicy::Accordion);
+        assert!(!config.confirm_close);
         assert_eq!(config.tab_bar.position, TabBarPosition::Bottom);
         assert_eq!(
             config.workspace_sidebar.position,

@@ -416,16 +416,37 @@ impl WorkspaceSidebarState {
         column: u16,
         row: u16,
     ) -> WorkspaceSidebarAction {
+        self.item_at(area, position, ui, column, row)
+            .map(switch_to)
+            .unwrap_or(WorkspaceSidebarAction::Stay)
+    }
+
+    pub fn item_id_at(
+        &self,
+        area: Rect,
+        position: WorkspaceSidebarPosition,
+        ui: &UiConfig,
+        column: u16,
+        row: u16,
+    ) -> Option<WorkspaceId> {
+        self.item_at(area, position, ui, column, row)
+            .map(|item| item.id)
+    }
+
+    fn item_at(
+        &self,
+        area: Rect,
+        position: WorkspaceSidebarPosition,
+        ui: &UiConfig,
+        column: u16,
+        row: u16,
+    ) -> Option<&WorkspaceItem> {
         if ui.workspace_sidebar.display == WorkspaceSidebarDisplay::Expanded {
-            return workspace_item_at(&self.model, None, None, area, position, ui, column, row)
-                .map(switch_to)
-                .unwrap_or(WorkspaceSidebarAction::Stay);
+            return workspace_item_at(&self.model, None, None, area, position, ui, column, row);
         }
-        let Some(content) = sidebar_content(area, position) else {
-            return WorkspaceSidebarAction::Stay;
-        };
+        let content = sidebar_content(area, position)?;
         if column < content.x || column >= content.right() {
-            return WorkspaceSidebarAction::Stay;
+            return None;
         }
         let header = render_sidebar_chrome(&ui.workspace_sidebar.header, &self.model, None, ui);
         let header_height = if header.spans.is_empty() || content.height <= SIDEBAR_HEADER_HEIGHT {
@@ -452,19 +473,13 @@ impl WorkspaceSidebarState {
                 VisibleRow::Ellipsis => y = y.saturating_add(1),
                 VisibleRow::Item(index) => {
                     if row == y {
-                        return self
-                            .model
-                            .items
-                            .get(index)
-                            .filter(|item| !item.closing)
-                            .map(switch_to)
-                            .unwrap_or(WorkspaceSidebarAction::Stay);
+                        return self.model.items.get(index).filter(|item| !item.closing);
                     }
                     y = y.saturating_add(1);
                 }
             }
         }
-        WorkspaceSidebarAction::Stay
+        None
     }
 
     pub fn begin_switch(&mut self) {

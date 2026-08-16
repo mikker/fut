@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Close confirmations are now centered, can be disabled with `ui.confirm_close = false`, and closing the final successful terminal exits cleanly.
+- Tabs and workspace rows now have right-click menus for switching, creating, renaming, closing, and changing workspace display and visibility.
 - The command palette now opens with `Ctrl-b :` and gives every built-in action a searchable tmux-style command name using Fut's tab terminology.
 - Added `fut a` and `fut ls` command aliases, plus a confirmed `Ctrl-b x` shortcut for closing the focused pane.
 - Fut now refuses to nest interactive clients by default; set `FUT_ALLOW_NESTED` to force intentional nesting.

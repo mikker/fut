@@ -5,6 +5,7 @@ mod cheatsheet;
 mod chrome;
 mod command_bar;
 pub(crate) mod config;
+mod context_menu;
 mod copy_mode;
 mod dialog;
 mod fuzzy;
@@ -23,7 +24,7 @@ mod tab_bar;
 mod temporary_command;
 mod toast;
 
-use std::{io, num::NonZeroU16, path::Path, process::Stdio, time::Duration};
+use std::{collections::HashMap, io, num::NonZeroU16, path::Path, process::Stdio, time::Duration};
 
 use actions::{ClientAction, FocusDirection, NavigationScope};
 use anyhow::{Context, bail};
@@ -36,6 +37,7 @@ use command_bar::{CommandBarAction, CommandBarState};
 use config::{
     MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH, PaneLayoutPolicy, UiConfig, WorkspaceSidebarDisplay,
 };
+use context_menu::{ContextMenuAction, ContextMenuState};
 use copy_mode::{
     CopyModeErrorDisposition, CopyModeInput, CopyModePaste, CopyModeReply, CopyModeState,
 };
@@ -107,6 +109,7 @@ enum ClientSurface {
     WorkspaceSidebar(WorkspaceSidebarState),
     TabBar(TabBarState),
     CommandBar(CommandBarState),
+    ContextMenu(ContextMenuState),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -410,7 +413,7 @@ async fn run(
     let mut create_workspace = CreateState::default();
     let mut create_tab = CreateState::default();
     let mut split_pane = CreateState::default();
-    let mut close_pane = ClosePaneState::default();
+    let mut close_target = CloseTargetState::default();
     let mut focus = FocusState::default();
     let mut toasts = ToastState::default();
     let mut pending_focused_exit: Option<Option<i32>> = None;
@@ -465,7 +468,7 @@ async fn run(
             }
             frame = framed.next() => {
                 let Some(frame) = frame else {
-                    if let Some(Some(code)) = pending_focused_exit {
+                    if let Some(code) = failed_exit_code(pending_focused_exit) {
                         bail!("terminal exited with status {code}");
                     }
                     break;
@@ -803,7 +806,7 @@ async fn run(
                     }
                     ServerMessage::CommandCompleted { command } => {
                         if command == crate::protocol::AcknowledgedCommand::CloseTarget
-                            && close_pane.complete(request_id)
+                            && close_target.complete(request_id)
                         {
                             force_draw = true;
                         }
@@ -876,8 +879,8 @@ async fn run(
                             force_draw = true;
                             continue;
                         }
-                        if close_pane.fail(request_id) {
-                            toasts.error(format!("close pane failed · {message}"));
+                        if close_target.fail(request_id) {
+                            toasts.error(format!("close failed · {message}"));
                             force_draw = true;
                             continue;
                         }
@@ -933,7 +936,7 @@ async fn run(
                     }
                 }
             }
-            event = events.next(), if accepts_client_input(&focus, &create_workspace, &create_tab, &split_pane, &close_pane, &pending_focused_exit) => {
+            event = events.next(), if accepts_client_input(&focus, &create_workspace, &create_tab, &split_pane, &close_target, &pending_focused_exit) => {
                 let Some(event) = event else {
                     release_captured_mouse_input(
                         framed,
@@ -947,20 +950,18 @@ async fn run(
                     mouse_input.cancel_local_drags();
                 }
                 match event {
-                    Event::Key(key) if close_pane.is_confirming() && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                    Event::Key(key) if close_target.is_confirming() && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                         toasts.clear();
                         if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
-                            if let Some(request_id) = close_pane.confirm() {
+                            if let Some((request_id, selector)) = close_target.confirm() {
                                 send_request(
                                     framed,
                                     Some(request_id),
-                                    ClientMessage::CloseTarget {
-                                        selector: TargetSelector::Pane(view.focused().pane_id),
-                                    },
+                                    ClientMessage::CloseTarget { selector },
                                 ).await?;
                             }
                         } else {
-                            close_pane.cancel();
+                            close_target.cancel();
                         }
                         force_draw = true;
                     }
@@ -1087,6 +1088,64 @@ async fn run(
                     }
                     Event::Paste(text) if rename.is_some() => {
                         rename.as_mut().expect("rename exists").paste(&text);
+                        force_draw = true;
+                    }
+                    Event::Key(key) if matches!(surface.as_ref(), Some(ClientSurface::ContextMenu(_))) => {
+                        toasts.clear();
+                        let action = match surface.as_mut().expect("context menu exists") {
+                            ClientSurface::ContextMenu(menu) => menu.key(key),
+                            _ => unreachable!("surface guard ensures context menu"),
+                        };
+                        dispatch_context_menu_action(
+                            action,
+                            framed,
+                            &mut view,
+                            &resources,
+                            &mut surface,
+                            &mut rename,
+                            &mut create_workspace,
+                            &mut create_tab,
+                            &mut close_target,
+                            &mut focus,
+                            &mut mouse_input,
+                            &mut ui,
+                            &mut toasts,
+                            terminal.size()?.into(),
+                        ).await?;
+                        force_draw = true;
+                    }
+                    Event::Mouse(mouse) if matches!(surface.as_ref(), Some(ClientSurface::ContextMenu(_))) => {
+                        let host = terminal.size()?.into();
+                        let action = match surface.as_mut().expect("context menu exists") {
+                            ClientSurface::ContextMenu(menu) => match mouse.kind {
+                                HostMouseEventKind::Moved => {
+                                    menu.mouse_move(host, mouse.column, mouse.row);
+                                    ContextMenuAction::Stay
+                                }
+                                HostMouseEventKind::Down(HostMouseButton::Left) => {
+                                    menu.click(host, mouse.column, mouse.row)
+                                }
+                                _ => ContextMenuAction::Stay,
+                            },
+                            _ => unreachable!("surface guard ensures context menu"),
+                        };
+                        mouse_input.discard(mouse);
+                        dispatch_context_menu_action(
+                            action,
+                            framed,
+                            &mut view,
+                            &resources,
+                            &mut surface,
+                            &mut rename,
+                            &mut create_workspace,
+                            &mut create_tab,
+                            &mut close_target,
+                            &mut focus,
+                            &mut mouse_input,
+                            &mut ui,
+                            &mut toasts,
+                            host,
+                        ).await?;
                         force_draw = true;
                     }
                     Event::Key(key) if matches!(surface.as_ref(), Some(ClientSurface::Notifications(_))) => {
@@ -1356,7 +1415,7 @@ async fn run(
                                     &mut create_workspace,
                                     &mut create_tab,
                                     &mut split_pane,
-                                    &mut close_pane,
+                                    &mut close_target,
                                     &mut focus,
                                     &mut copy_mode,
                                     &mut prefix,
@@ -1423,6 +1482,77 @@ async fn run(
                         } else {
                             Vec::new()
                         };
+                        if matches!(mouse.kind, HostMouseEventKind::Down(HostMouseButton::Right))
+                            && matches!(surface.as_ref(), None | Some(ClientSurface::WorkspaceSidebar(_)) | Some(ClientSurface::TabBar(_)))
+                            && let Some(snapshot) = resources.snapshot()
+                        {
+                            let anchor = (mouse.column, mouse.row);
+                            let workspace_id = if let Some(ClientSurface::WorkspaceSidebar(sidebar)) = surface.as_ref() {
+                                workspace_sidebar_drawer(host, &ui).and_then(|area| {
+                                    sidebar.item_id_at(
+                                        area,
+                                        ui.workspace_sidebar.position,
+                                        &ui,
+                                        mouse.column,
+                                        mouse.row,
+                                    )
+                                })
+                            } else {
+                                layout.workspace_sidebar.and_then(|sidebar_layout| {
+                                    let area = sidebar_layout.docked()?;
+                                    let sidebar = WorkspaceSidebarState::open(
+                                        snapshot,
+                                        view.focused(),
+                                        &workspace_history,
+                                        resources.notifications(),
+                                    )?;
+                                    sidebar.item_id_at(
+                                        area,
+                                        ui.workspace_sidebar.position,
+                                        &ui,
+                                        mouse.column,
+                                        mouse.row,
+                                    )
+                                })
+                            };
+                            let menu = workspace_id.and_then(|workspace_id| {
+                                ContextMenuState::for_workspace(
+                                    snapshot,
+                                    view.focused(),
+                                    &workspace_history,
+                                    workspace_id,
+                                    ui.workspace_sidebar.display,
+                                    ui.workspace_sidebar.visibility,
+                                    anchor,
+                                )
+                            }).or_else(|| {
+                                let area = layout.tab_bar?;
+                                let tab_id = TabBarState::item_at(
+                                    snapshot,
+                                    view.focused(),
+                                    view.is_zoomed(),
+                                    &ui,
+                                    resources.notifications(),
+                                    spinner_frame,
+                                    area,
+                                    mouse.column,
+                                    mouse.row,
+                                )?;
+                                ContextMenuState::for_tab(
+                                    snapshot,
+                                    view.focused(),
+                                    &workspace_history,
+                                    tab_id,
+                                    anchor,
+                                )
+                            });
+                            if let Some(menu) = menu {
+                                mouse_input.discard(mouse);
+                                surface = Some(ClientSurface::ContextMenu(menu));
+                                force_draw = true;
+                                continue;
+                            }
+                        }
                         let activation = matches!(mouse.kind, HostMouseEventKind::Down(HostMouseButton::Left))
                             .then(|| {
                                 if visible_sidebar.is_some_and(|divider| {
@@ -1741,7 +1871,7 @@ async fn run(
                                     &mut create_workspace,
                                     &mut create_tab,
                                     &mut split_pane,
-                                    &mut close_pane,
+                                    &mut close_target,
                                     &mut focus,
                                     &mut copy_mode,
                                     &mut prefix,
@@ -1840,6 +1970,7 @@ async fn run(
                     None
                         | Some(ClientSurface::WorkspaceSidebar(_))
                         | Some(ClientSurface::TabBar(_))
+                        | Some(ClientSurface::ContextMenu(_))
                 )
                 .then(|| resources.attention_revision(focused_terminal_id))
                 .flatten()
@@ -1949,6 +2080,9 @@ async fn run(
                             Some(ClientSurface::CommandBar(command_bar)) => {
                                 command_bar.render(layout.terminal, frame.buffer_mut());
                             }
+                            Some(ClientSurface::ContextMenu(menu)) => {
+                                menu.render(area, &ui.styles, frame.buffer_mut());
+                            }
                             Some(ClientSurface::WorkspaceSidebar(_))
                             | Some(ClientSurface::TabBar(_))
                             | None => {}
@@ -2007,6 +2141,118 @@ async fn run(
     Ok(())
 }
 
+fn failed_exit_code(exit: Option<Option<i32>>) -> Option<i32> {
+    exit.flatten().filter(|code| *code != 0)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "context-menu actions share the interactive client's request and safeguard state"
+)]
+async fn dispatch_context_menu_action(
+    action: ContextMenuAction,
+    framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    view: &mut ViewState,
+    resources: &ResourceState,
+    surface: &mut Option<ClientSurface>,
+    rename: &mut Option<RenameState>,
+    create_workspace: &mut CreateState,
+    create_tab: &mut CreateState,
+    close_target: &mut CloseTargetState,
+    focus: &mut FocusState,
+    mouse_input: &mut MouseInputState,
+    ui: &mut UiConfig,
+    toasts: &mut ToastState,
+    host: Rect,
+) -> anyhow::Result<()> {
+    match action {
+        ContextMenuAction::Stay => return Ok(()),
+        ContextMenuAction::Dismiss => {}
+        ContextMenuAction::SwitchTab(pane_id) | ContextMenuAction::SwitchWorkspace(pane_id) => {
+            release_captured_mouse_input(framed, mouse_input, view.focused().terminal_id).await?;
+            let origin = if matches!(action, ContextMenuAction::SwitchTab(_)) {
+                FocusOrigin::Tab
+            } else {
+                FocusOrigin::Workspace
+            };
+            if let Some(request) = focus.begin(origin) {
+                let scope = if matches!(action, ContextMenuAction::SwitchTab(_)) {
+                    NavigationScope::Tab
+                } else {
+                    NavigationScope::Workspace
+                };
+                send_request(
+                    framed,
+                    Some(request),
+                    ClientMessage::SelectTarget {
+                        selector: TargetSelector::Pane(pane_id),
+                        expected: resources
+                            .snapshot()
+                            .and_then(|snapshot| selection_expectation(snapshot, pane_id, scope)),
+                    },
+                )
+                .await?;
+            }
+        }
+        ContextMenuAction::CreateTab(workspace_id) => {
+            if let Some(request) = create_tab.begin() {
+                send_request(
+                    framed,
+                    Some(request),
+                    ClientMessage::CreateTab {
+                        workspace_id,
+                        name: None,
+                        cwd: None,
+                        program: None,
+                        argv: Vec::new(),
+                    },
+                )
+                .await?;
+            }
+        }
+        ContextMenuAction::CreateWorkspace(session_id) => {
+            if let Some(request) = create_workspace.begin() {
+                send_request(
+                    framed,
+                    Some(request),
+                    ClientMessage::CreateWorkspace {
+                        session_id,
+                        name: None,
+                        cwd: None,
+                        program: None,
+                        argv: Vec::new(),
+                    },
+                )
+                .await?;
+            }
+        }
+        ContextMenuAction::Rename(selector, name) => {
+            let label = match selector {
+                crate::protocol::RenameSelector::Workspace(_) => "workspace",
+                crate::protocol::RenameSelector::Tab(_) => "tab",
+                crate::protocol::RenameSelector::Session(_) => "session",
+            };
+            *rename = Some(RenameState::open(selector, label, name));
+        }
+        ContextMenuAction::Close(selector, label) => {
+            toasts.replace(
+                start_target_close(framed, close_target, selector, label, ui.confirm_close).await?,
+            );
+        }
+        ContextMenuAction::SetDisplay(display) => {
+            ui.workspace_sidebar.display.set(display);
+            resize_view(framed, host, view, resources, ui).await?;
+        }
+        ContextMenuAction::SetVisibility(visibility) => {
+            ui.workspace_sidebar.visibility.set(visibility);
+            resize_view(framed, host, view, resources, ui).await?;
+        }
+    }
+    *surface = None;
+    view.invalidate_drawn();
+    Ok(())
+}
+
 fn refresh_surface_resources(
     surface: &mut Option<ClientSurface>,
     snapshot: &crate::resources::ResourceSnapshot,
@@ -2032,7 +2278,7 @@ fn refresh_surface_resources(
         Some(ClientSurface::Notifications(dialog)) => {
             dialog.accept_resources(snapshot, notifications);
         }
-        Some(ClientSurface::CommandBar(_)) | None => {}
+        Some(ClientSurface::CommandBar(_) | ClientSurface::ContextMenu(_)) | None => {}
     }
 }
 
@@ -2082,14 +2328,14 @@ fn accepts_client_input(
     create_workspace: &CreateState,
     create_tab: &CreateState,
     split_pane: &CreateState,
-    close_pane: &ClosePaneState,
+    close_target: &CloseTargetState,
     pending_focused_exit: &Option<Option<i32>>,
 ) -> bool {
     focus.request_id.is_none()
         && !create_workspace.blocks_input()
         && !create_tab.blocks_input()
         && !split_pane.blocks_input()
-        && !close_pane.blocks_input()
+        && !close_target.blocks_input()
         && pending_focused_exit.is_none()
 }
 
@@ -2654,7 +2900,7 @@ async fn dispatch_client_action(
     create_workspace: &mut CreateState,
     create_tab: &mut CreateState,
     split_pane: &mut CreateState,
-    close_pane: &mut ClosePaneState,
+    close_target: &mut CloseTargetState,
     focus: &mut FocusState,
     copy_mode: &mut Option<CopyModeState>,
     prefix: &mut PrefixState,
@@ -3000,9 +3246,14 @@ async fn dispatch_client_action(
             resize_view(framed, host, view, resources, ui).await?;
         }
         ClientAction::ClosePane => {
-            if close_pane.begin() {
-                return Ok(Some(Toast::prompt("Kill pane? (y/n)")));
-            }
+            return start_target_close(
+                framed,
+                close_target,
+                TargetSelector::Pane(view.focused().pane_id),
+                "pane",
+                ui.confirm_close,
+            )
+            .await;
         }
         ClientAction::Detach => send(framed, ClientMessage::Detach).await?,
     }
@@ -3237,37 +3488,82 @@ impl CreateState {
 }
 
 #[derive(Default)]
-enum ClosePaneState {
+enum CloseTargetState {
     #[default]
     Idle,
-    Confirming,
+    Confirming {
+        selector: TargetSelector,
+    },
     Closing(Uuid),
 }
 
-impl ClosePaneState {
-    fn begin(&mut self) -> bool {
-        if !matches!(self, Self::Idle) {
-            return false;
+async fn start_target_close(
+    framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    state: &mut CloseTargetState,
+    selector: TargetSelector,
+    label: &'static str,
+    confirm: bool,
+) -> anyhow::Result<Option<Toast>> {
+    match state.begin(selector, confirm) {
+        CloseTargetStart::Busy => Ok(None),
+        CloseTargetStart::Confirming => Ok(Some(Toast::prompt(format!("Close {label}? (y/n)")))),
+        CloseTargetStart::Closing {
+            request_id,
+            selector,
+        } => {
+            send_request(
+                framed,
+                Some(request_id),
+                ClientMessage::CloseTarget { selector },
+            )
+            .await?;
+            Ok(None)
         }
-        *self = Self::Confirming;
-        true
     }
+}
 
-    fn is_confirming(&self) -> bool {
-        matches!(self, Self::Confirming)
-    }
+enum CloseTargetStart {
+    Busy,
+    Confirming,
+    Closing {
+        request_id: Uuid,
+        selector: TargetSelector,
+    },
+}
 
-    fn confirm(&mut self) -> Option<Uuid> {
-        if !self.is_confirming() {
-            return None;
+impl CloseTargetState {
+    fn begin(&mut self, selector: TargetSelector, confirm: bool) -> CloseTargetStart {
+        if !matches!(self, Self::Idle) {
+            return CloseTargetStart::Busy;
+        }
+        if confirm {
+            *self = Self::Confirming { selector };
+            return CloseTargetStart::Confirming;
         }
         let request_id = Uuid::new_v4();
         *self = Self::Closing(request_id);
-        Some(request_id)
+        CloseTargetStart::Closing {
+            request_id,
+            selector,
+        }
+    }
+
+    fn is_confirming(&self) -> bool {
+        matches!(self, Self::Confirming { .. })
+    }
+
+    fn confirm(&mut self) -> Option<(Uuid, TargetSelector)> {
+        let Self::Confirming { selector, .. } = self else {
+            return None;
+        };
+        let selector = selector.clone();
+        let request_id = Uuid::new_v4();
+        *self = Self::Closing(request_id);
+        Some((request_id, selector))
     }
 
     fn cancel(&mut self) {
-        if self.is_confirming() {
+        if matches!(self, Self::Confirming { .. }) {
             *self = Self::Idle;
         }
     }
@@ -3460,6 +3756,7 @@ struct ViewState {
     panes: Vec<PaneState>,
     layout: SplitTree,
     zoomed: bool,
+    resize_requests: HashMap<Uuid, TerminalId>,
 }
 
 impl ViewState {
@@ -3471,6 +3768,7 @@ impl ViewState {
             panes: Vec::new(),
             layout: selected.layout.clone(),
             zoomed: false,
+            resize_requests: HashMap::new(),
         };
         view.replace(selected)?;
         Ok(view)
@@ -3610,6 +3908,7 @@ impl ViewState {
             .find(|pane| pane.target.terminal_id == terminal_id)
         {
             pane.resize_request_id = Some(request_id);
+            self.resize_requests.insert(request_id, terminal_id);
         }
     }
 
@@ -3622,25 +3921,38 @@ impl ViewState {
         let Some(request_id) = request_id else {
             return false;
         };
+        if self.resize_requests.get(&request_id) != Some(&terminal_id) {
+            return false;
+        }
+        self.resize_requests.remove(&request_id);
         self.panes
             .iter_mut()
             .find(|pane| pane.target.terminal_id == terminal_id)
-            .is_some_and(|pane| pane.complete_resize(request_id, size))
+            .is_none_or(|pane| {
+                if pane.resize_request_id == Some(request_id) {
+                    pane.complete_resize(request_id, size)
+                } else {
+                    true
+                }
+            })
     }
 
     fn reject_resize(&mut self, request_id: Option<Uuid>) -> bool {
         let Some(request_id) = request_id else {
             return false;
         };
-        let Some(pane) = self
-            .panes
-            .iter_mut()
-            .find(|pane| pane.resize_request_id == Some(request_id))
-        else {
+        let Some(terminal_id) = self.resize_requests.remove(&request_id) else {
             return false;
         };
-        pane.resize_request_id = None;
-        pane.last_size = None;
+        if let Some(pane) = self
+            .panes
+            .iter_mut()
+            .find(|pane| pane.target.terminal_id == terminal_id)
+            .filter(|pane| pane.resize_request_id == Some(request_id))
+        {
+            pane.resize_request_id = None;
+            pane.last_size = None;
+        }
         true
     }
 
@@ -4547,7 +4859,7 @@ mod tests {
         let workspace = CreateState::default();
         let mut state = CreateState::default();
         let split = CreateState::default();
-        let close = ClosePaneState::default();
+        let close = CloseTargetState::default();
         let focus = FocusState::default();
         let no_exit = None;
         let request = state.begin().expect("first request starts");
@@ -4588,20 +4900,46 @@ mod tests {
     }
 
     #[test]
-    fn close_pane_state_waits_for_confirmation_and_correlated_completion() {
-        let mut state = ClosePaneState::default();
-        assert!(state.begin());
+    fn close_target_state_waits_for_confirmation_and_correlated_completion() {
+        let pane = TargetSelector::Pane(crate::domain::PaneId::new());
+        let mut state = CloseTargetState::default();
+        assert!(matches!(
+            state.begin(pane.clone(), true),
+            CloseTargetStart::Confirming
+        ));
         assert!(state.is_confirming());
         assert!(!state.blocks_input());
         state.cancel();
         assert!(!state.is_confirming());
 
-        assert!(state.begin());
-        let request = state.confirm().unwrap();
+        assert!(matches!(
+            state.begin(pane.clone(), true),
+            CloseTargetStart::Confirming
+        ));
+        let (request, selector) = state.confirm().unwrap();
+        assert_eq!(selector, pane);
         assert!(state.blocks_input());
         assert!(!state.complete(Some(Uuid::new_v4())));
         assert!(state.complete(Some(request)));
         assert!(!state.blocks_input());
+
+        let CloseTargetStart::Closing {
+            request_id,
+            selector,
+        } = state.begin(pane.clone(), false)
+        else {
+            panic!("unconfirmed close did not start immediately")
+        };
+        assert_eq!(selector, pane);
+        assert!(state.complete(Some(request_id)));
+    }
+
+    #[test]
+    fn successful_terminal_exit_is_not_a_client_failure() {
+        assert_eq!(failed_exit_code(Some(Some(0))), None);
+        assert_eq!(failed_exit_code(Some(Some(7))), Some(7));
+        assert_eq!(failed_exit_code(Some(None)), None);
+        assert_eq!(failed_exit_code(None), None);
     }
 
     #[test]
@@ -4799,6 +5137,25 @@ mod tests {
                 .replace(selected_view(2, panes[0].clone(), panes[..2].to_vec()))
                 .unwrap()
         );
+        assert_eq!(state.focused().terminal_id, panes[1].terminal_id);
+    }
+
+    #[test]
+    fn replaced_views_still_own_in_flight_resize_errors() {
+        let mut panes = targets(2);
+        panes[1].tab_id = TabId::new();
+        let old_terminal = panes[0].terminal_id;
+        let request_id = Uuid::new_v4();
+        let mut state =
+            ViewState::new(selected_view(1, panes[0].clone(), vec![panes[0].clone()])).unwrap();
+        state.mark_resize_requested(old_terminal, request_id);
+
+        state
+            .replace(selected_view(2, panes[1].clone(), vec![panes[1].clone()]))
+            .unwrap();
+
+        assert!(state.reject_resize(Some(request_id)));
+        assert!(!state.reject_resize(Some(request_id)));
         assert_eq!(state.focused().terminal_id, panes[1].terminal_id);
     }
 

@@ -1,6 +1,6 @@
 ---
 id: fut-gpkw
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-08-15T14:14:13Z

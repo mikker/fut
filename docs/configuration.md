@@ -23,6 +23,8 @@ A missing implicit file uses defaults and is not created. `FUT_CONFIG` must be a
 
 Files must be regular UTF-8 files no larger than 64 KiB. Unknown fields, invalid values, unsafe control or bidirectional-formatting characters, ambiguous segments, and out-of-scope tokens are errors.
 
+Closing a pane, tab, or workspace asks for confirmation by default. Set `ui.confirm_close = false` to perform those close actions immediately. This setting is client-local and applies to both keyboard commands and contextual menus.
+
 ## Complete example
 
 ```toml
@@ -32,6 +34,7 @@ extensions = [
 
 [ui]
 pane_layout = "splits" # "splits" or "accordion"
+confirm_close = true   # Require confirmation before closing panes, tabs, or workspaces.
 
 [ui.bindings]
 open_command_bar = "space"

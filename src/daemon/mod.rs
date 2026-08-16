@@ -2742,16 +2742,11 @@ async fn handle_connection(
                         }
                     }
                     ClientMessage::CloseTarget { selector } => {
-                        if selector != TargetSelector::Pane(attachment.focused.selected.pane_id) {
-                            send_error(
-                                &mut connection,
-                                envelope.request_id,
-                                "not_focused",
-                                "interactive closing requires the focused pane",
-                            ).await?;
-                            continue;
-                        }
-                        match close_target(&shared, selector, None).await {
+                        match close_interactive_target(
+                            &shared,
+                            &attachment.focused.selected,
+                            selector,
+                        ).await {
                             Ok(()) => send(
                                 &mut connection,
                                 envelope.request_id,
@@ -3779,6 +3774,23 @@ fn interactive_rename_allowed(
             .workspace_id_for_tab(*target)
             .is_ok_and(|owner| owner == workspace_id),
         RenameSelector::Session(_) => false,
+    }
+}
+
+fn interactive_close_allowed(
+    resources: &ResourceTree,
+    focused: &SelectedTarget,
+    selector: &TargetSelector,
+) -> bool {
+    match selector {
+        TargetSelector::Pane(target) => *target == focused.pane_id,
+        TargetSelector::Tab(target) => resources
+            .workspace_id_for_tab(*target)
+            .is_ok_and(|owner| owner == focused.workspace_id),
+        TargetSelector::Workspace(target) => resources
+            .session_id_for_workspace(*target)
+            .is_ok_and(|owner| owner == focused.session_id),
+        TargetSelector::Session(_) | TargetSelector::Terminal(_) => false,
     }
 }
 
@@ -4867,6 +4879,25 @@ async fn close_target(
     context: Option<TerminalContext>,
 ) -> Result<(), DaemonError> {
     let pending = prepare_target_close(shared, selector, context).await?;
+    finish_target_close(shared, pending).await
+}
+
+async fn close_interactive_target(
+    shared: &Shared,
+    focused: &SelectedTarget,
+    selector: TargetSelector,
+) -> Result<(), DaemonError> {
+    let pending = {
+        let mut state = shared.lock().await;
+        if !interactive_close_allowed(&state.resources, focused, &selector) {
+            return Err(DaemonError::new(
+                "outside_scope",
+                "interactive close target is outside the active resource list",
+            ));
+        }
+        let (scope, handles) = state.begin_target_close(selector)?;
+        PendingClose { scope, handles }
+    };
     finish_target_close(shared, pending).await
 }
 
@@ -6194,6 +6225,73 @@ mod tests {
             path.session_id,
             path.workspace_id,
             &RenameSelector::Session(crate::resources::SessionSelector::Id(path.session_id,)),
+        ));
+    }
+
+    #[test]
+    fn interactive_close_is_limited_to_the_visible_resource_scope() {
+        let (mut state, path) = inconsistent_state();
+        let sibling_tab = TabId::new();
+        state
+            .resources
+            .add_tab(
+                path.workspace_id,
+                TabPath {
+                    tab_id: sibling_tab,
+                    tab_name: "sibling".into(),
+                    pane_id: PaneId::new(),
+                    terminal_id: TerminalId::new(),
+                },
+            )
+            .unwrap();
+        let peer = WorkspacePath {
+            workspace_id: WorkspaceId::new(),
+            workspace_name: "peer".into(),
+            root: "/peer".into(),
+            tab_id: TabId::new(),
+            tab_name: "shell".into(),
+            pane_id: PaneId::new(),
+            terminal_id: TerminalId::new(),
+        };
+        let peer_workspace = peer.workspace_id;
+        let peer_tab = peer.tab_id;
+        state
+            .resources
+            .add_workspace(path.session_id, peer)
+            .unwrap();
+        let focused = SelectedTarget {
+            session_id: path.session_id,
+            workspace_id: path.workspace_id,
+            tab_id: path.tab_id,
+            pane_id: path.pane_id,
+            terminal_id: path.terminal_id,
+            child_pid: 1,
+        };
+
+        assert!(interactive_close_allowed(
+            &state.resources,
+            &focused,
+            &TargetSelector::Pane(path.pane_id),
+        ));
+        assert!(interactive_close_allowed(
+            &state.resources,
+            &focused,
+            &TargetSelector::Tab(sibling_tab),
+        ));
+        assert!(interactive_close_allowed(
+            &state.resources,
+            &focused,
+            &TargetSelector::Workspace(peer_workspace),
+        ));
+        assert!(!interactive_close_allowed(
+            &state.resources,
+            &focused,
+            &TargetSelector::Tab(peer_tab),
+        ));
+        assert!(!interactive_close_allowed(
+            &state.resources,
+            &focused,
+            &TargetSelector::Pane(PaneId::new()),
         ));
     }
 
