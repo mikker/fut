@@ -6877,6 +6877,18 @@ async fn public_agent_activity_spins_lists_waiting_terminals_and_navigates_unrea
             .await,
         ServerMessage::CommandCompleted { .. }
     ));
+    let agent_list = || {
+        let output = harness
+            .cli()
+            .args(["--json", "agent", "list"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let unread = agent_list();
+    assert_eq!(unread["result"]["unread_count"], 1);
+    assert_eq!(unread["result"]["agents"][1]["unread"], true);
     client.wait_for("• 1").await;
     client.send(b"\x02u");
     client.wait_for(" terminals waiting").await;
@@ -6884,6 +6896,9 @@ async fn public_agent_activity_spins_lists_waiting_terminals_and_navigates_unrea
     client.send(b"\r");
     client.wait_for("WAITING").await;
     tokio::time::sleep(Duration::from_millis(200)).await;
+    let read = agent_list();
+    assert_eq!(read["result"]["unread_count"], 0);
+    assert_eq!(read["result"]["agents"][1]["unread"], false);
 
     client.clear_output();
     assert!(matches!(

@@ -918,6 +918,31 @@ impl ResourceTree {
             .ok_or_else(|| ResourceError::Invariant("terminal pane is missing".into()))
     }
 
+    pub fn acknowledge_agent(
+        &mut self,
+        terminal_id: TerminalId,
+        event_revision: u64,
+    ) -> Result<Option<u64>, ResourceError> {
+        let pane_id = *self
+            .terminals
+            .get(&terminal_id)
+            .ok_or(ResourceError::NotFound("terminal"))?;
+        let activity = &mut self
+            .panes
+            .get_mut(&pane_id)
+            .ok_or_else(|| ResourceError::Invariant("terminal pane is missing".into()))?
+            .activity;
+        let Some(attention) = activity.attention() else {
+            return Ok(None);
+        };
+        if attention.revision != event_revision || activity.read_revision >= event_revision {
+            return Ok(None);
+        }
+        activity.read_revision = event_revision;
+        self.revision += 1;
+        Ok(Some(self.revision))
+    }
+
     pub fn update_agent_detection(
         &mut self,
         terminal_id: TerminalId,
@@ -2927,6 +2952,20 @@ mod tests {
         assert!(serialized_activity.get("integration").is_some());
         assert_eq!(serialized_activity["last_event"]["kind"], "completed");
         assert!(serialized_activity.get("attention").is_none());
+        assert!(completed.has_unread_attention());
+        let acknowledged_revision = tree
+            .acknowledge_agent(terminal_id, completed_revision)
+            .unwrap()
+            .unwrap();
+        let acknowledged = tree.agent_activity(terminal_id).unwrap();
+        assert_eq!(acknowledged.read_revision, completed_revision);
+        assert!(!acknowledged.has_unread_attention());
+        assert_eq!(
+            tree.acknowledge_agent(terminal_id, completed_revision)
+                .unwrap(),
+            None
+        );
+        assert_eq!(tree.revision(), acknowledged_revision);
         tree.report_agent(terminal_id, AgentReport::Blocked, 30)
             .unwrap();
         let blocked = tree.snapshot().sessions[0].workspaces[0].tabs[0].panes[0]
@@ -2937,6 +2976,7 @@ mod tests {
             blocked.last_event.as_ref().unwrap().kind,
             AgentReport::Blocked
         );
+        assert!(blocked.has_unread_attention());
         assert_eq!(
             blocked.integration.as_ref().unwrap().source.as_deref(),
             Some("pi")

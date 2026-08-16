@@ -8,7 +8,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    domain::{AgentReport, TabId},
+    domain::TabId,
     protocol::SelectedTarget,
     resources::{MaterializedTokenMap, ResourceSnapshot},
 };
@@ -156,10 +156,11 @@ fn sidebar_rect(
     Some(Rect::new(x, body.y, width, body.height))
 }
 
+static NOTIFICATIONS: NotificationState = NotificationState::new();
+
 #[derive(Default)]
 pub(super) struct ResourceState {
     snapshot: Option<ResourceSnapshot>,
-    notifications: NotificationState,
 }
 
 impl ResourceState {
@@ -180,33 +181,31 @@ impl ResourceState {
     }
 
     pub fn notifications(&self) -> &NotificationState {
-        &self.notifications
+        &NOTIFICATIONS
     }
 
     pub fn attention_revision(&self, terminal_id: crate::domain::TerminalId) -> Option<u64> {
-        self.snapshot
+        let pane = self
+            .snapshot
             .as_ref()?
             .sessions
             .iter()
             .flat_map(|session| &session.workspaces)
             .flat_map(|workspace| &workspace.tabs)
             .flat_map(|tab| &tab.panes)
-            .find(|pane| pane.terminal_id == terminal_id)?
-            .activity
-            .last_event
-            .as_ref()
-            .filter(|event| matches!(event.kind, AgentReport::Blocked | AgentReport::Completed))
-            .map(|event| event.revision)
-    }
-
-    pub fn observe(&mut self, terminal_id: crate::domain::TerminalId, revision: u64) -> bool {
-        self.notifications.observe(terminal_id, revision)
+            .find(|pane| pane.terminal_id == terminal_id)?;
+        if !pane.activity.has_unread_attention() {
+            return None;
+        }
+        pane.activity
+            .attention()
+            .map(|attention| attention.revision)
     }
 
     pub fn has_working(&self) -> bool {
         self.snapshot
             .as_ref()
-            .is_some_and(|snapshot| self.notifications.has_working(snapshot))
+            .is_some_and(|snapshot| self.notifications().has_working(snapshot))
     }
 
     pub fn workspace_count(&self, focused: &SelectedTarget) -> Option<usize> {

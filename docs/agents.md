@@ -45,6 +45,17 @@ fut --json agent list
 fut --json agent get TERMINAL_ID
 ```
 
+Each listed agent includes an `unread` boolean, and the list result includes
+`unread_count` for status bars and other external observers:
+
+```sh
+fut --json agent list | jq -r '.result.unread_count'
+```
+
+Blocked and completed reports become unread daemon-wide. Rendering that
+terminal in any attached client marks the event read for every client and for
+later CLI calls; a newer event remains unread until it is rendered.
+
 Submit a prompt as one atomic paste-and-Enter operation. Targets are always
 explicit, and a currently working agent is rejected with `agent_busy`:
 

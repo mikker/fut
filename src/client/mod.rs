@@ -2167,8 +2167,17 @@ async fn run(
                     perf.record("draw", draw_started.elapsed(), 0);
                 }
                 view.mark_drawn();
-                force_draw = rendered_attention
-                    .is_some_and(|revision| resources.observe(focused_terminal_id, revision));
+                force_draw = false;
+                if let Some(event_revision) = rendered_attention {
+                    send(
+                        framed,
+                        ClientMessage::AcknowledgeAgent {
+                            terminal_id: focused_terminal_id,
+                            event_revision,
+                        },
+                    )
+                    .await?;
+                }
             }
         }
     }

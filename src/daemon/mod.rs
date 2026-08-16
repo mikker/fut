@@ -304,6 +304,20 @@ impl SharedState {
         Ok(())
     }
 
+    fn acknowledge_agent(
+        &mut self,
+        terminal_id: TerminalId,
+        event_revision: u64,
+    ) -> Result<(), DaemonError> {
+        if let Some(revision) = self
+            .resources
+            .acknowledge_agent(terminal_id, event_revision)?
+        {
+            self.publish_resource_change(revision);
+        }
+        Ok(())
+    }
+
     fn register_session(
         &mut self,
         path: InitialPath,
@@ -2703,6 +2717,27 @@ async fn handle_connection(
                         let snapshot = shared.lock().await.resources.snapshot();
                         send(&mut connection, envelope.request_id, ServerMessage::Resources { snapshot }).await?;
                     }
+                    ClientMessage::AcknowledgeAgent { terminal_id, event_revision } => {
+                        let result = shared
+                            .lock()
+                            .await
+                            .acknowledge_agent(terminal_id, event_revision);
+                        match result {
+                            Ok(()) => send(
+                                &mut connection,
+                                envelope.request_id,
+                                ServerMessage::CommandCompleted {
+                                    command: AcknowledgedCommand::AcknowledgeAgent,
+                                },
+                            ).await?,
+                            Err(error) => send_error(
+                                &mut connection,
+                                envelope.request_id,
+                                error.code,
+                                &error.message,
+                            ).await?,
+                        }
+                    }
                     ClientMessage::Detach => {
                         match attachment.close().await {
                             Ok(()) => {
@@ -3255,6 +3290,31 @@ async fn control_loop(
                     }
                     Err(error) => {
                         send_error(connection, envelope.request_id, error.code, &error.message).await?
+                    }
+                }
+            }
+            ClientMessage::AcknowledgeAgent {
+                terminal_id,
+                event_revision,
+            } => {
+                let result = shared
+                    .lock()
+                    .await
+                    .acknowledge_agent(terminal_id, event_revision);
+                match result {
+                    Ok(()) => {
+                        send(
+                            connection,
+                            envelope.request_id,
+                            ServerMessage::CommandCompleted {
+                                command: AcknowledgedCommand::AcknowledgeAgent,
+                            },
+                        )
+                        .await?
+                    }
+                    Err(error) => {
+                        send_error(connection, envelope.request_id, error.code, &error.message)
+                            .await?
                     }
                 }
             }

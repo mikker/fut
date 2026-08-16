@@ -1074,6 +1074,10 @@ async fn execute(cli: Cli) -> Result<()> {
         }) => {
             let snapshot = list_resources(&socket).await?;
             let agents = integrated_agents(&snapshot);
+            let unread_count = agents
+                .iter()
+                .filter(|agent| agent["unread"].as_bool() == Some(true))
+                .count();
             let human = agents
                 .iter()
                 .map(render_agent)
@@ -1082,7 +1086,11 @@ async fn execute(cli: Cli) -> Result<()> {
             output(
                 cli.json,
                 "agent.list",
-                json!({ "revision": snapshot.revision, "agents": agents }),
+                json!({
+                    "revision": snapshot.revision,
+                    "unread_count": unread_count,
+                    "agents": agents,
+                }),
                 human,
             )
         }
@@ -1825,6 +1833,7 @@ fn integrated_agents(snapshot: &ResourceSnapshot) -> Vec<serde_json::Value> {
                         && !tab.closing
                         && !pane.closing
                         && pane.activity.state != AgentState::Working;
+                    let unread = pane.activity.has_unread_attention();
                     agents.push(json!({
                         "terminal_id": pane.terminal_id,
                         "pane_id": pane.id,
@@ -1836,6 +1845,7 @@ fn integrated_agents(snapshot: &ResourceSnapshot) -> Vec<serde_json::Value> {
                         },
                         "session": { "id": session.id, "name": session.name },
                         "available": available,
+                        "unread": unread,
                         "activity": pane.activity,
                     }));
                 }
@@ -1875,10 +1885,11 @@ fn resolve_agent(
 
 fn render_agent(agent: &serde_json::Value) -> String {
     format!(
-        "agent={} state={} available={} session={} workspace={} tab={} pane={}",
+        "agent={} state={} available={} unread={} session={} workspace={} tab={} pane={}",
         agent["terminal_id"].as_str().unwrap_or("-"),
         agent["activity"]["state"].as_str().unwrap_or("-"),
         agent["available"].as_bool().unwrap_or(false),
+        agent["unread"].as_bool().unwrap_or(false),
         agent["session"]["id"].as_str().unwrap_or("-"),
         agent["workspace"]["id"].as_str().unwrap_or("-"),
         agent["tab"]["id"].as_str().unwrap_or("-"),

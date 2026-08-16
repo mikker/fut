@@ -439,6 +439,35 @@ pub struct AgentActivity {
     /// back to the current idle state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_event: Option<AgentEvent>,
+    /// Latest attention event observed by any client. Read status belongs to
+    /// the daemon so every attached client and external status reader agrees.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub read_revision: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+impl AgentActivity {
+    pub fn attention(&self) -> Option<AgentAttention> {
+        let event = self.last_event.as_ref()?;
+        let kind = match event.kind {
+            AgentReport::Blocked => AttentionKind::Blocked,
+            AgentReport::Completed => AttentionKind::Completed,
+            AgentReport::Idle | AgentReport::Working => return None,
+        };
+        Some(AgentAttention {
+            revision: event.revision,
+            kind,
+            occurred_at_ms: event.occurred_at_ms,
+        })
+    }
+
+    pub fn has_unread_attention(&self) -> bool {
+        self.attention()
+            .is_some_and(|attention| self.read_revision < attention.revision)
+    }
 }
 
 impl<'de> Deserialize<'de> for AgentActivity {
@@ -462,6 +491,8 @@ impl<'de> Deserialize<'de> for AgentActivity {
             last_event: Option<AgentEvent>,
             #[serde(default)]
             attention: Option<AgentAttention>,
+            #[serde(default)]
+            read_revision: u64,
         }
 
         let wire = WireActivity::deserialize(deserializer)?;
@@ -504,6 +535,7 @@ impl<'de> Deserialize<'de> for AgentActivity {
             revision: wire.revision,
             updated_at_ms: wire.updated_at_ms,
             last_event,
+            read_revision: wire.read_revision,
         })
     }
 }

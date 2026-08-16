@@ -1,16 +1,10 @@
-use std::{
-    collections::HashMap,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use ratatui::{buffer::Buffer, layout::Rect, style::Style};
 
 use crate::{
-    domain::{
-        AgentActivity, AgentAttention, AgentReport, AgentState, AttentionKind, PaneId, SessionId,
-        TerminalId,
-    },
+    domain::{AgentState, AttentionKind, PaneId, SessionId, TerminalId},
     resources::{PaneSnapshot, ResourceSnapshot},
 };
 
@@ -24,20 +18,6 @@ const MAX_WIDTH: u16 = 80;
 const MAX_HEIGHT: u16 = 16;
 
 const BRAILLE_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-fn attention(activity: &AgentActivity) -> Option<AgentAttention> {
-    let event = activity.last_event.as_ref()?;
-    let kind = match event.kind {
-        AgentReport::Blocked => AttentionKind::Blocked,
-        AgentReport::Completed => AttentionKind::Completed,
-        AgentReport::Idle | AgentReport::Working => return None,
-    };
-    Some(AgentAttention {
-        revision: event.revision,
-        kind,
-        occurred_at_ms: event.occurred_at_ms,
-    })
-}
 
 fn open_panes(snapshot: &ResourceSnapshot) -> impl Iterator<Item = &PaneSnapshot> {
     snapshot
@@ -72,37 +52,32 @@ impl ActivityIndicator {
 }
 
 #[derive(Default)]
-pub(super) struct NotificationState {
-    seen: HashMap<TerminalId, u64>,
-}
+pub(super) struct NotificationState {}
 
 impl NotificationState {
-    pub(super) fn observe(&mut self, terminal_id: TerminalId, revision: u64) -> bool {
-        let seen = self.seen.entry(terminal_id).or_default();
-        if *seen >= revision {
-            return false;
-        }
-        *seen = revision;
-        true
+    pub(super) const fn new() -> Self {
+        Self {}
     }
 
     pub(super) fn is_unseen(&self, pane: &PaneSnapshot) -> bool {
-        attention(&pane.activity).is_some_and(|attention| {
-            self.seen.get(&pane.terminal_id).copied().unwrap_or(0) < attention.revision
-        })
+        pane.activity.has_unread_attention()
     }
 
     pub(super) fn indicator(&self, panes: &[PaneSnapshot]) -> Option<ActivityIndicator> {
         if panes.iter().any(|pane| {
             self.is_unseen(pane)
-                && attention(&pane.activity)
+                && pane
+                    .activity
+                    .attention()
                     .is_some_and(|attention| attention.kind == AttentionKind::Blocked)
         }) {
             return Some(ActivityIndicator::Blocked);
         }
         if panes.iter().any(|pane| {
             self.is_unseen(pane)
-                && attention(&pane.activity)
+                && pane
+                    .activity
+                    .attention()
                     .is_some_and(|attention| attention.kind == AttentionKind::Completed)
         }) {
             return Some(ActivityIndicator::Completed);
@@ -134,7 +109,7 @@ impl NotificationState {
                         continue;
                     }
                     for pane in &tab.panes {
-                        let Some(attention) = attention(&pane.activity) else {
+                        let Some(attention) = pane.activity.attention() else {
                             continue;
                         };
                         if !self.is_unseen(pane) || pane.closing {
@@ -367,7 +342,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        domain::{AgentEvent, AgentIntegration, TabId, WorkspaceId},
+        domain::{AgentActivity, AgentEvent, AgentIntegration, AgentReport, TabId, WorkspaceId},
         resources::{Project, ProjectIdentity, SessionSnapshot, TabSnapshot, WorkspaceSnapshot},
         splits::SplitTree,
     };
@@ -390,6 +365,7 @@ mod tests {
                     occurred_at_ms: 10,
                     turn_id: None,
                 }),
+                read_revision: 0,
             },
             cwd: None,
             worktree: None,
@@ -403,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn unseen_is_per_client_revision() {
+    fn unseen_comes_from_daemon_activity_revision() {
         let terminal_id = TerminalId::new();
         let pane = PaneSnapshot {
             tokens: Default::default(),
@@ -422,14 +398,16 @@ mod tests {
                     occurred_at_ms: 10,
                     turn_id: None,
                 }),
+                read_revision: 0,
             },
             cwd: None,
             worktree: None,
         };
-        let mut notifications = NotificationState::default();
+        let notifications = NotificationState::default();
         assert!(notifications.is_unseen(&pane));
-        assert!(notifications.observe(terminal_id, 4));
-        assert!(!notifications.is_unseen(&pane));
+        let mut read = pane.clone();
+        read.activity.read_revision = 4;
+        assert!(!notifications.is_unseen(&read));
     }
 
     #[test]
@@ -452,13 +430,12 @@ mod tests {
                     occurred_at_ms: 20,
                     turn_id: None,
                 }),
+                read_revision: 4,
             },
             cwd: None,
             worktree: None,
         };
-        let mut notifications = NotificationState::default();
-
-        assert!(notifications.observe(terminal_id, 4));
+        let notifications = NotificationState::default();
         assert!(notifications.is_unseen(&pane));
     }
 
@@ -468,7 +445,9 @@ mod tests {
         let seen = completed_pane(false);
         let current = completed_pane(false);
         let closing = completed_pane(true);
-        let snapshot = ResourceSnapshot {
+        let mut seen = seen;
+        seen.activity.read_revision = 1;
+        let mut snapshot = ResourceSnapshot {
             revision: 1,
             sessions: vec![SessionSnapshot {
                 tokens: Default::default(),
@@ -495,14 +474,15 @@ mod tests {
                 }],
             }],
         };
-        let mut notifications = NotificationState::default();
-        assert!(notifications.observe(seen.terminal_id, 1));
+        let notifications = NotificationState::default();
 
         assert_eq!(
             notifications.next(&snapshot, current.terminal_id),
             Some(candidate.id)
         );
-        assert!(notifications.observe(candidate.terminal_id, 1));
+        snapshot.sessions[0].workspaces[0].tabs[0].panes[0]
+            .activity
+            .read_revision = 1;
         assert_eq!(notifications.next(&snapshot, current.terminal_id), None);
     }
 
@@ -534,7 +514,9 @@ mod tests {
             closing,
             tabs,
         };
-        let snapshot = ResourceSnapshot {
+        let mut current = current;
+        current.activity.read_revision = 1;
+        let mut snapshot = ResourceSnapshot {
             revision: 1,
             sessions: vec![
                 SessionSnapshot {
@@ -582,8 +564,7 @@ mod tests {
                 },
             ],
         };
-        let mut notifications = NotificationState::default();
-        assert!(notifications.observe(current.terminal_id, 1));
+        let notifications = NotificationState::default();
 
         let waiting = notifications.waiting(&snapshot);
         assert_eq!(
@@ -602,7 +583,9 @@ mod tests {
             notifications.next(&snapshot, current.terminal_id),
             Some(candidate.id)
         );
-        assert!(notifications.observe(candidate.terminal_id, 1));
+        snapshot.sessions[2].workspaces[0].tabs[1].panes[1]
+            .activity
+            .read_revision = 1;
         assert_eq!(notifications.next(&snapshot, current.terminal_id), None);
     }
 }
