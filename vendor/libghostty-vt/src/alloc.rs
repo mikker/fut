@@ -255,13 +255,31 @@ unsafe extern "C" fn _global_remap(
 // Allocator API
 //------------------------------------
 
-/// Adapt a Rust Allocator into a libghostty Allocator.
+/// Adapt a borrowed Rust allocator into a libghostty allocator.
+///
+/// The returned adapter borrows `value`; it and every object allocated through
+/// it must be dropped before `value` is dropped.
+///
+/// ```compile_fail
+/// use allocator_api2::alloc::Global;
+/// use libghostty_vt::alloc::Allocator;
+///
+/// let allocator;
+/// {
+///     let owner = Global;
+///     allocator = Allocator::from_ref(&owner);
+/// }
+/// drop(allocator); // `owner` does not live long enough
+/// ```
 #[cfg(feature = "allocator_api")]
-impl<'ctx, A: alloc::Allocator + 'ctx> From<A> for Allocator<'ctx> {
-    fn from(value: A) -> Self {
+impl<'ctx> Allocator<'ctx> {
+    /// Creates an adapter that borrows a Rust allocator.
+    pub fn from_ref<A: alloc::Allocator>(value: &'ctx A) -> Self {
         Self {
             inner: ffi::Allocator {
-                ctx: std::ptr::from_ref(value.by_ref()) as *mut std::ffi::c_void,
+                ctx: std::ptr::from_ref(value)
+                    .cast_mut()
+                    .cast::<std::ffi::c_void>(),
                 vtable: &ffi::AllocatorVtable {
                     alloc: Some(_alloc::<A>),
                     free: Some(_free::<A>),
@@ -271,6 +289,14 @@ impl<'ctx, A: alloc::Allocator + 'ctx> From<A> for Allocator<'ctx> {
             },
             _phan: PhantomData,
         }
+    }
+}
+
+/// Adapt a borrowed Rust allocator into a libghostty allocator.
+#[cfg(feature = "allocator_api")]
+impl<'ctx, A: alloc::Allocator> From<&'ctx A> for Allocator<'ctx> {
+    fn from(value: &'ctx A) -> Self {
+        Self::from_ref(value)
     }
 }
 
@@ -369,4 +395,43 @@ unsafe extern "C" fn _remap<A: alloc::Allocator>(
 #[cfg(feature = "allocator_api")]
 unsafe fn get_allocator<'a, A: alloc::Allocator>(ptr: *mut c_void) -> Option<&'a A> {
     unsafe { ptr.cast::<A>().as_ref() }
+}
+
+#[cfg(all(test, feature = "allocator_api"))]
+mod tests {
+    use std::{alloc, cell::Cell, ptr::NonNull};
+
+    use allocator_api2::alloc::{AllocError, Allocator as RustAllocator, Layout};
+
+    use super::{Allocator, Bytes};
+
+    #[derive(Default)]
+    struct CountingAllocator {
+        allocations: Cell<usize>,
+        frees: Cell<usize>,
+    }
+
+    unsafe impl RustAllocator for CountingAllocator {
+        fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+            self.allocations.set(self.allocations.get() + 1);
+            let ptr = NonNull::new(unsafe { alloc::alloc(layout) }).ok_or(AllocError)?;
+            Ok(NonNull::slice_from_raw_parts(ptr, layout.size()))
+        }
+
+        unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+            self.frees.set(self.frees.get() + 1);
+            unsafe { alloc::dealloc(ptr.as_ptr(), layout) };
+        }
+    }
+
+    #[test]
+    fn borrowed_allocator_remains_valid_while_its_owner_lives() {
+        let owner = CountingAllocator::default();
+        let allocator = Allocator::from_ref(&owner);
+        let bytes = Bytes::new_with_alloc(&allocator, 64).unwrap();
+
+        assert_eq!(owner.allocations.get(), 1);
+        drop(bytes);
+        assert_eq!(owner.frees.get(), 1);
+    }
 }

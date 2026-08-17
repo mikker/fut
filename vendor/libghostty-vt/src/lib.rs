@@ -42,10 +42,11 @@
 //!
 //! ## Using the unstable `Allocator` API
 //!
-//! You can adapt the existing, unstable `Allocator` API into a
-//! [libghostty-friendly allocator](alloc::Allocator) via its `From`
-//! implementation. Note that the `'alloc` lifetime must at least
-//! live as long as the `Allocator` instance itself.
+//! You can adapt a borrowed allocator implementing the unstable `Allocator`
+//! API into a [libghostty-friendly allocator](alloc::Allocator) with
+//! [`Allocator::from_ref`](alloc::Allocator::from_ref) (or `From<&A>`). The
+//! original allocator must outlive the adapter and every object allocated
+//! through it.
 //!
 //! # Thread safety
 //!

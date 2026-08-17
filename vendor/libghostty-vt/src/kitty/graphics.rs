@@ -188,12 +188,7 @@
 
 #![cfg(feature = "kitty-graphics")]
 
-use std::{
-    cell::RefCell,
-    ffi::OsStr,
-    mem::{ManuallyDrop, MaybeUninit},
-    path::Path,
-};
+use std::{cell::RefCell, ffi::OsStr, mem::ManuallyDrop, mem::MaybeUninit, path::Path};
 
 use crate::{
     Terminal,
@@ -881,16 +876,8 @@ pub fn set_png_decoder(f: Option<Box<dyn DecodePng>>) -> Result<()> {
 
             match decoder.decode_png(&alloc, data) {
                 Some(result) => {
-                    // IMPORTANT: Do NOT run the Rust destructor here
-                    // to avoid double-freeing the byte buffer.
-                    let mut result = ManuallyDrop::new(result);
                     unsafe {
-                        *out = ffi::SysImage {
-                            width: result.width,
-                            height: result.height,
-                            data: result.data.as_mut_ptr(),
-                            data_len: result.data.len(),
-                        }
+                        *out = result.into_sys_image();
                     };
                     true
                 }
@@ -997,13 +984,55 @@ pub struct DecodedImage<'alloc> {
     /// Byte buffer containing the decoded RGBA pixel data.
     pub data: Bytes<'alloc>,
 }
-impl From<DecodedImage<'_>> for ffi::SysImage {
-    fn from(mut value: DecodedImage<'_>) -> Self {
-        Self {
-            width: value.width,
-            height: value.height,
-            data: value.data.as_mut_ptr(),
-            data_len: value.data.len(),
+impl DecodedImage<'_> {
+    /// Transfers the pixel buffer to libghostty, which must free it with the
+    /// allocator that originally created the [`Bytes`].
+    fn into_sys_image(self) -> ffi::SysImage {
+        let Self {
+            width,
+            height,
+            data,
+        } = self;
+
+        // `SysImage` takes ownership of this allocation. Prevent `Bytes` from
+        // freeing it now; libghostty will free it through its originating
+        // allocator once it no longer needs the image.
+        let data = ManuallyDrop::new(data);
+        ffi::SysImage {
+            width,
+            height,
+            data: data.as_ptr().cast_mut(),
+            data_len: data.len(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DecodedImage;
+    use crate::alloc::Bytes;
+
+    #[test]
+    fn sys_image_takes_pixel_buffer_ownership() {
+        let mut data = Bytes::new(4).unwrap();
+        data.copy_from_slice(&[1, 2, 3, 4]);
+        let expected_ptr = data.as_mut_ptr();
+
+        let image = DecodedImage {
+            width: 1,
+            height: 1,
+            data,
+        }
+        .into_sys_image();
+
+        assert_eq!(image.data, expected_ptr);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(image.data, image.data_len) },
+            [1, 2, 3, 4]
+        );
+
+        // Mirror libghostty's ownership obligation: once it releases the
+        // image, it must free the transferred allocation exactly once.
+        unsafe { crate::ffi::ghostty_free(std::ptr::null(), image.data, image.data_len) };
     }
 }
