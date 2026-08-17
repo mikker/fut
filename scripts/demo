@@ -11,6 +11,7 @@ DEMO_ROOT=$(python3 -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' \
   "${FUT_DEMO_ROOT:-"$PROJECT_ROOT/target/fut-demo"}")
 RUNTIME_DIR="$DEMO_ROOT/runtime"
 SOCKET="$RUNTIME_DIR/fut.sock"
+CONFIG_DIR="$DEMO_ROOT/config"
 STATE_FILE="$DEMO_ROOT/demo.env"
 DAEMON_LOG="$DEMO_ROOT/daemon.log"
 CLIENT_LOG="$DEMO_ROOT/client.log"
@@ -35,6 +36,10 @@ build_binary() {
   (cd "$PROJECT_ROOT" && cargo build --quiet)
 }
 
+fut() {
+  "$FUT_BIN" --socket "$SOCKET" --config-dir "$CONFIG_DIR" "$@"
+}
+
 ensure_binary() {
   if [[ ! -x "$FUT_BIN" ]]; then
     build_binary
@@ -43,7 +48,7 @@ ensure_binary() {
 
 wait_for_daemon() {
   local attempts=0
-  until "$FUT_BIN" --socket "$SOCKET" daemon ping >/dev/null 2>&1; do
+  until fut daemon ping >/dev/null 2>&1; do
     if [[ -f "$DAEMON_PID_FILE" ]] && ! kill -0 "$(cat "$DAEMON_PID_FILE")" 2>/dev/null; then
       echo "Fut demo daemon exited during startup:" >&2
       cat "$DAEMON_LOG" >&2 || true
@@ -115,7 +120,7 @@ is_demo_daemon_pid() {
   local pid=$1
   local command
   command=$(ps -p "$pid" -o command= 2>/dev/null || true)
-  [[ "$command" == "$FUT_BIN --socket $SOCKET daemon run "* ]]
+  [[ "$command" == "$FUT_BIN --socket $SOCKET --config-dir $CONFIG_DIR daemon run "* ]]
 }
 
 clean_demo() {
@@ -138,7 +143,7 @@ clean_demo() {
     return 1
   fi
   if [[ -S "$SOCKET" && -x "$FUT_BIN" ]]; then
-    "$FUT_BIN" --socket "$SOCKET" daemon shutdown >/dev/null 2>&1 || true
+    fut daemon shutdown >/dev/null 2>&1 || true
     wait_for_socket_exit || true
   fi
   if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && is_demo_daemon_pid "$pid" &&
@@ -182,7 +187,7 @@ state_field() {
 }
 
 run_json() {
-  "$FUT_BIN" --socket "$SOCKET" --json "$@"
+  fut --json "$@"
 }
 
 rename_resources() {
@@ -191,9 +196,9 @@ rename_resources() {
   local tab_id=$3
   local workspace_name=$4
 
-  "$FUT_BIN" --socket "$SOCKET" session rename "$session_id" fut-demo >/dev/null
-  "$FUT_BIN" --socket "$SOCKET" workspace rename "$workspace_id" "$workspace_name" >/dev/null
-  "$FUT_BIN" --socket "$SOCKET" tab rename "$tab_id" shell >/dev/null
+  fut session rename "$session_id" fut-demo >/dev/null
+  fut workspace rename "$workspace_id" "$workspace_name" >/dev/null
+  fut tab rename "$tab_id" shell >/dev/null
 }
 
 new_shell_tab() {
@@ -254,13 +259,13 @@ setup_demo() {
   clean_demo
   mkdir -p "$DEMO_ROOT"
   printf 'fut-demo-v1\n' >"$OWNERSHIP_FILE"
-  mkdir -p "$RUNTIME_DIR"
+  mkdir -p "$RUNTIME_DIR" "$CONFIG_DIR"
   chmod 700 "$RUNTIME_DIR"
   : >"$CLIENT_LOG"
   setup_repository
 
   trap 'clean_demo' ERR INT TERM
-  "$FUT_BIN" --socket "$SOCKET" daemon run --cwd "$MAIN" -- \
+  fut daemon run --cwd "$MAIN" -- \
     /bin/sh -c \
       'printf "\033[1;36mFut demo · main / shell\033[0m\r\nTry Ctrl-b w, Ctrl-b ], and Ctrl-b s.\r\n"; exec "$1"' \
       fut-demo "$DEMO_SHELL" >"$DAEMON_LOG" 2>&1 &
@@ -286,10 +291,10 @@ setup_demo() {
   docs_tab=$(printf '%s' "$docs_json" | selected_field tab_id)
 
   rename_resources "$session_id" "$main_workspace" "$main_tab" main
-  "$FUT_BIN" --socket "$SOCKET" workspace rename "$feature_workspace" feature >/dev/null
-  "$FUT_BIN" --socket "$SOCKET" tab rename "$feature_tab" shell >/dev/null
-  "$FUT_BIN" --socket "$SOCKET" workspace rename "$docs_workspace" docs >/dev/null
-  "$FUT_BIN" --socket "$SOCKET" tab rename "$docs_tab" shell >/dev/null
+  fut workspace rename "$feature_workspace" feature >/dev/null
+  fut tab rename "$feature_tab" shell >/dev/null
+  fut workspace rename "$docs_workspace" docs >/dev/null
+  fut tab rename "$docs_tab" shell >/dev/null
 
   local editor_json editor_tab tests_json tests_tab
   editor_json=$(new_shell_tab "$main_workspace" editor "Fut demo · main / editor")
@@ -346,7 +351,7 @@ attach_demo() {
   local main_pane_id
   main_pane_id=$(state_field MAIN_PANE_ID)
   printf '\n--- attach %s ---\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$CLIENT_LOG"
-  "$FUT_BIN" --socket "$SOCKET" pane attach "$main_pane_id" \
+  fut pane attach "$main_pane_id" \
     2> >(tee -a "$CLIENT_LOG" >&2)
 }
 
