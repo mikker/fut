@@ -1,7 +1,7 @@
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Modifier, Style},
+    style::Style,
     text::{Line, Span},
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -20,7 +20,10 @@ use super::{
     },
     hotkey::{HotkeyButton, HotkeyLine},
     notifications::{ActivityIndicator, NotificationState},
-    presentation::{ItemState, TokenValue, apply_item_state, render_token_segments, truncate_line},
+    presentation::{
+        ItemState, TokenValue, apply_item_state, pill_cap_style, render_token_segments,
+        truncate_line,
+    },
     sidebar::{SidebarSide, slot_relevant},
 };
 
@@ -904,7 +907,11 @@ fn render_tab_item(
         return line;
     }
     let style = tab_item_style(model, index, selected, component_style, ui);
-    let cap = pill_cap_style(style, component_style, ui);
+    let mut bar = ui.styles.apply(SemanticStyle::Normal, Style::default());
+    if let Some(role) = component_style {
+        bar = ui.styles.apply(role, bar);
+    }
+    let cap = pill_cap_style(style, bar);
     let mut spans = Vec::with_capacity(line.spans.len() + 2);
     spans.extend(line.spans);
     if index == model.active {
@@ -916,24 +923,6 @@ fn render_tab_item(
         spans.push(Span::styled(" ", cap));
     }
     Line::from(spans)
-}
-
-/// Caps are drawn as the pill's own background on the bar background so they read as round ends.
-fn pill_cap_style(item: Style, component_style: Option<SemanticStyle>, ui: &UiConfig) -> Style {
-    let mut bar = ui.styles.apply(SemanticStyle::Normal, Style::default());
-    if let Some(role) = component_style {
-        bar = ui.styles.apply(role, bar);
-    }
-    let fill = if item.add_modifier.contains(Modifier::REVERSED) {
-        item.fg
-    } else {
-        item.bg
-    };
-    Style {
-        fg: fill,
-        bg: bar.bg,
-        ..Style::default()
-    }
 }
 
 fn render_tab_item_content(

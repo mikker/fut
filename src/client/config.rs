@@ -830,10 +830,7 @@ pub(super) struct SidebarRowConfig {
 impl Default for SidebarRowConfig {
     fn default() -> Self {
         Self {
-            left: vec![
-                SegmentConfig::token("workspace.marker"),
-                SegmentConfig::text(" "),
-            ],
+            left: vec![SegmentConfig::text(" ")],
             body: vec![
                 SegmentConfig::token("workspace.index"),
                 SegmentConfig {
@@ -1646,8 +1643,7 @@ fn token_allowed(scope: TokenScope, token: &str, extensions: &[Extension]) -> bo
         ),
         TokenScope::Workspace => matches!(
             token,
-            "workspace.marker"
-                | "workspace.index"
+            "workspace.index"
                 | "workspace.name"
                 | "workspace.id"
                 | "workspace.root"
@@ -1807,7 +1803,7 @@ width = 30
 display = "minimized"
 visibility = "visible"
 components = [
-  { component = "workspaces", size = "fill", header = [{ token = "session.name" }], footer = [{ token = "sidebar.status" }], row = { left = [{ token = "workspace.marker" }], body = [{ token = "workspace.name" }], right = [{ token = "workspace.tab_count" }] } },
+  { component = "workspaces", size = "fill", header = [{ token = "session.name" }], footer = [{ token = "sidebar.status" }], row = { left = [{ token = "workspace.index" }], body = [{ token = "workspace.name" }], right = [{ token = "workspace.tab_count" }] } },
   { component = "agents", size = 6, scope = "workspace" },
 ]
 "##,

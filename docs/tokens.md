@@ -64,7 +64,6 @@ These may appear in the `row.left`, `body`, `right`, or `detail` fields of a `co
 
 | Token | Value |
 | --- | --- |
-| `workspace.marker` | A bullet (`•`) for the active workspace, otherwise one blank cell |
 | `workspace.index` | One-based workspace index |
 | `workspace.name` | Workspace name; unnamed workspaces present their live location, or `multiple` when panes disagree |
 | `workspace.id` | Full stable workspace UUID |

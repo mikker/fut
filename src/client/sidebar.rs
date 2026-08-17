@@ -23,11 +23,13 @@ use super::{
     hotkey::{HotkeyButton, HotkeyLine},
     navigation::NavigationHistory,
     notifications::{ActivityIndicator, NotificationState},
-    presentation::{ItemState, TokenValue, apply_item_state, render_token_segments, truncate_line},
+    presentation::{
+        ItemState, TokenValue, apply_item_state, pill_cap_style, render_token_segments,
+        truncate_line,
+    },
 };
 
-/// The current workspace is marked with a bullet instead of an icon so the
-/// sidebar reads the same at every icon preset.
+/// Compact workspace and agent rails use the same preset-independent marker.
 const CURRENT_MARKER: &str = "•";
 const SIDEBAR_HEADER_HEIGHT: u16 = 3;
 
@@ -2130,8 +2132,8 @@ fn render_workspace_row(
     }
     let icons = ui.icons.resolve();
     let state = ItemState {
-        // The workspace marker carries active state so keyboard selection can own
-        // the row background without making two rows look selected at once.
+        // Keyboard selection owns the whole row; current styling is added to the
+        // title line below so workspace details remain quiet.
         current: false,
         selected,
         closing: item.closing,
@@ -2140,18 +2142,27 @@ fn render_workspace_row(
             Some(ActivityIndicator::Blocked | ActivityIndicator::Completed)
         ),
     };
-    clear(
-        area,
-        apply_item_state(
-            &ui.styles,
-            state,
-            ui.styles.apply(SemanticStyle::Normal, Style::default()),
-        ),
-        buffer,
-    );
+    let surface = ui.styles.apply(SemanticStyle::Normal, Style::default());
+    let row_style = apply_item_state(&ui.styles, state, surface);
+    clear(area, row_style, buffer);
+    let title_state = ItemState {
+        current: item.current,
+        ..state
+    };
+    let title_style = apply_item_state(&ui.styles, title_state, surface);
+    let pill = !icons.pill_left.is_empty() && !icons.pill_right.is_empty() && area.width >= 2;
+    let title = if pill {
+        Rect::new(area.x + 1, area.y, area.width - 2, 1)
+    } else {
+        Rect::new(area.x, area.y, area.width, 1)
+    };
+    clear(title, title_style, buffer);
+    if pill && item.current {
+        let cap_style = pill_cap_style(title_style, surface);
+        buffer.set_stringn(area.x, area.y, &icons.pill_left, 1, cap_style);
+        buffer.set_stringn(area.right() - 1, area.y, &icons.pill_right, 1, cap_style);
+    }
     let resolve = |token: &str| match token {
-        "workspace.marker" if item.current => TokenValue::plain(CURRENT_MARKER),
-        "workspace.marker" => TokenValue::plain(" "),
         "workspace.index" => TokenValue::plain((item.index + 1).to_string()),
         "workspace.name" => TokenValue::plain(sanitize(&item.name)),
         "workspace.id" => TokenValue::plain(item.id.to_string()),
@@ -2196,43 +2207,43 @@ fn render_workspace_row(
     let left = render_token_segments(
         &workspace_config(ui, side).row.left,
         None,
-        state,
+        title_state,
         &ui.styles,
         resolve,
     );
     let body = render_token_segments(
         &workspace_config(ui, side).row.body,
         None,
-        state,
+        title_state,
         &ui.styles,
         resolve,
     );
     let right = render_token_segments(
         &workspace_config(ui, side).row.right,
         None,
-        state,
+        title_state,
         &ui.styles,
         resolve,
     );
-    let width = usize::from(area.width);
-    let left_width = left.width().min(width);
-    let right_width = right.width().min(width.saturating_sub(left_width));
-    let body_width = width.saturating_sub(left_width + right_width);
+    let title_width = usize::from(title.width);
+    let left_width = left.width().min(title_width);
+    let right_width = right.width().min(title_width.saturating_sub(left_width));
+    let body_width = title_width.saturating_sub(left_width + right_width);
     buffer.set_line(
-        area.x,
-        area.y,
+        title.x,
+        title.y,
         &truncate_line(&left, left_width),
         left_width as u16,
     );
     buffer.set_line(
-        area.x.saturating_add(left_width as u16),
-        area.y,
+        title.x.saturating_add(left_width as u16),
+        title.y,
         &truncate_line(&body, body_width),
         body_width as u16,
     );
     buffer.set_line(
-        area.x.saturating_add((width - right_width) as u16),
-        area.y,
+        title.x.saturating_add((title_width - right_width) as u16),
+        title.y,
         &truncate_line(&right, right_width),
         right_width as u16,
     );
@@ -2247,18 +2258,9 @@ fn render_workspace_row(
         buffer.set_line(
             area.x,
             area.y.saturating_add(1),
-            &truncate_line(&detail, width),
+            &truncate_line(&detail, usize::from(area.width)),
             area.width,
         );
-    }
-    if item.current {
-        for row in area.y..area.y.saturating_add(area.height) {
-            for column in area.x..area.x.saturating_add(area.width) {
-                if let Some(cell) = buffer.cell_mut((column, row)) {
-                    cell.set_style(Style::default().add_modifier(ratatui::style::Modifier::BOLD));
-                }
-            }
-        }
     }
 }
 
@@ -2830,19 +2832,52 @@ mod tests {
         assert!(left_buffer[(0, 0)].modifier.contains(Modifier::BOLD));
         assert_eq!(left.lines().nth(1).unwrap().trim(), "│");
         assert_eq!(left.lines().nth(2).unwrap().trim(), "│");
-        assert_eq!(left_buffer[(0, 3)].symbol(), CURRENT_MARKER);
-        assert_eq!(left_buffer[(1, 3)].symbol(), " ");
-        assert_eq!(left_buffer[(2, 3)].symbol(), "1");
-        assert_eq!(left_buffer[(3, 3)].symbol(), " ");
+        assert_eq!(left_buffer[(0, 3)].symbol(), " ");
+        assert_eq!(left_buffer[(1, 3)].symbol(), "1");
+        assert_eq!(left_buffer[(2, 3)].symbol(), " ");
         assert_eq!(left_buffer[(22, 7)].symbol(), " ");
-        assert!(!left_buffer[(0, 3)].modifier.contains(Modifier::REVERSED));
-        assert!(left_buffer[(0, 3)].modifier.contains(Modifier::BOLD));
+        assert!(left_buffer[(0, 3)].modifier.contains(Modifier::REVERSED));
+        assert!(!left_buffer[(0, 4)].modifier.contains(Modifier::REVERSED));
         assert_eq!(left_buffer[(23, 0)].symbol(), "│");
         assert_eq!(left_buffer[(23, 0)].fg, ratatui::style::Color::DarkGray);
         assert!(
             left.lines().nth(5).unwrap().contains("bad�name"),
             "entries follow each other without spacing"
         );
+    }
+
+    #[test]
+    fn nerd_font_draws_only_the_focused_workspace_title_as_a_pill() {
+        let (snapshot, focused) = fixture(&["main"], 0);
+        let model = WorkspaceModel::from_snapshot(
+            &snapshot,
+            &focused,
+            &NavigationHistory::default(),
+            &NotificationState::default(),
+        );
+        let ui: UiConfig = toml::from_str("[icons]\npreset = 'nerd_font'\n").unwrap();
+        let area = Rect::new(0, 0, 24, 6);
+        let mut buffer = Buffer::empty(area);
+        render_model(
+            &model,
+            None,
+            None,
+            false,
+            0,
+            area,
+            SidebarSide::Left,
+            &ui,
+            &mut buffer,
+        );
+
+        assert_eq!(buffer[(0, 3)].symbol(), "\u{e0b6}");
+        assert_eq!(buffer[(22, 3)].symbol(), "\u{e0b4}");
+        for cap in [0, 22] {
+            assert_eq!(buffer[(cap, 3)].fg, ratatui::style::Color::Blue);
+            assert_eq!(buffer[(cap, 3)].bg, ratatui::style::Color::Reset);
+        }
+        assert!((1..22).all(|column| buffer[(column, 3)].modifier.contains(Modifier::REVERSED)));
+        assert!((0..23).all(|column| !buffer[(column, 4)].modifier.contains(Modifier::REVERSED)));
     }
 
     #[test]
@@ -2901,8 +2936,14 @@ mod tests {
             &NotificationState::default(),
         );
         for width in 1..24 {
-            let (text, _) = rendered(&model, None, None, width, 3, SidebarSide::Left);
-            assert!(text.contains(CURRENT_MARKER), "width {width}: {text:?}");
+            let (_, buffer) = rendered(&model, None, None, width, 3, SidebarSide::Left);
+            assert!(
+                buffer
+                    .content()
+                    .iter()
+                    .any(|cell| cell.modifier.contains(Modifier::REVERSED)),
+                "width {width}"
+            );
         }
     }
 

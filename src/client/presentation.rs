@@ -1,5 +1,5 @@
 use ratatui::{
-    style::Style,
+    style::{Modifier, Style},
     text::{Line, Span},
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -48,6 +48,20 @@ pub(super) fn apply_item_state(styles: &StylesConfig, state: ItemState, mut styl
         }
     }
     style
+}
+
+/// Draw a powerline pill cap using the item's fill on its surrounding surface.
+pub(super) fn pill_cap_style(item: Style, surface: Style) -> Style {
+    let fill = if item.add_modifier.contains(Modifier::REVERSED) {
+        item.fg
+    } else {
+        item.bg
+    };
+    Style {
+        fg: fill,
+        bg: surface.bg,
+        ..Style::default()
+    }
 }
 
 pub(super) fn render_token_segments(

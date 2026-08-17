@@ -78,7 +78,7 @@ preset = "nerd_font" # "ascii", "unicode", or "nerd_font"
 # tab = "T"
 # zoom = "zoom"
 # vertical_divider = "|"
-# pill_left = ""       # Focused-tab pill caps; empty outside "nerd_font".
+# pill_left = ""       # Focused tab/workspace pill caps; empty outside "nerd_font".
 # pill_right = ""
 
 [ui.styles.current]
@@ -147,7 +147,7 @@ width = 28
 display = "expanded" # "expanded" or "minimized"
 visibility = "automatic" # "visible", "automatic", or "hidden"
 components = [
-  { component = "workspaces", size = "fill", header = [{ token = "session.name", style = "current" }], footer = [{ token = "sidebar.status", style = "muted" }], row = { left = [{ token = "workspace.marker" }, { text = " " }], body = [{ token = "workspace.index" }, { token = "workspace.name", prefix = " " }], right = [{ token = "workspace.tab_count" }, { token = "workspace.closing", prefix = " " }, { text = " " }], detail = [{ text = "    " }, { token = "workspace.git_branch", style = "muted" }, { token = "workspace.git_added", prefix = " " }, { token = "workspace.git_deleted", prefix = " " }] } },
+  { component = "workspaces", size = "fill", header = [{ token = "session.name", style = "current" }], footer = [{ token = "sidebar.status", style = "muted" }], row = { left = [{ text = " " }], body = [{ token = "workspace.index" }, { token = "workspace.name", prefix = " " }], right = [{ token = "workspace.tab_count" }, { token = "workspace.closing", prefix = " " }, { text = " " }], detail = [{ text = "    " }, { token = "workspace.git_branch", style = "muted" }, { token = "workspace.git_added", prefix = " " }, { token = "workspace.git_deleted", prefix = " " }] } },
 ]
 
 [ui.sidebar.right]
@@ -209,7 +209,7 @@ Tab-item content uses the intrinsic display-cell width of its configured segment
 
 Tab-bar lanes contain groups. A group has `segments`, an optional semantic `style`, and a `priority` from 0 through 255. The tabs component is flexible and keeps its active or keyboard-selected item visible. Groups with higher priority than tabs reserve their complete width first. Tabs then grow toward their complete preferred width. Lower-priority groups appear only in remaining space. Left and right lanes stay edge-aligned; the center lane is geometrically centered and clamped between them. Groups never overlap. By default the right lane names the current workspace, truncated at 20 cells.
 
-Workspace rows have intrinsic `left` and `right` lanes; `body` receives the remaining cells and truncates safely. Expanded default rows retain the same marker and workspace number as the minimized rail, followed by the workspace name, and reserve trailing padding after status indicators so glyphs do not clip at the divider. A nonempty `detail` format adds a second full-width line. Workspaces are unnamed unless explicitly named, presenting as their live location — the work tree (or directory) every open pane is inside, or `multiple` when panes disagree. The default detail aligns under the row name and shows the Git branch at that live location with its short working-tree diff (`+N` inserted, `-N` deleted). The daemon collects those values with bounded background `git` processes and publishes them atomically into the shared resource snapshot, so rendering never waits, attached clients agree, and non-Git locations simply stay empty. Set `detail = []` for compact one-line rows. Header and footer are optional single-line segment lists. At tiny heights Fut preserves resource rows over decorative header/footer content, while switching and error status remains visible.
+Workspace rows have intrinsic `left` and `right` lanes; `body` receives the remaining cells and truncates safely. Expanded default rows show the workspace number and name, reserve leading and trailing padding, and use the same current style as the focused tab instead of a separate active marker. With Nerd Font pill caps, only that title line becomes a pill. The minimized rail keeps its compact active-workspace bullet. A nonempty `detail` format adds a second full-width line. Workspaces are unnamed unless explicitly named, presenting as their live location — the work tree (or directory) every open pane is inside, or `multiple` when panes disagree. The default detail aligns under the row name and shows the Git branch at that live location with its short working-tree diff (`+N` inserted, `-N` deleted). The daemon collects those values with bounded background `git` processes and publishes them atomically into the shared resource snapshot, so rendering never waits, attached clients agree, and non-Git locations simply stay empty. Set `detail = []` for compact one-line rows. Header and footer are optional single-line segment lists. At tiny heights Fut preserves resource rows over decorative header/footer content, while switching and error status remains visible.
 
 All widths are terminal display cells. Dynamic values are sanitized and truncated at grapheme boundaries. Bars never wrap.
 
@@ -250,7 +250,7 @@ Styles compose in this order: normal, group style, token style (`activity`, `att
 
 ## Icons
 
-`unicode` is the default and requires no private-use glyphs. `ascii` uses ASCII for the configurable resource icons; ordinary built-in help and truncation text may still use Unicode. `nerd_font` opts into a small Nerd Fonts v3-oriented resource/state set, and additionally draws the focused tab as a filled pill using powerline half-circle caps. Every icon can be overridden under `[ui.icons]`.
+`unicode` is the default and requires no private-use glyphs. `ascii` uses ASCII for the configurable resource icons; ordinary built-in help and truncation text may still use Unicode. `nerd_font` opts into a small Nerd Fonts v3-oriented resource/state set, and additionally draws focused tabs and expanded workspaces as filled pills using powerline half-circle caps. Every icon can be overridden under `[ui.icons]`.
 
 Fut cannot reliably detect the active terminal font. Use [`fut doctor`](doctor.md) for an honest visual probe; it never claims that an installed font is active.
 
