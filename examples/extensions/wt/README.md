@@ -1,10 +1,11 @@
 # wt
 
 Create a Git worktree, switch Fut to its new peer workspace, and launch an
-agent.
+optional configured command. Without one, the new workspace opens a shell.
 
-The extension requires [`wt`](https://github.com/mikker/wt) and `pi` on
-`PATH`. Set `FUT_WT_BIN` to use another `wt` executable.
+The extension requires [`wt`](https://github.com/mikker/wt) on `PATH`. Any
+configured post-open command must also be available on `PATH`. Set `FUT_WT_BIN`
+to use another `wt` executable.
 
 Add the extension's absolute directory to `~/.config/fut/config.toml`:
 
@@ -17,22 +18,22 @@ extensions = [
 Reload Fut's configuration, open the command palette with `Ctrl-b :`, and
 choose **New worktree**, then enter the worktree name. The launcher runs in the
 focused pane's working directory, so the current Git repository determines
-where `wt` creates the worktree. The agent opens without an initial prompt.
+where `wt` creates the worktree.
 
-The arguments after `./bin/create` in `fut-extension.toml` configure the
-post-open action as a direct argv array. For example, launch Codex instead:
+Configure the optional post-open action in your Fut config as a direct argument
+array. For example, launch Pi and bind the command to `Ctrl-b N`:
 
 ```toml
-[commands.new-agent-worktree]
-title = "New worktree"
-argv = ["./bin/create", "codex"]
-size = { width = 64, height = 10 }
-activate_opened = true
+[ui.bindings]
+"wt:new-worktree" = "N"
+
+[extension_commands."wt:new-worktree"]
+args = ["pi"]
 ```
 
 Arguments are preserved, so an action can also be configured as
-`["./bin/create", "my-agent", "--flag"]`. Running `bin/create` directly
-without an action defaults to `pi`.
+`["my-agent", "--flag"]`. Omit the `extension_commands` entry (or configure
+`args = []`) to open the default shell.
 
 The package contains two direct executables:
 

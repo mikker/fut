@@ -95,8 +95,27 @@ client to the most recent target opened by a descendant `fut open` after the
 command exits successfully. It defaults to `false`, so commands can create
 background workspaces without changing focus.
 
-Extension commands are palette-only. Use a top-level
-`[trusted_commands.NAME]` entry when a command needs a direct key binding.
+Bind an extension command under `[ui.bindings]` with its quoted qualified
+palette slug:
+
+```toml
+[ui.bindings]
+"review-status:open-review" = "r"
+```
+
+Bound extension commands also appear in delayed which-key help. Use a
+top-level `[trusted_commands.NAME]` entry for a direct executable that is not
+supplied by an extension.
+
+Override an extension command's manifest arguments by its same qualified slug:
+
+```toml
+[extension_commands."review-status:open-review"]
+args = ["--local-choice"]
+```
+
+The configured array replaces the manifest arguments after its executable;
+use `args = []` to pass none. Unknown command slugs reject the configuration.
 
 ## Workspace hooks
 

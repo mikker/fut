@@ -161,11 +161,21 @@ pub(super) struct ExtensionCommandIdentity {
     pub command: String,
 }
 
+impl ExtensionCommandIdentity {
+    fn slug(&self) -> String {
+        format!("{}:{}", self.id, self.command)
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ExtensionCommandConfig {
+    args: Vec<String>,
+}
+
 impl PaletteCommand {
     pub(super) fn slug(&self) -> Option<String> {
-        self.extension
-            .as_ref()
-            .map(|extension| format!("{}:{}", extension.id, extension.command))
+        self.extension.as_ref().map(ExtensionCommandIdentity::slug)
     }
 }
 
@@ -1155,6 +1165,7 @@ impl UiConfig {
 struct Config {
     ui: UiConfig,
     trusted_commands: BTreeMap<String, PaletteCommand>,
+    extension_commands: BTreeMap<String, ExtensionCommandConfig>,
     extensions: Vec<PathBuf>,
 }
 
@@ -1285,28 +1296,40 @@ fn load_path_outcome(path: &std::path::Path, explicit: bool) -> Result<LoadedCon
     for extension in &loaded_extensions {
         for launcher in extension.commands() {
             let argv = launcher.argv();
+            let identity = ExtensionCommandIdentity {
+                id: extension.id().to_owned(),
+                root: extension.root().to_owned(),
+                command: launcher.name().to_owned(),
+            };
+            let slug = identity.slug();
+            let binding = config.ui.bindings.values.remove(&slug);
+            let configured_args = config.extension_commands.remove(&slug);
             config.ui.bindings.commands.push(PaletteCommand {
                 title: launcher.title().to_owned(),
-                binding: None,
+                binding,
                 program: PathBuf::from(&argv[0]),
-                args: argv[1..]
-                    .iter()
-                    .map(|value| {
-                        value
-                            .to_str()
-                            .expect("extension manifest arguments are UTF-8")
-                            .to_owned()
-                    })
-                    .collect(),
+                args: configured_args.map_or_else(
+                    || {
+                        argv[1..]
+                            .iter()
+                            .map(|value| {
+                                value
+                                    .to_str()
+                                    .expect("extension manifest arguments are UTF-8")
+                                    .to_owned()
+                            })
+                            .collect()
+                    },
+                    |configured| configured.args,
+                ),
                 size: launcher.size(),
                 activate_opened: launcher.activate_opened(),
-                extension: Some(ExtensionCommandIdentity {
-                    id: extension.id().to_owned(),
-                    root: extension.root().to_owned(),
-                    command: launcher.name().to_owned(),
-                }),
+                extension: Some(identity),
             });
         }
+    }
+    if let Some(slug) = config.extension_commands.keys().next() {
+        bail!("unknown extension_commands command {slug:?}");
     }
     validate(&config.ui, &loaded_extensions)
         .with_context(|| format!("validate Fut config {}", path.display()))?;
@@ -1387,9 +1410,9 @@ fn validate(ui: &UiConfig, extensions: &[Extension]) -> Result<()> {
         .collect::<HashSet<_>>();
     let mut command_suffixes = HashSet::new();
     for command in &ui.bindings.commands {
-        validate_text("trusted_commands title", &command.title)?;
+        validate_text("command title", &command.title)?;
         if command.title.is_empty() {
-            bail!("trusted command titles must not be empty");
+            bail!("command titles must not be empty");
         }
         command
             .size
@@ -1397,16 +1420,16 @@ fn validate(ui: &UiConfig, extensions: &[Extension]) -> Result<()> {
             .context("validate command popup size")?;
         if let Some(binding) = &command.binding {
             let Some((suffix, _)) = parse_suffix(binding) else {
-                bail!("trusted command bindings must be one character or a named key");
+                bail!("command bindings must be one character or a named key");
             };
             if !command_suffixes.insert(suffix.clone()) {
-                bail!("trusted_commands must not assign the same key to multiple commands");
+                bail!("commands must not assign the same key to multiple commands");
             }
             if ALL_ACTIONS.into_iter().any(|action| {
                 explicitly_bound.contains(config_key(action))
                     && ui.bindings.suffix(action) == suffix
             }) {
-                bail!("a trusted command conflicts with an explicitly configured ui binding");
+                bail!("a command conflicts with an explicitly configured ui binding");
             }
         }
     }
@@ -2060,7 +2083,7 @@ components = [
         fs::write(
             &path,
             format!(
-                "extensions = [{:?}]\n",
+                "extensions = [{:?}]\n[ui.bindings]\n\"configured:launch\" = \"N\"\n[extension_commands.\"configured:launch\"]\nargs = [\"locally\", \"chosen\"]\n",
                 extension_root.display().to_string()
             ),
         )
@@ -2071,17 +2094,49 @@ components = [
         assert_eq!(loaded.extensions[0].id(), "configured");
         let command = loaded.ui.bindings.command(0).unwrap();
         assert_eq!(command.title, "Launch configured extension");
-        assert_eq!(command.binding, None);
+        assert_eq!(command.binding.as_deref(), Some("N"));
+        assert_eq!(
+            loaded.ui.bindings.action_for_suffix(b"N"),
+            Some(ClientAction::RunCommand(0))
+        );
         assert_eq!(
             command.program,
             extension_root.canonicalize().unwrap().join("bin/launch")
         );
-        assert_eq!(command.args, ["--ready"]);
+        assert_eq!(command.args, ["locally", "chosen"]);
         assert_eq!(command.size.width, Some(90));
         assert_eq!(command.size.height, Some(24));
         assert!(command.activate_opened);
         assert_eq!(command.extension.as_ref().unwrap().id, "configured");
         assert_eq!(command.slug().as_deref(), Some("configured:launch"));
+
+        fs::write(
+            &path,
+            format!(
+                "extensions = [{:?}]\n[ui.bindings]\n\"configured:missing\" = \"N\"\n",
+                extension_root.display().to_string()
+            ),
+        )
+        .unwrap();
+        let error = format!("{:#}", load_path_outcome(&path, true).unwrap_err());
+        assert!(
+            error.contains("unknown ui.bindings action \"configured:missing\""),
+            "{error}"
+        );
+
+        fs::write(
+            &path,
+            format!(
+                "extensions = [{:?}]\n[extension_commands.\"configured:missing\"]\nargs = []\n",
+                extension_root.display().to_string()
+            ),
+        )
+        .unwrap();
+        let error = format!("{:#}", load_path_outcome(&path, true).unwrap_err());
+        assert!(
+            error.contains("unknown extension_commands command \"configured:missing\""),
+            "{error}"
+        );
 
         let invalid_root = temporary.path().join("invalid");
         fs::create_dir(&invalid_root).unwrap();

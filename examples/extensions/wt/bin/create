@@ -7,10 +7,6 @@ set -eu
 
 wt_bin=${FUT_WT_BIN:-wt}
 
-if [ "$#" -eq 0 ]; then
-  set -- pi
-fi
-
 printf 'Worktree name: '
 IFS= read -r name || exit 0
 if [ -z "$name" ]; then
@@ -19,6 +15,11 @@ if [ -z "$name" ]; then
 fi
 
 printf '\nCreating %s…\n' "$name"
+if [ "$#" -eq 0 ]; then
+  exec "$wt_bin" create "$name" -- \
+    "$FUT_BIN" --socket "$FUT_SOCKET" open . --name "$name"
+fi
+
 exec "$wt_bin" create "$name" -- \
   "$FUT_BIN" --socket "$FUT_SOCKET" open . --name "$name" -- \
   env \

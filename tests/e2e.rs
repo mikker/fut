@@ -2157,6 +2157,42 @@ fn checked_in_wt_extension_composes_create_and_retirement_commands() {
         expected
     );
 
+    let mut create_shell = Command::new(extension.join("bin/create"))
+        .env("FUT_BIN", "/opt/fut")
+        .env("FUT_EXTENSION_ROOT", &extension)
+        .env("FUT_SOCKET", "/tmp/fut.sock")
+        .env("FUT_WT_BIN", &fake_wt)
+        .env("CAPTURE", &capture)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    create_shell
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"shell-worktree\n")
+        .unwrap();
+    assert!(create_shell.wait().unwrap().success());
+    assert_eq!(
+        fs::read_to_string(&capture)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        [
+            "create",
+            "shell-worktree",
+            "--",
+            "/opt/fut",
+            "--socket",
+            "/tmp/fut.sock",
+            "open",
+            ".",
+            "--name",
+            "shell-worktree",
+        ]
+    );
+
     let retire_capture = temporary.path().join("retire-argv");
     let fake_fut = temporary.path().join("fut");
     fs::write(
