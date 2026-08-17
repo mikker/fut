@@ -2,23 +2,17 @@
 
 ## Unreleased
 
-- Sidebars with multiple components now show dividers between each section.
-- Exited Pi and Claude Code sessions now disappear from agent lists instead of remaining as idle agents.
-- Added `--config-dir` for launching Fut with configuration from an alternate directory, including an empty directory for stock defaults.
-- Agent notification read status is now shared daemon-wide, and `fut agent list` reports per-agent unread state plus a total unread count for external status bars.
-- Close confirmations are now centered, can be disabled with `ui.confirm_close = false`, and closing the final successful terminal exits cleanly.
-- Tabs and workspace rows now have right-click menus for switching, creating, renaming, closing, and changing workspace display and visibility.
-- Extension commands now show and search by their qualified `extension:command` slug in the command palette.
-- Trusted and extension commands can now request centered popup dimensions, clamped to the available terminal size.
-- The bundled `wt` extension now switches to its new workspace, opens agents without requiring an initial prompt, and supports a configurable post-open action.
-- The command palette now opens with `Ctrl-b :` and gives every built-in action a searchable tmux-style command name using Fut's tab terminology.
-- Added `fut a` and `fut ls` command aliases, plus a confirmed `Ctrl-b x` shortcut for closing the focused pane.
-- Fut now refuses to nest interactive clients by default; set `FUT_ALLOW_NESTED` to force intentional nesting.
-- Tabs and workspaces can now be activated directly with a left mouse click, and displayed tab and workspace hotkeys can be clicked like buttons.
-- Added acknowledged workspace retirement for tools that need to close their own disposable Fut workspace safely.
-- Fixed explicit relative `fut open` paths being resolved from the daemon instead of the invoking process.
-- Extensions can now contribute packaged interactive commands to Fut's command palette, and trusted commands may be palette-only without a binding.
-- Independent left and right sidebars now compose scoped Workspaces and Agents lists, with automatic relevance, compact rails, drawers, and per-side resizing.
+## 0.7
+
+- Added independent, composable sidebars with scoped Workspaces and Agents lists, automatic relevance, compact rails, drawers, resizing, and section dividers.
+- Added mouse activation and contextual menus for tabs and workspaces.
+- Added packaged extension commands, palette-only trusted commands, qualified extension search, and configurable temporary-command sizes.
+- Moved the command palette to `Ctrl-b :`, added searchable tmux-style action names, `fut a` and `fut ls` aliases, and `Ctrl-b x` for closing panes.
+- Shared agent notification read state daemon-wide, exposed unread counts through `fut agent list`, and removed exited integrations from agent lists.
+- Added `--config-dir` and prevented accidental nested Fut clients unless `FUT_ALLOW_NESTED` is set.
+- Centered close confirmations, added `ui.confirm_close`, and fixed clean exit after the final successful terminal closes.
+- Added acknowledged workspace retirement and improved the bundled `wt` workflow with automatic activation and configurable post-open actions.
+- Fixed relative `fut open` paths being resolved from the daemon instead of the invoking process.
 
 ## 0.6
 
