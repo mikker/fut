@@ -2614,7 +2614,7 @@ async fn public_tab_new_is_isolated_and_public_tab_close_preserves_its_sibling()
     assert_ne!(terminal_id, original_terminal);
     assert_ne!(child_pid, original_pid);
     wait_for(DEADLINE, || marker.exists()).await;
-    wait_for(DEADLINE, || pwd_file.exists()).await;
+    wait_for_nonempty_file(&pwd_file).await;
     assert_eq!(
         fs::read_to_string(&pwd_file).unwrap().trim(),
         harness
@@ -2731,7 +2731,7 @@ async fn public_pane_new_preserves_attachment_isolates_input_and_cascades_on_las
     assert_ne!(pane_b, pane_a.id);
     assert_ne!(terminal_b, pane_a.terminal_id);
     assert_ne!(pid_b, selected_a.child_pid);
-    wait_for(DEADLINE, || pwd.exists()).await;
+    wait_for_nonempty_file(&pwd).await;
     assert_eq!(
         fs::read_to_string(&pwd).unwrap().trim(),
         harness
@@ -5540,7 +5540,7 @@ async fn public_pane_split_preserves_target_direction_cwd_argv_focus_and_atomic_
         .parse()
         .unwrap();
     assert!(split["result"]["selected"]["terminal_id"].is_string());
-    wait_for(DEADLINE, || argv_capture.exists()).await;
+    wait_for_nonempty_file(&argv_capture).await;
     assert_eq!(
         fs::read_to_string(&argv_capture).unwrap(),
         format!(
@@ -7994,7 +7994,7 @@ async fn public_tab_navigation_and_right_down_splits_share_the_command_catalog()
     client.send(b"\x02c");
     client.wait_for("sh-3.2$").await;
     client.send(b"pwd>tab-cwd\n");
-    wait_for(DEADLINE, || inherited_marker.exists()).await;
+    wait_for_nonempty_file(&inherited_marker).await;
     assert_eq!(
         fs::read_to_string(&inherited_marker).unwrap().trim(),
         split_cwd
@@ -8989,7 +8989,7 @@ async fn workspace_and_tab_bars_create_and_rename_logical_contexts() {
         created_cwd.display()
     );
     time::timeout(DEADLINE, async {
-        while !created_cwd.exists() {
+        while !file_has_contents(&created_cwd) {
             client.send(created_command.as_bytes());
             time::sleep(Duration::from_millis(100)).await;
         }
@@ -9067,7 +9067,7 @@ async fn workspace_and_tab_bars_create_and_rename_logical_contexts() {
         second_tab_cwd.display()
     );
     time::timeout(DEADLINE, async {
-        while !second_tab_cwd.exists() {
+        while !file_has_contents(&second_tab_cwd) {
             client.send(tab_command.as_bytes());
             time::sleep(Duration::from_millis(100)).await;
         }
@@ -11876,6 +11876,14 @@ async fn wait_for_file(path: PathBuf) {
     .unwrap_or_else(|_| panic!("marker did not appear before timeout: {}", path.display()));
 }
 
+async fn wait_for_nonempty_file(path: &std::path::Path) {
+    wait_for(DEADLINE, || file_has_contents(path)).await;
+}
+
+fn file_has_contents(path: &std::path::Path) -> bool {
+    fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0)
+}
+
 async fn chaos_identify_pane(
     client: &mut PtyChild,
     root: &std::path::Path,
@@ -11888,7 +11896,7 @@ async fn chaos_identify_pane(
     time::sleep(Duration::from_millis(100)).await;
     time::timeout(DEADLINE, async {
         loop {
-            if marker.exists() {
+            if file_has_contents(&marker) {
                 break;
             }
             client.send(paste.as_bytes());
@@ -11913,7 +11921,7 @@ async fn chaos_probe_pane(
     time::sleep(Duration::from_millis(100)).await;
     time::timeout(DEADLINE, async {
         loop {
-            if marker.exists() {
+            if file_has_contents(&marker) {
                 break;
             }
             client.send(paste.as_bytes());
