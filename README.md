@@ -18,10 +18,19 @@ brew install mikker/tap/fut
 
 [Documentation](https://fut.sh)
 
+## Quick start
+
+Run `fut` in a project. Most interactive commands begin with `Ctrl-b`; pause
+after the prefix to see all current bindings, press `Ctrl-b :` to search
+commands, and detach with `Ctrl-b d`.
+
+See [Using Fut](https://fut.sh/usage/) for the resource model, everyday
+controls, mouse and copy behavior, CLI automation, and shell completion.
+
 ## Agent integrations
 
-Fut can show native lifecycle activity from Claude Code and Codex. Install Fut
-first, then verify that the installed version supports agent reporting:
+Fut can show native lifecycle activity from Claude Code, Codex, and Pi. Install
+Fut first, then verify that the installed version supports agent reporting:
 
 ```sh
 fut agent report --help
@@ -47,6 +56,8 @@ Restart Pi after installing, then launch it inside Fut. The extension reports
 Pi's working, blocked, completed, and idle lifecycle states automatically.
 
 ### Codex
+
+The Codex adapter requires `python3`.
 
 ```sh
 codex plugin marketplace add mikker/fut

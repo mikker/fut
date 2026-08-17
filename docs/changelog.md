@@ -7,6 +7,25 @@ permalink: /changelog/
 
 # Changelog
 
+## Unreleased
+
+- Added composable left and right sidebars with contextual menus and section dividers.
+- Shared agent notification read state across clients and external observers.
+- Added alternate configuration directories, close controls, command aliases, and safer nested-client handling.
+- Added extension palette commands and configurable temporary-command sizes.
+- Added acknowledged retirement for disposable workspaces.
+
+## 0.6
+
+- Refined the global navigator with scoped filters and clearer hierarchy.
+- Moved global navigation to `Ctrl-b s`; `Ctrl-b Ctrl-s` now toggles sessions.
+
+## 0.5
+
+- Added Kitty graphics, OSC 8 hyperlinks, explicit local extensions, and presentation tokens.
+- Added live workspace location, branch, and diff presentation.
+- Improved naming, navigator filters, resource colors, and multi-daemon support.
+
 ## 0.4
 
 - Added fallback Codex activity detection when no lifecycle plugin is active.

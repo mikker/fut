@@ -7,6 +7,10 @@ permalink: /extensions/
 
 # Extensions
 
+> **TL;DR:** Add a trusted extension directory to the top-level `extensions`
+> array, reload with `Ctrl-b Shift-R`, then find its commands in `Ctrl-b :`.
+> Extensions may execute programs; only load directories you trust.
+
 Extensions are trusted local packages that add command-palette actions,
 workspace lifecycle hooks, and presentation values without changing Fut
 itself. They are ordinary directories containing a strict TOML manifest and,
@@ -23,7 +27,7 @@ extensions = [
 
 Reload configuration with `Ctrl-b Shift-R`. The complete extension set is
 validated atomically; an invalid manifest leaves the current configuration in
-place.
+place. Duplicate canonical roots or IDs reject the complete set.
 
 ## Manifest
 
@@ -53,9 +57,9 @@ lowercase letters, digits, and single `.`, `_`, or `-` separators. Unknown
 manifest fields are errors.
 
 Executable arrays are direct argv—not shell commands. Fut resolves `./bin/x`
-inside the canonical extension root. An executable may instead be an absolute
-path or a single name resolved through `PATH`. Fut never inserts a shell or
-interpolates manifest values.
+inside the canonical extension root and rejects lexical escapes from it. An
+executable may instead be an absolute path or a single name resolved through
+`PATH`. Fut never inserts a shell or interpolates manifest values.
 
 ## Palette commands
 
@@ -112,7 +116,8 @@ The supported hooks are:
 Hooks run asynchronously after a successful resource commit. They cannot
 veto, delay, rewrite, or roll back it. Fut executes hooks one at a time in
 mutation order, with the extension root as their working directory and a
-five-second timeout.
+five-second timeout. The initial workspace emits `workspace.created` because
+extensions load before daemon setup.
 
 The hook receives one versioned JSON object on stdin:
 
@@ -162,9 +167,9 @@ The target option must match the declaration scope. The UI token is qualified
 as `<scope>.extension.<extension-id>.<name>`:
 
 ```toml
-[ui.workspace_sidebar.row]
-right = [
-  { token = "workspace.extension.review-status.state" },
+[ui.sidebar.left]
+components = [
+  { component = "workspaces", row = { right = [{ token = "workspace.extension.review-status.state" }] } },
 ]
 ```
 
@@ -190,7 +195,9 @@ contexts.
 | Materialized token values per daemon | 4,096 |
 
 The hook queue holds 128 events and never blocks resource mutations. Fut
-retains at most 16 KiB each of hook stdout and stderr for diagnostics.
+retains at most 16 KiB each of hook stdout and stderr for diagnostics. A new
+event is dropped when the queue is full. Daemon shutdown gives the current hook
+a one-second grace period before cancellation.
 
 ## Examples
 
@@ -199,8 +206,7 @@ The repository includes two complete extensions:
 - [`example-workspace-status`](https://github.com/mikker/fut/tree/main/examples/extensions/example-workspace-status)
   turns workspace events into a sidebar token.
 - [`wt`](https://github.com/mikker/fut/tree/main/examples/extensions/wt)
-  creates a worktree, opens it as a workspace, runs a configurable action, and
-  retires the workspace when the worktree is removed.
+  creates a worktree, opens it as a workspace, and runs a configurable action.
 
 Extensions are an executable trust boundary. Only configure directories you
 trust, and keep their executables under the same review and permissions policy

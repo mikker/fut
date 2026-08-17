@@ -7,6 +7,10 @@ permalink: /tokens/
 
 # Presentation tokens
 
+> **TL;DR:** Tokens format Fut's tab bar and workspace list using values Fut
+> already knows. They never run commands. Use this page as the context-specific
+> token catalog and [Configuration](../configuration/) for layout syntax.
+
 Presentation tokens are pure, typed values expanded from the resource snapshot and client state already held by Fut. They never execute commands or perform I/O. Tokens are valid only in the documented context; a misspelling or out-of-scope token prevents the interactive client from starting.
 
 A token segment is explicit TOML:

@@ -7,6 +7,10 @@ permalink: /doctor/
 
 # Diagnostics
 
+> **TL;DR:** Run `fut doctor`. It safely checks configuration, terminal
+> capabilities, runtime permissions, daemon compatibility, and icons without
+> starting or changing anything.
+
 `fut doctor` performs a bounded, read-only diagnosis of the client environment:
 
 ```sh
@@ -29,7 +33,9 @@ Doctor reports:
 - a bounded Fut protocol handshake when a safe socket exists;
 - the configured icon preset and a visual glyph probe.
 
-The current development protocol is `17` and requires an exact client/daemon match. A successful handshake reports a compatible protocol-`17` daemon; any other protocol version is incompatible.
+Client and daemon protocol versions must match exactly. Doctor reports both
+versions when it can safely reach a daemon; an older or newer endpoint is
+incompatible.
 
 ## Nerd Fonts
 

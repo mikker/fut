@@ -18,8 +18,8 @@ It is built only on documented Codex surfaces:
 
 ## Install
 
-Install a Fut release that exposes `fut agent report`, then add Fut's GitHub
-marketplace and plugin:
+Install a Fut release that exposes `fut agent report` and ensure `python3` is
+available, then add Fut's GitHub marketplace and plugin:
 
 ```sh
 codex plugin marketplace add mikker/fut

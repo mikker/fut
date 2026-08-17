@@ -6,6 +6,11 @@ description: Report semantic agent activity to Fut.
 
 # Agent activity
 
+> **TL;DR:** Install the integration for your agent, launch it inside Fut, and
+> use the default right sidebar or `Ctrl-b u` to follow its state. Automation
+> can use `fut --json agent list`, `agent prompt`, `agent wait`, and `agent
+> read` without changing client focus.
+
 Programs running inside Fut receive scoped `FUT_SESSION_ID`, `FUT_WORKSPACE_ID`,
 `FUT_TAB_ID`, `FUT_PANE_ID`, and `FUT_TERMINAL_ID` environment variables.
 Resolve the terminal's current live ancestry, including the pane's current
@@ -34,6 +39,20 @@ fut agent skill
 
 The printed `SKILL.md` is bundled with the binary, so its instructions match the
 installed Fut release.
+
+## Install an integration
+
+Fut ships first-party lifecycle adapters for:
+
+- [Claude Code](https://github.com/mikker/fut/tree/main/integrations/claude-code)
+- [Codex](https://github.com/mikker/fut/tree/main/integrations/codex)
+- [Pi](#pi)
+
+Claude Code and Codex require their Fut plugin; Codex also requires the
+documented `notify` adapter for authoritative turn completion. Follow the
+linked installation guides, restart the agent, and launch it inside Fut. A
+screen-based Codex fallback exists, but explicit lifecycle reports are more
+reliable and take precedence.
 
 ## Control integrated agents
 
@@ -155,6 +174,8 @@ Set `FUT_AGENT_DETECTION_LOG=1` on the Fut daemon to print each Codex process,
 command line, matched rule, state, and quoted canonical screen to daemon stderr.
 This diagnostic can include terminal content and should only be enabled while
 debugging.
+
+## Report lifecycle from an integration
 
 Report semantic state from an integration with:
 

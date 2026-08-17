@@ -1,6 +1,8 @@
 # Example workspace status extension
 
-This intentionally small extension publishes the latest supported lifecycle event for each workspace. It demonstrates packaged hook executables, Fut's hook environment, and callback through the ordinary control CLI.
+This intentionally small extension publishes the latest create or rename event
+for each live workspace. It demonstrates packaged hook executables, Fut's hook
+environment, and callback through the ordinary control CLI.
 
 Load this directory by absolute path:
 

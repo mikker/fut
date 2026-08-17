@@ -6,8 +6,13 @@ layouts, submit prompts, read terminal output, or coordinate agents.
 
 ## Install
 
-This repository is a Pi package. Add the checkout to Pi using Pi's package
-installer:
+Install the package from GitHub, then restart Pi:
+
+```sh
+pi install git:github.com/mikker/fut
+```
+
+For development, add a local checkout instead:
 
 ```sh
 pi install /absolute/path/to/fut

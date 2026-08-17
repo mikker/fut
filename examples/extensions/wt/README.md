@@ -1,8 +1,7 @@
 # wt
 
 Create a Git worktree, switch Fut to its new peer workspace, and launch an
-agent. When the agent successfully runs `wt done`, `wt ship`, or `wt rm`, the
-worktree removal event gracefully retires its Fut workspace.
+agent.
 
 The extension requires [`wt`](https://github.com/mikker/wt) and `pi` on
 `PATH`. Set `FUT_WT_BIN` to use another `wt` executable.
@@ -38,5 +37,6 @@ without an action defaults to `pi`.
 The package contains two direct executables:
 
 - `bin/create` composes `wt create`, `fut open`, and the configured action.
-- `bin/worktree-event` accepts `wt`'s versioned removal event and calls
-  `fut workspace retire` using the agent terminal's validated caller context.
+- `bin/worktree-event` is an adapter for a versioned `worktree.removed` event;
+  it calls `fut workspace retire` using the agent terminal's validated caller
+  context. Current `wt` releases do not invoke this adapter automatically.
