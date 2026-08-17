@@ -1,0 +1,6 @@
+id = "ghostty-title"
+
+[hooks]
+"client.attached" = ["./bin/window-title"]
+"client.session_changed" = ["./bin/window-title"]
+"client.detached" = ["./bin/window-title"]

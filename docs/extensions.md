@@ -1,7 +1,7 @@
 ---
 layout: default
 title: Extensions
-description: Add local commands, workspace hooks, and presentation tokens to Fut.
+description: Add local commands, lifecycle hooks, and presentation tokens to Fut.
 permalink: /extensions/
 ---
 
@@ -12,7 +12,7 @@ permalink: /extensions/
 > Extensions may execute programs; only load directories you trust.
 
 Extensions are trusted local packages that add command-palette actions,
-workspace lifecycle hooks, and presentation values without changing Fut
+lifecycle hooks, and presentation values without changing Fut
 itself. They are ordinary directories containing a strict TOML manifest and,
 usually, a few executables.
 
@@ -144,6 +144,49 @@ environment plus `FUT_BIN`, `FUT_SOCKET`, `FUT_EXTENSION_ID`,
 Hook failures are diagnostic only. Spawn errors, nonzero exits, output, and
 timeouts do not alter daemon state or stop later hooks.
 
+## Client hooks
+
+Client hooks run for each attached interactive client:
+
+- `client.attached` runs after Fut resolves the initially selected session.
+- `client.session_changed` runs when that client selects or renames a session.
+- `client.detached` runs when that client exits or detaches.
+
+```toml
+[hooks]
+"client.attached" = ["./bin/client-event"]
+"client.session_changed" = ["./bin/client-event"]
+"client.detached" = ["./bin/client-event"]
+```
+
+These hooks use the same direct argv, timeout, ordering, output bounds, and
+diagnostic-only failure behavior as workspace hooks. They run from the client
+process, making `/dev/tty` available for deliberate host-terminal integration.
+Configuration changes to client hooks take effect when the client next
+attaches.
+
+The hook receives one versioned JSON object on stdin:
+
+```json
+{
+  "version": 1,
+  "event": "client.session_changed",
+  "session": {
+    "id": "SESSION_UUID",
+    "name": "current-session"
+  },
+  "previous_session": {
+    "id": "PREVIOUS_SESSION_UUID",
+    "name": "previous-session"
+  }
+}
+```
+
+`previous_session` appears only for `client.session_changed`. Hook processes
+inherit the client environment plus `FUT_BIN`, `FUT_SOCKET`,
+`FUT_EXTENSION_ID`, `FUT_EXTENSION_ROOT`, `FUT_EVENT`, `FUT_EVENT_VERSION`,
+`FUT_SESSION_ID`, and `FUT_SESSION_NAME`.
+
 ## Presentation tokens
 
 Extensions can declare plain string values for a resource scope:
@@ -201,7 +244,10 @@ a one-second grace period before cancellation.
 
 ## Examples
 
-The repository includes two complete extensions:
+The repository includes three complete extensions:
+
+- [`ghostty-title`](https://github.com/mikker/fut/tree/main/examples/extensions/ghostty-title)
+  follows the selected Fut session in the current Ghostty window title.
 
 - [`example-workspace-status`](https://github.com/mikker/fut/tree/main/examples/extensions/example-workspace-status)
   turns workspace events into a sidebar token.

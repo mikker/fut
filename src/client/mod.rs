@@ -421,9 +421,37 @@ async fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     selected: SelectedView,
+    ui: UiConfig,
+    socket_path: &Path,
+    config_dir: Option<&Path>,
+) -> anyhow::Result<()> {
+    let mut client_hooks = crate::extensions::ClientHookRuntime::new(
+        ui.extensions.clone(),
+        std::env::current_exe().context("resolve current Fut executable")?,
+        socket_path.to_owned(),
+    );
+    let result = run_loop(
+        terminal,
+        framed,
+        selected,
+        ui,
+        socket_path,
+        config_dir,
+        &mut client_hooks,
+    )
+    .await;
+    client_hooks.shutdown().await;
+    result
+}
+
+async fn run_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    selected: SelectedView,
     mut ui: UiConfig,
     socket_path: &Path,
     config_dir: Option<&Path>,
+    client_hooks: &mut crate::extensions::ClientHookRuntime,
 ) -> anyhow::Result<()> {
     let mut events = EventStream::new();
     let mut termination = TerminationSignals::subscribe()?;
@@ -680,6 +708,7 @@ async fn run(
                     ServerMessage::Resources { snapshot } => {
                         if resources.accept(snapshot) {
                             let snapshot = resources.snapshot().expect("accepted resources exist");
+                            client_hooks.observe(snapshot, view.focused());
                             refresh_surface_resources(
                                 &mut surface,
                                 snapshot,
@@ -707,6 +736,7 @@ async fn run(
                     ServerMessage::ResourcesChanged { snapshot } => {
                         if resources.accept(snapshot) {
                             let snapshot = resources.snapshot().expect("accepted resources exist");
+                            client_hooks.observe(snapshot, view.focused());
                             refresh_surface_resources(
                                 &mut surface,
                                 snapshot,
@@ -796,6 +826,7 @@ async fn run(
                             &ui,
                         ).await?;
                         if let Some(snapshot) = resources.snapshot() {
+                            client_hooks.observe(snapshot, view.focused());
                             refresh_surface_resources(
                                 &mut surface,
                                 snapshot,

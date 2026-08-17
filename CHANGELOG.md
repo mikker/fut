@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Fixed linked filenames bleeding through or breaking the borders of dialogs drawn over terminal content.
+- Added client lifecycle hooks and a Ghostty extension that follows the active Fut session in the window title and restores the previous title on detach.
 
 ## 0.7
 

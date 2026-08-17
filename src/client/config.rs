@@ -1103,6 +1103,8 @@ pub(crate) struct UiConfig {
     pub(super) styles: StylesConfig,
     pub(super) tab_bar: TabBarConfig,
     pub(super) sidebar: SidebarConfig,
+    #[serde(skip)]
+    pub(super) extensions: Vec<Extension>,
 }
 
 impl Default for UiConfig {
@@ -1115,6 +1117,7 @@ impl Default for UiConfig {
             styles: StylesConfig::default(),
             tab_bar: TabBarConfig::default(),
             sidebar: SidebarConfig::default(),
+            extensions: Vec::new(),
         }
     }
 }
@@ -1307,6 +1310,7 @@ fn load_path_outcome(path: &std::path::Path, explicit: bool) -> Result<LoadedCon
     }
     validate(&config.ui, &loaded_extensions)
         .with_context(|| format!("validate Fut config {}", path.display()))?;
+    config.ui.extensions = loaded_extensions.clone();
     Ok(LoadedConfig {
         ui: config.ui,
         extensions: loaded_extensions,

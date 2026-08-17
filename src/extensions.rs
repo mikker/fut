@@ -25,7 +25,8 @@ use tokio::{
 use crate::{
     command::PopupSize,
     domain::{SessionId, WorkspaceId},
-    resources::{MAX_MATERIALIZED_TOKEN_VALUE_BYTES, Mutation, ResourceEvent},
+    protocol::SelectedTarget,
+    resources::{MAX_MATERIALIZED_TOKEN_VALUE_BYTES, Mutation, ResourceEvent, ResourceSnapshot},
 };
 
 pub(crate) const MANIFEST_FILE_NAME: &str = "fut-extension.toml";
@@ -34,7 +35,14 @@ const FUT_EXTENSION_ID: &str = "FUT_EXTENSION_ID";
 const FUT_EXTENSION_ROOT: &str = "FUT_EXTENSION_ROOT";
 const EVENT_VERSION: u8 = 1;
 
-const SUPPORTED_HOOKS: [&str; 3] = ["workspace.created", "workspace.renamed", "workspace.closed"];
+const SUPPORTED_HOOKS: [&str; 6] = [
+    "client.attached",
+    "client.session_changed",
+    "client.detached",
+    "workspace.created",
+    "workspace.renamed",
+    "workspace.closed",
+];
 const HOOK_QUEUE_CAPACITY: usize = 128;
 const HOOK_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_EVENT_PAYLOAD_BYTES: usize = 64 * 1024;
@@ -295,6 +303,161 @@ pub(crate) async fn run_hooks(
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ClientSession {
+    id: SessionId,
+    name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ClientHookEvent {
+    kind: &'static str,
+    session: ClientSession,
+    previous_session: Option<ClientSession>,
+}
+
+impl ClientHookEvent {
+    fn payload(&self) -> Result<Vec<u8>> {
+        #[derive(Serialize)]
+        struct Payload<'a> {
+            version: u8,
+            event: &'a str,
+            session: &'a ClientSession,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            previous_session: Option<&'a ClientSession>,
+        }
+
+        let mut payload = serde_json::to_vec(&Payload {
+            version: EVENT_VERSION,
+            event: self.kind,
+            session: &self.session,
+            previous_session: self.previous_session.as_ref(),
+        })?;
+        payload.push(b'\n');
+        if payload.len() > MAX_EVENT_PAYLOAD_BYTES {
+            bail!(
+                "serialized hook payload is {} bytes; maximum is {MAX_EVENT_PAYLOAD_BYTES}",
+                payload.len()
+            );
+        }
+        Ok(payload)
+    }
+}
+
+pub(crate) struct ClientHookRuntime {
+    sender: Option<mpsc::Sender<ClientHookEvent>>,
+    task: Option<JoinHandle<()>>,
+    current: Option<ClientSession>,
+}
+
+impl ClientHookRuntime {
+    pub(crate) fn new(extensions: Vec<Extension>, fut_bin: PathBuf, socket: PathBuf) -> Self {
+        let (sender, mut receiver) = mpsc::channel::<ClientHookEvent>(HOOK_QUEUE_CAPACITY);
+        let task = tokio::spawn(async move {
+            while let Some(event) = receiver.recv().await {
+                run_client_event(&extensions, &fut_bin, &socket, &event).await;
+            }
+        });
+        Self {
+            sender: Some(sender),
+            task: Some(task),
+            current: None,
+        }
+    }
+
+    pub(crate) fn observe(&mut self, snapshot: &ResourceSnapshot, focused: &SelectedTarget) {
+        let Some(session) = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.id == focused.session_id)
+        else {
+            return;
+        };
+        let session = ClientSession {
+            id: session.id,
+            name: session.name.clone(),
+        };
+        self.observe_session(session);
+    }
+
+    fn observe_session(&mut self, session: ClientSession) {
+        if self.current.as_ref() == Some(&session) {
+            return;
+        }
+        let event = ClientHookEvent {
+            kind: if self.current.is_some() {
+                "client.session_changed"
+            } else {
+                "client.attached"
+            },
+            session: session.clone(),
+            previous_session: self.current.clone(),
+        };
+        let Some(sender) = &self.sender else {
+            return;
+        };
+        match sender.try_send(event) {
+            Ok(()) => self.current = Some(session),
+            Err(_) => {
+                tracing::warn!("client extension hook queue full; lifecycle event dropped");
+            }
+        }
+    }
+
+    pub(crate) async fn shutdown(mut self) {
+        if let (Some(sender), Some(session)) = (&self.sender, self.current.take()) {
+            let _ = sender
+                .send(ClientHookEvent {
+                    kind: "client.detached",
+                    session,
+                    previous_session: None,
+                })
+                .await;
+        }
+        self.sender.take();
+        let Some(mut task) = self.task.take() else {
+            return;
+        };
+        if timeout(Duration::from_secs(1), &mut task).await.is_err() {
+            task.abort();
+        }
+    }
+}
+
+async fn run_client_event(
+    extensions: &[Extension],
+    fut_bin: &Path,
+    socket: &Path,
+    event: &ClientHookEvent,
+) {
+    let payload = match event.payload() {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::warn!(%error, event = event.kind, "client extension hook payload rejected");
+            return;
+        }
+    };
+    for extension in extensions {
+        let Some(command) = extension.hooks.get(event.kind) else {
+            continue;
+        };
+        run_command(
+            extension,
+            command,
+            fut_bin,
+            socket,
+            HookInvocation {
+                event: event.kind,
+                session_id: event.session.id,
+                workspace_id: None,
+                session_name: Some(&event.session.name),
+                payload: &payload,
+            },
+        )
+        .await;
+    }
+}
+
 async fn run_event(extensions: &[Extension], fut_bin: &Path, socket: &Path, event: &HookEvent) {
     let payload = match event.payload() {
         Ok(payload) => payload,
@@ -307,8 +470,29 @@ async fn run_event(extensions: &[Extension], fut_bin: &Path, socket: &Path, even
         let Some(command) = extension.hooks.get(event.kind) else {
             continue;
         };
-        run_command(extension, command, fut_bin, socket, event, &payload).await;
+        run_command(
+            extension,
+            command,
+            fut_bin,
+            socket,
+            HookInvocation {
+                event: event.kind,
+                session_id: event.session_id,
+                workspace_id: Some(event.workspace_id),
+                session_name: None,
+                payload: &payload,
+            },
+        )
+        .await;
     }
+}
+
+struct HookInvocation<'a> {
+    event: &'a str,
+    session_id: SessionId,
+    workspace_id: Option<WorkspaceId>,
+    session_name: Option<&'a str>,
+    payload: &'a [u8],
 }
 
 async fn run_command(
@@ -316,31 +500,36 @@ async fn run_command(
     hook: &ExtensionCommand,
     fut_bin: &Path,
     socket: &Path,
-    event: &HookEvent,
-    payload: &[u8],
+    invocation: HookInvocation<'_>,
 ) {
+    let event = invocation.event;
     let mut command = Command::new(&hook.argv[0]);
     command
         .args(&hook.argv[1..])
         .current_dir(&extension.root)
         .envs(extension.command_environment())
         .env(FUT_BIN, fut_bin)
-        .env("FUT_EVENT", event.kind)
+        .env("FUT_EVENT", event)
         .env("FUT_EVENT_VERSION", EVENT_VERSION.to_string())
         .env("FUT_SOCKET", socket)
-        .env("FUT_SESSION_ID", event.session_id.to_string())
-        .env("FUT_WORKSPACE_ID", event.workspace_id.to_string())
+        .env("FUT_SESSION_ID", invocation.session_id.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if let Some(workspace_id) = invocation.workspace_id {
+        command.env("FUT_WORKSPACE_ID", workspace_id.to_string());
+    }
+    if let Some(session_name) = invocation.session_name {
+        command.env("FUT_SESSION_NAME", session_name);
+    }
 
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
             tracing::warn!(
                 extension = extension.id,
-                event = event.kind,
+                event,
                 %error,
                 "extension hook failed to start"
             );
@@ -348,7 +537,7 @@ async fn run_command(
         }
     };
     let mut stdin = child.stdin.take().expect("hook stdin was piped");
-    let payload = payload.to_owned();
+    let payload = invocation.payload.to_owned();
     let input = tokio::spawn(async move {
         stdin.write_all(&payload).await?;
         stdin.shutdown().await
@@ -370,7 +559,7 @@ async fn run_command(
             let stderr = finish_output(stderr).await;
             tracing::warn!(
                 extension = extension.id,
-                event = event.kind,
+                event,
                 timeout_ms = HOOK_TIMEOUT.as_millis(),
                 stdout = %stdout,
                 stderr = %stderr,
@@ -386,7 +575,7 @@ async fn run_command(
         Ok(status) if status.success() && input_error.is_none() => {
             tracing::debug!(
                 extension = extension.id,
-                event = event.kind,
+                event,
                 stdout = %stdout,
                 stderr = %stderr,
                 "extension hook completed"
@@ -394,7 +583,7 @@ async fn run_command(
         }
         Ok(status) => tracing::warn!(
             extension = extension.id,
-            event = event.kind,
+            event,
             exit_status = %status,
             input_error = ?input_error,
             stdout = %stdout,
@@ -403,7 +592,7 @@ async fn run_command(
         ),
         Err(error) => tracing::warn!(
             extension = extension.id,
-            event = event.kind,
+            event,
             %error,
             stdout = %stdout,
             stderr = %stderr,
@@ -1092,6 +1281,39 @@ scope = "tab"
         );
     }
 
+    #[test]
+    fn client_hook_payload_is_exact_and_versioned() {
+        let previous = ClientSession {
+            id: SessionId::new(),
+            name: "previous".into(),
+        };
+        let event = ClientHookEvent {
+            kind: "client.session_changed",
+            session: ClientSession {
+                id: SessionId::new(),
+                name: "current".into(),
+            },
+            previous_session: Some(previous.clone()),
+        };
+
+        let payload: serde_json::Value = serde_json::from_slice(&event.payload().unwrap()).unwrap();
+        assert_eq!(
+            payload,
+            json!({
+                "version": 1,
+                "event": "client.session_changed",
+                "session": {
+                    "id": event.session.id,
+                    "name": "current",
+                },
+                "previous_session": {
+                    "id": previous.id,
+                    "name": "previous",
+                },
+            })
+        );
+    }
+
     #[tokio::test]
     async fn hook_receives_direct_argv_cwd_environment_and_stdin() {
         let temporary = executable_hook(
@@ -1151,6 +1373,101 @@ scope = "tab"
             )
             .unwrap()["event"],
             event.kind
+        );
+    }
+
+    #[tokio::test]
+    async fn client_hook_receives_client_lifecycle_environment_and_stdin() {
+        let temporary = executable_hook(
+            "id = 'capture-client'\n[hooks]\n'client.attached' = ['./hook']\n",
+            "#!/bin/sh\nenv | sort > environment\ncat > payload\n",
+        );
+        let extension = load(&[temporary.path().to_owned()]).unwrap().remove(0);
+        let event = ClientHookEvent {
+            kind: "client.attached",
+            session: ClientSession {
+                id: SessionId::new(),
+                name: "project λ".into(),
+            },
+            previous_session: None,
+        };
+        let socket = temporary.path().join("fut.sock");
+
+        run_client_event(&[extension], Path::new("/opt/fut/bin/fut"), &socket, &event).await;
+
+        let environment = fs::read_to_string(temporary.path().join("environment")).unwrap();
+        for expected in [
+            "FUT_EVENT=client.attached".to_owned(),
+            format!("FUT_SESSION_ID={}", event.session.id),
+            "FUT_SESSION_NAME=project λ".to_owned(),
+            format!("FUT_SOCKET={}", socket.display()),
+        ] {
+            assert!(
+                environment.lines().any(|line| line == expected),
+                "{expected}"
+            );
+        }
+        let payload: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(temporary.path().join("payload")).unwrap())
+                .unwrap();
+        assert_eq!(payload["event"], event.kind);
+        assert_eq!(payload["session"]["name"], event.session.name);
+    }
+
+    #[tokio::test]
+    async fn client_hook_runtime_orders_attach_change_and_detach() {
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let output_path = output.path().display().to_string();
+        let temporary = executable_hook(
+            &format!(
+                "id = 'client-order'\n[hooks]\n'client.attached' = ['./hook', {:?}]\n'client.session_changed' = ['./hook', {:?}]\n'client.detached' = ['./hook', {:?}]\n",
+                output_path, output_path, output_path
+            ),
+            "#!/bin/sh\nprintf '%s %s\\n' \"$FUT_EVENT\" \"$FUT_SESSION_NAME\" >> \"$1\"\n",
+        );
+        let extension = load(&[temporary.path().to_owned()]).unwrap().remove(0);
+        let first = ClientSession {
+            id: SessionId::new(),
+            name: "first".into(),
+        };
+        let second = ClientSession {
+            id: SessionId::new(),
+            name: "second".into(),
+        };
+        let mut runtime = ClientHookRuntime::new(
+            vec![extension],
+            PathBuf::from("/opt/fut/bin/fut"),
+            temporary.path().join("fut.sock"),
+        );
+
+        runtime.observe_session(first.clone());
+        runtime.observe_session(first);
+        runtime.observe_session(second);
+        runtime.shutdown().await;
+
+        assert_eq!(
+            fs::read_to_string(output.path()).unwrap(),
+            "client.attached first\nclient.session_changed second\nclient.detached second\n"
+        );
+    }
+
+    #[test]
+    fn checked_in_ghostty_title_extension_uses_only_client_hooks() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/extensions/ghostty-title");
+        let extension = load(&[root]).unwrap().remove(0);
+
+        assert_eq!(extension.id(), "ghostty-title");
+        assert_eq!(
+            extension
+                .hooks
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "client.attached",
+                "client.detached",
+                "client.session_changed"
+            ]
         );
     }
 

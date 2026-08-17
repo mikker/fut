@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+
+if [ "${TERM_PROGRAM:-}" != "ghostty" ] && [ -z "${GHOSTTY_RESOURCES_DIR:-}" ]; then
+  exit 0
+fi
+
+case "$FUT_EVENT" in
+  client.attached)
+    title="$(printf '%s' "$FUT_SESSION_NAME" | LC_ALL=C tr -d '[:cntrl:]')"
+    printf '\033[22;2t\033]2;%s\033\\' "$title" > /dev/tty
+    ;;
+  client.session_changed)
+    title="$(printf '%s' "$FUT_SESSION_NAME" | LC_ALL=C tr -d '[:cntrl:]')"
+    printf '\033]2;%s\033\\' "$title" > /dev/tty
+    ;;
+  client.detached)
+    printf '\033[23;2t' > /dev/tty
+    ;;
+esac
