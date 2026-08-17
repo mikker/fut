@@ -10,7 +10,10 @@ depends = ["fmt", "clippy", "test"]
 run = "cargo build"
 
 [tasks."build:all"]
-run = "cargo build --all-targets --all-features"
+run = '''
+cargo build --all-targets --all-features
+cargo build --release --all-targets --all-features
+'''
 
 [tasks.fmt]
 run = "cargo fmt --check"
