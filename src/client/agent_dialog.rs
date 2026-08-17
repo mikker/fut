@@ -104,13 +104,12 @@ impl AgentsDialog {
                             | KeyModifiers::SUPER
                             | KeyModifiers::HYPER
                             | KeyModifiers::META,
-                    ) =>
+                    )
+                    && self.query.len() + character.len_utf8() <= MAX_QUERY_BYTES =>
             {
-                if self.query.len() + character.len_utf8() <= MAX_QUERY_BYTES {
-                    self.query.push(character);
-                    self.refilter();
-                    self.ensure_selected_match();
-                }
+                self.query.push(character);
+                self.refilter();
+                self.ensure_selected_match();
             }
             _ => {}
         }
