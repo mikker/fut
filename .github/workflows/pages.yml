@@ -24,12 +24,12 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: actions/configure-pages@v5
+      - name: Add installer to site source
+        run: cp install.sh docs/install.sh
       - uses: actions/jekyll-build-pages@v1
         with:
           source: ./docs
           destination: ./_site
-      - name: Add installer
-        run: cp install.sh _site/install.sh
       - uses: actions/upload-pages-artifact@v3
 
   deploy:
