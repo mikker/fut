@@ -219,19 +219,26 @@ pub async fn attach(
 pub async fn attach_navigator(socket_path: &Path, config_dir: Option<&Path>) -> anyhow::Result<()> {
     let ui = load_ui_config(config_dir)?;
     let mut navigator_connection = connect_control_navigator(socket_path).await?;
-    let snapshot = match time::timeout(Duration::from_secs(2), receive(&mut navigator_connection))
-        .await
-        .context("daemon resource snapshot timed out")??
-    {
-        ServerMessage::Resources { snapshot } => snapshot,
-        ServerMessage::Error { code, message } => bail!("daemon error ({code}): {message}"),
-        message => bail!("expected resources from daemon, received {message:?}"),
-    };
+    let (snapshot, presence) =
+        match time::timeout(Duration::from_secs(2), receive(&mut navigator_connection))
+            .await
+            .context("daemon resource snapshot timed out")??
+        {
+            ServerMessage::Resources { snapshot, presence } => (snapshot, presence),
+            ServerMessage::Error { code, message } => bail!("daemon error ({code}): {message}"),
+            message => bail!("expected resources from daemon, received {message:?}"),
+        };
 
     let guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let selector =
-        initial_navigator(&mut terminal, &mut navigator_connection, snapshot, &ui).await?;
+    let selector = initial_navigator(
+        &mut terminal,
+        &mut navigator_connection,
+        snapshot,
+        presence,
+        &ui,
+    )
+    .await?;
     drop(navigator_connection);
     let Some(selector) = selector else {
         drop(terminal);
@@ -374,10 +381,12 @@ async fn initial_navigator(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     snapshot: ResourceSnapshot,
+    presence: crate::protocol::ClientPresenceSnapshot,
     ui: &UiConfig,
 ) -> anyhow::Result<Option<TargetSelector>> {
     let mut navigator = NavigatorState::open();
     navigator.accept_global_resources(&snapshot);
+    navigator.accept_presence(&presence);
     let mut events = EventStream::new();
     let mut termination = TerminationSignals::subscribe()?;
     loop {
@@ -406,8 +415,15 @@ async fn initial_navigator(
                 let Some(frame) = frame else { bail!("daemon disconnected while navigator was open") };
                 let envelope: Envelope<ServerMessage> = decode_payload(&frame?)?;
                 match envelope.message {
-                    ServerMessage::ResourcesChanged { snapshot } | ServerMessage::Resources { snapshot } => {
+                    ServerMessage::ResourcesChanged { snapshot } => {
                         navigator.accept_global_resources(&snapshot);
+                    }
+                    ServerMessage::Resources { snapshot, presence } => {
+                        navigator.accept_global_resources(&snapshot);
+                        navigator.accept_presence(&presence);
+                    }
+                    ServerMessage::PresenceChanged { presence } => {
+                        navigator.accept_presence(&presence);
                     }
                     ServerMessage::Error { code, message } => bail!("daemon error ({code}): {message}"),
                     _ => {}
@@ -705,7 +721,8 @@ async fn run_loop(
                             }
                         }
                     }
-                    ServerMessage::Resources { snapshot } => {
+                    ServerMessage::Resources { snapshot, presence } => {
+                        let presence_changed = resources.accept_presence(presence);
                         if resources.accept(snapshot) {
                             let snapshot = resources.snapshot().expect("accepted resources exist");
                             client_hooks.observe(snapshot, view.focused());
@@ -716,6 +733,7 @@ async fn run_loop(
                                 &workspace_history,
                                 resources.notifications(),
                             );
+                            refresh_surface_presence(&mut surface, resources.presence());
                             reconcile_resource_barriers(
                                 snapshot,
                                 &mut create_workspace,
@@ -730,6 +748,9 @@ async fn run_loop(
                                 &resources,
                                 &ui,
                             ).await?;
+                            force_draw = true;
+                        } else if presence_changed {
+                            refresh_surface_presence(&mut surface, resources.presence());
                             force_draw = true;
                         }
                     }
@@ -758,6 +779,12 @@ async fn run_loop(
                                 &resources,
                                 &ui,
                             ).await?;
+                            force_draw = true;
+                        }
+                    }
+                    ServerMessage::PresenceChanged { presence } => {
+                        if resources.accept_presence(presence) {
+                            refresh_surface_presence(&mut surface, resources.presence());
                             force_draw = true;
                         }
                     }
@@ -2502,6 +2529,15 @@ fn refresh_surface_resources(
     }
 }
 
+fn refresh_surface_presence(
+    surface: &mut Option<ClientSurface>,
+    presence: &crate::protocol::ClientPresenceSnapshot,
+) {
+    if let Some(ClientSurface::Navigator(navigator)) = surface.as_mut() {
+        navigator.accept_presence(presence);
+    }
+}
+
 fn reconcile_resource_barriers(
     snapshot: &crate::resources::ResourceSnapshot,
     create_workspace: &mut CreateState,
@@ -3228,6 +3264,7 @@ async fn dispatch_client_action(
                     resources.notifications(),
                 );
             }
+            navigator.accept_presence(resources.presence());
             *surface = Some(ClientSurface::Navigator(navigator));
         }
         ClientAction::OpenLeftSidebar | ClientAction::OpenRightSidebar => {

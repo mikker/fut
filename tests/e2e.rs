@@ -467,7 +467,7 @@ impl Harness {
     }
 
     async fn resources(&self) -> fut::resources::ResourceSnapshot {
-        let ServerMessage::Resources { snapshot } =
+        let ServerMessage::Resources { snapshot, .. } =
             self.control_command(ClientMessage::ListResources).await
         else {
             panic!("expected resources response")
@@ -2453,7 +2453,7 @@ async fn daemon_git_tokens_publish_atomic_shared_snapshots_and_clear_when_git_di
             ServerMessage::Welcome { .. }
         ));
         send(&mut watcher, ClientMessage::WatchResources).await;
-        let ServerMessage::Resources { snapshot } = receive(&mut watcher).await.unwrap() else {
+        let ServerMessage::Resources { snapshot, .. } = receive(&mut watcher).await.unwrap() else {
             panic!("expected initial resources")
         };
         assert_eq!(workspace_git_tokens(&snapshot), [Some("main"), None, None]);
@@ -7471,7 +7471,7 @@ async fn public_mouse_resizes_nested_shared_splits_without_stealing_application_
     let (mut reattached, selected) = attach_once(&harness, TargetSelector::Pane(pane_a)).await;
     assert_eq!(selected.tab_id, tab_id);
     send(&mut reattached, ClientMessage::ListResources).await;
-    let ServerMessage::Resources { snapshot } = receive_matching(&mut reattached, |message| {
+    let ServerMessage::Resources { snapshot, .. } = receive_matching(&mut reattached, |message| {
         matches!(message, ServerMessage::Resources { .. })
     })
     .await

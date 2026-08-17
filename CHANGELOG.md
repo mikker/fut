@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Styled the focused workspace title like the focused tab, including Nerd Font pill caps, without a redundant active marker.
+- The navigator now identifies and dims sessions already open in another Fut client.
 - Fixed the bundled `wt` command not switching to newly created worktrees.
 - Fixed linked filenames bleeding through or breaking the borders of dialogs drawn over terminal content.
 - Added client lifecycle hooks and a Ghostty extension that follows the active Fut session in the window title and restores the previous title on detach.

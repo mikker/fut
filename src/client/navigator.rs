@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::{
     domain::{PaneId, SessionId, TabId, WorkspaceId},
-    protocol::SelectedTarget,
+    protocol::{ClientPresenceSnapshot, SelectedTarget},
     resources::{ResourceSnapshot, TargetSelector},
 };
 
@@ -68,6 +68,7 @@ impl ResourceFilter {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct NavigatorRow {
     pub key: ResourceKey,
+    pub session_id: SessionId,
     pub depth: u16,
     pub label: String,
     pub inline_pane: Option<PaneId>,
@@ -76,6 +77,7 @@ pub(super) struct NavigatorRow {
     pub closing: bool,
     pub destination: Option<PaneId>,
     pub activity: Option<ActivityIndicator>,
+    pub open_elsewhere: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -96,6 +98,8 @@ pub(super) struct NavigatorState {
     pub scroll: usize,
     pub status: NavigatorStatus,
     pub resource_revision: Option<u64>,
+    presence: ClientPresenceSnapshot,
+    current_session: Option<SessionId>,
     pub switch_request: Option<Uuid>,
 }
 
@@ -116,6 +120,8 @@ impl NavigatorState {
             scroll: 0,
             status: NavigatorStatus::Loading,
             resource_revision: None,
+            presence: ClientPresenceSnapshot::default(),
+            current_session: None,
             switch_request: None,
         }
     }
@@ -172,6 +178,10 @@ impl NavigatorState {
         let old_index = self.selected;
         let previous_status = self.status.clone();
         self.rows = flatten_optional(snapshot, current, history, notifications);
+        self.current_session = self.rows.iter().find_map(|row| {
+            (row.current && matches!(row.key, ResourceKey::Session(_))).then_some(row.session_id)
+        });
+        self.apply_presence();
         self.refilter();
         self.resource_revision = Some(snapshot.revision);
         self.status = match previous_status {
@@ -193,6 +203,22 @@ impl NavigatorState {
         }
         self.ensure_selected_match();
         true
+    }
+
+    pub fn accept_presence(&mut self, presence: &ClientPresenceSnapshot) -> bool {
+        if presence.revision <= self.presence.revision {
+            return false;
+        }
+        self.presence = presence.clone();
+        self.apply_presence();
+        true
+    }
+
+    fn apply_presence(&mut self) {
+        for row in &mut self.rows {
+            let own_client = usize::from(self.current_session == Some(row.session_id));
+            row.open_elsewhere = self.presence.client_count(row.session_id) > own_client;
+        }
     }
 
     pub fn key(&mut self, key: KeyEvent, visible_rows: usize) -> NavigatorAction {
@@ -606,7 +632,9 @@ impl NavigatorState {
                             " "
                         };
                         let mut style = styles.apply(row.key.style(), Style::default());
-                        if row.closing {
+                        if row.closing
+                            || (row.open_elsewhere && self.current_session != Some(row.session_id))
+                        {
                             style = style.add_modifier(Modifier::DIM);
                         }
                         if row.current && !matches!(row.key, ResourceKey::Pane(_)) {
@@ -628,6 +656,12 @@ impl NavigatorState {
                             if row.inline_pane.is_some() {
                                 spans.push(Span::styled(
                                     " · pane",
+                                    styles.apply(SemanticStyle::Muted, style),
+                                ));
+                            }
+                            if row.open_elsewhere && matches!(row.key, ResourceKey::Session(_)) {
+                                spans.push(Span::styled(
+                                    " · open elsewhere",
                                     styles.apply(SemanticStyle::Muted, style),
                                 ));
                             }
@@ -862,6 +896,7 @@ fn flatten_optional(
         let session_current = Some(session.id) == current_session_id;
         rows.push(NavigatorRow {
             key: ResourceKey::Session(session.id),
+            session_id: session.id,
             depth: 0,
             label: session.name.clone(),
             inline_pane: None,
@@ -880,6 +915,7 @@ fn flatten_optional(
                     .cloned()
                     .collect::<Vec<_>>(),
             ),
+            open_elsewhere: false,
         });
         for workspace in &session.workspaces {
             let workspace_path = format!("{session_path} › {}", workspace.name);
@@ -887,6 +923,7 @@ fn flatten_optional(
             let workspace_current = session_current && Some(workspace.id) == current_workspace_id;
             rows.push(NavigatorRow {
                 key: ResourceKey::Workspace(workspace.id),
+                session_id: session.id,
                 depth: 1,
                 label: workspace.name.clone(),
                 inline_pane: None,
@@ -904,6 +941,7 @@ fn flatten_optional(
                         .cloned()
                         .collect::<Vec<_>>(),
                 ),
+                open_elsewhere: false,
             });
             for (tab_index, tab) in workspace.tabs.iter().enumerate() {
                 let tab_label = if tab.name.is_empty() {
@@ -921,6 +959,7 @@ fn flatten_optional(
                 let tab_row_closing = tab_closing || single_pane.is_some_and(|pane| pane.closing);
                 rows.push(NavigatorRow {
                     key: ResourceKey::Tab(tab.id),
+                    session_id: session.id,
                     depth: 2,
                     label: tab_label,
                     inline_pane: single_pane.map(|pane| pane.id),
@@ -932,6 +971,7 @@ fn flatten_optional(
                         .then(|| history.tab_destination(tab))
                         .flatten(),
                     activity: notifications.indicator(&tab.panes),
+                    open_elsewhere: false,
                 });
                 if single_pane.is_some() {
                     continue;
@@ -940,6 +980,7 @@ fn flatten_optional(
                     let pane_closing = tab_closing || pane.closing;
                     rows.push(NavigatorRow {
                         key: ResourceKey::Pane(pane.id),
+                        session_id: session.id,
                         depth: 3,
                         label: format!("pane {}", index + 1),
                         inline_pane: None,
@@ -948,6 +989,7 @@ fn flatten_optional(
                         closing: pane_closing,
                         destination: (!pane_closing).then_some(pane.id),
                         activity: notifications.indicator(std::slice::from_ref(pane)),
+                        open_elsewhere: false,
                     });
                 }
             }
@@ -1143,6 +1185,43 @@ mod tests {
             nav.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 10),
             NavigatorAction::Select(TargetSelector::Pane(pane_id)) if pane_id == current.pane_id
         ));
+    }
+
+    #[test]
+    fn presence_dims_sessions_open_in_another_client_but_not_the_current_session() {
+        let (snapshot, current, _) = fixture();
+        let presence = ClientPresenceSnapshot {
+            revision: 1,
+            sessions: vec![crate::protocol::SessionPresence {
+                session_id: current.session_id,
+                clients: 1,
+            }],
+        };
+
+        let mut global = NavigatorState::open();
+        global.accept_global_resources(&snapshot);
+        assert!(global.accept_presence(&presence));
+        assert!(global.rows.iter().all(|row| row.open_elsewhere));
+        let (global_text, global_buffer) = rendered(&mut global, 50, 8);
+        assert!(global_text.contains("sessión 🛰 · open elsewhere"));
+        assert!(global_buffer[(1, 2)].modifier.contains(Modifier::DIM));
+
+        let mut local = NavigatorState::open();
+        local.accept_resources(&snapshot, &current);
+        local.accept_presence(&presence);
+        assert!(local.rows.iter().all(|row| !row.open_elsewhere));
+
+        let shared_presence = ClientPresenceSnapshot {
+            revision: 2,
+            sessions: vec![crate::protocol::SessionPresence {
+                session_id: current.session_id,
+                clients: 2,
+            }],
+        };
+        local.accept_presence(&shared_presence);
+        assert!(local.rows.iter().all(|row| row.open_elsewhere));
+        let (_, local_buffer) = rendered(&mut local, 50, 8);
+        assert!(!local_buffer[(1, 2)].modifier.contains(Modifier::DIM));
     }
 
     #[test]
@@ -1474,6 +1553,7 @@ mod tests {
     fn tree() -> NavigatorState {
         let row = |depth: u16| NavigatorRow {
             key: ResourceKey::Pane(PaneId::new()),
+            session_id: SessionId::new(),
             depth,
             label: String::new(),
             inline_pane: None,
@@ -1482,6 +1562,7 @@ mod tests {
             closing: false,
             destination: None,
             activity: None,
+            open_elsewhere: false,
         };
         let mut nav = NavigatorState::open();
         nav.rows = [0, 1, 2, 3, 3, 2, 3, 1, 2, 3, 0, 1, 2, 3]

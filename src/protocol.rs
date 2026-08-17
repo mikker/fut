@@ -21,10 +21,32 @@ use crate::{
 /// Protocol version used by released Fut 0.1 builds.
 pub const PROTOCOL_VERSION_0_1: u16 = 0;
 /// Current clients and daemons require an exact protocol match.
-pub const PROTOCOL_VERSION: u16 = 22;
+pub const PROTOCOL_VERSION: u16 = 23;
 /// Enough for 50,000 individually styled MessagePack-encoded cells while
 /// remaining a firm pre-allocation bound for the length-delimited transport.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClientPresenceSnapshot {
+    pub revision: u64,
+    pub sessions: Vec<SessionPresence>,
+}
+
+impl ClientPresenceSnapshot {
+    #[must_use]
+    pub fn client_count(&self, session_id: SessionId) -> usize {
+        self.sessions
+            .iter()
+            .find(|session| session.session_id == session_id)
+            .map_or(0, |session| session.clients as usize)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SessionPresence {
+    pub session_id: SessionId,
+    pub clients: u32,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Envelope<T> {
@@ -312,10 +334,11 @@ pub enum ClientMessage {
         command: ContextualCommand,
     },
     ListResources,
-    /// Ask a control connection to stream resource changes: the correlated
-    /// response is a [`ServerMessage::Resources`] snapshot of the current
-    /// state, followed by an unsolicited [`ServerMessage::ResourcesChanged`]
-    /// for every later change.
+    /// Ask a control connection to stream resource and interactive-client
+    /// presence changes. The correlated response is a
+    /// [`ServerMessage::Resources`] snapshot of both, followed by unsolicited
+    /// [`ServerMessage::ResourcesChanged`] and [`ServerMessage::PresenceChanged`]
+    /// updates.
     WatchResources,
     CloseTarget {
         selector: TargetSelector,
@@ -390,9 +413,13 @@ pub enum ServerMessage {
     },
     Resources {
         snapshot: ResourceSnapshot,
+        presence: ClientPresenceSnapshot,
     },
     ResourcesChanged {
         snapshot: ResourceSnapshot,
+    },
+    PresenceChanged {
+        presence: ClientPresenceSnapshot,
     },
     Snapshot {
         terminal_id: TerminalId,
@@ -1129,6 +1156,7 @@ mod tests {
                 revision: 9,
                 sessions: vec![],
             },
+            presence: ClientPresenceSnapshot::default(),
         };
         assert_eq!(
             decode_payload::<ServerMessage>(&encode_payload(&resources).unwrap()).unwrap(),
@@ -1166,7 +1194,7 @@ mod tests {
             switched
         );
         assert_eq!(PROTOCOL_VERSION_0_1, 0);
-        assert_eq!(PROTOCOL_VERSION, 22);
+        assert_eq!(PROTOCOL_VERSION, 23);
 
         let watch = ClientMessage::WatchResources;
         assert_eq!(
@@ -1291,6 +1319,20 @@ mod tests {
         assert_eq!(
             decode_payload::<Envelope<ServerMessage>>(&encode_payload(&envelope).unwrap()).unwrap(),
             envelope
+        );
+
+        let presence = ServerMessage::PresenceChanged {
+            presence: ClientPresenceSnapshot {
+                revision: 3,
+                sessions: vec![SessionPresence {
+                    session_id: SessionId::new(),
+                    clients: 2,
+                }],
+            },
+        };
+        assert_eq!(
+            decode_payload::<ServerMessage>(&encode_payload(&presence).unwrap()).unwrap(),
+            presence
         );
     }
 

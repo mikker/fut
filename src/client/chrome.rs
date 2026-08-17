@@ -9,7 +9,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     domain::TabId,
-    protocol::SelectedTarget,
+    protocol::{ClientPresenceSnapshot, SelectedTarget},
     resources::{MaterializedTokenMap, ResourceSnapshot},
 };
 
@@ -181,6 +181,7 @@ static NOTIFICATIONS: NotificationState = NotificationState::new();
 #[derive(Default)]
 pub(super) struct ResourceState {
     snapshot: Option<ResourceSnapshot>,
+    presence: ClientPresenceSnapshot,
 }
 
 impl ResourceState {
@@ -198,6 +199,18 @@ impl ResourceState {
 
     pub fn snapshot(&self) -> Option<&ResourceSnapshot> {
         self.snapshot.as_ref()
+    }
+
+    pub fn accept_presence(&mut self, presence: ClientPresenceSnapshot) -> bool {
+        if presence.revision <= self.presence.revision {
+            return false;
+        }
+        self.presence = presence;
+        true
+    }
+
+    pub fn presence(&self) -> &ClientPresenceSnapshot {
+        &self.presence
     }
 
     pub fn notifications(&self) -> &NotificationState {

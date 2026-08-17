@@ -2561,7 +2561,7 @@ async fn stream_events(socket: &std::path::Path) -> Result<()> {
     )
     .await?
     {
-        ServerMessage::Resources { snapshot } => output(true, "events", &snapshot, "")?,
+        ServerMessage::Resources { snapshot, .. } => output(true, "events", &snapshot, "")?,
         other => return unexpected(other),
     }
     while let Some(frame) = framed.next().await {
@@ -2570,6 +2570,7 @@ async fn stream_events(socket: &std::path::Path) -> Result<()> {
             ServerMessage::ResourcesChanged { snapshot } => {
                 output(true, "events", &snapshot, "")?;
             }
+            ServerMessage::PresenceChanged { .. } => {}
             other => return unexpected(other),
         }
     }
@@ -2585,7 +2586,7 @@ fn session_selector(value: &str) -> SessionSelector {
 
 async fn list_resources(socket: &std::path::Path) -> Result<ResourceSnapshot> {
     match control(socket, ClientMessage::ListResources).await? {
-        ServerMessage::Resources { snapshot } => Ok(snapshot),
+        ServerMessage::Resources { snapshot, .. } => Ok(snapshot),
         other => unexpected(other),
     }
 }

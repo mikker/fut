@@ -138,7 +138,7 @@ fn fetch_snapshot() -> Option<ResourceSnapshot> {
         )
         .await
         {
-            Ok(Ok(ServerMessage::Resources { snapshot })) => Some(snapshot),
+            Ok(Ok(ServerMessage::Resources { snapshot, .. })) => Some(snapshot),
             _ => None,
         }
     })

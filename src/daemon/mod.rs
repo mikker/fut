@@ -3,6 +3,7 @@
 mod git;
 mod lease;
 pub mod path;
+mod presence;
 
 pub mod autostart;
 
@@ -47,10 +48,10 @@ use crate::{
     },
     project::{ProjectError, ProjectResolver, ResolvedLocation},
     protocol::{
-        AcknowledgedCommand, ClientMessage, ClientMode, ContextScope, ContextualCommand, Envelope,
-        OpenDisposition, PROTOCOL_VERSION, RenameSelector, SelectedTarget, SelectedView,
-        SelectionExpectation, ServerMessage, TerminalContext, TerminalInputOperation, codec,
-        decode_payload, encode_payload,
+        AcknowledgedCommand, ClientMessage, ClientMode, ClientPresenceSnapshot, ContextScope,
+        ContextualCommand, Envelope, OpenDisposition, PROTOCOL_VERSION, RenameSelector,
+        SelectedTarget, SelectedView, SelectionExpectation, ServerMessage, TerminalContext,
+        TerminalInputOperation, codec, decode_payload, encode_payload,
     },
     resources::{
         CheckoutDestination, InitialPath, Mutation, PresentationTokenTarget, ResourceError,
@@ -65,6 +66,7 @@ use crate::{
 
 use lease::AttachmentLease;
 use path::prepare_runtime_dir;
+use presence::ClientPresence;
 
 #[derive(Clone, Debug)]
 pub struct DaemonConfig {
@@ -109,6 +111,7 @@ struct RuntimeEntry {
 struct SharedState {
     resources: ResourceTree,
     runtimes: HashMap<TerminalId, RuntimeEntry>,
+    presence: ClientPresence,
     expected_finalizations: HashSet<TerminalId>,
     exited_terminals: VecDeque<(TerminalId, Option<i32>)>,
     resource_changes: watch::Sender<u64>,
@@ -694,6 +697,7 @@ struct Attachment {
     resource_revision: u64,
     streamed_resource_revision: u64,
     resource_changes: watch::Receiver<u64>,
+    presence_changes: watch::Receiver<ClientPresenceSnapshot>,
     updates: mpsc::Receiver<AttachmentUpdate>,
     update_sender: mpsc::Sender<AttachmentUpdate>,
     watchers: HashMap<TerminalId, (u64, JoinHandle<()>)>,
@@ -719,6 +723,7 @@ impl Attachment {
         fallback_terminal_ids: Vec<TerminalId>,
         resource_revision: u64,
         resource_changes: watch::Receiver<u64>,
+        presence_changes: watch::Receiver<ClientPresenceSnapshot>,
     ) -> Self {
         let (update_sender, updates) = mpsc::channel(ATTACHMENT_UPDATE_CAPACITY);
         let size = focused
@@ -735,6 +740,7 @@ impl Attachment {
             resource_revision,
             streamed_resource_revision: resource_revision,
             resource_changes,
+            presence_changes,
             updates,
             update_sender,
             watchers: HashMap::new(),
@@ -1351,6 +1357,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     let mut state = SharedState {
         resources: ResourceTree::default(),
         runtimes: HashMap::new(),
+        presence: ClientPresence::default(),
         expected_finalizations: HashSet::new(),
         exited_terminals: VecDeque::new(),
         resource_changes,
@@ -2165,6 +2172,7 @@ async fn handle_connection(
         return Ok(());
     }
     let client = ClientId::new();
+    let presence = shared.lock().await.presence.clone();
     let (leased, interactive_size) = match mode {
         ClientMode::Interactive { size, selector } => {
             if let Err(error) = size.validate() {
@@ -2210,6 +2218,9 @@ async fn handle_connection(
         }
         ClientMode::Control => (None, None),
     };
+    let mut presence = leased
+        .as_ref()
+        .map(|attachment| presence.attach(client, attachment.focused.selected.session_id));
     send(
         &mut connection,
         first.request_id,
@@ -2532,6 +2543,10 @@ async fn handle_connection(
                                     continue;
                                 }
                                 attachment = candidate;
+                                presence
+                                    .as_mut()
+                                    .expect("interactive client has presence")
+                                    .select(attachment.focused.selected.session_id);
                                 send(
                                     &mut connection,
                                     envelope.request_id,
@@ -2716,8 +2731,11 @@ async fn handle_connection(
                         }
                     }
                     ClientMessage::ListResources => {
-                        let snapshot = shared.lock().await.resources.snapshot();
-                        send(&mut connection, envelope.request_id, ServerMessage::Resources { snapshot }).await?;
+                        let (snapshot, presence) = {
+                            let state = shared.lock().await;
+                            (state.resources.snapshot(), state.presence.snapshot())
+                        };
+                        send(&mut connection, envelope.request_id, ServerMessage::Resources { snapshot, presence }).await?;
                     }
                     ClientMessage::AcknowledgeAgent { terminal_id, event_revision } => {
                         let result = shared
@@ -2824,6 +2842,17 @@ async fn handle_connection(
                     ).await?;
                 }
             }
+            changed = attachment.presence_changes.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let presence = attachment.presence_changes.borrow_and_update().clone();
+                send(
+                    &mut connection,
+                    None,
+                    ServerMessage::PresenceChanged { presence },
+                ).await?;
+            }
             update = attachment.updates.recv() => match update {
                 Some(AttachmentUpdate::Snapshot { terminal_id, generation, screen }) => {
                     match attachment.snapshot_for_update(terminal_id, generation, screen).await {
@@ -2907,6 +2936,10 @@ async fn handle_connection(
                             break;
                         }
                         attachment = replacement;
+                        presence
+                            .as_mut()
+                            .expect("interactive client has presence")
+                            .select(attachment.focused.selected.session_id);
                     } else {
                         attachment.remove(terminal_id);
                     }
@@ -2949,6 +2982,7 @@ async fn control_loop(
     shutdown: watch::Sender<bool>,
 ) -> Result<()> {
     let mut watched_changes: Option<watch::Receiver<u64>> = None;
+    let mut watched_presence: Option<watch::Receiver<ClientPresenceSnapshot>> = None;
     let mut retirement = None;
     loop {
         let frame = tokio::select! {
@@ -2959,6 +2993,18 @@ async fn control_loop(
                 }
                 let snapshot = shared.lock().await.resources.snapshot();
                 send(connection, None, ServerMessage::ResourcesChanged { snapshot }).await?;
+                continue;
+            }
+            changed = watched_presence_change(&mut watched_presence) => {
+                if changed.is_err() {
+                    break;
+                }
+                let presence = watched_presence
+                    .as_mut()
+                    .expect("presence receiver is installed")
+                    .borrow_and_update()
+                    .clone();
+                send(connection, None, ServerMessage::PresenceChanged { presence }).await?;
                 continue;
             }
         };
@@ -3187,26 +3233,30 @@ async fn control_loop(
                 }
             }
             ClientMessage::ListResources => {
-                let snapshot = shared.lock().await.resources.snapshot();
+                let (snapshot, presence) = {
+                    let state = shared.lock().await;
+                    (state.resources.snapshot(), state.presence.snapshot())
+                };
                 send(
                     connection,
                     envelope.request_id,
-                    ServerMessage::Resources { snapshot },
+                    ServerMessage::Resources { snapshot, presence },
                 )
                 .await?;
             }
             ClientMessage::WatchResources => {
                 // Subscribing and snapshotting under one lock leaves no gap in
                 // which a change could go unstreamed.
-                let snapshot = {
+                let (snapshot, presence) = {
                     let state = shared.lock().await;
                     watched_changes = Some(state.resource_changes.subscribe());
-                    state.resources.snapshot()
+                    watched_presence = Some(state.presence.subscribe());
+                    (state.resources.snapshot(), state.presence.snapshot())
                 };
                 send(
                     connection,
                     envelope.request_id,
-                    ServerMessage::Resources { snapshot },
+                    ServerMessage::Resources { snapshot, presence },
                 )
                 .await?;
             }
@@ -3727,6 +3777,15 @@ async fn watched_resource_change(
     }
 }
 
+async fn watched_presence_change(
+    changes: &mut Option<watch::Receiver<ClientPresenceSnapshot>>,
+) -> Result<(), tokio::sync::watch::error::RecvError> {
+    match changes {
+        Some(changes) => changes.changed().await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn lease_view(
     shared: &Shared,
     selector: Option<TargetSelector>,
@@ -3799,6 +3858,7 @@ async fn lease_view(
         fallback_terminal_ids,
         state.resources.revision(),
         state.resource_changes.subscribe(),
+        state.presence.subscribe(),
     ))
 }
 
@@ -6217,6 +6277,7 @@ mod tests {
         };
         let guard = lease.acquire(owner, size, Arc::clone(&terminal)).unwrap();
         let (_, resource_changes) = watch::channel(0);
+        let (_, presence_changes) = watch::channel(ClientPresenceSnapshot::default());
         let attachment = Attachment::new(
             owner,
             vec![ObservedTarget {
@@ -6232,6 +6293,7 @@ mod tests {
             Vec::new(),
             0,
             resource_changes,
+            presence_changes,
         );
         (attachment, terminal)
     }
@@ -6380,6 +6442,7 @@ mod tests {
             SharedState {
                 resources,
                 runtimes: HashMap::new(),
+                presence: ClientPresence::default(),
                 expected_finalizations: HashSet::new(),
                 exited_terminals: VecDeque::new(),
                 resource_changes: watch::channel(1).0,
@@ -6702,6 +6765,7 @@ mod tests {
         let mut state = SharedState {
             resources: ResourceTree::default(),
             runtimes: HashMap::new(),
+            presence: ClientPresence::default(),
             expected_finalizations: HashSet::new(),
             exited_terminals: VecDeque::new(),
             resource_changes,
