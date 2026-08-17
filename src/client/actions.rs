@@ -88,6 +88,7 @@ pub(super) enum ClientAction {
     ReloadConfig,
     EnterCopyMode,
     OpenNavigator,
+    OpenAgents,
     OpenLeftSidebar,
     OpenRightSidebar,
     OpenTabBar,
@@ -124,11 +125,12 @@ pub(super) struct DirectBinding {
     pub action: ClientAction,
 }
 
-pub(super) const ALL_ACTIONS: [ClientAction; 40] = [
+pub(super) const ALL_ACTIONS: [ClientAction; 41] = [
     ClientAction::OpenCommandBar,
     ClientAction::ReloadConfig,
     ClientAction::EnterCopyMode,
     ClientAction::OpenNavigator,
+    ClientAction::OpenAgents,
     ClientAction::OpenLeftSidebar,
     ClientAction::OpenRightSidebar,
     ClientAction::OpenTabBar,
@@ -167,7 +169,7 @@ pub(super) const ALL_ACTIONS: [ClientAction; 40] = [
     ClientAction::Detach,
 ];
 
-pub(super) const COMMANDS: [ActionDefinition; 39] = [
+pub(super) const COMMANDS: [ActionDefinition; 40] = [
     ActionDefinition {
         action: ClientAction::ReloadConfig,
         title: "Reload configuration",
@@ -177,6 +179,11 @@ pub(super) const COMMANDS: [ActionDefinition; 39] = [
         action: ClientAction::OpenNavigator,
         title: "Open global navigator",
         keywords: "global resources sessions tabs panes switch go",
+    },
+    ActionDefinition {
+        action: ClientAction::OpenAgents,
+        title: "Open agents",
+        keywords: "agents status working blocked completed idle switch",
     },
     ActionDefinition {
         action: ClientAction::OpenLeftSidebar,
@@ -368,7 +375,7 @@ pub(super) const COMMANDS: [ActionDefinition; 39] = [
 const UP: &[u8] = b"\x1b[A";
 const DOWN: &[u8] = b"\x1b[B";
 
-pub(super) const DIRECT_BINDINGS: [DirectBinding; 40] = [
+pub(super) const DIRECT_BINDINGS: [DirectBinding; 41] = [
     DirectBinding {
         suffix: b":",
         action: ClientAction::OpenCommandBar,
@@ -384,6 +391,10 @@ pub(super) const DIRECT_BINDINGS: [DirectBinding; 40] = [
     DirectBinding {
         suffix: b"s",
         action: ClientAction::OpenNavigator,
+    },
+    DirectBinding {
+        suffix: b"a",
+        action: ClientAction::OpenAgents,
     },
     DirectBinding {
         suffix: b"w",
@@ -547,6 +558,7 @@ pub(super) const fn command_name(action: ClientAction) -> &'static str {
         ClientAction::ReloadConfig => "reload-config",
         ClientAction::EnterCopyMode => "copy-mode",
         ClientAction::OpenNavigator => "choose-tree",
+        ClientAction::OpenAgents => "choose-agent",
         ClientAction::OpenLeftSidebar => "choose-left-sidebar",
         ClientAction::OpenRightSidebar => "choose-right-sidebar",
         ClientAction::OpenTabBar => "choose-tab",
@@ -593,6 +605,7 @@ pub(super) fn config_key(action: ClientAction) -> &'static str {
         ClientAction::ReloadConfig => "reload_config",
         ClientAction::EnterCopyMode => "enter_copy_mode",
         ClientAction::OpenNavigator => "open_navigator",
+        ClientAction::OpenAgents => "open_agents",
         ClientAction::OpenLeftSidebar => "open_left_sidebar",
         ClientAction::OpenRightSidebar => "open_right_sidebar",
         ClientAction::OpenTabBar => "open_tab_bar",
@@ -681,6 +694,7 @@ const fn requires_launcher(action: ClientAction) -> bool {
         ClientAction::ReloadConfig
         | ClientAction::EnterCopyMode
         | ClientAction::OpenNavigator
+        | ClientAction::OpenAgents
         | ClientAction::OpenLeftSidebar
         | ClientAction::OpenRightSidebar
         | ClientAction::OpenTabBar

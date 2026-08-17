@@ -53,6 +53,7 @@ All bindings below follow the `Ctrl-b` prefix.
 | --- | --- |
 | `:` | Search every command and configured extension action |
 | `s` | Search sessions, workspaces, tabs, and panes |
+| `a` | Search agents and see their live status |
 | `c` / `C` | Create a tab / workspace |
 | `t` | Focus the tab bar; use arrows, Enter, `c`, or `r` |
 | `w` / `]` | Open the left / right sidebar |

@@ -7,13 +7,14 @@ use ratatui::{
 };
 
 use crate::{
-    domain::{PaneId, SessionId, TabId, TerminalId, WorkspaceId},
+    domain::{PaneId, SessionId, TerminalId, WorkspaceId},
     protocol::SelectedTarget,
     resources::{MaterializedTokenMap, PanePathRef, ResourceSnapshot},
 };
 
 use super::{
     actions::NavigationScope,
+    agents::{self, AgentItem},
     chrome::{sanitize, truncate},
     config::{
         AgentScope, IconPreset, MINIMIZED_SIDEBAR_WIDTH, SemanticStyle, SidebarComponentConfig,
@@ -85,7 +86,6 @@ fn fresh_focused_path<'a>(
 struct FocusedAncestry {
     session_id: SessionId,
     workspace_id: WorkspaceId,
-    tab_id: TabId,
 }
 
 fn focused_ancestry(snapshot: &ResourceSnapshot, focused: &SelectedTarget) -> FocusedAncestry {
@@ -93,25 +93,12 @@ fn focused_ancestry(snapshot: &ResourceSnapshot, focused: &SelectedTarget) -> Fo
         FocusedAncestry {
             session_id: focused.session_id,
             workspace_id: focused.workspace_id,
-            tab_id: focused.tab_id,
         },
         |path| FocusedAncestry {
             session_id: path.session.id,
             workspace_id: path.workspace.id,
-            tab_id: path.tab.id,
         },
     )
-}
-
-fn agent_path_in_scope(path: PanePathRef<'_>, focused: FocusedAncestry, scope: AgentScope) -> bool {
-    path_is_live(path)
-        && path.pane.activity.has_active_integration()
-        && match scope {
-            AgentScope::Tab => path.tab.id == focused.tab_id,
-            AgentScope::Workspace => path.workspace.id == focused.workspace_id,
-            AgentScope::Session => path.session.id == focused.session_id,
-            AgentScope::Global => true,
-        }
 }
 
 pub(super) fn slot_relevant(
@@ -136,9 +123,9 @@ pub(super) fn slot_relevant(
                     .count()
                     > 1
             }
-            SidebarComponentConfig::Agents { scope, .. } => snapshot
-                .pane_paths()
-                .any(|path| agent_path_in_scope(path, focused_ancestry, *scope)),
+            SidebarComponentConfig::Agents { scope, .. } => {
+                agents::has_items(snapshot, focused, *scope)
+            }
         })
 }
 
@@ -672,18 +659,6 @@ impl WorkspacesComponent {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct AgentItem {
-    terminal_id: TerminalId,
-    pane_id: PaneId,
-    session: String,
-    workspace: String,
-    tab: String,
-    source: String,
-    current: bool,
-    indicator: Option<ActivityIndicator>,
-}
-
 pub(super) struct AgentsComponent {
     items: Vec<AgentItem>,
     selected: Option<TerminalId>,
@@ -722,28 +697,7 @@ impl AgentsComponent {
         notifications: &NotificationState,
     ) {
         let selected = self.selected;
-        let focused_ancestry = focused_ancestry(snapshot, focused);
-        self.items = snapshot
-            .pane_paths()
-            .filter(|path| agent_path_in_scope(*path, focused_ancestry, self.scope))
-            .map(|path| AgentItem {
-                terminal_id: path.pane.terminal_id,
-                pane_id: path.pane.id,
-                session: sanitize(&path.session.name),
-                workspace: sanitize(&path.workspace.name),
-                tab: sanitize(&path.tab.name),
-                source: sanitize(
-                    path.pane
-                        .activity
-                        .integration
-                        .as_ref()
-                        .and_then(|integration| integration.source.as_deref())
-                        .unwrap_or("agent"),
-                ),
-                current: path.pane.id == focused.pane_id,
-                indicator: notifications.indicator(std::slice::from_ref(path.pane)),
-            })
-            .collect();
+        self.items = agents::items(snapshot, focused, notifications, self.scope);
         self.selected = selected
             .filter(|terminal_id| {
                 self.items
@@ -1350,15 +1304,11 @@ fn render_agent_row(
     ui: &UiConfig,
     buffer: &mut Buffer,
 ) {
-    let attention = matches!(
-        item.indicator,
-        Some(ActivityIndicator::Blocked | ActivityIndicator::Completed)
-    );
     let state = ItemState {
         current: item.current,
         selected,
         closing: false,
-        attention,
+        attention: false,
     };
     let style = apply_item_state(
         &ui.styles,
@@ -1366,20 +1316,13 @@ fn render_agent_row(
         ui.styles.apply(SemanticStyle::Normal, Style::default()),
     );
     clear(area, style, buffer);
-    let marker = item
-        .indicator
-        .map_or(" ", |indicator| indicator.marker(spinner_frame));
-    let activity = match item.indicator {
-        Some(ActivityIndicator::Working) => "working",
-        Some(ActivityIndicator::Blocked) => "blocked",
-        Some(ActivityIndicator::Completed) => "completed",
-        None => "idle",
-    };
-    let label = format!(
-        " {} {} {} · {}/{}/{}",
-        marker, item.source, activity, item.session, item.workspace, item.tab
+    let status_style = ui.styles.apply(item.status_style(), style);
+    buffer.set_line(
+        area.x,
+        area.y,
+        &item.line(spinner_frame, "/", style, status_style),
+        area.width,
     );
-    buffer.set_stringn(area.x, area.y, label, usize::from(area.width), style);
 }
 
 fn render_minimized_agent_row(
@@ -1391,15 +1334,11 @@ fn render_minimized_agent_row(
     ui: &UiConfig,
     buffer: &mut Buffer,
 ) {
-    let attention = matches!(
-        item.indicator,
-        Some(ActivityIndicator::Blocked | ActivityIndicator::Completed)
-    );
     let state = ItemState {
         current: item.current,
         selected,
         closing: false,
-        attention,
+        attention: false,
     };
     let base = apply_item_state(
         &ui.styles,
@@ -1413,16 +1352,10 @@ fn render_minimized_agent_row(
         9 => "0".into(),
         _ => "…".into(),
     };
-    let (activity, activity_style) = item.indicator.map_or((" ", base), |indicator| {
-        let semantic = match indicator {
-            ActivityIndicator::Working => SemanticStyle::Activity,
-            ActivityIndicator::Blocked | ActivityIndicator::Completed => SemanticStyle::Attention,
-        };
-        (
-            indicator.marker(spinner_frame),
-            ui.styles.apply(semantic, base),
-        )
-    });
+    let activity = item
+        .indicator
+        .map_or(" ", |indicator| indicator.marker(spinner_frame));
+    let activity_style = ui.styles.apply(item.status_style(), base);
     buffer.set_line(
         area.x,
         area.y,
@@ -2368,8 +2301,8 @@ mod tests {
     use crate::{
         client::config::SidebarRowConfig,
         domain::{
-            AgentActivity, AgentEvent, AgentIntegration, AgentReport, AgentState, PaneId,
-            SessionId, TabId, TerminalId,
+            AgentActivity, AgentDetection, AgentEvent, AgentIntegration, AgentReport, AgentState,
+            PaneId, SessionId, TabId, TerminalId,
         },
         resources::{
             PaneSnapshot, Project, ProjectIdentity, SessionSnapshot, TabSnapshot, WorkspaceSnapshot,
@@ -3094,6 +3027,27 @@ mod tests {
     }
 
     #[test]
+    fn screen_detected_codex_is_visible_before_its_first_lifecycle_report() {
+        let (mut snapshot, focused) = fixture(&["main"], 0);
+        let pane = &mut snapshot.sessions[0].workspaces[0].tabs[0].panes[0];
+        pane.activity.detection = Some(AgentDetection {
+            agent: "codex".into(),
+            rule: "idle_fallback".into(),
+        });
+
+        let agents = AgentsComponent::open(
+            &snapshot,
+            &focused,
+            &NotificationState::default(),
+            AgentScope::Global,
+        );
+
+        assert_eq!(agents.items.len(), 1);
+        assert_eq!(agents.items[0].source, "codex");
+        assert_eq!(agents.items[0].status(), "idle");
+    }
+
+    #[test]
     fn agents_support_every_scope_from_fresh_ancestry_and_global_navigation() {
         let (mut snapshot, mut focused) = fixture(&["current", "session-peer"], 0);
         integrate(
@@ -3343,6 +3297,10 @@ mod tests {
             agents.items[3].indicator,
             Some(ActivityIndicator::Completed)
         );
+        assert_eq!(agents.items[0].status_style(), SemanticStyle::Muted);
+        assert_eq!(agents.items[1].status_style(), SemanticStyle::Activity);
+        assert_eq!(agents.items[2].status_style(), SemanticStyle::Error);
+        assert_eq!(agents.items[3].status_style(), SemanticStyle::Added);
 
         snapshot.sessions[0].workspaces[3].tabs[0].panes[0]
             .activity

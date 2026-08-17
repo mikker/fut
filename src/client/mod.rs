@@ -1,6 +1,8 @@
 //! Interactive terminal client for a running Fut daemon.
 
 mod actions;
+mod agent_dialog;
+mod agents;
 mod cheatsheet;
 mod chrome;
 mod command_bar;
@@ -27,6 +29,7 @@ mod toast;
 use std::{collections::HashMap, io, num::NonZeroU16, path::Path, process::Stdio, time::Duration};
 
 use actions::{ClientAction, FocusDirection, HistoryScope, NavigationScope};
+use agent_dialog::{AgentsAction, AgentsDialog};
 use anyhow::{Context, bail};
 use bytes::Bytes;
 use chrome::{
@@ -103,6 +106,7 @@ use crate::{
 
 enum ClientSurface {
     Navigator(NavigatorState),
+    Agents(AgentsDialog),
     Notifications(NotificationsDialog),
     Sidebar(SidebarState),
     TabBar(TabBarState),
@@ -1362,6 +1366,52 @@ async fn run_loop(
                             }
                         }
                     }
+                    Event::Key(key) if matches!(surface.as_ref(), Some(ClientSurface::Agents(_))) => {
+                        toasts.clear();
+                        let size = terminal.size()?;
+                        let visible = agent_dialog::dialog_body_rows(Rect::new(0, 0, size.width, size.height));
+                        let action = match surface.as_mut().expect("agents exist") {
+                            ClientSurface::Agents(dialog) => dialog.key(key, visible),
+                            _ => unreachable!("surface guard ensures agents"),
+                        };
+                        match action {
+                            AgentsAction::Stay => force_draw = true,
+                            AgentsAction::Close => {
+                                surface = None;
+                                view.invalidate_drawn();
+                                force_draw = true;
+                            }
+                            AgentsAction::Select(pane_id) => {
+                                release_captured_mouse_input(
+                                    framed,
+                                    &mut mouse_input,
+                                    view.focused().terminal_id,
+                                ).await?;
+                                surface = None;
+                                view.invalidate_drawn();
+                                if let Some(request) = focus.begin(FocusOrigin::Sidebar {
+                                    scope: NavigationScope::Global,
+                                    component: SidebarComponentKind::Agents,
+                                }) {
+                                    send_request(
+                                        framed,
+                                        Some(request),
+                                        ClientMessage::SelectTarget {
+                                            selector: TargetSelector::Pane(pane_id),
+                                            expected: None,
+                                        },
+                                    ).await?;
+                                }
+                                force_draw = true;
+                            }
+                        }
+                    }
+                    Event::Paste(text) if matches!(surface.as_ref(), Some(ClientSurface::Agents(_))) => {
+                        if let Some(ClientSurface::Agents(dialog)) = surface.as_mut() {
+                            dialog.paste(&text);
+                            force_draw = true;
+                        }
+                    }
                     Event::Paste(text) if matches!(surface.as_ref(), Some(ClientSurface::Navigator(_))) => {
                         if let Some(ClientSurface::Navigator(navigator)) = surface.as_mut() {
                             navigator.paste(&text);
@@ -2312,6 +2362,9 @@ async fn run_loop(
                             Some(ClientSurface::Navigator(nav)) => {
                                 nav.render(area, spinner_frame, &ui.styles, frame.buffer_mut());
                             }
+                            Some(ClientSurface::Agents(dialog)) => {
+                                dialog.render(area, spinner_frame, &ui.styles, frame.buffer_mut());
+                            }
                             Some(ClientSurface::Notifications(dialog)) => {
                                 dialog.render(area, frame.buffer_mut());
                             }
@@ -2515,6 +2568,9 @@ fn refresh_surface_resources(
                 workspace_history,
                 notifications,
             );
+        }
+        Some(ClientSurface::Agents(dialog)) => {
+            dialog.accept_resources(snapshot, focused, notifications);
         }
         Some(ClientSurface::Sidebar(sidebar)) => {
             sidebar.accept_resources(snapshot, focused, workspace_history, notifications);
@@ -3266,6 +3322,16 @@ async fn dispatch_client_action(
             }
             navigator.accept_presence(resources.presence());
             *surface = Some(ClientSurface::Navigator(navigator));
+        }
+        ClientAction::OpenAgents => {
+            let Some(snapshot) = resources.snapshot() else {
+                return Ok(Some(Toast::error("agents are still loading")));
+            };
+            *surface = Some(ClientSurface::Agents(AgentsDialog::open(
+                snapshot,
+                view.focused(),
+                resources.notifications(),
+            )));
         }
         ClientAction::OpenLeftSidebar | ClientAction::OpenRightSidebar => {
             let side = if action == ClientAction::OpenLeftSidebar {
