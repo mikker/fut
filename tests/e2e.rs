@@ -4440,10 +4440,13 @@ async fn immediate_exit_interactive_create_tab_never_loses_exit_or_old_attachmen
             if response.request_id == Some(request_id) {
                 break response.message;
             }
-            assert!(matches!(
-                response.message,
-                ServerMessage::Snapshot { terminal_id, .. } if terminal_id == old_terminal
-            ));
+            match response.message {
+                ServerMessage::Snapshot { terminal_id, .. } => {
+                    assert_eq!(terminal_id, old_terminal);
+                }
+                ServerMessage::ResourcesChanged { .. } => {}
+                other => panic!("unexpected frame before CreateTab response: {other:?}"),
+            }
         }
     })
     .await
@@ -4558,10 +4561,13 @@ async fn immediate_exit_interactive_create_pane_preserves_its_original_sibling()
             if response.request_id == Some(request_id) {
                 break response.message;
             }
-            assert!(matches!(
-                response.message,
-                ServerMessage::Snapshot { terminal_id, .. } if terminal_id == terminal_a
-            ));
+            match response.message {
+                ServerMessage::Snapshot { terminal_id, .. } => {
+                    assert_eq!(terminal_id, terminal_a);
+                }
+                ServerMessage::ResourcesChanged { .. } => {}
+                other => panic!("unexpected frame before CreatePane response: {other:?}"),
+            }
         }
     })
     .await
