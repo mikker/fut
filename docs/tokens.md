@@ -16,10 +16,16 @@ Presentation tokens are pure, typed values expanded from the resource snapshot a
 A token segment is explicit TOML:
 
 ```toml
-{ token = "tab.name", prefix = "[", suffix = "]", max_width = 24, style = "current" }
+{ token = "tab.name", prefix = " ", suffix = " ", max_width = 24, style = "current", inverted = true, pill = true }
 ```
 
-If the token is empty, its prefix and suffix are also omitted.
+If the token is empty, its prefix, suffix, and pill caps are also omitted.
+`inverted = true` turns the configured semantic foreground into a filled
+background using terminal reverse-video, preserving theme-adaptive glyph
+contrast and other composed modifiers. `pill = true` surrounds that inverted
+content with `pill_left` and `pill_right` under the Nerd Font preset; when the
+caps are empty under the Unicode or ASCII preset, only the inverted content is
+rendered.
 
 ## Tab-bar tokens
 
@@ -105,7 +111,7 @@ Compatibility follows the resource represented by each format:
 - Tab-item segments accept only declared tab tokens and resolve them from that item.
 - Workspace-row segments accept only declared workspace tokens and resolve them from that row.
 
-A declared value that has not been published is empty, including its configured prefix and suffix. Published values are plain text and receive only the normal group, segment, and item styles already configured by the user; a value cannot inject a style. Values are stored in the authoritative resource snapshot, shared by every client, and removed with their target. Rendering never invokes an extension or performs publication I/O.
+A declared value that has not been published is empty, including its configured prefix and suffix. Published values are plain text and receive only the normal group, segment, and item styles already configured by the user; a value cannot inject a style. A manifest may opt one token into `presentation = "spinner"`; any non-empty value then renders as the client's animated spinner in generic tab-bar groups, tab items, sidebar headers/footers, and workspace rows. The value remains validated plain text in the authoritative resource snapshot, and the existing 100 ms client clock supplies frames without extension I/O or repeated token publication. Values are shared by every client and removed with their target. Rendering never invokes an extension or performs publication I/O.
 
 See [Extensions](extensions.md#presentation-tokens) for declarations,
 publication syntax, limits, and the security boundary.

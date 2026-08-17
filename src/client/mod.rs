@@ -87,7 +87,10 @@ use uuid::Uuid;
 
 use sidebar::{ComponentEffect, SidebarComponentKind, SidebarSide, SidebarState, render_sidebar};
 use tab_bar::{TabBarAction, TabBarState};
-use temporary_command::{TemporaryCommandSurface, TemporaryCommandUpdate};
+use temporary_command::{
+    BackgroundCommandResult, ExtensionCommandContext, TemporaryCommandSurface,
+    TemporaryCommandUpdate, dispatch_background_command,
+};
 use toast::{Toast, ToastState};
 
 use crate::{
@@ -504,6 +507,7 @@ async fn run_loop(
     let mut spinner = time::interval(Duration::from_millis(100));
     spinner.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let (clipboard_results, mut clipboard_result) = mpsc::channel(1);
+    let (background_results, mut background_result) = mpsc::unbounded_channel();
     send_request(framed, Some(Uuid::new_v4()), ClientMessage::ListResources).await?;
     resize_view(framed, terminal.size()?.into(), &mut view, &resources, &ui).await?;
 
@@ -570,6 +574,12 @@ async fn run_loop(
                         resize_view(framed, terminal.size()?.into(), &mut view, &resources, &ui).await?;
                         force_draw = true;
                     }
+                }
+            }
+            result = background_result.recv() => {
+                if let Some(BackgroundCommandResult::Failed(message)) = result {
+                    toasts.error(format!("command failed · {}", sanitize(&message)));
+                    force_draw = true;
                 }
             }
             frame = framed.next() => {
@@ -1629,6 +1639,7 @@ async fn run_loop(
                                     &mut ui,
                                     &mut temporary_command,
                                     socket_path,
+                                    &background_results,
                                     config_dir,
                                 ).await?);
                                 force_draw = true;
@@ -2163,6 +2174,7 @@ async fn run_loop(
                                     &mut ui,
                                     &mut temporary_command,
                                     socket_path,
+                                    &background_results,
                                     config_dir,
                                 ).await?);
                                 force_draw = true;
@@ -2244,7 +2256,7 @@ async fn run_loop(
                 toasts.expire();
                 force_draw = true;
             }
-            _ = spinner.tick(), if resources.has_working() => {
+            _ = spinner.tick(), if resources.has_working() || resources.has_animated_extension_token(&ui) => {
                 spinner_frame = spinner_frame.wrapping_add(1);
                 force_draw = true;
             }
@@ -3234,6 +3246,7 @@ async fn dispatch_client_action(
     ui: &mut UiConfig,
     temporary_command: &mut Option<TemporaryCommandSurface>,
     socket_path: &Path,
+    background_results: &mpsc::UnboundedSender<BackgroundCommandResult>,
     config_dir: Option<&Path>,
 ) -> anyhow::Result<Option<Toast>> {
     match action {
@@ -3243,6 +3256,46 @@ async fn dispatch_client_action(
                     "configured command is no longer available",
                 )));
             };
+            let command = command.clone();
+            let workspace_root = command.extension.as_ref().and_then(|_| {
+                resources.snapshot().and_then(|snapshot| {
+                    snapshot
+                        .sessions
+                        .iter()
+                        .flat_map(|session| &session.workspaces)
+                        .find(|workspace| workspace.id == view.focused().workspace_id)
+                        .map(|workspace| workspace.root.clone())
+                })
+            });
+            if command.extension.is_some() && workspace_root.is_none() {
+                return Ok(Some(Toast::error(
+                    "command unavailable · focused workspace root is not loaded",
+                )));
+            }
+            if command.mode() == crate::extensions::ExtensionCommandMode::Background {
+                dispatch_background_command(
+                    command,
+                    ui.clone(),
+                    view.focused().clone(),
+                    workspace_root.expect("extension command resolved workspace root"),
+                    socket_path.to_owned(),
+                    background_results.clone(),
+                );
+                return Ok(None);
+            }
+            let extension_context = workspace_root
+                .as_deref()
+                .map(|root| ExtensionCommandContext::resolve(ui, &command, view.focused(), root))
+                .transpose();
+            let extension_context = match extension_context {
+                Ok(context) => context,
+                Err(error) => {
+                    return Ok(Some(Toast::error(format!(
+                        "command config failed · {}",
+                        one_line_error(&error)
+                    ))));
+                }
+            };
             let content = temporary_command_content(command.size.area(host));
             let size = TerminalSize {
                 columns: content.width,
@@ -3250,11 +3303,12 @@ async fn dispatch_client_action(
             };
             let fallback = std::env::current_dir().unwrap_or_else(|_| "/".into());
             match TemporaryCommandSurface::spawn(
-                command,
+                &command,
                 view.focused().child_pid,
                 &fallback,
                 size,
                 socket_path,
+                extension_context.as_ref(),
             )
             .await
             {

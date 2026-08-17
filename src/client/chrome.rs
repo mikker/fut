@@ -21,8 +21,8 @@ use super::{
     hotkey::{HotkeyButton, HotkeyLine},
     notifications::{ActivityIndicator, NotificationState},
     presentation::{
-        ItemState, TokenValue, apply_item_state, pill_cap_style, render_token_segments,
-        truncate_line,
+        ItemState, TokenValue, apply_item_state, extension_token_value, pill_cap_style,
+        render_token_segments, truncate_line,
     },
     sidebar::{SidebarSide, slot_relevant},
 };
@@ -236,6 +236,43 @@ impl ResourceState {
         self.snapshot
             .as_ref()
             .is_some_and(|snapshot| self.notifications().has_working(snapshot))
+    }
+
+    pub fn has_animated_extension_token(&self, ui: &UiConfig) -> bool {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return false;
+        };
+        ui.extensions
+            .iter()
+            .flat_map(|extension| extension.presentation_tokens())
+            .filter(|token| token.presentation() == crate::extensions::TokenPresentation::Spinner)
+            .any(|token| {
+                let populated = |values: &MaterializedTokenMap| {
+                    values
+                        .get(token.qualified_name())
+                        .is_some_and(|value| !value.is_empty())
+                };
+                match token.scope() {
+                    crate::extensions::PresentationScope::Session => snapshot
+                        .sessions
+                        .iter()
+                        .any(|session| populated(&session.tokens)),
+                    crate::extensions::PresentationScope::Workspace => snapshot
+                        .sessions
+                        .iter()
+                        .flat_map(|session| &session.workspaces)
+                        .any(|workspace| populated(&workspace.tokens)),
+                    crate::extensions::PresentationScope::Tab => snapshot
+                        .sessions
+                        .iter()
+                        .flat_map(|session| &session.workspaces)
+                        .flat_map(|workspace| &workspace.tabs)
+                        .any(|tab| populated(&tab.tokens)),
+                    crate::extensions::PresentationScope::Pane => snapshot
+                        .pane_paths()
+                        .any(|path| populated(&path.pane.tokens)),
+                }
+            })
     }
 
     pub fn sidebar_relevance(&self, focused: &SelectedTarget, ui: &UiConfig) -> SidebarRelevance {
@@ -597,6 +634,7 @@ fn render_bar_group(
         group.style,
         ItemState::default(),
         &ui.styles,
+        &icons,
         |token| match token {
             "fut" if selected.is_none() => TokenValue::plain("fut "),
             "session.name" => TokenValue::plain(model.session_name.clone()),
@@ -621,7 +659,7 @@ fn render_bar_group(
                 || TokenValue::plain(""),
                 |activity| activity_token(activity, spinner_frame),
             ),
-            _ => TokenValue::plain(model.extension_value(token)),
+            _ => extension_token_value(ui, token, model.extension_value(token), spinner_frame),
         },
     )
 }
@@ -718,13 +756,8 @@ fn visible_tabs(
     if line.width() > width {
         let fallback =
             render_tab_item_content(model, anchor, selected, component_style, spinner_frame, ui);
-        let marker = tab_token(
-            model,
-            anchor,
-            "tab.index",
-            spinner_frame,
-            &ui.icons.resolve(),
-        );
+        let icons = ui.icons.resolve();
+        let marker = tab_token(model, anchor, "tab.index", spinner_frame, ui, &icons);
         if width <= UnicodeWidthStr::width(marker.text.as_str()).saturating_add(2) {
             let mut style = ui.styles.apply(SemanticStyle::Normal, Style::default());
             if let Some(role) = component_style {
@@ -961,7 +994,8 @@ fn render_tab_item_content(
             ),
         },
         &ui.styles,
-        |token| tab_token(model, index, token, spinner_frame, &icons),
+        &icons,
+        |token| tab_token(model, index, token, spinner_frame, ui, &icons),
     )
 }
 
@@ -997,6 +1031,7 @@ fn tab_token(
     index: usize,
     token: &str,
     spinner_frame: usize,
+    ui: &UiConfig,
     icons: &super::config::IconSet,
 ) -> TokenValue {
     let tab = &model.tabs[index];
@@ -1015,7 +1050,12 @@ fn tab_token(
             || TokenValue::plain(""),
             |activity| activity_token(activity, spinner_frame),
         ),
-        _ => TokenValue::plain(tab.tokens.get(token).map_or("", String::as_str)),
+        _ => extension_token_value(
+            ui,
+            token,
+            tab.tokens.get(token).map_or("", String::as_str),
+            spinner_frame,
+        ),
     }
 }
 
@@ -1085,11 +1125,12 @@ fn clear_row(area: Rect, style: Style, buffer: &mut Buffer) {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::*;
     use crate::{
         domain::{AgentIntegration, PaneId, SessionId, TabId, TerminalId, WorkspaceId},
+        extensions,
         resources::{
             PaneSnapshot, Project, ProjectIdentity, SessionSnapshot, TabSnapshot, WorkspaceSnapshot,
         },
@@ -1156,6 +1197,57 @@ mod tests {
         )
     }
 
+    fn run_extension_ui() -> UiConfig {
+        let mut ui = UiConfig::default();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/extensions/run");
+        ui.extensions = extensions::load(&[root]).unwrap();
+        ui
+    }
+
+    #[test]
+    fn populated_spinner_token_animates_in_bar_and_keeps_redraw_clock_alive() {
+        let (mut snapshot, focused) = fixture(&["shell"], 0);
+        snapshot.sessions[0].workspaces[0].tokens.insert(
+            "workspace.extension.run.launching".into(),
+            "populated".into(),
+        );
+        let mut ui = run_extension_ui();
+        ui.icons.preset = super::super::config::IconPreset::NerdFont;
+        let model =
+            TabBarModel::from_snapshot(&snapshot, &focused, &NotificationState::default()).unwrap();
+        let group = GroupConfig {
+            segments: vec![super::super::config::SegmentConfig {
+                token: Some("workspace.extension.run.launching".into()),
+                style: Some(SemanticStyle::Attention),
+                inverted: true,
+                pill: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            render_bar_group(&group, &model, false, None, 0, &ui).to_string(),
+            "\u{e0b6}⠋\u{e0b4}"
+        );
+        assert_eq!(
+            render_bar_group(&group, &model, false, None, 1, &ui).to_string(),
+            "\u{e0b6}⠙\u{e0b4}"
+        );
+
+        let mut resources = ResourceState::default();
+        assert!(resources.accept(snapshot.clone()));
+        assert!(resources.has_animated_extension_token(&ui));
+        snapshot.revision += 1;
+        snapshot.sessions[0].workspaces[0]
+            .tokens
+            .insert("workspace.extension.run.launching".into(), String::new());
+        snapshot.sessions[0].workspaces[0]
+            .tokens
+            .insert("workspace.extension.run.play".into(), "spinner".into());
+        assert!(resources.accept(snapshot));
+        assert!(!resources.has_animated_extension_token(&ui));
+    }
+
     #[test]
     fn extension_tokens_resolve_from_current_bar_ancestry_and_tab_items() {
         let (mut snapshot, focused) = fixture(&["shell", "peer"], 0);
@@ -1200,6 +1292,7 @@ mod tests {
                 0,
                 "tab.extension.demo.value",
                 0,
+                &UiConfig::default(),
                 &UiConfig::default().icons.resolve(),
             )
             .text,
@@ -1211,6 +1304,7 @@ mod tests {
                 1,
                 "tab.extension.demo.value",
                 0,
+                &UiConfig::default(),
                 &UiConfig::default().icons.resolve(),
             )
             .text,

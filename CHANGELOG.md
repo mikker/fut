@@ -6,6 +6,8 @@
 - The navigator now identifies and dims sessions already open in another Fut client.
 - Added a searchable global agents dialog on `Ctrl-b a`, with color-coded sidebar statuses and startup Codex detection.
 - Fixed the bundled `wt` command not switching to newly created worktrees.
+- Added theme-adaptive inverted and Nerd Font pill presentation for token segments.
+- Added a managed run extension with restart/stop controls, optional output readiness signals, animated workspace status, live logs, and project-local configuration.
 - Fixed linked filenames bleeding through or breaking the borders of dialogs drawn over terminal content.
 - Added client lifecycle hooks and a Ghostty extension that follows the active Fut session in the window title and restores the previous title on detach.
 - Added direct key bindings and local argument overrides for extension-supplied commands using their qualified palette slugs.

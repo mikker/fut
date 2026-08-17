@@ -42,6 +42,7 @@ Omit any field to keep its default value.
 ```toml
 extensions = [
   "/Users/me/.config/fut/extensions/review-status",
+  "/Users/me/.config/fut/extensions/run",
 ]
 
 [ui]
@@ -50,6 +51,7 @@ confirm_close = true   # Require confirmation before closing panes, tabs, or wor
 
 [ui.bindings]
 open_command_bar = "space"
+"run:restart" = "r"
 # reload_config = "R"
 # enter_copy_mode = "["
 # open_navigator = "s"
@@ -129,6 +131,11 @@ center = [
   { segments = [{ component = "tabs" }], priority = 100 },
 ]
 right = [
+  { segments = [{ token = "workspace.extension.run.pause", style = "divider", inverted = true, pill = true }], priority = 220 },
+  { segments = [{ token = "workspace.extension.run.launching", style = "attention", inverted = true, pill = true }], priority = 220 },
+  { segments = [{ token = "workspace.extension.run.play", style = "added", inverted = true, pill = true }], priority = 220 },
+  { segments = [{ token = "workspace.extension.run.stop", style = "divider", inverted = true, pill = true }], priority = 220 },
+  { segments = [{ token = "workspace.extension.run.cross", style = "error", inverted = true, pill = true }], priority = 220 },
   { segments = [{ token = "client.zoom", suffix = " " }], priority = 255 },
   { segments = [{ token = "client.help" }], style = "muted", priority = 0 },
 ]
@@ -170,6 +177,23 @@ is accepted or rejected atomically, and references to extension tokens are
 validated with it. See [Extensions](extensions.md) for commands, hooks, tokens,
 limits, payloads, and examples.
 
+The global file and each workspace's `.fut/config.toml` may configure a loaded
+extension with the same namespaced table:
+
+```toml
+[extension.run]
+command = ["just", "run"]
+signal = "STATUS:READY" # optional literal readiness marker
+```
+
+Workspace values recursively override global defaults for commands and hooks
+invoked in that workspace. Unknown extension IDs and oversized data are errors;
+the extension owns validation of its inner keys and values. Project-local
+configuration is inert until an extension command or lifecycle hook is
+explicitly invoked: loading, opening, or entering a workspace never executes
+the configured command. See the bundled `run` extension for an example that
+starts only through `run:restart`.
+
 ## Bindings
 
 Bindings are suffixes after the fixed `Ctrl-b` prefix. `Ctrl-b :` opens the command palette. Override any action under `ui.bindings`; accepted values are one printable character or the names `prefix`, `ctrl-s`, `space`, `enter`, `tab`, `esc`, `up`, and `down`. `prefix` means pressing `Ctrl-b` again. Keys must remain unique. Action names are `open_command_bar`, `reload_config`, `enter_copy_mode`, `open_navigator`, `open_agents`, `open_left_sidebar`, `open_right_sidebar`, `open_tab_bar`, `open_notifications`, `focus_next_notification`, `create_workspace`, `create_tab`, `focus_next_tab`, `focus_previous_tab`, `split_pane_right`, `split_pane_down`, `focus_next_pane`, `focus_previous_pane`, `focus_pane_left`, `focus_pane_down`, `focus_pane_up`, `focus_pane_right`, `focus_last_pane`, `focus_last_tab`, `focus_last_workspace`, `focus_last_session`, `focus_next_workspace`, `focus_previous_workspace`, `focus_tab_1` through `focus_tab_10`, `toggle_pane_zoom`, `close_pane`, and `detach`. Extension commands use their quoted qualified palette slug, for example `"wt:new-worktree" = "N"`. `Ctrl-b Ctrl-s` switches to the last active session, so repeating it toggles between the two most recent sessions. Rebinding `focus_next_notification` away from `prefix` restores `Ctrl-b Ctrl-b` as a literal prefix unless another action uses `prefix`. The palette displays tmux-style command names, descriptions, and configured bindings, and searches all three.
@@ -204,7 +228,7 @@ Every segment sets exactly one of:
 - `token` — a pure value from Fut's already-materialized client/resource state;
 - `component` — a layout-aware repeated collection. The only current component is `tabs`.
 
-Token segments may also set `prefix`, `suffix`, `max_width`, and `style`. Prefix and suffix are emitted only when the token is nonempty. Text segments accept `style` but not affixes or `max_width`. Components must be the only segment in their group and do not accept segment options.
+Token segments may also set `prefix`, `suffix`, `max_width`, `style`, `inverted = true`, and `pill = true`. Prefix and suffix are emitted only when the token is nonempty. Inversion uses terminal reverse-video after normal style composition: the semantic foreground becomes the fill and the glyph uses the underlying terminal background, so it adapts to light and dark themes. A pill requires inversion and adds the configured `pill_left` and `pill_right` glyphs in that fill color around the complete segment, including its affixes. If either cap is empty, as in the Unicode and ASCII presets, Fut renders only the inverted content. Empty tokens emit neither affixes nor caps. Text segments accept `style` but not token-only options. Components must be the only segment in their group and do not accept segment options.
 
 Tab-item content uses the intrinsic display-cell width of its configured segments. The default format supplies one cell of padding on each side; add or remove text segments to adjust that spacing. The Nerd Font preset additionally reserves one cell at each end of every item so its active-tab pill does not move neighboring tabs. New tabs are created unnamed, so their title follows the foreground process in the focused pane. Name a tab with `fut tab new --name` or `Ctrl-b r` to keep that title fixed; renaming it to an empty string restores automatic naming.
 
@@ -247,17 +271,17 @@ Modifiers are `bold`, `dim`, `italic`, `underlined`, `reversed`, and `crossed_ou
 
 Colors may be `default`, ANSI names such as `red`, `blue`, `gray`, `dark_gray`, or `light_cyan`, an indexed color such as `index:123`, or exact RGB such as `#12abef`. Indexed colors remain references to the containing terminal's palette; RGB colors remain exact.
 
-Styles compose in this order: normal, group style, token style (`activity`, `attention`, `added`, or `deleted` when supplied), segment style, current, attention, closing, selected. Later foreground/background values replace earlier ones; modifiers are added or removed in sequence.
+Styles compose in this order: normal, group style, token style (`activity`, `attention`, `added`, or `deleted` when supplied), segment style, current, attention, closing, selected. Later foreground/background values replace earlier ones; modifiers are added or removed in sequence. An inverted token adds reverse-video after this composition without discarding the composed colors or modifiers.
 
 ## Icons
 
-`unicode` is the default and requires no private-use glyphs. `ascii` uses ASCII for the configurable resource icons; ordinary built-in help and truncation text may still use Unicode. `nerd_font` opts into a small Nerd Fonts v3-oriented resource/state set, and additionally draws focused tabs and expanded workspaces as filled pills using powerline half-circle caps. Every icon can be overridden under `[ui.icons]`.
+`unicode` is the default and requires no private-use glyphs. `ascii` uses ASCII for the configurable resource icons; ordinary built-in help and truncation text may still use Unicode. `nerd_font` opts into a small Nerd Fonts v3-oriented resource/state set, and additionally uses its Powerline half-circle caps for focused tabs, expanded workspaces, and token segments configured with `pill = true`. Every icon can be overridden under `[ui.icons]`.
 
 Fut cannot reliably detect the active terminal font. Use [`fut doctor`](doctor.md) for an honest visual probe; it never claims that an installed font is active.
 
 ## Security boundary
 
-Everything under `ui` remains non-executable: it has no shell commands, file reads, environment interpolation, networking, functions, or expression language, and presentation tokens resolve only already-materialized strings. `trusted_commands` is a deliberate executable trust boundary. Fut executes its `program` directly with the configured `args` and the client's environment; it does not invoke a shell unless you explicitly configure one. Explicit extension roots are the equivalent trust decision for extension manifests and their packaged commands. Only configure commands and extension directories you trust. Commands never run during configuration parsing or rendering; workspace hooks run only from committed daemon mutations, while client hooks run only for attachment lifecycle transitions. The same-user Unix socket is the authorization boundary for token publication, just as it is for other Fut control commands; Fut does not claim to authenticate the publishing process beyond that boundary.
+Everything under `ui` remains non-executable: it has no shell commands, file reads, environment interpolation, networking, functions, or expression language, and presentation tokens resolve only already-materialized strings. `trusted_commands` is a deliberate executable trust boundary. Fut executes its `program` directly with the configured `args` and the client's environment; it does not invoke a shell unless you explicitly configure one. Explicit extension roots and namespaced project tables are the equivalent trust decision for extension manifests, their packaged commands, and values those commands may execute. Only configure commands, extension directories, and projects you trust. Commands never run during configuration parsing or rendering; workspace hooks run only from committed daemon mutations, while client hooks run only for attachment lifecycle transitions. The same-user Unix socket is the authorization boundary for token publication, just as it is for other Fut control commands; Fut does not claim to authenticate the publishing process beyond that boundary.
 
 ## Related
 

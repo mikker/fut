@@ -23,6 +23,9 @@ use tokio::{
 };
 
 use crate::{
+    client::config::{
+        ExtensionConfigCatalog, ResolvedExtensionConfig, resolve_hook_extension_config_for_catalog,
+    },
     command::PopupSize,
     domain::{SessionId, WorkspaceId},
     protocol::SelectedTarget,
@@ -114,6 +117,7 @@ pub(crate) struct ExtensionLauncher {
     command: ExtensionCommand,
     size: PopupSize,
     activate_opened: bool,
+    mode: ExtensionCommandMode,
 }
 
 impl ExtensionLauncher {
@@ -136,6 +140,18 @@ impl ExtensionLauncher {
     pub(crate) fn activate_opened(&self) -> bool {
         self.activate_opened
     }
+
+    pub(crate) const fn mode(&self) -> ExtensionCommandMode {
+        self.mode
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ExtensionCommandMode {
+    #[default]
+    Interactive,
+    Background,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -281,6 +297,7 @@ pub(crate) struct HookReceiver {
 pub(crate) async fn run_hooks(
     mut queue: HookReceiver,
     extensions: Vec<Extension>,
+    extension_config: ExtensionConfigCatalog,
     fut_bin: PathBuf,
     socket: PathBuf,
     mut shutdown: watch::Receiver<bool>,
@@ -299,7 +316,7 @@ pub(crate) async fn run_hooks(
                 None => return,
             },
         };
-        run_event(&extensions, &fut_bin, &socket, &event).await;
+        run_event(&extensions, &extension_config, &fut_bin, &socket, &event).await;
     }
 }
 
@@ -450,7 +467,9 @@ async fn run_client_event(
                 event: event.kind,
                 session_id: event.session.id,
                 workspace_id: None,
+                workspace_root: None,
                 session_name: Some(&event.session.name),
+                extension_config: None,
                 payload: &payload,
             },
         )
@@ -458,7 +477,13 @@ async fn run_client_event(
     }
 }
 
-async fn run_event(extensions: &[Extension], fut_bin: &Path, socket: &Path, event: &HookEvent) {
+async fn run_event(
+    extensions: &[Extension],
+    config: &ExtensionConfigCatalog,
+    fut_bin: &Path,
+    socket: &Path,
+    event: &HookEvent,
+) {
     let payload = match event.payload() {
         Ok(payload) => payload,
         Err(error) => {
@@ -470,6 +495,20 @@ async fn run_event(extensions: &[Extension], fut_bin: &Path, socket: &Path, even
         let Some(command) = extension.hooks.get(event.kind) else {
             continue;
         };
+        let resolved_config = resolve_hook_extension_config_for_catalog(
+            config,
+            extensions,
+            extension.id(),
+            &event.workspace_root,
+        );
+        if let Some(warning) = &resolved_config.warning {
+            tracing::warn!(
+                extension = extension.id,
+                event = event.kind,
+                warning,
+                "extension hook config resolution fell back"
+            );
+        }
         run_command(
             extension,
             command,
@@ -479,7 +518,9 @@ async fn run_event(extensions: &[Extension], fut_bin: &Path, socket: &Path, even
                 event: event.kind,
                 session_id: event.session_id,
                 workspace_id: Some(event.workspace_id),
+                workspace_root: Some(&event.workspace_root),
                 session_name: None,
+                extension_config: Some(&resolved_config.config),
                 payload: &payload,
             },
         )
@@ -491,7 +532,9 @@ struct HookInvocation<'a> {
     event: &'a str,
     session_id: SessionId,
     workspace_id: Option<WorkspaceId>,
+    workspace_root: Option<&'a Path>,
     session_name: Option<&'a str>,
+    extension_config: Option<&'a ResolvedExtensionConfig>,
     payload: &'a [u8],
 }
 
@@ -520,8 +563,29 @@ async fn run_command(
     if let Some(workspace_id) = invocation.workspace_id {
         command.env("FUT_WORKSPACE_ID", workspace_id.to_string());
     }
+    if let Some(workspace_root) = invocation.workspace_root {
+        command.env("FUT_WORKSPACE_ROOT", workspace_root);
+    }
     if let Some(session_name) = invocation.session_name {
         command.env("FUT_SESSION_NAME", session_name);
+    }
+    if let Some(config) = invocation.extension_config {
+        command.env("FUT_EXTENSION_CONFIG", &config.json);
+        if let Some(path) = &config.global_source {
+            command.env("FUT_EXTENSION_CONFIG_GLOBAL_PATH", path);
+        } else {
+            command.env_remove("FUT_EXTENSION_CONFIG_GLOBAL_PATH");
+        }
+        if let Some(path) = &config.workspace_source {
+            command.env("FUT_EXTENSION_CONFIG_WORKSPACE_PATH", path);
+        } else {
+            command.env_remove("FUT_EXTENSION_CONFIG_WORKSPACE_PATH");
+        }
+    } else {
+        command
+            .env_remove("FUT_EXTENSION_CONFIG")
+            .env_remove("FUT_EXTENSION_CONFIG_GLOBAL_PATH")
+            .env_remove("FUT_EXTENSION_CONFIG_WORKSPACE_PATH");
     }
 
     let mut child = match command.spawn() {
@@ -687,6 +751,7 @@ impl PresentationScope {
 pub(crate) struct PresentationToken {
     name: String,
     scope: PresentationScope,
+    presentation: TokenPresentation,
     qualified_name: String,
 }
 
@@ -695,10 +760,22 @@ impl PresentationToken {
         self.scope
     }
 
+    pub(crate) const fn presentation(&self) -> TokenPresentation {
+        self.presentation
+    }
+
     /// The collision-free name later publication and rendering work can expose.
     pub(crate) fn qualified_name(&self) -> &str {
         &self.qualified_name
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TokenPresentation {
+    #[default]
+    Plain,
+    Spinner,
 }
 
 /// Validate unstyled materialized presentation text before it enters the
@@ -747,6 +824,8 @@ struct CommandDeclaration {
     size: PopupSize,
     #[serde(default)]
     activate_opened: bool,
+    #[serde(default)]
+    mode: ExtensionCommandMode,
 }
 
 #[derive(Debug, Deserialize)]
@@ -754,6 +833,8 @@ struct CommandDeclaration {
 struct TokenDeclaration {
     name: String,
     scope: PresentationScope,
+    #[serde(default)]
+    presentation: TokenPresentation,
 }
 
 /// Load all configured roots or return an error without exposing a partial set.
@@ -878,6 +959,16 @@ fn load_one(root: &Path) -> Result<Extension> {
             declaration.size.validate().with_context(|| {
                 format!("validate extension {:?} command {name:?} size", manifest.id)
             })?;
+            if declaration.mode == ExtensionCommandMode::Background
+                && (declaration.activate_opened
+                    || declaration.size.width.is_some()
+                    || declaration.size.height.is_some())
+            {
+                bail!(
+                    "extension {:?} background command {name:?} cannot declare size or activate_opened",
+                    manifest.id
+                );
+            }
             let command = validate_command(root, declaration.argv).with_context(|| {
                 format!("validate extension {:?} command {name:?} argv", manifest.id)
             })?;
@@ -890,6 +981,7 @@ fn load_one(root: &Path) -> Result<Extension> {
                     command,
                     size: declaration.size,
                     activate_opened: declaration.activate_opened,
+                    mode: declaration.mode,
                 },
             ))
         })
@@ -920,6 +1012,7 @@ fn load_one(root: &Path) -> Result<Extension> {
         presentation_tokens.push(PresentationToken {
             name: declaration.name,
             scope: declaration.scope,
+            presentation: declaration.presentation,
             qualified_name,
         });
     }
@@ -1105,6 +1198,11 @@ argv = ["./bin/review", "--interactive"]
 size = { width = 100, height = 30 }
 activate_opened = true
 
+[commands.refresh]
+title = "Refresh"
+argv = ["./bin/refresh"]
+mode = "background"
+
 [[presentation_tokens]]
 name = "branch"
 scope = "workspace"
@@ -1112,6 +1210,7 @@ scope = "workspace"
 [[presentation_tokens]]
 name = "review_state"
 scope = "tab"
+presentation = "spinner"
 "#,
         );
         fs::create_dir(temporary.path().join("bin")).unwrap();
@@ -1138,6 +1237,7 @@ scope = "tab"
         assert_eq!(launcher.size().width, Some(100));
         assert_eq!(launcher.size().height, Some(30));
         assert!(launcher.activate_opened());
+        assert_eq!(launcher.mode(), ExtensionCommandMode::Interactive);
         assert_eq!(
             launcher.argv(),
             [
@@ -1146,8 +1246,20 @@ scope = "tab"
             ]
         );
         assert_eq!(
+            extension.commands["refresh"].mode(),
+            ExtensionCommandMode::Background
+        );
+        assert_eq!(
             extension.presentation_tokens()[0].qualified_name(),
             "workspace.extension.acme.git-status.branch"
+        );
+        assert_eq!(
+            extension.presentation_tokens()[0].presentation(),
+            TokenPresentation::Plain
+        );
+        assert_eq!(
+            extension.presentation_tokens()[1].presentation(),
+            TokenPresentation::Spinner
         );
         assert_eq!(
             extension.command_environment(),
@@ -1210,6 +1322,14 @@ scope = "tab"
             (
                 "id = 'valid'\n[commands.launch]\ntitle = 'Launch'\nargv = ['/bin/true']\nsize = { width = 3 }\n",
                 "size.width must be at least 4",
+            ),
+            (
+                "id = 'valid'\n[commands.launch]\ntitle = 'Launch'\nargv = ['/bin/true']\nmode = 'background'\nsize = { width = 40 }\n",
+                "background command",
+            ),
+            (
+                "id = 'valid'\n[[presentation_tokens]]\nname = 'state'\nscope = 'workspace'\npresentation = 'movie'\n",
+                "unknown variant",
             ),
             (
                 "id = 'valid'\n[hooks]\n'workspace.created' = ['./../escape']\n",
@@ -1320,20 +1440,40 @@ scope = "tab"
             "id = 'capture'\n[hooks]\n'workspace.created' = ['./hook', 'literal argument']\n",
             "#!/bin/sh\npwd > cwd\nenv | sort > environment\nprintf '%s' \"$1\" > argument\ncat > payload\n",
         );
-        let extension = load(&[temporary.path().to_owned()]).unwrap().remove(0);
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let sentinel = workspace.join("must-not-start");
+        let global_path = temporary.path().join("global.toml");
+        fs::write(
+            &global_path,
+            format!(
+                "extensions = [{:?}]\n[extension.capture]\ncommand = ['touch', {:?}]\nsource = 'global-only'\n",
+                temporary.path().display().to_string(),
+                sentinel.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let loaded = crate::client::config::load_extensions_location(
+            &crate::client::config::ConfigLocation {
+                path: Some(global_path.clone()),
+                explicit: true,
+                source: "test",
+            },
+        )
+        .unwrap();
         let event = HookEvent {
             revision: 7,
             kind: "workspace.created",
             session_id: SessionId::new(),
             workspace_id: WorkspaceId::new(),
             workspace_name: "main".into(),
-            workspace_root: "/workspace".into(),
+            workspace_root: workspace.clone(),
             previous_name: None,
         };
         let socket = temporary.path().join("fut.sock");
 
         let fut_bin = Path::new("/opt/fut/bin/fut");
-        run_event(&[extension], fut_bin, &socket, &event).await;
+        run_event(&loaded.extensions, &loaded.config, fut_bin, &socket, &event).await;
 
         assert_eq!(
             fs::read_to_string(temporary.path().join("cwd"))
@@ -1361,12 +1501,79 @@ scope = "tab"
             format!("FUT_SESSION_ID={}", event.session_id),
             format!("FUT_SOCKET={}", socket.display()),
             format!("FUT_WORKSPACE_ID={}", event.workspace_id),
+            format!("FUT_WORKSPACE_ROOT={}", workspace.display()),
+            format!("FUT_EXTENSION_CONFIG_GLOBAL_PATH={}", global_path.display()),
         ] {
             assert!(
                 environment.lines().any(|line| line == expected),
                 "{expected}"
             );
         }
+        let config = environment
+            .lines()
+            .find_map(|line| line.strip_prefix("FUT_EXTENSION_CONFIG="))
+            .expect("hook config environment");
+        let config: serde_json::Value = serde_json::from_str(config).unwrap();
+        assert_eq!(config["command"], json!(["touch", sentinel]));
+        assert_eq!(config["source"], "global-only");
+        assert!(
+            !environment
+                .lines()
+                .any(|line| line.starts_with("FUT_EXTENSION_CONFIG_WORKSPACE_PATH="))
+        );
+        assert!(
+            !sentinel.exists(),
+            "loading hook config started its command"
+        );
+
+        let workspace_config = workspace.join(".fut/config.toml");
+        fs::create_dir(workspace.join(".fut")).unwrap();
+        fs::write(
+            &workspace_config,
+            "[extension.capture]\nsource = 'workspace'\nlocal = true\n",
+        )
+        .unwrap();
+        run_event(&loaded.extensions, &loaded.config, fut_bin, &socket, &event).await;
+        let environment = fs::read_to_string(temporary.path().join("environment")).unwrap();
+        assert!(environment.lines().any(|line| {
+            line == format!(
+                "FUT_EXTENSION_CONFIG_WORKSPACE_PATH={}",
+                workspace_config.display()
+            )
+        }));
+        let config = environment
+            .lines()
+            .find_map(|line| line.strip_prefix("FUT_EXTENSION_CONFIG="))
+            .expect("merged hook config environment");
+        let config: serde_json::Value = serde_json::from_str(config).unwrap();
+        assert_eq!(config["command"], json!(["touch", sentinel]));
+        assert_eq!(config["source"], "workspace");
+        assert_eq!(config["local"], true);
+        assert!(!sentinel.exists(), "merged hook config started its command");
+
+        fs::write(
+            &workspace_config,
+            "[extension.unknown]\nthis_must_still_be_rejected = true\n",
+        )
+        .unwrap();
+        run_event(&loaded.extensions, &loaded.config, fut_bin, &socket, &event).await;
+        let environment = fs::read_to_string(temporary.path().join("environment")).unwrap();
+        let config = environment
+            .lines()
+            .find_map(|line| line.strip_prefix("FUT_EXTENSION_CONFIG="))
+            .expect("fallback hook config environment");
+        let config: serde_json::Value = serde_json::from_str(config).unwrap();
+        assert_eq!(config["command"], json!(["touch", sentinel]));
+        assert_eq!(config["source"], "global-only");
+        assert!(
+            !environment
+                .lines()
+                .any(|line| line.starts_with("FUT_EXTENSION_CONFIG_WORKSPACE_PATH="))
+        );
+        assert!(
+            !sentinel.exists(),
+            "fallback hook config started its command"
+        );
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(
                 &fs::read_to_string(temporary.path().join("payload")).unwrap()
@@ -1471,6 +1678,67 @@ scope = "tab"
         );
     }
 
+    #[test]
+    fn checked_in_run_extension_manifest_and_smoke_are_valid() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/extensions/run");
+        let extension = load(std::slice::from_ref(&root)).unwrap().remove(0);
+
+        assert_eq!(extension.id(), "run");
+        assert_eq!(
+            extension
+                .hooks
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["workspace.closed", "workspace.created"]
+        );
+        assert_eq!(
+            extension
+                .commands()
+                .map(|command| (command.name(), command.mode()))
+                .collect::<Vec<_>>(),
+            [
+                ("edit-logs", ExtensionCommandMode::Interactive),
+                ("logs", ExtensionCommandMode::Interactive),
+                ("restart", ExtensionCommandMode::Background),
+                ("stop", ExtensionCommandMode::Background),
+            ]
+        );
+        assert_eq!(
+            extension
+                .presentation_tokens()
+                .iter()
+                .map(|token| token.name.as_str())
+                .collect::<Vec<_>>(),
+            ["pause", "launching", "play", "stop", "cross"]
+        );
+        assert_eq!(
+            extension.presentation_tokens()[1].presentation(),
+            TokenPresentation::Spinner
+        );
+
+        match std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+        {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => panic!("check python3 availability: {error}"),
+            Ok(output) if !output.status.success() => return,
+            Ok(_) => {}
+        }
+
+        let output = std::process::Command::new(root.join("test/smoke"))
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "run extension smoke failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[tokio::test]
     async fn nonzero_hook_does_not_stop_later_extensions() {
         let output = tempfile::NamedTempFile::new().unwrap();
@@ -1502,6 +1770,7 @@ scope = "tab"
 
         run_event(
             &extensions,
+            &ExtensionConfigCatalog::default(),
             Path::new("/opt/fut/bin/fut"),
             Path::new("/tmp/fut.sock"),
             &event,
@@ -1546,6 +1815,7 @@ scope = "tab"
 
         run_event(
             &extensions,
+            &ExtensionConfigCatalog::default(),
             Path::new("/opt/fut/bin/fut"),
             Path::new("/tmp/fut.sock"),
             &event,

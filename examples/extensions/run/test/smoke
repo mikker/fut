@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+# Smoke test for the run extension. No Fut daemon required: FUT_BIN points at
+# a stub that records `token publish` argv lines, and FUT_RUN_STATE_DIR keeps
+# all state inside a temporary directory.
+#
+# Covers: config validation, readiness signals (including chunk boundaries and
+# restart reset), start/stop lifecycle, exit tokens, launch failure,
+# rapid-restart races, workspace isolation, stale-PID safety, graceful-stop
+# escalation, log rotation, created/closed hooks, and viewer plumbing.
+set -euo pipefail
+
+HERE=$(cd "$(dirname "$0")/.." && pwd)
+RUNCTL="$HERE/bin/runctl"
+TMP=$(mktemp -d)
+PASS=0
+MARKER="fut-run-smoke-marker-$$"
+
+cleanup() {
+  pkill -f "$MARKER" 2>/dev/null || true
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
+
+fail() { echo "FAIL: $*" >&2; exit 1; }
+ok() { PASS=$((PASS + 1)); echo "ok $PASS - $*"; }
+
+# --- stub fut binary that records token publishes -----------------------------
+TOKENS="$TMP/tokens.log"
+: > "$TOKENS"
+STUB="$TMP/fut-stub"
+cat > "$STUB" <<'SH'
+#!/bin/sh
+out="${FUT_STUB_LOG:?}"
+{ printf '%s\037' "$@"; printf '\n'; } >> "$out"
+SH
+chmod +x "$STUB"
+
+export FUT_BIN="$STUB"
+export FUT_STUB_LOG="$TOKENS"
+export FUT_SOCKET="$TMP/fut.sock"
+export FUT_EXTENSION_ID="run"
+export FUT_RUN_STATE_DIR="$TMP/state"
+export FUT_RUN_MAX_LOG_BYTES=4096
+
+# Recorded argv: --socket S token publish run <name> <value> --workspace-id <ws>
+last_token() { # <workspace-id> -> name of last non-empty publish
+  awk -v ws="$1" 'BEGIN { FS = "\037" }
+    $3 == "token" && $4 == "publish" && $8 == "--workspace-id" && $9 == ws && $7 != "" { last = $6 }
+    END { print last }' "$TOKENS"
+}
+
+token_count() { # <workspace-id>
+  awk -v ws="$1" 'BEGIN { FS = "\037"; n = 0 }
+    $3 == "token" && $4 == "publish" && $9 == ws { n++ }
+    END { print n }' "$TOKENS"
+}
+
+state_dir() { find "$FUT_RUN_STATE_DIR" -type d -name "$1" 2>/dev/null | head -1; }
+
+state_get() { # <workspace-id> <python expression over `s`>
+  python3 -c "
+import json, sys
+try:
+    s = json.load(open(sys.argv[1]))
+except Exception:
+    s = {}
+print($2)
+" "$(state_dir "$1")/state.json"
+}
+
+run() { # <workspace-id> <config-json> <subcommand>
+  local ws=$1 cfg=$2 cmd=$3
+  mkdir -p "$TMP/roots/$ws"
+  env FUT_WORKSPACE_ID="$ws" FUT_WORKSPACE_ROOT="$TMP/roots/$ws" \
+      FUT_EXTENSION_CONFIG="$cfg" "$RUNCTL" "$cmd"
+}
+
+wait_for() { # <seconds> <command...>
+  local deadline=$((SECONDS + $1)); shift
+  until "$@"; do
+    [ "$SECONDS" -lt "$deadline" ] || return 1
+    sleep 0.1
+  done
+}
+
+child_alive() { # <workspace-id>
+  local pid
+  pid=$(state_get "$1" "s.get('child_pid', 0)")
+  [ "$pid" -gt 1 ] && kill -0 "$pid" 2>/dev/null
+}
+
+pid_dead() { ! kill -0 "$1" 2>/dev/null; }
+phase_is() { [ "$(state_get "$1" "s.get('phase')")" = "$2" ]; }
+token_is() { [ "$(last_token "$1")" = "$2" ]; }
+exit_code_is() { [ "$(state_get "$1" "(s.get('exit') or {}).get('code')")" = "$2" ]; }
+lines_at_least() { [ "$(wc -l < "$1")" -ge "$2" ]; }
+inode() { python3 -c 'import os, sys; print(os.stat(sys.argv[1]).st_ino)' "$1"; }
+
+# The marker is passed as $0 to sh so cleanup can pkill leftover runners.
+sleeper_cfg() { # <pids-file>
+  printf '{"command":["sh","-c","echo $$ >> %s; sleep 300","%s"]}' "$1" "$MARKER"
+}
+
+alive_count() { # <pids-file>
+  local n=0 pid
+  while read -r pid; do kill -0 "$pid" 2>/dev/null && n=$((n + 1)); done < "$1"
+  echo "$n"
+}
+
+# --- 1. config validation -----------------------------------------------------
+run w-cfg '{}' restart 2>"$TMP/err" && fail "restart without command succeeded"
+grep -q "no \[extension.run\] command configured" "$TMP/err" || fail "missing-config message: $(cat "$TMP/err")"
+run w-cfg '{"command":["x"],"nope":1}' restart 2>"$TMP/err" && fail "unknown key accepted"
+grep -q "unknown \[extension.run\] key" "$TMP/err" || fail "unknown-key message"
+run w-cfg '{"command":[]}' restart 2>"$TMP/err" && fail "empty command accepted"
+run w-cfg 'not json' restart 2>"$TMP/err" && fail "invalid JSON accepted"
+run w-cfg '{"command":["x"],"grace_seconds":true}' restart 2>"$TMP/err" && fail "boolean grace accepted"
+run w-cfg '{"command":["x"],"signal":false}' restart 2>"$TMP/err" && fail "non-string signal accepted"
+run w-cfg '{"command":["x"],"signal":""}' restart 2>"$TMP/err" && fail "empty signal accepted"
+[ "$(token_count w-cfg)" = 0 ] || fail "config errors published tokens"
+ok "config validation rejects bad [extension.run] tables"
+
+# --- 2. start, running state, play token ----------------------------------------
+PIDS1="$TMP/pids-w1"; : > "$PIDS1"
+out=$(run w1 "$(sleeper_cfg "$PIDS1")" restart) || fail "restart failed"
+[ -z "$out" ] || fail "restart was not silent: $out"
+phase_is w1 running || fail "w1 not running"
+wait_for 5 child_alive w1 || fail "w1 child not alive"
+token_is w1 play || fail "w1 token is '$(last_token w1)', wanted play"
+grep -q "fut-run · start · generation 1" "$(state_dir w1)/run.log" || fail "missing start separator"
+ok "restart starts the runner, records state, publishes play"
+
+# --- 3. readiness signal spans output chunks and resets on restart ---------------
+READY_CFG=$(printf '{"command":["sh","-c","printf STATUS:; sleep 1; printf READY >&2; sleep 300","%s"],"signal":"STATUS:READY"}' "$MARKER")
+run w-ready "$READY_CFG" restart || fail "readiness restart failed"
+phase_is w-ready launching || fail "signaled runner did not start in launching"
+token_is w-ready launching || fail "signaled runner did not publish launching"
+wait_for 5 phase_is w-ready running || fail "split readiness marker was not matched"
+wait_for 5 token_is w-ready play || fail "ready runner did not publish play"
+[ -n "$(state_get w-ready "s.get('ready_at', '')")" ] || fail "ready timestamp missing"
+run w-ready "$READY_CFG" restart || fail "readiness restart reset failed"
+phase_is w-ready launching || fail "restart did not reset readiness"
+token_is w-ready launching || fail "restart did not restore launching token"
+wait_for 5 phase_is w-ready running || fail "restarted runner never became ready"
+ok "literal readiness spans stdout/stderr chunks and each restart resets launching"
+
+# --- 4. exit before readiness still gets the normal final state -----------------
+run w-early-clean '{"command":["sh","-c","exit 0"],"signal":"never"}' restart || fail "early clean restart failed"
+wait_for 5 phase_is w-early-clean exited || fail "early clean runner never exited"
+token_is w-early-clean stop || fail "early clean runner did not publish stop"
+run w-early-fail '{"command":["sh","-c","exit 7"],"signal":"never"}' restart || fail "early failing restart failed"
+wait_for 5 phase_is w-early-fail exited || fail "early failing runner never exited"
+token_is w-early-fail cross || fail "early failing runner did not publish cross"
+ok "exit before readiness publishes stop for code 0 and cross for failure"
+
+# --- 5. rapid concurrent restarts leave exactly one runner ----------------------
+for _ in 1 2 3 4 5; do run w1 "$(sleeper_cfg "$PIDS1")" restart & done
+wait
+wait_for 5 lines_at_least "$PIDS1" 6 || fail "restarts did not all start"
+[ "$(alive_count "$PIDS1")" = 1 ] || fail "expected exactly 1 live child, got $(alive_count "$PIDS1")"
+[ "$(state_get w1 "s['generation']")" = 6 ] || fail "generation is $(state_get w1 "s['generation']"), wanted 6"
+phase_is w1 running || fail "w1 not running after races"
+token_is w1 play || fail "w1 token after races"
+ok "5 concurrent restarts: one survivor, generation 6, no orphans"
+
+# --- 6. isolation, stop, explicit-termination token ------------------------------
+PIDS2="$TMP/pids-w2"; : > "$PIDS2"
+run w2 "$(sleeper_cfg "$PIDS2")" restart || fail "w2 restart failed"
+[ -n "$(state_dir w2)" ] && [ "$(state_dir w1)" != "$(state_dir w2)" ] || fail "state dirs collide"
+run w1 'not json' stop || fail "w1 stop failed with invalid config"
+pid_dead "$(tail -1 "$PIDS1")" || fail "w1 child survived stop"
+wait_for 5 child_alive w2 || fail "w2 child died with w1"
+token_is w2 play || fail "w2 token disturbed by w1 stop"
+token_is w1 cross || fail "w1 stop token is '$(last_token w1)', wanted cross"
+phase_is w1 exited || fail "w1 phase after stop"
+[ "$(state_get w1 "(s.get('exit') or {}).get('signal')")" = 15 ] || fail "w1 exit signal"
+run w1 '{}' stop || fail "second stop errored"
+ok "stop uses default grace for invalid config, kills only its workspace, and shows cross"
+
+# --- 7. clean exit -> stop token, nonzero exit -> cross ---------------------------
+run w3 '{"command":["sh","-c","echo bye; exit 0"]}' restart || fail "w3 restart failed"
+wait_for 5 phase_is w3 exited || fail "w3 never exited"
+wait_for 5 token_is w3 stop || fail "w3 clean-exit token is '$(last_token w3)'"
+exit_code_is w3 0 || fail "w3 exit code"
+run w3 '{"command":["sh","-c","exit 7"]}' restart || fail "w3 restart(fail) failed"
+wait_for 5 exit_code_is w3 7 || fail "w3 nonzero exit not recorded"
+wait_for 5 token_is w3 cross || fail "w3 nonzero token is '$(last_token w3)'"
+ok "clean exit publishes stop; nonzero exit publishes cross"
+
+# --- 8. launch failure surfaces an error and cross --------------------------------
+run w4 '{"command":["/definitely/not/here-xyz"]}' restart 2>"$TMP/err" && fail "launch failure exited 0"
+grep -q "failed to start /definitely/not/here-xyz" "$TMP/err" || fail "launch failure message: $(cat "$TMP/err")"
+token_is w4 cross || fail "w4 launch-failure token"
+phase_is w4 exited || fail "w4 launch-failure phase is not exited"
+[ "$(state_get w4 "bool((s.get('exit') or {}).get('error'))")" = True ] || fail "w4 launch error not recorded"
+ok "launch failure records exited state and error, then publishes cross"
+
+# A controller must also repair a pre-ack starting state when no supervisor lives.
+WS4S="$(dirname "$(state_dir w1)")/w4-starting"
+mkdir -p "$WS4S"
+printf '%s\n' '{"generation":1,"phase":"starting"}' > "$WS4S/state.json"
+run w4-starting '{"typo":true}' stop || fail "stop did not repair starting state"
+phase_is w4-starting exited || fail "starting state was not repaired"
+token_is w4-starting cross || fail "starting-state repair did not publish cross"
+ok "stop repairs stale starting state even when config is invalid"
+
+# --- 9. stale state never kills an unrelated PID ----------------------------------
+sleep 300 & DECOY=$!
+WS5="$(dirname "$(state_dir w1)")/w5"
+mkdir -p "$WS5"
+cat > "$WS5/state.json" <<JSON
+{"generation": 9, "phase": "running", "supervisor_pid": $DECOY, "child_pid": $DECOY, "child_pgid": $DECOY}
+JSON
+run w5 '{"command":["sh","-c","exit 0"]}' restart || fail "w5 restart failed"
+kill -0 "$DECOY" 2>/dev/null || fail "restart killed an unrelated PID"
+kill "$DECOY" 2>/dev/null || true
+[ "$(state_get w5 "s['generation']")" = 10 ] || fail "w5 generation"
+ok "stale state.json without a live supervisor lock signals nothing"
+
+# --- 10. graceful stop escalates to SIGKILL ----------------------------------------
+PIDS6="$TMP/pids-w6"; : > "$PIDS6"
+CFG6=$(printf '{"command":["sh","-c","trap : TERM; echo $$ >> %s; while :; do sleep 1; done","%s"],"grace_seconds":1}' "$PIDS6" "$MARKER")
+run w6 "$CFG6" restart || fail "w6 restart failed"
+wait_for 5 lines_at_least "$PIDS6" 1 || fail "w6 never started"
+START=$SECONDS
+run w6 '{"grace_seconds":1}' stop || fail "w6 stop failed"
+[ $((SECONDS - START)) -le 8 ] || fail "w6 stop took $((SECONDS - START))s"
+wait_for 3 pid_dead "$(cat "$PIDS6")" || fail "w6 TERM-ignoring child survived"
+token_is w6 cross || fail "w6 escalation token"
+grep -q "escalating to SIGKILL" "$(state_dir w6)"/run.log* || fail "missing escalation separator"
+ok "stop escalates a TERM-ignoring process group to SIGKILL"
+
+# --- 11. log rotation stays bounded without replacing run.log -----------------------
+CFG7=$(printf '{"command":["sh","-c","while [ ! -e \\"$1\\" ]; do sleep 0.05; done; i=0; while [ $i -lt 300 ]; do printf %%0100d\\n $i; i=$((i+1)); done","%s","%s"]}' "$MARKER" "$TMP/w7-go")
+run w7 "$CFG7" restart || fail "w7 restart failed"
+D7=$(state_dir w7)
+INODE7=$(inode "$D7/run.log")
+touch "$TMP/w7-go"
+wait_for 5 phase_is w7 exited || fail "w7 never exited"
+[ -f "$D7/run.log.1" ] || fail "no rotated log"
+[ "$(inode "$D7/run.log")" = "$INODE7" ] || fail "run.log inode changed during rotation"
+for f in "$D7/run.log" "$D7/run.log.1"; do
+  size=$(wc -c < "$f")
+  [ "$size" -le 4096 ] || fail "$f is $size bytes, bound is 4096"
+done
+grep -q "log rotated" "$D7/run.log" || fail "missing rotation separator"
+grep -q "fut-run · exit · generation 1 · code 0" "$D7/run.log" || fail "missing exit separator"
+ok "log rotation copies then truncates; run.log inode stays stable and both files stay bounded"
+
+# --- 12. workspace.created hook: pause only when configured -------------------------
+mkdir -p "$TMP/roots/w8" "$TMP/roots/w9"
+HOOK_CFG=$(printf '{"command":["sh","-c","touch %s","fut-run-smoke-w8"]}' "$TMP/w8-started")
+hook() { # <workspace-id> <event> <root> [resolved-config-json]
+  local cfg=${4-}
+  [ -n "$cfg" ] || cfg='{}'
+  printf '{"version":1,"event":"%s","workspace":{"id":"%s","name":"x","root":"%s"}}\n' "$2" "$1" "$3" |
+    env FUT_WORKSPACE_ID="$1" FUT_EVENT="$2" FUT_EXTENSION_CONFIG="$cfg" "$RUNCTL" hook
+}
+hook w8 workspace.created "$TMP/roots/w8" "$HOOK_CFG" || fail "created hook failed"
+hook w9 workspace.created "$TMP/roots/w9" || fail "created hook (unconfigured) failed"
+token_is w8 pause || fail "w8 created token is '$(last_token w8)'"
+[ "$(token_count w9)" = 0 ] || fail "unconfigured workspace published tokens"
+[ ! -e "$TMP/roots/w8/.fut/config.toml" ] || fail "global-only smoke unexpectedly used local config"
+[ ! -e "$(dirname "$(state_dir w1)")/w8/state.json" ] || fail "created hook wrote state"
+[ ! -e "$TMP/w8-started" ] || fail "created hook auto-started the command"
+pgrep -f "fut-run-smoke-w8" >/dev/null && fail "created hook left a process behind"
+ok "created hook publishes pause from global-only resolved config, starts nothing"
+
+# --- 13. workspace.closed hook terminates and cleans up ------------------------------
+PIDS10="$TMP/pids-w10"; : > "$PIDS10"
+run w10 "$(sleeper_cfg "$PIDS10")" restart || fail "w10 restart failed"
+D10=$(state_dir w10)
+START=$SECONDS
+hook w10 workspace.closed "$TMP/roots/w10" || fail "closed hook failed"
+[ $((SECONDS - START)) -lt 4 ] || fail "closed hook took $((SECONDS - START))s"
+pid_dead "$(cat "$PIDS10")" || fail "w10 child survived close"
+[ ! -d "$D10" ] || fail "w10 state dir not removed"
+ok "closed hook finishes under 4s, stops the runner, and removes workspace state"
+
+# --- 14. logs / edit-logs plumbing ----------------------------------------------------
+mkdir -p "$TMP/bin"
+cat > "$TMP/bin/less" <<SH
+#!/bin/sh
+printf '%s\n' "\$@" > "$TMP/less-args"
+SH
+cat > "$TMP/fake-editor" <<SH
+#!/bin/sh
+printf '%s\n' "\$@" > "$TMP/editor-args"
+SH
+chmod +x "$TMP/bin/less" "$TMP/fake-editor"
+PATH="$TMP/bin:$PATH" run w1 '{}' logs || fail "logs command failed"
+{ grep -qx -- '-R' "$TMP/less-args" && grep -qx -- '+F' "$TMP/less-args"; } || fail "less args: $(cat "$TMP/less-args")"
+grep -q 'run\.log$' "$TMP/less-args" || fail "less did not get the log path"
+env VISUAL="$TMP/fake-editor --flag" FUT_WORKSPACE_ID=w1 FUT_WORKSPACE_ROOT="$TMP/roots/w1" \
+    FUT_EXTENSION_CONFIG='{}' "$RUNCTL" edit-logs || fail "edit-logs failed"
+grep -qx -- '--flag' "$TMP/editor-args" || fail "editor args: $(cat "$TMP/editor-args")"
+grep -q 'run\.log$' "$TMP/editor-args" || fail "editor did not get the log path"
+ok "logs opens less -R +F; edit-logs honors VISUAL with arguments"
+
+# --- 15. leftover cleanup --------------------------------------------------------------
+run w2 '{}' stop || fail "w2 cleanup stop failed"
+run w-ready '{}' stop || fail "readiness cleanup stop failed"
+echo "all $PASS smoke checks passed"

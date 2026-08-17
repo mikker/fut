@@ -25,8 +25,8 @@ use super::{
     navigation::NavigationHistory,
     notifications::{ActivityIndicator, NotificationState},
     presentation::{
-        ItemState, TokenValue, apply_item_state, pill_cap_style, render_token_segments,
-        truncate_line,
+        ItemState, TokenValue, apply_item_state, extension_token_value, pill_cap_style,
+        render_token_segments, truncate_line,
     },
 };
 
@@ -548,6 +548,7 @@ impl WorkspacesComponent {
             workspace_config(ui, position).header,
             &self.model,
             None,
+            0,
             position,
             ui,
         );
@@ -1388,11 +1389,16 @@ struct WorkspaceGeometry {
     footer: Vec<Line<'static>>,
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "shared render and hit geometry keeps its resource and animation inputs explicit"
+)]
 fn workspace_geometry(
     model: &WorkspaceModel,
     selected: Option<WorkspaceId>,
     status: Option<&WorkspaceStatus>,
     help: bool,
+    spinner_frame: usize,
     area: Rect,
     position: SidebarSide,
     ui: &UiConfig,
@@ -1402,6 +1408,7 @@ fn workspace_geometry(
         workspace_config(ui, position).header,
         model,
         status,
+        spinner_frame,
         position,
         ui,
     );
@@ -1410,7 +1417,7 @@ fn workspace_geometry(
     } else {
         SIDEBAR_HEADER_HEIGHT
     };
-    let footer_lines = render_sidebar_footer(model, status, help, position, ui);
+    let footer_lines = render_sidebar_footer(model, status, help, spinner_frame, position, ui);
     let footer_allowed = status
         .is_none_or(|status| content.height >= 5 || !matches!(status, WorkspaceStatus::Ready));
     let urgent_footer = matches!(
@@ -1498,7 +1505,7 @@ fn workspace_hotkey_at(
     if lines.is_empty() {
         return None;
     }
-    let geometry = workspace_geometry(model, None, Some(status), help, area, position, ui)?;
+    let geometry = workspace_geometry(model, None, Some(status), help, 0, area, position, ui)?;
     if !rect_contains(geometry.content, column, row) || geometry.content.height < 5 {
         return None;
     }
@@ -1525,7 +1532,7 @@ fn workspace_item_at<'a>(
     column: u16,
     row: u16,
 ) -> Option<&'a WorkspaceItem> {
-    let geometry = workspace_geometry(model, selected, status, false, area, position, ui)?;
+    let geometry = workspace_geometry(model, selected, status, false, 0, area, position, ui)?;
     geometry.row_geometries.into_iter().find_map(|geometry| {
         let VisibleRow::Item(index) = geometry.row else {
             return None;
@@ -1645,6 +1652,7 @@ fn render_minimized_model(
         workspace_config(ui, position).header,
         model,
         None,
+        spinner_frame,
         position,
         ui,
     );
@@ -1772,8 +1780,16 @@ fn render_model(
     if render_sidebar_frame(area, position, ui, buffer).is_none() {
         return;
     }
-    let Some(geometry) = workspace_geometry(model, selected, status, help, area, position, ui)
-    else {
+    let Some(geometry) = workspace_geometry(
+        model,
+        selected,
+        status,
+        help,
+        spinner_frame,
+        area,
+        position,
+        ui,
+    ) else {
         return;
     };
     render_sidebar_header(
@@ -1863,6 +1879,7 @@ fn render_sidebar_footer(
     model: &WorkspaceModel,
     status: Option<&WorkspaceStatus>,
     help: bool,
+    spinner_frame: usize,
     side: SidebarSide,
     ui: &UiConfig,
 ) -> Vec<Line<'static>> {
@@ -1875,7 +1892,14 @@ fn render_sidebar_footer(
             .map(|hotkey| hotkey.line)
             .collect();
     }
-    let footer = render_sidebar_chrome(workspace_config(ui, side).footer, model, status, side, ui);
+    let footer = render_sidebar_chrome(
+        workspace_config(ui, side).footer,
+        model,
+        status,
+        spinner_frame,
+        side,
+        ui,
+    );
     (!footer.spans.is_empty())
         .then_some(footer)
         .into_iter()
@@ -2012,6 +2036,7 @@ fn render_sidebar_chrome(
     segments: &[super::config::SegmentConfig],
     model: &WorkspaceModel,
     status: Option<&WorkspaceStatus>,
+    spinner_frame: usize,
     side: SidebarSide,
     ui: &UiConfig,
 ) -> ratatui::text::Line<'static> {
@@ -2024,6 +2049,7 @@ fn render_sidebar_chrome(
         None,
         ItemState::default(),
         &ui.styles,
+        &icons,
         |token| match token {
             "fut" => TokenValue::plain("fut"),
             "session.name" => TokenValue::plain(model.session_name.clone()),
@@ -2046,7 +2072,7 @@ fn render_sidebar_chrome(
                 ),
                 None => TokenValue::plain(format!(" {display} · {visibility}")),
             },
-            _ => TokenValue::plain(model.extension_value(token)),
+            _ => extension_token_value(ui, token, model.extension_value(token), spinner_frame),
         },
     )
 }
@@ -2135,13 +2161,14 @@ fn render_workspace_row(
                 TokenValue::styled(activity.marker(spinner_frame), style)
             },
         ),
-        _ => TokenValue::plain(item.token_value(token)),
+        _ => extension_token_value(ui, token, item.token_value(token), spinner_frame),
     };
     let left = render_token_segments(
         &workspace_config(ui, side).row.left,
         None,
         title_state,
         &ui.styles,
+        &icons,
         resolve,
     );
     let body = render_token_segments(
@@ -2149,6 +2176,7 @@ fn render_workspace_row(
         None,
         title_state,
         &ui.styles,
+        &icons,
         resolve,
     );
     let right = render_token_segments(
@@ -2156,6 +2184,7 @@ fn render_workspace_row(
         None,
         title_state,
         &ui.styles,
+        &icons,
         resolve,
     );
     let title_width = usize::from(title.width);
@@ -2186,6 +2215,7 @@ fn render_workspace_row(
             None,
             state,
             &ui.styles,
+            &icons,
             resolve,
         );
         buffer.set_line(
@@ -2292,7 +2322,7 @@ fn render_sidebar_header(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use crossterm::event::KeyModifiers;
     use ratatui::style::Modifier;
@@ -2304,6 +2334,7 @@ mod tests {
             AgentActivity, AgentDetection, AgentEvent, AgentIntegration, AgentReport, AgentState,
             PaneId, SessionId, TabId, TerminalId,
         },
+        extensions,
         resources::{
             PaneSnapshot, Project, ProjectIdentity, SessionSnapshot, TabSnapshot, WorkspaceSnapshot,
         },
@@ -2430,6 +2461,59 @@ mod tests {
             model.items[1].token_value("workspace.extension.demo.value"),
             ""
         );
+    }
+
+    #[test]
+    fn workspace_row_renders_manifest_spinner_frames() {
+        let (mut snapshot, focused) = fixture(&["main"], 0);
+        snapshot.sessions[0].workspaces[0].tokens.insert(
+            "workspace.extension.run.launching".into(),
+            "populated".into(),
+        );
+        let model = WorkspaceModel::from_snapshot(
+            &snapshot,
+            &focused,
+            &NavigationHistory::default(),
+            &NotificationState::default(),
+        );
+        let mut ui = UiConfig::default();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/extensions/run");
+        ui.extensions = extensions::load(&[root]).unwrap();
+        let SidebarComponentConfig::Workspaces { row, .. } = &mut ui.sidebar.left.components[0]
+        else {
+            panic!("default left sidebar should contain workspaces");
+        };
+        row.left.clear();
+        row.body = vec![super::super::config::SegmentConfig {
+            token: Some("workspace.extension.run.launching".into()),
+            ..Default::default()
+        }];
+        row.right.clear();
+        row.detail.clear();
+
+        let area = Rect::new(0, 0, 2, 1);
+        let mut first = Buffer::empty(area);
+        render_workspace_row(
+            &model.items[0],
+            false,
+            0,
+            area,
+            SidebarSide::Left,
+            &ui,
+            &mut first,
+        );
+        let mut second = Buffer::empty(area);
+        render_workspace_row(
+            &model.items[0],
+            false,
+            1,
+            area,
+            SidebarSide::Left,
+            &ui,
+            &mut second,
+        );
+        assert_eq!(first[(0, 0)].symbol(), "⠋");
+        assert_eq!(second[(0, 0)].symbol(), "⠙");
     }
 
     #[test]

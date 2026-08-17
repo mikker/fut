@@ -19,6 +19,10 @@ const MAX_HEIGHT: u16 = 16;
 
 const BRAILLE_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+pub(super) fn spinner_marker(frame: usize) -> &'static str {
+    BRAILLE_SPINNER[frame % BRAILLE_SPINNER.len()]
+}
+
 fn open_panes(snapshot: &ResourceSnapshot) -> impl Iterator<Item = &PaneSnapshot> {
     snapshot
         .sessions
@@ -44,7 +48,7 @@ pub(super) enum ActivityIndicator {
 impl ActivityIndicator {
     pub(super) fn marker(self, frame: usize) -> &'static str {
         match self {
-            Self::Working => BRAILLE_SPINNER[frame % BRAILLE_SPINNER.len()],
+            Self::Working => spinner_marker(frame),
             Self::Blocked => "!",
             Self::Completed => "•",
         }

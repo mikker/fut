@@ -42,6 +42,11 @@ argv = ["./bin/open-review", "--interactive"]
 size = { width = 100, height = 30 }
 activate_opened = true
 
+[commands.refresh]
+title = "Refresh review status"
+argv = ["./bin/refresh"]
+mode = "background"
+
 [hooks]
 "workspace.created" = ["./bin/workspace-event"]
 "workspace.renamed" = ["./bin/workspace-event"]
@@ -49,6 +54,11 @@ activate_opened = true
 [[presentation_tokens]]
 name = "state"
 scope = "workspace"
+
+[[presentation_tokens]]
+name = "refreshing"
+scope = "workspace"
+presentation = "spinner"
 ```
 
 IDs and declaration names are 1–64 bytes. They begin with a lowercase ASCII
@@ -75,7 +85,8 @@ size = { width = 120, height = 40 }
 Commands appear in `Ctrl-b :` as a stable qualified slug followed by their
 title, such as `review-status:open-review  Open review`. Both are searchable.
 Commands run in an interactive temporary PTY, inherit the focused pane's live
-working directory and client environment, and receive:
+working directory and client environment. Extension commands run from the
+focused workspace root and receive:
 
 | Variable | Value |
 | --- | --- |
@@ -84,6 +95,21 @@ working directory and client environment, and receive:
 | `FUT_EXTENSION_ID` | Manifest ID |
 | `FUT_EXTENSION_COMMAND` | Command declaration name |
 | `FUT_EXTENSION_ROOT` | Canonical extension directory |
+| `FUT_SESSION_ID` | Focused session UUID |
+| `FUT_WORKSPACE_ID` | Focused workspace UUID |
+| `FUT_TAB_ID` | Focused tab UUID |
+| `FUT_PANE_ID` | Focused pane UUID |
+| `FUT_TERMINAL_ID` | Focused terminal UUID |
+| `FUT_EXTENSION_CONFIG` | Resolved `[extension.<id>]` table as compact JSON |
+| `FUT_EXTENSION_CONFIG_GLOBAL_PATH` | Global source path, when it contributed values |
+| `FUT_EXTENSION_CONFIG_WORKSPACE_PATH` | Workspace source path, when it contributed values |
+
+Set `mode = "background"` for a non-interactive command. Fut starts it
+asynchronously without opening a temporary surface, keeps successful commands
+silent, and shows a bounded spawn or nonzero-exit error as a toast. Background
+commands have null stdin and stdout and may not declare `size` or
+`activate_opened`; stderr is retained only for the bounded failure diagnostic.
+The default mode is `interactive`.
 
 `size` requests the centered outer popup dimensions. Omit either dimension to
 fill the terminal in that direction. Fut clamps dimensions to the available
@@ -116,6 +142,31 @@ args = ["--local-choice"]
 
 The configured array replaces the manifest arguments after its executable;
 use `args = []` to pass none. Unknown command slugs reject the configuration.
+
+## Extension configuration
+
+Extensions can receive bounded, namespaced data from the global Fut config and
+the focused workspace's `.fut/config.toml`. Both locations use the same shape:
+
+```toml
+[extension.review-status]
+remote = "origin"
+[extension.review-status.display]
+compact = true
+```
+
+Workspace values recursively override global defaults; arrays and scalar
+values replace their global value. Fut rejects tables for extension IDs that
+are not explicitly loaded, limits nesting, key counts, arrays, scalar sizes,
+and the resolved payload, and retains the contributing paths for diagnostics.
+It does not interpret an extension's inner table—that validation belongs to
+the extension. The resolved object is exposed as JSON through
+`FUT_EXTENSION_CONFIG`; it is `{}` when neither source configures the extension.
+
+Workspace configuration is read only when an extension command or workspace
+hook is explicitly invoked. Reading or entering a project never executes the
+configured values. A lifecycle hook may publish status derived from the table,
+but only an explicit command can start project-defined work.
 
 ## Workspace hooks
 
@@ -158,7 +209,10 @@ The hook receives one versioned JSON object on stdin:
 Only rename events include `previous_name`. Hook processes inherit the daemon
 environment plus `FUT_BIN`, `FUT_SOCKET`, `FUT_EXTENSION_ID`,
 `FUT_EXTENSION_ROOT`, `FUT_EVENT`, `FUT_EVENT_VERSION`, `FUT_SESSION_ID`, and
-`FUT_WORKSPACE_ID`.
+`FUT_WORKSPACE_ID`. Workspace hooks also receive the resolved
+`FUT_EXTENSION_CONFIG` and its optional global/workspace provenance variables
+described above, plus `FUT_WORKSPACE_ROOT`, the absolute root of the workspace
+in the event.
 
 Hook failures are diagnostic only. Spawn errors, nonzero exits, output, and
 timeouts do not alter daemon state or stop later hooks.
@@ -208,7 +262,8 @@ inherit the client environment plus `FUT_BIN`, `FUT_SOCKET`,
 
 ## Presentation tokens
 
-Extensions can declare plain string values for a resource scope:
+Extensions can declare bounded values and their client presentation for a
+resource scope:
 
 ```toml
 [[presentation_tokens]]
@@ -235,6 +290,14 @@ components = [
 ]
 ```
 
+Presentation defaults to `plain`: the client renders the validated published
+string exactly as token text. `presentation = "spinner"` instead treats any
+non-empty published value as presence and renders an animated spinner using
+the client's existing 100 ms clock. Empty still suppresses the segment and its
+affixes. Animation is entirely client-side—publication happens only when the
+extension's state changes, never once per frame—and does not give plain token
+values a control or styling channel.
+
 Values are plain text. They cannot inject styles, actions, or executable
 behavior. Unpublished values are empty; published values live in ordinary
 resource snapshots, are shared by every attached client, and disappear when
@@ -255,6 +318,10 @@ contexts.
 | Hook stdin payload | 64 KiB |
 | Published token value | 1 KiB |
 | Materialized token values per daemon | 4,096 |
+| Extension config keys | 128 |
+| Extension config nesting depth | 8 |
+| Values in one extension config array | 128 |
+| Resolved extension config JSON | 16 KiB |
 
 The hook queue holds 128 events and never blocks resource mutations. Fut
 retains at most 16 KiB each of hook stdout and stderr for diagnostics. A new
@@ -263,7 +330,7 @@ a one-second grace period before cancellation.
 
 ## Examples
 
-The repository includes three complete extensions:
+The repository includes four complete extensions:
 
 - [`ghostty-title`](https://github.com/mikker/fut/tree/main/examples/extensions/ghostty-title)
   follows the selected Fut session in the current Ghostty window title.
@@ -272,10 +339,15 @@ The repository includes three complete extensions:
   turns workspace events into a sidebar token.
 - [`wt`](https://github.com/mikker/fut/tree/main/examples/extensions/wt)
   creates a worktree, opens it as a workspace, and runs a configurable action.
+- [`run`](https://github.com/mikker/fut/tree/main/examples/extensions/run)
+  explicitly manages one long-running command per workspace, with safe
+  restart/stop, optional output readiness, live logs, and styled status tokens.
 
-Extensions are an executable trust boundary. Only configure directories you
-trust, and keep their executables under the same review and permissions policy
-as shell scripts in your dotfiles.
+Extensions and their namespaced project configuration are an executable trust
+boundary. Merely loading `[extension.<id>]` does not run it, but invoking the
+extension may deliberately execute its values. Only configure directories and
+projects you trust, and keep their executables under the same review and
+permissions policy as shell scripts in your dotfiles.
 
 ## Related
 

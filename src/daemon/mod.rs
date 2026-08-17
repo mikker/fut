@@ -1327,7 +1327,9 @@ fn watch_attachment(
 /// Bind Fut's sole socket and run while at least one session is alive.
 pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     let config_location = global_config::resolve_location(config.config_dir.as_deref())?;
-    let extensions = global_config::load_extensions_location(&config_location)?;
+    let loaded_extensions = global_config::load_extensions_location(&config_location)?;
+    let extensions = loaded_extensions.extensions;
+    let extension_config = loaded_extensions.config;
     let fut_bin = std::env::current_exe().context("resolve current Fut executable")?;
     let (hook_queue, hook_receiver) = crate::extensions::hook_queue();
     let resolved = ProjectResolver::default()
@@ -1377,6 +1379,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     let mut hooks = tokio::spawn(crate::extensions::run_hooks(
         hook_receiver,
         extensions,
+        extension_config,
         fut_bin,
         config.socket_path.clone(),
         hook_shutdown_rx,

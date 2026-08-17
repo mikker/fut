@@ -1,0 +1,797 @@
+#!/usr/bin/env python3
+"""One managed long-running command per Fut workspace.
+
+Subcommands (see fut-extension.toml):
+  restart    background: stop the current runner, start a fresh one
+  stop       background: stop the current runner without replacing it
+  logs       interactive: follow the workspace log with `less -R +F`
+  edit-logs  interactive: open the workspace log in VISUAL/EDITOR
+  hook       workspace.created / workspace.closed dispatch via FUT_EVENT
+
+State layout, one directory per workspace under
+$FUT_RUN_STATE_DIR or ${XDG_STATE_HOME:-~/.local/state}/fut-run:
+
+  <sha256(FUT_SOCKET)[:12]>/<workspace-id>/
+    control.lock     serializes restart/stop/close end to end
+    state.lock       guards state.json writes and token publishes
+    supervisor.lock  held by the live supervisor for its whole life;
+                     this lock, not any recorded PID, is the liveness truth
+    state.json       generation, phase, PIDs, exit details
+    run.log          stable combined stdout/stderr, bounded
+    run.log.1        previous rotation
+
+Ordering rules that keep races safe:
+  - Controllers never signal a PID unless supervisor.lock is currently held,
+    so stale state.json entries can never kill an unrelated process.
+  - restart bumps the generation before terminating the old supervisor; a
+    supervisor only records its exit and publishes a token while state.json
+    still carries its own generation, so a superseded runner goes silent.
+  - Token publishes happen under state.lock right after the generation
+    check, so the last published state always matches the newest generation.
+"""
+
+import fcntl
+import hashlib
+import json
+import os
+import re
+import select
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+TOKENS = [
+    ("pause", "…"),
+    ("launching", "1"),
+    ("play", "▶"),
+    ("stop", "■"),
+    ("cross", "✗"),
+]
+CONFIG_KEYS = {"command", "grace_seconds", "signal"}
+DEFAULT_GRACE = 3.0
+CLOSE_GRACE = 0.5        # workspace.closed must fit Fut's 5s hook timeout
+CLOSE_CONTROL_TIMEOUT = 0.5
+CLOSE_KILL_WAIT = 0.5
+TERMINATION_SETTLE = 0.5
+CONTROL_TIMEOUT = 20.0
+STATE_TIMEOUT = 5.0
+SPAWN_ACK_TIMEOUT = 10.0
+MAX_STATE_BYTES = 64 * 1024
+MAX_LOG_BYTES = max(1024, int(os.environ.get("FUT_RUN_MAX_LOG_BYTES", 2 * 1024 * 1024)))
+
+# flock file descriptors held by this process; a forked supervisor closes
+# them so the controller's locks release when the controller exits.
+HELD_LOCK_FDS = []
+
+
+def fail(message):
+    print("run: %s" % message, file=sys.stderr)
+    sys.exit(1)
+
+
+def require_env(name):
+    value = os.environ.get(name)
+    if not value:
+        fail("%s is not set" % name)
+    return value
+
+
+def timestamp():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def workspace_dir(workspace_id, create=True):
+    base = os.environ.get("FUT_RUN_STATE_DIR")
+    if not base:
+        home = os.environ.get("XDG_STATE_HOME") or os.path.join(
+            os.path.expanduser("~"), ".local", "state"
+        )
+        base = os.path.join(home, "fut-run")
+    instance = hashlib.sha256(
+        os.path.abspath(require_env("FUT_SOCKET")).encode()
+    ).hexdigest()[:12]
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", workspace_id)[:80]
+    if safe != workspace_id:
+        safe += "-" + hashlib.sha256(workspace_id.encode()).hexdigest()[:8]
+    path = os.path.join(base, instance, safe)
+    if create:
+        os.makedirs(path, exist_ok=True)
+    return path
+
+
+# --- locks -----------------------------------------------------------------
+
+
+class Lock:
+    def __init__(self, wsdir, name):
+        self.path = os.path.join(wsdir, name)
+        self.fd = None
+
+    def acquire(self, timeout):
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.fd = fd
+                HELD_LOCK_FDS.append(fd)
+                return True
+            except OSError:
+                if time.monotonic() >= deadline:
+                    os.close(fd)
+                    return False
+                time.sleep(0.05)
+
+    def release(self):
+        if self.fd is not None:
+            HELD_LOCK_FDS.remove(self.fd)
+            os.close(self.fd)
+            self.fd = None
+
+
+class state_lock:
+    def __init__(self, wsdir):
+        self.lock = Lock(wsdir, "state.lock")
+
+    def __enter__(self):
+        if not self.lock.acquire(STATE_TIMEOUT):
+            raise RuntimeError("timed out waiting for the run state lock")
+        return self
+
+    def __exit__(self, *_):
+        self.lock.release()
+
+
+def supervisor_alive(wsdir):
+    fd = os.open(os.path.join(wsdir, "supervisor.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+
+
+# --- state and tokens --------------------------------------------------------
+
+
+def read_state(wsdir):
+    try:
+        with open(os.path.join(wsdir, "state.json"), "rb") as handle:
+            raw = handle.read(MAX_STATE_BYTES + 1)
+    except OSError:
+        return {}
+    if len(raw) > MAX_STATE_BYTES:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_state(wsdir, state):
+    path = os.path.join(wsdir, "state.json")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(state, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+
+def publish_tokens(active):
+    """Publish exactly one of the five workspace tokens; clear the rest.
+
+    The active token is published first so the indicator never blinks empty.
+    Failures are ignored: the workspace may already be gone.
+    """
+    fut_bin = os.environ.get("FUT_BIN")
+    socket = os.environ.get("FUT_SOCKET")
+    extension = os.environ.get("FUT_EXTENSION_ID", "run")
+    workspace = os.environ.get("FUT_WORKSPACE_ID")
+    if not (fut_bin and socket and workspace):
+        return
+    glyphs = dict(TOKENS)
+    order = [active] + [name for name, _ in TOKENS if name != active]
+    for name in order:
+        try:
+            subprocess.run(
+                [
+                    fut_bin,
+                    "--socket",
+                    socket,
+                    "token",
+                    "publish",
+                    extension,
+                    name,
+                    glyphs[name] if name == active else "",
+                    "--workspace-id",
+                    workspace,
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
+# --- configuration -----------------------------------------------------------
+
+
+class ConfigError(ValueError):
+    pass
+
+
+def parse_config(require_command):
+    raw = os.environ.get("FUT_EXTENSION_CONFIG") or "{}"
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        raise ConfigError("FUT_EXTENSION_CONFIG is not valid JSON")
+    if not isinstance(data, dict):
+        raise ConfigError("[extension.run] must be a table")
+    unknown = sorted(set(data) - CONFIG_KEYS)
+    if unknown:
+        raise ConfigError(
+            "unknown [extension.run] key(s): %s "
+            "(expected: command, grace_seconds, signal)"
+            % ", ".join(unknown)
+        )
+    command = data.get("command")
+    if command is not None:
+        if (
+            not isinstance(command, list)
+            or not command
+            or not all(isinstance(arg, str) and arg for arg in command)
+        ):
+            raise ConfigError(
+                "[extension.run] command must be a non-empty array of non-empty strings"
+            )
+    elif require_command:
+        raise ConfigError(
+            "no [extension.run] command configured; add one to .fut/config.toml "
+            "or the global Fut config"
+        )
+    grace = data.get("grace_seconds", DEFAULT_GRACE)
+    if isinstance(grace, bool) or not isinstance(grace, (int, float)) or not 0 <= grace <= 120:
+        raise ConfigError("[extension.run] grace_seconds must be a number between 0 and 120")
+    readiness_signal = data.get("signal")
+    if readiness_signal is not None and (
+        not isinstance(readiness_signal, str) or not readiness_signal
+    ):
+        raise ConfigError("[extension.run] signal must be a non-empty string")
+    return command, float(grace), readiness_signal
+
+
+def load_config(require_command):
+    try:
+        return parse_config(require_command)
+    except ConfigError as error:
+        fail(str(error))
+
+
+def stop_grace():
+    """Invalid config must never prevent an already-running process from stopping."""
+    try:
+        _, grace, _ = parse_config(require_command=False)
+        return grace
+    except ConfigError:
+        return DEFAULT_GRACE
+
+
+# --- termination -------------------------------------------------------------
+
+
+def wait_supervisor_exit(wsdir, timeout):
+    deadline = time.monotonic() + timeout
+    while True:
+        if not supervisor_alive(wsdir):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+def signal_if_alive(wsdir, target, sig, group=False):
+    """Signal a recorded PID only while the supervisor lock is still held."""
+    if not isinstance(target, int) or target <= 1 or not supervisor_alive(wsdir):
+        return
+    try:
+        if group:
+            os.killpg(target, sig)
+        else:
+            os.kill(target, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def terminate_runner(wsdir, grace, kill_wait=2.0):
+    """Bring the workspace to a no-supervisor state, or raise RuntimeError.
+
+    Sends SIGTERM to the supervisor, which owns graceful child-group shutdown
+    and its own escalation after `grace` seconds. Only if the supervisor never
+    exits do we SIGKILL the recorded child group and supervisor directly.
+    """
+    if not supervisor_alive(wsdir):
+        return
+    with state_lock(wsdir):
+        state = read_state(wsdir)
+    signal_if_alive(wsdir, state.get("supervisor_pid"), signal.SIGTERM)
+    if wait_supervisor_exit(wsdir, grace + TERMINATION_SETTLE):
+        return
+    signal_if_alive(wsdir, state.get("child_pgid"), signal.SIGKILL, group=True)
+    signal_if_alive(wsdir, state.get("supervisor_pid"), signal.SIGKILL)
+    if wait_supervisor_exit(wsdir, kill_wait):
+        return
+    raise RuntimeError("the current runner refused to stop; nothing was started")
+
+
+# --- log writing -------------------------------------------------------------
+
+
+class LogWriter:
+    """Bounded run.log writer that preserves the active file's inode."""
+
+    def __init__(self, wsdir):
+        self.path = os.path.join(wsdir, "run.log")
+        self.fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        self.size = os.fstat(self.fd).st_size
+
+    def write(self, data):
+        while data:
+            room = MAX_LOG_BYTES - self.size
+            if room <= 0:
+                self.rotate()
+                continue
+            part = data[:room]
+            os.write(self.fd, part)
+            self.size += len(part)
+            data = data[len(part):]
+
+    def write_line(self, text):
+        self.write(text.encode("utf-8", "replace") + b"\n")
+
+    def rotate(self):
+        shutil.copyfile(self.path, self.path + ".1")
+        os.ftruncate(self.fd, 0)
+        os.lseek(self.fd, 0, os.SEEK_SET)
+        self.size = 0
+        self.write_line("===== fut-run · log rotated · %s =====" % timestamp())
+
+
+# --- supervisor --------------------------------------------------------------
+
+TERM_REQUESTED = {"flag": False}
+
+
+def ack(fd, message):
+    try:
+        os.write(fd, message.encode("utf-8", "replace") + b"\n")
+    except OSError:
+        pass
+
+
+def describe_exit(returncode):
+    if returncode < 0:
+        return "signal %d" % -returncode
+    return "code %d" % returncode
+
+
+class LiteralMatcher:
+    """Bounded streaming literal matcher that retains only a possible prefix."""
+
+    def __init__(self, literal):
+        self.needle = literal.encode("utf-8")
+        self.tail = b""
+        self.matched = False
+
+    def feed(self, chunk):
+        if self.matched:
+            return True
+        window = self.tail + chunk
+        self.matched = self.needle in window
+        if not self.matched:
+            keep = min(len(self.needle) - 1, len(window))
+            self.tail = window[-keep:] if keep else b""
+        return self.matched
+
+
+def record_ready(wsdir, generation):
+    """Atomically move launching to running; false asks the pump to retry."""
+    try:
+        with state_lock(wsdir):
+            state = read_state(wsdir)
+            if (
+                int(state.get("generation", 0)) != generation
+                or state.get("phase") != "launching"
+            ):
+                return True
+            state.update(phase="running", ready_at=timestamp())
+            write_state(wsdir, state)
+            publish_tokens("play")
+            return True
+    except RuntimeError:
+        return False
+
+
+def supervise(wsdir, generation, command, cwd, grace, readiness_signal, ack_fd):
+    """Detached process that owns one child generation until it exits."""
+    signal.signal(signal.SIGTERM, lambda *_: TERM_REQUESTED.__setitem__("flag", True))
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    # Drop the controller's inherited lock descriptors and stdio. Keeping the
+    # inherited stderr open would stall Fut's background-command bookkeeping.
+    for fd in list(HELD_LOCK_FDS):
+        os.close(fd)
+    HELD_LOCK_FDS.clear()
+    devnull = os.open(os.devnull, os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(devnull, fd)
+    if devnull > 2:
+        os.close(devnull)
+
+    holder = Lock(wsdir, "supervisor.lock")
+    if not holder.acquire(0):
+        ack(ack_fd, "another runner is already active")
+        os._exit(1)
+
+    log = LogWriter(wsdir)
+    log.write_line(
+        "===== fut-run · start · generation %d · %s · %s ====="
+        % (generation, timestamp(), shlex.join(command))
+    )
+    try:
+        child = subprocess.Popen(
+            command,
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except OSError as error:
+        log.write_line("===== fut-run · start failed · %s =====" % error)
+        record_exit(wsdir, generation, command, cwd, None, str(error), terminated=False)
+        ack(ack_fd, "failed to start %s: %s" % (command[0], error))
+        os._exit(1)
+
+    try:
+        with state_lock(wsdir):
+            if int(read_state(wsdir).get("generation", 0)) != generation:
+                raise RuntimeError("superseded by a newer restart")
+            write_state(
+                wsdir,
+                {
+                    "generation": generation,
+                    "phase": "launching" if readiness_signal is not None else "running",
+                    "command": command,
+                    "cwd": cwd,
+                    "signal": readiness_signal,
+                    "supervisor_pid": os.getpid(),
+                    "child_pid": child.pid,
+                    "child_pgid": child.pid,
+                    "started_at": timestamp(),
+                    "stop_requested": False,
+                },
+            )
+            publish_tokens("launching" if readiness_signal is not None else "play")
+            ack(ack_fd, "ok")
+            os.close(ack_fd)
+    except RuntimeError as error:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        child.wait()
+        ack(ack_fd, str(error))
+        os._exit(1)
+
+    terminated = pump_child(child, log, grace, readiness_signal, wsdir, generation)
+    log.write_line(
+        "===== fut-run · exit · generation %d · %s · %s ====="
+        % (generation, describe_exit(child.returncode), timestamp())
+    )
+    record_exit(wsdir, generation, command, cwd, child.returncode, None, terminated)
+    os._exit(0)
+
+
+def pump_child(child, log, grace, readiness_signal, wsdir, generation):
+    """Copy child output to the log until the child exits.
+
+    Handles SIGTERM by forwarding it to the child's process group and
+    escalating to SIGKILL after the grace period. Also copes with a child
+    that closes stdout but keeps running, and with detached grandchildren
+    that keep the output pipe open after the child itself has exited.
+    """
+    fd = child.stdout.fileno()
+    term_at = None
+    killed = False
+    eof = False
+    exited_at = None
+    matcher = LiteralMatcher(readiness_signal) if readiness_signal is not None else None
+    ready_recorded = matcher is None
+    while True:
+        if matcher is not None and matcher.matched and not ready_recorded:
+            ready_recorded = record_ready(wsdir, generation)
+        if TERM_REQUESTED["flag"] and term_at is None:
+            term_at = time.monotonic()
+            log.write_line("===== fut-run · stop requested · %s =====" % timestamp())
+            try:
+                os.killpg(child.pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+        if (
+            term_at is not None
+            and not killed
+            and time.monotonic() - term_at >= grace
+            and child.poll() is None
+        ):
+            killed = True
+            log.write_line("===== fut-run · escalating to SIGKILL =====")
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        exited = child.poll() is not None
+        if eof:
+            if exited:
+                break
+            time.sleep(0.2)
+            continue
+        try:
+            ready, _, _ = select.select([fd], [], [], 0.2)
+        except InterruptedError:
+            continue
+        if ready:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                eof = True
+                continue
+            log.write(chunk)
+            if matcher is not None:
+                matcher.feed(chunk)
+            exited_at = None
+        elif exited:
+            if exited_at is None:
+                exited_at = time.monotonic()
+            elif time.monotonic() - exited_at > 0.5:
+                break  # pipe held open by a detached descendant
+    child.wait()
+    return term_at is not None
+
+
+def record_exit(wsdir, generation, command, cwd, returncode, error, terminated):
+    """Record the exit and publish the final token, unless superseded."""
+    try:
+        with state_lock(wsdir):
+            state = read_state(wsdir)
+            if int(state.get("generation", 0)) != generation:
+                return
+            stop_requested = bool(state.get("stop_requested")) or terminated
+            clean = returncode == 0 and not stop_requested
+            write_state(
+                wsdir,
+                {
+                    "generation": generation,
+                    "phase": "exited",
+                    "command": command,
+                    "cwd": cwd,
+                    "signal": state.get("signal"),
+                    "ready_at": state.get("ready_at"),
+                    "stop_requested": stop_requested,
+                    "exit": {
+                        "code": returncode if returncode is not None and returncode >= 0 else None,
+                        "signal": -returncode if returncode is not None and returncode < 0 else None,
+                        "error": error,
+                        "at": timestamp(),
+                    },
+                },
+            )
+            publish_tokens("stop" if clean else "cross")
+    except RuntimeError:
+        pass
+
+
+def spawn_supervisor(wsdir, generation, command, cwd, grace, readiness_signal):
+    """Double-fork a detached supervisor; return None or an error message."""
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(read_fd)
+            os.setsid()
+            if os.fork() == 0:
+                supervise(
+                    wsdir,
+                    generation,
+                    command,
+                    cwd,
+                    grace,
+                    readiness_signal,
+                    write_fd,
+                )
+            os._exit(0)
+        except BaseException:
+            os._exit(1)
+    os.close(write_fd)
+    os.waitpid(pid, 0)
+    data = b""
+    deadline = time.monotonic() + SPAWN_ACK_TIMEOUT
+    while b"\n" not in data:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        ready, _, _ = select.select([read_fd], [], [], remaining)
+        if not ready:
+            break
+        chunk = os.read(read_fd, 4096)
+        if not chunk:
+            break
+        data += chunk
+    os.close(read_fd)
+    line = data.split(b"\n", 1)[0].decode("utf-8", "replace").strip()
+    if line == "ok":
+        return None
+    return line or "the run supervisor did not report back in time"
+
+
+# --- commands ----------------------------------------------------------------
+
+
+def with_control_lock(wsdir, timeout=CONTROL_TIMEOUT):
+    control = Lock(wsdir, "control.lock")
+    if not control.acquire(timeout):
+        fail("another run command is still in progress")
+    return control
+
+
+def cmd_restart():
+    workspace = require_env("FUT_WORKSPACE_ID")
+    command, grace, readiness_signal = load_config(require_command=True)
+    cwd = os.environ.get("FUT_WORKSPACE_ROOT") or os.getcwd()
+    wsdir = workspace_dir(workspace)
+    with_control_lock(wsdir)
+    try:
+        with state_lock(wsdir):
+            # Bump the generation in place: the old supervisor goes silent,
+            # while its recorded PIDs stay available for termination below.
+            state = read_state(wsdir)
+            generation = int(state.get("generation", 0)) + 1
+            state.update(
+                generation=generation,
+                phase="starting",
+                command=command,
+                cwd=cwd,
+                signal=readiness_signal,
+            )
+            state.pop("ready_at", None)
+            write_state(wsdir, state)
+        terminate_runner(wsdir, grace)
+    except RuntimeError as error:
+        fail(str(error))
+    try:
+        error = spawn_supervisor(
+            wsdir, generation, command, cwd, grace, readiness_signal
+        )
+    except Exception as spawn_error:
+        error = "failed to start run supervisor: %s" % spawn_error
+    if error:
+        try:
+            terminate_runner(wsdir, min(grace, DEFAULT_GRACE), kill_wait=0.5)
+        except RuntimeError as stop_error:
+            error = "%s; cleanup also failed: %s" % (error, stop_error)
+        record_exit(wsdir, generation, command, cwd, None, error, terminated=False)
+        fail(error)
+
+
+def repair_stopped_runner(wsdir):
+    """Finish a stop if the supervisor vanished before recording its exit."""
+    with state_lock(wsdir):
+        state = read_state(wsdir)
+        if state.get("phase") in ("starting", "launching", "running"):
+            state.update(phase="exited", stop_requested=True)
+            state["exit"] = {
+                "code": None,
+                "signal": None,
+                "error": "runner vanished",
+                "at": timestamp(),
+            }
+            write_state(wsdir, state)
+            publish_tokens("cross")
+
+
+def cmd_stop():
+    workspace = require_env("FUT_WORKSPACE_ID")
+    grace = stop_grace()
+    wsdir = workspace_dir(workspace)
+    with_control_lock(wsdir)
+    try:
+        if supervisor_alive(wsdir):
+            with state_lock(wsdir):
+                state = read_state(wsdir)
+                state["stop_requested"] = True
+                write_state(wsdir, state)
+            terminate_runner(wsdir, grace)
+        repair_stopped_runner(wsdir)
+    except RuntimeError as error:
+        fail(str(error))
+
+
+def log_path(wsdir):
+    path = os.path.join(wsdir, "run.log")
+    open(path, "a").close()
+    return path
+
+
+def cmd_logs():
+    path = log_path(workspace_dir(require_env("FUT_WORKSPACE_ID")))
+    try:
+        os.execvp("less", ["less", "-R", "+F", path])
+    except OSError as error:
+        fail("could not start less: %s" % error)
+
+
+def cmd_edit_logs():
+    path = log_path(workspace_dir(require_env("FUT_WORKSPACE_ID")))
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    argv = shlex.split(editor)
+    if not argv:
+        fail("VISUAL/EDITOR is empty")
+    try:
+        os.execvp(argv[0], argv + [path])
+    except OSError as error:
+        fail("could not start %s: %s" % (argv[0], error))
+
+
+def cmd_hook():
+    event = os.environ.get("FUT_EVENT", "")
+    # Drain Fut's bounded payload even though run hooks use environment context only.
+    sys.stdin.buffer.read()
+    workspace = os.environ.get("FUT_WORKSPACE_ID")
+    if not workspace:
+        return
+    if event == "workspace.created":
+        command, _, _ = load_config(require_command=False)
+        if command is None:
+            return
+        wsdir = workspace_dir(workspace)
+        with state_lock(wsdir):
+            if not supervisor_alive(wsdir) and read_state(wsdir).get("phase") != "running":
+                publish_tokens("pause")
+    elif event == "workspace.closed":
+        wsdir = workspace_dir(workspace, create=False)
+        if not os.path.isdir(wsdir):
+            return
+        with_control_lock(wsdir, timeout=CLOSE_CONTROL_TIMEOUT)
+        try:
+            terminate_runner(wsdir, CLOSE_GRACE, kill_wait=CLOSE_KILL_WAIT)
+        except RuntimeError as error:
+            fail("workspace close: %s" % error)
+        shutil.rmtree(wsdir, ignore_errors=True)
+        if os.path.exists(wsdir):
+            fail("workspace close: could not remove runner state")
+
+
+def main():
+    commands = {
+        "restart": cmd_restart,
+        "stop": cmd_stop,
+        "logs": cmd_logs,
+        "edit-logs": cmd_edit_logs,
+        "hook": cmd_hook,
+    }
+    if len(sys.argv) != 2 or sys.argv[1] not in commands:
+        fail("usage: runctl {%s}" % "|".join(sorted(commands)))
+    commands[sys.argv[1]]()
+
+
+if __name__ == "__main__":
+    main()

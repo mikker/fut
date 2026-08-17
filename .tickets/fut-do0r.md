@@ -1,6 +1,6 @@
 ---
 id: fut-do0r
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-08-17T12:07:44Z
@@ -35,7 +35,7 @@ Run extension:
 - Scope manager state and logs by workspace ID so parallel worktrees and logical workspaces are independent.
 - A supervisor owns an exclusive lock and the child process group, captures combined stdout/stderr, records command/cwd/PIDs/timestamps/exit details, and prevents repeated-hotkey races or stale-PID kills. Restart sends graceful termination, escalates after a short timeout, then starts a fresh supervisor. Workspace close terminates its runner. Client detach does not.
 - Append run separators to a stable log and rotate at a bounded size. `run:logs` opens `less -R +F`; Ctrl-C leaves follow mode, F resumes, v invokes VISUAL/EDITOR, and q returns to Fut. `run:edit-logs` opens the same file directly through VISUAL then EDITOR.
-- Declare four workspace presentation tokens and populate exactly one logical state: configured/unstarted = pause (muted), running = play (added/green), clean exit = stop (muted), killed or nonzero exit = cross (error). A workspace without run configuration publishes no indicator.
+- Declare five workspace presentation tokens and populate exactly one logical state: configured/unstarted = ellipsis (muted), launching = animated spinner (attention/yellow), running = play (added/green), clean exit = stop (muted), killed or nonzero exit = cross (error). When `signal` is configured, launching lasts until the combined output emits that literal; without one, the process is running immediately. A workspace without run configuration publishes no indicator.
 
 Tuna dogfood:
 - Add `.fut/config.toml` with `[extension.run] command = ["just", "run"]`.
@@ -47,11 +47,10 @@ Tuna dogfood:
 - Merely loading project config never executes its command.
 - prefix+r starts a configured workspace runner; pressing it again terminates the complete previous process group and starts exactly one replacement without showing a temporary surface.
 - Separate Fut workspaces have independent process, state, token, and log ownership.
-- The tab bar displays pause before first run, green play while running, stop after exit 0, and an error cross after explicit termination, signal, or nonzero exit. Unconfigured workspaces show nothing.
+- The tab bar displays an ellipsis before first run, a yellow spinner while awaiting readiness, green play while running, stop after exit 0, and an error cross after explicit termination, signal, or nonzero exit. Unconfigured workspaces show nothing.
 - Stop terminates without restarting; closing a workspace cleans up its runner; detaching a client leaves it running.
 - Logs update live in a full-screen temporary viewer, remain scrollable, open in VISUAL/EDITOR from the viewer, and also open through a separate command.
 - Locks/generation checks cover rapid restart, stale state, and natural-exit-versus-restart races without killing an unrelated PID.
 - Fut unit/integration tests cover config precedence and bounds, command context, non-interactive dispatch, token transitions, process-group restart/stop, workspace isolation, and checked-in extension smoke behavior.
 - Fut docs and Unreleased changelog describe extension configuration, non-interactive commands, runtime context, status tokens, controls, trust boundary, and the run example.
 - `cargo test` and a debug build pass, followed by manual Tuna dogfooding of start, rapid restart, stop, failure, logs/editor, detach/reattach, and workspace closure.
-

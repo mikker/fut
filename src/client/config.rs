@@ -3,7 +3,7 @@ use std::{
     env, fs,
     io::Read,
     os::unix::fs::OpenOptionsExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
@@ -17,12 +17,20 @@ use super::actions::{
 };
 use crate::{
     command::PopupSize,
-    extensions::{self, Extension},
+    extensions::{self, Extension, ExtensionCommandMode},
 };
 
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
+const MAX_EXTENSION_CONFIG_KEYS: usize = 128;
+const MAX_EXTENSION_CONFIG_DEPTH: usize = 8;
+const MAX_EXTENSION_CONFIG_KEY_BYTES: usize = 128;
+const MAX_EXTENSION_CONFIG_VALUE_BYTES: usize = 4 * 1024;
+const MAX_EXTENSION_CONFIG_ARRAY_VALUES: usize = 128;
+const MAX_EXTENSION_CONFIG_SERIALIZED_BYTES: usize = 16 * 1024;
 const MAX_SEGMENTS: usize = 64;
 const MAX_TEXT_BYTES: usize = 1024;
+
+type ExtensionConfigTable = serde_json::Map<String, serde_json::Value>;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -152,6 +160,8 @@ pub(super) struct PaletteCommand {
     pub activate_opened: bool,
     #[serde(skip)]
     pub extension: Option<ExtensionCommandIdentity>,
+    #[serde(skip)]
+    pub mode: ExtensionCommandMode,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -176,6 +186,10 @@ struct ExtensionCommandConfig {
 impl PaletteCommand {
     pub(super) fn slug(&self) -> Option<String> {
         self.extension.as_ref().map(ExtensionCommandIdentity::slug)
+    }
+
+    pub(super) const fn mode(&self) -> ExtensionCommandMode {
+        self.mode
     }
 }
 
@@ -659,6 +673,8 @@ pub(super) struct SegmentConfig {
     pub token: Option<String>,
     pub component: Option<String>,
     pub style: Option<SemanticStyle>,
+    pub inverted: bool,
+    pub pill: bool,
     pub prefix: String,
     pub suffix: String,
     pub max_width: Option<u16>,
@@ -1112,6 +1128,8 @@ pub(crate) struct UiConfig {
     pub(super) sidebar: SidebarConfig,
     #[serde(skip)]
     pub(super) extensions: Vec<Extension>,
+    #[serde(skip)]
+    extension_config: ExtensionConfigCatalog,
 }
 
 impl Default for UiConfig {
@@ -1125,6 +1143,7 @@ impl Default for UiConfig {
             tab_bar: TabBarConfig::default(),
             sidebar: SidebarConfig::default(),
             extensions: Vec::new(),
+            extension_config: ExtensionConfigCatalog::default(),
         }
     }
 }
@@ -1164,6 +1183,27 @@ struct Config {
     trusted_commands: BTreeMap<String, PaletteCommand>,
     extension_commands: BTreeMap<String, ExtensionCommandConfig>,
     extensions: Vec<PathBuf>,
+    #[serde(deserialize_with = "deserialize_extension_config_catalog")]
+    extension: BTreeMap<String, ExtensionConfigTable>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ExtensionConfigCatalog {
+    defaults: BTreeMap<String, ExtensionConfigTable>,
+    source: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ResolvedExtensionConfig {
+    pub json: String,
+    pub global_source: Option<PathBuf>,
+    pub workspace_source: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ResolvedHookExtensionConfig {
+    pub config: ResolvedExtensionConfig,
+    pub warning: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1178,6 +1218,12 @@ pub(crate) struct LoadedConfig {
     pub ui: UiConfig,
     pub extensions: Vec<Extension>,
     pub present: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct LoadedExtensionConfig {
+    pub extensions: Vec<Extension>,
+    pub config: ExtensionConfigCatalog,
 }
 
 pub(crate) fn resolve_location(config_dir: Option<&std::path::Path>) -> Result<ConfigLocation> {
@@ -1248,28 +1294,44 @@ pub(crate) fn load_location(location: &ConfigLocation) -> Result<LoadedConfig> {
     )
 }
 
-/// Load only the daemon-owned extension declarations. Client presentation
-/// mistakes must not prevent the daemon from starting; the interactive client
-/// validates the complete configuration independently before changing terminal
-/// state.
-pub(crate) fn load_extensions_location(location: &ConfigLocation) -> Result<Vec<Extension>> {
+/// Load only the daemon-owned extension declarations and namespaced config.
+/// Client presentation mistakes must not prevent the daemon from starting; the
+/// interactive client validates the complete configuration independently before
+/// changing terminal state.
+pub(crate) fn load_extensions_location(location: &ConfigLocation) -> Result<LoadedExtensionConfig> {
     let Some(path) = &location.path else {
-        return Ok(Vec::new());
+        return Ok(LoadedExtensionConfig {
+            extensions: Vec::new(),
+            config: ExtensionConfigCatalog::default(),
+        });
     };
     let Some(source) = read_config_source(path, location.explicit)? else {
-        return Ok(Vec::new());
+        return Ok(LoadedExtensionConfig {
+            extensions: Vec::new(),
+            config: ExtensionConfigCatalog::default(),
+        });
     };
 
     #[derive(Default, Deserialize)]
     struct ExtensionConfig {
         #[serde(default)]
         extensions: Vec<PathBuf>,
+        #[serde(default, deserialize_with = "deserialize_extension_config_catalog")]
+        extension: BTreeMap<String, ExtensionConfigTable>,
     }
 
     let config = toml::from_str::<ExtensionConfig>(&source)
-        .with_context(|| format!("parse extension paths from Fut config {}", path.display()))?;
-    extensions::load(&config.extensions)
-        .with_context(|| format!("load extensions from Fut config {}", path.display()))
+        .with_context(|| format!("parse daemon extension config from {}", path.display()))?;
+    let loaded_extensions = extensions::load(&config.extensions)
+        .with_context(|| format!("load extensions from Fut config {}", path.display()))?;
+    validate_extension_config_catalog(&config.extension, &loaded_extensions, path)?;
+    Ok(LoadedExtensionConfig {
+        extensions: loaded_extensions,
+        config: ExtensionConfigCatalog {
+            source: (!config.extension.is_empty()).then(|| path.to_owned()),
+            defaults: config.extension,
+        },
+    })
 }
 
 #[cfg(test)]
@@ -1322,15 +1384,21 @@ fn load_path_outcome(path: &std::path::Path, explicit: bool) -> Result<LoadedCon
                 size: launcher.size(),
                 activate_opened: launcher.activate_opened(),
                 extension: Some(identity),
+                mode: launcher.mode(),
             });
         }
     }
     if let Some(slug) = config.extension_commands.keys().next() {
         bail!("unknown extension_commands command {slug:?}");
     }
+    validate_extension_config_catalog(&config.extension, &loaded_extensions, path)?;
     validate(&config.ui, &loaded_extensions)
         .with_context(|| format!("validate Fut config {}", path.display()))?;
     config.ui.extensions = loaded_extensions.clone();
+    config.ui.extension_config = ExtensionConfigCatalog {
+        source: (!config.extension.is_empty()).then(|| path.to_owned()),
+        defaults: config.extension,
+    };
     Ok(LoadedConfig {
         ui: config.ui,
         extensions: loaded_extensions,
@@ -1376,6 +1444,287 @@ fn read_config_source(path: &std::path::Path, explicit: bool) -> Result<Option<S
         );
     }
     Ok(Some(source))
+}
+
+pub(super) fn resolve_extension_config(
+    ui: &UiConfig,
+    extension_id: &str,
+    workspace_root: &Path,
+) -> Result<ResolvedExtensionConfig> {
+    resolve_extension_config_for_catalog(
+        &ui.extension_config,
+        &ui.extensions,
+        extension_id,
+        workspace_root,
+    )
+}
+
+pub(crate) fn resolve_extension_config_for_catalog(
+    catalog: &ExtensionConfigCatalog,
+    extensions: &[Extension],
+    extension_id: &str,
+    workspace_root: &Path,
+) -> Result<ResolvedExtensionConfig> {
+    resolve_extension_config_sources(catalog, extensions, extension_id, Some(workspace_root))
+}
+
+pub(crate) fn resolve_hook_extension_config_for_catalog(
+    catalog: &ExtensionConfigCatalog,
+    extensions: &[Extension],
+    extension_id: &str,
+    workspace_root: &Path,
+) -> ResolvedHookExtensionConfig {
+    match resolve_extension_config_sources(catalog, extensions, extension_id, Some(workspace_root))
+    {
+        Ok(config) => ResolvedHookExtensionConfig {
+            config,
+            warning: None,
+        },
+        Err(workspace_error) => {
+            match resolve_extension_config_sources(catalog, extensions, extension_id, None) {
+                Ok(config) => ResolvedHookExtensionConfig {
+                    config,
+                    warning: Some(format!(
+                        "workspace extension config rejected: {workspace_error:#}; using global-only config"
+                    )),
+                },
+                Err(global_error) => ResolvedHookExtensionConfig {
+                    config: ResolvedExtensionConfig {
+                        json: "{}".to_owned(),
+                        global_source: None,
+                        workspace_source: None,
+                    },
+                    warning: Some(format!(
+                        "workspace extension config rejected: {workspace_error:#}; global extension config unavailable: {global_error:#}; using empty config"
+                    )),
+                },
+            }
+        }
+    }
+}
+
+fn resolve_extension_config_sources(
+    catalog: &ExtensionConfigCatalog,
+    extensions: &[Extension],
+    extension_id: &str,
+    workspace_root: Option<&Path>,
+) -> Result<ResolvedExtensionConfig> {
+    let mut resolved = catalog
+        .defaults
+        .get(extension_id)
+        .cloned()
+        .unwrap_or_default();
+    let global_source = catalog
+        .defaults
+        .contains_key(extension_id)
+        .then(|| catalog.source.clone())
+        .flatten();
+    let mut local_source = None;
+
+    if let Some(workspace_root) = workspace_root {
+        let workspace_path = workspace_root.join(".fut/config.toml");
+        if let Some(source) = read_config_source(&workspace_path, false)? {
+            #[derive(Default, Deserialize)]
+            #[serde(default, deny_unknown_fields)]
+            struct WorkspaceConfig {
+                #[serde(deserialize_with = "deserialize_extension_config_catalog")]
+                extension: BTreeMap<String, ExtensionConfigTable>,
+            }
+
+            let workspace = toml::from_str::<WorkspaceConfig>(&source).with_context(|| {
+                format!("parse workspace Fut config {}", workspace_path.display())
+            })?;
+            validate_extension_config_catalog(&workspace.extension, extensions, &workspace_path)?;
+            if let Some(overrides) = workspace.extension.get(extension_id) {
+                merge_extension_tables(&mut resolved, overrides.clone());
+                local_source = Some(workspace_path);
+            }
+        }
+    }
+
+    validate_extension_config_table(extension_id, &resolved, Path::new("resolved config"))?;
+    let json = serde_json::to_string(&serde_json::Value::Object(resolved))?;
+    if json.len() > MAX_EXTENSION_CONFIG_SERIALIZED_BYTES {
+        bail!(
+            "resolved extension.{extension_id} config is {} bytes; maximum is {MAX_EXTENSION_CONFIG_SERIALIZED_BYTES}",
+            json.len()
+        );
+    }
+    Ok(ResolvedExtensionConfig {
+        json,
+        global_source,
+        workspace_source: local_source,
+    })
+}
+
+fn deserialize_extension_config_catalog<'de, D>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, ExtensionConfigTable>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    BTreeMap::<String, toml::Table>::deserialize(deserializer)?
+        .into_iter()
+        .map(|(id, table)| {
+            convert_toml_config_value(toml::Value::Table(table))
+                .and_then(|value| {
+                    value
+                        .as_object()
+                        .cloned()
+                        .context("extension config must be a table")
+                })
+                .map(|table| (id, table))
+                .map_err(serde::de::Error::custom)
+        })
+        .collect()
+}
+
+fn convert_toml_config_value(value: toml::Value) -> Result<serde_json::Value> {
+    Ok(match value {
+        toml::Value::String(value) => serde_json::Value::String(value),
+        toml::Value::Integer(value) => serde_json::Value::Number(value.into()),
+        toml::Value::Float(value) => serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .context("extension config floats must be finite")?,
+        toml::Value::Boolean(value) => serde_json::Value::Bool(value),
+        toml::Value::Datetime(value) => serde_json::Value::String(value.to_string()),
+        toml::Value::Array(values) => serde_json::Value::Array(
+            values
+                .into_iter()
+                .map(convert_toml_config_value)
+                .collect::<Result<_>>()?,
+        ),
+        toml::Value::Table(table) => serde_json::Value::Object(
+            table
+                .into_iter()
+                .map(|(key, value)| convert_toml_config_value(value).map(|value| (key, value)))
+                .collect::<Result<_>>()?,
+        ),
+    })
+}
+
+fn validate_extension_config_catalog(
+    catalog: &BTreeMap<String, ExtensionConfigTable>,
+    extensions: &[Extension],
+    source: &Path,
+) -> Result<()> {
+    for (id, table) in catalog {
+        if !extensions.iter().any(|extension| extension.id() == id) {
+            bail!(
+                "unknown extension ID {id:?} in {} (no configured extension declares it)",
+                source.display()
+            );
+        }
+        validate_extension_config_table(id, table, source)?;
+    }
+    Ok(())
+}
+
+fn validate_extension_config_table(
+    id: &str,
+    table: &ExtensionConfigTable,
+    source: &Path,
+) -> Result<()> {
+    let mut keys = 0;
+    validate_extension_config_value(
+        &serde_json::Value::Object(table.clone()),
+        0,
+        &mut keys,
+        &format!("extension.{id}"),
+        source,
+    )?;
+    let serialized = serde_json::to_vec(&serde_json::Value::Object(table.clone()))?;
+    if serialized.len() > MAX_EXTENSION_CONFIG_SERIALIZED_BYTES {
+        bail!(
+            "extension.{id} in {} serializes to {} bytes; maximum is {MAX_EXTENSION_CONFIG_SERIALIZED_BYTES}",
+            source.display(),
+            serialized.len()
+        );
+    }
+    Ok(())
+}
+
+fn validate_extension_config_value(
+    value: &serde_json::Value,
+    depth: usize,
+    keys: &mut usize,
+    key_path: &str,
+    source: &Path,
+) -> Result<()> {
+    if depth > MAX_EXTENSION_CONFIG_DEPTH {
+        bail!(
+            "{key_path} in {} exceeds the maximum extension config depth of {MAX_EXTENSION_CONFIG_DEPTH}",
+            source.display()
+        );
+    }
+    match value {
+        serde_json::Value::Object(table) => {
+            for (key, child) in table {
+                *keys += 1;
+                if *keys > MAX_EXTENSION_CONFIG_KEYS {
+                    bail!(
+                        "extension config in {} has more than {MAX_EXTENSION_CONFIG_KEYS} keys",
+                        source.display()
+                    );
+                }
+                if key.is_empty()
+                    || key.len() > MAX_EXTENSION_CONFIG_KEY_BYTES
+                    || key.chars().any(char::is_control)
+                {
+                    bail!(
+                        "extension config key {key:?} in {} must be non-empty, control-free, and at most {MAX_EXTENSION_CONFIG_KEY_BYTES} bytes",
+                        source.display()
+                    );
+                }
+                validate_extension_config_value(
+                    child,
+                    depth + 1,
+                    keys,
+                    &format!("{key_path}.{key}"),
+                    source,
+                )?;
+            }
+        }
+        serde_json::Value::Array(values) => {
+            if values.len() > MAX_EXTENSION_CONFIG_ARRAY_VALUES {
+                bail!(
+                    "{key_path} in {} has {} array values; maximum is {MAX_EXTENSION_CONFIG_ARRAY_VALUES}",
+                    source.display(),
+                    values.len()
+                );
+            }
+            for value in values {
+                validate_extension_config_value(value, depth + 1, keys, key_path, source)?;
+            }
+        }
+        scalar => {
+            let serialized = serde_json::to_vec(scalar)?;
+            if serialized.len() > MAX_EXTENSION_CONFIG_VALUE_BYTES {
+                bail!(
+                    "{key_path} in {} is {} serialized bytes; maximum per value is {MAX_EXTENSION_CONFIG_VALUE_BYTES}",
+                    source.display(),
+                    serialized.len()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn merge_extension_tables(base: &mut ExtensionConfigTable, overrides: ExtensionConfigTable) {
+    for (key, override_value) in overrides {
+        match (base.get_mut(&key), override_value) {
+            (
+                Some(serde_json::Value::Object(base_table)),
+                serde_json::Value::Object(override_table),
+            ) => {
+                merge_extension_tables(base_table, override_table);
+            }
+            (_, value) => {
+                base.insert(key, value);
+            }
+        }
+    }
 }
 
 fn validate(ui: &UiConfig, extensions: &[Extension]) -> Result<()> {
@@ -1466,6 +1815,8 @@ fn validate(ui: &UiConfig, extensions: &[Extension]) -> Result<()> {
         ("tab", &ui.icons.tab),
         ("zoom", &ui.icons.zoom),
         ("vertical_divider", &ui.icons.vertical_divider),
+        ("pill_left", &ui.icons.pill_left),
+        ("pill_right", &ui.icons.pill_right),
     ] {
         if let Some(value) = value {
             validate_text(&format!("ui.icons.{name}"), value)?;
@@ -1576,6 +1927,9 @@ fn validate_segments(
         if selectors != 1 {
             bail!("{path} must set exactly one of text, token, or component");
         }
+        if segment.pill && !segment.inverted {
+            bail!("{path} pill requires inverted = true");
+        }
         for (field, value) in [
             ("text", segment.text.as_deref()),
             ("prefix", Some(segment.prefix.as_str())),
@@ -1588,9 +1942,13 @@ fn validate_segments(
         if segment.text.is_some()
             && (!segment.prefix.is_empty()
                 || !segment.suffix.is_empty()
-                || segment.max_width.is_some())
+                || segment.max_width.is_some()
+                || segment.inverted
+                || segment.pill)
         {
-            bail!("{path} text segments do not accept prefix, suffix, or max_width");
+            bail!(
+                "{path} text segments do not accept prefix, suffix, max_width, inverted, or pill"
+            );
         }
         if let Some(token) = segment.token.as_deref()
             && !token_allowed(scope, token, extensions)
@@ -1605,8 +1963,12 @@ fn validate_segments(
                 || !segment.prefix.is_empty()
                 || !segment.suffix.is_empty()
                 || segment.max_width.is_some()
+                || segment.inverted
+                || segment.pill
             {
-                bail!("{path} component does not accept style, prefix, suffix, or max_width");
+                bail!(
+                    "{path} component does not accept style, prefix, suffix, max_width, inverted, or pill"
+                );
             }
             *component_count += 1;
         }
@@ -1791,7 +2153,7 @@ add_modifiers = ["bold", "underlined"]
 
 [ui.tab_bar]
 position = "bottom"
-left = [{ segments = [{ token = "workspace.name", max_width = 20 }], priority = 200 }]
+left = [{ segments = [{ token = "workspace.name", max_width = 20, style = "workspace", inverted = true, pill = true }], priority = 200 }]
 center = [{ segments = [{ component = "tabs" }] }]
 right = [{ segments = [{ token = "client.zoom", prefix = " " }], style = "current" }]
 
@@ -1835,6 +2197,10 @@ components = [
         assert_eq!(config.icons.resolve().pill_left, "\u{e0b6}");
         assert_eq!(config.icons.resolve().pill_right, "\u{e0b4}");
         assert_eq!(UiConfig::default().icons.resolve().pill_left, "");
+        let segment = &config.tab_bar.left[0].segments[0];
+        assert!(segment.inverted);
+        assert!(segment.pill);
+        assert_eq!(segment.style, Some(SemanticStyle::Workspace));
         assert_eq!(
             config.styles.attention.foreground,
             Some(UiColor::Rgb(0x12, 0xab, 0xef))
@@ -1982,6 +2348,9 @@ components = [
             "[ui.tab_bar]\nleft = [{ segments = [{ token = 'tab.marker' }] }]\n",
             "[ui.tab_bar.item]\nsegments = [{ component = 'tabs' }]\n",
             "[ui.tab_bar]\nleft = [{ segments = [{ text = \"x\\n\" }] }]\n",
+            "[ui.tab_bar]\nleft = [{ segments = [{ text = 'x', inverted = true }] }]\n",
+            "[ui.tab_bar]\nleft = [{ segments = [{ component = 'tabs', pill = true }] }]\n",
+            "[ui.tab_bar]\nleft = [{ segments = [{ token = 'workspace.name', pill = true }] }]\n",
             "[ui]\nexecute = 'surprise'\n",
             "[ui.sidebar.left]\nwidth = 2\n",
             "[ui.sidebar.left]\ncomponents = [{ component = 'workspaces', size = 'fill' }, { component = 'agents', size = 'fill' }]\n",
@@ -2049,20 +2418,54 @@ components = [
     #[test]
     fn daemon_extension_loading_ignores_unrelated_invalid_ui() {
         let temporary = tempfile::tempdir().unwrap();
+        let extension_root = temporary.path().join("extension");
+        fs::create_dir(&extension_root).unwrap();
+        fs::write(
+            extension_root.join(extensions::MANIFEST_FILE_NAME),
+            "id = 'run'\n",
+        )
+        .unwrap();
         let path = temporary.path().join("config.toml");
         fs::write(
             &path,
-            "[ui.tab_bar]\nleft = [{ segments = [{ token = 'not.a.token' }] }]\n",
+            format!(
+                "extensions = [{:?}]\n[ui.tab_bar]\nleft = [{{ segments = [{{ token = 'not.a.token' }}] }}]\n[extension.run]\ncommand = ['global']\n",
+                extension_root.display().to_string()
+            ),
         )
         .unwrap();
         let location = ConfigLocation {
-            path: Some(path),
+            path: Some(path.clone()),
             explicit: true,
             source: "test",
         };
 
         assert!(load_location(&location).is_err());
-        assert!(load_extensions_location(&location).unwrap().is_empty());
+        let loaded = load_extensions_location(&location).unwrap();
+        assert_eq!(loaded.extensions.len(), 1);
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let resolved = resolve_extension_config_for_catalog(
+            &loaded.config,
+            &loaded.extensions,
+            "run",
+            &workspace,
+        )
+        .unwrap();
+        assert_eq!(resolved.json, r#"{"command":["global"]}"#);
+        assert_eq!(resolved.global_source.as_deref(), Some(path.as_path()));
+
+        fs::write(
+            &path,
+            format!(
+                "extensions = [{:?}]\n[extension.run]\nvalue = {:?}\n",
+                extension_root.display().to_string(),
+                "x".repeat(MAX_EXTENSION_CONFIG_VALUE_BYTES + 1),
+            ),
+        )
+        .unwrap();
+        let error = load_extensions_location(&location).unwrap_err().to_string();
+        assert!(error.contains("per value"), "{error}");
     }
 
     #[test]
@@ -2153,6 +2556,184 @@ components = [
         let error = format!("{:#}", load_path_outcome(&path, true).unwrap_err());
         assert!(error.contains("INVALID"), "{error}");
         assert!(error.contains(&path.display().to_string()), "{error}");
+    }
+
+    #[test]
+    fn extension_config_recursively_merges_workspace_over_global_and_is_inert() {
+        let temporary = tempfile::tempdir().unwrap();
+        let extension_root = temporary.path().join("extension");
+        fs::create_dir(&extension_root).unwrap();
+        fs::write(
+            extension_root.join(extensions::MANIFEST_FILE_NAME),
+            "id = 'run'\n[commands.restart]\ntitle = 'Restart'\nargv = ['./restart']\nmode = 'background'\n",
+        )
+        .unwrap();
+        let global_path = temporary.path().join("global.toml");
+        fs::write(
+            &global_path,
+            format!(
+                "extensions = [{:?}]\n[extension.run]\ncommand = ['global']\nkeep = true\nstarted = 2026-08-17T12:00:00Z\n[extension.run.log]\nsize = 10\ncolor = 'blue'\n",
+                extension_root.display().to_string()
+            ),
+        )
+        .unwrap();
+        let loaded = load_path_outcome(&global_path, true).unwrap();
+        assert_eq!(
+            loaded.ui.bindings.command(0).unwrap().mode(),
+            ExtensionCommandMode::Background
+        );
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir_all(workspace.join(".fut")).unwrap();
+        let sentinel = workspace.join("must-not-exist");
+        let workspace_path = workspace.join(".fut/config.toml");
+        fs::write(
+            &workspace_path,
+            format!(
+                "[extension.run]\ncommand = ['touch', {:?}]\n[extension.run.log]\nsize = 20\n",
+                sentinel.display().to_string()
+            ),
+        )
+        .unwrap();
+
+        let resolved = resolve_extension_config(&loaded.ui, "run", &workspace).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&resolved.json).unwrap();
+        assert_eq!(value["command"], serde_json::json!(["touch", sentinel]));
+        assert_eq!(value["keep"], true);
+        assert_eq!(value["started"], "2026-08-17T12:00:00Z");
+        assert_eq!(value["log"]["size"], 20);
+        assert_eq!(value["log"]["color"], "blue");
+        assert_eq!(
+            resolved.global_source.as_deref(),
+            Some(global_path.as_path())
+        );
+        assert_eq!(
+            resolved.workspace_source.as_deref(),
+            Some(workspace_path.as_path())
+        );
+        assert!(
+            !sentinel.exists(),
+            "loading project config must not execute it"
+        );
+    }
+
+    #[test]
+    fn extension_config_rejects_unknown_ids_in_global_and_workspace_sources() {
+        let temporary = tempfile::tempdir().unwrap();
+        let extension_root = temporary.path().join("extension");
+        fs::create_dir(&extension_root).unwrap();
+        fs::write(
+            extension_root.join(extensions::MANIFEST_FILE_NAME),
+            "id = 'known'\n[commands.open]\ntitle = 'Open'\nargv = ['./open']\n",
+        )
+        .unwrap();
+        let global_path = temporary.path().join("global.toml");
+        fs::write(
+            &global_path,
+            format!(
+                "extensions = [{:?}]\n[extension.unknown]\nvalue = true\n",
+                extension_root.display().to_string()
+            ),
+        )
+        .unwrap();
+        let error = format!("{:#}", load_path_outcome(&global_path, true).unwrap_err());
+        assert!(
+            error.contains("unknown extension ID \"unknown\""),
+            "{error}"
+        );
+        assert!(
+            error.contains(&global_path.display().to_string()),
+            "{error}"
+        );
+        let error = format!(
+            "{:#}",
+            load_extensions_location(&ConfigLocation {
+                path: Some(global_path.clone()),
+                explicit: true,
+                source: "test",
+            })
+            .unwrap_err()
+        );
+        assert!(
+            error.contains("unknown extension ID \"unknown\""),
+            "{error}"
+        );
+
+        fs::write(
+            &global_path,
+            format!(
+                "extensions = [{:?}]\n",
+                extension_root.display().to_string()
+            ),
+        )
+        .unwrap();
+        let loaded = load_path_outcome(&global_path, true).unwrap();
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir_all(workspace.join(".fut")).unwrap();
+        let workspace_path = workspace.join(".fut/config.toml");
+        fs::write(&workspace_path, "[extension.unknown]\nvalue = true\n").unwrap();
+        let error = format!(
+            "{:#}",
+            resolve_extension_config(&loaded.ui, "known", &workspace).unwrap_err()
+        );
+        assert!(
+            error.contains("unknown extension ID \"unknown\""),
+            "{error}"
+        );
+        assert!(
+            error.contains(&workspace_path.display().to_string()),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn extension_config_bounds_keys_depth_values_and_serialized_size() {
+        let source = Path::new("/tmp/extension-config-test.toml");
+
+        let too_many_keys = (0..=MAX_EXTENSION_CONFIG_KEYS)
+            .map(|index| (format!("key-{index}"), serde_json::Value::Bool(true)))
+            .collect();
+        assert!(
+            validate_extension_config_table("run", &too_many_keys, source)
+                .unwrap_err()
+                .to_string()
+                .contains("keys")
+        );
+
+        let mut nested = serde_json::Value::Bool(true);
+        for index in 0..=MAX_EXTENSION_CONFIG_DEPTH {
+            nested = serde_json::json!({ format!("level-{index}"): nested });
+        }
+        let nested = nested.as_object().unwrap().clone();
+        assert!(
+            validate_extension_config_table("run", &nested, source)
+                .unwrap_err()
+                .to_string()
+                .contains("depth")
+        );
+
+        let oversized_value = serde_json::json!({
+            "value": "x".repeat(MAX_EXTENSION_CONFIG_VALUE_BYTES + 1)
+        });
+        assert!(
+            validate_extension_config_table("run", oversized_value.as_object().unwrap(), source)
+                .unwrap_err()
+                .to_string()
+                .contains("per value")
+        );
+
+        let serialized = serde_json::json!({
+            "one": "x".repeat(3_500),
+            "two": "x".repeat(3_500),
+            "three": "x".repeat(3_500),
+            "four": "x".repeat(3_500),
+            "five": "x".repeat(3_500),
+        });
+        assert!(
+            validate_extension_config_table("run", serialized.as_object().unwrap(), source)
+                .unwrap_err()
+                .to_string()
+                .contains("serializes")
+        );
     }
 
     #[test]
