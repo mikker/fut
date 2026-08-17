@@ -2484,9 +2484,13 @@ mod tests {
             panic!("default left sidebar should contain workspaces");
         };
         row.left.clear();
-        row.body = vec![super::super::config::SegmentConfig {
-            token: Some("workspace.extension.run.launching".into()),
-            ..Default::default()
+        row.body = vec![super::super::config::SegmentConfig::Token {
+            token: "workspace.extension.run.launching".into(),
+            style: None,
+            prefix: String::new(),
+            suffix: String::new(),
+            max_width: None,
+            visual: super::super::config::TokenVisual::Plain,
         }];
         row.right.clear();
         row.detail.clear();

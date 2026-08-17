@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fixed shared-terminal attachment sizing, failed last-terminal replacement recovery, and transient Codex screen-capture errors.
+
 ## 0.8
 
 - Added a searchable global agents dialog on `Ctrl-b a`, with color-coded sidebar statuses and startup Codex detection.

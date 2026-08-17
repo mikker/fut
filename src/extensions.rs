@@ -115,9 +115,7 @@ pub(crate) struct ExtensionLauncher {
     name: String,
     title: String,
     command: ExtensionCommand,
-    size: PopupSize,
-    activate_opened: bool,
-    mode: ExtensionCommandMode,
+    execution: ExtensionCommandExecution,
 }
 
 impl ExtensionLauncher {
@@ -133,16 +131,8 @@ impl ExtensionLauncher {
         &self.command.argv
     }
 
-    pub(crate) fn size(&self) -> PopupSize {
-        self.size
-    }
-
-    pub(crate) fn activate_opened(&self) -> bool {
-        self.activate_opened
-    }
-
-    pub(crate) const fn mode(&self) -> ExtensionCommandMode {
-        self.mode
+    pub(crate) const fn execution(&self) -> &ExtensionCommandExecution {
+        &self.execution
     }
 }
 
@@ -152,6 +142,26 @@ pub(crate) enum ExtensionCommandMode {
     #[default]
     Interactive,
     Background,
+}
+
+/// Runtime command execution. Background commands have no popup-specific
+/// state by construction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ExtensionCommandExecution {
+    Interactive {
+        size: PopupSize,
+        activate_opened: bool,
+    },
+    Background,
+}
+
+impl ExtensionCommandExecution {
+    pub(crate) const fn mode(&self) -> ExtensionCommandMode {
+        match self {
+            Self::Interactive { .. } => ExtensionCommandMode::Interactive,
+            Self::Background => ExtensionCommandMode::Background,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -959,16 +969,24 @@ fn load_one(root: &Path) -> Result<Extension> {
             declaration.size.validate().with_context(|| {
                 format!("validate extension {:?} command {name:?} size", manifest.id)
             })?;
-            if declaration.mode == ExtensionCommandMode::Background
-                && (declaration.activate_opened
-                    || declaration.size.width.is_some()
-                    || declaration.size.height.is_some())
-            {
-                bail!(
-                    "extension {:?} background command {name:?} cannot declare size or activate_opened",
-                    manifest.id
-                );
-            }
+            let execution = match declaration.mode {
+                ExtensionCommandMode::Interactive => ExtensionCommandExecution::Interactive {
+                    size: declaration.size,
+                    activate_opened: declaration.activate_opened,
+                },
+                ExtensionCommandMode::Background => {
+                    if declaration.activate_opened
+                        || declaration.size.width.is_some()
+                        || declaration.size.height.is_some()
+                    {
+                        bail!(
+                            "extension {:?} background command {name:?} cannot declare size or activate_opened",
+                            manifest.id
+                        );
+                    }
+                    ExtensionCommandExecution::Background
+                }
+            };
             let command = validate_command(root, declaration.argv).with_context(|| {
                 format!("validate extension {:?} command {name:?} argv", manifest.id)
             })?;
@@ -979,9 +997,7 @@ fn load_one(root: &Path) -> Result<Extension> {
                     name: launcher_name,
                     title: declaration.title,
                     command,
-                    size: declaration.size,
-                    activate_opened: declaration.activate_opened,
-                    mode: declaration.mode,
+                    execution,
                 },
             ))
         })
@@ -1234,10 +1250,16 @@ presentation = "spinner"
         );
         let launcher = &extension.commands["open-review"];
         assert_eq!(launcher.title(), "Open review");
-        assert_eq!(launcher.size().width, Some(100));
-        assert_eq!(launcher.size().height, Some(30));
-        assert!(launcher.activate_opened());
-        assert_eq!(launcher.mode(), ExtensionCommandMode::Interactive);
+        assert!(matches!(
+            launcher.execution(),
+            ExtensionCommandExecution::Interactive {
+                size: PopupSize {
+                    width: Some(100),
+                    height: Some(30)
+                },
+                activate_opened: true,
+            }
+        ));
         assert_eq!(
             launcher.argv(),
             [
@@ -1246,8 +1268,8 @@ presentation = "spinner"
             ]
         );
         assert_eq!(
-            extension.commands["refresh"].mode(),
-            ExtensionCommandMode::Background
+            extension.commands["refresh"].execution(),
+            &ExtensionCommandExecution::Background
         );
         assert_eq!(
             extension.presentation_tokens()[0].qualified_name(),
@@ -1695,7 +1717,7 @@ scope = "tab"
         assert_eq!(
             extension
                 .commands()
-                .map(|command| (command.name(), command.mode()))
+                .map(|command| (command.name(), command.execution().mode()))
                 .collect::<Vec<_>>(),
             [
                 ("edit-logs", ExtensionCommandMode::Interactive),

@@ -2,6 +2,13 @@ use crate::domain::AgentState;
 
 pub const IDLE_CONFIRMATIONS: u8 = 3;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CodexProbe {
+    NotRunning,
+    Screen(String),
+    Unavailable,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CodexDetection {
     pub state: AgentState,

@@ -21,7 +21,7 @@ use crate::{
 /// Protocol version used by released Fut 0.1 builds.
 pub const PROTOCOL_VERSION_0_1: u16 = 0;
 /// Current clients and daemons require an exact protocol match.
-pub const PROTOCOL_VERSION: u16 = 23;
+pub const PROTOCOL_VERSION: u16 = 24;
 /// Enough for 50,000 individually styled MessagePack-encoded cells while
 /// remaining a firm pre-allocation bound for the length-delimited transport.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
@@ -198,6 +198,13 @@ pub enum OpenDisposition {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentPromptMode {
+    Submit,
+    Wait { timeout_ms: u64 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
     Hello {
@@ -231,9 +238,7 @@ pub enum ClientMessage {
     PromptAgent {
         terminal_id: TerminalId,
         text: String,
-        wait: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        timeout_ms: Option<u64>,
+        mode: AgentPromptMode,
     },
     WaitAgent {
         terminal_id: TerminalId,
@@ -741,8 +746,12 @@ mod tests {
             ClientMessage::PromptAgent {
                 terminal_id,
                 text: "explain λ".into(),
-                wait: true,
-                timeout_ms: Some(30_000),
+                mode: AgentPromptMode::Wait { timeout_ms: 30_000 },
+            },
+            ClientMessage::PromptAgent {
+                terminal_id,
+                text: "continue".into(),
+                mode: AgentPromptMode::Submit,
             },
             ClientMessage::WaitAgent {
                 terminal_id,
@@ -1194,7 +1203,7 @@ mod tests {
             switched
         );
         assert_eq!(PROTOCOL_VERSION_0_1, 0);
-        assert_eq!(PROTOCOL_VERSION, 23);
+        assert_eq!(PROTOCOL_VERSION, 24);
 
         let watch = ClientMessage::WatchResources;
         assert_eq!(

@@ -23,16 +23,20 @@ impl AttachmentLease {
         client: ClientId,
         size: TerminalSize,
         terminal: Arc<TerminalHandle>,
-    ) -> Option<LeaseGuard> {
+    ) -> Option<LeaseAcquisition> {
         let mut state = self.0.lock().ok()?;
         if state.sizes.contains_key(&client) {
             return None;
         }
         state.sizes.insert(client, size);
-        Some(LeaseGuard {
-            lease: self.clone(),
-            client,
-            terminal,
+        let geometry = geometry(&mut state)?;
+        Some(LeaseAcquisition {
+            guard: LeaseGuard {
+                lease: self.clone(),
+                client,
+                terminal,
+            },
+            geometry,
         })
     }
 
@@ -42,6 +46,11 @@ impl AttachmentLease {
     }
 }
 
+pub struct LeaseAcquisition {
+    pub guard: LeaseGuard,
+    pub geometry: AttachmentGeometry,
+}
+
 pub struct LeaseGuard {
     lease: AttachmentLease,
     client: ClientId,
@@ -49,14 +58,6 @@ pub struct LeaseGuard {
 }
 
 impl LeaseGuard {
-    pub fn has_peers(&self) -> bool {
-        self.lease.0.lock().is_ok_and(|state| state.sizes.len() > 1)
-    }
-
-    pub fn client_size(&self) -> Option<TerminalSize> {
-        self.lease.0.lock().ok()?.sizes.get(&self.client).copied()
-    }
-
     pub fn resize(&self, size: TerminalSize) -> Option<AttachmentGeometry> {
         let mut state = self.lease.0.lock().ok()?;
         *state.sizes.get_mut(&self.client)? = size;

@@ -116,9 +116,7 @@ fn screen_text(screen: &ScreenSnapshot) -> String {
 }
 
 /// Standalone stand-in for the client's `PaneState`: materializes a grid from
-/// a full snapshot, then splices delta rows into it. Deliberately shares no
-/// code with the real client — this is a headless measurement tool, not a
-/// protocol conformance check.
+/// full snapshots and applies domain-validated deltas.
 #[derive(Default)]
 struct MaterializedScreen {
     screen: Option<ScreenSnapshot>,
@@ -129,22 +127,13 @@ impl MaterializedScreen {
         self.screen.insert(screen)
     }
 
-    /// Splices `delta` into the current grid, or `None` if it doesn't apply
-    /// (no base grid yet, or a revision/size mismatch) — a real client would
+    /// Applies `delta`, or returns `None` if it doesn't apply — a real client would
     /// send `RefreshTerminal` here; this harness just discards the frame.
     fn apply_delta(&mut self, delta: ScreenDelta) -> Option<&ScreenSnapshot> {
         let current = self.screen.as_mut()?;
-        if delta.base_revision != current.revision || delta.size != current.size {
+        if current.apply_delta(delta).is_err() {
             return None;
         }
-        let columns = usize::from(current.size.columns);
-        for row in delta.rows {
-            let start = usize::from(row.index) * columns;
-            current.cells[start..start + columns].clone_from_slice(&row.cells);
-        }
-        current.revision = delta.revision;
-        current.cursor = delta.cursor;
-        current.scroll = delta.scroll;
         self.screen.as_ref()
     }
 

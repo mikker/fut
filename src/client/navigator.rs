@@ -86,7 +86,13 @@ pub(super) enum NavigatorStatus {
     Ready,
     Empty,
     Error { message: String },
-    Switching,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NavigatorPhase {
+    Browsing,
+    SwitchRequest { request_id: Uuid },
+    AwaitingSnapshot,
 }
 
 pub(super) struct NavigatorState {
@@ -100,7 +106,7 @@ pub(super) struct NavigatorState {
     pub resource_revision: Option<u64>,
     presence: ClientPresenceSnapshot,
     current_session: Option<SessionId>,
-    pub switch_request: Option<Uuid>,
+    phase: NavigatorPhase,
 }
 
 pub(super) enum NavigatorAction {
@@ -122,7 +128,7 @@ impl NavigatorState {
             resource_revision: None,
             presence: ClientPresenceSnapshot::default(),
             current_session: None,
-            switch_request: None,
+            phase: NavigatorPhase::Browsing,
         }
     }
 
@@ -185,7 +191,7 @@ impl NavigatorState {
         self.refilter();
         self.resource_revision = Some(snapshot.revision);
         self.status = match previous_status {
-            status @ (NavigatorStatus::Switching | NavigatorStatus::Error { .. }) => status,
+            status @ NavigatorStatus::Error { .. } => status,
             _ if self.rows.is_empty() => NavigatorStatus::Empty,
             _ => NavigatorStatus::Ready,
         };
@@ -228,7 +234,7 @@ impl NavigatorState {
         ) {
             return NavigatorAction::Stay;
         }
-        if matches!(self.status, NavigatorStatus::Switching) {
+        if self.is_switching() {
             return NavigatorAction::Stay;
         }
         if matches!(key.code, KeyCode::Esc) {
@@ -319,7 +325,7 @@ impl NavigatorState {
     }
 
     pub fn paste(&mut self, value: &str) {
-        if matches!(self.status, NavigatorStatus::Switching) {
+        if self.is_switching() {
             return;
         }
         for character in value.chars().filter(|character| !character.is_control()) {
@@ -398,25 +404,45 @@ impl NavigatorState {
     }
 
     pub fn begin_switch(&mut self, request: Uuid) {
-        self.switch_request = Some(request);
-        self.status = NavigatorStatus::Switching;
+        debug_assert!(!self.is_switching());
+        self.phase = NavigatorPhase::SwitchRequest {
+            request_id: request,
+        };
     }
 
     pub fn switch_error(&mut self, request: Option<Uuid>, message: String) -> bool {
-        if !matches_request(self.switch_request, request) {
+        let NavigatorPhase::SwitchRequest { request_id } = self.phase else {
+            return false;
+        };
+        if request != Some(request_id) {
             return false;
         }
-        self.switch_request = None;
+        self.phase = NavigatorPhase::Browsing;
         self.status = NavigatorStatus::Error { message };
         true
     }
 
     pub fn switch_selected(&mut self, request: Option<Uuid>) -> bool {
-        if !matches_request(self.switch_request, request) {
+        let NavigatorPhase::SwitchRequest { request_id } = self.phase else {
+            return false;
+        };
+        if request != Some(request_id) {
             return false;
         }
-        self.switch_request = None;
+        self.phase = NavigatorPhase::AwaitingSnapshot;
         true
+    }
+
+    pub fn accept_switch_snapshot(&mut self) -> bool {
+        if !matches!(self.phase, NavigatorPhase::AwaitingSnapshot) {
+            return false;
+        }
+        self.phase = NavigatorPhase::Browsing;
+        true
+    }
+
+    fn is_switching(&self) -> bool {
+        !matches!(self.phase, NavigatorPhase::Browsing)
     }
 
     /// Limit rows to one resource kind inside the selected row's enclosing
@@ -562,7 +588,7 @@ impl NavigatorState {
             let footer = match &self.status {
                 NavigatorStatus::Loading => "Loading…".to_owned(),
                 NavigatorStatus::Empty => "No resources".to_owned(),
-                NavigatorStatus::Switching => "Switching…".to_owned(),
+                _ if self.is_switching() => "Switching…".to_owned(),
                 NavigatorStatus::Error { message } => {
                     format!("Error: {message}  enter retry  esc cancel")
                 }
@@ -602,7 +628,7 @@ impl NavigatorState {
                 &format!("Error: {message}"),
                 Style::default(),
             ),
-            NavigatorStatus::Ready | NavigatorStatus::Switching | NavigatorStatus::Error { .. } => {
+            NavigatorStatus::Ready | NavigatorStatus::Error { .. } => {
                 if self.filtered.is_empty() {
                     put(
                         buffer,
@@ -812,10 +838,6 @@ pub(super) fn dialog_body_rows(host: Rect) -> usize {
     let area = frame_inner(dialog_area(host, MAX_WIDTH, MAX_HEIGHT));
     let (header, footer) = chrome_rows(area.height);
     usize::from(area.height.saturating_sub(header + footer))
-}
-
-fn matches_request(pending: Option<Uuid>, response: Option<Uuid>) -> bool {
-    pending.is_some() && pending == response
 }
 
 fn minimal_fuzzy_matches(query: &str, rows: &[NavigatorRow]) -> Vec<usize> {
@@ -1453,12 +1475,23 @@ mod tests {
         nav.begin_switch(switch);
         assert!(!nav.switch_selected(None));
         assert!(!nav.switch_error(Some(Uuid::new_v4()), "wrong".into()));
-        assert!(matches!(nav.status, NavigatorStatus::Switching));
+        assert!(matches!(
+            nav.phase,
+            NavigatorPhase::SwitchRequest { request_id } if request_id == switch
+        ));
         assert!(nav.switch_error(Some(switch), "busy".into()));
         assert!(matches!(
             nav.status,
             NavigatorStatus::Error { ref message } if message == "busy"
         ));
+
+        nav.begin_switch(switch);
+        assert!(nav.switch_selected(Some(switch)));
+        assert!(matches!(nav.phase, NavigatorPhase::AwaitingSnapshot));
+        assert!(!nav.switch_error(Some(switch), "too late".into()));
+        assert!(nav.accept_switch_snapshot());
+        assert!(matches!(nav.phase, NavigatorPhase::Browsing));
+        assert!(!nav.accept_switch_snapshot());
     }
 
     #[test]
@@ -1498,8 +1531,10 @@ mod tests {
                 nav.key(KeyEvent::new(code, KeyModifiers::NONE), 3),
                 NavigatorAction::Stay
             ));
-            assert_eq!(nav.switch_request, Some(request));
-            assert!(matches!(nav.status, NavigatorStatus::Switching));
+            assert!(matches!(
+                nav.phase,
+                NavigatorPhase::SwitchRequest { request_id } if request_id == request
+            ));
         }
     }
 

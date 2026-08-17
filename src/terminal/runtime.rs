@@ -61,7 +61,6 @@ pub(crate) struct AttachmentGeometry {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TerminalEvent {
-    TerminalExited { exit_code: Option<i32> },
     Error { message: String },
 }
 
@@ -922,7 +921,7 @@ fn run(
                                 &publishers,
                                 Duration::from_millis(100),
                             );
-                            publish_exit(publishers.events, publishers.lifecycle, code);
+                            publish_exit(publishers.lifecycle, code);
                             let _ = completion.send(Ok(()));
                             serve_exited(&mut queues.control, terminal);
                             return;
@@ -1037,7 +1036,7 @@ fn run(
                 publishers.snapshots,
                 publishers.events,
             );
-            publish_exit(publishers.events, publishers.lifecycle, Some(exit_code));
+            publish_exit(publishers.lifecycle, Some(exit_code));
             serve_exited(&mut queues.control, terminal);
             break;
         }
@@ -1488,13 +1487,8 @@ fn publish_optional(
         Err(error) => send_error(events, error),
     }
 }
-fn publish_exit(
-    events: &broadcast::Sender<TerminalEvent>,
-    lifecycle: &watch::Sender<TerminalLifecycle>,
-    exit_code: Option<i32>,
-) {
+fn publish_exit(lifecycle: &watch::Sender<TerminalLifecycle>, exit_code: Option<i32>) {
     lifecycle.send_replace(TerminalLifecycle::Exited { exit_code });
-    let _ = events.send(TerminalEvent::TerminalExited { exit_code });
 }
 fn send_error(events: &broadcast::Sender<TerminalEvent>, error: anyhow::Error) {
     let _ = events.send(TerminalEvent::Error {
@@ -1618,7 +1612,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn passes_explicit_args_env_and_input_then_reports_exit_once() {
+    async fn passes_explicit_args_env_and_input_then_reports_durable_exit() {
         let mut env = HashMap::new();
         env.insert("FUT_TEST".into(), "works".into());
         let handle = spawn_terminal(shell(
@@ -1627,18 +1621,19 @@ mod tests {
         ))
         .unwrap();
         let mut snapshots = handle.subscribe_snapshots();
-        let mut events = handle.subscribe_events();
+        let mut lifecycle = handle.subscribe_lifecycle();
         handle.input(b"input\n".to_vec()).await.unwrap();
         wait_for_text(&mut snapshots, "works:input").await;
-        let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(event, TerminalEvent::TerminalExited { exit_code: Some(0) });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), events.recv())
-                .await
-                .is_err()
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while *lifecycle.borrow_and_update() == TerminalLifecycle::Running {
+                lifecycle.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            *lifecycle.borrow(),
+            TerminalLifecycle::Exited { exit_code: Some(0) }
         );
     }
 

@@ -102,20 +102,12 @@ fn apply_delta(
     terminal_id: TerminalId,
     delta: fut::domain::ScreenDelta,
 ) -> ScreenSnapshot {
-    let mut screen = grids
-        .remove(&terminal_id)
-        .filter(|screen| screen.revision == delta.base_revision && screen.size == delta.size)
-        .unwrap_or_else(|| {
-            panic!("test harness received a delta with no matching base grid for {terminal_id:?}")
-        });
-    let columns = usize::from(screen.size.columns);
-    for row in delta.rows {
-        let start = usize::from(row.index) * columns;
-        screen.cells[start..start + columns].clone_from_slice(&row.cells);
-    }
-    screen.revision = delta.revision;
-    screen.cursor = delta.cursor;
-    screen.scroll = delta.scroll;
+    let mut screen = grids.remove(&terminal_id).unwrap_or_else(|| {
+        panic!("test harness received a delta with no matching base grid for {terminal_id:?}")
+    });
+    screen.apply_delta(delta).unwrap_or_else(|error| {
+        panic!("test harness received an invalid delta for {terminal_id:?}: {error}")
+    });
     screen
 }
 
@@ -156,7 +148,20 @@ struct Harness {
 struct PtyChild {
     child: Child,
     input: Option<std::process::ChildStdin>,
-    output: Arc<Mutex<Vec<u8>>>,
+    output: Arc<Mutex<PtyOutput>>,
+    renderer: Mutex<PtyRenderer>,
+}
+
+#[derive(Default)]
+struct PtyOutput {
+    bytes: Vec<u8>,
+    checkpoint: usize,
+}
+
+struct PtyRenderer {
+    terminal: fut::terminal::bench::VtBench,
+    parsed: usize,
+    screen: Option<ScreenSnapshot>,
 }
 
 impl PtyChild {
@@ -168,7 +173,7 @@ impl PtyChild {
             .spawn()
             .expect("spawn PTY child");
         let input = child.stdin.take();
-        let output = Arc::new(Mutex::new(Vec::new()));
+        let output = Arc::new(Mutex::new(PtyOutput::default()));
         let readers: Vec<Box<dyn Read + Send>> = vec![
             Box::new(child.stdout.take().unwrap()),
             Box::new(child.stderr.take().unwrap()),
@@ -181,7 +186,11 @@ impl PtyChild {
                     if count == 0 {
                         break;
                     }
-                    output.lock().unwrap().extend_from_slice(&bytes[..count]);
+                    output
+                        .lock()
+                        .unwrap()
+                        .bytes
+                        .extend_from_slice(&bytes[..count]);
                 }
             });
         }
@@ -189,6 +198,11 @@ impl PtyChild {
             child,
             input,
             output,
+            renderer: Mutex::new(PtyRenderer {
+                terminal: fut::terminal::bench::VtBench::new(SIZE).expect("test terminal"),
+                parsed: 0,
+                screen: None,
+            }),
         }
     }
 
@@ -264,7 +278,8 @@ impl PtyChild {
     }
 
     fn text(&self) -> String {
-        String::from_utf8_lossy(&self.output.lock().unwrap()).into_owned()
+        let output = self.output.lock().unwrap();
+        String::from_utf8_lossy(&output.bytes[output.checkpoint..]).into_owned()
     }
 
     /// Whether the raw output or the rendered screen contains `needle`.
@@ -276,18 +291,35 @@ impl PtyChild {
     }
 
     fn screen_text(&self) -> String {
-        let bytes = self.output.lock().unwrap().clone();
-        let mut terminal = fut::terminal::bench::VtBench::new(SIZE).expect("test terminal");
-        let snapshot = terminal
+        let mut renderer = self.renderer.lock().unwrap();
+        let bytes = {
+            let output = self.output.lock().unwrap();
+            output.bytes[renderer.parsed..].to_vec()
+        };
+        renderer.parsed += bytes.len();
+        let snapshot = renderer
+            .terminal
             .feed(&bytes)
             .ok()
             .flatten()
-            .or_else(|| terminal.snapshot().ok().flatten());
-        snapshot.as_ref().map(snapshot_text).unwrap_or_default()
+            .or_else(|| renderer.terminal.snapshot().ok().flatten());
+        if let Some(snapshot) = snapshot {
+            renderer.screen = Some(snapshot);
+        }
+        renderer
+            .screen
+            .as_ref()
+            .map(snapshot_text)
+            .unwrap_or_default()
     }
 
     fn clear_output(&mut self) {
-        self.output.lock().unwrap().clear();
+        // Bring the retained VT state up to date before advancing the raw
+        // observation boundary. Future diff repaints can then reuse cells
+        // that were written before this checkpoint without losing context.
+        self.screen_text();
+        let mut output = self.output.lock().unwrap();
+        output.checkpoint = output.bytes.len();
     }
 }
 
@@ -2216,12 +2248,34 @@ fn checked_in_wt_extension_composes_create_and_retirement_commands() {
         .unwrap();
     assert!(retire.wait().unwrap().success());
     assert_eq!(
-        fs::read_to_string(retire_capture)
+        fs::read_to_string(&retire_capture)
             .unwrap()
             .lines()
             .collect::<Vec<_>>(),
         ["--socket", "/tmp/fut.sock", "workspace", "retire"]
     );
+
+    fs::remove_file(&retire_capture).unwrap();
+    for payload in [
+        b"not json\n".as_slice(),
+        br#"{"version":10,"event":"worktree.removed"}"#.as_slice(),
+        br#"{"version":1,"event":{"name":"worktree.removed"}}"#.as_slice(),
+        br#"{"version":1,"event":"workspace.renamed"}"#.as_slice(),
+    ] {
+        let mut invalid = Command::new(extension.join("bin/worktree-event"))
+            .env("FUT_BIN", &fake_fut)
+            .env("FUT_SOCKET", "/tmp/fut.sock")
+            .env("CAPTURE", &retire_capture)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        invalid.stdin.take().unwrap().write_all(payload).unwrap();
+        assert!(!invalid.wait().unwrap().success());
+        assert!(
+            !retire_capture.exists(),
+            "retire command ran for {payload:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -9653,15 +9707,15 @@ async fn asynchronous_copy_cursor_loss_precedes_the_canonical_snapshot() {
                 ServerMessage::Snapshot {
                     terminal_id: id,
                     screen,
-                } if id == terminal_id => {
+                } if id == terminal_id
+                    && snapshot_text(&screen).contains("RAW_ALTERNATE_READY") =>
+                {
                     assert!(
                         saw_cursor_loss,
-                        "canonical snapshot arrived before typed cursor loss"
+                        "invalidating canonical snapshot arrived before typed cursor loss"
                     );
-                    if snapshot_text(&screen).contains("RAW_ALTERNATE_READY") {
-                        assert!(screen.cells.iter().all(|cell| !cell.selected));
-                        break;
-                    }
+                    assert!(screen.cells.iter().all(|cell| !cell.selected));
+                    break;
                 }
                 _ => {}
             }

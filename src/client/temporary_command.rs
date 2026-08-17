@@ -83,6 +83,13 @@ impl TemporaryCommandSurface {
         socket_path: &Path,
         extension_context: Option<&ExtensionCommandContext>,
     ) -> anyhow::Result<Self> {
+        let crate::extensions::ExtensionCommandExecution::Interactive {
+            size: popup_size,
+            activate_opened,
+        } = command.execution
+        else {
+            anyhow::bail!("background commands cannot open an interactive surface");
+        };
         let cwd = if let Some(context) = extension_context {
             context.workspace_root.clone()
         } else {
@@ -97,8 +104,7 @@ impl TemporaryCommandSurface {
             add_extension_environment(&mut env, command, context, socket_path)?;
         }
         let terminal_id = TerminalId::new();
-        let activation = command
-            .activate_opened
+        let activation = activate_opened
             .then(|| ActivationSocket::bind(socket_path))
             .transpose()?;
         if let Some(activation) = &activation {
@@ -122,7 +128,7 @@ impl TemporaryCommandSurface {
         let lifecycle = handle.subscribe_lifecycle();
         Ok(Self {
             title: command.title.clone(),
-            size: command.size,
+            size: popup_size,
             handle,
             snapshots,
             events,
@@ -177,7 +183,6 @@ impl TemporaryCommandSurface {
                 }
             }
             event = self.events.recv() => match event {
-                Ok(TerminalEvent::TerminalExited { exit_code }) => TemporaryCommandUpdate::Exited(exit_code),
                 Ok(TerminalEvent::Error { message }) => TemporaryCommandUpdate::Error(message),
                 Err(broadcast::error::RecvError::Lagged(_)) => TemporaryCommandUpdate::Screen,
                 Err(broadcast::error::RecvError::Closed) => TemporaryCommandUpdate::Stopped,
@@ -518,10 +523,11 @@ mod tests {
             binding: Some("x".into()),
             program: program.into(),
             args: args.iter().map(|arg| (*arg).into()).collect(),
-            size: PopupSize::default(),
-            activate_opened: false,
+            execution: crate::extensions::ExtensionCommandExecution::Interactive {
+                size: PopupSize::default(),
+                activate_opened: false,
+            },
             extension: None,
-            mode: crate::extensions::ExtensionCommandMode::Interactive,
         }
     }
 
@@ -678,7 +684,7 @@ mod tests {
                 output.to_str().unwrap(),
             ],
         );
-        launch.mode = crate::extensions::ExtensionCommandMode::Background;
+        launch.execution = crate::extensions::ExtensionCommandExecution::Background;
         launch.extension = Some(ExtensionCommandIdentity {
             id: "test-extension".into(),
             root: temporary.path().to_owned(),
@@ -734,7 +740,7 @@ mod tests {
                 "printf 'actionable '; yes x | head -c 10000 >&2; exit 7",
             ],
         );
-        launch.mode = crate::extensions::ExtensionCommandMode::Background;
+        launch.execution = crate::extensions::ExtensionCommandExecution::Background;
         launch.extension = Some(ExtensionCommandIdentity {
             id: "test-extension".into(),
             root: temporary.path().to_owned(),

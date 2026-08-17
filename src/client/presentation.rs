@@ -6,7 +6,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::{
-    config::{IconSet, SegmentConfig, SemanticStyle, StylesConfig, UiConfig},
+    config::{IconSet, SegmentConfig, SemanticStyle, StylesConfig, TokenVisual, UiConfig},
     notifications::spinner_marker,
 };
 use crate::extensions::TokenPresentation;
@@ -100,24 +100,31 @@ pub(super) fn render_token_segments(
 ) -> Line<'static> {
     let mut spans = Vec::new();
     for segment in segments {
-        let (text, token_style, is_token) = if let Some(text) = segment.text.as_deref() {
-            (text.to_owned(), None, false)
-        } else if let Some(token) = segment.token.as_deref() {
-            let value = resolve(token);
-            if value.text.is_empty() {
-                continue;
+        let (text, token_style, segment_style, visual) = match segment {
+            SegmentConfig::Text { text, style } => (text.clone(), None, *style, TokenVisual::Plain),
+            SegmentConfig::Token {
+                token,
+                style,
+                prefix,
+                suffix,
+                max_width,
+                visual,
+            } => {
+                let value = resolve(token);
+                if value.text.is_empty() {
+                    continue;
+                }
+                let value_text = max_width.map_or(value.text.clone(), |width| {
+                    truncate(&value.text, usize::from(width))
+                });
+                (
+                    format!("{prefix}{value_text}{suffix}"),
+                    value.style,
+                    *style,
+                    *visual,
+                )
             }
-            let value_text = match segment.max_width {
-                Some(width) => truncate(&value.text, usize::from(width)),
-                None => value.text,
-            };
-            (
-                format!("{}{}{}", segment.prefix, value_text, segment.suffix),
-                value.style,
-                true,
-            )
-        } else {
-            continue;
+            SegmentConfig::Tabs => continue,
         };
         if text.is_empty() {
             continue;
@@ -130,14 +137,17 @@ pub(super) fn render_token_segments(
         if let Some(role) = token_style {
             style = styles.apply(role, style);
         }
-        if let Some(role) = segment.style {
+        if let Some(role) = segment_style {
             style = styles.apply(role, style);
         }
         style = apply_item_state(styles, state, style);
-        if is_token && segment.inverted {
+        if visual != TokenVisual::Plain {
             style = style.add_modifier(Modifier::REVERSED);
         }
-        if is_token && segment.pill && !icons.pill_left.is_empty() && !icons.pill_right.is_empty() {
+        if visual == TokenVisual::Pill
+            && !icons.pill_left.is_empty()
+            && !icons.pill_right.is_empty()
+        {
             let cap = pill_cap_style(style, surface);
             spans.push(Span::styled(icons.pill_left.clone(), cap));
             spans.push(Span::styled(text, style));
@@ -249,14 +259,13 @@ mod tests {
     #[test]
     fn empty_tokens_suppress_affixes_and_unicode_truncates_by_cells() {
         let icons = icons(IconPreset::NerdFont);
-        let segments = vec![SegmentConfig {
-            token: Some("test".into()),
+        let segments = vec![SegmentConfig::Token {
+            token: "test".into(),
+            style: None,
             prefix: "[".into(),
             suffix: "]".into(),
             max_width: Some(3),
-            inverted: true,
-            pill: true,
-            ..SegmentConfig::default()
+            visual: TokenVisual::Pill,
         }];
         let empty = render_token_segments(
             &segments,
@@ -287,14 +296,13 @@ mod tests {
         .unwrap();
         let icons = icons(IconPreset::NerdFont);
         let line = render_token_segments(
-            &[SegmentConfig {
-                token: Some("status".into()),
+            &[SegmentConfig::Token {
+                token: "status".into(),
                 prefix: " ".into(),
                 suffix: " ".into(),
                 style: Some(SemanticStyle::Attention),
-                inverted: true,
-                pill: true,
-                ..SegmentConfig::default()
+                max_width: None,
+                visual: TokenVisual::Pill,
             }],
             None,
             ItemState::default(),
@@ -324,12 +332,13 @@ mod tests {
     fn pill_without_configured_caps_falls_back_to_inverted_content_only() {
         for preset in [IconPreset::Unicode, IconPreset::Ascii] {
             let line = render_token_segments(
-                &[SegmentConfig {
-                    token: Some("status".into()),
+                &[SegmentConfig::Token {
+                    token: "status".into(),
                     style: Some(SemanticStyle::Added),
-                    inverted: true,
-                    pill: true,
-                    ..SegmentConfig::default()
+                    prefix: String::new(),
+                    suffix: String::new(),
+                    max_width: None,
+                    visual: TokenVisual::Pill,
                 }],
                 None,
                 ItemState::default(),
@@ -358,9 +367,9 @@ mod tests {
         )
         .unwrap();
         let line = render_token_segments(
-            &[SegmentConfig {
-                text: Some("value".into()),
-                ..SegmentConfig::default()
+            &[SegmentConfig::Text {
+                text: "value".into(),
+                style: None,
             }],
             None,
             ItemState {

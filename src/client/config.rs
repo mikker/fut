@@ -17,7 +17,7 @@ use super::actions::{
 };
 use crate::{
     command::PopupSize,
-    extensions::{self, Extension, ExtensionCommandMode},
+    extensions::{self, Extension, ExtensionCommandExecution, ExtensionCommandMode},
 };
 
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
@@ -145,23 +145,31 @@ pub(super) struct BindingsConfig {
     commands: Vec<PaletteCommand>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct PaletteCommand {
     pub title: String,
-    #[serde(default)]
     pub binding: Option<String>,
     pub program: PathBuf,
-    #[serde(default)]
     pub args: Vec<String>,
-    #[serde(default)]
-    pub size: PopupSize,
-    #[serde(default)]
-    pub activate_opened: bool,
-    #[serde(skip)]
+    pub execution: ExtensionCommandExecution,
     pub extension: Option<ExtensionCommandIdentity>,
-    #[serde(skip)]
-    pub mode: ExtensionCommandMode,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PaletteCommandDto {
+    title: String,
+    #[serde(default)]
+    binding: Option<String>,
+    program: PathBuf,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    size: PopupSize,
+    #[serde(default)]
+    activate_opened: bool,
+    #[serde(default)]
+    mode: ExtensionCommandMode,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -189,7 +197,35 @@ impl PaletteCommand {
     }
 
     pub(super) const fn mode(&self) -> ExtensionCommandMode {
-        self.mode
+        self.execution.mode()
+    }
+}
+
+impl<'de> Deserialize<'de> for PaletteCommand {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let dto = PaletteCommandDto::deserialize(deserializer)?;
+        let execution = match dto.mode {
+            ExtensionCommandMode::Interactive => ExtensionCommandExecution::Interactive {
+                size: dto.size,
+                activate_opened: dto.activate_opened,
+            },
+            ExtensionCommandMode::Background => {
+                if dto.activate_opened || dto.size.width.is_some() || dto.size.height.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "background command cannot declare size or activate_opened",
+                    ));
+                }
+                ExtensionCommandExecution::Background
+            }
+        };
+        Ok(Self {
+            title: dto.title,
+            binding: dto.binding,
+            program: dto.program,
+            args: dto.args,
+            execution,
+            extension: None,
+        })
     }
 }
 
@@ -666,40 +702,162 @@ impl IconsConfig {
     }
 }
 
+/// Raw TOML form for a presentation segment. This deliberately mirrors the
+/// user-facing syntax; [`SegmentConfig`] is the validated form the renderer
+/// receives.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub(super) struct SegmentConfig {
-    pub text: Option<String>,
-    pub token: Option<String>,
-    pub component: Option<String>,
-    pub style: Option<SemanticStyle>,
-    pub inverted: bool,
-    pub pill: bool,
-    pub prefix: String,
-    pub suffix: String,
-    pub max_width: Option<u16>,
+struct SegmentConfigDto {
+    text: Option<String>,
+    token: Option<String>,
+    component: Option<String>,
+    style: Option<SemanticStyle>,
+    inverted: bool,
+    pill: bool,
+    prefix: String,
+    suffix: String,
+    max_width: Option<u16>,
+}
+
+/// Renderer-ready presentation segment. Its shape makes selectors mutually
+/// exclusive and makes a pill necessarily inverted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum SegmentConfig {
+    Text {
+        text: String,
+        style: Option<SemanticStyle>,
+    },
+    Token {
+        token: String,
+        style: Option<SemanticStyle>,
+        prefix: String,
+        suffix: String,
+        max_width: Option<u16>,
+        visual: TokenVisual,
+    },
+    Tabs,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum TokenVisual {
+    #[default]
+    Plain,
+    Inverted,
+    Pill,
 }
 
 impl SegmentConfig {
     fn text(value: &str) -> Self {
-        Self {
-            text: Some(value.into()),
-            ..Self::default()
+        Self::Text {
+            text: value.into(),
+            style: None,
         }
     }
 
     fn token(value: &str) -> Self {
-        Self {
-            token: Some(value.into()),
-            ..Self::default()
+        Self::token_with(value, None, "", "", None, TokenVisual::Plain)
+    }
+
+    fn token_with(
+        value: &str,
+        style: Option<SemanticStyle>,
+        prefix: &str,
+        suffix: &str,
+        max_width: Option<u16>,
+        visual: TokenVisual,
+    ) -> Self {
+        Self::Token {
+            token: value.into(),
+            style,
+            prefix: prefix.into(),
+            suffix: suffix.into(),
+            max_width,
+            visual,
         }
     }
 
     fn component(value: &str) -> Self {
-        Self {
-            component: Some(value.into()),
-            ..Self::default()
+        match value {
+            "tabs" => Self::Tabs,
+            _ => unreachable!("default config only uses supported components"),
         }
+    }
+}
+
+impl SegmentConfigDto {
+    fn compile(self) -> std::result::Result<SegmentConfig, String> {
+        let selectors = usize::from(self.text.is_some())
+            + usize::from(self.token.is_some())
+            + usize::from(self.component.is_some());
+        if selectors != 1 {
+            return Err("must set exactly one of text, token, or component".into());
+        }
+        for (field, value) in [
+            ("text", self.text.as_deref()),
+            ("prefix", Some(self.prefix.as_str())),
+            ("suffix", Some(self.suffix.as_str())),
+        ] {
+            if let Some(value) = value {
+                validate_text(field, value).map_err(|error| error.to_string())?;
+            }
+        }
+        if let Some(text) = self.text {
+            if !self.prefix.is_empty()
+                || !self.suffix.is_empty()
+                || self.max_width.is_some()
+                || self.inverted
+                || self.pill
+            {
+                return Err(
+                    "text segments do not accept prefix, suffix, max_width, inverted, or pill"
+                        .into(),
+                );
+            }
+            return Ok(SegmentConfig::Text {
+                text,
+                style: self.style,
+            });
+        }
+        if let Some(token) = self.token {
+            let visual = match (self.inverted, self.pill) {
+                (false, true) => return Err("pill requires inverted = true".into()),
+                (false, false) => TokenVisual::Plain,
+                (true, false) => TokenVisual::Inverted,
+                (true, true) => TokenVisual::Pill,
+            };
+            return Ok(SegmentConfig::Token {
+                token,
+                style: self.style,
+                prefix: self.prefix,
+                suffix: self.suffix,
+                max_width: self.max_width,
+                visual,
+            });
+        }
+        if self.component.as_deref() != Some("tabs") {
+            return Err("contains unknown or out-of-scope component".into());
+        }
+        if self.style.is_some()
+            || !self.prefix.is_empty()
+            || !self.suffix.is_empty()
+            || self.max_width.is_some()
+            || self.inverted
+            || self.pill
+        {
+            return Err(
+                "component does not accept style, prefix, suffix, max_width, inverted, or pill"
+                    .into(),
+            );
+        }
+        Ok(SegmentConfig::Tabs)
+    }
+}
+
+impl<'de> Deserialize<'de> for SegmentConfig {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        SegmentConfigDto::deserialize(deserializer)?
+            .compile()
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -738,21 +896,9 @@ impl Default for ItemFormat {
             segments: vec![
                 SegmentConfig::text(" "),
                 SegmentConfig::token("tab.index"),
-                SegmentConfig {
-                    token: Some("tab.name".into()),
-                    prefix: " ".into(),
-                    ..SegmentConfig::default()
-                },
-                SegmentConfig {
-                    token: Some("tab.closing".into()),
-                    prefix: " ".into(),
-                    ..SegmentConfig::default()
-                },
-                SegmentConfig {
-                    token: Some("tab.activity".into()),
-                    prefix: " ".into(),
-                    ..SegmentConfig::default()
-                },
+                SegmentConfig::token_with("tab.name", None, " ", "", None, TokenVisual::Plain),
+                SegmentConfig::token_with("tab.closing", None, " ", "", None, TokenVisual::Plain),
+                SegmentConfig::token_with("tab.activity", None, " ", "", None, TokenVisual::Plain),
                 SegmentConfig::text(" "),
             ],
         }
@@ -781,22 +927,26 @@ impl Default for TabBarConfig {
             center: Vec::new(),
             right: vec![
                 GroupConfig {
-                    segments: vec![SegmentConfig {
-                        token: Some("workspace.name".into()),
-                        prefix: " ".into(),
-                        suffix: " ".into(),
-                        max_width: Some(20),
-                        ..SegmentConfig::default()
-                    }],
+                    segments: vec![SegmentConfig::token_with(
+                        "workspace.name",
+                        None,
+                        " ",
+                        " ",
+                        Some(20),
+                        TokenVisual::Plain,
+                    )],
                     style: Some(SemanticStyle::Muted),
                     priority: 200,
                 },
                 GroupConfig {
-                    segments: vec![SegmentConfig {
-                        token: Some("client.zoom".into()),
-                        suffix: " ".into(),
-                        ..SegmentConfig::default()
-                    }],
+                    segments: vec![SegmentConfig::token_with(
+                        "client.zoom",
+                        None,
+                        "",
+                        " ",
+                        None,
+                        TokenVisual::Plain,
+                    )],
                     style: None,
                     priority: 255,
                 },
@@ -811,12 +961,14 @@ impl Default for TabBarConfig {
                     priority: 0,
                 },
                 GroupConfig {
-                    segments: vec![SegmentConfig {
-                        token: Some("client.waiting".into()),
-                        prefix: " ".into(),
-                        suffix: " ".into(),
-                        ..SegmentConfig::default()
-                    }],
+                    segments: vec![SegmentConfig::token_with(
+                        "client.waiting",
+                        None,
+                        " ",
+                        " ",
+                        None,
+                        TokenVisual::Plain,
+                    )],
                     style: Some(SemanticStyle::Attention),
                     priority: 255,
                 },
@@ -849,42 +1001,60 @@ impl Default for SidebarRowConfig {
             left: vec![SegmentConfig::text(" ")],
             body: vec![
                 SegmentConfig::token("workspace.index"),
-                SegmentConfig {
-                    token: Some("workspace.name".into()),
-                    prefix: " ".into(),
-                    ..SegmentConfig::default()
-                },
+                SegmentConfig::token_with(
+                    "workspace.name",
+                    None,
+                    " ",
+                    "",
+                    None,
+                    TokenVisual::Plain,
+                ),
             ],
             right: vec![
-                SegmentConfig {
-                    token: Some("workspace.activity".into()),
-                    prefix: " ".into(),
-                    ..SegmentConfig::default()
-                },
-                SegmentConfig {
-                    token: Some("workspace.closing".into()),
-                    prefix: " ".into(),
-                    ..SegmentConfig::default()
-                },
+                SegmentConfig::token_with(
+                    "workspace.activity",
+                    None,
+                    " ",
+                    "",
+                    None,
+                    TokenVisual::Plain,
+                ),
+                SegmentConfig::token_with(
+                    "workspace.closing",
+                    None,
+                    " ",
+                    "",
+                    None,
+                    TokenVisual::Plain,
+                ),
                 SegmentConfig::text(" "),
             ],
             detail: vec![
                 SegmentConfig::text("    "),
-                SegmentConfig {
-                    token: Some("workspace.git_branch".into()),
-                    style: Some(SemanticStyle::Muted),
-                    ..SegmentConfig::default()
-                },
-                SegmentConfig {
-                    token: Some("workspace.git_added".into()),
-                    prefix: " ".into(),
-                    ..SegmentConfig::default()
-                },
-                SegmentConfig {
-                    token: Some("workspace.git_deleted".into()),
-                    prefix: " ".into(),
-                    ..SegmentConfig::default()
-                },
+                SegmentConfig::token_with(
+                    "workspace.git_branch",
+                    Some(SemanticStyle::Muted),
+                    "",
+                    "",
+                    None,
+                    TokenVisual::Plain,
+                ),
+                SegmentConfig::token_with(
+                    "workspace.git_added",
+                    None,
+                    " ",
+                    "",
+                    None,
+                    TokenVisual::Plain,
+                ),
+                SegmentConfig::token_with(
+                    "workspace.git_deleted",
+                    None,
+                    " ",
+                    "",
+                    None,
+                    TokenVisual::Plain,
+                ),
             ],
         }
     }
@@ -899,11 +1069,14 @@ pub(super) struct SidebarSlotConfig {
 }
 
 fn default_sidebar_footer() -> Vec<SegmentConfig> {
-    vec![SegmentConfig {
-        token: Some("sidebar.status".into()),
-        style: Some(SemanticStyle::Muted),
-        ..SegmentConfig::default()
-    }]
+    vec![SegmentConfig::token_with(
+        "sidebar.status",
+        Some(SemanticStyle::Muted),
+        "",
+        "",
+        None,
+        TokenVisual::Plain,
+    )]
 }
 
 fn default_sidebar_header() -> Vec<SegmentConfig> {
@@ -1381,10 +1554,8 @@ fn load_path_outcome(path: &std::path::Path, explicit: bool) -> Result<LoadedCon
                     },
                     |configured| configured.args,
                 ),
-                size: launcher.size(),
-                activate_opened: launcher.activate_opened(),
+                execution: launcher.execution().clone(),
                 extension: Some(identity),
-                mode: launcher.mode(),
             });
         }
     }
@@ -1760,10 +1931,9 @@ fn validate(ui: &UiConfig, extensions: &[Extension]) -> Result<()> {
         if command.title.is_empty() {
             bail!("command titles must not be empty");
         }
-        command
-            .size
-            .validate()
-            .context("validate command popup size")?;
+        if let ExtensionCommandExecution::Interactive { size, .. } = command.execution {
+            size.validate().context("validate command popup size")?;
+        }
         if let Some(binding) = &command.binding {
             let Some((suffix, _)) = parse_suffix(binding) else {
                 bail!("command bindings must be one character or a named key");
@@ -1847,7 +2017,7 @@ fn validate(ui: &UiConfig, extensions: &[Extension]) -> Result<()> {
             if group
                 .segments
                 .iter()
-                .any(|segment| segment.component.is_some())
+                .any(|segment| matches!(segment, SegmentConfig::Tabs))
                 && group.segments.len() != 1
             {
                 bail!(
@@ -1921,56 +2091,16 @@ fn validate_segments(
     }
     for (index, segment) in segments.iter().enumerate() {
         let path = format!("{path}[{index}]");
-        let selectors = usize::from(segment.text.is_some())
-            + usize::from(segment.token.is_some())
-            + usize::from(segment.component.is_some());
-        if selectors != 1 {
-            bail!("{path} must set exactly one of text, token, or component");
-        }
-        if segment.pill && !segment.inverted {
-            bail!("{path} pill requires inverted = true");
-        }
-        for (field, value) in [
-            ("text", segment.text.as_deref()),
-            ("prefix", Some(segment.prefix.as_str())),
-            ("suffix", Some(segment.suffix.as_str())),
-        ] {
-            if let Some(value) = value {
-                validate_text(&format!("{path}.{field}"), value)?;
+        match segment {
+            SegmentConfig::Text { .. } => {}
+            SegmentConfig::Token { token, .. } if !token_allowed(scope, token, extensions) => {
+                bail!("{path} contains unknown or out-of-scope token {token:?}");
             }
-        }
-        if segment.text.is_some()
-            && (!segment.prefix.is_empty()
-                || !segment.suffix.is_empty()
-                || segment.max_width.is_some()
-                || segment.inverted
-                || segment.pill)
-        {
-            bail!(
-                "{path} text segments do not accept prefix, suffix, max_width, inverted, or pill"
-            );
-        }
-        if let Some(token) = segment.token.as_deref()
-            && !token_allowed(scope, token, extensions)
-        {
-            bail!("{path} contains unknown or out-of-scope token {token:?}");
-        }
-        if let Some(component) = segment.component.as_deref() {
-            if !components || component != "tabs" {
-                bail!("{path} contains unknown or out-of-scope component {component:?}");
+            SegmentConfig::Token { .. } => {}
+            SegmentConfig::Tabs if !components => {
+                bail!("{path} contains unknown or out-of-scope component \"tabs\"");
             }
-            if segment.style.is_some()
-                || !segment.prefix.is_empty()
-                || !segment.suffix.is_empty()
-                || segment.max_width.is_some()
-                || segment.inverted
-                || segment.pill
-            {
-                bail!(
-                    "{path} component does not accept style, prefix, suffix, max_width, inverted, or pill"
-                );
-            }
-            *component_count += 1;
+            SegmentConfig::Tabs => *component_count += 1,
         }
     }
     Ok(())
@@ -2198,9 +2328,14 @@ components = [
         assert_eq!(config.icons.resolve().pill_right, "\u{e0b4}");
         assert_eq!(UiConfig::default().icons.resolve().pill_left, "");
         let segment = &config.tab_bar.left[0].segments[0];
-        assert!(segment.inverted);
-        assert!(segment.pill);
-        assert_eq!(segment.style, Some(SemanticStyle::Workspace));
+        assert!(matches!(
+            segment,
+            SegmentConfig::Token {
+                style: Some(SemanticStyle::Workspace),
+                visual: TokenVisual::Pill,
+                ..
+            }
+        ));
         assert_eq!(
             config.styles.attention.foreground,
             Some(UiColor::Rgb(0x12, 0xab, 0xef))
@@ -2233,7 +2368,7 @@ components = [
             group
                 .segments
                 .iter()
-                .any(|segment| segment.component.as_deref() == Some("tabs"))
+                .any(|segment| matches!(segment, SegmentConfig::Tabs))
         }));
         assert_eq!(config.styles.current.background, None);
         assert_eq!(
@@ -2503,9 +2638,16 @@ components = [
             extension_root.canonicalize().unwrap().join("bin/launch")
         );
         assert_eq!(command.args, ["locally", "chosen"]);
-        assert_eq!(command.size.width, Some(90));
-        assert_eq!(command.size.height, Some(24));
-        assert!(command.activate_opened);
+        assert!(matches!(
+            command.execution,
+            ExtensionCommandExecution::Interactive {
+                size: PopupSize {
+                    width: Some(90),
+                    height: Some(24)
+                },
+                activate_opened: true,
+            }
+        ));
         assert_eq!(command.extension.as_ref().unwrap().id, "configured");
         assert_eq!(command.slug().as_deref(), Some("configured:launch"));
 
@@ -2805,8 +2947,16 @@ size = { width = 120, height = 40 }
             "Unbound"
         );
         assert_eq!(config.bindings.command(0).unwrap().args, ["-c", "git diff"]);
-        assert_eq!(config.bindings.command(0).unwrap().size.width, Some(120));
-        assert_eq!(config.bindings.command(0).unwrap().size.height, Some(40));
+        assert!(matches!(
+            config.bindings.command(0).unwrap().execution,
+            ExtensionCommandExecution::Interactive {
+                size: PopupSize {
+                    width: Some(120),
+                    height: Some(40)
+                },
+                ..
+            }
+        ));
 
         fs::write(
             &path,

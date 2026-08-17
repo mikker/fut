@@ -453,7 +453,6 @@ pub enum ResourceError {
 struct Session {
     name: String,
     project: Project,
-    closing: bool,
     tokens: MaterializedTokenMap,
     workspaces: Vec<WorkspaceId>,
 }
@@ -462,7 +461,6 @@ struct Workspace {
     session_id: SessionId,
     name: String,
     root: PathBuf,
-    closing: bool,
     tokens: MaterializedTokenMap,
     tabs: Vec<TabId>,
 }
@@ -473,20 +471,29 @@ struct Tab {
     name: String,
     automatic_name: String,
     focused_pane: PaneId,
-    closing: bool,
     tokens: MaterializedTokenMap,
-    panes: Vec<PaneId>,
-    layout: SplitTree,
+    /// `None` only while removing the final pane, before empty-resource
+    /// cascading removes the tab in the same mutation.
+    layout: Option<SplitTree>,
 }
 #[derive(Clone, Debug)]
 struct Pane {
     tab_id: TabId,
     terminal_id: TerminalId,
-    closing: bool,
     tokens: MaterializedTokenMap,
     activity: AgentActivity,
     cwd: Option<PathBuf>,
     worktree: Option<PathBuf>,
+}
+
+/// An explicitly requested close. Descendants inherit this state through
+/// their ownership ancestry, but never store a copied close flag themselves.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum CloseIntent {
+    Session(SessionId),
+    Workspace(WorkspaceId),
+    Tab(TabId),
+    Pane(PaneId),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -498,6 +505,7 @@ pub struct ResourceTree {
     tabs: BTreeMap<TabId, Tab>,
     panes: BTreeMap<PaneId, Pane>,
     terminals: BTreeMap<TerminalId, PaneId>,
+    close_intents: BTreeSet<CloseIntent>,
 }
 
 impl ResourceTree {
@@ -506,14 +514,46 @@ impl ResourceTree {
         self.revision
     }
 
+    fn session_is_closing(&self, session_id: SessionId) -> bool {
+        self.close_intents
+            .contains(&CloseIntent::Session(session_id))
+    }
+
+    fn workspace_is_closing(&self, workspace_id: WorkspaceId) -> bool {
+        let workspace = &self.workspaces[&workspace_id];
+        self.session_is_closing(workspace.session_id)
+            || self
+                .close_intents
+                .contains(&CloseIntent::Workspace(workspace_id))
+    }
+
+    fn tab_is_closing(&self, tab_id: TabId) -> bool {
+        let tab = &self.tabs[&tab_id];
+        self.workspace_is_closing(tab.workspace_id)
+            || self.close_intents.contains(&CloseIntent::Tab(tab_id))
+    }
+
+    fn pane_is_closing(&self, pane_id: PaneId) -> bool {
+        let pane = &self.panes[&pane_id];
+        self.tab_is_closing(pane.tab_id) || self.close_intents.contains(&CloseIntent::Pane(pane_id))
+    }
+
+    fn tab_panes(&self, tab_id: TabId) -> Vec<PaneId> {
+        self.tabs[&tab_id]
+            .layout
+            .as_ref()
+            .map_or_else(Vec::new, SplitTree::leaf_ids)
+    }
+
     #[must_use]
     pub fn automatic_name_terminal_ids(&self) -> Vec<TerminalId> {
         self.tabs
-            .values()
-            .filter(|tab| tab.name.is_empty() && !tab.closing)
-            .filter_map(|tab| self.panes.get(&tab.focused_pane))
-            .filter(|pane| !pane.closing)
-            .map(|pane| pane.terminal_id)
+            .iter()
+            .filter(|(id, tab)| tab.name.is_empty() && !self.tab_is_closing(**id))
+            .filter_map(|(_, tab)| {
+                (!self.pane_is_closing(tab.focused_pane))
+                    .then_some(self.panes[&tab.focused_pane].terminal_id)
+            })
             .collect()
     }
 
@@ -584,7 +624,7 @@ impl ResourceTree {
             };
         };
         let session = &self.sessions[&session_id];
-        if session.closing {
+        if self.session_is_closing(session_id) {
             return Err(ResourceError::Closing("session"));
         }
         if root_owner.is_some_and(|workspace| workspace.session_id != session_id) {
@@ -598,7 +638,7 @@ impl ResourceTree {
             .collect::<Vec<_>>();
         if let Some(workspace_id) = matching_roots
             .iter()
-            .find(|workspace_id| !self.workspaces[workspace_id].closing)
+            .find(|workspace_id| !self.workspace_is_closing(**workspace_id))
         {
             return Ok(CheckoutDestination::Existing(*workspace_id));
         }
@@ -628,21 +668,21 @@ impl ResourceTree {
             .get(&tab_id)
             .ok_or(ResourceError::NotFound("tab"))?;
         let workspace = &self.workspaces[&tab.workspace_id];
-        if self.sessions[&workspace.session_id].closing {
+        if self.session_is_closing(workspace.session_id) {
             return Err(ResourceError::Closing("session"));
         }
-        if workspace.closing {
+        if self.workspace_is_closing(tab.workspace_id) {
             return Err(ResourceError::Closing("workspace"));
         }
-        if tab.closing {
+        if self.tab_is_closing(tab_id) {
             return Err(ResourceError::Closing("tab"));
         }
-        Ok(tab
-            .panes
+        Ok(self
+            .tab_panes(tab_id)
             .iter()
             .filter_map(|pane_id| {
                 let pane = &self.panes[pane_id];
-                (!pane.closing).then_some(ResolvedTerminalPath {
+                (!self.pane_is_closing(*pane_id)).then_some(ResolvedTerminalPath {
                     session_id: workspace.session_id,
                     workspace_id: tab.workspace_id,
                     tab_id,
@@ -659,7 +699,9 @@ impl ResourceTree {
             .get(&tab_id)
             .ok_or(ResourceError::NotFound("tab"))?;
         tab.layout
-            .retained(|pane_id| self.panes.get(&pane_id).is_some_and(|pane| !pane.closing))
+            .as_ref()
+            .expect("live tab has a layout")
+            .retained(|pane_id| self.panes.contains_key(&pane_id) && !self.pane_is_closing(pane_id))
             .ok_or_else(|| ResourceError::Invariant("tab has no open pane layout".into()))
     }
 
@@ -692,13 +734,13 @@ impl ResourceTree {
             .get(&tab_id)
             .ok_or(ResourceError::NotFound("tab"))?;
         let workspace = &self.workspaces[&tab.workspace_id];
-        if self.sessions[&workspace.session_id].closing {
+        if self.session_is_closing(workspace.session_id) {
             return Err(ResourceError::Closing("session"));
         }
-        if workspace.closing {
+        if self.workspace_is_closing(tab.workspace_id) {
             return Err(ResourceError::Closing("workspace"));
         }
-        if tab.closing {
+        if self.tab_is_closing(tab_id) {
             return Err(ResourceError::Closing("tab"));
         }
         Ok(tab.workspace_id)
@@ -850,7 +892,7 @@ impl ResourceTree {
                     .sessions
                     .get(&id)
                     .ok_or(ResourceError::NotFound("session"))?;
-                if session.closing {
+                if self.session_is_closing(id) {
                     return Err(ResourceError::Closing("session"));
                 }
                 Ok(&session.tokens)
@@ -860,11 +902,10 @@ impl ResourceTree {
                     .workspaces
                     .get(&id)
                     .ok_or(ResourceError::NotFound("workspace"))?;
-                let session = &self.sessions[&workspace.session_id];
-                if session.closing {
+                if self.session_is_closing(workspace.session_id) {
                     return Err(ResourceError::Closing("session"));
                 }
-                if workspace.closing {
+                if self.workspace_is_closing(id) {
                     return Err(ResourceError::Closing("workspace"));
                 }
                 Ok(&workspace.tokens)
@@ -872,14 +913,13 @@ impl ResourceTree {
             PresentationTokenTarget::Tab(id) => {
                 let tab = self.tabs.get(&id).ok_or(ResourceError::NotFound("tab"))?;
                 let workspace = &self.workspaces[&tab.workspace_id];
-                let session = &self.sessions[&workspace.session_id];
-                if session.closing {
+                if self.session_is_closing(workspace.session_id) {
                     return Err(ResourceError::Closing("session"));
                 }
-                if workspace.closing {
+                if self.workspace_is_closing(tab.workspace_id) {
                     return Err(ResourceError::Closing("workspace"));
                 }
-                if tab.closing {
+                if self.tab_is_closing(id) {
                     return Err(ResourceError::Closing("tab"));
                 }
                 Ok(&tab.tokens)
@@ -888,17 +928,16 @@ impl ResourceTree {
                 let pane = self.panes.get(&id).ok_or(ResourceError::NotFound("pane"))?;
                 let tab = &self.tabs[&pane.tab_id];
                 let workspace = &self.workspaces[&tab.workspace_id];
-                let session = &self.sessions[&workspace.session_id];
-                if session.closing {
+                if self.session_is_closing(workspace.session_id) {
                     return Err(ResourceError::Closing("session"));
                 }
-                if workspace.closing {
+                if self.workspace_is_closing(tab.workspace_id) {
                     return Err(ResourceError::Closing("workspace"));
                 }
-                if tab.closing {
+                if self.tab_is_closing(pane.tab_id) {
                     return Err(ResourceError::Closing("tab"));
                 }
-                if pane.closing {
+                if self.pane_is_closing(id) {
                     return Err(ResourceError::Closing("pane"));
                 }
                 Ok(&pane.tokens)
@@ -1156,7 +1195,6 @@ impl ResourceTree {
             Session {
                 name: path.session_name,
                 project: path.project,
-                closing: false,
                 tokens: BTreeMap::new(),
                 workspaces: vec![path.workspace_id],
             },
@@ -1168,7 +1206,6 @@ impl ResourceTree {
                 session_id: path.session_id,
                 name: path.workspace_name,
                 root: path.root,
-                closing: false,
                 tokens: BTreeMap::new(),
                 tabs: vec![path.tab_id],
             },
@@ -1180,10 +1217,8 @@ impl ResourceTree {
                 name: path.tab_name,
                 automatic_name: String::new(),
                 focused_pane: path.pane_id,
-                closing: false,
                 tokens: BTreeMap::new(),
-                panes: vec![path.pane_id],
-                layout: SplitTree::leaf(path.pane_id),
+                layout: Some(SplitTree::leaf(path.pane_id)),
             },
         );
         self.insert_pane(path.tab_id, path.pane_id, path.terminal_id);
@@ -1222,7 +1257,7 @@ impl ResourceTree {
             .sessions
             .get(&session_id)
             .ok_or(ResourceError::NotFound("session"))?;
-        if session.closing {
+        if self.session_is_closing(session_id) {
             return Err(ResourceError::Closing("session"));
         }
         if session.name == new_name {
@@ -1261,10 +1296,10 @@ impl ResourceTree {
             .get(&workspace_id)
             .ok_or(ResourceError::NotFound("workspace"))?;
         let session_id = workspace.session_id;
-        if self.sessions[&session_id].closing {
+        if self.session_is_closing(session_id) {
             return Err(ResourceError::Closing("session"));
         }
-        if workspace.closing {
+        if self.workspace_is_closing(workspace_id) {
             return Err(ResourceError::Closing("workspace"));
         }
         if workspace.name == new_name {
@@ -1308,16 +1343,16 @@ impl ResourceTree {
             .ok_or(ResourceError::NotFound("tab"))?;
         let workspace_id = tab.workspace_id;
         let workspace = &self.workspaces[&workspace_id];
-        if self.sessions[&workspace.session_id].closing {
+        if self.session_is_closing(workspace.session_id) {
             return Err(ResourceError::Closing("session"));
         }
-        if workspace.closing {
+        if self.workspace_is_closing(workspace_id) {
             return Err(ResourceError::Closing("workspace"));
         }
         if tab.name == new_name {
             return Ok(self.unchanged());
         }
-        if tab.closing {
+        if self.tab_is_closing(tab_id) {
             return Err(ResourceError::Closing("tab"));
         }
         if !new_name.is_empty()
@@ -1354,7 +1389,7 @@ impl ResourceTree {
             .sessions
             .get(&session_id)
             .ok_or(ResourceError::NotFound("session"))?;
-        if session.closing {
+        if self.session_is_closing(session_id) {
             return Err(ResourceError::Closing("session"));
         }
         if !path.workspace_name.is_empty()
@@ -1391,7 +1426,6 @@ impl ResourceTree {
                 session_id,
                 name: path.workspace_name,
                 root: path.root,
-                closing: false,
                 tokens: BTreeMap::new(),
                 tabs: vec![path.tab_id],
             },
@@ -1403,10 +1437,8 @@ impl ResourceTree {
                 name: path.tab_name,
                 automatic_name: String::new(),
                 focused_pane: path.pane_id,
-                closing: false,
                 tokens: BTreeMap::new(),
-                panes: vec![path.pane_id],
-                layout: SplitTree::leaf(path.pane_id),
+                layout: Some(SplitTree::leaf(path.pane_id)),
             },
         );
         self.insert_pane(path.tab_id, path.pane_id, path.terminal_id);
@@ -1444,10 +1476,10 @@ impl ResourceTree {
             .workspaces
             .get(&workspace_id)
             .ok_or(ResourceError::NotFound("workspace"))?;
-        if self.sessions[&workspace.session_id].closing {
+        if self.session_is_closing(workspace.session_id) {
             return Err(ResourceError::Closing("session"));
         }
-        if workspace.closing {
+        if self.workspace_is_closing(workspace_id) {
             return Err(ResourceError::Closing("workspace"));
         }
         if !path.tab_name.is_empty()
@@ -1474,10 +1506,8 @@ impl ResourceTree {
                 name: path.tab_name,
                 automatic_name: String::new(),
                 focused_pane: path.pane_id,
-                closing: false,
                 tokens: BTreeMap::new(),
-                panes: vec![path.pane_id],
-                layout: SplitTree::leaf(path.pane_id),
+                layout: Some(SplitTree::leaf(path.pane_id)),
             },
         );
         self.insert_pane(path.tab_id, path.pane_id, path.terminal_id);
@@ -1509,20 +1539,30 @@ impl ResourceTree {
             .tabs
             .get(&tab_id)
             .ok_or(ResourceError::NotFound("tab"))?;
-        if self.session_for_workspace(tab.workspace_id).closing {
+        if self.session_is_closing(self.workspaces[&tab.workspace_id].session_id) {
             return Err(ResourceError::Closing("session"));
         }
-        if self.workspaces[&tab.workspace_id].closing {
+        if self.workspace_is_closing(tab.workspace_id) {
             return Err(ResourceError::Closing("workspace"));
         }
-        if tab.closing {
+        if self.tab_is_closing(tab_id) {
             return Err(ResourceError::Closing("tab"));
         }
         self.check_pane_ids(pane_id, terminal_id)?;
-        let anchor = tab.panes.last().copied().expect("live tab has a pane");
+        let anchor = tab
+            .layout
+            .as_ref()
+            .expect("live tab has a layout")
+            .leaf_ids()
+            .last()
+            .copied()
+            .expect("live tab has a pane");
         let tab = self.tabs.get_mut(&tab_id).unwrap();
-        assert!(tab.layout.split(anchor, SplitDirection::Right, pane_id));
-        tab.panes.push(pane_id);
+        assert!(tab.layout.as_mut().expect("live tab has a layout").split(
+            anchor,
+            SplitDirection::Right,
+            pane_id
+        ));
         self.insert_pane(tab_id, pane_id, terminal_id);
         Ok(self.finish(
             vec![ResourceEvent::PaneCreated {
@@ -1547,29 +1587,28 @@ impl ResourceTree {
             .get(&anchor)
             .ok_or(ResourceError::NotFound("pane"))?
             .clone();
-        if anchor_pane.closing {
+        if self.pane_is_closing(anchor) {
             return Err(ResourceError::Closing("pane"));
         }
         let tab_id = anchor_pane.tab_id;
         let tab = &self.tabs[&tab_id];
-        if self.session_for_workspace(tab.workspace_id).closing {
+        if self.session_is_closing(self.workspaces[&tab.workspace_id].session_id) {
             return Err(ResourceError::Closing("session"));
         }
-        if self.workspaces[&tab.workspace_id].closing {
+        if self.workspace_is_closing(tab.workspace_id) {
             return Err(ResourceError::Closing("workspace"));
         }
-        if tab.closing {
+        if self.tab_is_closing(tab_id) {
             return Err(ResourceError::Closing("tab"));
         }
         self.check_pane_ids(pane_id, terminal_id)?;
-        let index = tab
-            .panes
-            .iter()
-            .position(|candidate| *candidate == anchor)
-            .expect("anchor pane belongs to its tab");
         let tab = self.tabs.get_mut(&tab_id).unwrap();
-        assert!(tab.layout.split(anchor, direction, pane_id));
-        tab.panes.insert(index + 1, pane_id);
+        assert!(
+            tab.layout
+                .as_mut()
+                .expect("live tab has a layout")
+                .split(anchor, direction, pane_id)
+        );
         self.insert_pane(tab_id, pane_id, terminal_id);
         Ok(self.finish(
             vec![ResourceEvent::PaneCreated {
@@ -1595,17 +1634,19 @@ impl ResourceTree {
             .tabs
             .get(&tab_id)
             .ok_or(ResourceError::NotFound("tab"))?;
-        if self.session_for_workspace(tab.workspace_id).closing {
+        if self.session_is_closing(self.workspaces[&tab.workspace_id].session_id) {
             return Err(ResourceError::Closing("session"));
         }
-        if self.workspaces[&tab.workspace_id].closing {
+        if self.workspace_is_closing(tab.workspace_id) {
             return Err(ResourceError::Closing("workspace"));
         }
-        if tab.closing {
+        if self.tab_is_closing(tab_id) {
             return Err(ResourceError::Closing("tab"));
         }
         let current = tab
             .layout
+            .as_ref()
+            .expect("live tab has a layout")
             .ratio(split_id)
             .ok_or(ResourceError::NotFound("split"))?;
         if current == ratio {
@@ -1616,6 +1657,8 @@ impl ResourceTree {
                 .get_mut(&tab_id)
                 .expect("validated tab exists")
                 .layout
+                .as_mut()
+                .expect("live tab has a layout")
                 .resize(split_id, ratio)
         );
         Ok(self.finish(
@@ -1643,49 +1686,55 @@ impl ResourceTree {
             .tabs
             .get(&destination)
             .ok_or(ResourceError::NotFound("tab"))?;
-        if source_tab.closing || destination_tab.closing {
+        if self.tab_is_closing(pane.tab_id) || self.tab_is_closing(destination) {
             return Err(ResourceError::Closing("tab"));
         }
-        if pane.closing {
+        if self.pane_is_closing(pane_id) {
             return Err(ResourceError::Closing("pane"));
         }
         let source_workspace = source_tab.workspace_id;
         if source_workspace != destination_tab.workspace_id {
             return Err(ResourceError::DifferentWorkspace);
         }
-        if self.session_for_workspace(source_workspace).closing {
+        if self.session_is_closing(self.workspaces[&source_workspace].session_id) {
             return Err(ResourceError::Closing("session"));
         }
-        if self.workspaces[&source_workspace].closing {
+        if self.workspace_is_closing(source_workspace) {
             return Err(ResourceError::Closing("workspace"));
         }
         if pane.tab_id == destination {
             return Ok(self.unchanged());
         }
         let source = self.tabs.get_mut(&pane.tab_id).unwrap();
-        source.panes.retain(|id| *id != pane_id);
         source.layout = source
             .layout
-            .clone()
-            .without(pane_id)
-            .unwrap_or_else(|| SplitTree::leaf(pane_id));
+            .take()
+            .expect("live source tab has a layout")
+            .without(pane_id);
         if source.focused_pane == pane_id
-            && let Some(replacement) = source.panes.last().copied()
+            && let Some(replacement) = source
+                .layout
+                .as_ref()
+                .and_then(|layout| layout.leaf_ids().last().copied())
         {
             source.focused_pane = replacement;
             source.automatic_name.clear();
         }
         let destination_tab = self.tabs.get_mut(&destination).unwrap();
         let anchor = *destination_tab
-            .panes
+            .layout
+            .as_ref()
+            .expect("live destination tab has a layout")
+            .leaf_ids()
             .last()
             .expect("destination tab has a pane");
         assert!(
             destination_tab
                 .layout
+                .as_mut()
+                .expect("live destination tab has a layout")
                 .split(anchor, SplitDirection::Right, pane_id)
         );
-        destination_tab.panes.push(pane_id);
         self.panes.get_mut(&pane_id).unwrap().tab_id = destination;
         let mut events = vec![ResourceEvent::PaneMoved {
             pane_id,
@@ -1705,19 +1754,19 @@ impl ResourceTree {
             .clone();
         let tab = &self.tabs[&pane.tab_id];
         let workspace = &self.workspaces[&tab.workspace_id];
-        if self.sessions[&workspace.session_id].closing {
+        if self.session_is_closing(workspace.session_id) {
             return Err(ResourceError::Closing("session"));
         }
-        if workspace.closing {
+        if self.workspace_is_closing(tab.workspace_id) {
             return Err(ResourceError::Closing("workspace"));
         }
-        if tab.closing {
+        if self.tab_is_closing(pane.tab_id) {
             return Err(ResourceError::Closing("tab"));
         }
-        if pane.closing {
+        if self.pane_is_closing(pane_id) {
             return Err(ResourceError::Closing("pane"));
         }
-        self.panes.get_mut(&pane_id).unwrap().closing = true;
+        self.close_intents.insert(CloseIntent::Pane(pane_id));
         let terminal_id = pane.terminal_id;
         Ok(self.finish(
             vec![ResourceEvent::PaneCloseRequested {
@@ -1734,21 +1783,21 @@ impl ResourceTree {
             .get(&pane_id)
             .ok_or(ResourceError::NotFound("pane"))?
             .clone();
-        let session = self.session_for_tab(pane.tab_id);
-        if session.closing {
+        let session_id = self.workspaces[&self.tabs[&pane.tab_id].workspace_id].session_id;
+        if self.session_is_closing(session_id) {
             return Err(ResourceError::Closing("session"));
         }
         let workspace_id = self.tabs[&pane.tab_id].workspace_id;
-        if self.workspaces[&workspace_id].closing {
+        if self.workspace_is_closing(workspace_id) {
             return Err(ResourceError::Closing("workspace"));
         }
-        if self.tabs[&pane.tab_id].closing {
+        if self.tab_is_closing(pane.tab_id) {
             return Err(ResourceError::Closing("tab"));
         }
-        if !pane.closing {
+        if !self.close_intents.contains(&CloseIntent::Pane(pane_id)) {
             return Err(ResourceError::NotFound("pending pane close"));
         }
-        self.panes.get_mut(&pane_id).unwrap().closing = false;
+        self.close_intents.remove(&CloseIntent::Pane(pane_id));
         Ok(self.finish(
             vec![ResourceEvent::PaneCloseCancelled {
                 pane_id,
@@ -1764,24 +1813,29 @@ impl ResourceTree {
             .get(&tab_id)
             .ok_or(ResourceError::NotFound("tab"))?;
         let workspace = &self.workspaces[&tab.workspace_id];
-        if self.sessions[&workspace.session_id].closing {
+        if self.session_is_closing(workspace.session_id) {
             return Err(ResourceError::Closing("session"));
         }
-        if workspace.closing {
+        if self.workspace_is_closing(tab.workspace_id) {
             return Err(ResourceError::Closing("workspace"));
         }
-        if tab.closing {
+        if self.tab_is_closing(tab_id) {
             return Err(ResourceError::Closing("tab"));
         }
-        if tab.panes.iter().any(|id| self.panes[id].closing) {
+        if self
+            .tab_panes(tab_id)
+            .iter()
+            .any(|id| self.pane_is_closing(*id))
+        {
             return Err(ResourceError::Closing("pane"));
         }
-        let panes = tab.panes.clone();
+        let panes = tab
+            .layout
+            .as_ref()
+            .expect("live tab has a layout")
+            .leaf_ids();
         let terminals = panes.iter().map(|id| self.panes[id].terminal_id).collect();
-        self.tabs.get_mut(&tab_id).unwrap().closing = true;
-        for pane_id in panes {
-            self.panes.get_mut(&pane_id).unwrap().closing = true;
-        }
+        self.close_intents.insert(CloseIntent::Tab(tab_id));
         Ok(self.finish(vec![ResourceEvent::TabCloseRequested { tab_id }], terminals))
     }
 
@@ -1791,44 +1845,32 @@ impl ResourceTree {
             .get(&tab_id)
             .ok_or(ResourceError::NotFound("tab"))?;
         let workspace = &self.workspaces[&tab.workspace_id];
-        if self.sessions[&workspace.session_id].closing {
+        if self.session_is_closing(workspace.session_id) {
             return Err(ResourceError::Closing("session"));
         }
-        if workspace.closing {
+        if self.workspace_is_closing(tab.workspace_id) {
             return Err(ResourceError::Closing("workspace"));
         }
-        if !tab.closing {
+        if !self.close_intents.contains(&CloseIntent::Tab(tab_id)) {
             return Err(ResourceError::NotFound("pending tab close"));
         }
-        let panes = tab.panes.clone();
-        self.tabs.get_mut(&tab_id).unwrap().closing = false;
-        for pane_id in panes {
-            self.panes.get_mut(&pane_id).unwrap().closing = false;
-        }
+        self.close_intents.remove(&CloseIntent::Tab(tab_id));
         Ok(self.finish(vec![ResourceEvent::TabCloseCancelled { tab_id }], vec![]))
     }
 
     pub fn close_session(&mut self, session_id: SessionId) -> Result<Mutation, ResourceError> {
-        let session = self
-            .sessions
+        self.sessions
             .get(&session_id)
             .ok_or(ResourceError::NotFound("session"))?;
-        if session.closing {
+        if self.session_is_closing(session_id) {
             return Err(ResourceError::Closing("session"));
         }
         let panes = self.session_panes(session_id);
-        if panes.iter().any(|id| self.panes[id].closing) {
+        if panes.iter().any(|id| self.pane_is_closing(*id)) {
             return Err(ResourceError::Closing("pane"));
         }
         let terminals: Vec<_> = panes.iter().map(|id| self.panes[id].terminal_id).collect();
-        self.sessions.get_mut(&session_id).unwrap().closing = true;
-        let workspaces = self.sessions[&session_id].workspaces.clone();
-        for workspace_id in workspaces {
-            self.workspaces.get_mut(&workspace_id).unwrap().closing = true;
-        }
-        for pane_id in panes {
-            self.panes.get_mut(&pane_id).unwrap().closing = true;
-        }
+        self.close_intents.insert(CloseIntent::Session(session_id));
         Ok(self.finish(
             vec![ResourceEvent::SessionCloseRequested { session_id }],
             terminals,
@@ -1840,22 +1882,16 @@ impl ResourceTree {
         &mut self,
         session_id: SessionId,
     ) -> Result<Mutation, ResourceError> {
-        let session = self
-            .sessions
+        self.sessions
             .get(&session_id)
             .ok_or(ResourceError::NotFound("session"))?;
-        if !session.closing {
+        if !self
+            .close_intents
+            .contains(&CloseIntent::Session(session_id))
+        {
             return Err(ResourceError::NotFound("pending session close"));
         }
-        let panes = self.session_panes(session_id);
-        self.sessions.get_mut(&session_id).unwrap().closing = false;
-        let workspaces = self.sessions[&session_id].workspaces.clone();
-        for workspace_id in workspaces {
-            self.workspaces.get_mut(&workspace_id).unwrap().closing = false;
-        }
-        for pane_id in panes {
-            self.panes.get_mut(&pane_id).unwrap().closing = false;
-        }
+        self.close_intents.remove(&CloseIntent::Session(session_id));
         Ok(self.finish(
             vec![ResourceEvent::SessionCloseCancelled { session_id }],
             vec![],
@@ -1870,21 +1906,19 @@ impl ResourceTree {
             .workspaces
             .get(&workspace_id)
             .ok_or(ResourceError::NotFound("workspace"))?;
-        if self.sessions[&workspace.session_id].closing {
+        if self.session_is_closing(workspace.session_id) {
             return Err(ResourceError::Closing("session"));
         }
-        if workspace.closing {
+        if self.workspace_is_closing(workspace_id) {
             return Err(ResourceError::Closing("workspace"));
         }
         let panes = self.workspace_panes(workspace_id);
-        if panes.iter().any(|id| self.panes[id].closing) {
+        if panes.iter().any(|id| self.pane_is_closing(*id)) {
             return Err(ResourceError::Closing("pane"));
         }
         let terminals = panes.iter().map(|id| self.panes[id].terminal_id).collect();
-        self.workspaces.get_mut(&workspace_id).unwrap().closing = true;
-        for pane in panes {
-            self.panes.get_mut(&pane).unwrap().closing = true;
-        }
+        self.close_intents
+            .insert(CloseIntent::Workspace(workspace_id));
         Ok(self.finish(
             vec![ResourceEvent::WorkspaceCloseRequested { workspace_id }],
             terminals,
@@ -1899,17 +1933,17 @@ impl ResourceTree {
             .workspaces
             .get(&workspace_id)
             .ok_or(ResourceError::NotFound("workspace"))?;
-        if self.sessions[&workspace.session_id].closing {
+        if self.session_is_closing(workspace.session_id) {
             return Err(ResourceError::Closing("session"));
         }
-        if !workspace.closing {
+        if !self
+            .close_intents
+            .contains(&CloseIntent::Workspace(workspace_id))
+        {
             return Err(ResourceError::NotFound("pending workspace close"));
         }
-        let panes = self.workspace_panes(workspace_id);
-        self.workspaces.get_mut(&workspace_id).unwrap().closing = false;
-        for pane in panes {
-            self.panes.get_mut(&pane).unwrap().closing = false;
-        }
+        self.close_intents
+            .remove(&CloseIntent::Workspace(workspace_id));
         Ok(self.finish(
             vec![ResourceEvent::WorkspaceCloseCancelled { workspace_id }],
             vec![],
@@ -1920,7 +1954,7 @@ impl ResourceTree {
         let Some(&pane_id) = self.terminals.get(&terminal_id) else {
             return Err(ResourceError::NotFound("terminal"));
         };
-        let requested = self.panes[&pane_id].closing;
+        let requested = self.pane_is_closing(pane_id);
         let cause = if requested {
             CloseCause::Requested
         } else {
@@ -1947,19 +1981,18 @@ impl ResourceTree {
         let tab_id = self.panes[&pane_id].tab_id;
         let workspace_id = self.tabs[&tab_id].workspace_id;
         let session_id = self.workspaces[&workspace_id].session_id;
-        let tab = &self.tabs[&tab_id];
-        let pane_index = tab
-            .panes
+        let panes = self.tab_panes(tab_id);
+        let pane_index = panes
             .iter()
             .position(|candidate| *candidate == pane_id)
             .ok_or_else(|| ResourceError::Invariant("pane missing from tab".into()))?;
-        let mut fallback = tab.panes[..pane_index]
+        let mut fallback = panes[..pane_index]
             .iter()
             .rev()
-            .chain(tab.panes[pane_index + 1..].iter())
+            .chain(panes[pane_index + 1..].iter())
             .filter_map(|pane_id| {
                 let pane = &self.panes[pane_id];
-                (!pane.closing).then_some(pane.terminal_id)
+                (!self.pane_is_closing(*pane_id)).then_some(pane.terminal_id)
             })
             .collect::<Vec<_>>();
 
@@ -1974,11 +2007,10 @@ impl ResourceTree {
             .rev()
             .chain(workspace.tabs[tab_index + 1..].iter())
         {
-            let tab = &self.tabs[tab_id];
-            if !tab.closing {
-                fallback.extend(tab.panes.iter().filter_map(|pane_id| {
+            if !self.tab_is_closing(*tab_id) {
+                fallback.extend(self.tab_panes(*tab_id).iter().filter_map(|pane_id| {
                     let pane = &self.panes[pane_id];
-                    (!pane.closing).then_some(pane.terminal_id)
+                    (!self.pane_is_closing(*pane_id)).then_some(pane.terminal_id)
                 }));
             }
         }
@@ -1994,18 +2026,16 @@ impl ResourceTree {
             .rev()
             .chain(session.workspaces[workspace_index + 1..].iter())
         {
-            let workspace = &self.workspaces[workspace_id];
-            if workspace.closing {
+            if self.workspace_is_closing(*workspace_id) {
                 continue;
             }
-            for tab_id in &workspace.tabs {
-                let tab = &self.tabs[tab_id];
-                if tab.closing {
+            for tab_id in &self.workspaces[workspace_id].tabs {
+                if self.tab_is_closing(*tab_id) {
                     continue;
                 }
-                for pane_id in &tab.panes {
-                    let pane = &self.panes[pane_id];
-                    if !pane.closing {
+                for pane_id in self.tab_panes(*tab_id) {
+                    let pane = &self.panes[&pane_id];
+                    if !self.pane_is_closing(pane_id) {
                         fallback.push(pane.terminal_id);
                     }
                 }
@@ -2022,23 +2052,21 @@ impl ResourceTree {
             .sessions
             .get(&session_id)
             .ok_or(ResourceError::NotFound("session"))?;
-        if session.closing {
+        if self.session_is_closing(session_id) {
             return Ok(Vec::new());
         }
         let mut terminals = Vec::new();
         for workspace_id in &session.workspaces {
-            let workspace = &self.workspaces[workspace_id];
-            if workspace.closing {
+            if self.workspace_is_closing(*workspace_id) {
                 continue;
             }
-            for tab_id in &workspace.tabs {
-                let tab = &self.tabs[tab_id];
-                if tab.closing {
+            for tab_id in &self.workspaces[workspace_id].tabs {
+                if self.tab_is_closing(*tab_id) {
                     continue;
                 }
-                terminals.extend(tab.panes.iter().filter_map(|pane_id| {
+                terminals.extend(self.tab_panes(*tab_id).iter().filter_map(|pane_id| {
                     let pane = &self.panes[pane_id];
-                    (!pane.closing).then_some(pane.terminal_id)
+                    (!self.pane_is_closing(*pane_id)).then_some(pane.terminal_id)
                 }));
             }
         }
@@ -2104,32 +2132,23 @@ impl ResourceTree {
                     };
                     if tab.workspace_id != *wid
                         || check_optional_name(&tab.name).is_err()
-                        || tab.panes.is_empty()
-                        || !tab.layout.validate()
-                        || tab.layout.leaf_ids() != tab.panes
+                        || !tab.layout.as_ref().is_some_and(SplitTree::validate)
                         || (!tab.name.is_empty() && !tab_names.insert(&tab.name))
                         || !seen_tabs.insert(*tid)
-                        || !unique(&tab.panes)
                     {
                         return self.invalid("tab fields or parent");
                     }
-                    for pid in &tab.panes {
-                        let Some(pane) = self.panes.get(pid) else {
+                    for pid in self.tab_panes(*tid) {
+                        let Some(pane) = self.panes.get(&pid) else {
                             return self.invalid("missing pane");
                         };
                         if pane.tab_id != *tid
-                            || !seen_panes.insert(*pid)
-                            || self.terminals.get(&pane.terminal_id) != Some(pid)
-                            || (session.closing && !pane.closing)
-                            || (workspace.closing && !pane.closing)
-                            || (tab.closing && !pane.closing)
+                            || !seen_panes.insert(pid)
+                            || self.terminals.get(&pane.terminal_id) != Some(&pid)
                         {
-                            return self.invalid("pane fields, parent, or closing state");
+                            return self.invalid("pane fields or parent");
                         }
                     }
-                }
-                if session.closing && !workspace.closing {
-                    return self.invalid("closing session has open workspace");
                 }
             }
         }
@@ -2147,23 +2166,32 @@ impl ResourceTree {
         }) {
             return self.invalid("terminal reverse reference");
         }
+        if self.close_intents.iter().any(|intent| match intent {
+            CloseIntent::Session(id) => !self.sessions.contains_key(id),
+            CloseIntent::Workspace(id) => !self.workspaces.contains_key(id),
+            CloseIntent::Tab(id) => !self.tabs.contains_key(id),
+            CloseIntent::Pane(id) => !self.panes.contains_key(id),
+        }) {
+            return self.invalid("close intent refers to missing resource");
+        }
         Ok(())
     }
 
     fn remove_pane(&mut self, pane_id: PaneId) -> TabId {
         let pane = self.panes.remove(&pane_id).unwrap();
         self.terminals.remove(&pane.terminal_id);
-        self.tabs
-            .get_mut(&pane.tab_id)
-            .unwrap()
-            .panes
-            .retain(|id| *id != pane_id);
+        self.close_intents.remove(&CloseIntent::Pane(pane_id));
         let tab = self.tabs.get_mut(&pane.tab_id).unwrap();
-        if let Some(layout) = tab.layout.clone().without(pane_id) {
-            tab.layout = layout;
-        }
+        tab.layout = tab
+            .layout
+            .take()
+            .expect("pane tab has a layout")
+            .without(pane_id);
         if tab.focused_pane == pane_id
-            && let Some(replacement) = tab.panes.last().copied()
+            && let Some(replacement) = tab
+                .layout
+                .as_ref()
+                .and_then(|layout| layout.leaf_ids().last().copied())
         {
             tab.focused_pane = replacement;
             tab.automatic_name.clear();
@@ -2172,10 +2200,11 @@ impl ResourceTree {
     }
 
     fn cascade_empty(&mut self, tab_id: TabId, events: &mut Vec<ResourceEvent>) {
-        if !self.tabs[&tab_id].panes.is_empty() {
+        if self.tabs[&tab_id].layout.is_some() {
             return;
         }
         let workspace_id = self.tabs.remove(&tab_id).unwrap().workspace_id;
+        self.close_intents.remove(&CloseIntent::Tab(tab_id));
         self.workspaces
             .get_mut(&workspace_id)
             .unwrap()
@@ -2186,6 +2215,8 @@ impl ResourceTree {
             return;
         }
         let workspace = self.workspaces.remove(&workspace_id).unwrap();
+        self.close_intents
+            .remove(&CloseIntent::Workspace(workspace_id));
         let session_id = workspace.session_id;
         self.sessions
             .get_mut(&session_id)
@@ -2202,6 +2233,7 @@ impl ResourceTree {
             return;
         }
         self.sessions.remove(&session_id);
+        self.close_intents.remove(&CloseIntent::Session(session_id));
         self.session_order.retain(|id| *id != session_id);
         events.push(ResourceEvent::SessionClosed { session_id });
     }
@@ -2212,7 +2244,6 @@ impl ResourceTree {
             Pane {
                 tab_id,
                 terminal_id,
-                closing: false,
                 tokens: BTreeMap::new(),
                 activity: AgentActivity::default(),
                 cwd: None,
@@ -2248,7 +2279,7 @@ impl ResourceTree {
             id,
             name: s.name.clone(),
             project: s.project.clone(),
-            closing: s.closing,
+            closing: self.session_is_closing(id),
             tokens: s.tokens.clone(),
             workspaces: s
                 .workspaces
@@ -2282,7 +2313,7 @@ impl ResourceTree {
                 w.name.clone()
             },
             root: w.root.clone(),
-            closing: w.closing,
+            closing: self.workspace_is_closing(id),
             tokens: w.tokens.clone(),
             tabs,
         }
@@ -2296,10 +2327,17 @@ impl ResourceTree {
             } else {
                 t.name.clone()
             },
-            closing: t.closing,
+            closing: self.tab_is_closing(id),
             tokens: t.tokens.clone(),
-            layout: t.layout.clone(),
-            panes: t.panes.iter().map(|id| self.pane_snapshot(*id)).collect(),
+            layout: t.layout.clone().expect("snapshotted tab has a layout"),
+            panes: t
+                .layout
+                .as_ref()
+                .expect("snapshotted tab has a layout")
+                .leaf_ids()
+                .into_iter()
+                .map(|id| self.pane_snapshot(id))
+                .collect(),
         }
     }
     fn pane_snapshot(&self, id: PaneId) -> PaneSnapshot {
@@ -2307,34 +2345,26 @@ impl ResourceTree {
         PaneSnapshot {
             id,
             terminal_id: p.terminal_id,
-            closing: p.closing,
+            closing: self.pane_is_closing(id),
             tokens: p.tokens.clone(),
             activity: p.activity.clone(),
             cwd: p.cwd.clone(),
             worktree: p.worktree.clone(),
         }
     }
-    fn session_for_workspace(&self, workspace_id: WorkspaceId) -> &Session {
-        &self.sessions[&self.workspaces[&workspace_id].session_id]
-    }
-    fn session_for_tab(&self, tab_id: TabId) -> &Session {
-        self.session_for_workspace(self.tabs[&tab_id].workspace_id)
-    }
     fn session_panes(&self, session_id: SessionId) -> Vec<PaneId> {
         self.sessions[&session_id]
             .workspaces
             .iter()
             .flat_map(|w| &self.workspaces[w].tabs)
-            .flat_map(|t| &self.tabs[t].panes)
-            .copied()
+            .flat_map(|t| self.tab_panes(*t))
             .collect()
     }
     fn workspace_panes(&self, workspace_id: WorkspaceId) -> Vec<PaneId> {
         self.workspaces[&workspace_id]
             .tabs
             .iter()
-            .flat_map(|tab| &self.tabs[tab].panes)
-            .copied()
+            .flat_map(|tab| self.tab_panes(*tab))
             .collect()
     }
     fn open_paths(&self) -> Result<Vec<ResolvedTerminalPath>, ResourceError> {
@@ -2356,7 +2386,7 @@ impl ResourceTree {
             .sessions
             .get(&session_id)
             .ok_or(ResourceError::NotFound("session"))?;
-        if session.closing {
+        if self.session_is_closing(session_id) {
             return Err(ResourceError::Closing("session"));
         }
         if session.workspaces.is_empty() {
@@ -2380,10 +2410,10 @@ impl ResourceTree {
             .workspaces
             .get(&workspace_id)
             .ok_or(ResourceError::NotFound("workspace"))?;
-        if self.sessions[&workspace.session_id].closing {
+        if self.session_is_closing(workspace.session_id) {
             return Err(ResourceError::Closing("session"));
         }
-        if workspace.closing {
+        if self.workspace_is_closing(workspace_id) {
             return Err(ResourceError::Closing("workspace"));
         }
         if workspace.tabs.is_empty() {
@@ -2405,37 +2435,40 @@ impl ResourceTree {
             .get(&tab_id)
             .ok_or(ResourceError::NotFound("tab"))?;
         let workspace = &self.workspaces[&tab.workspace_id];
-        if self.sessions[&workspace.session_id].closing {
+        if self.session_is_closing(workspace.session_id) {
             return Err(ResourceError::Closing("session"));
         }
-        if workspace.closing {
+        if self.workspace_is_closing(tab.workspace_id) {
             return Err(ResourceError::Closing("workspace"));
         }
-        if tab.closing {
+        if self.tab_is_closing(tab_id) {
             return Err(ResourceError::Closing("tab"));
         }
-        if tab.panes.is_empty() {
+        if tab.layout.is_none() {
             return self.invalid("tab has no pane");
         }
-        tab.panes.iter().map(|id| self.path_for_pane(*id)).collect()
+        self.tab_panes(tab_id)
+            .into_iter()
+            .map(|id| self.path_for_pane(id))
+            .collect()
     }
     fn path_for_pane(&self, pane_id: PaneId) -> Result<ResolvedTerminalPath, ResourceError> {
         let pane = self
             .panes
             .get(&pane_id)
             .ok_or(ResourceError::NotFound("pane"))?;
-        if pane.closing {
+        if self.pane_is_closing(pane_id) {
             return Err(ResourceError::Closing("pane"));
         }
         let tab = &self.tabs[&pane.tab_id];
         let workspace = &self.workspaces[&tab.workspace_id];
-        if self.sessions[&workspace.session_id].closing {
+        if self.session_is_closing(workspace.session_id) {
             return Err(ResourceError::Closing("session"));
         }
-        if workspace.closing {
+        if self.workspace_is_closing(tab.workspace_id) {
             return Err(ResourceError::Closing("workspace"));
         }
-        if tab.closing {
+        if self.tab_is_closing(pane.tab_id) {
             return Err(ResourceError::Closing("tab"));
         }
         Ok(ResolvedTerminalPath {
@@ -3641,9 +3674,9 @@ mod tests {
             }]
         );
         assert!(moved.terminals_to_close.is_empty());
-        assert_eq!(tree.tabs[&source].panes, vec![source_sibling]);
+        assert_eq!(tree.tab_panes(source), vec![source_sibling]);
         assert_eq!(
-            tree.tabs[&destination].panes,
+            tree.tab_panes(destination),
             vec![destination_sibling, destination_tail, pane]
         );
         assert_eq!(tree.panes[&pane].terminal_id, terminal);
@@ -4487,17 +4520,21 @@ mod tests {
     }
 
     #[test]
-    fn ancestor_close_does_not_mark_tabs_closing_and_validation_checks_one_way_invariant() {
+    fn ancestor_close_is_inherited_without_copying_close_intents() {
         let mut tree = ResourceTree::default();
         let path = initial("session", "/project");
         let (workspace_id, tab_id) = (path.workspace_id, path.tab_id);
         tree.create_session(path).unwrap();
         tree.close_workspace(workspace_id).unwrap();
-        assert!(!tree.snapshot().sessions[0].workspaces[0].tabs[0].closing);
+        assert!(tree.snapshot().sessions[0].workspaces[0].tabs[0].closing);
+        assert!(
+            tree.close_intents
+                .contains(&CloseIntent::Workspace(workspace_id))
+        );
+        assert!(!tree.close_intents.contains(&CloseIntent::Tab(tab_id)));
         tree.cancel_close_workspace(workspace_id).unwrap();
-
-        tree.tabs.get_mut(&tab_id).unwrap().closing = true;
-        assert!(matches!(tree.validate(), Err(ResourceError::Invariant(_))));
+        assert!(!tree.snapshot().sessions[0].workspaces[0].tabs[0].closing);
+        tree.validate().unwrap();
     }
 
     #[test]

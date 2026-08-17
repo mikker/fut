@@ -1115,6 +1115,75 @@ impl ScreenSnapshot {
             graphics: KittyGraphics::default(),
         }
     }
+
+    /// Atomically applies a delta produced from this exact snapshot.
+    ///
+    /// All of `delta` is checked before this snapshot is changed. A rejected
+    /// delta therefore leaves the receiver usable as the base for a later
+    /// refresh or a correctly sequenced delta.
+    pub fn apply_delta(&mut self, delta: ScreenDelta) -> Result<(), ScreenDeltaError> {
+        if delta.base_revision != self.revision {
+            return Err(ScreenDeltaError::BaseRevisionMismatch {
+                expected: self.revision,
+                actual: delta.base_revision,
+            });
+        }
+        if delta.size != self.size {
+            return Err(ScreenDeltaError::SizeMismatch {
+                expected: self.size,
+                actual: delta.size,
+            });
+        }
+        if delta.revision <= self.revision {
+            return Err(ScreenDeltaError::RevisionNotNewer {
+                current: self.revision,
+                actual: delta.revision,
+            });
+        }
+
+        let columns = usize::from(self.size.columns);
+        let rows = usize::from(self.size.rows);
+        let mut seen_rows = vec![false; rows];
+        for row in &delta.rows {
+            let index = usize::from(row.index);
+            if index >= rows {
+                return Err(ScreenDeltaError::RowOutOfBounds {
+                    row: row.index,
+                    rows: self.size.rows,
+                });
+            }
+            if std::mem::replace(&mut seen_rows[index], true) {
+                return Err(ScreenDeltaError::DuplicateRow { row: row.index });
+            }
+            if row.cells.len() != columns {
+                return Err(ScreenDeltaError::RowWidth {
+                    row: row.index,
+                    expected: columns,
+                    actual: row.cells.len(),
+                });
+            }
+        }
+        if delta.cursor.column >= self.size.columns || delta.cursor.row >= self.size.rows {
+            return Err(ScreenDeltaError::CursorOutOfBounds {
+                column: delta.cursor.column,
+                row: delta.cursor.row,
+            });
+        }
+
+        for row in delta.rows {
+            let start = usize::from(row.index) * columns;
+            self.cells[start..start + columns].clone_from_slice(&row.cells);
+        }
+        self.revision = delta.revision;
+        self.hyperlinks = delta.hyperlinks;
+        self.cursor = delta.cursor;
+        self.scroll = delta.scroll;
+        self.mouse_tracking = delta.mouse_tracking;
+        if let Some(graphics) = delta.graphics {
+            self.graphics = graphics;
+        }
+        Ok(())
+    }
 }
 
 /// One changed row of a [`ScreenDelta`]: its index within the grid plus a
@@ -1153,6 +1222,32 @@ pub struct ScreenDelta {
     /// cursor, and scroll updates so image bytes are not resent every frame.
     #[serde(rename = "g", default, skip_serializing_if = "Option::is_none")]
     pub graphics: Option<KittyGraphics>,
+}
+
+/// Why a [`ScreenDelta`] could not be applied to a [`ScreenSnapshot`].
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum ScreenDeltaError {
+    #[error("delta base revision {actual} does not match snapshot revision {expected}")]
+    BaseRevisionMismatch { expected: u64, actual: u64 },
+    #[error("delta size {actual:?} does not match snapshot size {expected:?}")]
+    SizeMismatch {
+        expected: TerminalSize,
+        actual: TerminalSize,
+    },
+    #[error("delta revision {actual} is not newer than snapshot revision {current}")]
+    RevisionNotNewer { current: u64, actual: u64 },
+    #[error("delta row {row} is outside the {rows}-row snapshot")]
+    RowOutOfBounds { row: u16, rows: u16 },
+    #[error("delta contains row {row} more than once")]
+    DuplicateRow { row: u16 },
+    #[error("delta row {row} has {actual} cells; expected {expected}")]
+    RowWidth {
+        row: u16,
+        expected: usize,
+        actual: usize,
+    },
+    #[error("delta cursor ({column}, {row}) is outside the snapshot")]
+    CursorOutOfBounds { column: u16, row: u16 },
 }
 
 #[cfg(test)]
@@ -1384,6 +1479,232 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    fn delta_snapshot() -> ScreenSnapshot {
+        ScreenSnapshot::new(
+            10,
+            TerminalSize {
+                columns: 2,
+                rows: 2,
+            },
+            vec![
+                Cell {
+                    contents: "a".into(),
+                    hyperlink: Some(0),
+                    ..Cell::default()
+                },
+                Cell {
+                    contents: "b".into(),
+                    ..Cell::default()
+                },
+                Cell {
+                    contents: "c".into(),
+                    ..Cell::default()
+                },
+                Cell {
+                    contents: "d".into(),
+                    ..Cell::default()
+                },
+            ],
+            Cursor {
+                column: 0,
+                row: 0,
+                visible: true,
+                shape: CursorShape::Block,
+                blinking: false,
+            },
+        )
+        .unwrap()
+    }
+
+    fn valid_delta(revision: u64) -> ScreenDelta {
+        ScreenDelta {
+            revision,
+            base_revision: 10,
+            size: TerminalSize {
+                columns: 2,
+                rows: 2,
+            },
+            rows: vec![DeltaRow {
+                index: 1,
+                cells: vec![
+                    Cell {
+                        contents: "x".into(),
+                        hyperlink: Some(0),
+                        ..Cell::default()
+                    },
+                    Cell {
+                        contents: "y".into(),
+                        ..Cell::default()
+                    },
+                ],
+            }],
+            hyperlinks: vec!["https://example.test/new".into()],
+            cursor: Cursor {
+                column: 1,
+                row: 1,
+                visible: true,
+                shape: CursorShape::Underline,
+                blinking: true,
+            },
+            scroll: ScrollPosition {
+                offset_from_bottom: 3,
+                max_offset_from_bottom: 8,
+            },
+            mouse_tracking: true,
+            graphics: None,
+        }
+    }
+
+    #[test]
+    fn delta_produces_the_same_complete_state_as_a_full_snapshot() {
+        let mut from_delta = delta_snapshot();
+        let mut delta = valid_delta(11);
+        delta.graphics = Some(KittyGraphics {
+            images: vec![KittyImage {
+                id: 7,
+                generation: 4,
+                png: vec![1, 2, 3],
+            }],
+            placements: vec![KittyPlacement {
+                image_id: 7,
+                placement_id: 2,
+                column: 0,
+                row: 1,
+                columns: 1,
+                rows: 1,
+                source_x: 0,
+                source_y: 0,
+                source_width: 1,
+                source_height: 1,
+                z: 0,
+            }],
+        });
+        from_delta.apply_delta(delta).unwrap();
+
+        let mut full = ScreenSnapshot::new(
+            11,
+            from_delta.size,
+            vec![
+                Cell {
+                    contents: "a".into(),
+                    hyperlink: Some(0),
+                    ..Cell::default()
+                },
+                Cell {
+                    contents: "b".into(),
+                    ..Cell::default()
+                },
+                Cell {
+                    contents: "x".into(),
+                    hyperlink: Some(0),
+                    ..Cell::default()
+                },
+                Cell {
+                    contents: "y".into(),
+                    ..Cell::default()
+                },
+            ],
+            Cursor {
+                column: 1,
+                row: 1,
+                visible: true,
+                shape: CursorShape::Underline,
+                blinking: true,
+            },
+        )
+        .unwrap();
+        full.hyperlinks = vec!["https://example.test/new".into()];
+        full.scroll = ScrollPosition {
+            offset_from_bottom: 3,
+            max_offset_from_bottom: 8,
+        };
+        full.mouse_tracking = true;
+        full.graphics = from_delta.graphics.clone();
+
+        assert_eq!(from_delta, full);
+    }
+
+    #[test]
+    fn delta_graphics_retain_change_and_clear() {
+        let mut snapshot = delta_snapshot();
+        let retained = KittyGraphics {
+            images: vec![KittyImage {
+                id: 1,
+                generation: 1,
+                png: vec![1],
+            }],
+            placements: Vec::new(),
+        };
+        snapshot.graphics = retained.clone();
+
+        snapshot.apply_delta(valid_delta(11)).unwrap();
+        assert_eq!(snapshot.graphics, retained);
+
+        let changed = KittyGraphics {
+            images: vec![KittyImage {
+                id: 2,
+                generation: 2,
+                png: vec![2],
+            }],
+            placements: Vec::new(),
+        };
+        let mut change = valid_delta(12);
+        change.base_revision = 11;
+        change.graphics = Some(changed.clone());
+        snapshot.apply_delta(change).unwrap();
+        assert_eq!(snapshot.graphics, changed);
+
+        let mut clear = valid_delta(13);
+        clear.base_revision = 12;
+        clear.graphics = Some(KittyGraphics::default());
+        snapshot.apply_delta(clear).unwrap();
+        assert_eq!(snapshot.graphics, KittyGraphics::default());
+    }
+
+    #[test]
+    fn invalid_delta_is_rejected_without_changing_the_snapshot() {
+        let malformed = [
+            {
+                let mut delta = valid_delta(11);
+                delta.base_revision = 9;
+                delta
+            },
+            {
+                let mut delta = valid_delta(11);
+                delta.size.columns = 3;
+                delta
+            },
+            valid_delta(10),
+            {
+                let mut delta = valid_delta(11);
+                delta.rows[0].index = 2;
+                delta
+            },
+            {
+                let mut delta = valid_delta(11);
+                delta.rows.push(delta.rows[0].clone());
+                delta
+            },
+            {
+                let mut delta = valid_delta(11);
+                delta.rows[0].cells.pop();
+                delta
+            },
+            {
+                let mut delta = valid_delta(11);
+                delta.cursor.column = 2;
+                delta
+            },
+        ];
+
+        for delta in malformed {
+            let mut snapshot = delta_snapshot();
+            let before = snapshot.clone();
+            assert!(snapshot.apply_delta(delta).is_err());
+            assert_eq!(snapshot, before);
+        }
     }
 
     #[test]

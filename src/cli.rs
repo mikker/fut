@@ -42,9 +42,10 @@ use crate::{
         TerminalOutputSource, WorkspaceId,
     },
     protocol::{
-        AcknowledgedCommand, ClientMessage, ClientMode, ContextScope, ContextualCommand, Envelope,
-        PROTOCOL_VERSION, PROTOCOL_VERSION_0_1, RenameSelector, ServerMessage, TerminalContext,
-        TerminalInputOperation, codec, decode_payload, encode_payload,
+        AcknowledgedCommand, AgentPromptMode, ClientMessage, ClientMode, ContextScope,
+        ContextualCommand, Envelope, PROTOCOL_VERSION, PROTOCOL_VERSION_0_1, RenameSelector,
+        ServerMessage, TerminalContext, TerminalInputOperation, codec, decode_payload,
+        encode_payload,
     },
     resources::{
         PanePathRef, PresentationTokenTarget, ResourceSnapshot, SessionSelector, TabSnapshot,
@@ -1152,13 +1153,18 @@ async fn execute(cli: Cli) -> Result<()> {
                 )
                 .into());
             }
+            let mode = match timeout {
+                Some(timeout) => AgentPromptMode::Wait {
+                    timeout_ms: timeout.as_millis() as u64,
+                },
+                None => AgentPromptMode::Submit,
+            };
             match control(
                 &socket,
                 ClientMessage::PromptAgent {
                     terminal_id,
                     text,
-                    wait,
-                    timeout_ms: timeout.map(|value| value.as_millis() as u64),
+                    mode,
                 },
             )
             .await?
@@ -2532,8 +2538,7 @@ async fn request(
             Duration::from_millis((*timeout_ms).min(3_600_000)) + Duration::from_secs(1)
         }
         ClientMessage::PromptAgent {
-            wait: true,
-            timeout_ms: Some(timeout_ms),
+            mode: AgentPromptMode::Wait { timeout_ms },
             ..
         } => Duration::from_millis((*timeout_ms).min(3_600_000)) + Duration::from_secs(1),
         _ => Duration::from_secs(15),

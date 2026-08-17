@@ -488,9 +488,7 @@ async fn run_loop(
     let mut rename: Option<RenameState> = None;
     let mut workspace_history = NavigationHistory::default();
     workspace_history.record(view.focused());
-    let mut create_workspace = CreateState::default();
-    let mut create_tab = CreateState::default();
-    let mut split_pane = CreateState::default();
+    let mut create = CreateCoordinator::default();
     let mut close_target = CloseTargetState::default();
     let mut focus = FocusState::default();
     let mut toasts = ToastState::default();
@@ -598,29 +596,30 @@ async fn run_loop(
                 let request_id = envelope.request_id;
                 match envelope.message {
                     ServerMessage::Snapshot { terminal_id, screen } => {
-                        if view.accept(terminal_id, screen)
+                        let accepted = view.accept(terminal_id, screen);
+                        let navigator_completed = accepted
                             && terminal_id == view.focused().terminal_id
-                            && matches!(
-                                surface.as_ref(),
-                                Some(ClientSurface::Navigator(nav))
-                                    if nav.switch_request.is_none()
-                                        && matches!(nav.status, navigator::NavigatorStatus::Switching)
-                            )
-                        {
+                            && match surface.as_mut() {
+                                Some(ClientSurface::Navigator(nav)) => {
+                                    nav.accept_switch_snapshot()
+                                }
+                                _ => false,
+                            };
+                        if navigator_completed {
                             surface = None;
                         }
                     }
                     ServerMessage::SnapshotDelta { terminal_id, delta } => {
                         match view.accept_delta(terminal_id, delta) {
                             DeltaApplyResult::Applied => {
-                                if terminal_id == view.focused().terminal_id
-                                    && matches!(
-                                        surface.as_ref(),
-                                        Some(ClientSurface::Navigator(nav))
-                                            if nav.switch_request.is_none()
-                                                && matches!(nav.status, navigator::NavigatorStatus::Switching)
-                                    )
-                                {
+                                let navigator_completed = terminal_id == view.focused().terminal_id
+                                    && match surface.as_mut() {
+                                        Some(ClientSurface::Navigator(nav)) => {
+                                            nav.accept_switch_snapshot()
+                                        }
+                                        _ => false,
+                                    };
+                                if navigator_completed {
                                     surface = None;
                                 }
                             }
@@ -750,9 +749,7 @@ async fn run_loop(
                             refresh_surface_presence(&mut surface, resources.presence());
                             reconcile_resource_barriers(
                                 snapshot,
-                                &mut create_workspace,
-                                &mut create_tab,
-                                &mut split_pane,
+                                &mut create,
                                 &mut rename,
                             );
                             resize_view(
@@ -781,9 +778,7 @@ async fn run_loop(
                             );
                             reconcile_resource_barriers(
                                 snapshot,
-                                &mut create_workspace,
-                                &mut create_tab,
-                                &mut split_pane,
+                                &mut create,
                                 &mut rename,
                             );
                             resize_view(
@@ -816,15 +811,8 @@ async fn run_loop(
                         let notification_selected =
                             matches!(focus_origin, Some(FocusOrigin::Notification));
                         let observed_revision = resources.snapshot().map(|snapshot| snapshot.revision);
-                        let workspace_created_selected = create_workspace.selected(
-                            request_id,
-                            &target,
-                            observed_revision,
-                        );
                         let create_selected =
-                            create_tab.selected(request_id, &target, observed_revision);
-                        let split_selected =
-                            split_pane.selected(request_id, &target, observed_revision);
+                            create.selected(request_id, &target, observed_revision);
                         if !view.replace(target)? {
                             if navigator_selected
                                 || workspace_selected
@@ -835,7 +823,7 @@ async fn run_loop(
                                 view.invalidate_drawn();
                                 force_draw = true;
                             }
-                            if workspace_created_selected || create_selected || split_selected {
+                            if create_selected.is_some() {
                                 force_draw = true;
                             }
                             continue;
@@ -879,10 +867,6 @@ async fn run_loop(
                         if navigator_selected && view.focused().terminal_id == old_terminal {
                             surface = None;
                             view.invalidate_drawn();
-                        } else if navigator_selected
-                            && let Some(ClientSurface::Navigator(nav)) = surface.as_mut()
-                        {
-                            nav.status = navigator::NavigatorStatus::Switching;
                         }
                         if workspace_selected {
                             surface = None;
@@ -899,19 +883,19 @@ async fn run_loop(
                         if notification_selected {
                             view.invalidate_drawn();
                         }
-                        if workspace_created_selected || create_selected || split_selected {
+                        if create_selected.is_some() {
                             view.invalidate_drawn();
                         }
                         force_draw = true;
                     }
                     ServerMessage::WorkspaceCreated { selected: target } => {
-                        if !create_workspace.created(request_id, target.terminal_id) {
+                        if !create.created(request_id, CreateKind::Workspace, target.terminal_id) {
                             continue;
                         }
                         force_draw = true;
                     }
                     ServerMessage::TabCreated { selected: target } => {
-                        if !create_tab.created(request_id, target.terminal_id) {
+                        if !create.created(request_id, CreateKind::Tab, target.terminal_id) {
                             continue;
                         }
                         if target.terminal_id == view.focused().terminal_id {
@@ -920,7 +904,7 @@ async fn run_loop(
                         force_draw = true;
                     }
                     ServerMessage::PaneCreated { selected: target } => {
-                        if !split_pane.created(request_id, target.terminal_id) {
+                        if !create.created(request_id, CreateKind::SplitPane, target.terminal_id) {
                             continue;
                         }
                         force_draw = true;
@@ -1003,18 +987,8 @@ async fn run_loop(
                             force_draw = true;
                             continue;
                         }
-                        if create_workspace.fail(request_id) {
-                            toasts.error(format!("create workspace failed · {message}"));
-                            force_draw = true;
-                            continue;
-                        }
-                        if create_tab.fail(request_id) {
-                            toasts.error(format!("create tab failed · {message}"));
-                            force_draw = true;
-                            continue;
-                        }
-                        if split_pane.fail(request_id) {
-                            toasts.error(format!("split failed · {message}"));
+                        if let Some(kind) = create.fail(request_id) {
+                            toasts.error(format!("{} failed · {message}", kind.label()));
                             force_draw = true;
                             continue;
                         }
@@ -1087,7 +1061,7 @@ async fn run_loop(
                     }
                 }
             }
-            event = events.next(), if accepts_client_input(&focus, &create_workspace, &create_tab, &split_pane, &close_target, &pending_focused_exit) => {
+            event = events.next(), if accepts_client_input(&focus, &create, &close_target, &pending_focused_exit) => {
                 let Some(event) = event else {
                     release_captured_mouse_input(
                         framed,
@@ -1256,8 +1230,7 @@ async fn run_loop(
                             &resources,
                             &mut surface,
                             &mut rename,
-                            &mut create_workspace,
-                            &mut create_tab,
+                            &mut create,
                             &mut close_target,
                             &mut focus,
                             &mut mouse_input,
@@ -1290,8 +1263,7 @@ async fn run_loop(
                             &resources,
                             &mut surface,
                             &mut rename,
-                            &mut create_workspace,
-                            &mut create_tab,
+                            &mut create,
                             &mut close_target,
                             &mut focus,
                             &mut mouse_input,
@@ -1448,7 +1420,7 @@ async fn run_loop(
                                 force_draw = true;
                             }
                             ComponentEffect::CreateWorkspace => {
-                                if let Some(request) = create_workspace.begin() {
+                                if let Some(request) = create.begin(CreateKind::Workspace) {
                                     send_request(
                                         framed,
                                         Some(request),
@@ -1551,7 +1523,7 @@ async fn run_loop(
                                 force_draw = true;
                             }
                             TabBarAction::Create => {
-                                if let Some(request) = create_tab.begin() {
+                                if let Some(request) = create.begin(CreateKind::Tab) {
                                     send_request(
                                         framed,
                                         Some(request),
@@ -1628,9 +1600,7 @@ async fn run_loop(
                                     &resources,
                                     &mut surface,
                                     &workspace_history,
-                                    &mut create_workspace,
-                                    &mut create_tab,
-                                    &mut split_pane,
+                                    &mut create,
                                     &mut close_target,
                                     &mut focus,
                                     &mut copy_mode,
@@ -1927,7 +1897,7 @@ async fn run_loop(
                                     }
                                 }
                                 UiActivation::Tab(TabBarAction::Create) => {
-                                    if let Some(request) = create_tab.begin() {
+                                    if let Some(request) = create.begin(CreateKind::Tab) {
                                         send_request(
                                             framed,
                                             Some(request),
@@ -1963,7 +1933,7 @@ async fn run_loop(
                                     view.invalidate_drawn();
                                 }
                                 UiActivation::Sidebar(ComponentEffect::CreateWorkspace) => {
-                                    if let Some(request) = create_workspace.begin() {
+                                    if let Some(request) = create.begin(CreateKind::Workspace) {
                                         send_request(
                                             framed,
                                             Some(request),
@@ -2163,9 +2133,7 @@ async fn run_loop(
                                     &resources,
                                     &mut surface,
                                     &workspace_history,
-                                    &mut create_workspace,
-                                    &mut create_tab,
-                                    &mut split_pane,
+                                    &mut create,
                                     &mut close_target,
                                     &mut focus,
                                     &mut copy_mode,
@@ -2468,8 +2436,7 @@ async fn dispatch_context_menu_action(
     resources: &ResourceState,
     surface: &mut Option<ClientSurface>,
     rename: &mut Option<RenameState>,
-    create_workspace: &mut CreateState,
-    create_tab: &mut CreateState,
+    create: &mut CreateCoordinator,
     close_target: &mut CloseTargetState,
     focus: &mut FocusState,
     mouse_input: &mut MouseInputState,
@@ -2507,7 +2474,7 @@ async fn dispatch_context_menu_action(
             }
         }
         ContextMenuAction::CreateTab(workspace_id) => {
-            if let Some(request) = create_tab.begin() {
+            if let Some(request) = create.begin(CreateKind::Tab) {
                 send_request(
                     framed,
                     Some(request),
@@ -2523,7 +2490,7 @@ async fn dispatch_context_menu_action(
             }
         }
         ContextMenuAction::CreateWorkspace(session_id) => {
-            if let Some(request) = create_workspace.begin() {
+            if let Some(request) = create.begin(CreateKind::Workspace) {
                 send_request(
                     framed,
                     Some(request),
@@ -2608,14 +2575,10 @@ fn refresh_surface_presence(
 
 fn reconcile_resource_barriers(
     snapshot: &crate::resources::ResourceSnapshot,
-    create_workspace: &mut CreateState,
-    create_tab: &mut CreateState,
-    split_pane: &mut CreateState,
+    create: &mut CreateCoordinator,
     rename: &mut Option<RenameState>,
 ) {
-    create_workspace.accept_resources(snapshot.revision);
-    create_tab.accept_resources(snapshot.revision);
-    split_pane.accept_resources(snapshot.revision);
+    create.accept_resources(snapshot.revision);
     if rename
         .as_mut()
         .is_some_and(|rename| rename.accept_resources(snapshot))
@@ -2645,16 +2608,12 @@ fn selection_expectation(
 
 fn accepts_client_input(
     focus: &FocusState,
-    create_workspace: &CreateState,
-    create_tab: &CreateState,
-    split_pane: &CreateState,
+    create: &CreateCoordinator,
     close_target: &CloseTargetState,
     pending_focused_exit: &Option<Option<i32>>,
 ) -> bool {
     focus.request_id.is_none()
-        && !create_workspace.blocks_input()
-        && !create_tab.blocks_input()
-        && !split_pane.blocks_input()
+        && !create.blocks_input()
         && !close_target.blocks_input()
         && pending_focused_exit.is_none()
 }
@@ -3235,9 +3194,7 @@ async fn dispatch_client_action(
     resources: &ResourceState,
     surface: &mut Option<ClientSurface>,
     workspace_history: &NavigationHistory,
-    create_workspace: &mut CreateState,
-    create_tab: &mut CreateState,
-    split_pane: &mut CreateState,
+    create: &mut CreateCoordinator,
     close_target: &mut CloseTargetState,
     focus: &mut FocusState,
     copy_mode: &mut Option<CopyModeState>,
@@ -3296,7 +3253,13 @@ async fn dispatch_client_action(
                     ))));
                 }
             };
-            let content = temporary_command_content(command.size.area(host));
+            let crate::extensions::ExtensionCommandExecution::Interactive {
+                size: popup_size, ..
+            } = &command.execution
+            else {
+                unreachable!("background commands returned after dispatch")
+            };
+            let content = temporary_command_content(popup_size.area(host));
             let size = TerminalSize {
                 columns: content.width,
                 rows: content.height,
@@ -3465,7 +3428,7 @@ async fn dispatch_client_action(
             }
         }
         ClientAction::CreateWorkspace => {
-            if let Some(request) = create_workspace.begin() {
+            if let Some(request) = create.begin(CreateKind::Workspace) {
                 send_request(
                     framed,
                     Some(request),
@@ -3481,7 +3444,7 @@ async fn dispatch_client_action(
             }
         }
         ClientAction::CreateTab => {
-            if let Some(request) = create_tab.begin() {
+            if let Some(request) = create.begin(CreateKind::Tab) {
                 send_request(
                     framed,
                     Some(request),
@@ -3546,7 +3509,7 @@ async fn dispatch_client_action(
             }
         }
         ClientAction::SplitPaneRight | ClientAction::SplitPaneDown => {
-            if let Some(request) = split_pane.begin() {
+            if let Some(request) = create.begin(CreateKind::SplitPane) {
                 send_request(
                     framed,
                     Some(request),
@@ -3797,45 +3760,77 @@ async fn receive(
     Ok(decode_payload::<Envelope<ServerMessage>>(&frame)?.message)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CreateKind {
+    Workspace,
+    Tab,
+    SplitPane,
+}
+
+impl CreateKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Workspace => "create workspace",
+            Self::Tab => "create tab",
+            Self::SplitPane => "split",
+        }
+    }
+}
+
 #[derive(Default)]
-enum CreateState {
+struct CreateCoordinator {
+    flow: CreateFlow,
+}
+
+#[derive(Default)]
+enum CreateFlow {
     #[default]
     Idle,
     AwaitingCreated {
+        kind: CreateKind,
         request_id: Uuid,
     },
     AwaitingSelected {
+        kind: CreateKind,
         request_id: Uuid,
         terminal_id: TerminalId,
     },
     AwaitingResources {
+        kind: CreateKind,
         request_id: Uuid,
         resource_revision: u64,
     },
 }
 
-impl CreateState {
-    fn begin(&mut self) -> Option<Uuid> {
-        if !matches!(self, Self::Idle) {
+impl CreateCoordinator {
+    fn begin(&mut self, kind: CreateKind) -> Option<Uuid> {
+        if !matches!(self.flow, CreateFlow::Idle) {
             return None;
         }
         let request_id = Uuid::new_v4();
-        *self = Self::AwaitingCreated { request_id };
+        self.flow = CreateFlow::AwaitingCreated { kind, request_id };
         Some(request_id)
     }
 
-    fn created(&mut self, request_id: Option<Uuid>, terminal_id: TerminalId) -> bool {
-        let Self::AwaitingCreated {
+    fn created(
+        &mut self,
+        request_id: Option<Uuid>,
+        kind: CreateKind,
+        terminal_id: TerminalId,
+    ) -> bool {
+        let CreateFlow::AwaitingCreated {
+            kind: expected_kind,
             request_id: expected,
-        } = self
+        } = self.flow
         else {
             return false;
         };
-        if request_id != Some(*expected) {
+        if request_id != Some(expected) || kind != expected_kind {
             return false;
         }
-        *self = Self::AwaitingSelected {
-            request_id: *expected,
+        self.flow = CreateFlow::AwaitingSelected {
+            kind,
+            request_id: expected,
             terminal_id,
         };
         true
@@ -3846,58 +3841,64 @@ impl CreateState {
         request_id: Option<Uuid>,
         selected: &SelectedView,
         observed_revision: Option<u64>,
-    ) -> bool {
-        let Self::AwaitingSelected {
+    ) -> Option<CreateKind> {
+        let CreateFlow::AwaitingSelected {
+            kind,
             request_id: expected,
             terminal_id,
-        } = self
+        } = self.flow
         else {
-            return false;
+            return None;
         };
-        if request_id != Some(*expected) || *terminal_id != selected.focused.terminal_id {
-            return false;
+        if request_id != Some(expected) || terminal_id != selected.focused.terminal_id {
+            return None;
         }
         if observed_revision.is_some_and(|revision| revision >= selected.resource_revision) {
-            *self = Self::Idle;
+            self.flow = CreateFlow::Idle;
         } else {
-            *self = Self::AwaitingResources {
-                request_id: *expected,
+            self.flow = CreateFlow::AwaitingResources {
+                kind,
+                request_id: expected,
                 resource_revision: selected.resource_revision,
             };
         }
-        true
+        Some(kind)
     }
 
     fn accept_resources(&mut self, revision: u64) -> bool {
-        let Self::AwaitingResources {
+        let CreateFlow::AwaitingResources {
             resource_revision, ..
-        } = self
+        } = self.flow
         else {
             return false;
         };
-        if revision < *resource_revision {
+        if revision < resource_revision {
             return false;
         }
-        *self = Self::Idle;
+        self.flow = CreateFlow::Idle;
         true
     }
 
-    fn fail(&mut self, request_id: Option<Uuid>) -> bool {
-        let expected = match self {
-            Self::Idle => return false,
-            Self::AwaitingCreated { request_id }
-            | Self::AwaitingSelected { request_id, .. }
-            | Self::AwaitingResources { request_id, .. } => *request_id,
+    fn fail(&mut self, request_id: Option<Uuid>) -> Option<CreateKind> {
+        let (kind, expected) = match self.flow {
+            CreateFlow::Idle => return None,
+            CreateFlow::AwaitingCreated { kind, request_id }
+            | CreateFlow::AwaitingSelected {
+                kind, request_id, ..
+            }
+            | CreateFlow::AwaitingResources {
+                kind, request_id, ..
+            } => (kind, request_id),
         };
         if request_id != Some(expected) {
-            return false;
+            return None;
         }
-        *self = Self::Idle;
-        true
+        self.flow = CreateFlow::Idle;
+        Some(kind)
     }
 
     fn blocks_input(&self) -> bool {
-        !matches!(self, Self::Idle)
+        !matches!(self.flow, CreateFlow::Idle)
     }
 }
 
@@ -4129,32 +4130,15 @@ impl PaneState {
         let Some(current) = self.pending.as_mut() else {
             return DeltaOutcome::Mismatch;
         };
-        if delta.base_revision != current.revision || delta.size != current.size {
+        let size = delta.size;
+        let revision = delta.revision;
+        if current.apply_delta(delta).is_err() {
             return DeltaOutcome::Mismatch;
         }
-        let columns = usize::from(current.size.columns);
-        for row in delta.rows {
-            let start = usize::from(row.index) * columns;
-            if row.cells.len() != columns {
-                return DeltaOutcome::Mismatch;
-            }
-            let Some(slice) = current.cells.get_mut(start..start + columns) else {
-                return DeltaOutcome::Mismatch;
-            };
-            slice.clone_from_slice(&row.cells);
-        }
-        current.revision = delta.revision;
-        current.hyperlinks = delta.hyperlinks;
-        current.cursor = delta.cursor;
-        current.scroll = delta.scroll;
-        current.mouse_tracking = delta.mouse_tracking;
-        if let Some(graphics) = delta.graphics {
-            current.graphics = graphics;
-        }
         if self.resize_request_id.is_none() {
-            self.observe_authoritative_size(delta.size);
+            self.observe_authoritative_size(size);
         }
-        self.newest_revision = Some(delta.revision);
+        self.newest_revision = Some(revision);
         DeltaOutcome::Applied
     }
 }
@@ -5232,48 +5216,45 @@ mod tests {
     }
 
     #[test]
-    fn create_tab_state_blocks_input_through_correlated_ack_and_selection() {
-        let workspace = CreateState::default();
-        let mut state = CreateState::default();
-        let split = CreateState::default();
+    fn create_coordinator_blocks_overlapping_operations_through_ack_and_selection() {
+        let mut state = CreateCoordinator::default();
         let close = CloseTargetState::default();
         let focus = FocusState::default();
         let no_exit = None;
-        let request = state.begin().expect("first request starts");
-        assert!(state.begin().is_none());
+        let request = state.begin(CreateKind::Tab).expect("first request starts");
+        assert!(state.begin(CreateKind::Workspace).is_none());
         assert!(state.blocks_input());
-        assert!(!accepts_client_input(
-            &focus, &workspace, &state, &split, &close, &no_exit
-        ));
+        assert!(!accepts_client_input(&focus, &state, &close, &no_exit));
         let target = targets(1).remove(0);
-        assert!(!state.created(None, target.terminal_id));
-        assert!(!state.created(Some(Uuid::new_v4()), target.terminal_id));
-        assert!(state.created(Some(request), target.terminal_id));
+        assert!(!state.created(None, CreateKind::Tab, target.terminal_id));
+        assert!(!state.created(Some(Uuid::new_v4()), CreateKind::Tab, target.terminal_id));
+        assert!(!state.created(Some(request), CreateKind::Workspace, target.terminal_id));
+        assert!(state.created(Some(request), CreateKind::Tab, target.terminal_id));
         assert!(state.blocks_input());
-        assert!(!accepts_client_input(
-            &focus, &workspace, &state, &split, &close, &no_exit
-        ));
+        assert!(!accepts_client_input(&focus, &state, &close, &no_exit));
         let selected = selected_view(2, target.clone(), vec![target]);
-        assert!(!state.selected(Some(Uuid::new_v4()), &selected, Some(1)));
-        assert!(state.begin().is_none());
-        assert!(state.selected(Some(request), &selected, Some(1)));
+        assert_eq!(
+            state.selected(Some(Uuid::new_v4()), &selected, Some(1)),
+            None
+        );
+        assert!(state.begin(CreateKind::SplitPane).is_none());
+        assert_eq!(
+            state.selected(Some(request), &selected, Some(1)),
+            Some(CreateKind::Tab)
+        );
         assert!(state.blocks_input());
         assert!(!state.accept_resources(1));
         assert!(state.accept_resources(2));
         assert!(!state.blocks_input());
-        assert!(accepts_client_input(
-            &focus, &workspace, &state, &split, &close, &no_exit
-        ));
-        assert!(state.begin().is_some());
+        assert!(accepts_client_input(&focus, &state, &close, &no_exit));
+        assert!(state.begin(CreateKind::Workspace).is_some());
 
-        let mut failed = CreateState::default();
-        let request = failed.begin().unwrap();
-        assert!(!failed.fail(Some(Uuid::new_v4())));
-        assert!(failed.fail(Some(request)));
+        let mut failed = CreateCoordinator::default();
+        let request = failed.begin(CreateKind::SplitPane).unwrap();
+        assert_eq!(failed.fail(Some(Uuid::new_v4())), None);
+        assert_eq!(failed.fail(Some(request)), Some(CreateKind::SplitPane));
         assert!(!failed.blocks_input());
-        assert!(accepts_client_input(
-            &focus, &workspace, &failed, &split, &close, &no_exit
-        ));
+        assert!(accepts_client_input(&focus, &failed, &close, &no_exit));
     }
 
     #[test]

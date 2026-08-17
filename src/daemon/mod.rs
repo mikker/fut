@@ -37,7 +37,7 @@ use tokio_util::codec::Framed;
 use uuid::Uuid;
 
 use crate::{
-    agent_detection::{CodexStabilizer, detect_codex, is_codex_process},
+    agent_detection::{CodexProbe, CodexStabilizer, detect_codex, is_codex_process},
     client::config as global_config,
     domain::{
         AgentActivity, AgentDetection, AgentReport, AgentState, ClientId, CopyModeAction,
@@ -48,10 +48,10 @@ use crate::{
     },
     project::{ProjectError, ProjectResolver, ResolvedLocation},
     protocol::{
-        AcknowledgedCommand, ClientMessage, ClientMode, ClientPresenceSnapshot, ContextScope,
-        ContextualCommand, Envelope, OpenDisposition, PROTOCOL_VERSION, RenameSelector,
-        SelectedTarget, SelectedView, SelectionExpectation, ServerMessage, TerminalContext,
-        TerminalInputOperation, codec, decode_payload, encode_payload,
+        AcknowledgedCommand, AgentPromptMode, ClientMessage, ClientMode, ClientPresenceSnapshot,
+        ContextScope, ContextualCommand, Envelope, OpenDisposition, PROTOCOL_VERSION,
+        RenameSelector, SelectedTarget, SelectedView, SelectionExpectation, ServerMessage,
+        TerminalContext, TerminalInputOperation, codec, decode_payload, encode_payload,
     },
     resources::{
         CheckoutDestination, InitialPath, Mutation, PresentationTokenTarget, ResourceError,
@@ -120,6 +120,19 @@ struct SharedState {
     extensions: Vec<crate::extensions::Extension>,
     hook_queue: crate::extensions::HookQueue,
     accepting: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FinalizationOutcome {
+    AlreadyFinalized,
+    ResourcesRemain,
+    MultiplexerEmpty,
+}
+
+impl FinalizationOutcome {
+    fn is_empty(self) -> bool {
+        self == Self::MultiplexerEmpty
+    }
 }
 
 const AGENT_EVENT_CAPACITY: usize = 256;
@@ -454,9 +467,12 @@ impl SharedState {
         self.resize_split(tab_id, split_id, ratio)
     }
 
-    fn finalize_terminal(&mut self, terminal_id: TerminalId) -> Result<bool, DaemonError> {
+    fn finalize_terminal(
+        &mut self,
+        terminal_id: TerminalId,
+    ) -> Result<FinalizationOutcome, DaemonError> {
         if self.expected_finalizations.remove(&terminal_id) {
-            return Ok(false);
+            return Ok(FinalizationOutcome::AlreadyFinalized);
         }
         if !self.runtimes.contains_key(&terminal_id) {
             return Err(DaemonError::new(
@@ -486,16 +502,20 @@ impl SharedState {
         if mutation.multiplexer_empty {
             self.accepting = false;
         }
-        Ok(mutation.multiplexer_empty)
+        Ok(if mutation.multiplexer_empty {
+            FinalizationOutcome::MultiplexerEmpty
+        } else {
+            FinalizationOutcome::ResourcesRemain
+        })
     }
 
     fn finalize_terminal_for_replacement(
         &mut self,
         terminal_id: TerminalId,
-    ) -> Result<bool, DaemonError> {
-        let empty = self.finalize_terminal(terminal_id)?;
+    ) -> Result<FinalizationOutcome, DaemonError> {
+        let outcome = self.finalize_terminal(terminal_id)?;
         self.expected_finalizations.insert(terminal_id);
-        Ok(empty)
+        Ok(outcome)
     }
 
     fn begin_target_close(
@@ -660,6 +680,19 @@ struct LeasedTarget {
     selected: SelectedTarget,
     terminal: Arc<TerminalHandle>,
     lease: lease::LeaseGuard,
+    pending_geometry: Option<crate::terminal::AttachmentGeometry>,
+}
+
+impl LeasedTarget {
+    async fn apply_acquisition_geometry(&mut self) -> Result<(), DaemonError> {
+        let Some(geometry) = self.pending_geometry.take() else {
+            return Ok(());
+        };
+        self.terminal
+            .resize_for_attachment(geometry)
+            .await
+            .map_err(|error| DaemonError::new(command_error_code(&error), error.to_string()))
+    }
 }
 
 struct ObservedTarget {
@@ -707,6 +740,16 @@ struct Attachment {
     next_watcher_generation: u64,
 }
 
+struct AttachmentInit {
+    owner: ClientId,
+    size: TerminalSize,
+    panes: Vec<ObservedTarget>,
+    focused: LeasedTarget,
+    layout: SplitTree,
+    fallback_terminal_ids: Vec<TerminalId>,
+    resource_revision: u64,
+}
+
 #[derive(Clone, Copy)]
 struct FocusedViewportState {
     terminal_id: TerminalId,
@@ -716,29 +759,20 @@ struct FocusedViewportState {
 
 impl Attachment {
     fn new(
-        owner: ClientId,
-        panes: Vec<ObservedTarget>,
-        focused: LeasedTarget,
-        layout: SplitTree,
-        fallback_terminal_ids: Vec<TerminalId>,
-        resource_revision: u64,
+        init: AttachmentInit,
         resource_changes: watch::Receiver<u64>,
         presence_changes: watch::Receiver<ClientPresenceSnapshot>,
     ) -> Self {
         let (update_sender, updates) = mpsc::channel(ATTACHMENT_UPDATE_CAPACITY);
-        let size = focused
-            .lease
-            .client_size()
-            .expect("a new attachment retains its client size");
         let mut attachment = Self {
-            owner,
-            size,
-            panes,
-            focused,
-            layout,
-            fallback_terminal_ids,
-            resource_revision,
-            streamed_resource_revision: resource_revision,
+            owner: init.owner,
+            size: init.size,
+            panes: init.panes,
+            focused: init.focused,
+            layout: init.layout,
+            fallback_terminal_ids: init.fallback_terminal_ids,
+            resource_revision: init.resource_revision,
+            streamed_resource_revision: init.resource_revision,
             resource_changes,
             presence_changes,
             updates,
@@ -788,10 +822,6 @@ impl Attachment {
 
     fn size(&self) -> TerminalSize {
         self.size
-    }
-
-    fn shares_focused_terminal(&self) -> bool {
-        self.focused.lease.has_peers()
     }
 
     fn focused_viewport_state(&self) -> FocusedViewportState {
@@ -1298,7 +1328,6 @@ fn watch_attachment(
                     }
                 }
                 event = events.recv() => match event {
-                    Ok(TerminalEvent::TerminalExited { .. }) => {}
                     Ok(TerminalEvent::Error { message }) => {
                         if updates
                             .send(AttachmentUpdate::Error {
@@ -1494,7 +1523,7 @@ struct ProcessObservation {
     name: String,
     command: String,
     cwd: Option<PathBuf>,
-    codex_screen: Option<String>,
+    codex_probe: CodexProbe,
 }
 
 async fn refresh_process_names(
@@ -1524,14 +1553,16 @@ async fn refresh_process_names(
                 let name = process_name(pid).await?;
                 let command = process_command(pid).await.unwrap_or_default();
                 let cwd = process_cwd(pid).await;
-                let codex_screen = if is_codex_process(&name, &command) {
-                    terminal
+                let codex_probe = if is_codex_process(&name, &command) {
+                    match terminal
                         .read_output(TerminalOutputSource::Visible, 1, false)
                         .await
-                        .ok()
-                        .map(|output| output.text)
+                    {
+                        Ok(output) => CodexProbe::Screen(output.text),
+                        Err(_) => CodexProbe::Unavailable,
+                    }
                 } else {
-                    None
+                    CodexProbe::NotRunning
                 };
                 Some(ProcessObservation {
                     terminal_id,
@@ -1539,7 +1570,7 @@ async fn refresh_process_names(
                     name,
                     command,
                     cwd,
-                    codex_screen,
+                    codex_probe,
                 })
             })
             .await
@@ -1585,7 +1616,7 @@ async fn refresh_process_names(
             name,
             command,
             cwd,
-            codex_screen,
+            codex_probe,
         } = observation;
         if let Some(cwd) = cwd {
             let worktree = worktrees.get(&cwd).cloned().flatten();
@@ -1608,28 +1639,32 @@ async fn refresh_process_names(
             codex.remove(&terminal_id);
             continue;
         }
-        let (detection, detected_state) = if let Some(screen) = codex_screen {
-            let detected = detect_codex(&screen);
-            if std::env::var_os("FUT_AGENT_DETECTION_LOG").is_some() {
-                eprintln!(
-                    "codex detection terminal={terminal_id} pid={pid} process={name:?} command={command:?} state={:?} rule={} screen={screen:?}",
-                    detected.state, detected.rule
-                );
+        let (detection, detected_state) = match codex_probe {
+            CodexProbe::Screen(screen) => {
+                let detected = detect_codex(&screen);
+                if std::env::var_os("FUT_AGENT_DETECTION_LOG").is_some() {
+                    eprintln!(
+                        "codex detection terminal={terminal_id} pid={pid} process={name:?} command={command:?} state={:?} rule={} screen={screen:?}",
+                        detected.state, detected.rule
+                    );
+                }
+                let stabilizer = codex.entry(terminal_id).or_default();
+                let Some(stable_state) = stabilizer.observe(detected.state) else {
+                    continue;
+                };
+                (
+                    Some(AgentDetection {
+                        agent: "codex".into(),
+                        rule: detected.rule.into(),
+                    }),
+                    stable_state,
+                )
             }
-            let stabilizer = codex.entry(terminal_id).or_default();
-            let Some(stable_state) = stabilizer.observe(detected.state) else {
-                continue;
-            };
-            (
-                Some(AgentDetection {
-                    agent: "codex".into(),
-                    rule: detected.rule.into(),
-                }),
-                stable_state,
-            )
-        } else {
-            codex.remove(&terminal_id);
-            (None, AgentState::Idle)
+            CodexProbe::NotRunning => {
+                codex.remove(&terminal_id);
+                (None, AgentState::Idle)
+            }
+            CodexProbe::Unavailable => continue,
         };
         if let Ok(revision) =
             state
@@ -1754,7 +1789,7 @@ fn watch_terminal(terminal: Arc<TerminalHandle>, exited: mpsc::UnboundedSender<T
 async fn finalize_terminal(shared: &Shared, terminal_id: TerminalId) -> bool {
     let mut state = shared.lock().await;
     match state.finalize_terminal(terminal_id) {
-        Ok(empty) => empty,
+        Ok(outcome) => outcome.is_empty(),
         Err(error) => {
             tracing::error!(message = %error.message, %terminal_id, "finalize terminal resource");
             false
@@ -2188,7 +2223,7 @@ async fn handle_connection(
                 .await?;
                 return Ok(());
             }
-            let mut attachment = match lease_view(&shared, selector, None, client, size).await {
+            let attachment = match lease_view(&shared, selector, None, client, size).await {
                 Ok(attachment) => attachment,
                 Err(error) => {
                     send_error(
@@ -2209,12 +2244,6 @@ async fn handle_connection(
                     &error.message,
                 )
                 .await?;
-                return Ok(());
-            }
-            if attachment.shares_focused_terminal()
-                && let Err(error) = attachment.resize_focused(size).await
-            {
-                send_command_error(&mut connection, first.request_id, error).await?;
                 return Ok(());
             }
             (Some(attachment), Some(size))
@@ -3445,9 +3474,8 @@ async fn control_loop(
             ClientMessage::PromptAgent {
                 terminal_id,
                 text,
-                wait,
-                timeout_ms,
-            } => match prompt_agent(&shared, terminal_id, text, wait, timeout_ms).await {
+                mode,
+            } => match prompt_agent(&shared, terminal_id, text, mode).await {
                 Ok(result) => {
                     let message = match result.activity {
                         Some(activity) => ServerMessage::AgentSettled {
@@ -3822,14 +3850,15 @@ async fn lease_view(
             format!("terminal already exited with status {exit_code:?}"),
         ));
     }
-    let guard = focused_runtime
+    let acquisition = focused_runtime
         .lease
         .acquire(client, size, Arc::clone(&focused_runtime.handle))
         .ok_or_else(|| DaemonError::new("attachment_error", "client already attached"))?;
     let focused_target = LeasedTarget {
         selected: selected_target(focused, &focused_runtime.handle),
         terminal: Arc::clone(&focused_runtime.handle),
-        lease: guard,
+        lease: acquisition.guard,
+        pending_geometry: Some(acquisition.geometry),
     };
     let mut panes = Vec::with_capacity(paths.len());
     for path in paths {
@@ -3853,16 +3882,24 @@ async fn lease_view(
     let layout = retain_observed_layout(layout, &panes)?;
     let revision = state.resources.focus_pane(focused.pane_id)?;
     state.publish_resource_change(revision);
-    Ok(Attachment::new(
-        client,
-        panes,
-        focused_target,
-        layout,
-        fallback_terminal_ids,
-        state.resources.revision(),
-        state.resource_changes.subscribe(),
-        state.presence.subscribe(),
-    ))
+    let resource_changes = state.resource_changes.subscribe();
+    let presence_changes = state.presence.subscribe();
+    let mut attachment = Attachment::new(
+        AttachmentInit {
+            owner: client,
+            size,
+            panes,
+            focused: focused_target,
+            layout,
+            fallback_terminal_ids,
+            resource_revision: state.resources.revision(),
+        },
+        resource_changes,
+        presence_changes,
+    );
+    drop(state);
+    attachment.focused.apply_acquisition_geometry().await?;
+    Ok(attachment)
 }
 
 fn validate_selection_expectation(
@@ -3924,6 +3961,7 @@ async fn focus_leased_attachment(
     attachment: &mut Attachment,
     mut focused: LeasedTarget,
 ) -> Result<(), DaemonError> {
+    focused.apply_acquisition_geometry().await?;
     attachment
         .clear_active_copy_mode()
         .await
@@ -4190,6 +4228,8 @@ async fn open_location(
         let mut destination = state
             .resources
             .checkout_destination(&resolved.project, &resolved.workspace_root)?;
+        let mut replacing = None;
+        let mut planned_resources = None;
         if let CheckoutDestination::Existing(workspace_id) = destination {
             let path = state
                 .resources
@@ -4203,14 +4243,16 @@ async fn open_location(
                 .borrow()
                 .clone();
             if matches!(exited_terminal, TerminalLifecycle::Exited { .. }) {
-                state.finalize_terminal_for_replacement(path.terminal_id)?;
-                // This accepted open replaces the now-empty checkout rather than
-                // turning a natural terminal exit into daemon shutdown.
-                state.accepting = true;
-                destination = state
-                    .resources
-                    .checkout_destination(&resolved.project, &resolved.workspace_root)?;
+                // Plan against a clone first. The live tree and daemon
+                // acceptance state remain untouched until any replacement
+                // process has spawned successfully.
+                let mut planned = state.resources.clone();
+                planned.terminal_exited(path.terminal_id)?;
+                destination =
+                    planned.checkout_destination(&resolved.project, &resolved.workspace_root)?;
                 if let CheckoutDestination::Existing(workspace_id) = destination {
+                    state.finalize_terminal_for_replacement(path.terminal_id)?;
+                    state.accepting = true;
                     let replacement = state
                         .resources
                         .initial_terminal_for_workspace(workspace_id)?;
@@ -4226,6 +4268,8 @@ async fn open_location(
                         OpenDisposition::Existing,
                     ));
                 }
+                replacing = Some(path.terminal_id);
+                planned_resources = Some(planned);
             } else {
                 let runtime = &state.runtimes[&path.terminal_id];
                 return Ok((
@@ -4234,11 +4278,10 @@ async fn open_location(
                 ));
             }
         }
-        let session_name = name.clone().unwrap_or_else(|| {
-            state
-                .resources
-                .available_session_name(&resolved.suggested_session_name)
-        });
+        let resources = planned_resources.as_ref().unwrap_or(&state.resources);
+        let session_name = name
+            .clone()
+            .unwrap_or_else(|| resources.available_session_name(&resolved.suggested_session_name));
         // `name` names the workspace only when it joins an existing session;
         // on a fresh session it names the session and the workspace starts
         // unnamed, presenting as its live location.
@@ -4256,7 +4299,7 @@ async fn open_location(
             pane_id: PaneId::new(),
             terminal_id: TerminalId::new(),
         };
-        let mut validated = state.resources.clone();
+        let mut validated = resources.clone();
         match destination {
             CheckoutDestination::CreateSession => {
                 validated.create_session(proposed_session.clone())?;
@@ -4299,6 +4342,9 @@ async fn open_location(
             })
             .map_err(|error| DaemonError::new("spawn_failed", error.to_string()))?,
         );
+        let commit = replacing
+            .map(|terminal_id| state.finalize_terminal_for_replacement(terminal_id))
+            .transpose();
         let (path, disposition, insertion) = match destination {
             CheckoutDestination::CreateSession => {
                 let path = proposed_session;
@@ -4309,7 +4355,8 @@ async fn open_location(
                     pane_id: path.pane_id,
                     terminal_id: path.terminal_id,
                 };
-                let insertion = state.register_session(path, Arc::clone(&terminal));
+                let insertion = commit
+                    .and_then(|_| state.register_session(path.clone(), Arc::clone(&terminal)));
                 (selected, OpenDisposition::SessionCreated, insertion)
             }
             CheckoutDestination::AddWorkspace { session_id } => {
@@ -4321,11 +4368,18 @@ async fn open_location(
                     pane_id: path.pane_id,
                     terminal_id: path.terminal_id,
                 };
-                let insertion = state.register_workspace(session_id, path, Arc::clone(&terminal));
+                let insertion = commit.and_then(|_| {
+                    state.register_workspace(session_id, path.clone(), Arc::clone(&terminal))
+                });
                 (selected, OpenDisposition::WorkspaceCreated, insertion)
             }
             CheckoutDestination::Existing(_) => unreachable!(),
         };
+        if replacing.is_some() && insertion.is_ok() {
+            // A successful replacement keeps the daemon live even when the
+            // finalized terminal was the last resource in the old tree.
+            state.accepting = true;
+        }
         let selected = selected_target(path, &terminal);
         (terminal, selected, disposition, insertion.err())
     };
@@ -4507,14 +4561,15 @@ async fn create_workspace(
                         .runtimes
                         .get(&terminal.id())
                         .expect("new runtime inserted");
-                    let guard = runtime
+                    let acquisition = runtime
                         .lease
                         .acquire(client, size, Arc::clone(&terminal))
                         .expect("new terminal has an independent lease");
                     CreatedTerminal::Attached(LeasedTarget {
                         selected,
                         terminal: Arc::clone(&terminal),
-                        lease: guard,
+                        lease: acquisition.guard,
+                        pending_geometry: Some(acquisition.geometry),
                     })
                 }
             }),
@@ -4627,14 +4682,15 @@ async fn create_tab(
                         .runtimes
                         .get(&terminal.id())
                         .expect("new runtime inserted");
-                    let guard = runtime
+                    let acquisition = runtime
                         .lease
                         .acquire(client, size, Arc::clone(&terminal))
                         .expect("new terminal has an independent lease");
                     let target = LeasedTarget {
                         selected,
                         terminal: Arc::clone(&terminal),
-                        lease: guard,
+                        lease: acquisition.guard,
+                        pending_geometry: Some(acquisition.geometry),
                     };
                     CreatedTerminal::Attached(target)
                 }
@@ -4800,14 +4856,15 @@ async fn create_pane(
                         .runtimes
                         .get(&terminal.id())
                         .expect("new runtime inserted");
-                    let guard = runtime
+                    let acquisition = runtime
                         .lease
                         .acquire(client, size, Arc::clone(&terminal))
                         .expect("new terminal has an independent lease");
                     CreatedTerminal::Attached(LeasedTarget {
                         selected,
                         terminal: Arc::clone(&terminal),
-                        lease: guard,
+                        lease: acquisition.guard,
+                        pending_geometry: Some(acquisition.geometry),
                     })
                 }
             }),
@@ -5276,8 +5333,7 @@ async fn prompt_agent(
     shared: &Shared,
     terminal_id: TerminalId,
     text: String,
-    wait: bool,
-    timeout_ms: Option<u64>,
+    mode: AgentPromptMode,
 ) -> Result<AgentCommandResult, DaemonError> {
     if text.len() > MAX_AGENT_PROMPT_BYTES {
         return Err(DaemonError::new(
@@ -5288,17 +5344,13 @@ async fn prompt_agent(
             ),
         ));
     }
-    if wait {
-        validate_agent_timeout(
-            timeout_ms
-                .ok_or_else(|| DaemonError::new("invalid_timeout", "--wait requires a timeout"))?,
-        )?;
-    } else if timeout_ms.is_some() {
-        return Err(DaemonError::new(
-            "invalid_timeout",
-            "a prompt timeout requires wait=true",
-        ));
-    }
+    let timeout_ms = match mode {
+        AgentPromptMode::Submit => None,
+        AgentPromptMode::Wait { timeout_ms } => {
+            validate_agent_timeout(timeout_ms)?;
+            Some(timeout_ms)
+        }
+    };
 
     // Subscribe and capture the barrier under one lock. Reports racing the
     // terminal write are retained even if Working and Completed arrive before
@@ -5347,20 +5399,20 @@ async fn prompt_agent(
         .paste_and_input(text, vec![b'\r'])
         .await
         .map_err(agent_input_error)?;
-    if !wait {
+    let Some(timeout_ms) = timeout_ms else {
         return Ok(AgentCommandResult {
             barrier_revision,
             working_revision: None,
             activity: None,
         });
-    }
+    };
     wait_for_agent_events(
         shared,
         terminal_id,
         barrier_revision,
         None,
         true,
-        timeout_ms.expect("validated wait timeout"),
+        timeout_ms,
         events,
         &mut lifecycle,
     )
@@ -6278,23 +6330,27 @@ mod tests {
             columns: 80,
             rows: 24,
         };
-        let guard = lease.acquire(owner, size, Arc::clone(&terminal)).unwrap();
+        let acquisition = lease.acquire(owner, size, Arc::clone(&terminal)).unwrap();
         let (_, resource_changes) = watch::channel(0);
         let (_, presence_changes) = watch::channel(ClientPresenceSnapshot::default());
         let attachment = Attachment::new(
-            owner,
-            vec![ObservedTarget {
-                selected: selected.clone(),
-                terminal: Arc::clone(&terminal),
-            }],
-            LeasedTarget {
-                selected,
-                terminal: Arc::clone(&terminal),
-                lease: guard,
+            AttachmentInit {
+                owner,
+                size,
+                panes: vec![ObservedTarget {
+                    selected: selected.clone(),
+                    terminal: Arc::clone(&terminal),
+                }],
+                focused: LeasedTarget {
+                    selected,
+                    terminal: Arc::clone(&terminal),
+                    lease: acquisition.guard,
+                    pending_geometry: Some(acquisition.geometry),
+                },
+                layout: SplitTree::leaf(pane_id),
+                fallback_terminal_ids: Vec::new(),
+                resource_revision: 0,
             },
-            SplitTree::leaf(pane_id),
-            Vec::new(),
-            0,
             resource_changes,
             presence_changes,
         );
@@ -6540,7 +6596,10 @@ mod tests {
         state.expected_finalizations.insert(path.terminal_id);
         let before = state.resources.snapshot();
 
-        assert!(!state.finalize_terminal(path.terminal_id).unwrap());
+        assert_eq!(
+            state.finalize_terminal(path.terminal_id).unwrap(),
+            FinalizationOutcome::AlreadyFinalized
+        );
         assert_eq!(state.resources.snapshot(), before);
         assert!(state.finalize_terminal(path.terminal_id).is_err());
         assert_eq!(state.resources.snapshot(), before);
@@ -6682,13 +6741,83 @@ mod tests {
             },
         );
 
-        assert!(state.finalize_terminal_for_replacement(old_id).unwrap());
+        assert_eq!(
+            state.finalize_terminal_for_replacement(old_id).unwrap(),
+            FinalizationOutcome::MultiplexerEmpty
+        );
         assert!(!state.accepting);
         state.accepting = true;
 
         assert!(state.accepting);
-        assert!(!state.finalize_terminal(old_id).unwrap());
+        assert_eq!(
+            state.finalize_terminal(old_id).unwrap(),
+            FinalizationOutcome::AlreadyFinalized
+        );
         assert!(state.accepting);
+    }
+
+    #[tokio::test]
+    async fn failed_last_terminal_replacement_leaves_live_state_untouched() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let resolved = ResolvedLocation {
+            cwd: root.clone(),
+            project: crate::resources::Project {
+                identity: crate::resources::ProjectIdentity::CanonicalDirectory(root.clone()),
+            },
+            workspace_root: root.clone(),
+            suggested_session_name: "replacement".into(),
+            workspace_kind: crate::project::WorkspaceKind::Directory,
+        };
+        let terminal = Arc::new(
+            spawn_terminal(SpawnSpec {
+                id: TerminalId::new(),
+                program: "/bin/sh".into(),
+                argv: vec!["-c".into(), "exit 0".into()],
+                cwd: root.clone(),
+                env: HashMap::new(),
+                size: TerminalSize {
+                    columns: 80,
+                    rows: 24,
+                },
+            })
+            .unwrap(),
+        );
+        let path = initial_path(&resolved, "replacement".into(), terminal.id());
+        let (mut state, _) = inconsistent_state();
+        state.resources = ResourceTree::default();
+        state
+            .register_session(path.clone(), Arc::clone(&terminal))
+            .unwrap();
+        let mut lifecycle = terminal.subscribe_lifecycle();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while matches!(*lifecycle.borrow_and_update(), TerminalLifecycle::Running) {
+                lifecycle.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let before = state.resources.snapshot();
+        let shared = Arc::new(Mutex::new(state));
+        let (exited, _) = mpsc::unbounded_channel();
+
+        let error = open_location(
+            &shared,
+            &exited,
+            None,
+            root,
+            Some("/definitely/missing/fut-shell".into()),
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code, "spawn_failed");
+        let state = shared.lock().await;
+        assert!(state.accepting);
+        assert_eq!(state.resources.snapshot(), before);
+        assert!(state.runtimes.contains_key(&path.terminal_id));
+        assert!(!state.expected_finalizations.contains(&path.terminal_id));
     }
 
     #[tokio::test]
@@ -6721,7 +6850,10 @@ mod tests {
             .unwrap();
         assert_eq!(added.terminal_id, terminal_id);
         assert!(state.runtimes.contains_key(&terminal_id));
-        assert!(!state.finalize_terminal(terminal_id).unwrap());
+        assert_eq!(
+            state.finalize_terminal(terminal_id).unwrap(),
+            FinalizationOutcome::ResourcesRemain
+        );
         assert!(!state.runtimes.contains_key(&terminal_id));
         assert!(
             state

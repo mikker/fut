@@ -15,8 +15,8 @@ use crate::{
 
 use super::{
     config::{
-        GroupConfig, MINIMIZED_SIDEBAR_WIDTH, SemanticStyle, SidebarDisplay, SidebarVisibility,
-        TabBarPosition, UiConfig,
+        GroupConfig, MINIMIZED_SIDEBAR_WIDTH, SegmentConfig, SemanticStyle, SidebarDisplay,
+        SidebarVisibility, TabBarPosition, UiConfig,
     },
     hotkey::{HotkeyButton, HotkeyLine},
     notifications::{ActivityIndicator, NotificationState},
@@ -382,6 +382,33 @@ struct ResolvedGroup {
     allocation: usize,
 }
 
+/// The fully resolved tab-bar layout for one terminal row. Rendering and hit
+/// testing both consume this scene so configured lane allocation cannot drift
+/// from clickable geometry.
+struct TabBarScene {
+    groups: Vec<PlacedTabBarGroup>,
+}
+
+struct PlacedTabBarGroup {
+    x: usize,
+    width: usize,
+    line: Line<'static>,
+    tabs: Vec<VisibleTab>,
+    hotkeys: Option<PlacedHotkeys>,
+}
+
+#[derive(Clone, Copy)]
+struct VisibleTab {
+    id: TabId,
+    x: usize,
+    width: usize,
+}
+
+struct PlacedHotkeys {
+    x: usize,
+    line: HotkeyLine<TabBarHotkey>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum TabBarHotkey {
     Create,
@@ -393,6 +420,129 @@ pub(super) enum TabBarHotkey {
 pub(super) enum TabBarHit {
     Item(TabId),
     Hotkey(TabBarHotkey),
+}
+
+impl TabBarScene {
+    fn build(
+        model: &TabBarModel,
+        zoomed: bool,
+        selected: Option<TabId>,
+        spinner_frame: usize,
+        ui: &UiConfig,
+        width: usize,
+    ) -> Self {
+        let mut groups = resolved_groups(model, zoomed, selected, spinner_frame, ui);
+        allocate_groups(&mut groups, width);
+        let lane_width = |lane| {
+            groups
+                .iter()
+                .filter(|group| group.lane == lane)
+                .map(|group| group.allocation)
+                .sum::<usize>()
+        };
+        let left_width = lane_width(Lane::Left);
+        let center_width = lane_width(Lane::Center);
+        let right_width = lane_width(Lane::Right);
+        let center_x = width
+            .saturating_sub(center_width)
+            .checked_div(2)
+            .unwrap_or(0)
+            .clamp(left_width, width.saturating_sub(right_width + center_width));
+
+        let mut placed = Vec::new();
+        for (lane, mut x) in [
+            (Lane::Left, 0usize),
+            (Lane::Center, center_x),
+            (Lane::Right, width.saturating_sub(right_width)),
+        ] {
+            for group in groups.iter().filter(|group| group.lane == lane) {
+                if group.allocation == 0 {
+                    continue;
+                }
+                let (line, tabs) = if group.tabs {
+                    let visible = visible_tabs(
+                        model,
+                        selected,
+                        group.allocation,
+                        group.style,
+                        spinner_frame,
+                        ui,
+                    );
+                    (visible.line, visible.tabs)
+                } else {
+                    (truncate_line(&group.line, group.allocation), Vec::new())
+                };
+                let hotkeys = group
+                    .hotkeys
+                    .then(|| {
+                        let hotkeys = tab_bar_hotkeys(group.style, ui);
+                        let rendered = group.line.to_string();
+                        let needle = hotkeys.line.to_string();
+                        rendered.find(&needle).map(|byte_offset| PlacedHotkeys {
+                            x: UnicodeWidthStr::width(&rendered[..byte_offset]),
+                            line: hotkeys,
+                        })
+                    })
+                    .flatten();
+                placed.push(PlacedTabBarGroup {
+                    x,
+                    width: group.allocation,
+                    line,
+                    tabs,
+                    hotkeys,
+                });
+                x += group.allocation;
+            }
+        }
+        Self { groups: placed }
+    }
+
+    fn hit_at(&self, column: usize) -> Option<TabBarHit> {
+        let group = self
+            .groups
+            .iter()
+            .find(|group| column >= group.x && column < group.x + group.width)?;
+        let column = column - group.x;
+        if let Some(tab) = group
+            .tabs
+            .iter()
+            .find(|tab| column >= tab.x && column < tab.x + tab.width)
+        {
+            return Some(TabBarHit::Item(tab.id));
+        }
+        let hotkeys = group.hotkeys.as_ref()?;
+        hotkeys
+            .line
+            .action_at(column.saturating_sub(hotkeys.x))
+            .map(TabBarHit::Hotkey)
+    }
+}
+
+fn tab_bar_model(
+    snapshot: Option<&ResourceSnapshot>,
+    focused: &SelectedTarget,
+    notifications: &NotificationState,
+) -> TabBarModel {
+    snapshot
+        .and_then(|snapshot| TabBarModel::from_snapshot(snapshot, focused, notifications))
+        .unwrap_or_else(|| TabBarModel {
+            session_name: "session".into(),
+            session_tokens: MaterializedTokenMap::new(),
+            workspace_name: "workspace".into(),
+            workspace_tokens: MaterializedTokenMap::new(),
+            pane_tokens: MaterializedTokenMap::new(),
+            tabs: vec![TabItem {
+                id: focused.tab_id,
+                name: "tab".into(),
+                closing: false,
+                pane_count: 1,
+                tokens: MaterializedTokenMap::new(),
+                activity: None,
+            }],
+            active: 0,
+            client_waiting: 0,
+            session_waiting: 0,
+        })
 }
 
 #[allow(
@@ -418,74 +568,23 @@ pub(super) fn render_tab_bar(
         ui.styles.apply(SemanticStyle::Normal, Style::default()),
         buffer,
     );
-    let width = usize::from(area.width);
-    let model = snapshot
-        .and_then(|snapshot| TabBarModel::from_snapshot(snapshot, focused, notifications))
-        .unwrap_or_else(|| TabBarModel {
-            session_name: "session".into(),
-            session_tokens: MaterializedTokenMap::new(),
-            workspace_name: "workspace".into(),
-            workspace_tokens: MaterializedTokenMap::new(),
-            pane_tokens: MaterializedTokenMap::new(),
-            tabs: vec![TabItem {
-                id: focused.tab_id,
-                name: "tab".into(),
-                closing: false,
-                pane_count: 1,
-                tokens: MaterializedTokenMap::new(),
-                activity: None,
-            }],
-            active: 0,
-            client_waiting: 0,
-            session_waiting: 0,
-        });
-    let mut groups = resolved_groups(&model, zoomed, selected, spinner_frame, ui);
-    allocate_groups(&mut groups, width);
-    let lane_width = |lane| {
-        groups
-            .iter()
-            .filter(|group| group.lane == lane)
-            .map(|group| group.allocation)
-            .sum::<usize>()
-    };
-    let left_width = lane_width(Lane::Left);
-    let center_width = lane_width(Lane::Center);
-    let right_width = lane_width(Lane::Right);
-    let center_x = width
-        .saturating_sub(center_width)
-        .checked_div(2)
-        .unwrap_or(0)
-        .clamp(left_width, width.saturating_sub(right_width + center_width));
-    for (lane, mut x) in [
-        (Lane::Left, 0usize),
-        (Lane::Center, center_x),
-        (Lane::Right, width.saturating_sub(right_width)),
-    ] {
-        for group in groups.iter().filter(|group| group.lane == lane) {
-            if group.allocation == 0 {
-                continue;
-            }
-            let line = if group.tabs {
-                visible_tabs(
-                    &model,
-                    selected,
-                    group.allocation,
-                    group.style,
-                    spinner_frame,
-                    ui,
-                )
-                .0
-            } else {
-                truncate_line(&group.line, group.allocation)
-            };
-            buffer.set_line(
-                area.x.saturating_add(u16::try_from(x).unwrap_or(u16::MAX)),
-                area.y,
-                &line,
-                u16::try_from(group.allocation).unwrap_or(u16::MAX),
-            );
-            x += group.allocation;
-        }
+    let model = tab_bar_model(snapshot, focused, notifications);
+    let scene = TabBarScene::build(
+        &model,
+        zoomed,
+        selected,
+        spinner_frame,
+        ui,
+        usize::from(area.width),
+    );
+    for group in scene.groups {
+        buffer.set_line(
+            area.x
+                .saturating_add(u16::try_from(group.x).unwrap_or(u16::MAX)),
+            area.y,
+            &group.line,
+            u16::try_from(group.width).unwrap_or(u16::MAX),
+        );
     }
 }
 
@@ -509,63 +608,15 @@ pub(super) fn tab_bar_hit_at(
         return None;
     }
     let model = TabBarModel::from_snapshot(snapshot, focused, notifications)?;
-    let width = usize::from(area.width);
-    let mut groups = resolved_groups(&model, zoomed, selected, spinner_frame, ui);
-    allocate_groups(&mut groups, width);
-    let lane_width = |lane| {
-        groups
-            .iter()
-            .filter(|group| group.lane == lane)
-            .map(|group| group.allocation)
-            .sum::<usize>()
-    };
-    let left_width = lane_width(Lane::Left);
-    let center_width = lane_width(Lane::Center);
-    let right_width = lane_width(Lane::Right);
-    let center_x = width
-        .saturating_sub(center_width)
-        .checked_div(2)
-        .unwrap_or(0)
-        .clamp(left_width, width.saturating_sub(right_width + center_width));
-    let clicked = usize::from(column - area.x);
-    for (lane, mut x) in [
-        (Lane::Left, 0usize),
-        (Lane::Center, center_x),
-        (Lane::Right, width.saturating_sub(right_width)),
-    ] {
-        for group in groups.iter().filter(|group| group.lane == lane) {
-            if clicked >= x && clicked < x + group.allocation {
-                if group.tabs
-                    && let Some(tab) = visible_tab_at(
-                        &model,
-                        selected,
-                        group.allocation,
-                        group.style,
-                        spinner_frame,
-                        ui,
-                        clicked - x,
-                    )
-                {
-                    return Some(TabBarHit::Item(tab));
-                }
-                if group.hotkeys {
-                    let hotkeys = tab_bar_hotkeys(group.style, ui);
-                    let rendered = group.line.to_string();
-                    let needle = hotkeys.line.to_string();
-                    if let Some(byte_offset) = rendered.find(&needle) {
-                        let cell_offset = UnicodeWidthStr::width(&rendered[..byte_offset]);
-                        if let Some(action) =
-                            hotkeys.action_at(clicked.saturating_sub(x + cell_offset))
-                        {
-                            return Some(TabBarHit::Hotkey(action));
-                        }
-                    }
-                }
-            }
-            x += group.allocation;
-        }
-    }
-    None
+    TabBarScene::build(
+        &model,
+        zoomed,
+        selected,
+        spinner_frame,
+        ui,
+        usize::from(area.width),
+    )
+    .hit_at(usize::from(column - area.x))
 }
 
 fn resolved_groups(
@@ -585,11 +636,11 @@ fn resolved_groups(
             let tabs = group
                 .segments
                 .iter()
-                .any(|segment| segment.component.as_deref() == Some("tabs"));
+                .any(|segment| matches!(segment, SegmentConfig::Tabs));
             let hotkeys = group
                 .segments
                 .iter()
-                .any(|segment| segment.token.as_deref() == Some("client.help"));
+                .any(|segment| matches!(segment, SegmentConfig::Token { token, .. } if token == "client.help"));
             let line = if tabs {
                 selected_line(
                     model,
@@ -728,6 +779,11 @@ fn allocate_groups(groups: &mut [ResolvedGroup], width: usize) {
     }
 }
 
+struct VisibleTabs {
+    line: Line<'static>,
+    tabs: Vec<VisibleTab>,
+}
+
 fn visible_tabs(
     model: &TabBarModel,
     selected: Option<TabId>,
@@ -735,9 +791,12 @@ fn visible_tabs(
     component_style: Option<SemanticStyle>,
     spinner_frame: usize,
     ui: &UiConfig,
-) -> (Line<'static>, bool) {
+) -> VisibleTabs {
     if width == 0 {
-        return (Line::default(), false);
+        return VisibleTabs {
+            line: Line::default(),
+            tabs: Vec::new(),
+        };
     }
     let anchor = selected
         .and_then(|id| model.tabs.iter().position(|tab| tab.id == id))
@@ -773,12 +832,23 @@ fn visible_tabs(
             if selected == Some(tab.id) {
                 style = ui.styles.apply(SemanticStyle::Selected, style);
             }
-            return (
-                Line::styled(format!("{:^width$}", marker.text), style),
-                false,
-            );
+            return VisibleTabs {
+                line: Line::styled(format!("{:^width$}", marker.text), style),
+                tabs: vec![VisibleTab {
+                    id: tab.id,
+                    x: 0,
+                    width,
+                }],
+            };
         }
-        return (truncate_line(&fallback, width), false);
+        return VisibleTabs {
+            line: truncate_line(&fallback, width),
+            tabs: vec![VisibleTab {
+                id: model.tabs[anchor].id,
+                x: 0,
+                width,
+            }],
+        };
     }
 
     loop {
@@ -812,74 +882,6 @@ fn visible_tabs(
             if candidate.width() <= width {
                 last += 1;
                 line = candidate;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    (line, first == 0 && last + 1 == model.tabs.len())
-}
-
-fn visible_tab_at(
-    model: &TabBarModel,
-    selected: Option<TabId>,
-    width: usize,
-    component_style: Option<SemanticStyle>,
-    spinner_frame: usize,
-    ui: &UiConfig,
-    column: usize,
-) -> Option<TabId> {
-    if width == 0 || column >= width {
-        return None;
-    }
-    let anchor = selected
-        .and_then(|id| model.tabs.iter().position(|tab| tab.id == id))
-        .unwrap_or(model.active);
-    let mut first = anchor;
-    let mut last = anchor;
-    let line = selected_line(
-        model,
-        selected,
-        first,
-        last,
-        component_style,
-        spinner_frame,
-        ui,
-    );
-    if line.width() > width {
-        return Some(model.tabs[anchor].id);
-    }
-    loop {
-        let mut changed = false;
-        if first > 0 {
-            let candidate = selected_line(
-                model,
-                selected,
-                first - 1,
-                last,
-                component_style,
-                spinner_frame,
-                ui,
-            );
-            if candidate.width() <= width {
-                first -= 1;
-                changed = true;
-            }
-        }
-        if last + 1 < model.tabs.len() {
-            let candidate = selected_line(
-                model,
-                selected,
-                first,
-                last + 1,
-                component_style,
-                spinner_frame,
-                ui,
-            );
-            if candidate.width() <= width {
-                last += 1;
                 changed = true;
             }
         }
@@ -888,16 +890,19 @@ fn visible_tab_at(
         }
     }
     let overflow_width = format!(" {} ", ui.icons.resolve().overflow).width();
-    let mut x = if first > 0 { overflow_width } else { 0 };
+    let mut x = usize::from(first > 0) * overflow_width;
+    let mut tabs = Vec::with_capacity(last - first + 1);
     for index in first..=last {
         let item_width =
             render_tab_item(model, index, selected, component_style, spinner_frame, ui).width();
-        if column >= x && column < x + item_width {
-            return Some(model.tabs[index].id);
-        }
+        tabs.push(VisibleTab {
+            id: model.tabs[index].id,
+            x,
+            width: item_width,
+        });
         x += item_width;
     }
-    None
+    VisibleTabs { line, tabs }
 }
 
 fn selected_line(
@@ -1216,12 +1221,13 @@ mod tests {
         let model =
             TabBarModel::from_snapshot(&snapshot, &focused, &NotificationState::default()).unwrap();
         let group = GroupConfig {
-            segments: vec![super::super::config::SegmentConfig {
-                token: Some("workspace.extension.run.launching".into()),
+            segments: vec![super::super::config::SegmentConfig::Token {
+                token: "workspace.extension.run.launching".into(),
                 style: Some(SemanticStyle::Attention),
-                inverted: true,
-                pill: true,
-                ..Default::default()
+                prefix: String::new(),
+                suffix: String::new(),
+                max_width: None,
+                visual: super::super::config::TokenVisual::Pill,
             }],
             ..Default::default()
         };
@@ -1275,9 +1281,13 @@ mod tests {
                 "pane.extension.demo.value",
             ]
             .into_iter()
-            .map(|token| super::super::config::SegmentConfig {
-                token: Some(token.into()),
-                ..Default::default()
+            .map(|token| super::super::config::SegmentConfig::Token {
+                token: token.into(),
+                style: None,
+                prefix: String::new(),
+                suffix: String::new(),
+                max_width: None,
+                visual: super::super::config::TokenVisual::Plain,
             })
             .collect(),
             ..Default::default()
@@ -1751,6 +1761,29 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(visible.windows(2).all(|pair| pair[0].0 < pair[1].0));
         assert!(text.matches('…').count() <= 2);
+    }
+
+    #[test]
+    fn tab_bar_scene_uses_the_rendered_tab_geometry_for_hits() {
+        let (snapshot, focused) = fixture(&["one", "two", "three", "four"], 1);
+        let model =
+            TabBarModel::from_snapshot(&snapshot, &focused, &NotificationState::default()).unwrap();
+        let scene = TabBarScene::build(&model, false, None, 0, &UiConfig::default(), 18);
+
+        let rendered_tabs = scene
+            .groups
+            .iter()
+            .flat_map(|group| {
+                group
+                    .tabs
+                    .iter()
+                    .map(move |tab| (group.x + tab.x, tab.width, TabBarHit::Item(tab.id)))
+            })
+            .collect::<Vec<_>>();
+        assert!(!rendered_tabs.is_empty());
+        for (x, width, hit) in rendered_tabs {
+            assert!((x..x + width).all(|column| scene.hit_at(column) == Some(hit)));
+        }
     }
 
     #[test]
