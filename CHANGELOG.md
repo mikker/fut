@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Sidebars with multiple components now show dividers between each section.
 - Exited Pi and Claude Code sessions now disappear from agent lists instead of remaining as idle agents.
 - Added `--config-dir` for launching Fut with configuration from an alternate directory, including an empty directory for stock defaults.
 - Agent notification read status is now shared daemon-wide, and `fut agent list` reports per-agent unread state plus a total unread count for external status bars.

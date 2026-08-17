@@ -1141,6 +1141,7 @@ impl SidebarState {
                 ),
             }
         }
+        render_component_dividers(&geometry, self.side, ui, buffer);
     }
 
     pub(super) const fn side(&self) -> SidebarSide {
@@ -1181,16 +1182,25 @@ struct ComponentGeometry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SidebarGeometry {
     components: Vec<ComponentGeometry>,
+    dividers: Vec<Rect>,
 }
 
 impl SidebarGeometry {
     fn new(area: Rect, components: &[SidebarComponentConfig]) -> Self {
+        let divider_count = components
+            .len()
+            .saturating_sub(1)
+            .min(usize::from(area.height.saturating_sub(
+                u16::try_from(components.len()).unwrap_or(u16::MAX),
+            )));
+        let component_height = area
+            .height
+            .saturating_sub(u16::try_from(divider_count).unwrap_or(u16::MAX));
         let has_fill = components
             .iter()
             .any(|component| component.size() == SidebarComponentSize::Fill);
-        let mut fixed_budget = area
-            .height
-            .saturating_sub(u16::from(has_fill && area.height > 0));
+        let mut fixed_budget =
+            component_height.saturating_sub(u16::from(has_fill && component_height > 0));
         let fixed_heights = components
             .iter()
             .map(|component| match component.size() {
@@ -1204,9 +1214,11 @@ impl SidebarGeometry {
             .collect::<Vec<_>>();
         let fill_rows = area
             .height
+            .saturating_sub(u16::try_from(divider_count).unwrap_or(u16::MAX))
             .saturating_sub(fixed_heights.iter().copied().sum::<u16>());
         let mut y = area.y;
-        let mut remaining = area.height;
+        let mut remaining = component_height;
+        let mut dividers = Vec::with_capacity(divider_count);
         let components = components
             .iter()
             .enumerate()
@@ -1222,10 +1234,17 @@ impl SidebarGeometry {
                 };
                 y = y.saturating_add(height);
                 remaining = remaining.saturating_sub(height);
+                if index < divider_count {
+                    dividers.push(Rect::new(area.x, y, area.width, 1));
+                    y = y.saturating_add(1);
+                }
                 geometry
             })
             .collect();
-        Self { components }
+        Self {
+            components,
+            dividers,
+        }
     }
 
     fn component_at(&self, column: u16, row: u16) -> Option<ComponentGeometry> {
@@ -1233,6 +1252,45 @@ impl SidebarGeometry {
             .iter()
             .copied()
             .find(|component| rect_contains(component.area, column, row))
+    }
+}
+
+fn render_component_dividers(
+    geometry: &SidebarGeometry,
+    side: SidebarSide,
+    ui: &UiConfig,
+    buffer: &mut Buffer,
+) {
+    let normal = ui.styles.apply(SemanticStyle::Normal, Style::default());
+    let style = ui.styles.apply(SemanticStyle::Divider, normal);
+    let (horizontal, junction) = match ui.icons.preset {
+        IconPreset::Ascii => ("-", "+"),
+        IconPreset::Unicode | IconPreset::NerdFont => (
+            "─",
+            match side {
+                SidebarSide::Left => "┤",
+                SidebarSide::Right => "├",
+            },
+        ),
+    };
+    for divider in &geometry.dividers {
+        let Some(content) = sidebar_content(*divider, side) else {
+            continue;
+        };
+        for column in content.x..content.right() {
+            if let Some(cell) = buffer.cell_mut((column, divider.y)) {
+                cell.set_symbol(horizontal).set_style(style);
+            }
+        }
+        if divider.width > 1 {
+            let column = match side {
+                SidebarSide::Left => divider.right() - 1,
+                SidebarSide::Right => divider.x,
+            };
+            if let Some(cell) = buffer.cell_mut((column, divider.y)) {
+                cell.set_symbol(junction).set_style(style);
+            }
+        }
     }
 }
 
@@ -1599,6 +1657,7 @@ pub(super) fn render_sidebar(
             }
         }
     }
+    render_component_dividers(&geometry, side, ui, buffer);
 }
 
 #[allow(
@@ -3444,18 +3503,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sidebar.focused_component, 0);
-        let area = Rect::new(0, 0, 28, 16);
+        let area = Rect::new(0, 0, 28, 17);
         assert_eq!(
             sidebar.workspace_item_id_at(area, &ui, 2, 2),
             None,
             "agent rows are not workspace context-menu targets"
         );
         assert_eq!(
-            sidebar.workspace_item_id_at(area, &ui, 2, 13),
+            sidebar.workspace_item_id_at(area, &ui, 2, 14),
             Some(snapshot.sessions[0].workspaces[2].id)
         );
         assert_eq!(
-            sidebar.click(area, &ui, 2, 13),
+            sidebar.click(area, &ui, 2, 14),
             ComponentEffect::Navigate(
                 destination,
                 NavigationScope::Workspace,
@@ -3565,12 +3624,60 @@ mod tests {
         ];
         let geometry = SidebarGeometry::new(Rect::new(4, 5, 20, 8), &components);
         assert_eq!(geometry.components[0].area, Rect::new(4, 5, 20, 3));
-        assert_eq!(geometry.components[1].area, Rect::new(4, 8, 20, 5));
+        assert_eq!(geometry.dividers, vec![Rect::new(4, 8, 20, 1)]);
+        assert_eq!(geometry.components[1].area, Rect::new(4, 9, 20, 4));
         assert_eq!(geometry.component_at(7, 7).unwrap().index, 0);
-        assert_eq!(geometry.component_at(7, 8).unwrap().index, 1);
+        assert!(geometry.component_at(7, 8).is_none());
+        assert_eq!(geometry.component_at(7, 9).unwrap().index, 1);
 
         let tiny = SidebarGeometry::new(Rect::new(0, 0, 20, 2), &components);
         assert_eq!(tiny.components[0].area.height, 1);
         assert_eq!(tiny.components[1].area.height, 1);
+        assert!(tiny.dividers.is_empty());
+    }
+
+    #[test]
+    fn passive_and_active_sidebars_draw_dividers_between_components() {
+        let (mut snapshot, focused) = fixture(&["one", "two"], 0);
+        integrate(
+            &mut snapshot.sessions[0].workspaces[0].tabs[0].panes[0],
+            "codex",
+            AgentState::Idle,
+        );
+        let ui: UiConfig = toml::from_str(
+            "[sidebar.left]\ncomponents = [{ component = 'agents', size = 3 }, { component = 'workspaces', size = 'fill' }]\n",
+        )
+        .unwrap();
+        let area = Rect::new(0, 0, 10, 8);
+        let sidebar = SidebarState::open(
+            &snapshot,
+            &focused,
+            &NavigationHistory::default(),
+            &NotificationState::default(),
+            SidebarSide::Left,
+            &ui,
+        )
+        .unwrap();
+        let mut passive = Buffer::empty(area);
+        render_sidebar(
+            Some(&snapshot),
+            &focused,
+            &NavigationHistory::default(),
+            &NotificationState::default(),
+            0,
+            area,
+            SidebarSide::Left,
+            &ui,
+            &mut passive,
+        );
+        let mut active = Buffer::empty(area);
+        sidebar.render(area, &ui, 0, &mut active);
+
+        for buffer in [&passive, &active] {
+            for column in 0..9 {
+                assert_eq!(buffer[(column, 3)].symbol(), "─");
+            }
+            assert_eq!(buffer[(9, 3)].symbol(), "┤");
+        }
     }
 }
