@@ -4,14 +4,32 @@ set -eu
 : "${FUT_BIN:?}"
 : "${FUT_SOCKET:?}"
 
-event=$(cat)
-case "$event" in
-  *'"version":1'*'"event":"worktree.removed"'*) ;;
-  *)
-    printf 'wt extension: unsupported lifecycle event\n' >&2
-    exit 64
-    ;;
-esac
+if ! python3 -c '
+import json
+import sys
+
+def reject_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+try:
+    event = json.load(sys.stdin, object_pairs_hook=reject_duplicate_keys)
+except (ValueError, TypeError):
+    sys.exit(1)
+
+version = event.get("version") if isinstance(event, dict) else None
+name = event.get("event") if isinstance(event, dict) else None
+if isinstance(event, dict) and type(version) is int and version == 1 and name == "worktree.removed":
+    sys.exit(0)
+sys.exit(1)
+'; then
+  printf 'wt extension: unsupported lifecycle event\n' >&2
+  exit 64
+fi
 
 # Omitting the workspace ID deliberately asks Fut to validate the complete
 # live caller context inherited by the agent terminal.

@@ -7,6 +7,9 @@ The extension requires [`wt`](https://github.com/mikker/wt) on `PATH`. Any
 configured post-open command must also be available on `PATH`. Set `FUT_WT_BIN`
 to use another `wt` executable.
 
+The `bin/worktree-event` adapter also requires `python3` on `PATH`; it uses only
+Python's standard-library JSON parser to validate lifecycle events.
+
 Add the extension's absolute directory to `~/.config/fut/config.toml`:
 
 ```toml
