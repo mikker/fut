@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Fixed the bundled `wt` command not switching to newly created worktrees.
 - Fixed linked filenames bleeding through or breaking the borders of dialogs drawn over terminal content.
 - Added client lifecycle hooks and a Ghostty extension that follows the active Fut session in the window title and restores the previous title on detach.
 - Added direct key bindings and local argument overrides for extension-supplied commands using their qualified palette slugs.

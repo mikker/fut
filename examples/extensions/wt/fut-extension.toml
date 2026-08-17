@@ -3,5 +3,5 @@ id = "wt"
 [commands.new-worktree]
 title = "New worktree"
 argv = ["./bin/create"]
-# size = { width = 64, height = 10 }
-# activate_opened = true
+size = { width = 64, height = 10 }
+activate_opened = true
