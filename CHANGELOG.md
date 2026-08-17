@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fixed linked filenames bleeding through or breaking the borders of dialogs drawn over terminal content.
+
 ## 0.7
 
 - Added independent, composable sidebars with scoped Workspaces and Agents lists, automatic relevance, compact rails, drawers, resizing, and section dividers.

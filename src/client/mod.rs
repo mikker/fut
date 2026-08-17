@@ -4833,23 +4833,28 @@ impl Widget for Screen<'_> {
                 };
 
                 if let Some(uri) = hyperlink_uri(screen, cell) {
-                    let start = column;
-                    let (text, width) = hyperlink_run(screen, row, start, columns, cell);
-                    column += width;
-                    if let Some(target) = buffer.cell_mut((area.x + start, area.y + row)) {
-                        let symbol = format!("\x1b]8;;{uri}\x1b\\{text}\x1b]8;;\x1b\\");
+                    let width = u16::try_from(UnicodeWidthStr::width(cell.contents.as_str()))
+                        .unwrap_or(1)
+                        .max(1)
+                        .min(columns - column);
+                    if let Some(target) = buffer.cell_mut((area.x + column, area.y + row)) {
+                        // Keep every linked grapheme independently composable. A single
+                        // ForcedWidth run for a whole filename makes Ratatui skip every
+                        // overlaid cell in that run, so dialogs cannot cover part of it.
+                        let symbol = format!("\x1b]8;;{uri}\x1b\\{}\x1b]8;;\x1b\\", cell.contents);
                         target
                             .set_symbol(&symbol)
                             .set_diff_option(CellDiffOption::ForcedWidth(
-                                NonZeroU16::new(width).expect("hyperlink run is non-empty"),
+                                NonZeroU16::new(width).expect("hyperlink cell is non-empty"),
                             ))
                             .set_style(cell_style);
                     }
-                    for trailing in start + 1..column {
+                    for trailing in column + 1..column + width {
                         if let Some(target) = buffer.cell_mut((area.x + trailing, area.y + row)) {
                             target.set_diff_option(CellDiffOption::Skip);
                         }
                     }
+                    column += width;
                 } else {
                     if let Some(target) = buffer.cell_mut((area.x + column, area.y + row)) {
                         target
@@ -4872,53 +4877,6 @@ fn hyperlink_uri<'a>(screen: &'a ScreenSnapshot, cell: &crate::domain::Cell) -> 
                 && !uri.chars().any(char::is_control)
         })
         .map(|uri| uri.as_str())
-}
-
-fn hyperlink_run(
-    screen: &ScreenSnapshot,
-    row: u16,
-    start: u16,
-    columns: u16,
-    first: &crate::domain::Cell,
-) -> (String, u16) {
-    let mut text = String::new();
-    let mut column = start;
-    while column < columns {
-        let index = usize::from(row) * usize::from(screen.size.columns) + usize::from(column);
-        let Some(cell) = screen.cells.get(index) else {
-            break;
-        };
-        if cell.hyperlink != first.hyperlink
-            || cell.style != first.style
-            || cell.selected != first.selected
-        {
-            break;
-        }
-        let width = u16::try_from(UnicodeWidthStr::width(cell.contents.as_str()))
-            .unwrap_or(1)
-            .max(1)
-            .min(columns - column);
-        let occupied_have_same_link = (1..width).all(|offset| {
-            screen
-                .cells
-                .get(index + usize::from(offset))
-                .is_some_and(|tail| {
-                    tail.hyperlink == first.hyperlink
-                        && tail.style == first.style
-                        && tail.selected == first.selected
-                })
-        });
-        if !occupied_have_same_link {
-            if column == start {
-                text.push_str(&cell.contents);
-                column += width;
-            }
-            break;
-        }
-        text.push_str(&cell.contents);
-        column += width;
-    }
-    (text, column - start)
 }
 
 fn style(source: CellStyle, selected: bool) -> Style {
@@ -6649,9 +6607,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn screen_rendering_re_emits_explicit_hyperlinks_with_their_cell_width() {
-        let text = "Example link";
+    fn linked_screen(text: &str, uri: &str) -> ScreenSnapshot {
         let mut screen = ScreenSnapshot::new(
             1,
             TerminalSize {
@@ -6674,21 +6630,44 @@ mod tests {
             },
         )
         .unwrap();
-        screen.hyperlinks.push("https://example.com".into());
+        screen.hyperlinks.push(uri.into());
+        screen
+    }
+
+    #[test]
+    fn screen_rendering_re_emits_explicit_hyperlinks_with_their_cell_width() {
+        let text = "Example link";
+        let screen = linked_screen(text, "https://example.com");
 
         let rendered = bench::render_snapshot(&screen);
-        let cell = &rendered[(0, 0)];
+        for (column, character) in text.chars().enumerate() {
+            let cell = &rendered[(column as u16, 0)];
+            assert_eq!(
+                cell.symbol(),
+                format!("\x1b]8;;https://example.com\x1b\\{character}\x1b]8;;\x1b\\")
+            );
+            assert_eq!(
+                cell.diff_option,
+                CellDiffOption::ForcedWidth(NonZeroU16::new(1).unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn hyperlink_cells_do_not_span_dialog_overlays() {
+        let text = "linked filename across dialog";
+        let screen = linked_screen(text, "file:///tmp/example");
+
+        let mut rendered = bench::render_snapshot(&screen);
+        dialog::render_frame(Rect::new(8, 0, 10, 1), &mut rendered);
+
+        assert!((8..18).all(|column| {
+            rendered[(column, 0)].diff_option == CellDiffOption::None
+                && rendered[(column, 0)].symbol() == " "
+        }));
         assert_eq!(
-            cell.symbol(),
-            "\x1b]8;;https://example.com\x1b\\Example link\x1b]8;;\x1b\\"
-        );
-        assert_eq!(
-            cell.diff_option,
-            CellDiffOption::ForcedWidth(NonZeroU16::new(text.len() as u16).unwrap())
-        );
-        assert!(
-            (1..text.len() as u16)
-                .all(|column| rendered[(column, 0)].diff_option == CellDiffOption::Skip)
+            rendered[(7, 0)].diff_option,
+            CellDiffOption::ForcedWidth(NonZeroU16::new(1).unwrap())
         );
     }
 
