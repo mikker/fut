@@ -460,6 +460,7 @@ mod tests {
                 project: Project {
                     identity: ProjectIdentity::CanonicalDirectory(PathBuf::from("/project")),
                 },
+                trusted_project_config: None,
                 closing: false,
                 workspaces: vec![WorkspaceSnapshot {
                     tokens: Default::default(),
@@ -528,6 +529,7 @@ mod tests {
                     id: SessionId::new(),
                     name: "closing-session".into(),
                     project: project(),
+                    trusted_project_config: None,
                     closing: true,
                     workspaces: vec![workspace(
                         "main",
@@ -540,6 +542,7 @@ mod tests {
                     id: SessionId::new(),
                     name: "closing-workspace".into(),
                     project: project(),
+                    trusted_project_config: None,
                     closing: false,
                     workspaces: vec![workspace(
                         "main",
@@ -552,6 +555,7 @@ mod tests {
                     id: open_session_id,
                     name: "open".into(),
                     project: project(),
+                    trusted_project_config: None,
                     closing: false,
                     workspaces: vec![workspace(
                         "main",

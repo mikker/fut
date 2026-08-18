@@ -100,6 +100,13 @@ version = 1
 focus = "code.agent"
 environment = { RUST_BACKTRACE = "1" }
 
+[extension.wt]
+open_existing = true
+
+[extension.run]
+command = ["mise", "run", "dev"]
+auto_start = true
+
 [[tabs]]
 id = "code"
 cwd = "."
@@ -110,10 +117,10 @@ panes = [
 ]
 
 [[tabs]]
-id = "server"
-name = "development server"
+id = "console"
+name = "project console"
 panes = [
-  { id = "server", command = ["mise", "run", "fresh"] },
+  { id = "shell" },
 ]
 ```
 
@@ -129,6 +136,14 @@ from the workspace checkout root; pane `cwd` overrides tab `cwd`, and a tab
 `cwd` applies to panes that omit one. Environment values layer from recipe to
 tab to pane, with the most specific value winning. `FUT_*` variables are
 reserved for Fut and cannot be set by a recipe.
+
+Namespaced `[extension.ID]` tables are also part of the exact trusted recipe.
+They layer over global extension defaults and are captured when the project
+session is created, so the main checkout, linked worktrees, and logical peer
+workspaces share one approved project configuration. The bundled `wt`
+extension can open existing worktrees with `open_existing = true`; the bundled
+`run` extension can start its managed command in every new workspace with
+`auto_start = true`. Both are disabled by default.
 
 `fut open -- COMMAND...` still takes priority for the recipe-selected focus
 pane when it creates a workspace; the rest of the recipe is unchanged. Recipe
@@ -279,8 +294,9 @@ is accepted or rejected atomically, and references to extension tokens are
 validated with it. See [Extensions](extensions.md) for commands, hooks, tokens,
 limits, payloads, and examples.
 
-The global file and each workspace's `.fut/config.toml` may configure a loaded
-extension with the same namespaced table:
+The global file, a trusted project recipe, and each workspace's
+`.fut/config.toml` may configure a loaded extension with the same namespaced
+table. Values layer global → trusted project → workspace:
 
 ```toml
 [extension.run]
@@ -288,13 +304,15 @@ command = ["just", "run"]
 signal = "STATUS:READY" # optional literal readiness marker
 ```
 
-Workspace values recursively override global defaults for commands and hooks
-invoked in that workspace. Unknown extension IDs and oversized data are errors;
-the extension owns validation of its inner keys and values. Project-local
-configuration is inert until an extension command or lifecycle hook is
-explicitly invoked: loading, opening, or entering a workspace never executes
-the configured command. See the bundled `run` extension for an example that
-starts only through `run:restart`.
+Workspace values recursively override trusted project and global defaults for
+explicit commands invoked there. Unknown extension IDs and oversized data are
+errors; the extension owns validation of its inner keys and values. Fut gives
+extensions the trusted global/project layers separately; the bundled automatic
+behaviors use only those values. Workspace-local values remain inert in the
+bundled extensions until an explicit command is invoked. See the bundled `run`
+extension for optional trusted `auto_start` and manual
+`run:restart`, and the bundled `wt` extension for optional existing-worktree
+discovery.
 
 ## Bindings
 
@@ -383,7 +401,7 @@ Fut cannot reliably detect the active terminal font. Use [`fut doctor`](doctor.m
 
 ## Security boundary
 
-Everything under `ui` remains non-executable: it has no shell commands, file reads, environment interpolation, networking, functions, or expression language, and presentation tokens resolve only already-materialized strings. `trusted_commands` is a deliberate executable trust boundary. Fut executes its `program` directly with the configured `args` and the client's environment; it does not invoke a shell unless you explicitly configure one. Explicit extension roots and namespaced project tables are the equivalent trust decision for extension manifests, their packaged commands, and values those commands may execute. An explicit project `recipe` path is also a global trust decision; a repository `.fut/project.toml` becomes executable only after `fut project trust NAME` approves that canonical file's exact current bytes. Only configure commands, extension directories, and recipes you trust. Commands never run during configuration parsing or rendering; workspace hooks run only from committed daemon mutations, client hooks run only for attachment lifecycle transitions, and recipes run only while creating a new session or workspace. The same-user Unix socket is the authorization boundary for token publication, just as it is for other Fut control commands; Fut does not claim to authenticate the publishing process beyond that boundary.
+Everything under `ui` remains non-executable: it has no shell commands, file reads, environment interpolation, networking, functions, or expression language, and presentation tokens resolve only already-materialized strings. `trusted_commands` is a deliberate executable trust boundary. Fut executes its `program` directly with the configured `args` and the client's environment; it does not invoke a shell unless you explicitly configure one. Explicit extension roots and namespaced project tables are the equivalent trust decision for extension manifests, their packaged commands, and values those commands may execute. An explicit project `recipe` path is also a global trust decision; a repository `.fut/project.toml` becomes executable only after `fut project trust NAME` approves that canonical file's exact current bytes. Only configure commands, extension directories, and recipes you trust. Commands never run during configuration parsing or rendering; resource hooks run only from committed daemon mutations, client hooks run only for attachment lifecycle transitions, and recipes run only while creating a new session or workspace. Trusted recipe extension settings may deliberately make those lifecycle hooks perform work such as opening existing worktrees or starting a managed command. The same-user Unix socket is the authorization boundary for token publication, just as it is for other Fut control commands; Fut does not claim to authenticate the publishing process beyond that boundary.
 
 ## Related
 

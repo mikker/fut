@@ -18,6 +18,7 @@ use super::actions::{
 use crate::{
     command::PopupSize,
     extensions::{self, Extension, ExtensionCommandExecution, ExtensionCommandMode},
+    resources::{ExtensionConfigTable, TrustedProjectConfig},
 };
 
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
@@ -29,8 +30,6 @@ const MAX_EXTENSION_CONFIG_ARRAY_VALUES: usize = 128;
 const MAX_EXTENSION_CONFIG_SERIALIZED_BYTES: usize = 16 * 1024;
 const MAX_SEGMENTS: usize = 64;
 const MAX_TEXT_BYTES: usize = 1024;
-
-type ExtensionConfigTable = serde_json::Map<String, serde_json::Value>;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1404,7 +1403,9 @@ pub(crate) struct ExtensionConfigCatalog {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ResolvedExtensionConfig {
     pub json: String,
+    pub trusted_json: String,
     pub global_source: Option<PathBuf>,
+    pub project_source: Option<PathBuf>,
     pub workspace_source: Option<PathBuf>,
 }
 
@@ -1744,12 +1745,14 @@ pub(super) fn resolve_extension_config(
     ui: &UiConfig,
     extension_id: &str,
     workspace_root: &Path,
+    project: Option<&TrustedProjectConfig>,
 ) -> Result<ResolvedExtensionConfig> {
     resolve_extension_config_for_catalog(
         &ui.extension_config,
         &ui.extensions,
         extension_id,
         workspace_root,
+        project,
     )
 }
 
@@ -1758,8 +1761,15 @@ pub(crate) fn resolve_extension_config_for_catalog(
     extensions: &[Extension],
     extension_id: &str,
     workspace_root: &Path,
+    project: Option<&TrustedProjectConfig>,
 ) -> Result<ResolvedExtensionConfig> {
-    resolve_extension_config_sources(catalog, extensions, extension_id, Some(workspace_root))
+    resolve_extension_config_sources(
+        catalog,
+        extensions,
+        extension_id,
+        Some(workspace_root),
+        project,
+    )
 }
 
 pub(crate) fn resolve_hook_extension_config_for_catalog(
@@ -1767,15 +1777,22 @@ pub(crate) fn resolve_hook_extension_config_for_catalog(
     extensions: &[Extension],
     extension_id: &str,
     workspace_root: &Path,
+    project: Option<&TrustedProjectConfig>,
 ) -> ResolvedHookExtensionConfig {
-    match resolve_extension_config_sources(catalog, extensions, extension_id, Some(workspace_root))
-    {
+    match resolve_extension_config_sources(
+        catalog,
+        extensions,
+        extension_id,
+        Some(workspace_root),
+        project,
+    ) {
         Ok(config) => ResolvedHookExtensionConfig {
             config,
             warning: None,
         },
         Err(workspace_error) => {
-            match resolve_extension_config_sources(catalog, extensions, extension_id, None) {
+            match resolve_extension_config_sources(catalog, extensions, extension_id, None, project)
+            {
                 Ok(config) => ResolvedHookExtensionConfig {
                     config,
                     warning: Some(format!(
@@ -1785,7 +1802,9 @@ pub(crate) fn resolve_hook_extension_config_for_catalog(
                 Err(global_error) => ResolvedHookExtensionConfig {
                     config: ResolvedExtensionConfig {
                         json: "{}".to_owned(),
+                        trusted_json: "{}".to_owned(),
                         global_source: None,
+                        project_source: None,
                         workspace_source: None,
                     },
                     warning: Some(format!(
@@ -1802,6 +1821,7 @@ fn resolve_extension_config_sources(
     extensions: &[Extension],
     extension_id: &str,
     workspace_root: Option<&Path>,
+    project: Option<&TrustedProjectConfig>,
 ) -> Result<ResolvedExtensionConfig> {
     let mut resolved = catalog
         .defaults
@@ -1813,6 +1833,16 @@ fn resolve_extension_config_sources(
         .contains_key(extension_id)
         .then(|| catalog.source.clone())
         .flatten();
+    let project_source = project.and_then(|project| {
+        project
+            .extension
+            .contains_key(extension_id)
+            .then(|| project.source.clone())
+    });
+    if let Some(overrides) = project.and_then(|project| project.extension.get(extension_id)) {
+        merge_extension_tables(&mut resolved, overrides.clone());
+    }
+    let trusted_json = serde_json::to_string(&serde_json::Value::Object(resolved.clone()))?;
     let mut local_source = None;
 
     if let Some(workspace_root) = workspace_root {
@@ -1846,12 +1876,14 @@ fn resolve_extension_config_sources(
     }
     Ok(ResolvedExtensionConfig {
         json,
+        trusted_json,
         global_source,
+        project_source,
         workspace_source: local_source,
     })
 }
 
-fn deserialize_extension_config_catalog<'de, D>(
+pub(crate) fn deserialize_extension_config_catalog<'de, D>(
     deserializer: D,
 ) -> std::result::Result<BTreeMap<String, ExtensionConfigTable>, D::Error>
 where
@@ -1897,7 +1929,7 @@ fn convert_toml_config_value(value: toml::Value) -> Result<serde_json::Value> {
     })
 }
 
-fn validate_extension_config_catalog(
+pub(crate) fn validate_extension_config_catalog(
     catalog: &BTreeMap<String, ExtensionConfigTable>,
     extensions: &[Extension],
     source: &Path,
@@ -2783,6 +2815,7 @@ components = [
             &loaded.extensions,
             "run",
             &workspace,
+            None,
         )
         .unwrap();
         assert_eq!(resolved.json, r#"{"command":["global"]}"#);
@@ -2926,6 +2959,21 @@ components = [
         fs::create_dir_all(workspace.join(".fut")).unwrap();
         let sentinel = workspace.join("must-not-exist");
         let workspace_path = workspace.join(".fut/config.toml");
+        let project_path = temporary.path().join("project.toml");
+        let project = TrustedProjectConfig {
+            source: project_path.clone(),
+            extension: BTreeMap::from([(
+                "run".to_owned(),
+                serde_json::json!({
+                    "command": ["project"],
+                    "auto_start": true,
+                    "log": { "color": "green" }
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            )]),
+        };
         fs::write(
             &workspace_path,
             format!(
@@ -2935,16 +2983,25 @@ components = [
         )
         .unwrap();
 
-        let resolved = resolve_extension_config(&loaded.ui, "run", &workspace).unwrap();
+        let resolved =
+            resolve_extension_config(&loaded.ui, "run", &workspace, Some(&project)).unwrap();
         let value: serde_json::Value = serde_json::from_str(&resolved.json).unwrap();
+        let trusted: serde_json::Value = serde_json::from_str(&resolved.trusted_json).unwrap();
         assert_eq!(value["command"], serde_json::json!(["touch", sentinel]));
+        assert_eq!(trusted["command"], serde_json::json!(["project"]));
+        assert_eq!(trusted["auto_start"], true);
         assert_eq!(value["keep"], true);
         assert_eq!(value["started"], "2026-08-17T12:00:00Z");
         assert_eq!(value["log"]["size"], 20);
-        assert_eq!(value["log"]["color"], "blue");
+        assert_eq!(value["log"]["color"], "green");
+        assert_eq!(trusted["log"]["color"], "green");
         assert_eq!(
             resolved.global_source.as_deref(),
             Some(global_path.as_path())
+        );
+        assert_eq!(
+            resolved.project_source.as_deref(),
+            Some(project_path.as_path())
         );
         assert_eq!(
             resolved.workspace_source.as_deref(),
@@ -3013,7 +3070,7 @@ components = [
         fs::write(&workspace_path, "[extension.unknown]\nvalue = true\n").unwrap();
         let error = format!(
             "{:#}",
-            resolve_extension_config(&loaded.ui, "known", &workspace).unwrap_err()
+            resolve_extension_config(&loaded.ui, "known", &workspace, None).unwrap_err()
         );
         assert!(
             error.contains("unknown extension ID \"unknown\""),

@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""Open every existing Git worktree when trusted project config opts in."""
+
+import json
+import os
+import subprocess
+import sys
+
+
+CONFIG_ENV = "FUT_EXTENSION_TRUSTED_CONFIG"
+CONFIG_KEYS = {"open_existing"}
+MAX_CONFIG_BYTES = 16 * 1024
+
+
+class ConfigError(ValueError):
+    pass
+
+
+def fail(message):
+    print("wt extension: %s" % message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def reject_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ConfigError("duplicate key %r in %s" % (key, CONFIG_ENV))
+        result[key] = value
+    return result
+
+
+def load_config():
+    raw = os.environ.get(CONFIG_ENV) or "{}"
+    if len(raw.encode("utf-8", "surrogatepass")) > MAX_CONFIG_BYTES:
+        raise ConfigError("%s exceeds %d bytes" % (CONFIG_ENV, MAX_CONFIG_BYTES))
+    try:
+        config = json.loads(raw, object_pairs_hook=reject_duplicate_keys)
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ConfigError("%s is not valid JSON: %s" % (CONFIG_ENV, error))
+    if not isinstance(config, dict):
+        raise ConfigError("trusted [extension.wt] config must be a table")
+    unknown = sorted(set(config) - CONFIG_KEYS)
+    if unknown:
+        raise ConfigError(
+            "unknown trusted [extension.wt] key(s): %s (expected: open_existing)"
+            % ", ".join(unknown)
+        )
+    open_existing = config.get("open_existing", False)
+    if type(open_existing) is not bool:
+        raise ConfigError("trusted [extension.wt] open_existing must be a boolean")
+    return open_existing
+
+
+def required_env(name):
+    value = os.environ.get(name)
+    if not value:
+        fail("%s is not set" % name)
+    return value
+
+
+def worktree_paths(root):
+    try:
+        output = subprocess.run(
+            ["git", "worktree", "list", "--porcelain", "-z"],
+            cwd=root,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=True,
+            timeout=30,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+    prefix = b"worktree "
+    paths = []
+    seen = set()
+    for field in output.split(b"\0"):
+        if not field.startswith(prefix):
+            continue
+        path = field[len(prefix) :]
+        if path and path not in seen:
+            seen.add(path)
+            paths.append(os.fsdecode(path))
+    return paths
+
+
+def worker():
+    fut_bin = required_env("FUT_BIN")
+    socket = required_env("FUT_SOCKET")
+    root = required_env("FUT_WORKSPACE_ROOT")
+    for path in worktree_paths(root):
+        try:
+            subprocess.run(
+                [fut_bin, "--socket", socket, "open", path],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
+def hook():
+    # Fut sends bounded event JSON on stdin. Drain it before returning so the
+    # hook runner never sees a broken pipe when this feature is disabled.
+    sys.stdin.buffer.read()
+    try:
+        enabled = load_config()
+    except ConfigError as error:
+        fail(str(error))
+    if not enabled:
+        return
+
+    # Validate context before detaching so configuration errors are visible.
+    required_env("FUT_BIN")
+    required_env("FUT_SOCKET")
+    required_env("FUT_WORKSPACE_ROOT")
+    try:
+        subprocess.Popen(
+            [sys.executable, os.path.realpath(__file__), "--worker"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except OSError as error:
+        fail("could not start worktree opener: %s" % error)
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--worker"]:
+        worker()
+    elif not sys.argv[1:]:
+        hook()
+    else:
+        fail("usage: open-existing")

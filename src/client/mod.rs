@@ -3214,27 +3214,37 @@ async fn dispatch_client_action(
                 )));
             };
             let command = command.clone();
-            let workspace_root = command.extension.as_ref().and_then(|_| {
+            let workspace_context = command.extension.as_ref().and_then(|_| {
                 resources.snapshot().and_then(|snapshot| {
-                    snapshot
-                        .sessions
-                        .iter()
-                        .flat_map(|session| &session.workspaces)
-                        .find(|workspace| workspace.id == view.focused().workspace_id)
-                        .map(|workspace| workspace.root.clone())
+                    snapshot.sessions.iter().find_map(|session| {
+                        session
+                            .workspaces
+                            .iter()
+                            .find(|workspace| workspace.id == view.focused().workspace_id)
+                            .map(|workspace| {
+                                (
+                                    workspace.root.clone(),
+                                    session.trusted_project_config.clone(),
+                                )
+                            })
+                    })
                 })
             });
-            if command.extension.is_some() && workspace_root.is_none() {
+            if command.extension.is_some() && workspace_context.is_none() {
                 return Ok(Some(Toast::error(
                     "command unavailable · focused workspace root is not loaded",
                 )));
             }
+            let (workspace_root, project_config) = workspace_context
+                .map(|(root, config)| (Some(root), config))
+                .unwrap_or((None, None));
             if command.mode() == crate::extensions::ExtensionCommandMode::Background {
                 dispatch_background_command(
                     command,
                     ui.clone(),
                     view.focused().clone(),
                     workspace_root.expect("extension command resolved workspace root"),
+                    project_config,
                     socket_path.to_owned(),
                     background_results.clone(),
                 );
@@ -3242,7 +3252,15 @@ async fn dispatch_client_action(
             }
             let extension_context = workspace_root
                 .as_deref()
-                .map(|root| ExtensionCommandContext::resolve(ui, &command, view.focused(), root))
+                .map(|root| {
+                    ExtensionCommandContext::resolve(
+                        ui,
+                        &command,
+                        view.focused(),
+                        root,
+                        project_config.as_ref(),
+                    )
+                })
                 .transpose();
             let extension_context = match extension_context {
                 Ok(context) => context,

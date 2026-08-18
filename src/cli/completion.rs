@@ -457,6 +457,7 @@ mod tests {
             project: Project {
                 identity: ProjectIdentity::CanonicalDirectory(root.into()),
             },
+            trusted_project_config: None,
             workspace_id: WorkspaceId::new(),
             workspace_name: format!("{name}-workspace"),
             root: root.into(),
@@ -509,6 +510,7 @@ mod tests {
                 project: Project {
                     identity: ProjectIdentity::CanonicalDirectory(PathBuf::from("/root")),
                 },
+                trusted_project_config: None,
                 closing: false,
                 workspaces: vec![WorkspaceSnapshot {
                     tokens: Default::default(),

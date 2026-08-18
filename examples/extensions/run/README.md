@@ -2,24 +2,30 @@
 
 One managed long-running command per workspace: restart it with a keystroke,
 watch its status in the tab bar, follow its log, and trust that closing the
-workspace cleans it up. Nothing ever starts automatically — loading a project
-configures the runner but only an explicit `run:restart` executes it. Workspace
-lifecycle hooks receive the same resolved table in `FUT_EXTENSION_CONFIG`, so
-global-only defaults publish the initial pause status too.
+workspace cleans it up. Commands remain manual by default. Trusted global or
+project-recipe configuration may opt into starting the runner when a workspace
+is created; workspace-local overrides can never enable automatic execution.
 
 ## Configuration
 
-The command comes from the shared `[extension.run]` table in the global Fut
-config or a project's `./.fut/config.toml` (project values override global
-defaults). Fut resolves the table and hands it to this extension; the
-extension validates the inner keys:
+The command comes from the shared `[extension.run]` table in global Fut config,
+a trusted `.fut/project.toml`, or a workspace's `./.fut/config.toml`. Values
+layer in that order. Fut resolves the table and hands it to this extension;
+the extension validates the inner keys:
 
 ```toml
 [extension.run]
 command = ["just", "run"]   # required argv array; never a shell string
 grace_seconds = 3           # optional, 0–120: SIGTERM→SIGKILL escalation delay
 signal = "STATUS:READY"      # optional literal marker in combined stdout/stderr
+auto_start = true            # optional; trusted global/project config only
 ```
+
+Put `auto_start` in `.fut/project.toml` when the project should run the command
+for every new workspace or worktree. The trusted command and all settings used
+for that automatic start come from global configuration plus the exact approved
+project recipe. A `.fut/config.toml` may still override manual `run:restart`,
+but cannot affect automatic execution.
 
 Load the extension and bind restart:
 

@@ -1062,6 +1062,7 @@ mod tests {
                     project: Project {
                         identity: ProjectIdentity::CanonicalDirectory(PathBuf::from("/tmp")),
                     },
+                    trusted_project_config: None,
                     closing: false,
                     workspaces: vec![WorkspaceSnapshot {
                         tokens: Default::default(),

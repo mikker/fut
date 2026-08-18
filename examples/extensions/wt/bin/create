@@ -2,10 +2,14 @@
 set -eu
 
 : "${FUT_BIN:?}"
-: "${FUT_EXTENSION_ROOT:?}"
 : "${FUT_SOCKET:?}"
 
 wt_bin=${FUT_WT_BIN:-wt}
+
+if [ "$#" -ne 0 ]; then
+  printf 'wt:new-worktree no longer accepts a post-open command; configure the project recipe instead.\n' >&2
+  exit 2
+fi
 
 printf 'Worktree name: '
 IFS= read -r name || exit 0
@@ -15,15 +19,5 @@ if [ -z "$name" ]; then
 fi
 
 printf '\nCreating %s…\n' "$name"
-if [ "$#" -eq 0 ]; then
-  exec "$wt_bin" create "$name" -- \
-    "$FUT_BIN" --socket "$FUT_SOCKET" open . --name "$name"
-fi
-
 exec "$wt_bin" create "$name" -- \
-  "$FUT_BIN" --socket "$FUT_SOCKET" open . --name "$name" -- \
-  env \
-  FUT_BIN="$FUT_BIN" \
-  FUT_SOCKET="$FUT_SOCKET" \
-  WT_EVENT_HANDLER="$FUT_EXTENSION_ROOT/bin/worktree-event" \
-  "$@"
+  "$FUT_BIN" --socket "$FUT_SOCKET" open . --name "$name"

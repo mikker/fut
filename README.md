@@ -28,9 +28,11 @@ See [Using Fut](https://fut.sh/usage/) for the resource model, everyday
 controls, mouse and copy behavior, CLI automation, and shell completion.
 
 Configured projects can use a repository-owned `.fut/project.toml` to create
-their initial workspace. Review it, then run `fut project trust NAME` to
-approve its exact contents or `fut project untrust NAME` to revoke that
-machine-local approval; neither command requires a running daemon.
+their initial workspace and configure trusted extension behavior such as
+opening existing worktrees or starting a managed run command. Review it, then
+run `fut project trust NAME` to approve its exact contents or
+`fut project untrust NAME` to revoke that machine-local approval; neither
+command requires a running daemon.
 
 ## Agent integrations
 

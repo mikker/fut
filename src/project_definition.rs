@@ -16,7 +16,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::{client::config::ProjectConfig, splits::SplitDirection};
+use crate::{
+    client::config::{
+        ProjectConfig, deserialize_extension_config_catalog, validate_extension_config_catalog,
+    },
+    extensions::Extension,
+    resources::ExtensionConfigTable,
+    splits::SplitDirection,
+};
 
 const MAX_RECIPE_BYTES: u64 = 64 * 1024;
 const MAX_TRUST_STORE_BYTES: u64 = 1024 * 1024;
@@ -35,6 +42,8 @@ const MAX_ID_BYTES: usize = 64;
 #[serde(deny_unknown_fields)]
 pub(crate) struct WorkspaceRecipe {
     version: u8,
+    #[serde(default, deserialize_with = "deserialize_extension_config_catalog")]
+    extension: BTreeMap<String, ExtensionConfigTable>,
     #[serde(default)]
     environment: BTreeMap<String, String>,
     #[serde(default)]
@@ -203,6 +212,10 @@ impl TrustStoreLock {
 }
 
 impl WorkspaceRecipe {
+    pub(crate) fn extension(&self) -> &BTreeMap<String, ExtensionConfigTable> {
+        &self.extension
+    }
+
     pub(crate) fn tabs(&self) -> &[RecipeTab] {
         &self.tabs
     }
@@ -276,13 +289,15 @@ impl RecipeSplit {
 pub(crate) fn load(
     project_name: Option<&str>,
     project: &ProjectConfig,
+    extensions: &[Extension],
 ) -> std::result::Result<Option<LoadedRecipe>, ProjectDefinitionError> {
-    load_with_trust_store(project_name, project, None)
+    load_with_trust_store(project_name, project, extensions, None)
 }
 
 fn load_with_trust_store(
     project_name: Option<&str>,
     project: &ProjectConfig,
+    extensions: &[Extension],
     state_path: Option<&Path>,
 ) -> std::result::Result<Option<LoadedRecipe>, ProjectDefinitionError> {
     let explicit = project.recipe().is_some();
@@ -311,7 +326,7 @@ fn load_with_trust_store(
             });
         }
     }
-    Ok(Some(parse_recipe(file)?))
+    Ok(Some(parse_recipe(file, extensions)?))
 }
 
 /// Validate and approve the exact current bytes of a repository recipe.
@@ -319,12 +334,14 @@ fn load_with_trust_store(
 /// validated no-op without creating machine-local state.
 pub(crate) fn trust(
     project: &ProjectConfig,
+    extensions: &[Extension],
 ) -> std::result::Result<RecipeTrustChange, ProjectDefinitionError> {
-    trust_with_store(project, None)
+    trust_with_store(project, extensions, None)
 }
 
 fn trust_with_store(
     project: &ProjectConfig,
+    extensions: &[Extension],
     state_path: Option<&Path>,
 ) -> std::result::Result<RecipeTrustChange, ProjectDefinitionError> {
     if let Some(source) = project.recipe() {
@@ -334,7 +351,7 @@ fn trust_with_store(
                 source.display()
             )
         })?;
-        let loaded = parse_recipe(file)?;
+        let loaded = parse_recipe(file, extensions)?;
         return Ok(RecipeTrustChange {
             source: loaded.source,
             digest: Some(loaded.digest),
@@ -353,7 +370,7 @@ fn trust_with_store(
     })?;
     // Approval is only written after strict UTF-8, TOML, version, and semantic
     // validation of the exact bytes whose digest will be stored.
-    parse_recipe_ref(&file)?;
+    parse_recipe_ref(&file, extensions)?;
     let resolved_state_path;
     let state_path = match state_path {
         Some(state_path) => state_path,
@@ -452,8 +469,8 @@ fn read_recipe(path: &Path, required: bool) -> Result<Option<RecipeFile>> {
     }))
 }
 
-fn parse_recipe(file: RecipeFile) -> Result<LoadedRecipe> {
-    let recipe = parse_recipe_ref(&file)?;
+fn parse_recipe(file: RecipeFile, extensions: &[Extension]) -> Result<LoadedRecipe> {
+    let recipe = parse_recipe_ref(&file, extensions)?;
     Ok(LoadedRecipe {
         source: file.source,
         digest: file.digest,
@@ -461,12 +478,12 @@ fn parse_recipe(file: RecipeFile) -> Result<LoadedRecipe> {
     })
 }
 
-fn parse_recipe_ref(file: &RecipeFile) -> Result<WorkspaceRecipe> {
+fn parse_recipe_ref(file: &RecipeFile, extensions: &[Extension]) -> Result<WorkspaceRecipe> {
     let text = std::str::from_utf8(&file.bytes)
         .with_context(|| format!("project recipe {} is not UTF-8", file.source.display()))?;
     let recipe = toml::from_str::<WorkspaceRecipe>(text)
         .with_context(|| format!("parse project recipe {}", file.source.display()))?;
-    validate(&recipe)
+    validate(&recipe, extensions)
         .with_context(|| format!("validate project recipe {}", file.source.display()))?;
     Ok(recipe)
 }
@@ -787,13 +804,14 @@ fn storable_path(path: &Path) -> Result<&str> {
     })
 }
 
-fn validate(recipe: &WorkspaceRecipe) -> Result<()> {
+fn validate(recipe: &WorkspaceRecipe, extensions: &[Extension]) -> Result<()> {
     if recipe.version != 1 {
         bail!("unsupported recipe version {}; expected 1", recipe.version);
     }
     if recipe.tabs.is_empty() || recipe.tabs.len() > MAX_TABS {
         bail!("recipe must contain between 1 and {MAX_TABS} tabs");
     }
+    validate_extension_config_catalog(&recipe.extension, extensions, Path::new("project recipe"))?;
     validate_environment(&recipe.environment, "environment")?;
     let mut tab_ids = HashSet::new();
     let mut tab_names = HashSet::new();
@@ -913,7 +931,7 @@ mod tests {
 
     fn parse(source: &str) -> Result<WorkspaceRecipe> {
         let recipe = toml::from_str(source)?;
-        validate(&recipe)?;
+        validate(&recipe, &[])?;
         Ok(recipe)
     }
 
@@ -947,6 +965,24 @@ panes = [{ id = "server", command = ["mise", "run", "fresh"] }]
             "editor"
         );
         assert_eq!(recipe.tabs()[1].name(), "dev server");
+    }
+
+    #[test]
+    fn trusted_recipe_extension_config_requires_a_loaded_extension() {
+        let source = r#"
+version = 1
+tabs = [{ id = "code", panes = [{ id = "shell" }] }]
+[extension.run]
+command = ["mise", "run", "dev"]
+auto_start = true
+"#;
+        let recipe: WorkspaceRecipe = toml::from_str(source).unwrap();
+        assert!(validate(&recipe, &[]).is_err());
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/extensions/run");
+        let extensions = crate::extensions::load(&[root]).unwrap();
+        validate(&recipe, &extensions).unwrap();
+        assert_eq!(recipe.extension()["run"]["auto_start"], true);
     }
 
     #[test]
@@ -1011,7 +1047,8 @@ tabs = [
         };
         let state_path = temporary.path().join("state/fut/trusted-recipes.toml");
 
-        let error = load_with_trust_store(Some("fut"), &project, Some(&state_path)).unwrap_err();
+        let error =
+            load_with_trust_store(Some("fut"), &project, &[], Some(&state_path)).unwrap_err();
         assert!(matches!(
             error,
             ProjectDefinitionError::UntrustedRecipe { .. }
@@ -1020,7 +1057,7 @@ tabs = [
         assert!(error.contains(&digest), "{error}");
         assert!(error.contains("fut project trust fut"), "{error}");
 
-        let trusted = trust_with_store(&project, Some(&state_path)).unwrap();
+        let trusted = trust_with_store(&project, &[], Some(&state_path)).unwrap();
         assert!(trusted.changed);
         assert_eq!(trusted.source, recipe_path.canonicalize().unwrap());
         assert_eq!(trusted.digest.as_deref(), Some(digest.as_str()));
@@ -1028,7 +1065,7 @@ tabs = [
             fs::metadata(&state_path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        let loaded = load_with_trust_store(Some("fut"), &project, Some(&state_path))
+        let loaded = load_with_trust_store(Some("fut"), &project, &[], Some(&state_path))
             .unwrap()
             .unwrap();
         assert_eq!(loaded.digest, digest);
@@ -1040,14 +1077,14 @@ tabs = [
         )
         .unwrap();
         assert!(matches!(
-            load_with_trust_store(Some("fut"), &project, Some(&state_path)),
+            load_with_trust_store(Some("fut"), &project, &[], Some(&state_path)),
             Err(ProjectDefinitionError::UntrustedRecipe { .. })
         ));
-        let retrusted = trust_with_store(&project, Some(&state_path)).unwrap();
+        let retrusted = trust_with_store(&project, &[], Some(&state_path)).unwrap();
         assert!(retrusted.changed);
         assert_ne!(retrusted.digest.as_deref(), Some(digest.as_str()));
         assert!(
-            load_with_trust_store(Some("fut"), &project, Some(&state_path))
+            load_with_trust_store(Some("fut"), &project, &[], Some(&state_path))
                 .unwrap()
                 .is_some()
         );
@@ -1056,7 +1093,7 @@ tabs = [
         assert!(untrusted.changed);
         assert!(!untrusted.trusted);
         assert!(matches!(
-            load_with_trust_store(Some("fut"), &project, Some(&state_path)),
+            load_with_trust_store(Some("fut"), &project, &[], Some(&state_path)),
             Err(ProjectDefinitionError::UntrustedRecipe { .. })
         ));
     }
@@ -1074,8 +1111,8 @@ tabs = [
             path: temporary.path().join("project"),
             recipe: Some(recipe_path),
         };
-        assert!(load(Some("fut"), &project).unwrap().is_some());
-        let trusted = trust(&project).unwrap();
+        assert!(load(Some("fut"), &project, &[]).unwrap().is_some());
+        let trusted = trust(&project, &[]).unwrap();
         assert!(!trusted.changed);
         assert!(trusted.trusted);
         assert!(trusted.inherently_trusted);
@@ -1104,26 +1141,30 @@ tabs = [
         fs::write(&state_path, "version = 1\nunknown = true\n").unwrap();
         fs::set_permissions(&state_path, fs::Permissions::from_mode(0o600)).unwrap();
 
-        let error = load_with_trust_store(Some("fut"), &project, Some(&state_path)).unwrap_err();
+        let error =
+            load_with_trust_store(Some("fut"), &project, &[], Some(&state_path)).unwrap_err();
         assert!(matches!(error, ProjectDefinitionError::Invalid(_)));
         assert!(format!("{error:#}").contains("parse project recipe trust store"));
 
         fs::write(&state_path, "version = 1\nrecipes = []\n").unwrap();
         fs::set_permissions(&state_path, fs::Permissions::from_mode(0o644)).unwrap();
-        let error = load_with_trust_store(Some("fut"), &project, Some(&state_path)).unwrap_err();
+        let error =
+            load_with_trust_store(Some("fut"), &project, &[], Some(&state_path)).unwrap_err();
         assert!(format!("{error:#}").contains("permissions 0600"));
 
         let oversized = fs::File::create(&state_path).unwrap();
         oversized.set_len(MAX_TRUST_STORE_BYTES + 1).unwrap();
         fs::set_permissions(&state_path, fs::Permissions::from_mode(0o600)).unwrap();
-        let error = load_with_trust_store(Some("fut"), &project, Some(&state_path)).unwrap_err();
+        let error =
+            load_with_trust_store(Some("fut"), &project, &[], Some(&state_path)).unwrap_err();
         assert!(format!("{error:#}").contains("maximum"));
 
         fs::remove_file(&state_path).unwrap();
         let target = temporary.path().join("state/other.toml");
         fs::write(&target, "version = 1\nrecipes = []\n").unwrap();
         std::os::unix::fs::symlink(&target, &state_path).unwrap();
-        let error = load_with_trust_store(Some("fut"), &project, Some(&state_path)).unwrap_err();
+        let error =
+            load_with_trust_store(Some("fut"), &project, &[], Some(&state_path)).unwrap_err();
         assert!(format!("{error:#}").contains("read project recipe trust store"));
     }
 
@@ -1139,7 +1180,7 @@ tabs = [
         };
         let state_path = temporary.path().join("state/fut/trusted-recipes.toml");
 
-        assert!(trust_with_store(&project, Some(&state_path)).is_err());
+        assert!(trust_with_store(&project, &[], Some(&state_path)).is_err());
         assert!(!state_path.exists());
     }
 

@@ -50,7 +50,8 @@ TOKENS = {
     "stop": "■",
     "cross": "✗",
 }
-CONFIG_KEYS = {"command", "grace_seconds", "signal"}
+CONFIG_KEYS = {"auto_start", "command", "grace_seconds", "signal"}
+TRUSTED_CONFIG_ENV = "FUT_EXTENSION_TRUSTED_CONFIG"
 DEFAULT_GRACE = 3.0
 CLOSE_GRACE = 0.5        # workspace.closed must fit Fut's 5s hook timeout
 CLOSE_CONTROL_TIMEOUT = 0.5
@@ -234,20 +235,25 @@ class ConfigError(ValueError):
     pass
 
 
-def parse_config(require_command):
-    raw = os.environ.get("FUT_EXTENSION_CONFIG") or "{}"
+def parse_config(require_command, environment="FUT_EXTENSION_CONFIG"):
+    raw = os.environ.get(environment) or "{}"
+    label = (
+        "trusted [extension.run]"
+        if environment == TRUSTED_CONFIG_ENV
+        else "[extension.run]"
+    )
     try:
         data = json.loads(raw)
     except ValueError:
-        raise ConfigError("FUT_EXTENSION_CONFIG is not valid JSON")
+        raise ConfigError("%s is not valid JSON" % environment)
     if not isinstance(data, dict):
-        raise ConfigError("[extension.run] must be a table")
+        raise ConfigError("%s must be a table" % label)
     unknown = sorted(set(data) - CONFIG_KEYS)
     if unknown:
         raise ConfigError(
-            "unknown [extension.run] key(s): %s "
-            "(expected: command, grace_seconds, signal)"
-            % ", ".join(unknown)
+            "unknown %s key(s): %s "
+            "(expected: auto_start, command, grace_seconds, signal)"
+            % (label, ", ".join(unknown))
         )
     command = data.get("command")
     if command is not None:
@@ -257,27 +263,33 @@ def parse_config(require_command):
             or not all(isinstance(arg, str) and arg for arg in command)
         ):
             raise ConfigError(
-                "[extension.run] command must be a non-empty array of non-empty strings"
+                "%s command must be a non-empty array of non-empty strings" % label
             )
     elif require_command:
-        raise ConfigError(
-            "no [extension.run] command configured; add one to .fut/config.toml "
-            "or the global Fut config"
-        )
+        if environment == TRUSTED_CONFIG_ENV:
+            raise ConfigError("no trusted [extension.run] command configured")
+        else:
+            raise ConfigError(
+                "no [extension.run] command configured; add one to .fut/config.toml "
+                "or the global Fut config"
+            )
     grace = data.get("grace_seconds", DEFAULT_GRACE)
     if isinstance(grace, bool) or not isinstance(grace, (int, float)) or not 0 <= grace <= 120:
-        raise ConfigError("[extension.run] grace_seconds must be a number between 0 and 120")
+        raise ConfigError("%s grace_seconds must be a number between 0 and 120" % label)
     readiness_signal = data.get("signal")
     if readiness_signal is not None and (
         not isinstance(readiness_signal, str) or not readiness_signal
     ):
-        raise ConfigError("[extension.run] signal must be a non-empty string")
-    return command, float(grace), readiness_signal
+        raise ConfigError("%s signal must be a non-empty string" % label)
+    auto_start = data.get("auto_start", False)
+    if type(auto_start) is not bool:
+        raise ConfigError("%s auto_start must be a boolean" % label)
+    return command, float(grace), readiness_signal, auto_start
 
 
-def load_config(require_command):
+def load_config(require_command, environment="FUT_EXTENSION_CONFIG"):
     try:
-        return parse_config(require_command)
+        return parse_config(require_command, environment)
     except ConfigError as error:
         fail(str(error))
 
@@ -285,7 +297,7 @@ def load_config(require_command):
 def stop_grace():
     """Invalid config must never prevent an already-running process from stopping."""
     try:
-        _, grace, _ = parse_config(require_command=False)
+        _, grace, _, _ = parse_config(require_command=False)
         return grace
     except ConfigError:
         return DEFAULT_GRACE
@@ -656,9 +668,9 @@ def with_control_lock(wsdir, timeout=CONTROL_TIMEOUT):
     return control
 
 
-def cmd_restart():
+def restart_runner(config):
     workspace = require_env("FUT_WORKSPACE_ID")
-    command, grace, readiness_signal = load_config(require_command=True)
+    command, grace, readiness_signal, _ = config
     cwd = os.environ.get("FUT_WORKSPACE_ROOT") or os.getcwd()
     wsdir = workspace_dir(workspace)
     with_control_lock(wsdir)
@@ -693,6 +705,10 @@ def cmd_restart():
             error = "%s; cleanup also failed: %s" % (error, stop_error)
         record_exit(wsdir, generation, command, cwd, None, error, terminated=False)
         fail(error)
+
+
+def cmd_restart():
+    restart_runner(load_config(require_command=True))
 
 
 def repair_stopped_runner(wsdir):
@@ -762,7 +778,14 @@ def cmd_hook():
     if not workspace:
         return
     if event == "workspace.created":
-        command, _, _ = load_config(require_command=False)
+        trusted = load_config(require_command=False, environment=TRUSTED_CONFIG_ENV)
+        trusted_command, _, _, auto_start = trusted
+        if auto_start:
+            if trusted_command is None:
+                fail("trusted [extension.run] auto_start requires command")
+            restart_runner(trusted)
+            return
+        command, _, _, _ = load_config(require_command=False)
         if command is None:
             return
         wsdir = workspace_dir(workspace)

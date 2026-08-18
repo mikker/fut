@@ -14,7 +14,7 @@ use crate::{
     protocol::{OpenDisposition, SelectedTarget},
     resources::{
         CheckoutDestination, InitialPath, Mutation, ResolvedTerminalPath, ResourceTree, TabPath,
-        WorkspacePath,
+        TrustedProjectConfig, WorkspacePath,
     },
     splits::SplitDirection,
     terminal::{SpawnSpec, TerminalHandle, TerminalLifecycle, spawn_terminal},
@@ -28,6 +28,7 @@ use super::{
 #[derive(Clone, Debug)]
 pub(super) struct PreparedRecipe {
     tabs: Vec<PreparedRecipeTab>,
+    trusted_project_config: Option<TrustedProjectConfig>,
 }
 
 #[derive(Clone, Debug)]
@@ -93,11 +94,12 @@ struct ConfiguredProject {
 
 pub(super) async fn prepare_initial(
     catalog: &global_config::ProjectCatalog,
+    extensions: &[crate::extensions::Extension],
     resolved: &ResolvedLocation,
     command_override: Option<(PathBuf, Vec<String>)>,
 ) -> Result<Option<PreparedRecipe>, DaemonError> {
     let configured = configured_project(catalog, None, resolved).await?;
-    let Some(loaded) = load_project_recipe(configured.as_ref())? else {
+    let Some(loaded) = load_project_recipe(configured.as_ref(), extensions)? else {
         return Ok(None);
     };
     prepare_recipe(loaded, &resolved.workspace_root, command_override)
@@ -151,6 +153,10 @@ pub(super) async fn open_location(
         state.projects.clone()
     };
     let configured = configured_project(&catalog, project.as_deref(), &resolved).await?;
+    let extensions = {
+        let state = shared.lock().await;
+        state.extensions.clone()
+    };
 
     // Existing resources win before recipe I/O. A changed, removed, or newly
     // untrusted recipe never prevents an already-live workspace from opening.
@@ -164,7 +170,7 @@ pub(super) async fn open_location(
         }
     }
 
-    let loaded = match load_project_recipe(configured.as_ref()) {
+    let loaded = match load_project_recipe(configured.as_ref(), &extensions) {
         Ok(loaded) => loaded,
         Err(error) => {
             let mut state = shared.lock().await;
@@ -319,12 +325,13 @@ async fn configured_project(
 
 fn load_project_recipe(
     project: Option<&ConfiguredProject>,
+    extensions: &[crate::extensions::Extension],
 ) -> Result<Option<LoadedRecipe>, DaemonError> {
     let Some(project) = project else {
         return Ok(None);
     };
-    crate::project_definition::load(Some(&project.name), &project.config).map_err(|error| {
-        match error {
+    crate::project_definition::load(Some(&project.name), &project.config, extensions).map_err(
+        |error| match error {
             error @ ProjectDefinitionError::UntrustedRecipe { .. } => {
                 DaemonError::new("untrusted_recipe", error.to_string())
             }
@@ -334,8 +341,8 @@ fn load_project_recipe(
             ProjectDefinitionError::Invalid(error) => {
                 DaemonError::new("invalid_recipe", format!("{error:#}"))
             }
-        }
-    })
+        },
+    )
 }
 
 async fn prepare_recipe(
@@ -349,6 +356,10 @@ async fn prepare_recipe(
         recipe,
     } = loaded;
     tracing::debug!(path = %source.display(), %digest, "loaded trusted project recipe");
+    let trusted_project_config = (!recipe.extension().is_empty()).then(|| TrustedProjectConfig {
+        source: source.clone(),
+        extension: recipe.extension().clone(),
+    });
     let focus = recipe.focus().and_then(|focus| focus.split_once('.'));
     let mut tabs = Vec::with_capacity(recipe.tabs().len());
     for (tab_index, tab) in recipe.tabs().iter().enumerate() {
@@ -412,7 +423,10 @@ async fn prepare_recipe(
             panes,
         });
     }
-    Ok(PreparedRecipe { tabs })
+    Ok(PreparedRecipe {
+        tabs,
+        trusted_project_config,
+    })
 }
 
 fn default_shell_command() -> (PathBuf, Vec<String>) {
@@ -516,6 +530,7 @@ fn plan_recipe_creation(
             session_id,
             session_name,
             project: resolved.project.clone(),
+            trusted_project_config: recipe.trusted_project_config.clone(),
             workspace_id,
             workspace_name,
             root: resolved.workspace_root.clone(),
@@ -753,6 +768,9 @@ panes = [
 [[tabs]]
 id = "server"
 panes = [{ id = "server" }]
+[extension.run]
+command = ["mise", "run", "dev"]
+auto_start = true
 "#,
         )
         .unwrap();
@@ -760,7 +778,9 @@ panes = [{ id = "server" }]
             path: temporary.path().to_owned(),
             recipe: Some(source),
         };
-        let loaded = crate::project_definition::load(Some("test"), &project)
+        let extension_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/extensions/run");
+        let extensions = crate::extensions::load(&[extension_root]).unwrap();
+        let loaded = crate::project_definition::load(Some("test"), &project, &extensions)
             .unwrap()
             .unwrap();
         let recipe = prepare_recipe(loaded, temporary.path(), None)
@@ -793,6 +813,14 @@ panes = [{ id = "server" }]
 
         plan.resources.validate().unwrap();
         let snapshot = plan.resources.snapshot();
+        assert_eq!(
+            snapshot.sessions[0]
+                .trusted_project_config
+                .as_ref()
+                .unwrap()
+                .extension["run"]["auto_start"],
+            true
+        );
         let workspace = &snapshot.sessions[0].workspaces[0];
         assert_eq!(workspace.tabs.len(), 2);
         assert_eq!(workspace.tabs[0].panes.len(), 2);

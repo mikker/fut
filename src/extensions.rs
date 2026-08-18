@@ -38,10 +38,11 @@ const FUT_EXTENSION_ID: &str = "FUT_EXTENSION_ID";
 const FUT_EXTENSION_ROOT: &str = "FUT_EXTENSION_ROOT";
 const EVENT_VERSION: u8 = 1;
 
-const SUPPORTED_HOOKS: [&str; 6] = [
+const SUPPORTED_HOOKS: [&str; 7] = [
     "client.attached",
     "client.session_changed",
     "client.detached",
+    "session.created",
     "workspace.created",
     "workspace.renamed",
     "workspace.closed",
@@ -172,17 +173,55 @@ struct HookEvent {
     workspace_id: WorkspaceId,
     workspace_name: String,
     workspace_root: PathBuf,
+    trusted_project_config: Option<crate::resources::TrustedProjectConfig>,
     previous_name: Option<String>,
 }
 
 impl HookEvent {
     fn from_mutation(mutation: &Mutation) -> impl Iterator<Item = Self> + '_ {
-        mutation.events.iter().filter_map(|event| match event {
+        let initial_workspace = mutation.events.iter().find_map(|event| match event {
             ResourceEvent::WorkspaceCreated {
                 session_id,
                 id,
                 name,
                 root,
+                trusted_project_config,
+            } => Some((
+                *session_id,
+                *id,
+                name.clone(),
+                root.clone(),
+                trusted_project_config.clone(),
+            )),
+            _ => None,
+        });
+        mutation.events.iter().filter_map(move |event| match event {
+            ResourceEvent::SessionCreated {
+                id,
+                trusted_project_config,
+                ..
+            } => initial_workspace.as_ref().and_then(
+                |(session_id, workspace_id, workspace_name, workspace_root, workspace_config)| {
+                    (*session_id == *id).then(|| Self {
+                        revision: mutation.revision,
+                        kind: "session.created",
+                        session_id: *id,
+                        workspace_id: *workspace_id,
+                        workspace_name: workspace_name.clone(),
+                        workspace_root: workspace_root.clone(),
+                        trusted_project_config: trusted_project_config
+                            .clone()
+                            .or_else(|| workspace_config.clone()),
+                        previous_name: None,
+                    })
+                },
+            ),
+            ResourceEvent::WorkspaceCreated {
+                session_id,
+                id,
+                name,
+                root,
+                trusted_project_config,
             } => Some(Self {
                 revision: mutation.revision,
                 kind: "workspace.created",
@@ -190,6 +229,7 @@ impl HookEvent {
                 workspace_id: *id,
                 workspace_name: name.clone(),
                 workspace_root: root.clone(),
+                trusted_project_config: trusted_project_config.clone(),
                 previous_name: None,
             }),
             ResourceEvent::WorkspaceRenamed {
@@ -198,6 +238,7 @@ impl HookEvent {
                 root,
                 old_name,
                 new_name,
+                trusted_project_config,
             } => Some(Self {
                 revision: mutation.revision,
                 kind: "workspace.renamed",
@@ -205,6 +246,7 @@ impl HookEvent {
                 workspace_id: *id,
                 workspace_name: new_name.clone(),
                 workspace_root: root.clone(),
+                trusted_project_config: trusted_project_config.clone(),
                 previous_name: Some(old_name.clone()),
             }),
             ResourceEvent::WorkspaceClosed {
@@ -212,6 +254,7 @@ impl HookEvent {
                 workspace_id,
                 name,
                 root,
+                trusted_project_config,
             } => Some(Self {
                 revision: mutation.revision,
                 kind: "workspace.closed",
@@ -219,6 +262,7 @@ impl HookEvent {
                 workspace_id: *workspace_id,
                 workspace_name: name.clone(),
                 workspace_root: root.clone(),
+                trusted_project_config: trusted_project_config.clone(),
                 previous_name: None,
             }),
             _ => None,
@@ -510,6 +554,7 @@ async fn run_event(
             extensions,
             extension.id(),
             &event.workspace_root,
+            event.trusted_project_config.as_ref(),
         );
         if let Some(warning) = &resolved_config.warning {
             tracing::warn!(
@@ -581,10 +626,14 @@ async fn run_command(
     }
     if let Some(config) = invocation.extension_config {
         command.env("FUT_EXTENSION_CONFIG", &config.json);
+        command.env("FUT_EXTENSION_TRUSTED_CONFIG", &config.trusted_json);
         if let Some(path) = &config.global_source {
             command.env("FUT_EXTENSION_CONFIG_GLOBAL_PATH", path);
         } else {
             command.env_remove("FUT_EXTENSION_CONFIG_GLOBAL_PATH");
+        }
+        if let Some(path) = &config.project_source {
+            command.env("FUT_EXTENSION_CONFIG_PROJECT_PATH", path);
         }
         if let Some(path) = &config.workspace_source {
             command.env("FUT_EXTENSION_CONFIG_WORKSPACE_PATH", path);
@@ -1402,6 +1451,7 @@ scope = "tab"
             workspace_id: WorkspaceId::new(),
             workspace_name: "new name".into(),
             workspace_root: "/work/tree".into(),
+            trusted_project_config: None,
             previous_name: Some("old name".into()),
         };
 
@@ -1420,6 +1470,57 @@ scope = "tab"
                 },
                 "previous_name": "old name",
             })
+        );
+    }
+
+    #[test]
+    fn session_created_hook_uses_the_initial_workspace_and_trusted_config() {
+        let session_id = SessionId::new();
+        let workspace_id = WorkspaceId::new();
+        let trusted_project_config = crate::resources::TrustedProjectConfig {
+            source: "/project/.fut/project.toml".into(),
+            extension: BTreeMap::from([(
+                "wt".into(),
+                serde_json::json!({ "open_existing": true })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )]),
+        };
+        let mutation = Mutation {
+            revision: 8,
+            events: vec![
+                ResourceEvent::SessionCreated {
+                    id: session_id,
+                    name: "project".into(),
+                    project: crate::resources::Project {
+                        identity: crate::resources::ProjectIdentity::CanonicalDirectory(
+                            "/project".into(),
+                        ),
+                    },
+                    trusted_project_config: Some(trusted_project_config.clone()),
+                },
+                ResourceEvent::WorkspaceCreated {
+                    session_id,
+                    id: workspace_id,
+                    name: "main".into(),
+                    root: "/project".into(),
+                    trusted_project_config: Some(trusted_project_config.clone()),
+                },
+            ],
+            terminals_to_close: Vec::new(),
+            multiplexer_empty: false,
+        };
+
+        let events = HookEvent::from_mutation(&mutation).collect::<Vec<_>>();
+        assert_eq!(
+            events.iter().map(|event| event.kind).collect::<Vec<_>>(),
+            ["session.created", "workspace.created"]
+        );
+        assert_eq!(events[0].workspace_id, workspace_id);
+        assert_eq!(
+            events[0].trusted_project_config.as_ref().unwrap().extension["wt"]["open_existing"],
+            true
         );
     }
 
@@ -1490,6 +1591,7 @@ scope = "tab"
             workspace_id: WorkspaceId::new(),
             workspace_name: "main".into(),
             workspace_root: workspace.clone(),
+            trusted_project_config: None,
             previous_name: None,
         };
         let socket = temporary.path().join("fut.sock");
@@ -1701,6 +1803,22 @@ scope = "tab"
     }
 
     #[test]
+    fn checked_in_wt_extension_discovers_once_per_session() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/extensions/wt");
+        let extension = load(&[root]).unwrap().remove(0);
+
+        assert_eq!(extension.id(), "wt");
+        assert_eq!(
+            extension
+                .hooks
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["session.created"]
+        );
+    }
+
+    #[test]
     fn checked_in_run_extension_manifest_and_smoke_are_valid() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/extensions/run");
         let extension = load(std::slice::from_ref(&root)).unwrap().remove(0);
@@ -1732,7 +1850,7 @@ scope = "tab"
                 .iter()
                 .map(|token| token.name.as_str())
                 .collect::<Vec<_>>(),
-            ["pause", "launching", "play", "stop", "cross"]
+            ["pause", "launching", "play", "stop", "cross", "status"]
         );
         assert_eq!(
             extension.presentation_tokens()[1].presentation(),
@@ -1787,6 +1905,7 @@ scope = "tab"
             workspace_id: WorkspaceId::new(),
             workspace_name: "main".into(),
             workspace_root: "/workspace".into(),
+            trusted_project_config: None,
             previous_name: None,
         };
 
@@ -1831,6 +1950,7 @@ scope = "tab"
             workspace_id: WorkspaceId::new(),
             workspace_name: "main".into(),
             workspace_root: "/workspace".into(),
+            trusted_project_config: None,
             previous_name: None,
         };
         let started = tokio::time::Instant::now();

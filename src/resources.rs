@@ -27,6 +27,15 @@ pub const MAX_MATERIALIZED_TOKEN_VALUES: usize = 4096;
 pub const MAX_MATERIALIZED_TOKEN_VALUE_BYTES: usize = 1024;
 
 pub type MaterializedTokenMap = BTreeMap<String, String>;
+pub type ExtensionConfigTable = serde_json::Map<String, serde_json::Value>;
+
+/// Extension configuration approved as part of the exact project recipe and
+/// captured for the lifetime of its live session.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TrustedProjectConfig {
+    pub source: PathBuf,
+    pub extension: BTreeMap<String, ExtensionConfigTable>,
+}
 
 pub(crate) const WORKSPACE_GIT_BRANCH_TOKEN: &str = "workspace.git_branch";
 pub(crate) const WORKSPACE_GIT_ADDED_TOKEN: &str = "workspace.git_added";
@@ -132,6 +141,7 @@ pub struct InitialPath {
     pub session_id: SessionId,
     pub session_name: String,
     pub project: Project,
+    pub trusted_project_config: Option<TrustedProjectConfig>,
     pub workspace_id: WorkspaceId,
     pub workspace_name: String,
     pub root: PathBuf,
@@ -180,6 +190,8 @@ pub struct SessionSnapshot {
     pub id: SessionId,
     pub name: String,
     pub project: Project,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_project_config: Option<TrustedProjectConfig>,
     pub closing: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tokens: MaterializedTokenMap,
@@ -323,6 +335,7 @@ pub enum ResourceEvent {
         id: SessionId,
         name: String,
         project: Project,
+        trusted_project_config: Option<TrustedProjectConfig>,
     },
     SessionRenamed {
         id: SessionId,
@@ -334,6 +347,7 @@ pub enum ResourceEvent {
         id: WorkspaceId,
         name: String,
         root: PathBuf,
+        trusted_project_config: Option<TrustedProjectConfig>,
     },
     WorkspaceRenamed {
         session_id: SessionId,
@@ -341,6 +355,7 @@ pub enum ResourceEvent {
         root: PathBuf,
         old_name: String,
         new_name: String,
+        trusted_project_config: Option<TrustedProjectConfig>,
     },
     TabCreated {
         workspace_id: WorkspaceId,
@@ -409,6 +424,7 @@ pub enum ResourceEvent {
         workspace_id: WorkspaceId,
         name: String,
         root: PathBuf,
+        trusted_project_config: Option<TrustedProjectConfig>,
     },
     SessionClosed {
         session_id: SessionId,
@@ -453,6 +469,7 @@ pub enum ResourceError {
 struct Session {
     name: String,
     project: Project,
+    trusted_project_config: Option<TrustedProjectConfig>,
     tokens: MaterializedTokenMap,
     workspaces: Vec<WorkspaceId>,
 }
@@ -1189,12 +1206,14 @@ impl ResourceTree {
             id: path.session_id,
             name: path.session_name.clone(),
             project: path.project.clone(),
+            trusted_project_config: path.trusted_project_config.clone(),
         };
         self.sessions.insert(
             path.session_id,
             Session {
                 name: path.session_name,
                 project: path.project,
+                trusted_project_config: path.trusted_project_config.clone(),
                 tokens: BTreeMap::new(),
                 workspaces: vec![path.workspace_id],
             },
@@ -1230,6 +1249,7 @@ impl ResourceTree {
                     id: path.workspace_id,
                     name: self.workspaces[&path.workspace_id].name.clone(),
                     root: self.workspaces[&path.workspace_id].root.clone(),
+                    trusted_project_config: path.trusted_project_config,
                 },
                 ResourceEvent::TabCreated {
                     workspace_id: path.workspace_id,
@@ -1319,6 +1339,7 @@ impl ResourceTree {
             new_name.clone(),
         );
         let root = self.workspaces[&workspace_id].root.clone();
+        let trusted_project_config = self.sessions[&session_id].trusted_project_config.clone();
         Ok(self.finish(
             vec![ResourceEvent::WorkspaceRenamed {
                 session_id,
@@ -1326,6 +1347,7 @@ impl ResourceTree {
                 root,
                 old_name,
                 new_name,
+                trusted_project_config,
             }],
             vec![],
         ))
@@ -1449,6 +1471,9 @@ impl ResourceTree {
                     id: path.workspace_id,
                     name: self.workspaces[&path.workspace_id].name.clone(),
                     root: self.workspaces[&path.workspace_id].root.clone(),
+                    trusted_project_config: self.sessions[&session_id]
+                        .trusted_project_config
+                        .clone(),
                 },
                 ResourceEvent::TabCreated {
                     workspace_id: path.workspace_id,
@@ -2218,6 +2243,7 @@ impl ResourceTree {
         self.close_intents
             .remove(&CloseIntent::Workspace(workspace_id));
         let session_id = workspace.session_id;
+        let trusted_project_config = self.sessions[&session_id].trusted_project_config.clone();
         self.sessions
             .get_mut(&session_id)
             .unwrap()
@@ -2228,6 +2254,7 @@ impl ResourceTree {
             workspace_id,
             name: workspace.name,
             root: workspace.root,
+            trusted_project_config,
         });
         if !self.sessions[&session_id].workspaces.is_empty() {
             return;
@@ -2279,6 +2306,7 @@ impl ResourceTree {
             id,
             name: s.name.clone(),
             project: s.project.clone(),
+            trusted_project_config: s.trusted_project_config.clone(),
             closing: self.session_is_closing(id),
             tokens: s.tokens.clone(),
             workspaces: s
@@ -2546,6 +2574,7 @@ mod tests {
             project: Project {
                 identity: ProjectIdentity::CanonicalDirectory(project.into()),
             },
+            trusted_project_config: None,
             workspace_id: WorkspaceId::new(),
             workspace_name: "main".into(),
             root: format!("{project}/main").into(),
@@ -3789,13 +3818,15 @@ mod tests {
                     name: "s".into(),
                     project: Project {
                         identity: ProjectIdentity::CanonicalDirectory("/p".into())
-                    }
+                    },
+                    trusted_project_config: None,
                 },
                 ResourceEvent::WorkspaceCreated {
                     session_id: ids.0,
                     id: ids.1,
                     name: "main".into(),
-                    root: "/p/main".into()
+                    root: "/p/main".into(),
+                    trusted_project_config: None,
                 },
                 ResourceEvent::TabCreated {
                     workspace_id: ids.1,
@@ -4227,6 +4258,7 @@ mod tests {
                 root: "/project/main".into(),
                 old_name: "main".into(),
                 new_name: "  Main  ".into(),
+                trusted_project_config: None,
             }]
         );
         let tab_rename = tree.rename_tab(tab_id, "Shell".into()).unwrap();

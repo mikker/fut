@@ -1972,6 +1972,7 @@ async fn configured_workspace_hooks_observe_committed_lifecycle_in_order() {
             r#"
 id = "lifecycle"
 [hooks]
+"session.created" = ["./hook"]
 "workspace.created" = ["./hook"]
 "workspace.renamed" = ["./hook"]
 "workspace.closed" = ["./hook"]
@@ -1995,7 +1996,7 @@ id = "lifecycle"
     .await;
     let events_path = harness.root.path().join("extension/events.jsonl");
     wait_for(DEADLINE, || {
-        fs::read_to_string(&events_path).is_ok_and(|events| events.lines().count() == 1)
+        fs::read_to_string(&events_path).is_ok_and(|events| events.lines().count() == 2)
     })
     .await;
 
@@ -2050,7 +2051,7 @@ id = "lifecycle"
         }
     );
     wait_for(DEADLINE, || {
-        fs::read_to_string(&events_path).is_ok_and(|events| events.lines().count() == 4)
+        fs::read_to_string(&events_path).is_ok_and(|events| events.lines().count() == 6)
     })
     .await;
 
@@ -2065,7 +2066,9 @@ id = "lifecycle"
             .map(|event| event["event"].as_str().unwrap())
             .collect::<Vec<_>>(),
         [
+            "session.created",
             "workspace.created",
+            "session.created",
             "workspace.created",
             "workspace.renamed",
             "workspace.closed",
@@ -2074,10 +2077,10 @@ id = "lifecycle"
     // The workspace was never explicitly named; it presented its root's
     // basename. Lifecycle events carry stored names, so the rename reports an
     // empty previous name.
-    assert_eq!(events[2]["previous_name"], "");
-    assert_eq!(events[3]["workspace"]["name"], "renamed");
+    assert_eq!(events[4]["previous_name"], "");
+    assert_eq!(events[4]["workspace"]["name"], "renamed");
     assert_eq!(
-        events[3]["workspace"]["root"],
+        events[4]["workspace"]["root"],
         fs::canonicalize(&second_root)
             .unwrap()
             .display()
@@ -2152,7 +2155,7 @@ async fn checked_in_example_extension_smokes_hooks_cli_tokens_and_configuration(
 }
 
 #[test]
-fn checked_in_wt_extension_composes_create_and_retirement_commands() {
+fn checked_in_wt_extension_composes_project_open_and_retirement_commands() {
     let extension = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/extensions/wt");
     let temporary = tempfile::tempdir().unwrap();
     let capture = temporary.path().join("create-argv");
@@ -2164,7 +2167,6 @@ fn checked_in_wt_extension_composes_create_and_retirement_commands() {
     .unwrap();
     fs::set_permissions(&fake_wt, fs::Permissions::from_mode(0o755)).unwrap();
     let mut create = Command::new(extension.join("bin/create"))
-        .args(["test-agent", "--automatic"])
         .env("FUT_BIN", "/opt/fut")
         .env("FUT_EXTENSION_ROOT", &extension)
         .env("FUT_SOCKET", "/tmp/fut.sock")
@@ -2192,16 +2194,6 @@ fn checked_in_wt_extension_composes_create_and_retirement_commands() {
         ".".to_owned(),
         "--name".to_owned(),
         "feature-name".to_owned(),
-        "--".to_owned(),
-        "env".to_owned(),
-        "FUT_BIN=/opt/fut".to_owned(),
-        "FUT_SOCKET=/tmp/fut.sock".to_owned(),
-        format!(
-            "WT_EVENT_HANDLER={}",
-            extension.join("bin/worktree-event").display()
-        ),
-        "test-agent".to_owned(),
-        "--automatic".to_owned(),
     ];
     assert_eq!(
         fs::read_to_string(&capture)
@@ -2212,7 +2204,8 @@ fn checked_in_wt_extension_composes_create_and_retirement_commands() {
         expected
     );
 
-    let mut create_shell = Command::new(extension.join("bin/create"))
+    let mut obsolete = Command::new(extension.join("bin/create"))
+        .arg("test-agent")
         .env("FUT_BIN", "/opt/fut")
         .env("FUT_EXTENSION_ROOT", &extension)
         .env("FUT_SOCKET", "/tmp/fut.sock")
@@ -2222,31 +2215,13 @@ fn checked_in_wt_extension_composes_create_and_retirement_commands() {
         .stdout(Stdio::null())
         .spawn()
         .unwrap();
-    create_shell
+    obsolete
         .stdin
         .take()
         .unwrap()
-        .write_all(b"shell-worktree\n")
+        .write_all(b"obsolete\n")
         .unwrap();
-    assert!(create_shell.wait().unwrap().success());
-    assert_eq!(
-        fs::read_to_string(&capture)
-            .unwrap()
-            .lines()
-            .collect::<Vec<_>>(),
-        [
-            "create",
-            "shell-worktree",
-            "--",
-            "/opt/fut",
-            "--socket",
-            "/tmp/fut.sock",
-            "open",
-            ".",
-            "--name",
-            "shell-worktree",
-        ]
-    );
+    assert!(!obsolete.wait().unwrap().success());
 
     let retire_capture = temporary.path().join("retire-argv");
     let fake_fut = temporary.path().join("fut");

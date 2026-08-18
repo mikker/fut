@@ -1788,7 +1788,9 @@ fn run_project_command(
     let catalog = client::config::load_projects(config_dir)?;
     let project = catalog_project(&catalog, &name)?;
     let change = if trust {
-        crate::project_definition::trust(project)
+        let location = client::config::resolve_location(config_dir)?;
+        let loaded = client::config::load_extensions_location(&location)?;
+        crate::project_definition::trust(project, &loaded.extensions)
     } else {
         crate::project_definition::untrust(&name, project)
     }
@@ -3076,6 +3078,7 @@ mod tests {
                 project: Project {
                     identity: ProjectIdentity::CanonicalDirectory("/project".into()),
                 },
+                trusted_project_config: None,
                 closing: false,
                 tokens: Default::default(),
                 workspaces: vec![WorkspaceSnapshot {

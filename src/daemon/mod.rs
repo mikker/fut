@@ -1373,7 +1373,8 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     let command_override = config
         .recipe_command_override
         .then(|| (config.spawn.program.clone(), config.spawn.argv.clone()));
-    let prepared_recipe = recipe::prepare_initial(&projects, &resolved, command_override).await?;
+    let prepared_recipe =
+        recipe::prepare_initial(&projects, &extensions, &resolved, command_override).await?;
     let socket = bind_socket(&config.socket_path).await?;
     let mut initial_spawn = config.spawn;
     initial_spawn.cwd = resolved.cwd.clone();
@@ -1764,6 +1765,7 @@ fn initial_path(resolved: &ResolvedLocation, name: String, terminal_id: Terminal
         session_id: SessionId::new(),
         session_name: name,
         project: resolved.project.clone(),
+        trusted_project_config: None,
         workspace_id: WorkspaceId::new(),
         workspace_name: String::new(),
         root: resolved.workspace_root.clone(),

@@ -17,6 +17,7 @@ use crate::{
     command::{ACTIVATE_OPENED_SOCKET_ENV, PopupSize},
     domain::{PaneId, ScreenSnapshot, TerminalId, TerminalSize},
     protocol::SelectedTarget,
+    resources::TrustedProjectConfig,
     terminal::{SpawnSpec, TerminalEvent, TerminalHandle, TerminalLifecycle, spawn_terminal},
 };
 
@@ -37,6 +38,7 @@ impl ExtensionCommandContext {
         command: &PaletteCommand,
         focused: &SelectedTarget,
         workspace_root: &Path,
+        project: Option<&TrustedProjectConfig>,
     ) -> anyhow::Result<Self> {
         let extension = command
             .extension
@@ -45,7 +47,7 @@ impl ExtensionCommandContext {
         Ok(Self {
             focused: focused.clone(),
             workspace_root: workspace_root.to_owned(),
-            config: resolve_extension_config(ui, &extension.id, workspace_root)?,
+            config: resolve_extension_config(ui, &extension.id, workspace_root, project)?,
         })
     }
 }
@@ -205,13 +207,20 @@ pub(super) fn dispatch_background_command(
     ui: UiConfig,
     focused: SelectedTarget,
     workspace_root: PathBuf,
+    project: Option<TrustedProjectConfig>,
     socket_path: PathBuf,
     results: mpsc::UnboundedSender<BackgroundCommandResult>,
 ) {
     tokio::spawn(async move {
         let context_command = command.clone();
         let context = tokio::task::spawn_blocking(move || {
-            ExtensionCommandContext::resolve(&ui, &context_command, &focused, &workspace_root)
+            ExtensionCommandContext::resolve(
+                &ui,
+                &context_command,
+                &focused,
+                &workspace_root,
+                project.as_ref(),
+            )
         })
         .await;
         let result = match context {
@@ -331,6 +340,10 @@ fn add_extension_environment(
         context.focused.terminal_id.to_string(),
     );
     environment.insert("FUT_EXTENSION_CONFIG".into(), context.config.json.clone());
+    environment.insert(
+        "FUT_EXTENSION_TRUSTED_CONFIG".into(),
+        context.config.trusted_json.clone(),
+    );
     if let Some(path) = &context.config.global_source {
         environment.insert(
             "FUT_EXTENSION_CONFIG_GLOBAL_PATH".into(),
@@ -338,6 +351,14 @@ fn add_extension_environment(
         );
     } else {
         environment.remove("FUT_EXTENSION_CONFIG_GLOBAL_PATH");
+    }
+    if let Some(path) = &context.config.project_source {
+        environment.insert(
+            "FUT_EXTENSION_CONFIG_PROJECT_PATH".into(),
+            path.display().to_string(),
+        );
+    } else {
+        environment.remove("FUT_EXTENSION_CONFIG_PROJECT_PATH");
     }
     if let Some(path) = &context.config.workspace_source {
         environment.insert(
@@ -614,7 +635,9 @@ mod tests {
             workspace_root: temporary.path().to_owned(),
             config: ResolvedExtensionConfig {
                 json: r#"{"command":["just","run"]}"#.into(),
+                trusted_json: r#"{"command":["just","run"]}"#.into(),
                 global_source: Some(global_config.clone()),
+                project_source: None,
                 workspace_source: Some(workspace_config.clone()),
             },
         };
@@ -705,6 +728,7 @@ mod tests {
             UiConfig::default(),
             focused,
             temporary.path().to_owned(),
+            None,
             temporary.path().join("fut.sock"),
             sender,
         );
@@ -758,7 +782,9 @@ mod tests {
             workspace_root: temporary.path().to_owned(),
             config: ResolvedExtensionConfig {
                 json: "{}".into(),
+                trusted_json: "{}".into(),
                 global_source: None,
+                project_source: None,
                 workspace_source: None,
             },
         };

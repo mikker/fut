@@ -123,6 +123,7 @@ run w-cfg 'not json' restart 2>"$TMP/err" && fail "invalid JSON accepted"
 run w-cfg '{"command":["x"],"grace_seconds":true}' restart 2>"$TMP/err" && fail "boolean grace accepted"
 run w-cfg '{"command":["x"],"signal":false}' restart 2>"$TMP/err" && fail "non-string signal accepted"
 run w-cfg '{"command":["x"],"signal":""}' restart 2>"$TMP/err" && fail "empty signal accepted"
+run w-cfg '{"command":["x"],"auto_start":"yes"}' restart 2>"$TMP/err" && fail "non-boolean auto_start accepted"
 [ "$(token_count w-cfg)" = 0 ] || fail "config errors published tokens"
 ok "config validation rejects bad [extension.run] tables"
 
@@ -255,14 +256,17 @@ grep -q "log rotated" "$D7/run.log" || fail "missing rotation separator"
 grep -q "fut-run · exit · generation 1 · code 0" "$D7/run.log" || fail "missing exit separator"
 ok "log rotation copies then truncates; run.log inode stays stable and both files stay bounded"
 
-# --- 12. workspace.created hook: pause only when configured -------------------------
-mkdir -p "$TMP/roots/w8" "$TMP/roots/w9"
-HOOK_CFG=$(printf '{"command":["sh","-c","touch %s","fut-run-smoke-w8"]}' "$TMP/w8-started")
-hook() { # <workspace-id> <event> <root> [resolved-config-json]
+# --- 12. workspace.created hook: trusted auto-start or merged-config pause -----------
+mkdir -p "$TMP/roots/w8" "$TMP/roots/w9" "$TMP/roots/w-auto"
+HOOK_CFG=$(printf '{"command":["sh","-c","touch %s","fut-run-smoke-w8"],"auto_start":true}' "$TMP/w8-started")
+hook() { # <workspace-id> <event> <root> [resolved-config-json] [trusted-config-json]
   local cfg=${4-}
+  local trusted=${5-}
   [ -n "$cfg" ] || cfg='{}'
+  [ -n "$trusted" ] || trusted='{}'
   printf '{"version":1,"event":"%s","workspace":{"id":"%s","name":"x","root":"%s"}}\n' "$2" "$1" "$3" |
-    env FUT_WORKSPACE_ID="$1" FUT_EVENT="$2" FUT_EXTENSION_CONFIG="$cfg" "$RUNCTL" hook
+    env FUT_WORKSPACE_ID="$1" FUT_WORKSPACE_ROOT="$3" FUT_EVENT="$2" \
+      FUT_EXTENSION_CONFIG="$cfg" FUT_EXTENSION_TRUSTED_CONFIG="$trusted" "$RUNCTL" hook
 }
 hook w8 workspace.created "$TMP/roots/w8" "$HOOK_CFG" || fail "created hook failed"
 hook w9 workspace.created "$TMP/roots/w9" || fail "created hook (unconfigured) failed"
@@ -272,7 +276,19 @@ token_is w8 pause || fail "w8 created token is '$(last_token w8)'"
 [ ! -e "$(dirname "$(state_dir w1)")/w8/state.json" ] || fail "created hook wrote state"
 [ ! -e "$TMP/w8-started" ] || fail "created hook auto-started the command"
 pgrep -f "fut-run-smoke-w8" >/dev/null && fail "created hook left a process behind"
-ok "created hook publishes pause from global-only resolved config, starts nothing"
+
+AUTO_PIDS="$TMP/pids-w-auto"; : > "$AUTO_PIDS"
+AUTO_TRUSTED=$(printf '{"command":["sh","-c","echo $$ >> %s; sleep 300","%s"],"auto_start":true}' "$AUTO_PIDS" "$MARKER")
+hook w-auto workspace.created "$TMP/roots/w-auto" \
+  '{"command":["/merged/config/must/not/run"],"auto_start":true}' \
+  "$AUTO_TRUSTED" || fail "trusted auto-start hook failed"
+phase_is w-auto running || fail "trusted auto-start runner is not running"
+wait_for 5 child_alive w-auto || fail "trusted auto-start child is not alive"
+[ "$(state_get w-auto "s.get('command') == ['sh', '-c', 'echo \$\$ >> $AUTO_PIDS; sleep 300', '$MARKER']")" = True ] || \
+  fail "auto-start did not use trusted command"
+token_is w-auto play || fail "trusted auto-start did not publish play"
+D_AUTO=$(state_dir w-auto)
+ok "created hook pauses from merged config or auto-starts only trusted config"
 
 # --- 13. workspace.closed hook terminates and cleans up ------------------------------
 PIDS10="$TMP/pids-w10"; : > "$PIDS10"
@@ -284,6 +300,9 @@ hook w10 workspace.closed "$TMP/roots/w10" || fail "closed hook failed"
 pid_dead "$(cat "$PIDS10")" || fail "w10 child survived close"
 [ ! -d "$D10" ] || fail "w10 state dir not removed"
 ok "closed hook finishes under 4s, stops the runner, and removes workspace state"
+
+hook w-auto workspace.closed "$TMP/roots/w-auto" || fail "auto-start cleanup hook failed"
+[ ! -d "$D_AUTO" ] || fail "auto-start state survived close"
 
 # --- 14. logs / edit-logs plumbing ----------------------------------------------------
 mkdir -p "$TMP/bin"

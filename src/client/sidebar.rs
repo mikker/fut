@@ -2389,6 +2389,7 @@ mod tests {
                     project: Project {
                         identity: ProjectIdentity::CanonicalDirectory(PathBuf::from("/project")),
                     },
+                    trusted_project_config: None,
                     closing: false,
                     workspaces,
                 }],

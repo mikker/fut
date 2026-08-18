@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+HERE=$(cd "$(dirname "$0")/.." && pwd)
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+fail() { echo "FAIL: $*" >&2; exit 1; }
+
+cat > "$TMP/wt" <<'SH'
+#!/bin/sh
+printf '%s\n' "$@" > "$CAPTURE"
+SH
+chmod +x "$TMP/wt"
+
+printf 'feature-name\n' | env \
+  FUT_BIN=/opt/fut FUT_SOCKET=/tmp/fut.sock FUT_WT_BIN="$TMP/wt" \
+  CAPTURE="$TMP/create-argv" "$HERE/bin/create" >/dev/null
+
+diff -u - "$TMP/create-argv" <<'EOF' || fail "create argv changed"
+create
+feature-name
+--
+/opt/fut
+--socket
+/tmp/fut.sock
+open
+.
+--name
+feature-name
+EOF
+
+if printf 'feature-name\n' | env \
+  FUT_BIN=/opt/fut FUT_SOCKET=/tmp/fut.sock FUT_WT_BIN="$TMP/wt" \
+  CAPTURE="$TMP/ignored" "$HERE/bin/create" pi 2>/dev/null; then
+  fail "obsolete post-open command was accepted"
+fi
+
+mkdir -p "$TMP/root" "$TMP/bin"
+cat > "$TMP/bin/git" <<'PY'
+#!/usr/bin/env python3
+import os, sys, time
+open(os.environ["GIT_CWD"], "w").write(os.getcwd())
+time.sleep(0.5)
+sys.stdout.buffer.write(
+    b"worktree /repo/main\0HEAD abc\0branch refs/heads/main\0\0"
+    b"worktree /repo/feature with spaces\0HEAD def\0detached\0\0"
+    b"worktree /repo/main\0HEAD abc\0\0"
+)
+PY
+cat > "$TMP/fut" <<'PY'
+#!/usr/bin/env python3
+import os, sys
+with open(os.environ["FUT_CALLS"], "ab") as handle:
+    handle.write(b"\0".join(os.fsencode(arg) for arg in sys.argv[1:]) + b"\n")
+PY
+chmod +x "$TMP/bin/git" "$TMP/fut"
+
+COMMON=(
+  FUT_BIN="$TMP/fut"
+  FUT_SOCKET=/tmp/fut.sock
+  FUT_WORKSPACE_ROOT="$TMP/root"
+  FUT_CALLS="$TMP/fut-calls"
+  GIT_CWD="$TMP/git-cwd"
+  PATH="$TMP/bin:$PATH"
+)
+
+env "${COMMON[@]}" FUT_EXTENSION_TRUSTED_CONFIG='{}' \
+  "$HERE/bin/open-existing" </dev/null
+[ ! -e "$TMP/git-cwd" ] || fail "disabled hook enumerated worktrees"
+
+env "${COMMON[@]}" FUT_EXTENSION_TRUSTED_CONFIG='{"open_existing":true}' \
+  "$HERE/bin/open-existing" </dev/null
+[ ! -e "$TMP/fut-calls" ] || fail "hook waited for detached enumeration"
+
+for _ in {1..50}; do
+  [ -e "$TMP/fut-calls" ] && [ "$(wc -l < "$TMP/fut-calls")" -eq 2 ] && break
+  sleep 0.1
+done
+EXPECTED_CWD=$(cd "$TMP/root" && pwd -P)
+[ "$(cat "$TMP/git-cwd")" = "$EXPECTED_CWD" ] || fail "git ran outside workspace root"
+
+python3 - "$TMP/fut-calls" <<'PY' || fail "unexpected fut open calls"
+import sys
+calls = [line.split(b"\0") for line in open(sys.argv[1], "rb").read().splitlines()]
+assert calls == [
+    [b"--socket", b"/tmp/fut.sock", b"open", b"/repo/main"],
+    [b"--socket", b"/tmp/fut.sock", b"open", b"/repo/feature with spaces"],
+], calls
+PY
+
+if env "${COMMON[@]}" FUT_EXTENSION_TRUSTED_CONFIG='{"open_existing":"yes"}' \
+  "$HERE/bin/open-existing" </dev/null 2>/dev/null; then
+  fail "non-boolean open_existing was accepted"
+fi
+if env "${COMMON[@]}" FUT_EXTENSION_TRUSTED_CONFIG='{"open_existing":true,"extra":1}' \
+  "$HERE/bin/open-existing" </dev/null 2>/dev/null; then
+  fail "unknown trusted config was accepted"
+fi
+
+echo "wt extension smoke checks passed"

@@ -101,7 +101,9 @@ focused workspace root and receive:
 | `FUT_PANE_ID` | Focused pane UUID |
 | `FUT_TERMINAL_ID` | Focused terminal UUID |
 | `FUT_EXTENSION_CONFIG` | Resolved `[extension.<id>]` table as compact JSON |
+| `FUT_EXTENSION_TRUSTED_CONFIG` | Global and trusted-project layers only, as compact JSON |
 | `FUT_EXTENSION_CONFIG_GLOBAL_PATH` | Global source path, when it contributed values |
+| `FUT_EXTENSION_CONFIG_PROJECT_PATH` | Trusted project recipe path, when it contributed values |
 | `FUT_EXTENSION_CONFIG_WORKSPACE_PATH` | Workspace source path, when it contributed values |
 
 Set `mode = "background"` for a non-interactive command. Fut starts it
@@ -145,8 +147,9 @@ use `args = []` to pass none. Unknown command slugs reject the configuration.
 
 ## Extension configuration
 
-Extensions can receive bounded, namespaced data from the global Fut config and
-the focused workspace's `.fut/config.toml`. Both locations use the same shape:
+Extensions can receive bounded, namespaced data from global Fut config, a
+trusted `.fut/project.toml`, and the focused workspace's `.fut/config.toml`.
+All locations use the same shape:
 
 ```toml
 [extension.review-status]
@@ -155,29 +158,34 @@ remote = "origin"
 compact = true
 ```
 
-Workspace values recursively override global defaults; arrays and scalar
-values replace their global value. Fut rejects tables for extension IDs that
-are not explicitly loaded, limits nesting, key counts, arrays, scalar sizes,
-and the resolved payload, and retains the contributing paths for diagnostics.
-It does not interpret an extension's inner table—that validation belongs to
-the extension. The resolved object is exposed as JSON through
-`FUT_EXTENSION_CONFIG`; it is `{}` when neither source configures the extension.
+Values recursively layer global → trusted project → workspace; arrays and
+scalar values replace the less specific value. Fut rejects tables for
+extension IDs that are not explicitly loaded, limits nesting, key counts,
+arrays, scalar sizes, and the resolved payload, and retains contributing paths
+for diagnostics. It does not interpret an extension's inner table—that
+validation belongs to the extension. The complete resolved object is exposed
+through `FUT_EXTENSION_CONFIG`. `FUT_EXTENSION_TRUSTED_CONFIG` omits the
+workspace layer, allowing lifecycle hooks to gate automatic execution on only
+globally configured or exactly approved project values.
 
-Workspace configuration is read only when an extension command or workspace
-hook is explicitly invoked. Reading or entering a project never executes the
-configured values. A lifecycle hook may publish status derived from the table,
-but only an explicit command can start project-defined work.
+Workspace configuration is read only when an extension command or resource
+hook is invoked. Trusted extension code ultimately decides how to use it. The
+bundled run and wt extensions gate automatic `auto_start` and `open_existing`
+behavior on `FUT_EXTENSION_TRUSTED_CONFIG`, so workspace-local values cannot
+enable those operations.
 
-## Workspace hooks
+## Resource hooks
 
 The supported hooks are:
 
+- `session.created`
 - `workspace.created`
 - `workspace.renamed`
 - `workspace.closed`
 
 ```toml
 [hooks]
+"session.created" = ["./bin/session-event"]
 "workspace.created" = ["./bin/workspace-event"]
 "workspace.renamed" = ["./bin/workspace-event"]
 "workspace.closed" = ["./bin/workspace-event"]
@@ -186,8 +194,10 @@ The supported hooks are:
 Hooks run asynchronously after a successful resource commit. They cannot
 veto, delay, rewrite, or roll back it. Fut executes hooks one at a time in
 mutation order, with the extension root as their working directory and a
-five-second timeout. The initial workspace emits `workspace.created` because
-extensions load before daemon setup.
+five-second timeout. The initial workspace emits both `session.created` and
+`workspace.created` because extensions load before daemon setup.
+`session.created` runs once for a new live project session and carries its
+initial workspace context.
 
 The hook receives one versioned JSON object on stdin:
 
@@ -209,10 +219,10 @@ The hook receives one versioned JSON object on stdin:
 Only rename events include `previous_name`. Hook processes inherit the daemon
 environment plus `FUT_BIN`, `FUT_SOCKET`, `FUT_EXTENSION_ID`,
 `FUT_EXTENSION_ROOT`, `FUT_EVENT`, `FUT_EVENT_VERSION`, `FUT_SESSION_ID`, and
-`FUT_WORKSPACE_ID`. Workspace hooks also receive the resolved
-`FUT_EXTENSION_CONFIG` and its optional global/workspace provenance variables
-described above, plus `FUT_WORKSPACE_ROOT`, the absolute root of the workspace
-in the event.
+`FUT_WORKSPACE_ID`. Resource hooks also receive `FUT_EXTENSION_CONFIG`,
+`FUT_EXTENSION_TRUSTED_CONFIG`, and their optional global/project/workspace
+provenance variables described above, plus `FUT_WORKSPACE_ROOT`, the absolute
+root of the workspace in the event.
 
 Hook failures are diagnostic only. Spawn errors, nonzero exits, output, and
 timeouts do not alter daemon state or stop later hooks.
@@ -233,7 +243,7 @@ Client hooks run for each attached interactive client:
 ```
 
 These hooks use the same direct argv, timeout, ordering, output bounds, and
-diagnostic-only failure behavior as workspace hooks. They run from the client
+diagnostic-only failure behavior as resource hooks. They run from the client
 process, making `/dev/tty` available for deliberate host-terminal integration.
 Configuration changes to client hooks take effect when the client next
 attaches.
