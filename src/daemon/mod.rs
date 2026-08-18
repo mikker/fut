@@ -4,6 +4,7 @@ mod git;
 mod lease;
 pub mod path;
 mod presence;
+mod recipe;
 
 pub mod autostart;
 
@@ -73,6 +74,7 @@ pub struct DaemonConfig {
     pub socket_path: PathBuf,
     pub spawn: SpawnSpec,
     pub config_dir: Option<PathBuf>,
+    pub recipe_command_override: bool,
 }
 
 impl DaemonConfig {
@@ -85,6 +87,7 @@ impl DaemonConfig {
         Self {
             socket_path,
             config_dir: None,
+            recipe_command_override: false,
             spawn: SpawnSpec {
                 id: TerminalId::new(),
                 program,
@@ -117,6 +120,7 @@ struct SharedState {
     resource_changes: watch::Sender<u64>,
     agent_events: broadcast::Sender<AgentLifecycleUpdate>,
     child_env: HashMap<String, String>,
+    projects: global_config::ProjectCatalog,
     extensions: Vec<crate::extensions::Extension>,
     hook_queue: crate::extensions::HookQueue,
     accepting: bool,
@@ -1357,6 +1361,7 @@ fn watch_attachment(
 pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     let config_location = global_config::resolve_location(config.config_dir.as_deref())?;
     let loaded_extensions = global_config::load_extensions_location(&config_location)?;
+    let projects = global_config::load_projects(config.config_dir.as_deref())?;
     let extensions = loaded_extensions.extensions;
     let extension_config = loaded_extensions.config;
     let fut_bin = std::env::current_exe().context("resolve current Fut executable")?;
@@ -1365,24 +1370,14 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
         .resolve(&config.spawn.cwd)
         .await
         .map_err(DaemonError::from)?;
+    let command_override = config
+        .recipe_command_override
+        .then(|| (config.spawn.program.clone(), config.spawn.argv.clone()));
+    let prepared_recipe = recipe::prepare_initial(&projects, &resolved, command_override).await?;
     let socket = bind_socket(&config.socket_path).await?;
     let mut initial_spawn = config.spawn;
     initial_spawn.cwd = resolved.cwd.clone();
-    let initial = initial_path(
-        &resolved,
-        resolved.suggested_session_name.clone(),
-        initial_spawn.id,
-    );
-    let initial_target = crate::resources::ResolvedTerminalPath {
-        session_id: initial.session_id,
-        workspace_id: initial.workspace_id,
-        tab_id: initial.tab_id,
-        pane_id: initial.pane_id,
-        terminal_id: initial.terminal_id,
-    };
     let child_env = initial_spawn.env.clone();
-    initial_spawn.env = terminal_env(&child_env, initial_target);
-    let terminal = Arc::new(spawn_terminal(initial_spawn)?);
     let (resource_changes, _) = watch::channel(0);
     let (agent_events, _) = broadcast::channel(AGENT_EVENT_CAPACITY);
     let mut state = SharedState {
@@ -1394,14 +1389,34 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
         resource_changes,
         agent_events,
         child_env,
+        projects,
         extensions: extensions.clone(),
         hook_queue,
         accepting: true,
     };
-    if let Err(error) = state.register_session(initial, Arc::clone(&terminal)) {
-        let _ = terminal.close().await;
-        return Err(error.into());
-    }
+    let initial_terminals = if let Some(recipe) = prepared_recipe {
+        recipe::create_initial(&mut state, &resolved, &recipe).await?
+    } else {
+        let initial = initial_path(
+            &resolved,
+            resolved.suggested_session_name.clone(),
+            initial_spawn.id,
+        );
+        let initial_target = crate::resources::ResolvedTerminalPath {
+            session_id: initial.session_id,
+            workspace_id: initial.workspace_id,
+            tab_id: initial.tab_id,
+            pane_id: initial.pane_id,
+            terminal_id: initial.terminal_id,
+        };
+        initial_spawn.env = terminal_env(&state.child_env, initial_target);
+        let terminal = Arc::new(spawn_terminal(initial_spawn)?);
+        if let Err(error) = state.register_session(initial, Arc::clone(&terminal)) {
+            let _ = terminal.close().await;
+            return Err(error.into());
+        }
+        vec![terminal]
+    };
     let git_resource_changes = state.resource_changes.subscribe();
     let shared = Arc::new(Mutex::new(state));
     let (hook_shutdown_tx, hook_shutdown_rx) = watch::channel(false);
@@ -1414,7 +1429,9 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
         hook_shutdown_rx,
     ));
     let (exited_tx, mut exited_rx) = mpsc::unbounded_channel();
-    watch_terminal(terminal, exited_tx.clone());
+    for terminal in initial_terminals {
+        watch_terminal(terminal, exited_tx.clone());
+    }
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let process_names = watch_process_names(Arc::clone(&shared), shutdown_tx.subscribe());
     let git_metadata = git::watch(
@@ -3059,11 +3076,16 @@ async fn control_loop(
                 .await?
             }
             ClientMessage::OpenLocation {
+                project,
                 name,
                 cwd,
                 program,
                 argv,
-            } => match open_location(&shared, &exited, name, cwd, program, argv).await {
+            } => match recipe::open_location(
+                &shared, &exited, project, name, cwd, program, argv,
+            )
+            .await
+            {
                 Ok((selected, disposition)) => {
                     send(
                         connection,
@@ -4205,16 +4227,14 @@ async fn exit_replacement_ids(
     replacements
 }
 
-async fn open_location(
+async fn open_location_without_recipe(
     shared: &Shared,
     exited: &mpsc::UnboundedSender<TerminalId>,
     name: Option<String>,
-    cwd: PathBuf,
+    resolved: ResolvedLocation,
     program: Option<PathBuf>,
     argv: Vec<String>,
 ) -> Result<(SelectedTarget, OpenDisposition), DaemonError> {
-    // Git and filesystem resolution can block, so it deliberately precedes the state lock.
-    let resolved = ProjectResolver::default().resolve(&cwd).await?;
     let program = program.unwrap_or_else(|| {
         std::env::var_os("SHELL")
             .map(PathBuf::from)
@@ -6507,6 +6527,7 @@ mod tests {
                 resource_changes: watch::channel(1).0,
                 agent_events: broadcast::channel(AGENT_EVENT_CAPACITY).0,
                 child_env: HashMap::new(),
+                projects: global_config::ProjectCatalog::default(),
                 extensions: Vec::new(),
                 hook_queue: crate::extensions::hook_queue().0,
                 accepting: true,
@@ -6801,9 +6822,10 @@ mod tests {
         let shared = Arc::new(Mutex::new(state));
         let (exited, _) = mpsc::unbounded_channel();
 
-        let error = open_location(
+        let error = recipe::open_location(
             &shared,
             &exited,
+            None,
             None,
             root,
             Some("/definitely/missing/fut-shell".into()),
@@ -6906,6 +6928,7 @@ mod tests {
             resource_changes,
             agent_events: broadcast::channel(AGENT_EVENT_CAPACITY).0,
             child_env: HashMap::new(),
+            projects: global_config::ProjectCatalog::default(),
             extensions: Vec::new(),
             hook_queue: crate::extensions::hook_queue().0,
             accepting: true,

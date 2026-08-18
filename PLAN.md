@@ -24,9 +24,9 @@ The Milestone 0–1 spike and the current daemon-integrated Milestone 2 slice ar
 - durable terminal lifecycle and confirmed child cleanup;
 - separate unit and process-level end-to-end test layers.
 
-The public grammar is now `attach`, `open`, `session`, `workspace`, `tab`, `pane`, `terminal`, `list`, `doctor`, and `daemon`. Noun-first applies to resource operations; top-level `attach`, `open`, `list`, read-only `doctor`, and the `daemon` lifecycle are intentional non-resource entry points. Exact operations accept raw IDs; inside Fut, layout commands may omit their applicable current ID and resolve fresh ancestry from `FUT_TERMINAL_ID`. UUID-shaped session attach values have ID precedence. Session, workspace, and tab attachment succeeds only when the ancestor identifies exactly one open terminal; pane and terminal IDs are exact, and the navigator handles interactive selection, including sibling panes. The public CLI has no typed-prefix or selector mini-language. Child commands require a literal `--` and are passed as direct argv. Bare `fut` opens the current directory and then attaches to its returned terminal. `fut attach` connects only to an existing daemon, starts lease-free in the global navigator, and attaches after selection. `fut open`, `fut tab new [WORKSPACE_ID]`, and `fut pane new [TAB_ID] [--cwd PATH] [-- COMMAND...]` are control-only; each returns complete selected ancestry and terminal identity, while resource attachment remains separate. Pane creation defaults to the shell, and its cwd defaults to the workspace root with relative paths resolved against that root. The CLI makes no atomic create-and-attach guarantee. The TUI consumes typed protocol IDs directly rather than constructing CLI arguments.
+The public grammar is now `attach`, `open`, `project`, `session`, `workspace`, `tab`, `pane`, `terminal`, `list`, `doctor`, and `daemon`. Noun-first applies to resource operations; top-level `attach`, `open`, `list`, read-only `doctor`, machine-local `project trust`/`project untrust`, and the `daemon` lifecycle are intentional non-resource entry points. Exact operations accept raw IDs; inside Fut, layout commands may omit their applicable current ID and resolve fresh ancestry from `FUT_TERMINAL_ID`. UUID-shaped session attach values have ID precedence. Session, workspace, and tab attachment succeeds only when the ancestor identifies exactly one open terminal; pane and terminal IDs are exact, and the navigator handles interactive selection, including sibling panes. The public CLI has no typed-prefix or selector mini-language. Child commands require a literal `--` and are passed as direct argv. Bare `fut` opens the current directory and then attaches to its returned terminal. `fut attach` connects only to an existing daemon, starts lease-free in the global navigator, and attaches after selection. `fut open`, `fut tab new [WORKSPACE_ID]`, and `fut pane new [TAB_ID] [--cwd PATH] [-- COMMAND...]` are control-only; each returns complete selected ancestry and terminal identity, while resource attachment remains separate. Pane creation defaults to the shell, and its cwd defaults to the workspace root with relative paths resolved against that root. The CLI makes no atomic create-and-attach guarantee. The TUI consumes typed protocol IDs directly rather than constructing CLI arguments.
 
-This validates logical workspace, tab, and pane creation, same-workspace pane movement, authored right/down split topology, multi-pane lifecycle, proper tab close, session, workspace, and tab rename, structured control output, live completion, revisioned resource streaming, and responsive simultaneous-pane UI end-to-end. Workspaces are user-defined collections of tabs with CWD context: Git checkouts fit naturally, but Fut does not prescribe or create them, and multiple workspaces in one session may share a root. `Ctrl-b w` and `Ctrl-b t` activate their respective resource lists, where `c` creates and `r` renames the selection. The current development protocol is `18` and requires exact client/daemon matching; `daemon shutdown` can still contact a Fut 0.1 protocol-`0` daemon during upgrade. Successful `--json` responses use a `version: 1` envelope and dotted command name. Failures preserve daemon codes and classify local argument and command errors. Shell completion remains bounded and read-only. Tabs own shared split trees whose validated leaf order matches pane order; clients default to recursively rendered splits and may select the accordion policy without rewriting topology. Focused-only degradation, client-local zoom, exact daemon-owned split resizing, directional and cyclic pane focus, complete focused-application mouse input, mouse drag selection and copy, client-local scrollback, wrapping, numbered and last-resource navigation, interactive workspace/tab CWD inheritance, host-native indexed ANSI colors, complete command-launcher coverage, and the semantic agent POC are implemented. Revisioned resource and selected views reconcile creation, movement, closure, lifecycle, topology, and split-ratio changes; focused exit remains inside its session and publishes the fresh resource snapshot needed to remove closed tab chrome. The baseline still lacks titles, richer keyboard input, trusted recipes, and terminal-native alerts.
+This validates logical workspace, tab, and pane creation, same-workspace pane movement, authored right/down split topology, multi-pane lifecycle, proper tab close, session, workspace, and tab rename, structured control output, live completion, revisioned resource streaming, and responsive simultaneous-pane UI end-to-end. Workspaces are user-defined collections of tabs with CWD context: Git checkouts fit naturally, but Fut does not prescribe or create them, and multiple workspaces in one session may share a root. `Ctrl-b w` and `Ctrl-b t` activate their respective resource lists, where `c` creates and `r` renames the selection. The current development protocol is `25` and requires exact client/daemon matching; `daemon shutdown` can still contact a Fut 0.1 protocol-`0` daemon during upgrade. Successful `--json` responses use a `version: 1` envelope and dotted command name. Failures preserve daemon codes and classify local argument and command errors. Shell completion remains bounded and read-only. Tabs own shared split trees whose validated leaf order matches pane order; clients default to recursively rendered splits and may select the accordion policy without rewriting topology. Focused-only degradation, client-local zoom, exact daemon-owned split resizing, directional and cyclic pane focus, complete focused-application mouse input, mouse drag selection and copy, client-local scrollback, wrapping, numbered and last-resource navigation, interactive workspace/tab CWD inheritance, host-native indexed ANSI colors, complete command-launcher coverage, trusted project recipes, and the semantic agent POC are implemented. Revisioned resource and selected views reconcile creation, movement, closure, lifecycle, topology, and split-ratio changes; focused exit remains inside its session and publishes the fresh resource snapshot needed to remove closed tab chrome. The baseline still lacks titles, richer keyboard input, and terminal-native alerts.
 
 The semantic POC provides explicit `idle`, `working`, `blocked`, and `completed` reports, a Pi integration, inline rollups, and per-client unseen attention navigation. BEL, output-unread, and silence alerts remain unstarted and separate from this POC.
 
@@ -40,7 +40,7 @@ Milestone numbers group capabilities; they do not force implementation order. Th
 
 1. refine remaining daily-driver terminal behavior and the implemented semantic POC through dogfooding;
 2. add terminal-native BEL, output-unread, and silence alerts without conflating them with semantic activity;
-3. return to Milestone 3's trusted project definitions and workspace recipes;
+3. extend Milestone 3's project catalog with its in-client opener and optional worktree automation;
 4. harden the resulting product through Milestone 6.
 
 UI work began before Milestone 2 closed: simultaneous pane rendering, per-client focus, and minimal split geometry now bridge resource semantics into Milestone 4. Milestone 4 treats visual quality as product work rather than a final polish pass. Terminal content should dominate a compact, responsive interface with unmistakable focus, a visible but unobtrusive hierarchy, restrained state color, and a small amount of character rather than ornamental panel chrome.
@@ -52,7 +52,7 @@ The default tab layout is a shared authored split tree rather than the former ac
 - `Ctrl-b |` splits the focused pane to the right; `Ctrl-b _` splits it downward. New branches begin 1:1, the new pane receives focus only after correlated creation and selection acknowledgements, and input remains paused through that transition.
 - Interactive splits inherit the focused terminal's current directory. The daemon queries the terminal's root child PID through a platform adapter at split time rather than trusting client or shell text (`lsof` on the current macOS implementation and `/proc` on Linux). If that fresh query is unavailable because the process raced exit or the OS refuses it, creation falls back to the terminal's recorded spawn directory, then the workspace root. Foreground-process-group, direct libproc, and OSC 7 refinement may follow without changing the split contract.
 - Closing a pane removes its leaf and collapses a one-child branch. Moving a pane removes and collapses at the source, then splits the destination tab's final open leaf to the right at 1:1, placing the moved pane in the new right leaf. This preserves the existing append order and does not change pane, terminal, process, PTY, or lease identity.
-- Automation has an explicit typed relative split operation addressed by raw pane ID and direction. Existing tab-relative pane creation remains deterministic by inserting a right split at the final leaf until project recipes can author complete trees.
+- Automation has an explicit typed relative split operation addressed by raw pane ID and direction. Existing tab-relative pane creation remains deterministic by inserting a right split at the final leaf, while project recipes author complete validated trees before publication.
 - The default client layout recursively renders the authored tree. A leaf requires 24 content columns when focused, 12 otherwise, and three content rows; every branch divider consumes one neutral cell on its axis. Subtree minimums compose recursively. If the entire tree fits, each branch applies its ratio clamped to both child minimums. If it does not fit, only the focused pane fills the host with no divider. These exact rules apply independently per client and never mutate the tree. Explicit zoom remains a client overlay.
 - Each branch has a stable ID and a reduced fractional ratio. Left-dragging a visible divider writes the exact requested `first cells / available cells` ratio through the daemon, preserving the cell at that host size, surviving detach, and reconciling other clients without publishing unchanged effective cells. Accordion, zoom, and focused-only fallback expose no divider gesture.
 - The accordion remains a separate client-owned policy over split-tree leaf order. Safe UI configuration provides `pane_layout = "splits" | "accordion"`, defaulting to `"splits"`; live configuration reload applies this preference and existing chrome placement to the attached client.
@@ -177,11 +177,11 @@ Introduce the real product model before reproducing more tmux behavior.
 - Shell completion obtains live resources from the daemon, presents enough names and ancestry to distinguish them, and inserts the exact raw ID accepted by the selected command. (Met.)
 - Every noninteractive command has versioned JSON success and error output; command names are dotted and scripts never need to parse human output. (Met.)
 
-## Milestone 3: Project definitions and workspace recipes (deferred)
+## Milestone 3: Project definitions and workspace recipes (in progress)
 
 Replace the external Tmuxinator/Herdr bootstrap layer with a native, trusted creation flow.
 
-This capability remains part of the intended product, but implementation follows the daily-driver UI and initial agent-status spike. Until then, explicit CLI creation remains the honest bootstrap path.
+The explicit catalog, daemonless approval commands, and trusted one-time workspace recipe creation flow are implemented. In-client project opening and approval, optional extension-driven worktree discovery, trust preview, and configuration explanation remain.
 
 ### Work
 
@@ -189,7 +189,7 @@ This capability remains part of the intended product, but implementation follows
 - Design a small TOML schema for tabs, panes, commands, environment, working directories, and initial layouts.
 - Prefer command argument arrays; allow shell evaluation only when explicitly requested.
 - Resolve configuration precedence with provenance available to diagnostics.
-- Add project trust based on project identity and configuration content.
+- Add machine-local project trust bound to a canonical recipe path and exact content, with daemonless approve/revoke commands. (Met.)
 - Preview executable actions before first trust.
 - Apply the same workspace recipe to the main checkout and new worktrees.
 - Make repeated open commands attach to live resources rather than duplicate them.
@@ -199,8 +199,8 @@ This capability remains part of the intended product, but implementation follows
 ### Tests
 
 - Configuration merge and provenance tests.
-- Trust invalidation when executable configuration changes.
-- No-command execution before trust.
+- Trust invalidation when executable configuration changes. (Met.)
+- No-command execution before trust. (Met.)
 - Idempotent project/workspace open behavior.
 - Recipes covering editor, server, console, logs, environment, and multi-pane tabs.
 
@@ -208,7 +208,7 @@ This capability remains part of the intended product, but implementation follows
 
 - Opening a known project produces its expected initial workspace.
 - Opening a new worktree applies the shared workspace recipe.
-- An untrusted repository cannot silently execute configuration.
+- An untrusted repository cannot silently execute configuration. (Met.)
 - The current `hdr` bootstrap responsibilities can move into Fut.
 
 ## Milestone 4: Daily-driver terminal, navigation, and UI

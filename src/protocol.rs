@@ -21,7 +21,7 @@ use crate::{
 /// Protocol version used by released Fut 0.1 builds.
 pub const PROTOCOL_VERSION_0_1: u16 = 0;
 /// Current clients and daemons require an exact protocol match.
-pub const PROTOCOL_VERSION: u16 = 24;
+pub const PROTOCOL_VERSION: u16 = 25;
 /// Enough for 50,000 individually styled MessagePack-encoded cells while
 /// remaining a firm pre-allocation bound for the length-delimited transport.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
@@ -281,6 +281,8 @@ pub enum ClientMessage {
     },
     Detach,
     OpenLocation {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
         cwd: PathBuf,
@@ -1106,6 +1108,7 @@ mod tests {
         let selector =
             TargetSelector::Session(crate::resources::SessionSelector::Name("project λ".into()));
         let message = ClientMessage::OpenLocation {
+            project: Some("fut".into()),
             name: Some("project λ".into()),
             cwd: PathBuf::from("/tmp/project"),
             program: Some(PathBuf::from("/bin/sh")),
@@ -1203,7 +1206,7 @@ mod tests {
             switched
         );
         assert_eq!(PROTOCOL_VERSION_0_1, 0);
-        assert_eq!(PROTOCOL_VERSION, 24);
+        assert_eq!(PROTOCOL_VERSION, 25);
 
         let watch = ClientMessage::WatchResources;
         assert_eq!(

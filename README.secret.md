@@ -60,9 +60,23 @@ Unknown fields, unsafe text, malformed or oversized files, ambiguous segments, a
 
 `fut open [PATH] [--name NAME] [-- COMMAND...]` replaces the former `new` command. It is always control-only and requires an existing daemon. Bare `fut` is the convenience path that opens the current directory and then attaches to the returned terminal. `fut attach` instead connects only to an existing daemon, opens the global navigator without a terminal lease, and attaches after selection. Attaching to an exact existing resource remains a separate `RESOURCE attach ID` operation; the CLI does not offer an atomic create-and-attach command. Child commands always follow `--`; they are passed as arguments without shell evaluation.
 
+Declare memorable project roots under `[projects.NAME]` in Fut's global config,
+then open one with `fut open --project NAME`. Supplying both a path and project,
+as in `fut open ../feature --project fut`, opens a linked checkout only after
+Fut verifies that it belongs to the configured Git project. The catalog is
+explicit and never scans project folders automatically.
+
+Catalog projects may define a trusted creation recipe for their initial tabs,
+panes, direct commands, working directories, environment, split layout, and
+focus. Review a repository `.fut/project.toml`, then approve its exact contents
+with `fut project trust NAME`; revoke approval with `fut project untrust NAME`.
+Both commands work without a daemon, and approval changes take effect for the
+next new workspace without a restart. An explicit global recipe path is
+inherently trusted. Recipes never reconcile an existing live workspace.
+
 ## Control surface
 
-Resource operations are noun-first. Top-level `attach`, `open`, `list`, and the read-only `doctor`, plus the `daemon` lifecycle commands, are intentional non-resource entry points:
+Resource operations are noun-first. Top-level `attach`, `open`, `list`, the read-only `doctor`, machine-local `project trust`/`project untrust`, and the `daemon` lifecycle commands are intentional non-resource entry points:
 
 ```sh
 fut session attach SESSION
@@ -89,6 +103,8 @@ fut terminal attach TERMINAL_ID
 
 fut attach
 fut list
+fut project trust NAME
+fut project untrust NAME
 fut daemon run [--cwd PATH] [-- COMMAND...]
 fut daemon ping
 fut daemon shutdown
@@ -104,7 +120,7 @@ A workspace is a logical user context and collection of tabs. Its root supplies 
 
 ## Automation and interaction
 
-The current development protocol is `17` and requires an exact match between clients and daemons. After upgrading from Fut 0.1, `fut daemon shutdown` can still stop its protocol-`0` daemon; otherwise stop the running daemon before retrying. Global `--json` is available only for noninteractive control commands. Successful output has a versioned envelope and dotted command name:
+The current development protocol is `25` and requires an exact match between clients and daemons. After upgrading from Fut 0.1, `fut daemon shutdown` can still stop its protocol-`0` daemon; otherwise stop the running daemon before retrying. Global `--json` is available only for noninteractive control commands. Successful output has a versioned envelope and dotted command name:
 
 ```json
 {"version":1,"command":"workspace.rename","result":{"workspace_id":"…","name":"api"}}
@@ -153,7 +169,7 @@ Multi-pane tabs default to a shared authored split tree matching tmux's split mo
 
 Mouse input is hit-tested against terminal content. A left click on an unfocused pane selects it through typed focus without forwarding that initiating gesture. In the focused pane, application mouse reporting takes precedence; otherwise a left drag selects and copies terminal text, with Shift as an explicit selection override. Requested motion, modifiers, and wheel input use Ghostty's application mouse modes and pane-local cells. Wheel routing prefers application reports, then DEC alternate scroll as three mode-aware cursor keys on the alternate screen, then three lines of client-local scrollback. Other clients' viewports are never changed, and copy mode or modal surfaces suppress application mouse input. Keyboard input, paste, and host resize return the focused pane to the live bottom.
 
-Multi-pane lifecycle is supported: pane and terminal navigation is exact; pane placement can move between tabs in one workspace without disturbing its terminal; exiting or closing one pane preserves its siblings and ancestors; and closing a whole tab closes all descendant panes and removes its tab-bar entry. When the focused terminal exits, Fut walks backward through pane, tab, and workspace resource order inside that session, then forward if there was no predecessor. It never crosses into another session: exhausting the attached session detaches that client and closes the empty session, while other sessions and the daemon remain alive. Interactive clients receive revisioned resource snapshots and authoritative complete tab views, including open split topology. External pane creation, movement, closure, and process exit therefore update every affected client without reselecting. Authored split topology is shared resource state; computed rectangles, accordion policy, zoom, focus, and viewport remain client-owned. Pane titles, pane naming, cross-workspace movement, richer keyboard input, and project recipes remain planned.
+Multi-pane lifecycle is supported: pane and terminal navigation is exact; pane placement can move between tabs in one workspace without disturbing its terminal; exiting or closing one pane preserves its siblings and ancestors; and closing a whole tab closes all descendant panes and removes its tab-bar entry. When the focused terminal exits, Fut walks backward through pane, tab, and workspace resource order inside that session, then forward if there was no predecessor. It never crosses into another session: exhausting the attached session detaches that client and closes the empty session, while other sessions and the daemon remain alive. Interactive clients receive revisioned resource snapshots and authoritative complete tab views, including open split topology. External pane creation, movement, closure, and process exit therefore update every affected client without reselecting. Authored split topology is shared resource state; computed rectangles, accordion policy, zoom, focus, and viewport remain client-owned. Pane titles, pane naming, cross-workspace movement, and richer keyboard input remain planned.
 
 Fut preserves indexed ANSI colors as palette indices instead of resolving them through an internal default palette. The containing terminal therefore applies its own theme to ANSI colors, while explicit 24-bit colors remain exact RGB values.
 

@@ -27,6 +27,11 @@ commands, and detach with `Ctrl-b d`.
 See [Using Fut](https://fut.sh/usage/) for the resource model, everyday
 controls, mouse and copy behavior, CLI automation, and shell completion.
 
+Configured projects can use a repository-owned `.fut/project.toml` to create
+their initial workspace. Review it, then run `fut project trust NAME` to
+approve its exact contents or `fut project untrust NAME` to revoke that
+machine-local approval; neither command requires a running daemon.
+
 ## Agent integrations
 
 Fut can show native lifecycle activity from Claude Code, Codex, and Pi. Install

@@ -558,6 +558,7 @@ impl Harness {
         command
             .env_clear()
             .env("HOME", self.root.path().join("home"))
+            .env("XDG_STATE_HOME", self.root.path().join("state"))
             .env("PATH", "/usr/bin:/bin")
             .env("TMPDIR", self.root.path().join("runtime"))
             .env("FUT_RUNTIME_DIR", self.root.path().join("runtime"))
@@ -587,6 +588,26 @@ fn git(cwd: &std::path::Path, arguments: &[&str]) {
     assert!(status.success());
 }
 
+fn project_trust_cli(root: &std::path::Path, operation: &str, name: &str) -> Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_fut"))
+        .env_clear()
+        .env("HOME", root.join("home"))
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env("PATH", "/usr/bin:/bin")
+        .arg("--json")
+        .arg("project")
+        .arg(operation)
+        .arg(name)
+        .output()
+        .expect("run daemonless project trust command");
+    assert!(
+        output.status.success(),
+        "project {operation} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("parse project trust JSON")
+}
+
 fn spawn_daemon(
     root: &TempDir,
     socket: &PathBuf,
@@ -610,6 +631,7 @@ fn spawn_daemon(
     command
         .env_clear()
         .env("HOME", home)
+        .env("XDG_STATE_HOME", root.path().join("state"))
         .env("PATH", path)
         .env("TMPDIR", runtime)
         .env("FUT_RUNTIME_DIR", runtime)
@@ -1705,6 +1727,7 @@ async fn agent_cli_composes_lifecycle_input_and_bounded_output_without_stale_idl
         selected: exiting, ..
     } = harness
         .control_command(ClientMessage::OpenLocation {
+            project: None,
             name: Some("exiting-agent".into()),
             cwd: exit_cwd,
             program: Some("/bin/sh".into()),
@@ -6188,6 +6211,7 @@ done
     let cwd_b = harness.root.path().join("project-b");
     fs::create_dir(&cwd_b).unwrap();
     let created = harness.control_command(ClientMessage::OpenLocation {
+        project: None,
         name: Some("project-b".into()),
         cwd: cwd_b.clone(),
         program: Some("/bin/sh".into()),
@@ -6287,6 +6311,7 @@ async fn public_last_session_navigation_toggles_after_global_selection() {
     fs::create_dir(&second_root).unwrap();
     let ServerMessage::LocationOpened { selected: second, .. } = harness
         .control_command(ClientMessage::OpenLocation {
+            project: None,
             name: Some("second-project".into()),
             cwd: second_root,
             program: Some("/bin/sh".into()),
@@ -6365,6 +6390,7 @@ async fn linked_git_worktree_is_a_peer_workspace_and_reopens_idempotently() {
 
     let linked = harness.root.path().join("linked");
     let opened = harness.control_command(ClientMessage::OpenLocation {
+        project: None,
         name: Some("linked".into()),
         cwd: linked.join("nested"),
         program: Some("/bin/sh".into()),
@@ -6412,6 +6438,7 @@ async fn linked_git_worktree_is_a_peer_workspace_and_reopens_idempotently() {
     let marker = harness.root.path().join("must-not-run");
     let reopened = harness
         .control_command(ClientMessage::OpenLocation {
+            project: None,
             name: Some("ignored".into()),
             cwd: linked.clone(),
             program: Some("/bin/sh".into()),
@@ -6488,6 +6515,411 @@ async fn linked_git_worktree_is_a_peer_workspace_and_reopens_idempotently() {
 }
 
 #[tokio::test]
+async fn trusted_catalog_recipe_atomically_creates_linked_and_bare_workspaces_once() {
+    let harness = Harness::start_with("while :; do sleep 1; done", |root| {
+        let main = root.join("main");
+        fs::create_dir(&main).unwrap();
+        git(&main, &["init", "-b", "main"]);
+        fs::write(main.join("tracked"), "x").unwrap();
+        git(&main, &["add", "tracked"]);
+        git(&main, &["commit", "-m", "initial"]);
+        let linked = root.join("linked-recipe");
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "recipe-linked",
+                linked.to_str().unwrap(),
+            ],
+        );
+        for checkout in [&main, &linked] {
+            fs::create_dir(checkout.join("frontend")).unwrap();
+            fs::create_dir(checkout.join("agent")).unwrap();
+        }
+        let recipe = r#"version = 1
+focus = "code.agent"
+environment = { PROJECT_LEVEL = "workspace", CASCADE = "workspace" }
+
+[[tabs]]
+id = "code"
+cwd = "frontend"
+environment = { CASCADE = "tab" }
+panes = [
+  { id = "editor", command = ["/bin/sh", "-c", 'printf "%s|%s|%s" "$PWD" "$PROJECT_LEVEL" "$CASCADE" > editor.marker; while :; do sleep 1; done'] },
+  { id = "agent", cwd = "agent", environment = { CASCADE = "pane" }, command = ["/bin/sh", "-c", 'printf "%s|%s|%s" "$PWD" "$PROJECT_LEVEL" "$CASCADE" > agent.marker; while :; do sleep 1; done'], split = { target = "editor", direction = "right" } },
+]
+
+[[tabs]]
+id = "server"
+name = "development server"
+panes = [
+  { id = "server", command = ["/bin/sh", "-c", 'printf "%s|%s" "$PROJECT_LEVEL" "$CASCADE" > server.marker; while :; do sleep 1; done'] },
+]
+"#;
+        fs::create_dir(main.join(".fut")).unwrap();
+        fs::write(main.join(".fut/project.toml"), recipe).unwrap();
+        let config_dir = root.join("home/.config/fut");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.toml"),
+            format!("[projects.fut]\npath = {:?}\n", main),
+        )
+        .unwrap();
+        let trusted = project_trust_cli(root, "trust", "fut");
+        assert_eq!(trusted["command"], "project.trust");
+        assert_eq!(trusted["version"], 1);
+        assert_eq!(trusted["result"]["name"], "fut");
+        assert_eq!(trusted["result"]["trusted"], true);
+        assert_eq!(trusted["result"]["changed"], true);
+    })
+    .await;
+    let linked = harness.root.path().join("linked-recipe");
+    let main = harness.root.path().join("main");
+
+    let mut watcher = harness.connect().await.unwrap();
+    assert!(matches!(
+        hello(&mut watcher, ClientMode::Control, PROTOCOL_VERSION)
+            .await
+            .unwrap(),
+        ServerMessage::Welcome { .. }
+    ));
+    send(&mut watcher, ClientMessage::WatchResources).await;
+    assert!(matches!(
+        receive(&mut watcher).await.unwrap(),
+        ServerMessage::Resources { .. }
+    ));
+
+    let opened = harness
+        .control_command(ClientMessage::OpenLocation {
+            project: Some("fut".into()),
+            name: Some("recipe-project".into()),
+            cwd: linked.clone(),
+            program: None,
+            argv: Vec::new(),
+        })
+        .await;
+    let ServerMessage::LocationOpened {
+        selected: linked_focus,
+        disposition: fut::protocol::OpenDisposition::SessionCreated,
+    } = opened
+    else {
+        panic!("recipe project did not create a session: {opened:?}")
+    };
+    let published = receive_matching(&mut watcher, |message| {
+        matches!(message, ServerMessage::ResourcesChanged { snapshot } if snapshot.sessions.iter().any(|session| session.id == linked_focus.session_id))
+    })
+    .await;
+    let ServerMessage::ResourcesChanged { snapshot } = published else {
+        unreachable!()
+    };
+    let session = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.id == linked_focus.session_id)
+        .unwrap();
+    assert_eq!(session.workspaces.len(), 1);
+    let workspace = &session.workspaces[0];
+    assert_eq!(workspace.tabs.len(), 2);
+    assert_eq!(workspace.tabs[0].name, "code");
+    assert_eq!(workspace.tabs[1].name, "development server");
+    assert_eq!(workspace.tabs[0].panes.len(), 2);
+    assert_eq!(workspace.tabs[1].panes.len(), 1);
+    assert_eq!(workspace.tabs[0].layout.leaf_ids().len(), 2);
+    assert_eq!(workspace.tabs[0].panes[1].id, linked_focus.pane_id);
+    assert_eq!(
+        workspace.tabs[0].panes[1].terminal_id,
+        linked_focus.terminal_id
+    );
+
+    wait_for(DEADLINE, || {
+        linked.join("frontend/editor.marker").exists()
+            && linked.join("agent/agent.marker").exists()
+            && linked.join("server.marker").exists()
+    })
+    .await;
+    assert_eq!(
+        fs::read_to_string(linked.join("frontend/editor.marker")).unwrap(),
+        format!(
+            "{}|workspace|tab",
+            linked.join("frontend").canonicalize().unwrap().display()
+        )
+    );
+    assert_eq!(
+        fs::read_to_string(linked.join("agent/agent.marker")).unwrap(),
+        format!(
+            "{}|workspace|pane",
+            linked.join("agent").canonicalize().unwrap().display()
+        )
+    );
+    assert_eq!(
+        fs::read_to_string(linked.join("server.marker")).unwrap(),
+        "workspace|workspace"
+    );
+
+    let bare = harness
+        .control_command(ClientMessage::OpenLocation {
+            project: None,
+            name: Some("main".into()),
+            cwd: main.clone(),
+            program: None,
+            argv: Vec::new(),
+        })
+        .await;
+    let ServerMessage::LocationOpened {
+        selected: main_focus,
+        disposition: fut::protocol::OpenDisposition::WorkspaceCreated,
+    } = bare
+    else {
+        panic!("bare catalog identity did not create a recipe workspace: {bare:?}")
+    };
+    assert_eq!(main_focus.session_id, linked_focus.session_id);
+    wait_for(DEADLINE, || {
+        main.join("frontend/editor.marker").exists()
+            && main.join("agent/agent.marker").exists()
+            && main.join("server.marker").exists()
+    })
+    .await;
+    let snapshot = harness.resources().await;
+    let session = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.id == linked_focus.session_id)
+        .unwrap();
+    assert_eq!(session.workspaces.len(), 2);
+    let main_workspace = session
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == main_focus.workspace_id)
+        .unwrap();
+    assert_eq!(main_workspace.tabs.len(), 2);
+    assert_eq!(main_workspace.tabs[0].panes[1].id, main_focus.pane_id);
+
+    fs::write(
+        main.join(".fut/project.toml"),
+        "this is no longer valid TOML",
+    )
+    .unwrap();
+    let ignored_marker = linked.join("must-not-run");
+    let reopened = harness
+        .control_command(ClientMessage::OpenLocation {
+            project: Some("fut".into()),
+            name: Some("ignored".into()),
+            cwd: linked,
+            program: Some("/bin/sh".into()),
+            argv: vec!["-c".into(), "touch must-not-run".into()],
+        })
+        .await;
+    assert!(
+        matches!(
+            &reopened,
+            ServerMessage::LocationOpened {
+                selected,
+                disposition: fut::protocol::OpenDisposition::Existing,
+            } if selected.workspace_id == linked_focus.workspace_id
+        ),
+        "unexpected existing recipe response: {reopened:?}"
+    );
+    assert!(!ignored_marker.exists());
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn repository_recipe_trust_change_and_untrust_apply_without_daemon_restart() {
+    let harness = Harness::start_with("while :; do sleep 1; done", |root| {
+        let project = root.join("untrusted-project");
+        fs::create_dir_all(project.join(".fut")).unwrap();
+        fs::write(
+            project.join(".fut/project.toml"),
+            r#"version = 1
+tabs = [{ id = "unsafe", panes = [{ id = "unsafe", command = ["/bin/sh", "-c", "touch untrusted-marker; while :; do sleep 1; done"] }] }]
+"#,
+        )
+        .unwrap();
+        let config_dir = root.join("home/.config/fut");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.toml"),
+            format!("[projects.unsafe]\npath = {:?}\n", project),
+        )
+        .unwrap();
+    })
+    .await;
+    let project = harness.root.path().join("untrusted-project");
+    let before = without_observations(harness.resources().await);
+    let response = harness
+        .control_command(ClientMessage::OpenLocation {
+            project: Some("unsafe".into()),
+            name: None,
+            cwd: project.clone(),
+            program: None,
+            argv: Vec::new(),
+        })
+        .await;
+    assert!(
+        matches!(
+            &response,
+            ServerMessage::Error { code, message }
+                if code == "untrusted_recipe"
+                    && message.contains("fut project trust unsafe")
+        ),
+        "unexpected untrusted response: {response:?}"
+    );
+    assert_eq!(without_observations(harness.resources().await), before);
+    assert!(!project.join("untrusted-marker").exists());
+
+    let trusted = project_trust_cli(harness.root.path(), "trust", "unsafe");
+    assert_eq!(trusted["command"], "project.trust");
+    assert_eq!(trusted["version"], 1);
+    assert_eq!(trusted["result"]["trusted"], true);
+    assert_eq!(trusted["result"]["changed"], true);
+    let store = harness.root.path().join("state/fut/trusted-recipes.toml");
+    assert!(store.is_file());
+    assert_eq!(
+        fs::metadata(&store).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    let opened = harness
+        .control_command(ClientMessage::OpenLocation {
+            project: Some("unsafe".into()),
+            name: None,
+            cwd: project.clone(),
+            program: None,
+            argv: Vec::new(),
+        })
+        .await;
+    let ServerMessage::LocationOpened {
+        selected: first,
+        disposition: fut::protocol::OpenDisposition::SessionCreated,
+    } = opened
+    else {
+        panic!("trusted recipe was not applied without restart: {opened:?}")
+    };
+    wait_for(DEADLINE, || project.join("untrusted-marker").exists()).await;
+    harness
+        .close_session(SessionSelector::Id(first.session_id))
+        .await;
+
+    fs::write(
+        project.join(".fut/project.toml"),
+        r#"version = 1
+tabs = [{ id = "changed", panes = [{ id = "changed", command = ["/bin/sh", "-c", "touch changed-marker; while :; do sleep 1; done"] }] }]
+"#,
+    )
+    .unwrap();
+    let changed = harness
+        .control_command(ClientMessage::OpenLocation {
+            project: Some("unsafe".into()),
+            name: None,
+            cwd: project.clone(),
+            program: None,
+            argv: Vec::new(),
+        })
+        .await;
+    assert!(matches!(
+        changed,
+        ServerMessage::Error { ref code, .. } if code == "untrusted_recipe"
+    ));
+    assert!(!project.join("changed-marker").exists());
+
+    let retrusted = project_trust_cli(harness.root.path(), "trust", "unsafe");
+    assert_eq!(retrusted["result"]["changed"], true);
+    let reopened = harness
+        .control_command(ClientMessage::OpenLocation {
+            project: Some("unsafe".into()),
+            name: None,
+            cwd: project.clone(),
+            program: None,
+            argv: Vec::new(),
+        })
+        .await;
+    let ServerMessage::LocationOpened {
+        selected: second, ..
+    } = reopened
+    else {
+        panic!("retrusted changed recipe was not applied: {reopened:?}")
+    };
+    wait_for(DEADLINE, || project.join("changed-marker").exists()).await;
+    harness
+        .close_session(SessionSelector::Id(second.session_id))
+        .await;
+
+    let untrusted = project_trust_cli(harness.root.path(), "untrust", "unsafe");
+    assert_eq!(untrusted["command"], "project.untrust");
+    assert_eq!(untrusted["version"], 1);
+    assert_eq!(untrusted["result"]["trusted"], false);
+    assert_eq!(untrusted["result"]["changed"], true);
+    let revoked = harness
+        .control_command(ClientMessage::OpenLocation {
+            project: Some("unsafe".into()),
+            name: None,
+            cwd: project,
+            program: None,
+            argv: Vec::new(),
+        })
+        .await;
+    assert!(matches!(
+        revoked,
+        ServerMessage::Error { ref code, .. } if code == "untrusted_recipe"
+    ));
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn daemon_bootstrap_applies_the_matching_catalog_recipe_atomically() {
+    let harness = Harness::start_with(
+        "touch bootstrap-focus.marker; while :; do sleep 1; done",
+        |root| {
+            let recipe = root.join("bootstrap-recipe.toml");
+            fs::write(
+                &recipe,
+                r#"version = 1
+focus = "main.focus"
+[[tabs]]
+id = "main"
+panes = [
+  { id = "first", command = ["/bin/sh", "-c", "touch bootstrap-first.marker; while :; do sleep 1; done"] },
+  { id = "focus", command = ["/bin/sh", "-c", "touch declared-focus.marker; while :; do sleep 1; done"], split = { target = "first", direction = "down" } },
+]
+"#,
+            )
+            .unwrap();
+            let config_dir = root.join("home/.config/fut");
+            fs::create_dir_all(&config_dir).unwrap();
+            fs::write(
+                config_dir.join("config.toml"),
+                format!(
+                    "[projects.bootstrap]\npath = {:?}\nrecipe = {:?}\n",
+                    root.join("cwd"),
+                    recipe
+                ),
+            )
+            .unwrap();
+        },
+    )
+    .await;
+    let cwd = harness.root.path().join("cwd");
+    wait_for(DEADLINE, || {
+        cwd.join("bootstrap-first.marker").exists() && cwd.join("bootstrap-focus.marker").exists()
+    })
+    .await;
+    let snapshot = harness.resources().await;
+    assert_eq!(snapshot.sessions.len(), 1);
+    assert_eq!(snapshot.sessions[0].workspaces.len(), 1);
+    let tabs = &snapshot.sessions[0].workspaces[0].tabs;
+    assert_eq!(tabs.len(), 1);
+    assert_eq!(tabs[0].panes.len(), 2);
+    assert_eq!(tabs[0].layout.leaf_ids().len(), 2);
+    assert!(
+        !cwd.join("declared-focus.marker").exists(),
+        "the explicit daemon command should override only the recipe focus command"
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn workspace_retirement_waits_for_its_acknowledgement_connection() {
     let mut harness = Harness::start_with("while :; do sleep 1; done", |root| {
         let main = root.join("cwd");
@@ -6508,6 +6940,7 @@ async fn workspace_retirement_waits_for_its_acknowledgement_connection() {
         disposition: fut::protocol::OpenDisposition::WorkspaceCreated,
     } = harness
         .control_command(ClientMessage::OpenLocation {
+            project: None,
             name: Some("linked".into()),
             cwd: linked,
             program: Some("/bin/sh".into()),
@@ -6644,6 +7077,7 @@ async fn existing_reopen_is_idempotent_and_invalid_name_never_spawns() {
     let marker_file = harness.root.path().join("duplicate.marker");
     let response = harness
         .control_command(ClientMessage::OpenLocation {
+            project: None,
             name: Some("cwd".into()),
             cwd: harness.root.path().join("cwd"),
             program: Some("/bin/sh".into()),
@@ -6666,6 +7100,7 @@ async fn existing_reopen_is_idempotent_and_invalid_name_never_spawns() {
     ));
     let response = harness
         .control_command(ClientMessage::OpenLocation {
+            project: None,
             name: Some("different-name".into()),
             cwd: harness.root.path().join("cwd"),
             program: Some("/bin/sh".into()),
@@ -6699,6 +7134,7 @@ async fn existing_reopen_is_idempotent_and_invalid_name_never_spawns() {
     fs::create_dir(&blank_cwd).unwrap();
     let response = harness
         .control_command(ClientMessage::OpenLocation {
+            project: None,
             name: Some(" \t ".into()),
             cwd: blank_cwd,
             program: Some("/bin/sh".into()),
@@ -6843,6 +7279,7 @@ async fn public_client_navigator_switches_live_pty_and_preserves_terminal_isolat
     fs::create_dir(&cwd_b).unwrap();
     let ServerMessage::LocationOpened { selected: b, .. } = harness
         .control_command(ClientMessage::OpenLocation {
+            project: None,
             name: Some("public-b".into()),
             cwd: cwd_b,
             program: Some("/bin/sh".into()),
@@ -6918,6 +7355,7 @@ async fn public_agent_activity_spins_lists_waiting_terminals_and_navigates_unrea
     fs::create_dir(&cwd_b).unwrap();
     let ServerMessage::LocationOpened { selected: b, .. } = harness
         .control_command(ClientMessage::OpenLocation {
+            project: None,
             name: Some("waiting-b".into()),
             cwd: cwd_b,
             program: Some("/bin/sh".into()),
@@ -8816,6 +9254,7 @@ done
         disposition: fut::protocol::OpenDisposition::WorkspaceCreated,
     } = harness
         .control_command(ClientMessage::OpenLocation {
+            project: None,
             name: Some("feature".into()),
             cwd: linked,
             program: Some("/bin/sh".into()),
@@ -10532,6 +10971,7 @@ async fn switching_is_atomic_reversible_and_keeps_protocol_routing_isolated() {
     fs::create_dir(&cwd_b).unwrap();
     let opened = harness
         .control_command(ClientMessage::OpenLocation {
+            project: None,
             name: Some("switch-b".into()),
             cwd: cwd_b,
             program: Some("/bin/sh".into()),
@@ -10607,6 +11047,7 @@ async fn same_target_list_and_failed_switches_preserve_the_attachment() {
     let cwd_b = harness.root.path().join("held-b");
     fs::create_dir(&cwd_b).unwrap();
     let ServerMessage::LocationOpened { selected: b, .. } = harness.control_command(ClientMessage::OpenLocation {
+        project: None,
         name: Some("held-b".into()), cwd: cwd_b, program: Some("/bin/sh".into()),
         argv: vec!["-c".into(), "printf 'B_READY\\r\\n'; while IFS= read -r line; do printf 'B_%s\\r\\n' \"$line\"; done".into()],
     }).await else { panic!("expected B") };
@@ -10683,6 +11124,7 @@ async fn missing_destination_and_post_switch_disconnects_preserve_exact_leases()
     fs::create_dir(&cwd_b).unwrap();
     let ServerMessage::LocationOpened { selected: b, .. } = harness
         .control_command(ClientMessage::OpenLocation {
+            project: None,
             name: Some("closing-b".into()),
             cwd: cwd_b,
             program: Some("/bin/sh".into()),
@@ -10735,6 +11177,7 @@ async fn missing_destination_and_post_switch_disconnects_preserve_exact_leases()
     fs::create_dir(&cwd_c).unwrap();
     let ServerMessage::LocationOpened { selected: c, .. } = harness
         .control_command(ClientMessage::OpenLocation {
+            project: None,
             name: Some("disconnect-c".into()),
             cwd: cwd_c,
             program: Some("/bin/sh".into()),
@@ -11279,6 +11722,7 @@ async fn last_terminal_exit_detaches_instead_of_crossing_sessions() {
         selected: second, ..
     } = harness
         .control_command(ClientMessage::OpenLocation {
+            project: None,
             name: Some("other".into()),
             cwd: second_cwd,
             program: Some("/bin/sh".into()),
@@ -11353,6 +11797,7 @@ async fn public_rename_preserves_a_live_process_and_rejects_invalid_changes_atom
     fs::create_dir(&sibling_cwd).unwrap();
     let ServerMessage::LocationOpened { .. } = harness
         .control_command(ClientMessage::OpenLocation {
+            project: None,
             name: Some("rename-sibling".into()),
             cwd: sibling_cwd,
             program: Some("/bin/sh".into()),

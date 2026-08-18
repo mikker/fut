@@ -86,17 +86,17 @@ Attaching connects a client to the live multiplexer. Detaching removes that clie
 
 Removing a live resource and, where applicable, terminating its process. Closure cascades upward when a parent becomes empty: the last pane closes its tab, the last tab closes its workspace, the last workspace closes its session, and the last session closes Fut.
 
-### Project definition (planned)
+### Project definition
 
 The durable declarative configuration associated with a project. It describes how a new session or workspace should initially be created. It is a creation recipe, not a continuously reconciled desired state.
 
-### Workspace recipe (planned)
+### Workspace recipe
 
 The portion of a project definition applied when a workspace is first created. It may declare initial tabs, pane layouts, commands, environment, and working directories. The same recipe can initialize the main checkout and newly discovered worktrees.
 
-### Project trust (planned)
+### Project trust
 
-The user's approval for a project's executable configuration. Reading safe metadata does not imply permission to run project-provided commands, hooks, or plugins.
+The user's machine-local approval for the exact current bytes at a repository recipe's canonical path. `fut project trust NAME` validates and approves that recipe, while `fut project untrust NAME` revokes it; neither operation requires a daemon. Changed content is untrusted, and reading safe metadata does not imply permission to run project-provided commands, hooks, or plugins. A recipe path explicitly selected in global configuration is inherently trusted.
 
 ### Activity
 

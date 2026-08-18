@@ -106,12 +106,25 @@ enum Command {
         /// Directory to open; defaults to the current directory.
         #[arg(value_name = "PATH", value_hint = ValueHint::DirPath)]
         path: Option<PathBuf>,
+        /// Open a project from the configured project catalog.
+        #[arg(
+            long,
+            value_name = "NAME",
+            add = ArgValueCompleter::new(completion::project)
+        )]
+        project: Option<String>,
         /// Name for the new session or workspace created for this location.
         #[arg(long)]
         name: Option<String>,
         /// Child program and its direct argv, following `--`; defaults to the shell.
         #[arg(last = true, value_hint = ValueHint::CommandWithArguments)]
         command: Vec<String>,
+    },
+    /// Approve or revoke repository-owned project recipes on this machine.
+    Project {
+        /// Project trust operation to perform.
+        #[command(subcommand)]
+        command: ProjectCommand,
     },
     /// Attach, rename, or close a session.
     Session {
@@ -178,6 +191,22 @@ enum Command {
         /// Daemon operation to perform.
         #[command(subcommand)]
         command: DaemonCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProjectCommand {
+    /// Approve the exact current repository recipe after validating it.
+    Trust {
+        /// Configured project name.
+        #[arg(add = ArgValueCompleter::new(completion::project))]
+        name: String,
+    },
+    /// Revoke this machine's approval of a repository recipe.
+    Untrust {
+        /// Configured project name.
+        #[arg(add = ArgValueCompleter::new(completion::project))]
+        name: String,
     },
 }
 
@@ -847,15 +876,22 @@ async fn execute(cli: Cli) -> Result<()> {
         Some(Command::Attach) => client::attach_navigator(&socket, config_dir.as_deref()).await,
         Some(Command::Open {
             path,
+            project,
             name,
             command,
         }) => {
             let current_dir = std::env::current_dir()?;
-            let cwd = resolve_open_path(path, &current_dir);
+            let cwd = resolve_project_open_path(
+                path,
+                project.as_deref(),
+                &current_dir,
+                config_dir.as_deref(),
+            )?;
             let (program, argv) = child_command(command);
             match control(
                 &socket,
                 ClientMessage::OpenLocation {
+                    project,
                     name,
                     cwd,
                     program,
@@ -886,6 +922,9 @@ async fn execute(cli: Cli) -> Result<()> {
                 }
                 other => unexpected(other),
             }
+        }
+        Some(Command::Project { command }) => {
+            run_project_command(config_dir.as_deref(), cli.json, command)
         }
         Some(Command::Session {
             command: SessionCommand::Attach { session },
@@ -1690,6 +1729,7 @@ async fn execute(cli: Cli) -> Result<()> {
             if let Some(program) = command.first() {
                 config.spawn.program = program.into();
                 config.spawn.argv = command[1..].to_vec();
+                config.recipe_command_override = true;
             }
             config.config_dir = config_dir;
             run_daemon(config).await
@@ -1734,6 +1774,89 @@ async fn execute(cli: Cli) -> Result<()> {
         }) => unreachable!("agent skill is handled before daemon setup"),
         Some(command) => run_mutation(&socket, cli.json, command).await,
     }
+}
+
+fn run_project_command(
+    config_dir: Option<&std::path::Path>,
+    json_output: bool,
+    command: ProjectCommand,
+) -> Result<()> {
+    let (name, trust, command_name) = match command {
+        ProjectCommand::Trust { name } => (name, true, "project.trust"),
+        ProjectCommand::Untrust { name } => (name, false, "project.untrust"),
+    };
+    let catalog = client::config::load_projects(config_dir)?;
+    let project = catalog_project(&catalog, &name)?;
+    let change = if trust {
+        crate::project_definition::trust(project)
+    } else {
+        crate::project_definition::untrust(&name, project)
+    }
+    .map_err(|error| match error {
+        error @ crate::project_definition::ProjectDefinitionError::InherentlyTrusted { .. } => {
+            anyhow::Error::new(CliError::new("inherently_trusted", error.to_string()))
+        }
+        error => anyhow::Error::new(error),
+    })?;
+    let trust_source = if change.inherently_trusted {
+        "global_config"
+    } else {
+        "machine_state"
+    };
+    output(
+        json_output,
+        command_name,
+        json!({
+            "name": name,
+            "recipe": change.source,
+            "sha256": change.digest,
+            "trusted": change.trusted,
+            "changed": change.changed,
+            "inherently_trusted": change.inherently_trusted,
+        }),
+        format!(
+            "project={name} trusted={} changed={} source={trust_source} recipe={}",
+            change.trusted,
+            change.changed,
+            change.source.display()
+        ),
+    )
+}
+
+fn resolve_project_open_path(
+    path: Option<PathBuf>,
+    project: Option<&str>,
+    current_dir: &std::path::Path,
+    config_dir: Option<&std::path::Path>,
+) -> Result<PathBuf> {
+    let Some(project_name) = project else {
+        return Ok(resolve_open_path(path, current_dir));
+    };
+    let catalog = client::config::load_projects(config_dir)?;
+    let configured = catalog_project(&catalog, project_name)?;
+    Ok(path.map_or_else(
+        || configured.path().to_owned(),
+        |path| resolve_open_path(Some(path), current_dir),
+    ))
+}
+
+fn catalog_project<'a>(
+    catalog: &'a client::config::ProjectCatalog,
+    name: &str,
+) -> Result<&'a client::config::ProjectConfig> {
+    catalog.get(name).ok_or_else(|| {
+        let available = catalog
+            .iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let message = if available.is_empty() {
+            format!("unknown project {name:?}; no projects are configured")
+        } else {
+            format!("unknown project {name:?}; configured projects: {available}")
+        };
+        anyhow::Error::new(CliError::new("unknown_project", message))
+    })
 }
 
 fn notify_command_activation(pane_id: PaneId) -> anyhow::Result<()> {
@@ -2402,6 +2525,7 @@ async fn open_current_location_with_config(
         let response = control(
             socket,
             ClientMessage::OpenLocation {
+                project: None,
                 name: None,
                 cwd: cwd.to_owned(),
                 program: None,
@@ -3714,6 +3838,68 @@ mod tests {
     }
 
     #[test]
+    fn open_accepts_a_catalog_project_with_an_optional_worktree_path() {
+        let cli = Cli::try_parse_from(["fut", "open", "../feature", "--project", "fut"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Open {
+                path: Some(path),
+                project: Some(project),
+                ..
+            }) if path == std::path::Path::new("../feature") && project == "fut"
+        ));
+    }
+
+    #[test]
+    fn project_trust_commands_parse_with_global_json() {
+        let cli = Cli::try_parse_from(["fut", "--json", "project", "trust", "fut"]).unwrap();
+        assert!(cli.json);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Project {
+                command: ProjectCommand::Trust { name }
+            }) if name == "fut"
+        ));
+
+        let cli = Cli::try_parse_from(["fut", "project", "untrust", "fut"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Project {
+                command: ProjectCommand::Untrust { name }
+            }) if name == "fut"
+        ));
+    }
+
+    #[test]
+    fn configured_project_supplies_its_root_and_preserves_an_explicit_path() {
+        let temporary = tempfile::tempdir().unwrap();
+        let main = temporary.path().join("main");
+        let linked = temporary.path().join("linked");
+        let config = temporary.path().join("config");
+        std::fs::create_dir(&config).unwrap();
+        std::fs::write(
+            config.join("config.toml"),
+            format!("[projects.fut]\npath = {:?}\n", main),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_project_open_path(None, Some("fut"), temporary.path(), Some(&config),).unwrap(),
+            main
+        );
+        assert_eq!(
+            resolve_project_open_path(
+                Some(PathBuf::from("linked")),
+                Some("fut"),
+                temporary.path(),
+                Some(&config),
+            )
+            .unwrap(),
+            linked
+        );
+    }
+
+    #[test]
     fn rejects_legacy_forms_typed_prefixes_and_unambiguous_bad_ids() {
         for args in [
             ["fut", "new"],
@@ -3805,6 +3991,7 @@ mod tests {
             [
                 "attach",
                 "open",
+                "project",
                 "session",
                 "workspace",
                 "tab",
@@ -3826,6 +4013,16 @@ mod tests {
         let help = String::from_utf8(help).unwrap();
         assert!(help.contains("versioned JSON for noninteractive commands only"));
         assert!(help.contains("existing daemon without attaching"));
+
+        let command = cli_command();
+        let project = command.find_subcommand("project").unwrap();
+        assert_eq!(
+            project
+                .get_subcommands()
+                .map(clap::Command::get_name)
+                .collect::<Vec<_>>(),
+            ["trust", "untrust"]
+        );
 
         let command = cli_command();
         let pane = command.find_subcommand("pane").unwrap();

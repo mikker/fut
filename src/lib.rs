@@ -9,6 +9,7 @@ pub mod doctor;
 pub mod domain;
 pub(crate) mod extensions;
 pub mod project;
+pub(crate) mod project_definition;
 pub mod protocol;
 pub mod resources;
 pub mod splits;

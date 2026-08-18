@@ -1356,8 +1356,43 @@ struct Config {
     trusted_commands: BTreeMap<String, PaletteCommand>,
     extension_commands: BTreeMap<String, ExtensionCommandConfig>,
     extensions: Vec<PathBuf>,
+    projects: BTreeMap<String, ProjectConfig>,
     #[serde(deserialize_with = "deserialize_extension_config_catalog")]
     extension: BTreeMap<String, ExtensionConfigTable>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProjectConfig {
+    pub(crate) path: PathBuf,
+    pub(crate) recipe: Option<PathBuf>,
+}
+
+impl ProjectConfig {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn recipe(&self) -> Option<&Path> {
+        self.recipe.as_deref()
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ProjectCatalog {
+    projects: BTreeMap<String, ProjectConfig>,
+}
+
+impl ProjectCatalog {
+    pub(crate) fn get(&self, name: &str) -> Option<&ProjectConfig> {
+        self.projects.get(name)
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, &ProjectConfig)> {
+        self.projects
+            .iter()
+            .map(|(name, project)| (name.as_str(), project))
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1467,6 +1502,32 @@ pub(crate) fn load_location(location: &ConfigLocation) -> Result<LoadedConfig> {
     )
 }
 
+/// Load the durable project catalog without making control commands depend on
+/// unrelated presentation configuration. Project entries are still strict and
+/// bounded by the same global configuration file reader.
+pub(crate) fn load_projects(config_dir: Option<&Path>) -> Result<ProjectCatalog> {
+    let location = resolve_location(config_dir)?;
+    let Some(path) = &location.path else {
+        return Ok(ProjectCatalog::default());
+    };
+    let Some(source) = read_config_source(path, location.explicit)? else {
+        return Ok(ProjectCatalog::default());
+    };
+
+    #[derive(Default, Deserialize)]
+    struct ProjectsConfig {
+        #[serde(default)]
+        projects: BTreeMap<String, ProjectConfig>,
+    }
+
+    let mut config = toml::from_str::<ProjectsConfig>(&source)
+        .with_context(|| format!("parse project catalog from {}", path.display()))?;
+    validate_projects(&mut config.projects, path)?;
+    Ok(ProjectCatalog {
+        projects: config.projects,
+    })
+}
+
 /// Load only the daemon-owned extension declarations and namespaced config.
 /// Client presentation mistakes must not prevent the daemon from starting; the
 /// interactive client validates the complete configuration independently before
@@ -1563,6 +1624,7 @@ fn load_path_outcome(path: &std::path::Path, explicit: bool) -> Result<LoadedCon
         bail!("unknown extension_commands command {slug:?}");
     }
     validate_extension_config_catalog(&config.extension, &loaded_extensions, path)?;
+    validate_projects(&mut config.projects, path)?;
     validate(&config.ui, &loaded_extensions)
         .with_context(|| format!("validate Fut config {}", path.display()))?;
     config.ui.extensions = loaded_extensions.clone();
@@ -1575,6 +1637,67 @@ fn load_path_outcome(path: &std::path::Path, explicit: bool) -> Result<LoadedCon
         extensions: loaded_extensions,
         present: true,
     })
+}
+
+fn validate_projects(projects: &mut BTreeMap<String, ProjectConfig>, source: &Path) -> Result<()> {
+    let home = env::var_os("HOME").map(PathBuf::from);
+    let mut paths = BTreeMap::<PathBuf, String>::new();
+    for (name, project) in projects {
+        if name.is_empty()
+            || name.len() > 64
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            bail!(
+                "invalid project name {name:?} in {}; use 1-64 ASCII letters, numbers, '-' or '_'",
+                source.display()
+            );
+        }
+        project.path = expand_project_path(&project.path, home.as_deref())?;
+        if !project.path.is_absolute() {
+            bail!(
+                "project {name:?} path in {} must be absolute or start with ~/",
+                source.display()
+            );
+        }
+        if let Some(previous) = paths.insert(project.path.clone(), name.clone()) {
+            bail!(
+                "projects {previous:?} and {name:?} use the same path {}",
+                project.path.display()
+            );
+        }
+        if let Some(recipe) = &mut project.recipe {
+            *recipe = expand_project_path(recipe, home.as_deref())?;
+            if !recipe.is_absolute() {
+                bail!(
+                    "project {name:?} recipe in {} must be absolute or start with ~/",
+                    source.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn expand_project_path(path: &Path, home: Option<&Path>) -> Result<PathBuf> {
+    let value = path.as_os_str().to_string_lossy();
+    if value == "~" {
+        return home
+            .filter(|home| home.is_absolute())
+            .map(Path::to_path_buf)
+            .context("HOME must be absolute to expand a project path beginning with ~");
+    }
+    if let Some(relative) = value.strip_prefix("~/") {
+        let home = home
+            .filter(|home| home.is_absolute())
+            .context("HOME must be absolute to expand a project path beginning with ~/")?;
+        return Ok(home.join(relative));
+    }
+    if value.starts_with('~') {
+        bail!("project paths support only ~ or ~/ expansion");
+    }
+    Ok(path.to_owned())
 }
 
 fn read_config_source(path: &std::path::Path, explicit: bool) -> Result<Option<String>> {
@@ -2199,6 +2322,81 @@ fn validate_text(path: &str, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_catalog_loads_without_validating_ui_and_expands_home() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config_dir = temporary.path().join("config");
+        fs::create_dir(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.toml"),
+            format!(
+                r#"
+[projects.fut]
+path = {:?}
+
+[ui]
+unknown_future_option = true
+"#,
+                temporary.path().join("dev/fut")
+            ),
+        )
+        .unwrap();
+        let catalog = load_projects(Some(&config_dir)).unwrap();
+
+        assert_eq!(
+            catalog.get("fut").unwrap().path(),
+            temporary.path().join("dev/fut")
+        );
+        assert_eq!(
+            expand_project_path(Path::new("~/dev/fut"), Some(temporary.path())).unwrap(),
+            temporary.path().join("dev/fut")
+        );
+    }
+
+    #[test]
+    fn project_catalog_rejects_ambiguous_names_and_paths() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[projects."not a slug"]
+path = "/one"
+"#,
+        )
+        .unwrap();
+        let location = ConfigLocation {
+            path: Some(path.clone()),
+            explicit: true,
+            source: "test",
+        };
+        assert!(load_location(&location).is_err());
+
+        fs::write(
+            &path,
+            r#"
+[projects.one]
+path = "/same"
+[projects.two]
+path = "/same"
+"#,
+        )
+        .unwrap();
+        assert!(load_location(&location).is_err());
+
+        fs::write(
+            &path,
+            r#"
+[projects.one]
+path = "/one"
+recipe_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+"#,
+        )
+        .unwrap();
+        let error = format!("{:#}", load_location(&location).unwrap_err());
+        assert!(error.contains("unknown field `recipe_sha256`"), "{error}");
+    }
 
     #[test]
     fn missing_implicit_config_and_empty_file_use_defaults() {

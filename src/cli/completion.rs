@@ -75,6 +75,22 @@ pub(super) fn pane_split_direction(_: &OsStr) -> Vec<CompletionCandidate> {
     split_directions()
 }
 
+pub(super) fn project(_: &OsStr) -> Vec<CompletionCandidate> {
+    let config_dir = explicit_config_dir(std::env::args_os());
+    let Ok(catalog) = crate::client::config::load_projects(config_dir.as_deref()) else {
+        return vec![];
+    };
+    catalog
+        .iter()
+        .enumerate()
+        .map(|(order, (name, project))| {
+            CompletionCandidate::new(name)
+                .help(Some(project.path().display().to_string().into()))
+                .display_order(Some(order))
+        })
+        .collect()
+}
+
 fn split_directions() -> Vec<CompletionCandidate> {
     ["right", "down"]
         .into_iter()
@@ -198,6 +214,30 @@ fn explicit_socket(
         if let Some(value) = argument
             .to_str()
             .and_then(|value| value.strip_prefix("--socket="))
+        {
+            return Some(value.into());
+        }
+    }
+    None
+}
+
+fn explicit_config_dir(
+    args: impl IntoIterator<Item = impl Into<std::ffi::OsString>>,
+) -> Option<PathBuf> {
+    let argv = completion_argv(args)?;
+    let mut args = argv.into_iter();
+    args.next()?;
+
+    while let Some(argument) = args.next() {
+        if argument == "--" {
+            break;
+        }
+        if argument == "--config-dir" {
+            return args.next().map(PathBuf::from);
+        }
+        if let Some(value) = argument
+            .to_str()
+            .and_then(|value| value.strip_prefix("--config-dir="))
         {
             return Some(value.into());
         }
