@@ -1,6 +1,6 @@
 ---
 id: de-4sp3
-status: open
+status: closed
 deps: [de-ee74, de-xutz]
 links: []
 created: 2026-08-18T19:55:11Z
@@ -22,3 +22,9 @@ Prototype only enough Wasmtime/WASI Component Model integration to measure binar
 
 A written decision records measured costs, required host capabilities, threat model, API sketch, and a ship/defer/reject recommendation; any prototype is clearly isolated; the trusted-process implementation does not depend on the result.
 
+
+## Notes
+
+**2026-08-18T23:16:34Z**
+
+Completed a docs-only Wasmtime/WASI Component Model evaluation. Decision: defer rather than reject. Current workloads need trusted OS access, while a useful sandbox would initially be a pure lifecycle-to-token transformer. Recorded threat model, WIT sketch, resource/cancellation policy, package coexistence, measured isolated host-size probes with caveats, supervised-process alternative, and concrete revisit gates. No production dependency was added; docs build and cargo build passed.

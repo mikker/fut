@@ -1,6 +1,6 @@
 ---
 id: de-8pyh
-status: open
+status: closed
 deps: []
 links: [thr-tind]
 created: 2026-08-18T19:55:10Z
@@ -21,3 +21,9 @@ Build on the current explicitly configured extension directories, direct argv ex
 
 Extensions can be added, changed, and removed without restarting the daemon; reload is atomic across daemon behavior and attached clients; queued events have deterministic generation semantics; manifests expose a versioned compatibility and capability contract; users can validate, inspect, install, update, enable, disable, and remove managed third-party packages with clear provenance; author documentation and end-to-end fixtures prove that extensions can be implemented in any executable language; malformed, incompatible, or partially installed packages never replace the active registry; docs and changelog are updated and the full build/test suite passes.
 
+
+## Notes
+
+**2026-08-18T23:16:34Z**
+
+Delivered the complete dynamic extension ecosystem: versioned language-neutral package contract, daemon-owned atomic generations, deterministic queued-event semantics, synchronized clients, inspection/validation/reload CLI, managed immutable local store, pinned explicit Git installs/updates, authoring/conformance kit, and a documented deferred Wasm sandbox decision. Full checks, E2E coverage, builds, and docs verification passed across the child work.

@@ -15,6 +15,9 @@ permalink: /extensions/
 Building a third-party package? Use the complete, language-neutral
 [Extension authoring guide](../extension-authoring/) for the API v1 process
 contract, compatibility policy, conformance workflow, and release checklist.
+Fut has also evaluated a lower-trust WebAssembly tier and
+[deferred it pending concrete demand](../decisions/wasm-extension-tier/); no
+WebAssembly runtime is part of the current extension system.
 
 Extensions are trusted local packages that add command-palette actions,
 lifecycle hooks, and presentation values without changing Fut
@@ -566,6 +569,7 @@ permissions policy as shell scripts in your dotfiles.
 ## Related
 
 - [Extension authoring](../extension-authoring/)
+- [WebAssembly sandbox-tier decision](../decisions/wasm-extension-tier/)
 - [Configuration](../configuration/)
 - [Presentation tokens](../tokens/)
 - [Diagnostics](../doctor/)

@@ -13,6 +13,11 @@ from standard input, inspect environment variables, and optionally run Fut's
 CLI. Fut does not require JavaScript, Lua, Rust, a dynamic library ABI, or a
 language-specific SDK.
 
+The current contract intentionally remains a trusted-process contract. A
+[capability-sandboxed WebAssembly tier](../decisions/wasm-extension-tier/) was
+evaluated and deferred until concrete lower-trust workloads justify its runtime
+and security-maintenance cost.
+
 This page is the third-party contract for manifest API version 1. The shorter
 [Extensions](../extensions/) page covers installation and use. The
 [`rust-status` example][rust-status] is a standalone compiled implementation;
