@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added a single run-status token for showing managed command state in workspace lists.
 - Fixed shared-terminal attachment sizing, failed last-terminal replacement recovery, and transient Codex screen-capture errors.
 
 ## 0.8

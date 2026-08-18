@@ -42,3 +42,7 @@ scope = "workspace"
 [[presentation_tokens]]
 name = "cross"
 scope = "workspace"
+
+[[presentation_tokens]]
+name = "status"
+scope = "workspace"

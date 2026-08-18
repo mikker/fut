@@ -43,13 +43,13 @@ import subprocess
 import sys
 import time
 
-TOKENS = [
-    ("pause", "…"),
-    ("launching", "1"),
-    ("play", "▶"),
-    ("stop", "■"),
-    ("cross", "✗"),
-]
+TOKENS = {
+    "pause": "…",
+    "launching": "1",
+    "play": "▶",
+    "stop": "■",
+    "cross": "✗",
+}
 CONFIG_KEYS = {"command", "grace_seconds", "signal"}
 DEFAULT_GRACE = 3.0
 CLOSE_GRACE = 0.5        # workspace.closed must fit Fut's 5s hook timeout
@@ -187,10 +187,12 @@ def write_state(wsdir, state):
 
 
 def publish_tokens(active):
-    """Publish exactly one of the five workspace tokens; clear the rest.
+    """Publish the general status and exactly one styled workspace token.
 
-    The active token is published first so the indicator never blinks empty.
-    Failures are ignored: the workspace may already be gone.
+    The general status makes the state usable in a single workspace-row
+    segment. It is published before the styled token changes so neither
+    representation blinks empty. Failures are ignored: the workspace may
+    already be gone.
     """
     fut_bin = os.environ.get("FUT_BIN")
     socket = os.environ.get("FUT_SOCKET")
@@ -198,9 +200,10 @@ def publish_tokens(active):
     workspace = os.environ.get("FUT_WORKSPACE_ID")
     if not (fut_bin and socket and workspace):
         return
-    glyphs = dict(TOKENS)
-    order = [active] + [name for name, _ in TOKENS if name != active]
-    for name in order:
+    status = "…" if active == "launching" else TOKENS[active]
+    values = [("status", status), (active, TOKENS[active])]
+    values.extend((name, "") for name in TOKENS if name != active)
+    for name, value in values:
         try:
             subprocess.run(
                 [
@@ -211,7 +214,7 @@ def publish_tokens(active):
                     "publish",
                     extension,
                     name,
-                    glyphs[name] if name == active else "",
+                    value,
                     "--workspace-id",
                     workspace,
                 ],

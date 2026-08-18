@@ -55,6 +55,12 @@ token_count() { # <workspace-id>
     END { print n }' "$TOKENS"
 }
 
+status_is() { # <workspace-id> <glyph>
+  awk -v ws="$1" -v glyph="$2" 'BEGIN { FS = "\037" }
+    $3 == "token" && $4 == "publish" && $6 == "status" && $9 == ws { value = $7 }
+    END { exit value == glyph ? 0 : 1 }' "$TOKENS"
+}
+
 state_dir() { find "$FUT_RUN_STATE_DIR" -type d -name "$1" 2>/dev/null | head -1; }
 
 state_get() { # <workspace-id> <python expression over `s`>
@@ -127,6 +133,7 @@ out=$(run w1 "$(sleeper_cfg "$PIDS1")" restart) || fail "restart failed"
 phase_is w1 running || fail "w1 not running"
 wait_for 5 child_alive w1 || fail "w1 child not alive"
 token_is w1 play || fail "w1 token is '$(last_token w1)', wanted play"
+status_is w1 '▶' || fail "w1 general status did not show running"
 grep -q "fut-run · start · generation 1" "$(state_dir w1)/run.log" || fail "missing start separator"
 ok "restart starts the runner, records state, publishes play"
 
@@ -172,6 +179,7 @@ pid_dead "$(tail -1 "$PIDS1")" || fail "w1 child survived stop"
 wait_for 5 child_alive w2 || fail "w2 child died with w1"
 token_is w2 play || fail "w2 token disturbed by w1 stop"
 token_is w1 cross || fail "w1 stop token is '$(last_token w1)', wanted cross"
+status_is w1 '✗' || fail "w1 general status did not show stopped"
 phase_is w1 exited || fail "w1 phase after stop"
 [ "$(state_get w1 "(s.get('exit') or {}).get('signal')")" = 15 ] || fail "w1 exit signal"
 run w1 '{}' stop || fail "second stop errored"

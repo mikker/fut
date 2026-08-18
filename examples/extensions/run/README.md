@@ -37,6 +37,11 @@ right = [
   { segments = [{ token = "workspace.extension.run.stop", style = "divider", inverted = true, pill = true }], priority = 220 },
   { segments = [{ token = "workspace.extension.run.cross", style = "error", inverted = true, pill = true }], priority = 220 },
 ]
+
+[ui.sidebar.left]
+components = [
+  { component = "workspaces", row = { right = [{ token = "workspace.extension.run.status" }] } },
+]
 ```
 
 With the Nerd Font icon preset, these render as theme-adaptive filled pills.
@@ -54,9 +59,9 @@ content inverted.
 
 ## Status tokens
 
-The manifest declares five workspace tokens; the extension keeps exactly one
-populated (publishing the new one before clearing the rest, so the indicator
-never blinks):
+The manifest declares five style-specific workspace tokens; the extension
+keeps exactly one populated (publishing the new one before clearing the rest,
+so the indicator never blinks):
 
 | Token | Glyph | Meaning |
 | --- | --- | --- |
@@ -65,6 +70,11 @@ never blinks):
 | `workspace.extension.run.play` | ▶ | running |
 | `workspace.extension.run.stop` | ■ | exited cleanly (code 0) |
 | `workspace.extension.run.cross` | ✗ | stopped, killed, signaled, or nonzero exit |
+
+The additional `workspace.extension.run.status` token carries the same current
+glyph in one stable token, using a static `…` while launching. It is intended
+for a compact workspace row where per-state styling and animation are less
+important than configuring the status as one segment.
 
 The example uses dark-gray pause/stop, yellow launching, green play, and red
 cross pills. A workspace without run configuration publishes nothing.
