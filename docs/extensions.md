@@ -12,6 +12,10 @@ permalink: /extensions/
 > COMMIT`; enable its ID, then run `fut extension reload`. Extensions are
 > trusted code that may execute programs with your user permissions.
 
+Building a third-party package? Use the complete, language-neutral
+[Extension authoring guide](../extension-authoring/) for the API v1 process
+contract, compatibility policy, conformance workflow, and release checklist.
+
 Extensions are trusted local packages that add command-palette actions,
 lifecycle hooks, and presentation values without changing Fut
 itself. They are ordinary directories containing a strict TOML manifest and,
@@ -274,9 +278,8 @@ size = { width = 120, height = 40 }
 
 Commands appear in `Ctrl-b :` as a stable qualified slug followed by their
 title, such as `review-status:open-review  Open review`. Both are searchable.
-Commands run in an interactive temporary PTY, inherit the focused pane's live
-working directory and client environment. Extension commands run from the
-focused workspace root and receive:
+Commands run in an interactive temporary PTY with the client environment.
+Extension commands run from the focused workspace root and receive:
 
 | Variable | Value |
 | --- | --- |
@@ -538,7 +541,7 @@ a one-second grace period before cancellation.
 
 ## Examples
 
-The repository includes four complete extensions:
+The repository includes five complete extensions:
 
 - [`ghostty-title`](https://github.com/mikker/fut/tree/main/examples/extensions/ghostty-title)
   follows the selected Fut session in the current Ghostty window title.
@@ -550,6 +553,9 @@ The repository includes four complete extensions:
 - [`run`](https://github.com/mikker/fut/tree/main/examples/extensions/run)
   explicitly manages one long-running command per workspace, with safe
   restart/stop, optional output readiness, live logs, and styled status tokens.
+- [`rust-status`](https://github.com/mikker/fut/tree/main/examples/extensions/rust-status)
+  is a dependency-free compiled Rust example covering commands, hooks, JSON
+  config, and token publication without checking in a platform binary.
 
 Extensions and their namespaced project configuration are an executable trust
 boundary. Merely loading `[extension.<id>]` does not run it, but invoking the
@@ -559,6 +565,7 @@ permissions policy as shell scripts in your dotfiles.
 
 ## Related
 
+- [Extension authoring](../extension-authoring/)
 - [Configuration](../configuration/)
 - [Presentation tokens](../tokens/)
 - [Diagnostics](../doctor/)

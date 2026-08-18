@@ -52,6 +52,10 @@ run = "cargo test --lib --all-features"
 [tasks."test:e2e"]
 run = "cargo test --test e2e --all-features"
 
+[tasks."test:extension-conformance"]
+description = "Build and exercise the compiled extension reference through public Fut boundaries"
+run = "scripts/extension-conformance"
+
 [tasks.journey]
 description = "Run the isolated keyboard-driven daily-driver journey"
 run = "cargo test --test e2e --all-features isolated_daily_driver_journey -- --nocapture --test-threads=1"

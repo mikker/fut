@@ -27,6 +27,12 @@ commands, and detach with `Ctrl-b d`.
 See [Using Fut](https://fut.sh/usage/) for the resource model, everyday
 controls, mouse and copy behavior, CLI automation, and shell completion.
 
+Fut extensions are language-neutral executable packages: direct argv
+commands, versioned JSON lifecycle hooks, namespaced configuration, and
+presentation tokens through the public CLI. See the [extension authoring
+guide](https://fut.sh/extension-authoring/) and the source-only
+[`rust-status` compiled example](examples/extensions/rust-status).
+
 Configured projects can use a repository-owned `.fut/project.toml` to create
 their initial workspace and configure trusted extension behavior such as
 opening existing worktrees or starting a managed run command. Review it, then

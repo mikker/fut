@@ -294,7 +294,8 @@ it never rewrites this array or any other part of `config.toml`. The complete
 merged set is accepted or rejected atomically, and references to extension
 tokens are validated with it. Fut does not discover or download extensions.
 See [Extensions](extensions.md) for managed install commands, trust boundaries,
-hooks, tokens, limits, payloads, and examples.
+hooks, tokens, limits, payloads, and examples. Third-party authors should use
+the [Extension authoring guide](extension-authoring.md) as the API contract.
 
 The global file, a trusted project recipe, and each workspace's
 `.fut/config.toml` may configure a loaded extension with the same namespaced

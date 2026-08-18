@@ -1,0 +1,17 @@
+api_version = 1
+version = "1.0.0"
+fut = ">=0.7.0, <1.0.0"
+capabilities = ["commands", "hooks", "presentation_tokens"]
+id = "rust-status"
+
+[commands.probe]
+title = "Probe Rust extension"
+argv = ["./bin/rust-status", "command"]
+
+[hooks]
+"workspace.created" = ["./bin/rust-status", "hook"]
+"workspace.renamed" = ["./bin/rust-status", "hook"]
+
+[[presentation_tokens]]
+name = "last_event"
+scope = "workspace"

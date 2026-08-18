@@ -1,6 +1,6 @@
 ---
 id: de-ee74
-status: open
+status: closed
 deps: [de-vhs0, de-lpnu]
 links: []
 created: 2026-08-18T19:55:11Z
@@ -22,3 +22,9 @@ Document package layout, manifest/API versions, capabilities, argv execution, en
 
 An external author can build and validate an extension from public documentation alone; examples exercise commands, hooks, configuration, and tokens; conformance tests run through the public process/control boundary; documentation clearly states the trusted-native-code model and why Fut does not require JS, Lua, or Rust dylibs.
 
+
+## Notes
+
+**2026-08-18T22:57:37Z**
+
+Published the API v1 language-neutral authoring guide, compatibility/release checklist, conformance runner, and a dependency-free standalone Rust extension example compiled with rustc and exercised through public Fut commands, hooks, config, and token publication. Full formatting, Clippy, unit/E2E, conformance, debug/release build, and Jekyll docs verification passed.

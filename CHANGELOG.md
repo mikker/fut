@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Failed popup commands now retain their terminal output and show its log path.
+- Added a language-neutral extension authoring contract, public-boundary conformance smoke test, and source-only compiled Rust example.
 - Added explicit extension installation and updates from exact Git commits, with optional content-digest verification and recorded source provenance.
 - Added a bounded local extension store with safe package installation, explicit enablement, immutable content verification, and daemonless management commands.
 - Added extension catalog inspection, daemonless package validation, atomic CLI reloads, active-generation diagnostics, and extension ID completion.

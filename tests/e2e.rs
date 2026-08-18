@@ -338,17 +338,22 @@ impl Harness {
     }
 
     async fn start_with(script: &str, setup: impl FnOnce(&std::path::Path)) -> Self {
-        Self::start_configured(script, setup, None).await
+        Self::start_configured(script, setup, None, false).await
+    }
+
+    async fn start_public_with(script: &str, setup: impl FnOnce(&std::path::Path)) -> Self {
+        Self::start_configured(script, setup, None, true).await
     }
 
     async fn start_with_shell(script: &str, shell: &std::path::Path) -> Self {
-        Self::start_configured(script, |_| {}, Some(shell)).await
+        Self::start_configured(script, |_| {}, Some(shell), false).await
     }
 
     async fn start_configured(
         script: &str,
         setup: impl FnOnce(&std::path::Path),
         shell: Option<&std::path::Path>,
+        public_readiness: bool,
     ) -> Self {
         let root = tempfile::Builder::new()
             .prefix("fut-e2e-")
@@ -372,7 +377,11 @@ impl Harness {
             daemon,
             terminal_pid: None,
         };
-        harness.wait_until_ready().await;
+        if public_readiness {
+            harness.wait_until_publicly_ready().await;
+        } else {
+            harness.wait_until_ready().await;
+        }
         harness
     }
 
@@ -426,6 +435,32 @@ impl Harness {
                     && hello(&mut connection, ClientMode::Control, PROTOCOL_VERSION)
                         .await
                         .is_ok_and(|message| matches!(message, ServerMessage::Welcome { .. }))
+                {
+                    return;
+                }
+                time::sleep(POLL_INTERVAL).await;
+            }
+        })
+        .await;
+        assert!(result.is_ok(), "daemon startup timed out: {}", self.logs());
+    }
+
+    async fn wait_until_publicly_ready(&mut self) {
+        let result = time::timeout(DEADLINE, async {
+            loop {
+                assert!(
+                    self.daemon
+                        .try_wait()
+                        .expect("query daemon status")
+                        .is_none(),
+                    "daemon exited during startup: {}",
+                    self.logs()
+                );
+                if self
+                    .cli()
+                    .args(["daemon", "ping"])
+                    .output()
+                    .is_ok_and(|output| output.status.success())
                 {
                     return;
                 }
@@ -10923,6 +10958,164 @@ async fn extension_commands_launch_from_the_palette_with_focused_context() {
     client.send(b"\x02d");
     client.wait_success().await;
     harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn compiled_rust_extension_conforms_through_public_fut_boundaries() {
+    let mut harness = Harness::start_public_with(
+        "printf 'RUST_CONFORMANCE_HOST_READY\\r\\n'; while :; do sleep 1; done",
+        |root| {
+            let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("examples/extensions/rust-status");
+            assert!(
+                !source.join("bin/rust-status").exists(),
+                "the compiled reference must not check in a platform binary"
+            );
+            let extension = root.join("rust-status");
+            fs::create_dir_all(extension.join("src")).unwrap();
+            fs::create_dir(extension.join("bin")).unwrap();
+            fs::copy(
+                source.join("fut-extension.toml"),
+                extension.join("fut-extension.toml"),
+            )
+            .unwrap();
+            fs::copy(source.join("src/main.rs"), extension.join("src/main.rs")).unwrap();
+
+            let compiled = Command::new("rustc")
+                .args(["--edition=2024", "-O", "-o"])
+                .arg(extension.join("bin/rust-status"))
+                .arg(extension.join("src/main.rs"))
+                .output()
+                .expect("compile dependency-free Rust extension fixture");
+            assert!(
+                compiled.status.success(),
+                "rustc failed: {}",
+                String::from_utf8_lossy(&compiled.stderr)
+            );
+
+            let log = root.join("rust-status.log");
+            let config = root.join("home/.config/fut/config.toml");
+            fs::create_dir_all(config.parent().unwrap()).unwrap();
+            fs::write(
+                config,
+                format!(
+                    "extensions = [{:?}]\n[extension.rust-status]\nlabel = 'global'\nlog_path = {:?}\n[ui.bindings]\n'rust-status:probe' = 'R'\n",
+                    extension.display().to_string(),
+                    log.display().to_string(),
+                ),
+            )
+            .unwrap();
+
+            let workspace_config = root.join("cwd/.fut/config.toml");
+            fs::create_dir_all(workspace_config.parent().unwrap()).unwrap();
+            fs::write(
+                workspace_config,
+                "[extension.rust-status]\nlabel = 'workspace'\n",
+            )
+            .unwrap();
+        },
+    )
+    .await;
+    let extension = harness.root.path().join("rust-status");
+    let log = harness.root.path().join("rust-status.log");
+
+    let validation = harness
+        .cli()
+        .args(["--json", "extension", "validate"])
+        .arg(&extension)
+        .output()
+        .unwrap();
+    assert!(
+        validation.status.success(),
+        "public validation failed: {}",
+        String::from_utf8_lossy(&validation.stderr)
+    );
+    let validation: Value = serde_json::from_slice(&validation.stdout).unwrap();
+    assert_eq!(validation["command"], "extension.validate");
+    assert_eq!(validation["result"]["valid"], true);
+    assert_eq!(validation["result"]["extension"]["id"], "rust-status");
+
+    wait_for(DEADLINE, || {
+        fs::read_to_string(&log)
+            .is_ok_and(|contents| contents.contains("hook=workspace.created label=workspace"))
+    })
+    .await;
+
+    let listed = harness.cli().args(["--json", "list"]).output().unwrap();
+    assert!(listed.status.success());
+    let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let workspace = &listed["result"]["sessions"][0]["workspaces"][0];
+    let workspace_id = workspace["id"].as_str().unwrap().to_owned();
+    let pane_id = workspace["tabs"][0]["panes"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        workspace["tokens"]["workspace.extension.rust-status.last_event"],
+        "workspace.created"
+    );
+
+    let mut command = Command::new("/usr/bin/script");
+    command
+        .env_clear()
+        .env("HOME", harness.root.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", harness.root.path().join("runtime"))
+        .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+        .env("TERM", "xterm-256color")
+        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .arg(format!(
+            "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {pane_id}",
+            env!("CARGO_BIN_EXE_fut"),
+            harness.socket.display(),
+        ));
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("RUST_CONFORMANCE_HOST_READY").await;
+    client.send(b"\x02R");
+    wait_for(DEADLINE, || {
+        fs::read_to_string(&log)
+            .is_ok_and(|contents| contents.contains("command=probe label=workspace"))
+    })
+    .await;
+    client.send(b"\x02d");
+    client.wait_success().await;
+
+    let renamed = harness
+        .cli()
+        .args(["--json", "workspace", "rename", &workspace_id, "renamed"])
+        .output()
+        .unwrap();
+    assert!(
+        renamed.status.success(),
+        "public rename failed: {}",
+        String::from_utf8_lossy(&renamed.stderr)
+    );
+    wait_for(DEADLINE, || {
+        fs::read_to_string(&log)
+            .is_ok_and(|contents| contents.contains("hook=workspace.renamed label=workspace"))
+    })
+    .await;
+
+    wait_for(DEADLINE, || {
+        let output = harness.cli().args(["--json", "list"]).output().unwrap();
+        let Ok(snapshot) = serde_json::from_slice::<Value>(&output.stdout) else {
+            return false;
+        };
+        snapshot["result"]["sessions"][0]["workspaces"][0]["tokens"]
+            ["workspace.extension.rust-status.last_event"]
+            == "workspace.renamed"
+    })
+    .await;
+    let records = fs::read_to_string(&log).unwrap();
+    assert!(records.contains("config={\"label\":\"workspace\",\"log_path\":"));
+
+    let shutdown = harness
+        .cli()
+        .args(["--json", "daemon", "shutdown"])
+        .output()
+        .unwrap();
+    assert!(shutdown.status.success());
+    harness.wait_until_exited().await;
 }
 
 #[tokio::test]
