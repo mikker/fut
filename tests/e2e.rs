@@ -558,6 +558,7 @@ impl Harness {
         command
             .env_clear()
             .env("HOME", self.root.path().join("home"))
+            .env("XDG_DATA_HOME", self.root.path().join("data"))
             .env("XDG_STATE_HOME", self.root.path().join("state"))
             .env("PATH", "/usr/bin:/bin")
             .env("TMPDIR", self.root.path().join("runtime"))
@@ -631,6 +632,7 @@ fn spawn_daemon(
     command
         .env_clear()
         .env("HOME", home)
+        .env("XDG_DATA_HOME", root.path().join("data"))
         .env("XDG_STATE_HOME", root.path().join("state"))
         .env("PATH", path)
         .env("TMPDIR", runtime)
@@ -2574,6 +2576,218 @@ id = "candidate"
     assert_eq!(invalid["version"], 1);
     assert_eq!(invalid["error"]["code"], "invalid_extension");
     assert!(!runtime.exists());
+}
+
+#[tokio::test]
+async fn managed_extension_store_commands_are_versioned_safe_and_merged_with_explicit_roots() {
+    let harness = Harness::start_with("while :; do sleep 1; done", |root| {
+        let explicit = root.join("explicit-extension");
+        fs::create_dir(&explicit).unwrap();
+        fs::write(
+            explicit.join("fut-extension.toml"),
+            r#"
+api_version = 1
+version = "1.0.0"
+fut = ">=0.7.0, <1.0.0"
+capabilities = []
+id = "explicit"
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("home/.config/fut")).unwrap();
+        fs::write(
+            root.join("home/.config/fut/config.toml"),
+            format!("extensions = [{:?}]\n", explicit.display().to_string()),
+        )
+        .unwrap();
+
+        let managed = root.join("managed-source");
+        fs::create_dir(&managed).unwrap();
+        fs::write(
+            managed.join("fut-extension.toml"),
+            r#"
+api_version = 1
+version = "2.3.4"
+fut = ">=0.7.0, <1.0.0"
+capabilities = ["commands"]
+id = "managed"
+[commands.run]
+title = "Run managed command"
+argv = ["./run"]
+"#,
+        )
+        .unwrap();
+        fs::write(managed.join("run"), "#!/bin/sh\ntouch package-executed\n").unwrap();
+        fs::set_permissions(managed.join("run"), fs::Permissions::from_mode(0o755)).unwrap();
+    })
+    .await;
+
+    let initial = harness
+        .cli()
+        .args(["--json", "extension", "list"])
+        .output()
+        .unwrap();
+    let initial: Value = serde_json::from_slice(&initial.stdout).unwrap();
+    assert_eq!(initial["result"]["count"], 1);
+    assert_eq!(initial["result"]["extensions"][0]["id"], "explicit");
+
+    let source = harness.root.path().join("managed-source");
+    let installed = harness
+        .cli()
+        .args(["--json", "extension", "install"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    assert!(installed.stderr.is_empty());
+    let installed: Value = serde_json::from_slice(&installed.stdout).unwrap();
+    assert_eq!(installed["version"], 1);
+    assert_eq!(installed["command"], "extension.install");
+    assert_eq!(installed["result"]["extension"]["id"], "managed");
+    assert_eq!(installed["result"]["extension"]["version"], "2.3.4");
+    assert_eq!(installed["result"]["extension"]["enabled"], false);
+    assert_eq!(installed["result"]["changed"], true);
+    assert_eq!(installed["result"]["scripts_executed"], false);
+    assert_eq!(installed["result"]["trust"], "trusted_local_code");
+    assert_eq!(installed["result"]["reload_required"], false);
+    let digest = installed["result"]["extension"]["content_sha256"]
+        .as_str()
+        .unwrap();
+    assert_eq!(digest.len(), 64);
+    let install_path = PathBuf::from(
+        installed["result"]["extension"]["install_path"]
+            .as_str()
+            .unwrap(),
+    );
+    assert!(install_path.is_dir());
+    assert!(install_path.ends_with(format!("managed/2.3.4/{digest}")));
+    assert!(!source.join("package-executed").exists());
+
+    let index_path = harness.root.path().join("data/fut/extensions/index.json");
+    let index_source = fs::read_to_string(&index_path).unwrap();
+    assert!(index_source.contains("\n  \"schema_version\": 1,"));
+    assert!(index_source.ends_with('\n'));
+    let index: Value = serde_json::from_str(&index_source).unwrap();
+    assert_eq!(
+        index["extensions"][0]["source"],
+        fs::canonicalize(&source)
+            .unwrap()
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert_eq!(
+        index["extensions"][0]["install_path"],
+        install_path.to_string_lossy().as_ref()
+    );
+
+    let human = harness
+        .cli()
+        .args(["extension", "install"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(human.status.success());
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(human.contains("changed=false"), "{human}");
+    assert!(
+        human.contains("No package scripts were executed"),
+        "{human}"
+    );
+    assert!(human.contains("trusted local code"), "{human}");
+
+    let enabled = harness
+        .cli()
+        .args(["--json", "extension", "enable", "managed"])
+        .output()
+        .unwrap();
+    assert!(enabled.status.success());
+    let enabled: Value = serde_json::from_slice(&enabled.stdout).unwrap();
+    assert_eq!(enabled["command"], "extension.enable");
+    assert_eq!(enabled["result"]["extension"]["enabled"], true);
+    assert_eq!(enabled["result"]["reload_required"], true);
+    assert!(!source.join("package-executed").exists());
+
+    let refused = harness
+        .cli()
+        .args(["--json", "extension", "remove", "managed"])
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(refused.stdout.is_empty());
+    let refused: Value = serde_json::from_slice(&refused.stderr).unwrap();
+    assert_eq!(refused["error"]["code"], "extension_enabled");
+    assert!(install_path.exists());
+
+    let reloaded = harness
+        .cli()
+        .args(["--json", "extension", "reload"])
+        .output()
+        .unwrap();
+    assert!(
+        reloaded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reloaded.stderr)
+    );
+    let reloaded: Value = serde_json::from_slice(&reloaded.stdout).unwrap();
+    let ids = reloaded["result"]["catalog"]["extensions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|extension| extension["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, ["explicit", "managed"]);
+
+    let disabled = harness
+        .cli()
+        .args(["--json", "extension", "disable", "managed"])
+        .output()
+        .unwrap();
+    assert!(disabled.status.success());
+    let disabled: Value = serde_json::from_slice(&disabled.stdout).unwrap();
+    assert_eq!(disabled["command"], "extension.disable");
+    assert_eq!(disabled["result"]["extension"]["enabled"], false);
+
+    let reloaded = harness
+        .cli()
+        .args(["--json", "extension", "reload"])
+        .output()
+        .unwrap();
+    assert!(reloaded.status.success());
+    let reloaded: Value = serde_json::from_slice(&reloaded.stdout).unwrap();
+    assert_eq!(
+        reloaded["result"]["catalog"]["extensions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        reloaded["result"]["catalog"]["extensions"][0]["id"],
+        "explicit"
+    );
+
+    let removed = harness
+        .cli()
+        .args(["--json", "extension", "remove", "managed"])
+        .output()
+        .unwrap();
+    assert!(removed.status.success());
+    let removed: Value = serde_json::from_slice(&removed.stdout).unwrap();
+    assert_eq!(removed["command"], "extension.remove");
+    assert_eq!(removed["result"]["changed"], true);
+    assert!(install_path.exists());
+    assert!(
+        serde_json::from_slice::<Value>(&fs::read(index_path).unwrap()).unwrap()["extensions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    harness.shutdown().await;
 }
 
 #[tokio::test]

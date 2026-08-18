@@ -163,7 +163,7 @@ enum Command {
         #[command(subcommand)]
         command: AgentCommand,
     },
-    /// Inspect, validate, or reload extension packages.
+    /// Inspect, manage, validate, or reload extension packages.
     Extension {
         /// Extension operation to perform.
         #[command(subcommand)]
@@ -767,6 +767,27 @@ enum ExtensionCommand {
         #[arg(value_name = "PATH", value_hint = ValueHint::DirPath)]
         path: PathBuf,
     },
+    /// Copy a trusted local package into Fut's managed store, initially disabled.
+    Install {
+        /// Local extension package directory containing fut-extension.toml.
+        #[arg(value_name = "PATH", value_hint = ValueHint::DirPath)]
+        path: PathBuf,
+    },
+    /// Include an installed managed extension in future loads.
+    Enable {
+        /// Installed managed extension ID.
+        id: String,
+    },
+    /// Exclude an installed managed extension from future loads.
+    Disable {
+        /// Installed managed extension ID.
+        id: String,
+    },
+    /// Remove a disabled package from Fut's managed store.
+    Remove {
+        /// Installed managed extension ID.
+        id: String,
+    },
     /// Ask the daemon to atomically reload its configured extensions.
     Reload,
 }
@@ -891,11 +912,25 @@ async fn execute(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
-    if let Some(Command::Extension {
-        command: ExtensionCommand::Validate { path },
-    }) = &cli.command
-    {
-        return validate_extension_package(path, cli.json);
+    if let Some(Command::Extension { command }) = &cli.command {
+        match command {
+            ExtensionCommand::Validate { path } => {
+                return validate_extension_package(path, cli.json);
+            }
+            ExtensionCommand::Install { path } => {
+                return install_extension_package(path, cli.json);
+            }
+            ExtensionCommand::Enable { id } => {
+                return mutate_managed_extension(id, true, cli.json);
+            }
+            ExtensionCommand::Disable { id } => {
+                return mutate_managed_extension(id, false, cli.json);
+            }
+            ExtensionCommand::Remove { id } => {
+                return remove_managed_extension(id, cli.json);
+            }
+            ExtensionCommand::List | ExtensionCommand::Show { .. } | ExtensionCommand::Reload => {}
+        }
     }
 
     let socket = socket_path(cli.socket.as_deref())?;
@@ -1866,8 +1901,13 @@ async fn execute(cli: Cli) -> Result<()> {
         }) => retire_workspace(&socket, cli.json, workspace_id).await,
         Some(Command::Doctor) => unreachable!("doctor is handled before command execution"),
         Some(Command::Extension {
-            command: ExtensionCommand::Validate { .. },
-        }) => unreachable!("extension validate is handled before daemon setup"),
+            command:
+                ExtensionCommand::Validate { .. }
+                | ExtensionCommand::Install { .. }
+                | ExtensionCommand::Enable { .. }
+                | ExtensionCommand::Disable { .. }
+                | ExtensionCommand::Remove { .. },
+        }) => unreachable!("daemonless extension command was handled before daemon setup"),
         Some(Command::Agent {
             command: AgentCommand::Skill,
         }) => unreachable!("agent skill is handled before daemon setup"),
@@ -1944,6 +1984,120 @@ fn validate_extension_package(path: &std::path::Path, json_output: bool) -> Resu
         json!({ "valid": true, "extension": extension }),
         format!("valid {}", render_extension_summary(&extension)),
     )
+}
+
+const EXTENSION_TRUST: &str = "trusted_local_code";
+
+fn install_extension_package(path: &std::path::Path, json_output: bool) -> Result<()> {
+    let change = crate::extension_store::install(path).map_err(|error| {
+        CliError::new(
+            "extension_install_failed",
+            format!("could not install extension package: {error:#}"),
+        )
+    })?;
+    let extension = &change.extension;
+    output(
+        json_output,
+        "extension.install",
+        json!({
+            "extension": extension,
+            "changed": change.changed,
+            "scripts_executed": false,
+            "trust": EXTENSION_TRUST,
+            "reload_required": extension.enabled,
+        }),
+        format!(
+            "installed extension {} version={} enabled={} changed={} sha256={} source={:?} path={:?}\nNo package scripts were executed. Installed extensions are trusted local code; review this package before enabling it.",
+            extension.id,
+            extension.version,
+            extension.enabled,
+            change.changed,
+            extension.content_sha256,
+            extension.source,
+            extension.install_path,
+        ),
+    )
+}
+
+fn mutate_managed_extension(id: &str, enabled: bool, json_output: bool) -> Result<()> {
+    let operation = if enabled { "enable" } else { "disable" };
+    let change = if enabled {
+        crate::extension_store::enable(id)
+    } else {
+        crate::extension_store::disable(id)
+    }
+    .map_err(|error| managed_extension_error(operation, error))?;
+    let extension = &change.extension;
+    let human = if enabled {
+        format!(
+            "enabled extension {} version={} changed={} path={:?} reload_required=true\nTrust boundary: Fut may execute this package's declared commands and hooks with your user permissions. Run `fut extension reload` to update a running daemon.",
+            extension.id, extension.version, change.changed, extension.install_path,
+        )
+    } else {
+        format!(
+            "disabled extension {} version={} changed={} reload_required=true\nThe current daemon may retain its active copy until `fut extension reload` or restart.",
+            extension.id, extension.version, change.changed,
+        )
+    };
+    output(
+        json_output,
+        if enabled {
+            "extension.enable"
+        } else {
+            "extension.disable"
+        },
+        json!({
+            "extension": extension,
+            "changed": change.changed,
+            "scripts_executed": false,
+            "trust": EXTENSION_TRUST,
+            "reload_required": true,
+        }),
+        human,
+    )
+}
+
+fn remove_managed_extension(id: &str, json_output: bool) -> Result<()> {
+    let change = crate::extension_store::remove(id)
+        .map_err(|error| managed_extension_error("remove", error))?;
+    let extension = &change.extension;
+    output(
+        json_output,
+        "extension.remove",
+        json!({
+            "extension": extension,
+            "changed": change.changed,
+            "scripts_executed": false,
+            "reload_required": true,
+        }),
+        format!(
+            "removed extension {} version={} changed={} reload_required=true\nA running daemon may retain its prior catalog until `fut extension reload` or restart.",
+            extension.id, extension.version, change.changed,
+        ),
+    )
+}
+
+fn managed_extension_error(
+    operation: &str,
+    error: crate::extension_store::StoreMutationError,
+) -> anyhow::Error {
+    match error {
+        crate::extension_store::StoreMutationError::NotFound { id } => CliError::new(
+            "not_found",
+            format!("managed extension {id:?} is not installed"),
+        )
+        .into(),
+        crate::extension_store::StoreMutationError::Enabled { id } => CliError::new(
+            "extension_enabled",
+            format!("managed extension {id:?} is enabled; disable it before removing it"),
+        )
+        .into(),
+        crate::extension_store::StoreMutationError::Failed(error) => CliError::new(
+            "extension_store_failed",
+            format!("could not {operation} managed extension: {error:#}"),
+        )
+        .into(),
+    }
 }
 
 fn extension_catalog_result(catalog: &ExtensionCatalog) -> serde_json::Value {
@@ -4292,7 +4446,9 @@ mod tests {
                 .get_subcommands()
                 .map(clap::Command::get_name)
                 .collect::<Vec<_>>(),
-            ["list", "show", "validate", "reload"]
+            [
+                "list", "show", "validate", "install", "enable", "disable", "remove", "reload"
+            ]
         );
         let validate = extension.find_subcommand("validate").unwrap();
         assert_eq!(

@@ -127,6 +127,10 @@ fut events
 fut extension list
 fut extension show EXTENSION_ID
 fut extension validate PATH
+fut extension install PATH
+fut extension enable EXTENSION_ID
+fut extension disable EXTENSION_ID
+fut extension remove EXTENSION_ID
 fut extension reload
 ```
 

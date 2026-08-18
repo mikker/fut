@@ -17,6 +17,7 @@ use super::actions::{
 };
 use crate::{
     command::PopupSize,
+    extension_store,
     extensions::{self, Extension, ExtensionCommandExecution, ExtensionCommandMode},
     resources::{ExtensionConfigTable, TrustedProjectConfig},
 };
@@ -1621,16 +1622,12 @@ pub(crate) fn stage(config_dir: Option<&Path>) -> Result<StagedUiConfig> {
 }
 
 pub(crate) fn load_location(location: &ConfigLocation) -> Result<LoadedConfig> {
-    location.path.as_ref().map_or_else(
-        || {
-            Ok(LoadedConfig {
-                ui: UiConfig::default(),
-                extensions: Vec::new(),
-                present: false,
-            })
-        },
-        |path| load_path_outcome(path, location.explicit),
-    )
+    location
+        .path
+        .as_ref()
+        .map_or_else(load_default_outcome, |path| {
+            load_path_outcome(path, location.explicit)
+        })
 }
 
 /// Load the durable project catalog without making control commands depend on
@@ -1664,19 +1661,6 @@ pub(crate) fn load_projects(config_dir: Option<&Path>) -> Result<ProjectCatalog>
 /// interactive client validates the complete configuration independently before
 /// changing terminal state.
 pub(crate) fn load_extensions_location(location: &ConfigLocation) -> Result<LoadedExtensionConfig> {
-    let Some(path) = &location.path else {
-        return Ok(LoadedExtensionConfig {
-            extensions: Vec::new(),
-            config: ExtensionConfigCatalog::default(),
-        });
-    };
-    let Some(source) = read_config_source(path, location.explicit)? else {
-        return Ok(LoadedExtensionConfig {
-            extensions: Vec::new(),
-            config: ExtensionConfigCatalog::default(),
-        });
-    };
-
     #[derive(Default, Deserialize)]
     struct ExtensionConfig {
         #[serde(default)]
@@ -1685,15 +1669,36 @@ pub(crate) fn load_extensions_location(location: &ConfigLocation) -> Result<Load
         extension: BTreeMap<String, ExtensionConfigTable>,
     }
 
-    let config = toml::from_str::<ExtensionConfig>(&source)
-        .with_context(|| format!("parse daemon extension config from {}", path.display()))?;
-    let loaded_extensions = extensions::load(&config.extensions)
-        .with_context(|| format!("load extensions from Fut config {}", path.display()))?;
-    validate_extension_config_catalog(&config.extension, &loaded_extensions, path)?;
+    let (config, source_path) = match &location.path {
+        Some(path) => match read_config_source(path, location.explicit)? {
+            Some(source) => (
+                toml::from_str::<ExtensionConfig>(&source).with_context(|| {
+                    format!("parse daemon extension config from {}", path.display())
+                })?,
+                Some(path.as_path()),
+            ),
+            None => (ExtensionConfig::default(), None),
+        },
+        None => (ExtensionConfig::default(), None),
+    };
+    let roots = merged_extension_roots(&config.extensions)?;
+    let loaded_extensions = extensions::load(&roots).with_context(|| {
+        source_path.map_or_else(
+            || "load managed extensions".to_owned(),
+            |path| {
+                format!(
+                    "load extensions from Fut config {} and managed store",
+                    path.display()
+                )
+            },
+        )
+    })?;
+    let validation_source = source_path.unwrap_or_else(|| Path::new("default Fut config"));
+    validate_extension_config_catalog(&config.extension, &loaded_extensions, validation_source)?;
     Ok(LoadedExtensionConfig {
         extensions: loaded_extensions,
         config: ExtensionConfigCatalog {
-            source: (!config.extension.is_empty()).then(|| path.to_owned()),
+            source: (!config.extension.is_empty()).then(|| validation_source.to_owned()),
             defaults: config.extension,
         },
     })
@@ -1705,16 +1710,17 @@ fn load_path(path: &std::path::Path, explicit: bool) -> Result<UiConfig> {
 }
 
 fn load_path_outcome(path: &std::path::Path, explicit: bool) -> Result<LoadedConfig> {
-    let Some(source) = read_config_source(path, explicit)? else {
-        return Ok(LoadedConfig {
-            ui: UiConfig::default(),
-            extensions: Vec::new(),
-            present: false,
-        });
-    };
-    let config = toml::from_str::<Config>(&source)
-        .with_context(|| format!("parse Fut config {}", path.display()))?;
-    let loaded_extensions = extensions::load(&config.extensions)
+    let source = read_config_source(path, explicit)?;
+    let present = source.is_some();
+    let config = source.map_or_else(
+        || Ok(Config::default()),
+        |source| {
+            toml::from_str::<Config>(&source)
+                .with_context(|| format!("parse Fut config {}", path.display()))
+        },
+    )?;
+    let roots = merged_extension_roots(&config.extensions)?;
+    let loaded_extensions = extensions::load(&roots)
         .with_context(|| format!("load extensions from Fut config {}", path.display()))?;
     validate_extension_config_catalog(&config.extension, &loaded_extensions, path)?;
     let extension_config = ExtensionConfigCatalog {
@@ -1725,13 +1731,37 @@ fn load_path_outcome(path: &std::path::Path, explicit: bool) -> Result<LoadedCon
         config,
         loaded_extensions.clone(),
         extension_config,
-        Some(path),
+        present.then_some(path),
     )?;
     Ok(LoadedConfig {
         ui,
         extensions: loaded_extensions,
-        present: true,
+        present,
     })
+}
+
+fn load_default_outcome() -> Result<LoadedConfig> {
+    let roots = merged_extension_roots(&[])?;
+    let loaded_extensions = extensions::load(&roots).context("load managed extensions")?;
+    let ui = materialize_config(
+        Config::default(),
+        loaded_extensions.clone(),
+        ExtensionConfigCatalog::default(),
+        None,
+    )?;
+    Ok(LoadedConfig {
+        ui,
+        extensions: loaded_extensions,
+        present: false,
+    })
+}
+
+fn merged_extension_roots(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let managed = extension_store::enabled_roots().context("load managed extension store")?;
+    let mut roots = Vec::with_capacity(explicit.len() + managed.len());
+    roots.extend_from_slice(explicit);
+    roots.extend(managed);
+    Ok(roots)
 }
 
 fn materialize_config(

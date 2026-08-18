@@ -7,17 +7,18 @@ permalink: /extensions/
 
 # Extensions
 
-> **TL;DR:** Add a trusted extension directory to the top-level `extensions`
-> array, reload with `Ctrl-b Shift-R`, then find its commands in `Ctrl-b :`.
-> Extensions may execute programs; only load directories you trust.
+> **TL;DR:** Install a reviewed local package with `fut extension install
+> PATH`, enable its ID, then run `fut extension reload`. Extensions are trusted
+> code that may execute programs with your user permissions.
 
 Extensions are trusted local packages that add command-palette actions,
 lifecycle hooks, and presentation values without changing Fut
 itself. They are ordinary directories containing a strict TOML manifest and,
 usually, a few executables.
 
-Fut does not discover, download, or install extensions. You choose every
-extension explicitly by absolute path:
+Fut never discovers or downloads extensions. You can either copy a local
+package into Fut's managed store or choose a directory explicitly by absolute
+path:
 
 ```toml
 extensions = [
@@ -30,7 +31,8 @@ complete local UI, then asks the daemon to prepare the complete extension set.
 Neither becomes visible until both candidates are valid and the daemon commits
 the reload against the generation that was prepared. An invalid UI, manifest,
 or concurrent stale reload leaves the active daemon extensions and client UI in
-place. Duplicate canonical roots or IDs reject the complete set.
+place. Enabled managed roots are appended to these explicit paths. Duplicate
+canonical roots or IDs reject the complete set.
 
 The daemon is authoritative for validated manifest declarations. Each attached
 client receives one complete generation containing the commands, hooks,
@@ -40,6 +42,55 @@ complete generation to every attached client, and a reconnect receives the
 latest generation with its welcome. An open command palette is closed during
 the swap so an entry from the old generation cannot select a command by a stale
 position.
+
+## Install and manage local packages
+
+The managed store makes a bounded, immutable copy of a local package:
+
+```sh
+fut extension install ./review-status
+fut extension enable review-status
+fut extension reload
+```
+
+`install` is daemonless and starts a new package disabled. It canonicalizes the
+source path, copies directories and regular files without following symbolic
+links, rejects special files, enforces the package limits below, validates the
+copied manifest, and atomically renames the staged copy into a path containing
+the extension ID, version, and SHA-256 content digest. It never runs an
+installer, manifest script, command, or hook. Reinstalling an ID preserves its
+enabled state and leaves the prior indexed package intact if staging,
+validation, or the atomic index update fails.
+
+Fut records the ID, version, canonical source, content SHA-256, immutable
+install path, and enabled state in a strict, versioned, human-readable
+`index.json` under `$XDG_DATA_HOME/fut/extensions`, falling back to
+`~/.local/share/fut/extensions`. This Fut-owned index is the managed
+configuration source; enable and disable update it atomically and never rewrite
+`config.toml`. A missing store is an empty managed set. Enabled content is
+rehash-verified before every load, so modification causes loading to fail
+closed.
+
+Enable and disable affect the next daemon load. Run `fut extension reload` to
+apply the change to a running daemon; until then its prior active catalog may
+remain in memory. Removal deliberately has no force option: disable the package
+first, reload if a daemon is running, then remove it:
+
+```sh
+fut extension disable review-status
+fut extension reload
+fut extension remove review-status
+```
+
+Removal unindexes the package immediately. Fut retains its immutable bytes so
+an older catalog already held by a running daemon cannot acquire dangling
+command or hook paths; those orphaned bytes are reserved for a future safe
+garbage-collection pass.
+
+Installation is not an endorsement or a sandbox. Enabling a managed extension
+is the same executable trust decision as adding an explicit root: its declared
+commands and hooks run with your user permissions. Review the copied local code
+before enabling it.
 
 ## Inspect, validate, and reload
 
@@ -70,10 +121,11 @@ fut --json extension validate ./review-status
 Validation is daemonless and side-effect-free. It reads the package directory,
 strictly validates `fut-extension.toml`, resolves packaged argv, and checks the
 manifest API plus its `fut` requirement against the running binary. It never
-starts a daemon, activates the package, or executes extension code. All four
-commands support `--json`; successes use Fut's versioned command/result
-envelope and failures use its versioned typed error envelope. Shell completion
-offers active extension IDs for `show` when a daemon is reachable.
+starts a daemon, activates the package, or executes extension code. All
+extension management, inspection, validation, and reload commands support
+`--json`; successes use Fut's versioned command/result envelope and failures use
+its versioned typed error envelope. Shell completion offers active extension
+IDs for `show` when a daemon is reachable.
 
 ## Manifest
 
@@ -400,6 +452,10 @@ contexts.
 | --- | ---: |
 | Configured extensions | 32 |
 | Manifest size | 64 KiB |
+| Files in one managed package | 1,024 |
+| Filesystem entries in one managed package | 2,048 |
+| Size of one managed package file | 16 MiB |
+| Total managed package content | 64 MiB |
 | Commands per manifest | 32 |
 | Hooks per manifest | 32 |
 | Presentation tokens per manifest | 64 |

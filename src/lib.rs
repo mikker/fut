@@ -7,6 +7,7 @@ pub(crate) mod command;
 pub mod daemon;
 pub mod doctor;
 pub mod domain;
+pub(crate) mod extension_store;
 pub(crate) mod extensions;
 pub mod project;
 pub(crate) mod project_definition;

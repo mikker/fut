@@ -289,10 +289,12 @@ An explicitly empty array hides that lane or format.
 ## Local extensions
 
 `extensions` is an explicit list of trusted absolute directory paths, loaded in
-order. Fut does not discover, download, or install extensions. The complete set
-is accepted or rejected atomically, and references to extension tokens are
-validated with it. See [Extensions](extensions.md) for commands, hooks, tokens,
-limits, payloads, and examples.
+order. Fut appends packages enabled through its Fut-owned local managed store;
+it never rewrites this array or any other part of `config.toml`. The complete
+merged set is accepted or rejected atomically, and references to extension
+tokens are validated with it. Fut does not discover or download extensions.
+See [Extensions](extensions.md) for managed install commands, trust boundaries,
+hooks, tokens, limits, payloads, and examples.
 
 The global file, a trusted project recipe, and each workspace's
 `.fut/config.toml` may configure a loaded extension with the same namespaced
@@ -401,7 +403,7 @@ Fut cannot reliably detect the active terminal font. Use [`fut doctor`](doctor.m
 
 ## Security boundary
 
-Everything under `ui` remains non-executable: it has no shell commands, file reads, environment interpolation, networking, functions, or expression language, and presentation tokens resolve only already-materialized strings. `trusted_commands` is a deliberate executable trust boundary. Fut executes its `program` directly with the configured `args` and the client's environment; it does not invoke a shell unless you explicitly configure one. Explicit extension roots and namespaced project tables are the equivalent trust decision for extension manifests, their packaged commands, and values those commands may execute. An explicit project `recipe` path is also a global trust decision; a repository `.fut/project.toml` becomes executable only after `fut project trust NAME` approves that canonical file's exact current bytes. Only configure commands, extension directories, and recipes you trust. Commands never run during configuration parsing or rendering; resource hooks run only from committed daemon mutations, client hooks run only for attachment lifecycle transitions, and recipes run only while creating a new session or workspace. Trusted recipe extension settings may deliberately make those lifecycle hooks perform work such as opening existing worktrees or starting a managed command. The same-user Unix socket is the authorization boundary for token publication, just as it is for other Fut control commands; Fut does not claim to authenticate the publishing process beyond that boundary.
+Everything under `ui` remains non-executable: it has no shell commands, file reads, environment interpolation, networking, functions, or expression language, and presentation tokens resolve only already-materialized strings. `trusted_commands` is a deliberate executable trust boundary. Fut executes its `program` directly with the configured `args` and the client's environment; it does not invoke a shell unless you explicitly configure one. Explicit extension roots, enabled managed extensions, and namespaced project tables are the equivalent trust decision for extension manifests, their packaged commands, and values those commands may execute. Managed installation only copies and validates a package; it runs no package scripts, and enablement is the explicit trust decision. An explicit project `recipe` path is also a global trust decision; a repository `.fut/project.toml` becomes executable only after `fut project trust NAME` approves that canonical file's exact current bytes. Only configure commands, extension directories, and recipes you trust. Commands never run during configuration parsing or rendering; resource hooks run only from committed daemon mutations, client hooks run only for attachment lifecycle transitions, and recipes run only while creating a new session or workspace. Trusted recipe extension settings may deliberately make those lifecycle hooks perform work such as opening existing worktrees or starting a managed command. The same-user Unix socket is the authorization boundary for token publication, just as it is for other Fut control commands; Fut does not claim to authenticate the publishing process beyond that boundary.
 
 ## Related
 
