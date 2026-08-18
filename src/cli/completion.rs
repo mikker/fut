@@ -41,6 +41,13 @@ completer!(terminal_attach, TerminalAttach);
 completer!(agent, Agent);
 completer!(get, Get);
 
+pub(super) fn extension(_: &OsStr) -> Vec<CompletionCandidate> {
+    let Some(catalog) = fetch_extension_catalog() else {
+        return vec![];
+    };
+    completion_candidates(extension_candidates(&catalog))
+}
+
 pub(super) fn pane_move_destination(_: &OsStr) -> Vec<CompletionCandidate> {
     let Some(source) = pane_move_source_from_argv(std::env::args_os()) else {
         return vec![];
@@ -158,6 +165,42 @@ fn fetch_snapshot() -> Option<ResourceSnapshot> {
             _ => None,
         }
     })
+}
+
+fn fetch_extension_catalog() -> Option<crate::protocol::ExtensionCatalog> {
+    let explicit = explicit_socket(std::env::args_os());
+    let socket = socket_path(explicit.as_deref()).ok()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .ok()?;
+    runtime.block_on(async {
+        match tokio::time::timeout(
+            COMPLETION_TIMEOUT,
+            super::control(&socket, ClientMessage::GetExtensionCatalog),
+        )
+        .await
+        {
+            Ok(Ok(ServerMessage::ExtensionCatalog { catalog })) => Some(catalog),
+            _ => None,
+        }
+    })
+}
+
+fn extension_candidates(catalog: &crate::protocol::ExtensionCatalog) -> Vec<Candidate> {
+    catalog
+        .extensions
+        .iter()
+        .map(|extension| Candidate {
+            value: extension.id.clone(),
+            help: format!(
+                "version {} — {}",
+                extension.version,
+                extension.root.display()
+            ),
+        })
+        .collect()
 }
 
 fn completion_argv(
@@ -576,6 +619,34 @@ mod tests {
             .map(|candidate| candidate.value)
             .collect::<Vec<_>>();
         assert_eq!(values, vec![integrated_id]);
+    }
+
+    #[test]
+    fn extension_completion_uses_active_catalog_ids_with_package_provenance() {
+        let catalog = crate::protocol::ExtensionCatalog {
+            generation: 4,
+            fingerprint: "0".repeat(64),
+            extensions: vec![crate::protocol::ExtensionDeclaration {
+                id: "review".into(),
+                api_version: 1,
+                version: "1.2.3".into(),
+                fut: ">=0.7.0, <1.0.0".into(),
+                capabilities: Vec::new(),
+                root: "/opt/fut/review".into(),
+                hooks: Default::default(),
+                commands: Default::default(),
+                presentation_tokens: Vec::new(),
+            }],
+            config: Default::default(),
+        };
+
+        assert_eq!(
+            extension_candidates(&catalog),
+            vec![Candidate {
+                value: "review".into(),
+                help: "version 1.2.3 — /opt/fut/review".into(),
+            }]
+        );
     }
 
     fn representative_trees() -> Vec<ResourceTree> {

@@ -1,6 +1,6 @@
 ---
 id: de-lpnu
-status: open
+status: closed
 deps: [de-lhfk]
 links: []
 created: 2026-08-18T19:55:11Z
@@ -22,3 +22,9 @@ Add noun-first commands for listing active extensions, showing manifest source/v
 
 Users and automation can list, inspect, validate, and reload extensions; JSON success and error envelopes follow existing CLI conventions; validation is daemonless and side-effect free; doctor explains active generation and rejected candidates; completion and docs cover the new grammar.
 
+
+## Notes
+
+**2026-08-18T21:41:27Z**
+
+Implemented and verified with strict Clippy, the full unit suite, extension-focused E2E coverage, and a successful build. The full E2E run had one unrelated focus-transfer timing failure that passed immediately when rerun serially.

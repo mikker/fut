@@ -8,12 +8,17 @@ use std::{
     os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
     path::{Component, Path, PathBuf},
     process::Stdio,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
+use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command,
@@ -28,11 +33,16 @@ use crate::{
     },
     command::PopupSize,
     domain::{SessionId, WorkspaceId},
-    protocol::SelectedTarget,
+    protocol::{
+        ExtensionCapabilityDeclaration, ExtensionCatalog, ExtensionCommandDeclaration,
+        ExtensionCommandExecutionDeclaration, ExtensionDeclaration, ExtensionPresentationScope,
+        ExtensionPresentationTokenDeclaration, ExtensionTokenPresentation, SelectedTarget,
+    },
     resources::{MAX_MATERIALIZED_TOKEN_VALUE_BYTES, Mutation, ResourceEvent, ResourceSnapshot},
 };
 
 pub(crate) const MANIFEST_FILE_NAME: &str = "fut-extension.toml";
+const MANIFEST_API_VERSION: u64 = 1;
 const FUT_BIN: &str = "FUT_BIN";
 const FUT_EXTENSION_ID: &str = "FUT_EXTENSION_ID";
 const FUT_EXTENSION_ROOT: &str = "FUT_EXTENSION_ROOT";
@@ -65,6 +75,10 @@ const MAX_ARG_BYTES: usize = 4096;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Extension {
     id: String,
+    api_version: u64,
+    version: Version,
+    fut_requirement: VersionReq,
+    capabilities: Vec<ExtensionCapability>,
     root: PathBuf,
     hooks: BTreeMap<String, ExtensionCommand>,
     commands: BTreeMap<String, ExtensionLauncher>,
@@ -74,6 +88,22 @@ pub(crate) struct Extension {
 impl Extension {
     pub(crate) fn id(&self) -> &str {
         &self.id
+    }
+
+    pub(crate) const fn api_version(&self) -> u64 {
+        self.api_version
+    }
+
+    pub(crate) fn version(&self) -> &Version {
+        &self.version
+    }
+
+    pub(crate) fn fut_requirement(&self) -> &VersionReq {
+        &self.fut_requirement
+    }
+
+    pub(crate) fn capabilities(&self) -> &[ExtensionCapability] {
+        &self.capabilities
     }
 
     pub(crate) fn root(&self) -> &Path {
@@ -103,6 +133,37 @@ impl Extension {
                 self.root.as_os_str().to_owned(),
             ),
         ]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum ExtensionCapability {
+    Commands,
+    Hooks,
+    PresentationTokens,
+}
+
+impl ExtensionCapability {
+    const ALL: [Self; 3] = [Self::Commands, Self::Hooks, Self::PresentationTokens];
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Commands => "commands",
+            Self::Hooks => "hooks",
+            Self::PresentationTokens => "presentation_tokens",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "commands" => Ok(Self::Commands),
+            "hooks" => Ok(Self::Hooks),
+            "presentation_tokens" => Ok(Self::PresentationTokens),
+            _ => bail!(
+                "unknown extension capability {value:?}; supported capabilities are {}",
+                Self::ALL.map(Self::as_str).join(", ")
+            ),
+        }
     }
 }
 
@@ -163,6 +224,561 @@ impl ExtensionCommandExecution {
             Self::Background => ExtensionCommandMode::Background,
         }
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct ExtensionRegistry {
+    generation: u64,
+    fingerprint: String,
+    extensions: Vec<Extension>,
+    config: ExtensionConfigCatalog,
+    declared_presentation_tokens: HashSet<String>,
+}
+
+impl ExtensionRegistry {
+    pub(crate) fn new(
+        generation: u64,
+        extensions: Vec<Extension>,
+        config: ExtensionConfigCatalog,
+    ) -> Result<Self> {
+        if generation == 0 {
+            bail!("extension registry generation must be at least 1");
+        }
+        let declared_presentation_tokens = validate_registry_declarations(&extensions)?;
+        let fingerprint = registry_fingerprint(&extensions, &config);
+        Ok(Self {
+            generation,
+            fingerprint,
+            extensions,
+            config,
+            declared_presentation_tokens,
+        })
+    }
+
+    pub(crate) fn at_generation(mut self, generation: u64) -> Result<Self> {
+        if generation == 0 {
+            bail!("extension registry generation must be at least 1");
+        }
+        self.generation = generation;
+        Ok(self)
+    }
+
+    pub(crate) const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    pub(crate) fn extensions(&self) -> &[Extension] {
+        &self.extensions
+    }
+
+    pub(crate) fn config(&self) -> &ExtensionConfigCatalog {
+        &self.config
+    }
+
+    pub(crate) fn declared_presentation_tokens(&self) -> &HashSet<String> {
+        &self.declared_presentation_tokens
+    }
+
+    pub(crate) fn extension(&self, id: &str) -> Option<&Extension> {
+        self.extensions
+            .iter()
+            .find(|extension| extension.id() == id)
+    }
+
+    pub(crate) fn catalog(&self) -> Result<ExtensionCatalog> {
+        let extensions = self
+            .extensions
+            .iter()
+            .map(extension_declaration)
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(source) = self.config.fingerprint_data().source {
+            validate_os_value(
+                "extension config source",
+                source.as_os_str(),
+                MAX_PATH_BYTES,
+            )?;
+            source.to_str().with_context(|| {
+                format!(
+                    "extension config source {} is not valid UTF-8 for the local protocol",
+                    source.display()
+                )
+            })?;
+        }
+        Ok(ExtensionCatalog {
+            generation: self.generation,
+            fingerprint: self.fingerprint.clone(),
+            extensions,
+            config: self.config.to_protocol(),
+        })
+    }
+
+    /// Rebuild the runtime representation solely from a daemon catalog. This
+    /// repeats all structural bounds and pins the fingerprint so a client never
+    /// accepts partial or malformed extension state from the wire.
+    pub(crate) fn from_catalog(catalog: ExtensionCatalog) -> Result<Self> {
+        if catalog.generation == 0 {
+            bail!("extension catalog generation must be at least 1");
+        }
+        if catalog.fingerprint.len() != 64
+            || !catalog
+                .fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            bail!("extension catalog fingerprint must be 64 lowercase hexadecimal characters");
+        }
+        if catalog.extensions.len() > MAX_EXTENSIONS {
+            bail!(
+                "extension catalog contains {} extensions; maximum is {MAX_EXTENSIONS}",
+                catalog.extensions.len()
+            );
+        }
+        if let Some(source) = &catalog.config.source {
+            if !source.is_absolute() {
+                bail!("extension catalog config source must be absolute");
+            }
+            validate_os_value(
+                "extension catalog config source",
+                source.as_os_str(),
+                MAX_PATH_BYTES,
+            )?;
+        }
+
+        let expected_fingerprint = catalog.fingerprint.clone();
+        let generation = catalog.generation;
+        let mut extensions = Vec::with_capacity(catalog.extensions.len());
+        let mut ids = HashSet::new();
+        for declaration in catalog.extensions {
+            let extension = extension_from_declaration(declaration)?;
+            if !ids.insert(extension.id.clone()) {
+                bail!(
+                    "extension catalog contains duplicate extension id {:?}",
+                    extension.id
+                );
+            }
+            extensions.push(extension);
+        }
+        let config = ExtensionConfigCatalog::from_protocol(catalog.config, &extensions)?;
+        let registry = Self::new(generation, extensions, config)?;
+        if registry.fingerprint != expected_fingerprint {
+            bail!(
+                "extension catalog fingerprint does not match its declarations and configuration"
+            );
+        }
+        Ok(registry)
+    }
+}
+
+fn extension_declaration(extension: &Extension) -> Result<ExtensionDeclaration> {
+    let root = extension.root.clone();
+    root.to_str().with_context(|| {
+        format!(
+            "extension root {} is not valid UTF-8 for the local protocol",
+            root.display()
+        )
+    })?;
+    let hooks = extension
+        .hooks
+        .iter()
+        .map(|(name, command)| Ok((name.clone(), protocol_argv(&command.argv)?)))
+        .collect::<Result<_>>()?;
+    let commands = extension
+        .commands
+        .iter()
+        .map(|(name, launcher)| {
+            let execution = match &launcher.execution {
+                ExtensionCommandExecution::Interactive {
+                    size,
+                    activate_opened,
+                } => ExtensionCommandExecutionDeclaration::Interactive {
+                    width: size.width,
+                    height: size.height,
+                    activate_opened: *activate_opened,
+                },
+                ExtensionCommandExecution::Background => {
+                    ExtensionCommandExecutionDeclaration::Background
+                }
+            };
+            Ok((
+                name.clone(),
+                ExtensionCommandDeclaration {
+                    title: launcher.title.clone(),
+                    argv: protocol_argv(&launcher.command.argv)?,
+                    execution,
+                },
+            ))
+        })
+        .collect::<Result<_>>()?;
+    let presentation_tokens = extension
+        .presentation_tokens
+        .iter()
+        .map(|token| ExtensionPresentationTokenDeclaration {
+            name: token.name.clone(),
+            scope: match token.scope {
+                PresentationScope::Session => ExtensionPresentationScope::Session,
+                PresentationScope::Workspace => ExtensionPresentationScope::Workspace,
+                PresentationScope::Tab => ExtensionPresentationScope::Tab,
+                PresentationScope::Pane => ExtensionPresentationScope::Pane,
+            },
+            presentation: match token.presentation {
+                TokenPresentation::Plain => ExtensionTokenPresentation::Plain,
+                TokenPresentation::Spinner => ExtensionTokenPresentation::Spinner,
+            },
+        })
+        .collect();
+    Ok(ExtensionDeclaration {
+        id: extension.id.clone(),
+        api_version: extension.api_version,
+        version: extension.version.to_string(),
+        fut: extension.fut_requirement.to_string(),
+        capabilities: extension
+            .capabilities
+            .iter()
+            .map(|capability| match capability {
+                ExtensionCapability::Commands => ExtensionCapabilityDeclaration::Commands,
+                ExtensionCapability::Hooks => ExtensionCapabilityDeclaration::Hooks,
+                ExtensionCapability::PresentationTokens => {
+                    ExtensionCapabilityDeclaration::PresentationTokens
+                }
+            })
+            .collect(),
+        root,
+        hooks,
+        commands,
+        presentation_tokens,
+    })
+}
+
+fn protocol_argv(argv: &[OsString]) -> Result<Vec<String>> {
+    argv.iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value.to_str().map(str::to_owned).with_context(|| {
+                format!("extension argv[{index}] is not valid UTF-8 for the local protocol")
+            })
+        })
+        .collect()
+}
+
+fn extension_from_declaration(declaration: ExtensionDeclaration) -> Result<Extension> {
+    if declaration.api_version != MANIFEST_API_VERSION {
+        bail!(
+            "extension {:?} catalog declares unsupported api_version {}",
+            declaration.id,
+            declaration.api_version
+        );
+    }
+    validate_identifier("extension id", &declaration.id)?;
+    if declaration.version.len() > MAX_ARG_BYTES || declaration.fut.len() > MAX_ARG_BYTES {
+        bail!(
+            "extension {:?} catalog version metadata exceeds {MAX_ARG_BYTES} bytes",
+            declaration.id
+        );
+    }
+    let version = Version::parse(&declaration.version)
+        .with_context(|| format!("extension {:?} catalog version is invalid", declaration.id))?;
+    let fut_requirement = VersionReq::parse(&declaration.fut).with_context(|| {
+        format!(
+            "extension {:?} catalog Fut requirement is invalid",
+            declaration.id
+        )
+    })?;
+    let running_fut_version = Version::parse(env!("CARGO_PKG_VERSION"))
+        .expect("Cargo package version must be valid SemVer");
+    if !fut_requirement.matches(&running_fut_version) {
+        bail!(
+            "extension {:?} catalog is incompatible with Fut {}",
+            declaration.id,
+            running_fut_version
+        );
+    }
+    if !declaration.root.is_absolute() {
+        bail!(
+            "extension {:?} catalog root must be absolute",
+            declaration.id
+        );
+    }
+    validate_os_value(
+        "extension catalog root",
+        declaration.root.as_os_str(),
+        MAX_PATH_BYTES,
+    )?;
+    if declaration.hooks.len() > MAX_HOOKS {
+        bail!(
+            "extension {:?} catalog declares too many hooks",
+            declaration.id
+        );
+    }
+    if declaration.commands.len() > MAX_COMMANDS {
+        bail!(
+            "extension {:?} catalog declares too many commands",
+            declaration.id
+        );
+    }
+    if declaration.presentation_tokens.len() > MAX_PRESENTATION_TOKENS {
+        bail!(
+            "extension {:?} catalog declares too many presentation tokens",
+            declaration.id
+        );
+    }
+
+    let capabilities = validate_capabilities(
+        &declaration.id,
+        declaration
+            .capabilities
+            .into_iter()
+            .map(|capability| match capability {
+                ExtensionCapabilityDeclaration::Commands => "commands",
+                ExtensionCapabilityDeclaration::Hooks => "hooks",
+                ExtensionCapabilityDeclaration::PresentationTokens => "presentation_tokens",
+            })
+            .map(str::to_owned)
+            .collect(),
+        !declaration.commands.is_empty(),
+        !declaration.hooks.is_empty(),
+        !declaration.presentation_tokens.is_empty(),
+    )?;
+    let hooks = declaration
+        .hooks
+        .into_iter()
+        .map(|(name, argv)| {
+            validate_identifier("hook name", &name)?;
+            if !SUPPORTED_HOOKS.contains(&name.as_str()) {
+                bail!("extension catalog declares unsupported hook {name:?}");
+            }
+            Ok((name, validate_command(&declaration.root, argv)?))
+        })
+        .collect::<Result<_>>()?;
+    let commands = declaration
+        .commands
+        .into_iter()
+        .map(|(name, command)| {
+            validate_identifier("command name", &name)?;
+            validate_title(&command.title)?;
+            let execution = match command.execution {
+                ExtensionCommandExecutionDeclaration::Interactive {
+                    width,
+                    height,
+                    activate_opened,
+                } => {
+                    let size = PopupSize { width, height };
+                    size.validate()?;
+                    ExtensionCommandExecution::Interactive {
+                        size,
+                        activate_opened,
+                    }
+                }
+                ExtensionCommandExecutionDeclaration::Background => {
+                    ExtensionCommandExecution::Background
+                }
+            };
+            let command_argv = validate_command(&declaration.root, command.argv)?;
+            let launcher_name = name.clone();
+            Ok((
+                name,
+                ExtensionLauncher {
+                    name: launcher_name,
+                    title: command.title,
+                    command: command_argv,
+                    execution,
+                },
+            ))
+        })
+        .collect::<Result<_>>()?;
+    let mut token_names = HashSet::new();
+    let mut presentation_tokens = Vec::with_capacity(declaration.presentation_tokens.len());
+    for token in declaration.presentation_tokens {
+        validate_identifier("presentation token name", &token.name)?;
+        if !token_names.insert(token.name.clone()) {
+            bail!(
+                "extension catalog repeats presentation token {:?}",
+                token.name
+            );
+        }
+        let scope = match token.scope {
+            ExtensionPresentationScope::Session => PresentationScope::Session,
+            ExtensionPresentationScope::Workspace => PresentationScope::Workspace,
+            ExtensionPresentationScope::Tab => PresentationScope::Tab,
+            ExtensionPresentationScope::Pane => PresentationScope::Pane,
+        };
+        let presentation = match token.presentation {
+            ExtensionTokenPresentation::Plain => TokenPresentation::Plain,
+            ExtensionTokenPresentation::Spinner => TokenPresentation::Spinner,
+        };
+        presentation_tokens.push(PresentationToken {
+            qualified_name: format!(
+                "{}.extension.{}.{}",
+                scope.as_str(),
+                declaration.id,
+                token.name
+            ),
+            name: token.name,
+            scope,
+            presentation,
+        });
+    }
+
+    Ok(Extension {
+        id: declaration.id,
+        api_version: declaration.api_version,
+        version,
+        fut_requirement,
+        capabilities,
+        root: declaration.root,
+        hooks,
+        commands,
+        presentation_tokens,
+    })
+}
+
+fn validate_registry_declarations(extensions: &[Extension]) -> Result<HashSet<String>> {
+    let mut extension_ids = HashSet::new();
+    let mut qualified_tokens = HashSet::new();
+    for extension in extensions {
+        if !extension_ids.insert(extension.id()) {
+            bail!(
+                "extension registry contains duplicate extension id {:?}",
+                extension.id()
+            );
+        }
+        let mut token_names = HashSet::new();
+        for token in extension.presentation_tokens() {
+            if !token_names.insert(&token.name) {
+                bail!(
+                    "extension registry contains duplicate presentation token declaration {:?} for extension {:?}",
+                    token.name,
+                    extension.id()
+                );
+            }
+            if !qualified_tokens.insert(token.qualified_name().to_owned()) {
+                bail!(
+                    "extension registry contains duplicate presentation token {:?}",
+                    token.qualified_name()
+                );
+            }
+        }
+    }
+    Ok(qualified_tokens)
+}
+
+struct FingerprintWriter(Sha256);
+
+impl FingerprintWriter {
+    fn new() -> Self {
+        Self(Sha256::new())
+    }
+
+    fn bytes(&mut self, value: &[u8]) {
+        let length = u64::try_from(value.len()).expect("fingerprint value length fits in u64");
+        self.0.update(length.to_be_bytes());
+        self.0.update(value);
+    }
+
+    fn string(&mut self, value: &str) {
+        self.bytes(value.as_bytes());
+    }
+
+    fn count(&mut self, value: usize) {
+        let value = u64::try_from(value).expect("fingerprint collection length fits in u64");
+        self.0.update(value.to_be_bytes());
+    }
+
+    fn u64(&mut self, value: u64) {
+        self.0.update(value.to_be_bytes());
+    }
+
+    fn option_u16(&mut self, value: Option<u16>) {
+        match value {
+            Some(value) => {
+                self.0.update([1]);
+                self.0.update(value.to_be_bytes());
+            }
+            None => self.0.update([0]),
+        }
+    }
+
+    fn boolean(&mut self, value: bool) {
+        self.0.update([u8::from(value)]);
+    }
+
+    fn finish(self) -> String {
+        format!("{:x}", self.0.finalize())
+    }
+}
+
+fn registry_fingerprint(extensions: &[Extension], config: &ExtensionConfigCatalog) -> String {
+    let mut fingerprint = FingerprintWriter::new();
+    fingerprint.bytes(b"fut-extension-registry-v1");
+    fingerprint.count(extensions.len());
+    for extension in extensions {
+        fingerprint.string(extension.id());
+        fingerprint.u64(extension.api_version());
+        fingerprint.string(&extension.version().to_string());
+        fingerprint.string(&extension.fut_requirement().to_string());
+        fingerprint.count(extension.capabilities().len());
+        for capability in ExtensionCapability::ALL
+            .into_iter()
+            .filter(|capability| extension.capabilities().contains(capability))
+        {
+            fingerprint.string(capability.as_str());
+        }
+        fingerprint.bytes(extension.root().as_os_str().as_bytes());
+
+        fingerprint.count(extension.hooks.len());
+        for (name, hook) in &extension.hooks {
+            fingerprint.string(name);
+            fingerprint.count(hook.argv.len());
+            for argument in &hook.argv {
+                fingerprint.bytes(argument.as_bytes());
+            }
+        }
+
+        fingerprint.count(extension.commands.len());
+        for (name, launcher) in &extension.commands {
+            fingerprint.string(name);
+            fingerprint.string(launcher.name());
+            fingerprint.string(launcher.title());
+            fingerprint.count(launcher.argv().len());
+            for argument in launcher.argv() {
+                fingerprint.bytes(argument.as_bytes());
+            }
+            match launcher.execution() {
+                ExtensionCommandExecution::Interactive {
+                    size,
+                    activate_opened,
+                } => {
+                    fingerprint.bytes(b"interactive");
+                    fingerprint.option_u16(size.width);
+                    fingerprint.option_u16(size.height);
+                    fingerprint.boolean(*activate_opened);
+                }
+                ExtensionCommandExecution::Background => fingerprint.bytes(b"background"),
+            }
+        }
+
+        fingerprint.count(extension.presentation_tokens.len());
+        for token in extension.presentation_tokens() {
+            fingerprint.string(&token.name);
+            fingerprint.string(token.scope().as_str());
+            fingerprint.string(token.presentation().as_str());
+            fingerprint.string(token.qualified_name());
+        }
+    }
+
+    let config = config.fingerprint_data();
+    fingerprint.string(&config.normalized_defaults);
+    match config.source {
+        Some(source) => {
+            fingerprint.boolean(true);
+            fingerprint.bytes(source.as_os_str().as_bytes());
+        }
+        None => fingerprint.boolean(false),
+    }
+    fingerprint.finish()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -311,8 +927,13 @@ impl HookEvent {
     }
 }
 
+struct QueuedHookEvent {
+    event: HookEvent,
+    registry: Arc<ExtensionRegistry>,
+}
+
 pub(crate) struct HookQueue {
-    sender: mpsc::Sender<HookEvent>,
+    sender: mpsc::Sender<QueuedHookEvent>,
     dropped: AtomicU64,
 }
 
@@ -329,9 +950,13 @@ pub(crate) fn hook_queue() -> (HookQueue, HookReceiver) {
 
 impl HookQueue {
     /// Queue committed events without ever applying backpressure to the daemon.
-    pub(crate) fn enqueue(&self, mutation: &Mutation) {
+    pub(crate) fn enqueue(&self, mutation: &Mutation, registry: Arc<ExtensionRegistry>) {
         for event in HookEvent::from_mutation(mutation) {
-            if self.sender.try_send(event).is_err() {
+            let queued = QueuedHookEvent {
+                event,
+                registry: Arc::clone(&registry),
+            };
+            if self.sender.try_send(queued).is_err() {
                 let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
                 if dropped.is_power_of_two() {
                     tracing::warn!(
@@ -345,19 +970,30 @@ impl HookQueue {
 }
 
 pub(crate) struct HookReceiver {
-    receiver: mpsc::Receiver<HookEvent>,
+    receiver: mpsc::Receiver<QueuedHookEvent>,
+}
+
+#[cfg(test)]
+impl HookReceiver {
+    pub(crate) async fn receive_snapshot_identity(&mut self) -> Option<(u64, u64, String)> {
+        self.receiver.recv().await.map(|queued| {
+            (
+                queued.event.revision,
+                queued.registry.generation(),
+                queued.registry.fingerprint().to_owned(),
+            )
+        })
+    }
 }
 
 pub(crate) async fn run_hooks(
     mut queue: HookReceiver,
-    extensions: Vec<Extension>,
-    extension_config: ExtensionConfigCatalog,
     fut_bin: PathBuf,
     socket: PathBuf,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
-        let event = tokio::select! {
+        let queued = tokio::select! {
             biased;
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -370,7 +1006,7 @@ pub(crate) async fn run_hooks(
                 None => return,
             },
         };
-        run_event(&extensions, &extension_config, &fut_bin, &socket, &event).await;
+        run_event(&queued.registry, &fut_bin, &socket, &queued.event).await;
     }
 }
 
@@ -416,24 +1052,39 @@ impl ClientHookEvent {
 }
 
 pub(crate) struct ClientHookRuntime {
-    sender: Option<mpsc::Sender<ClientHookEvent>>,
+    sender: Option<mpsc::Sender<QueuedClientHookEvent>>,
     task: Option<JoinHandle<()>>,
     current: Option<ClientSession>,
+    extensions: Arc<Vec<Extension>>,
+}
+
+struct QueuedClientHookEvent {
+    event: ClientHookEvent,
+    extensions: Arc<Vec<Extension>>,
 }
 
 impl ClientHookRuntime {
     pub(crate) fn new(extensions: Vec<Extension>, fut_bin: PathBuf, socket: PathBuf) -> Self {
-        let (sender, mut receiver) = mpsc::channel::<ClientHookEvent>(HOOK_QUEUE_CAPACITY);
+        let extensions = Arc::new(extensions);
+        let (sender, mut receiver) = mpsc::channel::<QueuedClientHookEvent>(HOOK_QUEUE_CAPACITY);
         let task = tokio::spawn(async move {
-            while let Some(event) = receiver.recv().await {
-                run_client_event(&extensions, &fut_bin, &socket, &event).await;
+            while let Some(queued) = receiver.recv().await {
+                run_client_event(&queued.extensions, &fut_bin, &socket, &queued.event).await;
             }
         });
         Self {
             sender: Some(sender),
             task: Some(task),
             current: None,
+            extensions,
         }
+    }
+
+    /// Switch declarations without synthesizing lifecycle events. Events
+    /// observed after this call snapshot the new catalog; work already queued
+    /// or running is allowed to finish against its original generation.
+    pub(crate) fn reconfigure(&mut self, extensions: Vec<Extension>) {
+        self.extensions = Arc::new(extensions);
     }
 
     pub(crate) fn observe(&mut self, snapshot: &ResourceSnapshot, focused: &SelectedTarget) {
@@ -467,7 +1118,10 @@ impl ClientHookRuntime {
         let Some(sender) = &self.sender else {
             return;
         };
-        match sender.try_send(event) {
+        match sender.try_send(QueuedClientHookEvent {
+            event,
+            extensions: Arc::clone(&self.extensions),
+        }) {
             Ok(()) => self.current = Some(session),
             Err(_) => {
                 tracing::warn!("client extension hook queue full; lifecycle event dropped");
@@ -478,10 +1132,13 @@ impl ClientHookRuntime {
     pub(crate) async fn shutdown(mut self) {
         if let (Some(sender), Some(session)) = (&self.sender, self.current.take()) {
             let _ = sender
-                .send(ClientHookEvent {
-                    kind: "client.detached",
-                    session,
-                    previous_session: None,
+                .send(QueuedClientHookEvent {
+                    event: ClientHookEvent {
+                        kind: "client.detached",
+                        session,
+                        previous_session: None,
+                    },
+                    extensions: Arc::clone(&self.extensions),
                 })
                 .await;
         }
@@ -531,13 +1188,7 @@ async fn run_client_event(
     }
 }
 
-async fn run_event(
-    extensions: &[Extension],
-    config: &ExtensionConfigCatalog,
-    fut_bin: &Path,
-    socket: &Path,
-    event: &HookEvent,
-) {
+async fn run_event(registry: &ExtensionRegistry, fut_bin: &Path, socket: &Path, event: &HookEvent) {
     let payload = match event.payload() {
         Ok(payload) => payload,
         Err(error) => {
@@ -545,13 +1196,13 @@ async fn run_event(
             return;
         }
     };
-    for extension in extensions {
+    for extension in registry.extensions() {
         let Some(command) = extension.hooks.get(event.kind) else {
             continue;
         };
         let resolved_config = resolve_hook_extension_config_for_catalog(
-            config,
-            extensions,
+            registry.config(),
+            registry.extensions(),
             extension.id(),
             &event.workspace_root,
             event.trusted_project_config.as_ref(),
@@ -837,6 +1488,15 @@ pub(crate) enum TokenPresentation {
     Spinner,
 }
 
+impl TokenPresentation {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Plain => "plain",
+            Self::Spinner => "spinner",
+        }
+    }
+}
+
 /// Validate unstyled materialized presentation text before it enters the
 /// resource tree or protocol snapshots.
 pub(crate) fn validate_presentation_value(value: &str) -> Result<()> {
@@ -865,6 +1525,10 @@ pub(crate) fn validate_presentation_value(value: &str) -> Result<()> {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
+    api_version: u64,
+    version: String,
+    fut: String,
+    capabilities: Vec<String>,
     id: String,
     #[serde(default)]
     hooks: BTreeMap<String, Vec<String>>,
@@ -922,6 +1586,14 @@ pub(crate) fn load(roots: &[PathBuf]) -> Result<Vec<Extension>> {
 
         let extension =
             load_one(&root).with_context(|| format!("load extension from {}", root.display()))?;
+        tracing::debug!(
+            extension = extension.id(),
+            api_version = extension.api_version(),
+            package_version = %extension.version(),
+            fut_requirement = %extension.fut_requirement(),
+            capabilities = ?extension.capabilities(),
+            "validated extension manifest"
+        );
         if !seen_ids.insert(extension.id.clone()) {
             bail!(
                 "extension id {:?} is declared by more than one configured root",
@@ -932,6 +1604,16 @@ pub(crate) fn load(roots: &[PathBuf]) -> Result<Vec<Extension>> {
     }
 
     Ok(loaded)
+}
+
+/// Validate one package directory against this Fut binary without activating
+/// it or executing any declaration from the package.
+pub(crate) fn validate_package(configured_root: &Path) -> Result<ExtensionDeclaration> {
+    let root = validate_root(configured_root)
+        .with_context(|| format!("validate extension package {}", configured_root.display()))?;
+    let extension =
+        load_one(&root).with_context(|| format!("load extension from {}", root.display()))?;
+    extension_declaration(&extension)
 }
 
 fn validate_root(configured_root: &Path) -> Result<PathBuf> {
@@ -959,7 +1641,43 @@ fn load_one(root: &Path) -> Result<Extension> {
     let source = read_manifest(&manifest_path)?;
     let manifest = toml::from_str::<Manifest>(&source)
         .with_context(|| format!("parse extension manifest {}", manifest_path.display()))?;
+    if manifest.api_version != MANIFEST_API_VERSION {
+        bail!(
+            "extension {:?} declares unsupported api_version {}; supported api_version is {MANIFEST_API_VERSION}",
+            manifest.id,
+            manifest.api_version
+        );
+    }
+    let version = Version::parse(&manifest.version).with_context(|| {
+        format!(
+            "extension {:?} package version {:?} is not valid SemVer",
+            manifest.id, manifest.version
+        )
+    })?;
+    let fut_requirement = VersionReq::parse(&manifest.fut).with_context(|| {
+        format!(
+            "extension {:?} Fut requirement {:?} is not a valid SemVer requirement",
+            manifest.id, manifest.fut
+        )
+    })?;
+    let running_fut_version = Version::parse(env!("CARGO_PKG_VERSION"))
+        .expect("Cargo package version must be valid SemVer");
+    if !fut_requirement.matches(&running_fut_version) {
+        bail!(
+            "extension {:?} requires Fut {}, but running Fut version {} is incompatible",
+            manifest.id,
+            fut_requirement,
+            running_fut_version
+        );
+    }
     validate_identifier("extension id", &manifest.id)?;
+    let capabilities = validate_capabilities(
+        &manifest.id,
+        manifest.capabilities,
+        !manifest.commands.is_empty(),
+        !manifest.hooks.is_empty(),
+        !manifest.presentation_tokens.is_empty(),
+    )?;
     if manifest.hooks.len() > MAX_HOOKS {
         bail!(
             "extension {:?} declares {} hooks; maximum is {MAX_HOOKS}",
@@ -1084,11 +1802,63 @@ fn load_one(root: &Path) -> Result<Extension> {
 
     Ok(Extension {
         id: manifest.id,
+        api_version: manifest.api_version,
+        version,
+        fut_requirement,
+        capabilities,
         root: root.to_owned(),
         hooks,
         commands,
         presentation_tokens,
     })
+}
+
+fn validate_capabilities(
+    extension_id: &str,
+    declarations: Vec<String>,
+    has_commands: bool,
+    has_hooks: bool,
+    has_presentation_tokens: bool,
+) -> Result<Vec<ExtensionCapability>> {
+    let mut capabilities = Vec::with_capacity(declarations.len());
+    let mut seen = HashSet::new();
+    for declaration in declarations {
+        let capability = ExtensionCapability::parse(&declaration)
+            .with_context(|| format!("validate extension {extension_id:?} capabilities"))?;
+        if !seen.insert(capability) {
+            bail!(
+                "extension {extension_id:?} declares capability {:?} more than once",
+                capability.as_str()
+            );
+        }
+        capabilities.push(capability);
+    }
+
+    for (capability, used) in [
+        (ExtensionCapability::Commands, has_commands),
+        (ExtensionCapability::Hooks, has_hooks),
+        (
+            ExtensionCapability::PresentationTokens,
+            has_presentation_tokens,
+        ),
+    ] {
+        let declared = seen.contains(&capability);
+        if used && !declared {
+            bail!(
+                "extension {extension_id:?} uses {} but does not declare the required capability {:?}",
+                capability.as_str(),
+                capability.as_str()
+            );
+        }
+        if declared && !used {
+            bail!(
+                "extension {extension_id:?} declares unused capability {:?}",
+                capability.as_str()
+            );
+        }
+    }
+
+    Ok(capabilities)
 }
 
 fn read_manifest(path: &Path) -> Result<String> {
@@ -1233,7 +2003,16 @@ mod tests {
 
     use super::*;
 
+    const VALID_MANIFEST_METADATA: &str = r#"api_version = 1
+version = "1.2.3"
+fut = ">=0.7.0, <1.0.0"
+"#;
+
     fn extension_root(manifest: &str) -> tempfile::TempDir {
+        raw_extension_root(&format!("{VALID_MANIFEST_METADATA}{manifest}"))
+    }
+
+    fn raw_extension_root(manifest: &str) -> tempfile::TempDir {
         let temporary = tempfile::tempdir().unwrap();
         fs::write(temporary.path().join(MANIFEST_FILE_NAME), manifest).unwrap();
         temporary
@@ -1247,11 +2026,310 @@ mod tests {
         temporary
     }
 
+    fn registry(extensions: Vec<Extension>) -> ExtensionRegistry {
+        ExtensionRegistry::new(1, extensions, ExtensionConfigCatalog::default()).unwrap()
+    }
+
+    fn workspace_mutation(revision: u64) -> Mutation {
+        Mutation {
+            revision,
+            events: vec![ResourceEvent::WorkspaceCreated {
+                session_id: SessionId::new(),
+                id: WorkspaceId::new(),
+                name: "main".into(),
+                root: "/workspace".into(),
+            }],
+            terminals_to_close: Vec::new(),
+            multiplexer_empty: false,
+        }
+    }
+
+    #[test]
+    fn registry_identity_is_deterministic_generation_stamped_and_ordered() {
+        let first = extension_root("id = 'first'\ncapabilities = []\n");
+        let second = extension_root("id = 'second'\ncapabilities = []\n");
+        let extensions = load(&[first.path().to_owned(), second.path().to_owned()]).unwrap();
+
+        let generation_one =
+            ExtensionRegistry::new(1, extensions.clone(), ExtensionConfigCatalog::default())
+                .unwrap();
+        let generation_two =
+            ExtensionRegistry::new(2, extensions.clone(), ExtensionConfigCatalog::default())
+                .unwrap();
+        assert_eq!(generation_one.generation(), 1);
+        assert_eq!(generation_two.generation(), 2);
+        assert_eq!(generation_one.fingerprint(), generation_two.fingerprint());
+        assert_eq!(generation_one.fingerprint().len(), 64);
+        assert!(
+            generation_one
+                .fingerprint()
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        );
+
+        let mut reversed = extensions.clone();
+        reversed.reverse();
+        let reversed = registry(reversed);
+        assert_ne!(generation_one.fingerprint(), reversed.fingerprint());
+
+        let duplicate_error = ExtensionRegistry::new(
+            1,
+            vec![extensions[0].clone(), extensions[0].clone()],
+            ExtensionConfigCatalog::default(),
+        )
+        .unwrap_err();
+        assert!(
+            duplicate_error
+                .to_string()
+                .contains("duplicate extension id \"first\"")
+        );
+
+        let token_extension = extension_root(
+            "id = 'tokens'\ncapabilities = ['presentation_tokens']\n[[presentation_tokens]]\nname = 'state'\nscope = 'workspace'\n",
+        );
+        let mut token_extension = load(&[token_extension.path().to_owned()])
+            .unwrap()
+            .remove(0);
+        token_extension
+            .presentation_tokens
+            .push(token_extension.presentation_tokens[0].clone());
+        let duplicate_token_error =
+            ExtensionRegistry::new(1, vec![token_extension], ExtensionConfigCatalog::default())
+                .unwrap_err();
+        assert!(
+            duplicate_token_error
+                .to_string()
+                .contains("duplicate presentation token declaration \"state\"")
+        );
+        assert!(ExtensionRegistry::new(0, Vec::new(), ExtensionConfigCatalog::default()).is_err());
+    }
+
+    #[test]
+    fn catalog_round_trip_rebuilds_exact_registry_and_rejects_unbounded_or_tampered_data() {
+        let root = extension_root(
+            r#"id = "catalog"
+capabilities = ["commands", "hooks", "presentation_tokens"]
+[hooks]
+"client.attached" = ["./hook", "attached"]
+"workspace.created" = ["./hook", "created"]
+[commands.open]
+title = "Open catalog"
+argv = ["./bin/open", "--all"]
+size = { width = 90, height = 24 }
+activate_opened = true
+[[presentation_tokens]]
+name = "state"
+scope = "workspace"
+presentation = "spinner"
+"#,
+        );
+        let registry = ExtensionRegistry::new(
+            4,
+            load(&[root.path().to_owned()]).unwrap(),
+            ExtensionConfigCatalog::default(),
+        )
+        .unwrap();
+        let catalog = registry.catalog().unwrap();
+        let rebuilt = ExtensionRegistry::from_catalog(catalog.clone()).unwrap();
+        assert_eq!(rebuilt.generation(), 4);
+        assert_eq!(rebuilt.fingerprint(), registry.fingerprint());
+        assert_eq!(rebuilt.extensions(), registry.extensions());
+        assert_eq!(rebuilt.config(), registry.config());
+
+        let mut tampered = catalog.clone();
+        tampered.extensions[0]
+            .commands
+            .get_mut("open")
+            .unwrap()
+            .title = "Changed".into();
+        assert!(
+            ExtensionRegistry::from_catalog(tampered)
+                .unwrap_err()
+                .to_string()
+                .contains("fingerprint does not match")
+        );
+
+        let mut oversized = catalog.clone();
+        oversized.extensions = vec![catalog.extensions[0].clone(); MAX_EXTENSIONS + 1];
+        assert!(
+            ExtensionRegistry::from_catalog(oversized)
+                .unwrap_err()
+                .to_string()
+                .contains("maximum")
+        );
+
+        let mut bad_argument = catalog;
+        bad_argument.extensions[0]
+            .commands
+            .get_mut("open")
+            .unwrap()
+            .argv
+            .push("x".repeat(MAX_ARG_BYTES + 1));
+        assert!(
+            ExtensionRegistry::from_catalog(bad_argument)
+                .unwrap_err()
+                .to_string()
+                .contains("argv")
+        );
+    }
+
+    #[test]
+    fn registry_fingerprint_covers_declarations_roots_and_normalized_global_config() {
+        let extension = extension_root(
+            r#"id = "rich"
+capabilities = ["commands", "hooks", "presentation_tokens"]
+[hooks]
+"workspace.created" = ["./hook", "--one"]
+[commands.launch]
+title = "Launch"
+argv = ["./launch", "--one"]
+size = { width = 90, height = 24 }
+activate_opened = true
+[[presentation_tokens]]
+name = "state"
+scope = "workspace"
+presentation = "spinner"
+"#,
+        );
+        let config_path = extension.path().join("global.toml");
+        let write_config = |body: &str| {
+            fs::write(
+                &config_path,
+                format!(
+                    "extensions = [{:?}]\n{body}",
+                    extension.path().display().to_string()
+                ),
+            )
+            .unwrap();
+            crate::client::config::load_extensions_location(
+                &crate::client::config::ConfigLocation {
+                    path: Some(config_path.clone()),
+                    explicit: true,
+                    source: "test",
+                },
+            )
+            .unwrap()
+        };
+
+        let loaded =
+            write_config("[extension.rich]\nz = 1\nnested = { second = [2, 3], first = true }\n");
+        let baseline = ExtensionRegistry::new(1, loaded.extensions, loaded.config).unwrap();
+        let loaded =
+            write_config("[extension.rich]\nnested = { first = true, second = [2, 3] }\nz = 1\n");
+        let reordered_config = ExtensionRegistry::new(1, loaded.extensions, loaded.config).unwrap();
+        assert_eq!(baseline.fingerprint(), reordered_config.fingerprint());
+
+        let other_config_path = extension.path().join("other-global.toml");
+        fs::write(
+            &other_config_path,
+            format!(
+                "extensions = [{:?}]\n[extension.rich]\nnested = {{ first = true, second = [2, 3] }}\nz = 1\n",
+                extension.path().display().to_string()
+            ),
+        )
+        .unwrap();
+        let loaded = crate::client::config::load_extensions_location(
+            &crate::client::config::ConfigLocation {
+                path: Some(other_config_path),
+                explicit: true,
+                source: "test",
+            },
+        )
+        .unwrap();
+        let changed_source = ExtensionRegistry::new(1, loaded.extensions, loaded.config).unwrap();
+        assert_ne!(baseline.fingerprint(), changed_source.fingerprint());
+
+        let loaded =
+            write_config("[extension.rich]\nnested = { first = true, second = [2, 3] }\nz = 2\n");
+        let changed_config = ExtensionRegistry::new(1, loaded.extensions, loaded.config).unwrap();
+        assert_ne!(baseline.fingerprint(), changed_config.fingerprint());
+
+        fs::write(
+            extension.path().join(MANIFEST_FILE_NAME),
+            format!(
+                "{VALID_MANIFEST_METADATA}id = 'rich'\ncapabilities = ['commands', 'hooks', 'presentation_tokens']\n[hooks]\n'workspace.created' = ['./hook', '--two']\n[commands.launch]\ntitle = 'Launch changed'\nargv = ['./launch', '--two']\nmode = 'background'\n[[presentation_tokens]]\nname = 'state'\nscope = 'workspace'\n"
+            ),
+        )
+        .unwrap();
+        let changed_declarations = registry(load(&[extension.path().to_owned()]).unwrap());
+        assert_ne!(baseline.fingerprint(), changed_declarations.fingerprint());
+
+        let other_root = extension_root(
+            "id = 'rich'\ncapabilities = ['commands']\n[commands.launch]\ntitle = 'Launch'\nargv = ['./launch']\n",
+        );
+        let other_root = registry(load(&[other_root.path().to_owned()]).unwrap());
+        assert_ne!(baseline.fingerprint(), other_root.fingerprint());
+    }
+
+    #[test]
+    fn registry_fingerprint_canonicalizes_capability_order() {
+        let extension = extension_root(
+            r#"id = "ordered"
+capabilities = ["commands", "hooks", "presentation_tokens"]
+[hooks]
+"workspace.created" = ["helper"]
+[commands.launch]
+title = "Launch"
+argv = ["helper"]
+[[presentation_tokens]]
+name = "state"
+scope = "workspace"
+"#,
+        );
+        let first = registry(load(&[extension.path().to_owned()]).unwrap());
+        fs::write(
+            extension.path().join(MANIFEST_FILE_NAME),
+            format!(
+                r#"{VALID_MANIFEST_METADATA}id = "ordered"
+capabilities = ["presentation_tokens", "commands", "hooks"]
+[hooks]
+"workspace.created" = ["helper"]
+[commands.launch]
+title = "Launch"
+argv = ["helper"]
+[[presentation_tokens]]
+name = "state"
+scope = "workspace"
+"#
+            ),
+        )
+        .unwrap();
+        let reordered = registry(load(&[extension.path().to_owned()]).unwrap());
+
+        assert_eq!(first.fingerprint(), reordered.fingerprint());
+    }
+
+    #[tokio::test]
+    async fn queued_hooks_retain_the_registry_snapshot_from_enqueue_time() {
+        let (queue, mut receiver) = hook_queue();
+        let generation_one = Arc::new(registry(Vec::new()));
+        let generation_two = Arc::new(
+            ExtensionRegistry::new(2, Vec::new(), ExtensionConfigCatalog::default()).unwrap(),
+        );
+        let retained = Arc::downgrade(&generation_one);
+
+        queue.enqueue(&workspace_mutation(1), Arc::clone(&generation_one));
+        queue.enqueue(&workspace_mutation(2), Arc::clone(&generation_two));
+        drop(generation_one);
+
+        let first = receiver.receiver.recv().await.unwrap();
+        let second = receiver.receiver.recv().await.unwrap();
+        assert_eq!(first.event.revision, 1);
+        assert_eq!(first.registry.generation(), 1);
+        assert!(retained.upgrade().is_some());
+        assert_eq!(second.event.revision, 2);
+        assert_eq!(second.registry.generation(), 2);
+        assert!(Arc::ptr_eq(&second.registry, &generation_two));
+        drop(first);
+        assert!(retained.upgrade().is_none());
+    }
+
     #[test]
     fn loads_namespaced_declarations_and_resolves_packaged_argv() {
         let temporary = extension_root(
             r#"
 id = "acme.git-status"
+capabilities = ["commands", "hooks", "presentation_tokens"]
 
 [hooks]
 "workspace.created" = ["./bin/refresh", "--quiet"]
@@ -1285,6 +2363,17 @@ presentation = "spinner"
         let extension = &extensions[0];
         let canonical_root = fs::canonicalize(temporary.path()).unwrap();
         assert_eq!(extension.id(), "acme.git-status");
+        assert_eq!(extension.api_version(), 1);
+        assert_eq!(extension.version(), &Version::new(1, 2, 3));
+        assert_eq!(extension.fut_requirement().to_string(), ">=0.7.0, <1.0.0");
+        assert_eq!(
+            extension.capabilities(),
+            [
+                ExtensionCapability::Commands,
+                ExtensionCapability::Hooks,
+                ExtensionCapability::PresentationTokens,
+            ]
+        );
         assert_eq!(extension.root, canonical_root);
         assert_eq!(
             extension.hooks["workspace.created"].argv,
@@ -1348,11 +2437,95 @@ presentation = "spinner"
     }
 
     #[test]
+    fn validates_one_package_into_protocol_metadata_without_running_it() {
+        let temporary = executable_hook(
+            "id = 'inspect'\ncapabilities = ['hooks']\n[hooks]\n'workspace.created' = ['./hook']\n",
+            "#!/bin/sh\ntouch should-not-run\n",
+        );
+
+        let declaration = validate_package(temporary.path()).unwrap();
+
+        assert_eq!(declaration.id, "inspect");
+        assert_eq!(declaration.version, "1.2.3");
+        assert_eq!(
+            declaration.root,
+            fs::canonicalize(temporary.path()).unwrap()
+        );
+        assert!(!temporary.path().join("should-not-run").exists());
+    }
+
+    #[test]
+    fn rejects_unsupported_api_and_malformed_or_incompatible_versions() {
+        for (manifest, expected) in [
+            (
+                "api_version = 2\nversion = '1.0.0'\nfut = '>=0.7.0, <1.0.0'\ncapabilities = []\nid = 'future-api'\n",
+                "unsupported api_version 2",
+            ),
+            (
+                "api_version = 1\nversion = 'one'\nfut = '>=0.7.0, <1.0.0'\ncapabilities = []\nid = 'bad-package-version'\n",
+                "package version \"one\" is not valid SemVer",
+            ),
+            (
+                "api_version = 1\nversion = '1.0.0'\nfut = 'eventually'\ncapabilities = []\nid = 'bad-fut-requirement'\n",
+                "Fut requirement \"eventually\" is not a valid SemVer requirement",
+            ),
+            (
+                "api_version = 1\nversion = '1.0.0'\nfut = '>=1.0.0'\ncapabilities = []\nid = 'incompatible'\n",
+                "requires Fut >=1.0.0, but running Fut version",
+            ),
+        ] {
+            let temporary = raw_extension_root(manifest);
+            let error = format!("{:#}", load(&[temporary.path().to_owned()]).unwrap_err());
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn requires_all_manifest_metadata_fields() {
+        for manifest in [
+            "version = '1.0.0'\nfut = '>=0.7.0, <1.0.0'\ncapabilities = []\nid = 'missing-api'\n",
+            "api_version = 1\nfut = '>=0.7.0, <1.0.0'\ncapabilities = []\nid = 'missing-version'\n",
+            "api_version = 1\nversion = '1.0.0'\ncapabilities = []\nid = 'missing-fut'\n",
+            "api_version = 1\nversion = '1.0.0'\nfut = '>=0.7.0, <1.0.0'\nid = 'missing-capabilities'\n",
+        ] {
+            let temporary = raw_extension_root(manifest);
+            let error = format!("{:#}", load(&[temporary.path().to_owned()]).unwrap_err());
+            assert!(error.contains("missing field"), "{error}");
+        }
+    }
+
+    #[test]
+    fn capabilities_must_be_known_unique_and_exactly_used() {
+        for (manifest, expected) in [
+            (
+                "id = 'missing-capability'\ncapabilities = []\n[commands.run]\ntitle = 'Run'\nargv = ['true']\n",
+                "does not declare the required capability \"commands\"",
+            ),
+            (
+                "id = 'unknown-capability'\ncapabilities = ['network']\n",
+                "unknown extension capability \"network\"",
+            ),
+            (
+                "id = 'duplicate-capability'\ncapabilities = ['commands', 'commands']\n[commands.run]\ntitle = 'Run'\nargv = ['true']\n",
+                "declares capability \"commands\" more than once",
+            ),
+            (
+                "id = 'unused-capability'\ncapabilities = ['hooks']\n",
+                "declares unused capability \"hooks\"",
+            ),
+        ] {
+            let temporary = extension_root(manifest);
+            let error = format!("{:#}", load(&[temporary.path().to_owned()]).unwrap_err());
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
     fn rejects_relative_roots_duplicate_ids_and_duplicate_tokens_atomically() {
         assert!(load(&[PathBuf::from("relative")]).is_err());
 
-        let one = extension_root("id = 'same'\n");
-        let two = extension_root("id = 'same'\n");
+        let one = extension_root("id = 'same'\ncapabilities = []\n");
+        let two = extension_root("id = 'same'\ncapabilities = []\n");
         let error = load(&[one.path().to_owned(), two.path().to_owned()])
             .unwrap_err()
             .to_string();
@@ -1361,6 +2534,7 @@ presentation = "spinner"
         let duplicate = extension_root(
             r#"
 id = "duplicate-token"
+capabilities = ["presentation_tokens"]
 [[presentation_tokens]]
 name = "status"
 scope = "workspace"
@@ -1376,42 +2550,45 @@ scope = "tab"
     #[test]
     fn rejects_invalid_ids_manifests_and_argv_with_context() {
         for (manifest, expected) in [
-            ("id = 'Uppercase'\n", "extension id"),
-            ("id = 'valid'\nunknown = true\n", "parse extension manifest"),
+            ("id = 'Uppercase'\ncapabilities = []\n", "extension id"),
             (
-                "id = 'valid'\n[hooks]\n'workspace.created' = []\n",
+                "id = 'valid'\ncapabilities = []\nunknown = true\n",
+                "parse extension manifest",
+            ),
+            (
+                "id = 'valid'\ncapabilities = ['hooks']\n[hooks]\n'workspace.created' = []\n",
                 "argv must contain an executable",
             ),
             (
-                "id = 'valid'\n[commands.launch]\ntitle = 'Launch'\nargv = []\n",
+                "id = 'valid'\ncapabilities = ['commands']\n[commands.launch]\ntitle = 'Launch'\nargv = []\n",
                 "argv must contain an executable",
             ),
             (
-                "id = 'valid'\n[commands.launch]\ntitle = ''\nargv = ['/bin/true']\n",
+                "id = 'valid'\ncapabilities = ['commands']\n[commands.launch]\ntitle = ''\nargv = ['/bin/true']\n",
                 "title must be",
             ),
             (
-                "id = 'valid'\n[commands.launch]\ntitle = 'Launch'\nargv = ['/bin/true']\nsize = { width = 3 }\n",
+                "id = 'valid'\ncapabilities = ['commands']\n[commands.launch]\ntitle = 'Launch'\nargv = ['/bin/true']\nsize = { width = 3 }\n",
                 "size.width must be at least 4",
             ),
             (
-                "id = 'valid'\n[commands.launch]\ntitle = 'Launch'\nargv = ['/bin/true']\nmode = 'background'\nsize = { width = 40 }\n",
+                "id = 'valid'\ncapabilities = ['commands']\n[commands.launch]\ntitle = 'Launch'\nargv = ['/bin/true']\nmode = 'background'\nsize = { width = 40 }\n",
                 "background command",
             ),
             (
-                "id = 'valid'\n[[presentation_tokens]]\nname = 'state'\nscope = 'workspace'\npresentation = 'movie'\n",
+                "id = 'valid'\ncapabilities = ['presentation_tokens']\n[[presentation_tokens]]\nname = 'state'\nscope = 'workspace'\npresentation = 'movie'\n",
                 "unknown variant",
             ),
             (
-                "id = 'valid'\n[hooks]\n'workspace.created' = ['./../escape']\n",
+                "id = 'valid'\ncapabilities = ['hooks']\n[hooks]\n'workspace.created' = ['./../escape']\n",
                 "must stay within the extension root",
             ),
             (
-                "id = 'valid'\n[hooks]\n'workspace.created' = ['../escape']\n",
+                "id = 'valid'\ncapabilities = ['hooks']\n[hooks]\n'workspace.created' = ['../escape']\n",
                 "must be an absolute path, a PATH executable name, or start with ./",
             ),
             (
-                "id = 'valid'\n[hooks]\n'workspace.changed' = ['helper']\n",
+                "id = 'valid'\ncapabilities = ['hooks']\n[hooks]\n'workspace.changed' = ['helper']\n",
                 "unsupported hook",
             ),
         ] {
@@ -1560,7 +2737,7 @@ scope = "tab"
     #[tokio::test]
     async fn hook_receives_direct_argv_cwd_environment_and_stdin() {
         let temporary = executable_hook(
-            "id = 'capture'\n[hooks]\n'workspace.created' = ['./hook', 'literal argument']\n",
+            "id = 'capture'\ncapabilities = ['hooks']\n[hooks]\n'workspace.created' = ['./hook', 'literal argument']\n",
             "#!/bin/sh\npwd > cwd\nenv | sort > environment\nprintf '%s' \"$1\" > argument\ncat > payload\n",
         );
         let workspace = temporary.path().join("workspace");
@@ -1584,6 +2761,11 @@ scope = "tab"
             },
         )
         .unwrap();
+        let registry = ExtensionRegistry::new(1, loaded.extensions, loaded.config).unwrap();
+        assert!(
+            !sentinel.exists(),
+            "registry construction started a command"
+        );
         let event = HookEvent {
             revision: 7,
             kind: "workspace.created",
@@ -1597,7 +2779,7 @@ scope = "tab"
         let socket = temporary.path().join("fut.sock");
 
         let fut_bin = Path::new("/opt/fut/bin/fut");
-        run_event(&loaded.extensions, &loaded.config, fut_bin, &socket, &event).await;
+        run_event(&registry, fut_bin, &socket, &event).await;
 
         assert_eq!(
             fs::read_to_string(temporary.path().join("cwd"))
@@ -1657,7 +2839,7 @@ scope = "tab"
             "[extension.capture]\nsource = 'workspace'\nlocal = true\n",
         )
         .unwrap();
-        run_event(&loaded.extensions, &loaded.config, fut_bin, &socket, &event).await;
+        run_event(&registry, fut_bin, &socket, &event).await;
         let environment = fs::read_to_string(temporary.path().join("environment")).unwrap();
         assert!(environment.lines().any(|line| {
             line == format!(
@@ -1680,7 +2862,7 @@ scope = "tab"
             "[extension.unknown]\nthis_must_still_be_rejected = true\n",
         )
         .unwrap();
-        run_event(&loaded.extensions, &loaded.config, fut_bin, &socket, &event).await;
+        run_event(&registry, fut_bin, &socket, &event).await;
         let environment = fs::read_to_string(temporary.path().join("environment")).unwrap();
         let config = environment
             .lines()
@@ -1710,7 +2892,7 @@ scope = "tab"
     #[tokio::test]
     async fn client_hook_receives_client_lifecycle_environment_and_stdin() {
         let temporary = executable_hook(
-            "id = 'capture-client'\n[hooks]\n'client.attached' = ['./hook']\n",
+            "id = 'capture-client'\ncapabilities = ['hooks']\n[hooks]\n'client.attached' = ['./hook']\n",
             "#!/bin/sh\nenv | sort > environment\ncat > payload\n",
         );
         let extension = load(&[temporary.path().to_owned()]).unwrap().remove(0);
@@ -1751,7 +2933,7 @@ scope = "tab"
         let output_path = output.path().display().to_string();
         let temporary = executable_hook(
             &format!(
-                "id = 'client-order'\n[hooks]\n'client.attached' = ['./hook', {:?}]\n'client.session_changed' = ['./hook', {:?}]\n'client.detached' = ['./hook', {:?}]\n",
+                "id = 'client-order'\ncapabilities = ['hooks']\n[hooks]\n'client.attached' = ['./hook', {:?}]\n'client.session_changed' = ['./hook', {:?}]\n'client.detached' = ['./hook', {:?}]\n",
                 output_path, output_path, output_path
             ),
             "#!/bin/sh\nprintf '%s %s\\n' \"$FUT_EVENT\" \"$FUT_SESSION_NAME\" >> \"$1\"\n",
@@ -1779,6 +2961,44 @@ scope = "tab"
         assert_eq!(
             fs::read_to_string(output.path()).unwrap(),
             "client.attached first\nclient.session_changed second\nclient.detached second\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_hook_reconfigure_keeps_session_and_routes_only_future_events_to_new_catalog() {
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let output_path = output.path().display().to_string();
+        let manifest = |id: &str| {
+            format!(
+                "id = {id:?}\ncapabilities = ['hooks']\n[hooks]\n'client.attached' = ['./hook', {:?}]\n'client.session_changed' = ['./hook', {:?}]\n'client.detached' = ['./hook', {:?}]\n",
+                output_path, output_path, output_path
+            )
+        };
+        let script = "#!/bin/sh\nprintf '%s %s %s\\n' \"$FUT_EXTENSION_ID\" \"$FUT_EVENT\" \"$FUT_SESSION_NAME\" >> \"$1\"\n";
+        let old_root = executable_hook(&manifest("old-hooks"), script);
+        let new_root = executable_hook(&manifest("new-hooks"), script);
+        let old = load(&[old_root.path().to_owned()]).unwrap().remove(0);
+        let new = load(&[new_root.path().to_owned()]).unwrap().remove(0);
+        let mut runtime = ClientHookRuntime::new(
+            vec![old],
+            PathBuf::from("/opt/fut/bin/fut"),
+            old_root.path().join("fut.sock"),
+        );
+
+        runtime.observe_session(ClientSession {
+            id: SessionId::new(),
+            name: "first".into(),
+        });
+        runtime.reconfigure(vec![new]);
+        runtime.observe_session(ClientSession {
+            id: SessionId::new(),
+            name: "second".into(),
+        });
+        runtime.shutdown().await;
+
+        assert_eq!(
+            fs::read_to_string(output.path()).unwrap(),
+            "old-hooks client.attached first\nnew-hooks client.session_changed second\nnew-hooks client.detached second\n"
         );
     }
 
@@ -1885,19 +3105,20 @@ scope = "tab"
         let output_path = output.path().display().to_string();
         let first = executable_hook(
             &format!(
-                "id = 'first'\n[hooks]\n'workspace.closed' = ['./hook', {:?}]\n",
+                "id = 'first'\ncapabilities = ['hooks']\n[hooks]\n'workspace.closed' = ['./hook', {:?}]\n",
                 output_path
             ),
             "#!/bin/sh\nprintf 'first\\n' >> \"$1\"\nexit 9\n",
         );
         let second = executable_hook(
             &format!(
-                "id = 'second'\n[hooks]\n'workspace.closed' = ['./hook', {:?}]\n",
+                "id = 'second'\ncapabilities = ['hooks']\n[hooks]\n'workspace.closed' = ['./hook', {:?}]\n",
                 output_path
             ),
             "#!/bin/sh\nprintf 'second\\n' >> \"$1\"\n",
         );
-        let extensions = load(&[first.path().to_owned(), second.path().to_owned()]).unwrap();
+        let registry =
+            registry(load(&[first.path().to_owned(), second.path().to_owned()]).unwrap());
         let event = HookEvent {
             revision: 9,
             kind: "workspace.closed",
@@ -1910,8 +3131,7 @@ scope = "tab"
         };
 
         run_event(
-            &extensions,
-            &ExtensionConfigCatalog::default(),
+            &registry,
             Path::new("/opt/fut/bin/fut"),
             Path::new("/tmp/fut.sock"),
             &event,
@@ -1930,19 +3150,19 @@ scope = "tab"
         let output_path = output.path().display().to_string();
         let slow = executable_hook(
             &format!(
-                "id = 'slow'\n[hooks]\n'workspace.created' = ['./hook', {:?}]\n",
+                "id = 'slow'\ncapabilities = ['hooks']\n[hooks]\n'workspace.created' = ['./hook', {:?}]\n",
                 output_path
             ),
             "#!/bin/sh\nprintf 'slow\\n' >> \"$1\"\nsleep 30\n",
         );
         let later = executable_hook(
             &format!(
-                "id = 'later'\n[hooks]\n'workspace.created' = ['./hook', {:?}]\n",
+                "id = 'later'\ncapabilities = ['hooks']\n[hooks]\n'workspace.created' = ['./hook', {:?}]\n",
                 output_path
             ),
             "#!/bin/sh\nprintf 'later\\n' >> \"$1\"\n",
         );
-        let extensions = load(&[slow.path().to_owned(), later.path().to_owned()]).unwrap();
+        let registry = registry(load(&[slow.path().to_owned(), later.path().to_owned()]).unwrap());
         let event = HookEvent {
             revision: 10,
             kind: "workspace.created",
@@ -1956,8 +3176,7 @@ scope = "tab"
         let started = tokio::time::Instant::now();
 
         run_event(
-            &extensions,
-            &ExtensionConfigCatalog::default(),
+            &registry,
             Path::new("/opt/fut/bin/fut"),
             Path::new("/tmp/fut.sock"),
             &event,

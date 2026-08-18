@@ -43,7 +43,8 @@ use crate::{
     },
     protocol::{
         AcknowledgedCommand, AgentPromptMode, ClientMessage, ClientMode, ContextScope,
-        ContextualCommand, Envelope, PROTOCOL_VERSION, PROTOCOL_VERSION_0_1, RenameSelector,
+        ContextualCommand, Envelope, ExtensionCapabilityDeclaration, ExtensionCatalog,
+        ExtensionDeclaration, PROTOCOL_VERSION, PROTOCOL_VERSION_0_1, RenameSelector,
         ServerMessage, TerminalContext, TerminalInputOperation, codec, decode_payload,
         encode_payload,
     },
@@ -161,6 +162,12 @@ enum Command {
         /// Agent operation to perform.
         #[command(subcommand)]
         command: AgentCommand,
+    },
+    /// Inspect, validate, or reload extension packages.
+    Extension {
+        /// Extension operation to perform.
+        #[command(subcommand)]
+        command: ExtensionCommand,
     },
     /// Publish a declared extension presentation token.
     Token {
@@ -745,6 +752,26 @@ enum DaemonCommand {
 }
 
 #[derive(Subcommand)]
+enum ExtensionCommand {
+    /// List the daemon's active extension generation.
+    List,
+    /// Show one active extension from the daemon's catalog.
+    Show {
+        /// Active extension ID.
+        #[arg(add = ArgValueCompleter::new(completion::extension))]
+        id: String,
+    },
+    /// Validate a package directory without activating or executing it.
+    Validate {
+        /// Extension package directory containing fut-extension.toml.
+        #[arg(value_name = "PATH", value_hint = ValueHint::DirPath)]
+        path: PathBuf,
+    },
+    /// Ask the daemon to atomically reload its configured extensions.
+    Reload,
+}
+
+#[derive(Subcommand)]
 enum TokenCommand {
     /// Materialize unstyled presentation text on one live resource.
     Publish(TokenPublishArgs),
@@ -862,6 +889,13 @@ async fn execute(cli: Cli) -> Result<()> {
         }
         print!("{AGENT_SKILL}");
         return Ok(());
+    }
+
+    if let Some(Command::Extension {
+        command: ExtensionCommand::Validate { path },
+    }) = &cli.command
+    {
+        return validate_extension_package(path, cli.json);
     }
 
     let socket = socket_path(cli.socket.as_deref())?;
@@ -1667,6 +1701,68 @@ async fn execute(cli: Cli) -> Result<()> {
                 Ok(())
             }
         }
+        Some(Command::Extension {
+            command: ExtensionCommand::List,
+        }) => {
+            let catalog = extension_catalog(&socket).await?;
+            output(
+                cli.json,
+                "extension.list",
+                extension_catalog_result(&catalog),
+                render_extension_list(&catalog),
+            )
+        }
+        Some(Command::Extension {
+            command: ExtensionCommand::Show { id },
+        }) => {
+            let catalog = extension_catalog(&socket).await?;
+            let extension = catalog
+                .extensions
+                .iter()
+                .find(|extension| extension.id == id)
+                .ok_or_else(|| {
+                    CliError::new("not_found", format!("active extension {id:?} not found"))
+                })?;
+            let defaults = catalog
+                .config
+                .defaults
+                .get(&id)
+                .cloned()
+                .unwrap_or_default();
+            output(
+                cli.json,
+                "extension.show",
+                json!({
+                    "generation": catalog.generation,
+                    "fingerprint": catalog.fingerprint,
+                    "extension": extension,
+                    "config": {
+                        "defaults": defaults,
+                        "source": catalog.config.source,
+                    },
+                }),
+                render_extension_show(&catalog, extension, &defaults),
+            )
+        }
+        Some(Command::Extension {
+            command: ExtensionCommand::Reload,
+        }) => match control(&socket, ClientMessage::ReloadExtensions).await? {
+            ServerMessage::ExtensionsReloaded { catalog, changed } => output(
+                cli.json,
+                "extension.reload",
+                json!({
+                    "changed": changed,
+                    "catalog": extension_catalog_result(&catalog),
+                }),
+                format!(
+                    "generation={} fingerprint={} extensions={} changed={changed}",
+                    catalog.generation,
+                    catalog.fingerprint,
+                    catalog.extensions.len(),
+                ),
+            ),
+            other => unexpected(other),
+        },
         Some(Command::Tab {
             command: TabCommand::List { workspace_id },
         }) => {
@@ -1769,6 +1865,9 @@ async fn execute(cli: Cli) -> Result<()> {
             command: WorkspaceCommand::Retire { workspace_id },
         }) => retire_workspace(&socket, cli.json, workspace_id).await,
         Some(Command::Doctor) => unreachable!("doctor is handled before command execution"),
+        Some(Command::Extension {
+            command: ExtensionCommand::Validate { .. },
+        }) => unreachable!("extension validate is handled before daemon setup"),
         Some(Command::Agent {
             command: AgentCommand::Skill,
         }) => unreachable!("agent skill is handled before daemon setup"),
@@ -1823,6 +1922,146 @@ fn run_project_command(
             change.source.display()
         ),
     )
+}
+
+fn validate_extension_package(path: &std::path::Path, json_output: bool) -> Result<()> {
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()
+            .context("read current directory for extension validation")?
+            .join(path)
+    };
+    let extension = crate::extensions::validate_package(&absolute).map_err(|error| {
+        CliError::new(
+            "invalid_extension",
+            format!("extension package is invalid: {error:#}"),
+        )
+    })?;
+    output(
+        json_output,
+        "extension.validate",
+        json!({ "valid": true, "extension": extension }),
+        format!("valid {}", render_extension_summary(&extension)),
+    )
+}
+
+fn extension_catalog_result(catalog: &ExtensionCatalog) -> serde_json::Value {
+    json!({
+        "generation": catalog.generation,
+        "fingerprint": catalog.fingerprint,
+        "count": catalog.extensions.len(),
+        "extensions": catalog.extensions,
+        "config": catalog.config,
+    })
+}
+
+fn render_extension_list(catalog: &ExtensionCatalog) -> String {
+    std::iter::once(format!(
+        "generation={} fingerprint={} extensions={}",
+        catalog.generation,
+        catalog.fingerprint,
+        catalog.extensions.len(),
+    ))
+    .chain(catalog.extensions.iter().map(render_extension_summary))
+    .collect::<Vec<_>>()
+    .join("\n")
+}
+
+fn render_extension_show(
+    catalog: &ExtensionCatalog,
+    extension: &ExtensionDeclaration,
+    defaults: &serde_json::Map<String, serde_json::Value>,
+) -> String {
+    let commands = extension
+        .commands
+        .iter()
+        .map(|(name, declaration)| {
+            let mode = match declaration.execution {
+                crate::protocol::ExtensionCommandExecutionDeclaration::Interactive { .. } => {
+                    "interactive"
+                }
+                crate::protocol::ExtensionCommandExecutionDeclaration::Background => "background",
+            };
+            format!("{name} ({mode})")
+        })
+        .collect::<Vec<_>>();
+    let tokens = extension
+        .presentation_tokens
+        .iter()
+        .map(|token| {
+            let scope = match token.scope {
+                crate::protocol::ExtensionPresentationScope::Session => "session",
+                crate::protocol::ExtensionPresentationScope::Workspace => "workspace",
+                crate::protocol::ExtensionPresentationScope::Tab => "tab",
+                crate::protocol::ExtensionPresentationScope::Pane => "pane",
+            };
+            let presentation = match token.presentation {
+                crate::protocol::ExtensionTokenPresentation::Plain => "plain",
+                crate::protocol::ExtensionTokenPresentation::Spinner => "spinner",
+            };
+            format!("{} ({scope}, {presentation})", token.name)
+        })
+        .collect::<Vec<_>>();
+    let source = catalog
+        .config
+        .source
+        .as_ref()
+        .map_or_else(|| "-".into(), |path| format!("{path:?}"));
+    format!(
+        "extension {}\n  generation: {}\n  fingerprint: {}\n  version: {}\n  api_version: {}\n  fut: {}\n  capabilities: {}\n  root: {:?}\n  manifest: {:?}\n  hooks: {}\n  commands: {}\n  presentation_tokens: {}\n  config_source: {}\n  config_defaults: {}",
+        extension.id,
+        catalog.generation,
+        catalog.fingerprint,
+        extension.version,
+        extension.api_version,
+        extension.fut,
+        extension_capabilities(extension),
+        extension.root,
+        extension.root.join(crate::extensions::MANIFEST_FILE_NAME),
+        joined_or_dash(extension.hooks.keys().cloned()),
+        joined_or_dash(commands),
+        joined_or_dash(tokens),
+        source,
+        serde_json::Value::Object(defaults.clone()),
+    )
+}
+
+fn render_extension_summary(extension: &ExtensionDeclaration) -> String {
+    format!(
+        "extension {} version={} api={} fut={} capabilities={} root={:?}",
+        extension.id,
+        extension.version,
+        extension.api_version,
+        extension.fut,
+        extension_capabilities(extension),
+        extension.root,
+    )
+}
+
+fn extension_capabilities(extension: &ExtensionDeclaration) -> String {
+    joined_or_dash(
+        extension
+            .capabilities
+            .iter()
+            .map(|capability| match capability {
+                ExtensionCapabilityDeclaration::Commands => "commands",
+                ExtensionCapabilityDeclaration::Hooks => "hooks",
+                ExtensionCapabilityDeclaration::PresentationTokens => "presentation_tokens",
+            }),
+    )
+}
+
+fn joined_or_dash(values: impl IntoIterator<Item = impl AsRef<str>>) -> String {
+    let values = values
+        .into_iter()
+        .map(|value| value.as_ref().to_owned())
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        "-".into()
+    } else {
+        values.join(", ")
+    }
 }
 
 fn resolve_project_open_path(
@@ -2492,7 +2731,7 @@ async fn open_and_attach(
     cwd: PathBuf,
     config_dir: Option<&std::path::Path>,
 ) -> Result<()> {
-    let ui = client::load_ui_config(config_dir)?;
+    let ui = client::stage_ui_config(config_dir)?;
     let selected = open_current_location_with_config(socket, &cwd, config_dir).await?;
     client::attach_with_ui(
         socket,
@@ -2718,6 +2957,13 @@ fn session_selector(value: &str) -> SessionSelector {
 async fn list_resources(socket: &std::path::Path) -> Result<ResourceSnapshot> {
     match control(socket, ClientMessage::ListResources).await? {
         ServerMessage::Resources { snapshot, .. } => Ok(snapshot),
+        other => unexpected(other),
+    }
+}
+
+async fn extension_catalog(socket: &std::path::Path) -> Result<ExtensionCatalog> {
+    match control(socket, ClientMessage::GetExtensionCatalog).await? {
+        ServerMessage::ExtensionCatalog { catalog } => Ok(catalog),
         other => unexpected(other),
     }
 }
@@ -3057,6 +3303,15 @@ fn unexpected<T>(message: ServerMessage) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_extension_catalog() -> crate::protocol::ExtensionCatalog {
+        crate::protocol::ExtensionCatalog {
+            generation: 1,
+            fingerprint: "0".repeat(64),
+            extensions: Vec::new(),
+            config: crate::protocol::ExtensionCatalogConfig::default(),
+        }
+    }
     use crate::{
         domain::AgentIntegration,
         resources::{
@@ -3361,6 +3616,7 @@ mod tests {
                             version: compatible_version,
                             server_version: "old".into(),
                             selected: None,
+                            extension_catalog: empty_extension_catalog(),
                         },
                     })
                     .unwrap(),
@@ -3405,6 +3661,7 @@ mod tests {
                 version: PROTOCOL_VERSION,
                 server_version: "test".into(),
                 selected: None,
+                extension_catalog: empty_extension_catalog(),
             },
             ServerMessage::CommandCompleted {
                 command: AcknowledgedCommand::Shutdown,
@@ -4001,6 +4258,7 @@ mod tests {
                 "pane",
                 "terminal",
                 "agent",
+                "extension",
                 "token",
                 "context",
                 "get",
@@ -4025,6 +4283,25 @@ mod tests {
                 .map(clap::Command::get_name)
                 .collect::<Vec<_>>(),
             ["trust", "untrust"]
+        );
+
+        let command = cli_command();
+        let extension = command.find_subcommand("extension").unwrap();
+        assert_eq!(
+            extension
+                .get_subcommands()
+                .map(clap::Command::get_name)
+                .collect::<Vec<_>>(),
+            ["list", "show", "validate", "reload"]
+        );
+        let validate = extension.find_subcommand("validate").unwrap();
+        assert_eq!(
+            validate
+                .get_arguments()
+                .map(clap::Arg::get_id)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["path"]
         );
 
         let command = cli_command();

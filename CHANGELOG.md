@@ -3,6 +3,9 @@
 ## Unreleased
 
 - Failed popup commands now retain their terminal output and show its log path.
+- Added extension catalog inspection, daemonless package validation, atomic CLI reloads, active-generation diagnostics, and extension ID completion.
+- Added atomic live extension reloads that synchronize commands, bindings, presentation tokens, and hooks across attached clients while preserving active configuration on validation failure.
+- Added versioned extension manifest compatibility and exact capability declarations, rejecting incompatible packages before activation.
 - Added a single run-status token for showing managed command state in workspace lists.
 - Made the global navigator taller so more resources are visible at once.
 - Added a project catalog with daemonless recipe approval commands and trusted one-time layouts, commands, environments, working directories, and focus for projects and linked worktrees.

@@ -31,11 +31,19 @@ Doctor reports:
 - runtime-directory ownership and private permissions;
 - socket type, ownership, and permissions;
 - a bounded Fut protocol handshake when a safe socket exists;
+- the active daemon extension generation, fingerprint, package count, manifest
+  metadata, canonical roots, and configuration provenance;
 - the configured icon preset and a visual glyph probe.
 
 Client and daemon protocol versions must match exactly. Doctor reports both
 versions when it can safely reach a daemon; an older or newer endpoint is
 incompatible.
+
+Configuration validation and active extension reporting are independent. If a
+changed package on disk is incompatible or malformed, the config check explains
+why that candidate is rejected while the extensions check still identifies the
+daemon's last-known-good active generation. Doctor only reads manifests and the
+daemon catalog; it never executes extension hooks or commands.
 
 ## Nerd Fonts
 
@@ -58,7 +66,10 @@ Diagnosed errors are part of the complete report rather than a secondary command
 {"version":1,"command":"doctor","result":{"status":"warning","checks":[{"id":"config","status":"ok","summary":"valid defaults; no configuration file"}]}}
 ```
 
-Check statuses are `ok`, `info`, `warning`, and `error`. Details include structured paths, environment hints, protocol versions, icon glyphs, and the explicit `active_font: "unknown"` limitation where applicable.
+Check statuses are `ok`, `info`, `warning`, and `error`. Details include
+structured paths, environment hints, protocol versions, active extension
+package metadata and provenance, icon glyphs, and the explicit
+`active_font: "unknown"` limitation where applicable.
 
 ## Related
 

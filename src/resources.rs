@@ -4,7 +4,7 @@
 //! canonicalize them before inserting them here. This tree deliberately performs no I/O.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -800,6 +800,59 @@ impl ResourceTree {
         value: String,
     ) -> Result<TokenPublication, ResourceError> {
         self.replace_presentation_tokens(target, [(qualified_name, Some(value))])
+    }
+
+    /// Remove materialized extension values whose qualified token names are no
+    /// longer declared. Built-in values are outside the extension registry and
+    /// are retained. All resource scopes are pruned in one revision.
+    pub(crate) fn prune_extension_presentation_tokens(
+        &mut self,
+        declared: &HashSet<String>,
+    ) -> TokenPublication {
+        let is_stale = |name: &String| !is_builtin_token(name) && !declared.contains(name);
+        let changed = self
+            .sessions
+            .values()
+            .any(|resource| resource.tokens.keys().any(is_stale))
+            || self
+                .workspaces
+                .values()
+                .any(|resource| resource.tokens.keys().any(is_stale))
+            || self
+                .tabs
+                .values()
+                .any(|resource| resource.tokens.keys().any(is_stale))
+            || self
+                .panes
+                .values()
+                .any(|resource| resource.tokens.keys().any(is_stale));
+        if !changed {
+            return TokenPublication {
+                revision: self.revision,
+                changed: false,
+            };
+        }
+
+        self.revision += 1;
+        let retain = |tokens: &mut MaterializedTokenMap| {
+            tokens.retain(|name, _| is_builtin_token(name) || declared.contains(name));
+        };
+        for resource in self.sessions.values_mut() {
+            retain(&mut resource.tokens);
+        }
+        for resource in self.workspaces.values_mut() {
+            retain(&mut resource.tokens);
+        }
+        for resource in self.tabs.values_mut() {
+            retain(&mut resource.tokens);
+        }
+        for resource in self.panes.values_mut() {
+            retain(&mut resource.tokens);
+        }
+        TokenPublication {
+            revision: self.revision,
+            changed: true,
+        }
     }
 
     /// Atomically replace Fut's internal Git presentation values for one live
@@ -2655,6 +2708,81 @@ mod tests {
         );
         tree.terminal_exited(terminal_id).unwrap();
         assert!(tree.snapshot().sessions.is_empty());
+    }
+
+    #[test]
+    fn extension_token_pruning_covers_every_scope_in_one_revision() {
+        let mut tree = ResourceTree::default();
+        let path = initial("token-prune", "/token-prune");
+        let (session_id, workspace_id, tab_id, pane_id) = (
+            path.session_id,
+            path.workspace_id,
+            path.tab_id,
+            path.pane_id,
+        );
+        tree.create_session(path).unwrap();
+        let scoped = [
+            (
+                PresentationTokenTarget::Session(session_id),
+                "session.extension.keep.state",
+                "session.extension.removed.state",
+            ),
+            (
+                PresentationTokenTarget::Workspace(workspace_id),
+                "workspace.extension.keep.state",
+                "workspace.extension.removed.state",
+            ),
+            (
+                PresentationTokenTarget::Tab(tab_id),
+                "tab.extension.keep.state",
+                "tab.extension.removed.state",
+            ),
+            (
+                PresentationTokenTarget::Pane(pane_id),
+                "pane.extension.keep.state",
+                "pane.extension.removed.state",
+            ),
+        ];
+        for (target, retained, removed) in scoped {
+            tree.publish_presentation_token(target, retained.into(), "keep".into())
+                .unwrap();
+            tree.publish_presentation_token(target, removed.into(), "remove".into())
+                .unwrap();
+        }
+        tree.publish_workspace_git_tokens(workspace_id, Some("main".into()), None, None)
+            .unwrap();
+        let before = tree.revision();
+        let declared = scoped
+            .into_iter()
+            .map(|(_, retained, _)| retained.to_owned())
+            .collect::<HashSet<_>>();
+
+        let pruned = tree.prune_extension_presentation_tokens(&declared);
+
+        assert!(pruned.changed);
+        assert_eq!(pruned.revision, before + 1);
+        let snapshot = tree.snapshot();
+        let session = &snapshot.sessions[0];
+        let workspace = &session.workspaces[0];
+        let tab = &workspace.tabs[0];
+        let pane = &tab.panes[0];
+        for tokens in [
+            &session.tokens,
+            &workspace.tokens,
+            &tab.tokens,
+            &pane.tokens,
+        ] {
+            assert!(tokens.keys().all(|name| !name.contains(".removed.")));
+            assert!(tokens.values().any(|value| value == "keep"));
+        }
+        assert_eq!(
+            workspace.tokens.get(WORKSPACE_GIT_BRANCH_TOKEN),
+            Some(&"main".to_owned())
+        );
+
+        let unchanged = tree.prune_extension_presentation_tokens(&declared);
+        assert!(!unchanged.changed);
+        assert_eq!(unchanged.revision, pruned.revision);
     }
 
     #[test]

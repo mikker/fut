@@ -1969,7 +1969,11 @@ async fn configured_workspace_hooks_observe_committed_lifecycle_in_order() {
         fs::create_dir(&extension).unwrap();
         fs::write(
             extension.join("fut-extension.toml"),
-            r#"
+r#"
+api_version = 1
+version = "1.0.0"
+fut = ">=0.7.0, <1.0.0"
+capabilities = ["hooks"]
 id = "lifecycle"
 [hooks]
 "session.created" = ["./hook"]
@@ -2283,7 +2287,11 @@ async fn declared_extension_tokens_publish_authoritatively_through_cli_and_proto
         fs::create_dir(&extension).unwrap();
         fs::write(
             extension.join("fut-extension.toml"),
-            r#"
+r#"
+api_version = 1
+version = "1.0.0"
+fut = ">=0.7.0, <1.0.0"
+capabilities = ["presentation_tokens"]
 id = "status"
 [[presentation_tokens]]
 name = "state"
@@ -2480,6 +2488,706 @@ scope = "pane"
     harness.shutdown().await;
 }
 
+#[test]
+fn public_extension_validate_is_daemonless_side_effect_free_and_versioned() {
+    let root = tempfile::tempdir().unwrap();
+    let package = root.path().join("candidate");
+    fs::create_dir(&package).unwrap();
+    fs::write(
+        package.join("fut-extension.toml"),
+        r#"
+api_version = 1
+version = "2.3.4"
+fut = ">=0.7.0, <1.0.0"
+capabilities = ["hooks"]
+id = "candidate"
+[hooks]
+"workspace.created" = ["./hook"]
+"#,
+    )
+    .unwrap();
+    fs::write(package.join("hook"), "#!/bin/sh\ntouch executed\n").unwrap();
+    let runtime = root.path().join("runtime-must-remain-absent");
+
+    let valid = Command::new(env!("CARGO_BIN_EXE_fut"))
+        .env_clear()
+        .env("HOME", root.path())
+        .env("PATH", "/usr/bin:/bin")
+        .env("FUT_RUNTIME_DIR", &runtime)
+        .current_dir(root.path())
+        .args([
+            "--socket",
+            "relative-socket-is-ignored",
+            "--json",
+            "extension",
+            "validate",
+            "candidate",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        valid.status.success(),
+        "{}",
+        String::from_utf8_lossy(&valid.stderr)
+    );
+    assert!(valid.stderr.is_empty());
+    let valid: Value = serde_json::from_slice(&valid.stdout).unwrap();
+    assert_eq!(valid["version"], 1);
+    assert_eq!(valid["command"], "extension.validate");
+    assert_eq!(valid["result"]["valid"], true);
+    assert_eq!(valid["result"]["extension"]["id"], "candidate");
+    assert_eq!(valid["result"]["extension"]["version"], "2.3.4");
+    assert!(!package.join("executed").exists());
+    assert!(!runtime.exists());
+
+    let human = Command::new(env!("CARGO_BIN_EXE_fut"))
+        .env_clear()
+        .env("HOME", root.path())
+        .env("PATH", "/usr/bin:/bin")
+        .env("FUT_RUNTIME_DIR", &runtime)
+        .current_dir(root.path())
+        .args(["extension", "validate", "candidate"])
+        .output()
+        .unwrap();
+    assert!(human.status.success());
+    assert!(
+        String::from_utf8(human.stdout)
+            .unwrap()
+            .contains("valid extension candidate version=2.3.4")
+    );
+    assert!(!package.join("executed").exists());
+    assert!(!runtime.exists());
+
+    fs::write(package.join("fut-extension.toml"), "invalid manifest\n").unwrap();
+    let invalid = Command::new(env!("CARGO_BIN_EXE_fut"))
+        .env_clear()
+        .env("HOME", root.path())
+        .env("PATH", "/usr/bin:/bin")
+        .env("FUT_RUNTIME_DIR", &runtime)
+        .current_dir(root.path())
+        .args(["--json", "extension", "validate", "candidate"])
+        .output()
+        .unwrap();
+    assert_eq!(invalid.status.code(), Some(1));
+    assert!(invalid.stdout.is_empty());
+    let invalid: Value = serde_json::from_slice(&invalid.stderr).unwrap();
+    assert_eq!(invalid["version"], 1);
+    assert_eq!(invalid["error"]["code"], "invalid_extension");
+    assert!(!runtime.exists());
+}
+
+#[tokio::test]
+async fn public_extension_catalog_commands_use_active_daemon_state_and_atomic_reload() {
+    let initial_manifest = r#"
+api_version = 1
+version = "1.0.0"
+fut = ">=0.7.0, <1.0.0"
+capabilities = ["commands"]
+id = "inspect"
+[commands.open]
+title = "Open inspector"
+argv = ["./open"]
+"#;
+    let harness = Harness::start_with("while :; do sleep 1; done", |root| {
+        let extension = root.join("extension");
+        fs::create_dir(&extension).unwrap();
+        fs::write(extension.join("fut-extension.toml"), initial_manifest).unwrap();
+        fs::create_dir_all(root.join("home/.config/fut")).unwrap();
+        fs::write(
+            root.join("home/.config/fut/config.toml"),
+            format!(
+                "extensions = [{:?}]\n[extension.inspect]\ncolor = 'blue'\n",
+                extension.display().to_string()
+            ),
+        )
+        .unwrap();
+    })
+    .await;
+
+    let ServerMessage::ExtensionCatalog { catalog } = harness
+        .control_command(ClientMessage::GetExtensionCatalog)
+        .await
+    else {
+        panic!("expected active extension catalog")
+    };
+    assert_eq!(catalog.generation, 1);
+    assert_eq!(catalog.extensions[0].id, "inspect");
+
+    let human = harness.cli().args(["extension", "list"]).output().unwrap();
+    assert!(human.status.success());
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(human.contains("generation=1"), "{human}");
+    assert!(human.contains("extension inspect version=1.0.0"), "{human}");
+
+    let listed = harness
+        .cli()
+        .args(["--json", "extension", "list"])
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed["version"], 1);
+    assert_eq!(listed["command"], "extension.list");
+    assert_eq!(listed["result"]["generation"], 1);
+    assert_eq!(listed["result"]["count"], 1);
+    assert_eq!(listed["result"]["extensions"][0]["id"], "inspect");
+
+    let shown = harness
+        .cli()
+        .args(["--json", "extension", "show", "inspect"])
+        .output()
+        .unwrap();
+    assert!(shown.status.success());
+    let shown: Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(shown["command"], "extension.show");
+    assert_eq!(
+        shown["result"]["extension"]["commands"]["open"]["title"],
+        "Open inspector"
+    );
+    assert_eq!(shown["result"]["config"]["defaults"]["color"], "blue");
+    assert!(shown["result"]["config"]["source"].is_string());
+    let shown = harness
+        .cli()
+        .args(["extension", "show", "inspect"])
+        .output()
+        .unwrap();
+    assert!(shown.status.success());
+    let shown = String::from_utf8(shown.stdout).unwrap();
+    assert!(shown.contains("extension inspect"), "{shown}");
+    assert!(shown.contains("commands: open (interactive)"), "{shown}");
+    assert!(
+        shown.contains("config_defaults: {\"color\":\"blue\"}"),
+        "{shown}"
+    );
+
+    let missing = harness
+        .cli()
+        .args(["--json", "extension", "show", "missing"])
+        .output()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(missing.stdout.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&missing.stderr).unwrap()["error"]["code"],
+        "not_found"
+    );
+
+    let doctor = harness.cli().args(["--json", "doctor"]).output().unwrap();
+    assert!(doctor.status.success());
+    let doctor: Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    let extensions = doctor["result"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["id"] == "extensions")
+        .unwrap();
+    assert_eq!(extensions["details"]["generation"], 1);
+    assert_eq!(extensions["details"]["count"], 1);
+    assert_eq!(extensions["details"]["packages"][0]["id"], "inspect");
+    assert_eq!(extensions["details"]["packages"][0]["version"], "1.0.0");
+    assert_eq!(
+        extensions["details"]["packages"][0]["provenance"],
+        "active_daemon_catalog"
+    );
+
+    let manifest = harness.root.path().join("extension/fut-extension.toml");
+    fs::write(&manifest, initial_manifest.replace("1.0.0", "1.1.0")).unwrap();
+    let reloaded = harness
+        .cli()
+        .args(["--json", "extension", "reload"])
+        .output()
+        .unwrap();
+    assert!(
+        reloaded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reloaded.stderr)
+    );
+    let reloaded: Value = serde_json::from_slice(&reloaded.stdout).unwrap();
+    assert_eq!(reloaded["command"], "extension.reload");
+    assert_eq!(reloaded["result"]["changed"], true);
+    assert_eq!(reloaded["result"]["catalog"]["generation"], 2);
+    assert_eq!(
+        reloaded["result"]["catalog"]["extensions"][0]["version"],
+        "1.1.0"
+    );
+    let unchanged = harness
+        .cli()
+        .args(["extension", "reload"])
+        .output()
+        .unwrap();
+    assert!(unchanged.status.success());
+    let unchanged = String::from_utf8(unchanged.stdout).unwrap();
+    assert!(unchanged.contains("generation=2"), "{unchanged}");
+    assert!(unchanged.contains("changed=false"), "{unchanged}");
+
+    fs::write(&manifest, "invalid manifest\n").unwrap();
+    let failed = harness
+        .cli()
+        .args(["--json", "extension", "reload"])
+        .output()
+        .unwrap();
+    assert_eq!(failed.status.code(), Some(1));
+    assert!(failed.stdout.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&failed.stderr).unwrap()["error"]["code"],
+        "extension_reload_failed"
+    );
+    let listed = harness
+        .cli()
+        .args(["--json", "extension", "list"])
+        .output()
+        .unwrap();
+    let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed["result"]["generation"], 2);
+    assert_eq!(listed["result"]["extensions"][0]["version"], "1.1.0");
+
+    let doctor = harness.cli().args(["--json", "doctor"]).output().unwrap();
+    assert_eq!(doctor.status.code(), Some(1));
+    let doctor: Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    let checks = doctor["result"]["checks"].as_array().unwrap();
+    let config = checks.iter().find(|check| check["id"] == "config").unwrap();
+    assert_eq!(config["status"], "error");
+    assert!(config["summary"].as_str().unwrap().contains("manifest"));
+    let active = checks
+        .iter()
+        .find(|check| check["id"] == "extensions")
+        .unwrap();
+    assert_eq!(active["status"], "ok");
+    assert_eq!(active["details"]["generation"], 2);
+    assert_eq!(active["details"]["packages"][0]["version"], "1.1.0");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn daemon_extensions_reload_atomically_rolls_back_and_prunes_removed_tokens() {
+    let mut harness = Harness::start_with("while :; do sleep 1; done", |root| {
+        let extension = root.join("extension");
+        fs::create_dir(&extension).unwrap();
+        fs::write(
+            extension.join("fut-extension.toml"),
+            r#"
+api_version = 1
+version = "1.0.0"
+fut = ">=0.7.0, <1.0.0"
+capabilities = ["presentation_tokens"]
+id = "reloadable"
+[[presentation_tokens]]
+name = "state"
+scope = "workspace"
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("home/.config/fut")).unwrap();
+        fs::write(
+            root.join("home/.config/fut/config.toml"),
+            format!("extensions = [{:?}]\n", extension.display().to_string()),
+        )
+        .unwrap();
+    })
+    .await;
+    let manifest = harness.root.path().join("extension/fut-extension.toml");
+    let initial = harness.resources().await;
+    let workspace_id = initial.sessions[0].workspaces[0].id;
+    let ServerMessage::ExtensionsReloaded { catalog, changed } = harness
+        .control_command(ClientMessage::ReloadExtensions)
+        .await
+    else {
+        panic!("expected extension reload response")
+    };
+    let generation = catalog.generation;
+    let fingerprint = catalog.fingerprint;
+    assert_eq!(generation, 1);
+    assert_eq!(fingerprint.len(), 64);
+    assert!(!changed);
+
+    let (mut interactive, _, _) = harness.interactive().await;
+    send(&mut interactive, ClientMessage::ReloadExtensions).await;
+    assert!(matches!(
+        receive_matching(&mut interactive, |message| matches!(
+            message,
+            ServerMessage::Error { code, .. } if code == "control_only"
+        ))
+        .await,
+        ServerMessage::Error { ref code, .. } if code == "control_only"
+    ));
+    harness.detach(&mut interactive).await;
+
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::PublishToken {
+                extension_id: "reloadable".into(),
+                token: "state".into(),
+                value: "ready".into(),
+                target: PresentationTokenTarget::Workspace(workspace_id),
+            })
+            .await,
+        ServerMessage::TokenPublished { changed: true, .. }
+    ));
+    let before_failure = harness.resources().await;
+    fs::write(&manifest, "this is not a valid extension manifest\n").unwrap();
+
+    let failed = harness
+        .control_command(ClientMessage::ReloadExtensions)
+        .await;
+    assert!(matches!(
+        failed,
+        ServerMessage::Error { ref code, ref message }
+            if code == "extension_reload_failed"
+                && message.contains("fix the configuration or extension package")
+                && message.contains("left unchanged")
+    ));
+    let after_failure = harness.resources().await;
+    assert_eq!(
+        after_failure.sessions[0].workspaces[0]
+            .tokens
+            .get("workspace.extension.reloadable.state"),
+        before_failure.sessions[0].workspaces[0]
+            .tokens
+            .get("workspace.extension.reloadable.state")
+    );
+    let mut after_failure_connection = harness.connect().await.unwrap();
+    let ServerMessage::Welcome {
+        extension_catalog: after_failure_catalog,
+        ..
+    } = hello(
+        &mut after_failure_connection,
+        ClientMode::Control,
+        PROTOCOL_VERSION,
+    )
+    .await
+    .unwrap()
+    else {
+        panic!("expected welcome after failed reload")
+    };
+    assert_eq!(after_failure_catalog.generation, generation);
+    assert_eq!(after_failure_catalog.fingerprint, fingerprint);
+
+    fs::write(
+        &manifest,
+        r#"
+api_version = 1
+version = "1.0.0"
+fut = ">=0.7.0, <1.0.0"
+capabilities = []
+id = "reloadable"
+"#,
+    )
+    .unwrap();
+    let reloaded = harness
+        .control_command(ClientMessage::ReloadExtensions)
+        .await;
+    let ServerMessage::ExtensionsReloaded {
+        catalog: changed_catalog,
+        changed,
+    } = reloaded
+    else {
+        panic!("expected changed extension reload response")
+    };
+    let generation = changed_catalog.generation;
+    let changed_fingerprint = changed_catalog.fingerprint.clone();
+    assert_eq!(generation, 2);
+    assert!(changed);
+    assert_ne!(changed_fingerprint, fingerprint);
+    let pruned = harness.resources().await;
+    assert!(pruned.revision > before_failure.revision);
+    assert!(pruned.sessions[0].workspaces[0].tokens.is_empty());
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::PublishToken {
+                extension_id: "reloadable".into(),
+                token: "state".into(),
+                value: "again".into(),
+                target: PresentationTokenTarget::Workspace(workspace_id),
+            })
+            .await,
+        ServerMessage::Error { ref code, .. } if code == "undeclared_token"
+    ));
+    assert_eq!(
+        harness
+            .control_command(ClientMessage::ReloadExtensions)
+            .await,
+        ServerMessage::ExtensionsReloaded {
+            catalog: changed_catalog,
+            changed: false,
+        }
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn extension_catalog_prepare_commit_converges_clients_reconnects_and_rejects_stale_cas() {
+    let harness = Harness::start_with("while :; do sleep 1; done", |root| {
+        let extension = root.join("extension");
+        fs::create_dir(&extension).unwrap();
+        fs::write(
+            extension.join("fut-extension.toml"),
+            r#"
+api_version = 1
+version = "1.0.0"
+fut = ">=0.7.0, <1.0.0"
+capabilities = ["commands", "hooks", "presentation_tokens"]
+id = "catalog"
+[hooks]
+"client.attached" = ["./hook"]
+[commands.launch]
+title = "Initial command"
+argv = ["./launch", "initial"]
+[[presentation_tokens]]
+name = "state"
+scope = "workspace"
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("home/.config/fut")).unwrap();
+        fs::write(
+            root.join("home/.config/fut/config.toml"),
+            format!(
+                "extensions = [{:?}]\n[extension.catalog]\nenabled = true\n",
+                extension.display().to_string()
+            ),
+        )
+        .unwrap();
+    })
+    .await;
+    let manifest = harness.root.path().join("extension/fut-extension.toml");
+
+    let mut client_a = harness.connect().await.unwrap();
+    let ServerMessage::Welcome {
+        extension_catalog: initial_a,
+        ..
+    } = hello(&mut client_a, interactive_mode(None), PROTOCOL_VERSION)
+        .await
+        .unwrap()
+    else {
+        panic!("expected client A welcome")
+    };
+    let mut client_b = harness.connect().await.unwrap();
+    let ServerMessage::Welcome {
+        extension_catalog: initial_b,
+        ..
+    } = hello(&mut client_b, interactive_mode(None), PROTOCOL_VERSION)
+        .await
+        .unwrap()
+    else {
+        panic!("expected client B welcome")
+    };
+    assert_eq!(initial_a, initial_b);
+    assert_eq!(initial_a.generation, 1);
+    assert_eq!(
+        initial_a.extensions[0].commands["launch"].title,
+        "Initial command"
+    );
+    assert_eq!(initial_a.config.defaults["catalog"]["enabled"], true);
+
+    fs::write(
+        &manifest,
+        r#"
+api_version = 1
+version = "1.1.0"
+fut = ">=0.7.0, <1.0.0"
+capabilities = ["commands", "hooks", "presentation_tokens"]
+id = "catalog"
+[hooks]
+"client.session_changed" = ["./new-hook"]
+[commands.launch]
+title = "Reloaded command"
+argv = ["./launch", "reloaded"]
+mode = "background"
+[[presentation_tokens]]
+name = "state"
+scope = "workspace"
+presentation = "spinner"
+"#,
+    )
+    .unwrap();
+    send(&mut client_a, ClientMessage::PrepareExtensionReload).await;
+    let ServerMessage::ExtensionReloadPrepared {
+        base_generation,
+        catalog: proposed,
+    } = receive_matching(&mut client_a, |message| {
+        matches!(message, ServerMessage::ExtensionReloadPrepared { .. })
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(base_generation, 1);
+    assert_eq!(proposed.generation, 2);
+    assert_eq!(
+        proposed.extensions[0].commands["launch"].title,
+        "Reloaded command"
+    );
+
+    let mut before_commit = harness.connect().await.unwrap();
+    let ServerMessage::Welcome {
+        extension_catalog: still_initial,
+        ..
+    } = hello(&mut before_commit, interactive_mode(None), PROTOCOL_VERSION)
+        .await
+        .unwrap()
+    else {
+        panic!("expected pre-commit welcome")
+    };
+    assert_eq!(still_initial, initial_a);
+    harness.detach(&mut before_commit).await;
+
+    send(
+        &mut client_a,
+        ClientMessage::CommitExtensionReload { base_generation },
+    )
+    .await;
+    let ServerMessage::ExtensionsReloaded {
+        catalog: committed,
+        changed: true,
+    } = receive_matching(&mut client_a, |message| {
+        matches!(message, ServerMessage::ExtensionsReloaded { .. })
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(committed, proposed);
+    for client in [&mut client_a, &mut client_b] {
+        let ServerMessage::ExtensionCatalogChanged { catalog } =
+            receive_matching(client, |message| {
+                matches!(message, ServerMessage::ExtensionCatalogChanged { .. })
+            })
+            .await
+        else {
+            unreachable!()
+        };
+        assert_eq!(catalog, committed);
+    }
+
+    let mut reconnected = harness.connect().await.unwrap();
+    let ServerMessage::Welcome {
+        extension_catalog: reconnect_catalog,
+        ..
+    } = hello(&mut reconnected, interactive_mode(None), PROTOCOL_VERSION)
+        .await
+        .unwrap()
+    else {
+        panic!("expected reconnect welcome")
+    };
+    assert_eq!(reconnect_catalog, committed);
+    harness.detach(&mut reconnected).await;
+
+    fs::write(&manifest, "invalid manifest\n").unwrap();
+    send(&mut client_a, ClientMessage::PrepareExtensionReload).await;
+    assert!(matches!(
+        receive_matching(&mut client_a, |message| matches!(
+            message,
+            ServerMessage::Error { code, .. } if code == "extension_reload_failed"
+        ))
+        .await,
+        ServerMessage::Error { ref code, .. } if code == "extension_reload_failed"
+    ));
+
+    fs::write(
+        &manifest,
+        r#"
+api_version = 1
+version = "1.2.0"
+fut = ">=0.7.0, <1.0.0"
+capabilities = ["commands"]
+id = "catalog"
+[commands.final]
+title = "Final command"
+argv = ["./final"]
+"#,
+    )
+    .unwrap();
+    send(&mut client_a, ClientMessage::PrepareExtensionReload).await;
+    let ServerMessage::ExtensionReloadPrepared {
+        base_generation: base_a,
+        catalog: candidate_a,
+    } = receive_matching(&mut client_a, |message| {
+        matches!(message, ServerMessage::ExtensionReloadPrepared { .. })
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    send(&mut client_b, ClientMessage::PrepareExtensionReload).await;
+    let ServerMessage::ExtensionReloadPrepared {
+        base_generation: base_b,
+        catalog: candidate_b,
+    } = receive_matching(&mut client_b, |message| {
+        matches!(message, ServerMessage::ExtensionReloadPrepared { .. })
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(base_a, 2);
+    assert_eq!(base_a, base_b);
+    assert_eq!(candidate_a, candidate_b);
+
+    send(
+        &mut client_a,
+        ClientMessage::CommitExtensionReload {
+            base_generation: base_a,
+        },
+    )
+    .await;
+    let ServerMessage::ExtensionsReloaded {
+        catalog: winner, ..
+    } = receive_matching(&mut client_a, |message| {
+        matches!(message, ServerMessage::ExtensionsReloaded { .. })
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(winner.generation, 3);
+    let ServerMessage::ExtensionCatalogChanged { catalog } =
+        receive_matching(&mut client_b, |message| {
+            matches!(message, ServerMessage::ExtensionCatalogChanged { .. })
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(catalog, winner);
+    send(
+        &mut client_b,
+        ClientMessage::CommitExtensionReload {
+            base_generation: base_b,
+        },
+    )
+    .await;
+    assert!(matches!(
+        receive_matching(&mut client_b, |message| matches!(
+            message,
+            ServerMessage::Error { code, .. } if code == "stale_extension_generation"
+        ))
+        .await,
+        ServerMessage::Error { ref code, .. } if code == "stale_extension_generation"
+    ));
+
+    let mut final_reconnect = harness.connect().await.unwrap();
+    let ServerMessage::Welcome {
+        extension_catalog: final_catalog,
+        ..
+    } = hello(
+        &mut final_reconnect,
+        interactive_mode(None),
+        PROTOCOL_VERSION,
+    )
+    .await
+    .unwrap()
+    else {
+        panic!("expected final reconnect welcome")
+    };
+    assert_eq!(final_catalog, winner);
+    harness.detach(&mut final_reconnect).await;
+    harness.detach(&mut client_a).await;
+    harness.detach(&mut client_b).await;
+    harness.shutdown().await;
+}
+
 #[tokio::test]
 async fn daemon_git_tokens_publish_atomic_shared_snapshots_and_clear_when_git_disappears() {
     let harness = Harness::start_with("while :; do sleep 1; done", |root| {
@@ -2617,7 +3325,7 @@ fn daemon_setup_rejects_unsupported_extension_hooks_before_creating_resources() 
     fs::create_dir(&extension).unwrap();
     fs::write(
         extension.join("fut-extension.toml"),
-        "id = 'invalid'\n[hooks]\n'workspace.changed' = ['helper']\n",
+        "api_version = 1\nversion = '1.0.0'\nfut = '>=0.7.0, <1.0.0'\ncapabilities = ['hooks']\nid = 'invalid'\n[hooks]\n'workspace.changed' = ['helper']\n",
     )
     .unwrap();
     let config = root.path().join("config.toml");
@@ -9727,7 +10435,7 @@ async fn extension_commands_launch_from_the_palette_with_focused_context() {
         fs::create_dir_all(&bin).unwrap();
         fs::write(
             extension.join("fut-extension.toml"),
-            "id = 'palette-test'\n[commands.probe]\ntitle = 'Extension context probe'\nargv = ['./bin/probe']\n",
+            "api_version = 1\nversion = '1.0.0'\nfut = '>=0.7.0, <1.0.0'\ncapabilities = ['commands']\nid = 'palette-test'\n[commands.probe]\ntitle = 'Extension context probe'\nargv = ['./bin/probe']\n",
         )
         .unwrap();
         let probe = bin.join("probe");
@@ -9807,7 +10515,7 @@ async fn extension_command_can_activate_the_target_opened_by_its_child() {
         fs::create_dir(extension.join("opened")).unwrap();
         fs::write(
             extension.join("fut-extension.toml"),
-            "id = 'activate-test'\n[commands.open]\ntitle = 'Open and activate'\nargv = ['./bin/open']\nactivate_opened = true\n",
+            "api_version = 1\nversion = '1.0.0'\nfut = '>=0.7.0, <1.0.0'\ncapabilities = ['commands']\nid = 'activate-test'\n[commands.open]\ntitle = 'Open and activate'\nargv = ['./bin/open']\nactivate_opened = true\n",
         )
         .unwrap();
         let open = bin.join("open");
@@ -11382,6 +12090,12 @@ fn protocol_0_daemon_rejects_current_client_and_accepts_shutdown() {
                                 version: PROTOCOL_VERSION_0_1,
                                 server_version: "0.1.0".into(),
                                 selected: None,
+                                extension_catalog: fut::protocol::ExtensionCatalog {
+                                    generation: 1,
+                                    fingerprint: "0".repeat(64),
+                                    extensions: Vec::new(),
+                                    config: fut::protocol::ExtensionCatalogConfig::default(),
+                                },
                             },
                         })
                         .unwrap(),

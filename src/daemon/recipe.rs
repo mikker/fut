@@ -734,7 +734,7 @@ fn install_recipe_plan(
     }
     state.accepting = true;
     for mutation in &plan.mutations {
-        state.hook_queue.enqueue(mutation);
+        state.enqueue_committed_mutation(mutation);
     }
     state.publish_resource_change(state.resources.revision());
     Ok(())

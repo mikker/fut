@@ -124,6 +124,10 @@ fut pane split right --cwd ../api -- zsh
 fut pane move PANE_ID DESTINATION_TAB_ID
 fut list
 fut events
+fut extension list
+fut extension show EXTENSION_ID
+fut extension validate PATH
+fut extension reload
 ```
 
 Commands after `--` are passed directly, without shell evaluation. Creation
@@ -151,6 +155,9 @@ COMPLETE=fish fut | source
 
 Re-source completion after upgrading. Resource completion is bounded and
 read-only; it never starts a daemon.
+Active extension-ID completion uses the same bounded, read-only daemon catalog
+lookup. Package validation itself is daemonless and never executes extension
+code.
 
 ## Next steps
 

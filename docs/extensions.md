@@ -25,15 +25,65 @@ extensions = [
 ]
 ```
 
-Reload configuration with `Ctrl-b Shift-R`. The complete extension set is
-validated atomically; an invalid manifest leaves the current configuration in
+Reload configuration with `Ctrl-b Shift-R`. Fut first stages and validates the
+complete local UI, then asks the daemon to prepare the complete extension set.
+Neither becomes visible until both candidates are valid and the daemon commits
+the reload against the generation that was prepared. An invalid UI, manifest,
+or concurrent stale reload leaves the active daemon extensions and client UI in
 place. Duplicate canonical roots or IDs reject the complete set.
+
+The daemon is authoritative for validated manifest declarations. Each attached
+client receives one complete generation containing the commands, hooks,
+presentation tokens, and extension defaults it needs; clients do not reread
+manifests to reconstruct that state. A successful reload publishes the same
+complete generation to every attached client, and a reconnect receives the
+latest generation with its welcome. An open command palette is closed during
+the swap so an entry from the old generation cannot select a command by a stale
+position.
+
+## Inspect, validate, and reload
+
+Use the noun-first extension commands to inspect the daemon's active catalog:
+
+```sh
+fut extension list
+fut extension show review-status
+fut extension reload
+```
+
+`list` and `show` report the daemon-authoritative generation, fingerprint,
+package version and compatibility requirement, capabilities, canonical package
+root, and configuration provenance. `show` also includes the package's hooks,
+commands, presentation tokens, and active namespaced defaults. `reload` asks the
+daemon to validate and atomically activate its currently configured package
+set. A failed reload leaves the prior generation active. This control command
+does not replace the interactive `Ctrl-b Shift-R` flow, which continues to
+stage local UI configuration and the daemon catalog together before commit.
+
+Validate a directory before adding or activating it:
+
+```sh
+fut extension validate ./review-status
+fut --json extension validate ./review-status
+```
+
+Validation is daemonless and side-effect-free. It reads the package directory,
+strictly validates `fut-extension.toml`, resolves packaged argv, and checks the
+manifest API plus its `fut` requirement against the running binary. It never
+starts a daemon, activates the package, or executes extension code. All four
+commands support `--json`; successes use Fut's versioned command/result
+envelope and failures use its versioned typed error envelope. Shell completion
+offers active extension IDs for `show` when a daemon is reachable.
 
 ## Manifest
 
 Every extension has a `fut-extension.toml` at its root:
 
 ```toml
+api_version = 1
+version = "1.2.0"
+fut = ">=0.7.0, <1.0.0"
+capabilities = ["commands", "hooks", "presentation_tokens"]
 id = "review-status"
 
 [commands.open-review]
@@ -61,10 +111,36 @@ scope = "workspace"
 presentation = "spinner"
 ```
 
+All five top-level metadata fields are required. `api_version` selects the
+manifest and process contract; Fut currently accepts exactly `1`. `version`
+is the extension package's SemVer version, while `fut` is a SemVer requirement
+matched against the running Fut package version before the extension can be
+activated. Invalid versions, unsupported API versions, and incompatible Fut
+requirements reject the complete candidate extension set.
+
+`capabilities` must contain exactly the cooperation surfaces used by the
+manifest: `commands` when `[commands]` is non-empty, `hooks` when `[hooks]` is
+non-empty, and `presentation_tokens` when any `[[presentation_tokens]]` are
+present. Unknown, duplicate, missing, and declared-but-unused capabilities are
+errors. Capabilities let Fut validate what a package asks Fut to provide; they
+are not operating-system permissions or a sandbox. Extensions are trusted
+native executables and retain the access of the Fut process that starts them.
+
 IDs and declaration names are 1–64 bytes. They begin with a lowercase ASCII
 letter, end with a lowercase letter or digit, and may otherwise contain
 lowercase letters, digits, and single `.`, `_`, or `-` separators. Unknown
 manifest fields are errors.
+
+### API version 1 contract
+
+API version 1 covers direct argv execution, the documented `FUT_*`
+environment variables, resolved extension configuration, version-1 hook JSON
+payloads, and control through the exact `FUT_BIN` and `FUT_SOCKET` supplied to
+the extension. The extension-specific control surface is `fut token publish`;
+extensions may also invoke Fut's documented non-interactive commands through
+that binary and socket. Hook payload `version` is versioned independently from
+the manifest's `api_version`, so consumers must validate it before reading an
+event.
 
 Executable arrays are direct argv—not shell commands. Fut resolves `./bin/x`
 inside the canonical extension root and rejects lexical escapes from it. An
@@ -235,6 +311,10 @@ Client hooks run for each attached interactive client:
 - `client.session_changed` runs when that client selects or renames a session.
 - `client.detached` runs when that client exits or detaches.
 
+Reloading reconfigures future client-hook events without synthesizing a detach
+or attach. A hook process already running may finish with the generation that
+started it; later lifecycle events use the newly committed generation.
+
 ```toml
 [hooks]
 "client.attached" = ["./bin/client-event"]
@@ -245,8 +325,8 @@ Client hooks run for each attached interactive client:
 These hooks use the same direct argv, timeout, ordering, output bounds, and
 diagnostic-only failure behavior as resource hooks. They run from the client
 process, making `/dev/tty` available for deliberate host-terminal integration.
-Configuration changes to client hooks take effect when the client next
-attaches.
+Configuration changes to client hooks take effect after the committed catalog
+swap for that client.
 
 The hook receives one versioned JSON object on stdin:
 

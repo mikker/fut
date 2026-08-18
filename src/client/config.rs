@@ -184,7 +184,7 @@ impl ExtensionCommandIdentity {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ExtensionCommandConfig {
     args: Vec<String>,
@@ -1348,7 +1348,7 @@ impl UiConfig {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct Config {
     ui: UiConfig,
@@ -1400,6 +1400,96 @@ pub(crate) struct ExtensionConfigCatalog {
     source: Option<PathBuf>,
 }
 
+pub(crate) struct ExtensionConfigFingerprintData<'a> {
+    pub(crate) normalized_defaults: String,
+    pub(crate) source: Option<&'a Path>,
+}
+
+impl ExtensionConfigCatalog {
+    /// The behavior-affecting global config data used to identify an extension
+    /// registry. Object keys are sorted recursively so equivalent TOML input
+    /// has the same representation regardless of declaration order.
+    pub(crate) fn fingerprint_data(&self) -> ExtensionConfigFingerprintData<'_> {
+        ExtensionConfigFingerprintData {
+            normalized_defaults: normalized_json(&serde_json::Value::Object(
+                self.defaults
+                    .iter()
+                    .map(|(id, table)| (id.clone(), serde_json::Value::Object(table.clone())))
+                    .collect(),
+            )),
+            source: self.source.as_deref(),
+        }
+    }
+
+    pub(crate) fn to_protocol(&self) -> crate::protocol::ExtensionCatalogConfig {
+        crate::protocol::ExtensionCatalogConfig {
+            defaults: self.defaults.clone(),
+            source: self.source.clone(),
+        }
+    }
+
+    pub(crate) fn from_protocol(
+        config: crate::protocol::ExtensionCatalogConfig,
+        extensions: &[Extension],
+    ) -> Result<Self> {
+        let source = config
+            .source
+            .as_deref()
+            .unwrap_or_else(|| Path::new("daemon extension catalog"));
+        validate_extension_config_catalog(&config.defaults, extensions, source)?;
+        Ok(Self {
+            defaults: config.defaults,
+            source: config.source,
+        })
+    }
+}
+
+fn normalized_json(value: &serde_json::Value) -> String {
+    fn write(value: &serde_json::Value, output: &mut String) {
+        match value {
+            serde_json::Value::Null => output.push_str("null"),
+            serde_json::Value::Bool(value) => {
+                output.push_str(if *value { "true" } else { "false" });
+            }
+            serde_json::Value::Number(value) => output.push_str(&value.to_string()),
+            serde_json::Value::String(value) => output.push_str(
+                &serde_json::to_string(value).expect("serializing a JSON string cannot fail"),
+            ),
+            serde_json::Value::Array(values) => {
+                output.push('[');
+                for (index, value) in values.iter().enumerate() {
+                    if index > 0 {
+                        output.push(',');
+                    }
+                    write(value, output);
+                }
+                output.push(']');
+            }
+            serde_json::Value::Object(values) => {
+                output.push('{');
+                let mut entries = values.iter().collect::<Vec<_>>();
+                entries.sort_unstable_by_key(|(key, _)| *key);
+                for (index, (key, value)) in entries.into_iter().enumerate() {
+                    if index > 0 {
+                        output.push(',');
+                    }
+                    output.push_str(
+                        &serde_json::to_string(key)
+                            .expect("serializing a JSON object key cannot fail"),
+                    );
+                    output.push(':');
+                    write(value, output);
+                }
+                output.push('}');
+            }
+        }
+    }
+
+    let mut output = String::new();
+    write(value, &mut output);
+    output
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ResolvedExtensionConfig {
     pub json: String,
@@ -1433,6 +1523,29 @@ pub(crate) struct LoadedConfig {
 pub(crate) struct LoadedExtensionConfig {
     pub extensions: Vec<Extension>,
     pub config: ExtensionConfigCatalog,
+}
+
+/// Parsed local UI input waiting to be materialized against one complete
+/// daemon catalog. It deliberately contains no manifest-derived state.
+#[derive(Clone, Debug)]
+pub(crate) struct StagedUiConfig {
+    config: Config,
+    source: Option<PathBuf>,
+}
+
+impl StagedUiConfig {
+    pub(crate) fn materialize(
+        &self,
+        catalog: &crate::protocol::ExtensionCatalog,
+    ) -> Result<UiConfig> {
+        let registry = extensions::ExtensionRegistry::from_catalog(catalog.clone())?;
+        materialize_config(
+            self.config.clone(),
+            registry.extensions().to_vec(),
+            registry.config().clone(),
+            self.source.as_deref(),
+        )
+    }
 }
 
 pub(crate) fn resolve_location(config_dir: Option<&std::path::Path>) -> Result<ConfigLocation> {
@@ -1485,9 +1598,26 @@ pub(crate) fn resolve_location(config_dir: Option<&std::path::Path>) -> Result<C
     })
 }
 
-pub(super) fn load(config_dir: Option<&std::path::Path>) -> Result<UiConfig> {
+pub(crate) fn stage(config_dir: Option<&Path>) -> Result<StagedUiConfig> {
     let location = resolve_location(config_dir)?;
-    Ok(load_location(&location)?.ui)
+    let Some(path) = &location.path else {
+        return Ok(StagedUiConfig {
+            config: Config::default(),
+            source: None,
+        });
+    };
+    let Some(source) = read_config_source(path, location.explicit)? else {
+        return Ok(StagedUiConfig {
+            config: Config::default(),
+            source: None,
+        });
+    };
+    let config = toml::from_str::<Config>(&source)
+        .with_context(|| format!("parse Fut config {}", path.display()))?;
+    Ok(StagedUiConfig {
+        config,
+        source: Some(path.clone()),
+    })
 }
 
 pub(crate) fn load_location(location: &ConfigLocation) -> Result<LoadedConfig> {
@@ -1582,12 +1712,36 @@ fn load_path_outcome(path: &std::path::Path, explicit: bool) -> Result<LoadedCon
             present: false,
         });
     };
-    let mut config = toml::from_str::<Config>(&source)
+    let config = toml::from_str::<Config>(&source)
         .with_context(|| format!("parse Fut config {}", path.display()))?;
     let loaded_extensions = extensions::load(&config.extensions)
         .with_context(|| format!("load extensions from Fut config {}", path.display()))?;
+    validate_extension_config_catalog(&config.extension, &loaded_extensions, path)?;
+    let extension_config = ExtensionConfigCatalog {
+        source: (!config.extension.is_empty()).then(|| path.to_owned()),
+        defaults: config.extension.clone(),
+    };
+    let ui = materialize_config(
+        config,
+        loaded_extensions.clone(),
+        extension_config,
+        Some(path),
+    )?;
+    Ok(LoadedConfig {
+        ui,
+        extensions: loaded_extensions,
+        present: true,
+    })
+}
+
+fn materialize_config(
+    mut config: Config,
+    extensions: Vec<Extension>,
+    extension_config: ExtensionConfigCatalog,
+    source: Option<&Path>,
+) -> Result<UiConfig> {
     config.ui.bindings.commands = config.trusted_commands.into_values().collect();
-    for extension in &loaded_extensions {
+    for extension in &extensions {
         for launcher in extension.commands() {
             let argv = launcher.argv();
             let identity = ExtensionCommandIdentity {
@@ -1624,20 +1778,13 @@ fn load_path_outcome(path: &std::path::Path, explicit: bool) -> Result<LoadedCon
     if let Some(slug) = config.extension_commands.keys().next() {
         bail!("unknown extension_commands command {slug:?}");
     }
-    validate_extension_config_catalog(&config.extension, &loaded_extensions, path)?;
-    validate_projects(&mut config.projects, path)?;
-    validate(&config.ui, &loaded_extensions)
-        .with_context(|| format!("validate Fut config {}", path.display()))?;
-    config.ui.extensions = loaded_extensions.clone();
-    config.ui.extension_config = ExtensionConfigCatalog {
-        source: (!config.extension.is_empty()).then(|| path.to_owned()),
-        defaults: config.extension,
-    };
-    Ok(LoadedConfig {
-        ui: config.ui,
-        extensions: loaded_extensions,
-        present: true,
-    })
+    let source = source.unwrap_or_else(|| Path::new("default Fut config"));
+    validate_projects(&mut config.projects, source)?;
+    validate(&config.ui, &extensions)
+        .with_context(|| format!("validate Fut config {}", source.display()))?;
+    config.ui.extensions = extensions;
+    config.ui.extension_config = extension_config;
+    Ok(config.ui)
 }
 
 fn validate_projects(projects: &mut BTreeMap<String, ProjectConfig>, source: &Path) -> Result<()> {
@@ -2787,7 +2934,7 @@ components = [
         fs::create_dir(&extension_root).unwrap();
         fs::write(
             extension_root.join(extensions::MANIFEST_FILE_NAME),
-            "id = 'run'\n",
+            "api_version = 1\nversion = '1.0.0'\nfut = '>=0.7.0, <1.0.0'\ncapabilities = []\nid = 'run'\n",
         )
         .unwrap();
         let path = temporary.path().join("config.toml");
@@ -2841,7 +2988,7 @@ components = [
         fs::create_dir(&extension_root).unwrap();
         fs::write(
             extension_root.join(extensions::MANIFEST_FILE_NAME),
-            "id = 'configured'\n[commands.launch]\ntitle = 'Launch configured extension'\nargv = ['./bin/launch', '--ready']\nsize = { width = 90, height = 24 }\nactivate_opened = true\n",
+            "api_version = 1\nversion = '1.0.0'\nfut = '>=0.7.0, <1.0.0'\ncapabilities = ['commands']\nid = 'configured'\n[commands.launch]\ntitle = 'Launch configured extension'\nargv = ['./bin/launch', '--ready']\nsize = { width = 90, height = 24 }\nactivate_opened = true\n",
         )
         .unwrap();
         let path = temporary.path().join("config.toml");
@@ -2914,7 +3061,7 @@ components = [
         fs::create_dir(&invalid_root).unwrap();
         fs::write(
             invalid_root.join(extensions::MANIFEST_FILE_NAME),
-            "id = 'INVALID'\n",
+            "api_version = 1\nversion = '1.0.0'\nfut = '>=0.7.0, <1.0.0'\ncapabilities = []\nid = 'INVALID'\n",
         )
         .unwrap();
         fs::write(
@@ -2932,13 +3079,74 @@ components = [
     }
 
     #[test]
+    fn staged_ui_materializes_every_extension_surface_from_catalog_without_manifest_reads() {
+        let temporary = tempfile::tempdir().unwrap();
+        let extension_root = temporary.path().join("extension");
+        fs::create_dir(&extension_root).unwrap();
+        let manifest = extension_root.join(extensions::MANIFEST_FILE_NAME);
+        fs::write(
+            &manifest,
+            "api_version = 1\nversion = '1.0.0'\nfut = '>=0.7.0, <1.0.0'\ncapabilities = ['commands', 'hooks', 'presentation_tokens']\nid = 'catalog'\n[hooks]\n'client.attached' = ['./hook']\n[commands.launch]\ntitle = 'Launch catalog'\nargv = ['./bin/launch', '--manifest']\n[[presentation_tokens]]\nname = 'badge'\nscope = 'tab'\npresentation = 'spinner'\n",
+        )
+        .unwrap();
+        fs::write(
+            temporary.path().join("config.toml"),
+            format!(
+                "extensions = [{:?}]\n[ui.bindings]\n\"catalog:launch\" = \"N\"\n[extension_commands.\"catalog:launch\"]\nargs = [\"configured\"]\n[extension.catalog]\nenabled = true\n[ui.tab_bar.item]\nsegments = [{{ token = 'tab.extension.catalog.badge' }}]\n",
+                extension_root.display().to_string()
+            ),
+        )
+        .unwrap();
+        let staged = stage(Some(temporary.path())).unwrap();
+        let location = resolve_location(Some(temporary.path())).unwrap();
+        let loaded = load_extensions_location(&location).unwrap();
+        let catalog = extensions::ExtensionRegistry::new(3, loaded.extensions, loaded.config)
+            .unwrap()
+            .catalog()
+            .unwrap();
+
+        fs::remove_file(manifest).unwrap();
+        let ui = staged.materialize(&catalog).unwrap();
+        let command = ui.bindings.command(0).unwrap();
+        assert_eq!(command.title, "Launch catalog");
+        assert_eq!(command.args, ["configured"]);
+        assert_eq!(
+            ui.bindings.action_for_suffix(b"N"),
+            Some(ClientAction::RunCommand(0))
+        );
+        assert_eq!(ui.extensions.len(), 1);
+        assert_eq!(
+            ui.extensions[0].presentation_tokens()[0].qualified_name(),
+            "tab.extension.catalog.badge"
+        );
+        assert_eq!(
+            resolve_extension_config(&ui, "catalog", temporary.path())
+                .unwrap()
+                .json,
+            r#"{"enabled":true}"#
+        );
+
+        let empty_catalog =
+            extensions::ExtensionRegistry::new(4, Vec::new(), ExtensionConfigCatalog::default())
+                .unwrap()
+                .catalog()
+                .unwrap();
+        let error = staged.materialize(&empty_catalog).unwrap_err().to_string();
+        assert!(
+            error.contains("unknown extension_commands command")
+                || error.contains("unknown or out-of-scope token")
+        );
+        assert_eq!(ui.bindings.command(0).unwrap().title, "Launch catalog");
+    }
+
+    #[test]
     fn extension_config_recursively_merges_workspace_over_global_and_is_inert() {
         let temporary = tempfile::tempdir().unwrap();
         let extension_root = temporary.path().join("extension");
         fs::create_dir(&extension_root).unwrap();
         fs::write(
             extension_root.join(extensions::MANIFEST_FILE_NAME),
-            "id = 'run'\n[commands.restart]\ntitle = 'Restart'\nargv = ['./restart']\nmode = 'background'\n",
+            "api_version = 1\nversion = '1.0.0'\nfut = '>=0.7.0, <1.0.0'\ncapabilities = ['commands']\nid = 'run'\n[commands.restart]\ntitle = 'Restart'\nargv = ['./restart']\nmode = 'background'\n",
         )
         .unwrap();
         let global_path = temporary.path().join("global.toml");
@@ -3020,7 +3228,7 @@ components = [
         fs::create_dir(&extension_root).unwrap();
         fs::write(
             extension_root.join(extensions::MANIFEST_FILE_NAME),
-            "id = 'known'\n[commands.open]\ntitle = 'Open'\nargv = ['./open']\n",
+            "api_version = 1\nversion = '1.0.0'\nfut = '>=0.7.0, <1.0.0'\ncapabilities = ['commands']\nid = 'known'\n[commands.open]\ntitle = 'Open'\nargv = ['./open']\n",
         )
         .unwrap();
         let global_path = temporary.path().join("global.toml");
@@ -3141,7 +3349,7 @@ components = [
         let manifest = extension_root.join(extensions::MANIFEST_FILE_NAME);
         fs::write(
             &manifest,
-            "id = 'status'\n[[presentation_tokens]]\nname = 'whole'\nscope = 'session'\n[[presentation_tokens]]\nname = 'state'\nscope = 'workspace'\n[[presentation_tokens]]\nname = 'badge'\nscope = 'tab'\n[[presentation_tokens]]\nname = 'mark'\nscope = 'pane'\n",
+            "api_version = 1\nversion = '1.0.0'\nfut = '>=0.7.0, <1.0.0'\ncapabilities = ['presentation_tokens']\nid = 'status'\n[[presentation_tokens]]\nname = 'whole'\nscope = 'session'\n[[presentation_tokens]]\nname = 'state'\nscope = 'workspace'\n[[presentation_tokens]]\nname = 'badge'\nscope = 'tab'\n[[presentation_tokens]]\nname = 'mark'\nscope = 'pane'\n",
         )
         .unwrap();
         let path = temporary.path().join("config.toml");
@@ -3155,13 +3363,17 @@ components = [
         .unwrap();
         load_path_outcome(&path, true).unwrap();
 
-        fs::write(&manifest, "id = 'status'\n").unwrap();
+        fs::write(
+            &manifest,
+            "api_version = 1\nversion = '1.0.0'\nfut = '>=0.7.0, <1.0.0'\ncapabilities = []\nid = 'status'\n",
+        )
+        .unwrap();
         let error = format!("{:#}", load_path_outcome(&path, true).unwrap_err());
         assert!(error.contains("unknown or out-of-scope token"), "{error}");
 
         fs::write(
             &manifest,
-            "id = 'status'\n[[presentation_tokens]]\nname = 'state'\nscope = 'workspace'\n",
+            "api_version = 1\nversion = '1.0.0'\nfut = '>=0.7.0, <1.0.0'\ncapabilities = ['presentation_tokens']\nid = 'status'\n[[presentation_tokens]]\nname = 'state'\nscope = 'workspace'\n",
         )
         .unwrap();
         fs::write(

@@ -6,7 +6,7 @@ use thiserror::Error;
 use tokio_util::codec::LengthDelimitedCodec;
 use uuid::Uuid;
 
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use crate::{
     domain::{
@@ -21,7 +21,7 @@ use crate::{
 /// Protocol version used by released Fut 0.1 builds.
 pub const PROTOCOL_VERSION_0_1: u16 = 0;
 /// Current clients and daemons require an exact protocol match.
-pub const PROTOCOL_VERSION: u16 = 26;
+pub const PROTOCOL_VERSION: u16 = 29;
 /// Enough for 50,000 individually styled MessagePack-encoded cells while
 /// remaining a firm pre-allocation bound for the length-delimited transport.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
@@ -204,6 +204,88 @@ pub enum AgentPromptMode {
     Wait { timeout_ms: u64 },
 }
 
+/// One complete, daemon-validated extension generation. Clients treat this as
+/// the sole source of manifest declarations and install it atomically.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExtensionCatalog {
+    pub generation: u64,
+    pub fingerprint: String,
+    pub extensions: Vec<ExtensionDeclaration>,
+    pub config: ExtensionCatalogConfig,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExtensionCatalogConfig {
+    pub defaults: BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExtensionDeclaration {
+    pub id: String,
+    pub api_version: u64,
+    pub version: String,
+    pub fut: String,
+    pub capabilities: Vec<ExtensionCapabilityDeclaration>,
+    pub root: PathBuf,
+    pub hooks: BTreeMap<String, Vec<String>>,
+    pub commands: BTreeMap<String, ExtensionCommandDeclaration>,
+    pub presentation_tokens: Vec<ExtensionPresentationTokenDeclaration>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionCapabilityDeclaration {
+    Commands,
+    Hooks,
+    PresentationTokens,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExtensionCommandDeclaration {
+    pub title: String,
+    pub argv: Vec<String>,
+    pub execution: ExtensionCommandExecutionDeclaration,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum ExtensionCommandExecutionDeclaration {
+    Interactive {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        width: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        height: Option<u16>,
+        #[serde(default)]
+        activate_opened: bool,
+    },
+    Background,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExtensionPresentationTokenDeclaration {
+    pub name: String,
+    pub scope: ExtensionPresentationScope,
+    pub presentation: ExtensionTokenPresentation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionPresentationScope {
+    Session,
+    Workspace,
+    Tab,
+    Pane,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionTokenPresentation {
+    Plain,
+    Spinner,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
@@ -341,6 +423,9 @@ pub enum ClientMessage {
         command: ContextualCommand,
     },
     ListResources,
+    /// Fetch the daemon-authoritative active extension generation without
+    /// subscribing to later catalog changes.
+    GetExtensionCatalog,
     /// Ask a control connection to stream resource and interactive-client
     /// presence changes. The correlated response is a
     /// [`ServerMessage::Resources`] snapshot of both, followed by unsolicited
@@ -367,6 +452,13 @@ pub enum ClientMessage {
         value: String,
         target: PresentationTokenTarget,
     },
+    PrepareExtensionReload,
+    CommitExtensionReload {
+        base_generation: u64,
+    },
+    /// Compatibility control operation. Interactive clients use the staged
+    /// prepare/commit flow so local UI validation happens before visibility.
+    ReloadExtensions,
     ReportAgent {
         terminal_id: TerminalId,
         report: AgentReport,
@@ -388,6 +480,7 @@ pub enum ServerMessage {
         version: u16,
         server_version: String,
         selected: Option<SelectedView>,
+        extension_catalog: ExtensionCatalog,
     },
     LocationOpened {
         selected: SelectedTarget,
@@ -414,6 +507,22 @@ pub enum ServerMessage {
     TokenPublished {
         resource_revision: u64,
         changed: bool,
+    },
+    ExtensionReloadPrepared {
+        base_generation: u64,
+        catalog: ExtensionCatalog,
+    },
+    ExtensionsReloaded {
+        catalog: ExtensionCatalog,
+        changed: bool,
+    },
+    /// Unsolicited latest-value notification after a committed generation
+    /// change. Interactive clients replace extension-derived state in one swap.
+    ExtensionCatalogChanged {
+        catalog: ExtensionCatalog,
+    },
+    ExtensionCatalog {
+        catalog: ExtensionCatalog,
     },
     TargetSelected {
         selected: SelectedView,
@@ -568,6 +677,94 @@ mod tests {
         Cell, Cursor, CursorShape, MAX_CELL_CONTENT_BYTES, MAX_VISIBLE_CELLS, MouseButton,
         MouseButtons, MouseEvent, MouseEventKind, MouseModifiers, MouseWheelDirection,
     };
+
+    fn extension_catalog(generation: u64) -> ExtensionCatalog {
+        ExtensionCatalog {
+            generation,
+            fingerprint: "0123456789abcdef".repeat(4),
+            extensions: Vec::new(),
+            config: ExtensionCatalogConfig::default(),
+        }
+    }
+
+    #[test]
+    fn extension_reload_transaction_and_complete_catalog_round_trip() {
+        let catalog = ExtensionCatalog {
+            generation: 8,
+            fingerprint: "abcdef0123456789".repeat(4),
+            extensions: vec![ExtensionDeclaration {
+                id: "review".into(),
+                api_version: 1,
+                version: "1.2.3".into(),
+                fut: ">=0.7.0, <1.0.0".into(),
+                capabilities: vec![
+                    ExtensionCapabilityDeclaration::Commands,
+                    ExtensionCapabilityDeclaration::Hooks,
+                    ExtensionCapabilityDeclaration::PresentationTokens,
+                ],
+                root: "/opt/fut/extensions/review".into(),
+                hooks: BTreeMap::from([(
+                    "client.attached".into(),
+                    vec!["/opt/fut/extensions/review/hook".into()],
+                )]),
+                commands: BTreeMap::from([(
+                    "open".into(),
+                    ExtensionCommandDeclaration {
+                        title: "Open review".into(),
+                        argv: vec!["/opt/fut/extensions/review/open".into(), "--all".into()],
+                        execution: ExtensionCommandExecutionDeclaration::Interactive {
+                            width: Some(90),
+                            height: Some(24),
+                            activate_opened: true,
+                        },
+                    },
+                )]),
+                presentation_tokens: vec![ExtensionPresentationTokenDeclaration {
+                    name: "state".into(),
+                    scope: ExtensionPresentationScope::Workspace,
+                    presentation: ExtensionTokenPresentation::Spinner,
+                }],
+            }],
+            config: ExtensionCatalogConfig {
+                defaults: BTreeMap::from([(
+                    "review".into(),
+                    serde_json::Map::from_iter([("enabled".into(), serde_json::Value::Bool(true))]),
+                )]),
+                source: Some("/Users/test/.config/fut/config.toml".into()),
+            },
+        };
+        for message in [
+            ServerMessage::ExtensionReloadPrepared {
+                base_generation: 7,
+                catalog: catalog.clone(),
+            },
+            ServerMessage::ExtensionsReloaded {
+                catalog: catalog.clone(),
+                changed: true,
+            },
+            ServerMessage::ExtensionCatalogChanged {
+                catalog: catalog.clone(),
+            },
+            ServerMessage::ExtensionCatalog {
+                catalog: catalog.clone(),
+            },
+        ] {
+            assert_eq!(
+                decode_payload::<ServerMessage>(&encode_payload(&message).unwrap()).unwrap(),
+                message
+            );
+        }
+        for message in [
+            ClientMessage::PrepareExtensionReload,
+            ClientMessage::CommitExtensionReload { base_generation: 7 },
+            ClientMessage::GetExtensionCatalog,
+        ] {
+            assert_eq!(
+                decode_payload::<ClientMessage>(&encode_payload(&message).unwrap()).unwrap(),
+                message
+            );
+        }
+    }
 
     #[test]
     fn agent_report_metadata_round_trips_and_old_requests_default_it() {
@@ -1163,6 +1360,19 @@ mod tests {
             decode_payload::<ServerMessage>(&encode_payload(&published).unwrap()).unwrap(),
             published
         );
+        let reload = ClientMessage::ReloadExtensions;
+        assert_eq!(
+            decode_payload::<ClientMessage>(&encode_payload(&reload).unwrap()).unwrap(),
+            reload
+        );
+        let reloaded = ServerMessage::ExtensionsReloaded {
+            catalog: extension_catalog(2),
+            changed: true,
+        };
+        assert_eq!(
+            decode_payload::<ServerMessage>(&encode_payload(&reloaded).unwrap()).unwrap(),
+            reloaded
+        );
         let resources = ServerMessage::Resources {
             snapshot: ResourceSnapshot {
                 revision: 9,
@@ -1206,7 +1416,7 @@ mod tests {
             switched
         );
         assert_eq!(PROTOCOL_VERSION_0_1, 0);
-        assert_eq!(PROTOCOL_VERSION, 26);
+        assert_eq!(PROTOCOL_VERSION, 29);
 
         let watch = ClientMessage::WatchResources;
         assert_eq!(
@@ -1310,6 +1520,7 @@ mod tests {
                 layout: SplitTree::leaf(focused.pane_id),
                 panes: vec![focused],
             }),
+            extension_catalog: extension_catalog(1),
         };
         assert_eq!(
             decode_payload::<ServerMessage>(&encode_payload(&welcome).unwrap()).unwrap(),

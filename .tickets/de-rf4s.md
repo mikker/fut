@@ -1,6 +1,6 @@
 ---
 id: de-rf4s
-status: open
+status: closed
 deps: [de-s1an, de-vhs0]
 links: []
 created: 2026-08-18T19:55:10Z
@@ -22,3 +22,9 @@ Add a daemon control operation that builds a complete candidate registry and swa
 
 Adding, changing, and removing hooks and token declarations takes effect without daemon restart; failed reloads leave the previous generation fully active; event behavior across reload is deterministic under queue backlog; reload cannot block resource commits; process-level tests cover successful reload, rollback, removal, and in-flight hooks.
 
+
+## Notes
+
+**2026-08-18T21:41:27Z**
+
+Implemented and verified with strict Clippy, the full unit suite, extension-focused E2E coverage, and a successful build. The full E2E run had one unrelated focus-transfer timing failure that passed immediately when rerun serially.

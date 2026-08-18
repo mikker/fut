@@ -121,7 +121,9 @@ struct SharedState {
     agent_events: broadcast::Sender<AgentLifecycleUpdate>,
     child_env: HashMap<String, String>,
     projects: global_config::ProjectCatalog,
-    extensions: Vec<crate::extensions::Extension>,
+    config_location: global_config::ConfigLocation,
+    extension_registry: Arc<crate::extensions::ExtensionRegistry>,
+    extension_catalog: watch::Sender<crate::protocol::ExtensionCatalog>,
     hook_queue: crate::extensions::HookQueue,
     accepting: bool,
 }
@@ -152,6 +154,19 @@ struct AgentLifecycleUpdate {
 struct DaemonError {
     code: &'static str,
     message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExtensionReload {
+    catalog: crate::protocol::ExtensionCatalog,
+    changed: bool,
+}
+
+#[derive(Debug)]
+struct PreparedExtensionReload {
+    base_generation: u64,
+    candidate: crate::extensions::ExtensionRegistry,
+    catalog: crate::protocol::ExtensionCatalog,
 }
 
 impl DaemonError {
@@ -239,7 +254,12 @@ impl SharedState {
 
     fn publish_mutation(&self, mutation: &Mutation) {
         self.publish_resource_change(mutation.revision);
-        self.hook_queue.enqueue(mutation);
+        self.enqueue_committed_mutation(mutation);
+    }
+
+    fn enqueue_committed_mutation(&self, mutation: &Mutation) {
+        self.hook_queue
+            .enqueue(mutation, Arc::clone(&self.extension_registry));
     }
 
     fn publish_token(
@@ -253,9 +273,8 @@ impl SharedState {
             return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
         }
         let extension = self
-            .extensions
-            .iter()
-            .find(|extension| extension.id() == extension_id)
+            .extension_registry
+            .extension(extension_id)
             .ok_or_else(|| {
                 DaemonError::new(
                     "unknown_extension",
@@ -300,6 +319,117 @@ impl SharedState {
             self.publish_resource_change(publication.revision);
         }
         Ok(publication)
+    }
+
+    fn activate_extension_candidate(
+        &mut self,
+        candidate: crate::extensions::ExtensionRegistry,
+    ) -> Result<ExtensionReload, DaemonError> {
+        if candidate.fingerprint() == self.extension_registry.fingerprint() {
+            return Ok(ExtensionReload {
+                catalog: self.extension_registry.catalog().map_err(|error| {
+                    DaemonError::new(
+                        "extension_reload_failed",
+                        format!("could not serialize active extension catalog: {error:#}"),
+                    )
+                })?,
+                changed: false,
+            });
+        }
+
+        let generation = self
+            .extension_registry
+            .generation()
+            .checked_add(1)
+            .ok_or_else(|| {
+                DaemonError::new(
+                    "extension_reload_failed",
+                    "extension generation is exhausted; restart the daemon before retrying",
+                )
+            })?;
+        let candidate = candidate.at_generation(generation).map_err(|error| {
+            DaemonError::new(
+                "extension_reload_failed",
+                format!("could not activate extension generation {generation}: {error:#}"),
+            )
+        })?;
+        let catalog = candidate.catalog().map_err(|error| {
+            DaemonError::new(
+                "extension_reload_failed",
+                format!(
+                    "could not publish extension generation {generation}: {error:#}; the active extension registry was left unchanged"
+                ),
+            )
+        })?;
+        let pruned = self
+            .resources
+            .prune_extension_presentation_tokens(candidate.declared_presentation_tokens());
+        self.extension_registry = Arc::new(candidate);
+        self.extension_catalog.send_replace(catalog.clone());
+        if pruned.changed {
+            self.publish_resource_change(pruned.revision);
+        }
+        Ok(ExtensionReload {
+            catalog,
+            changed: true,
+        })
+    }
+
+    fn prepare_extension_candidate(
+        &self,
+        candidate: crate::extensions::ExtensionRegistry,
+    ) -> Result<PreparedExtensionReload, DaemonError> {
+        let base_generation = self.extension_registry.generation();
+        let generation = if candidate.fingerprint() == self.extension_registry.fingerprint() {
+            base_generation
+        } else {
+            base_generation.checked_add(1).ok_or_else(|| {
+                DaemonError::new(
+                    "extension_reload_failed",
+                    "extension generation is exhausted; restart the daemon before retrying",
+                )
+            })?
+        };
+        let candidate = candidate.at_generation(generation).map_err(|error| {
+            DaemonError::new(
+                "extension_reload_failed",
+                format!("could not prepare extension generation {generation}: {error:#}"),
+            )
+        })?;
+        let catalog = candidate.catalog().map_err(|error| {
+            DaemonError::new(
+                "extension_reload_failed",
+                format!("could not prepare extension catalog: {error:#}"),
+            )
+        })?;
+        Ok(PreparedExtensionReload {
+            base_generation,
+            candidate,
+            catalog,
+        })
+    }
+
+    fn commit_extension_candidate(
+        &mut self,
+        prepared: PreparedExtensionReload,
+        base_generation: u64,
+    ) -> Result<ExtensionReload, DaemonError> {
+        if prepared.base_generation != base_generation {
+            return Err(DaemonError::new(
+                "invalid_extension_transaction",
+                "extension reload commit does not match the prepared base generation",
+            ));
+        }
+        if self.extension_registry.generation() != base_generation {
+            return Err(DaemonError::new(
+                "stale_extension_generation",
+                format!(
+                    "extension generation changed from {base_generation} to {}; reload the local UI candidate and retry",
+                    self.extension_registry.generation()
+                ),
+            ));
+        }
+        self.activate_extension_candidate(prepared.candidate)
     }
 
     fn report_agent(
@@ -641,6 +771,46 @@ impl SharedState {
             .map(|entry| Arc::clone(&entry.handle))
             .collect()
     }
+}
+
+async fn prepare_extension_reload(shared: &Shared) -> Result<PreparedExtensionReload, DaemonError> {
+    let location = shared.lock().await.config_location.clone();
+    let source = location.path.as_ref().map_or_else(
+        || "the resolved default configuration".to_owned(),
+        |path| path.display().to_string(),
+    );
+    let candidate = tokio::task::spawn_blocking(move || {
+        let loaded = global_config::load_extensions_location(&location)?;
+        crate::extensions::ExtensionRegistry::new(1, loaded.extensions, loaded.config)
+    })
+    .await
+    .map_err(|error| {
+        DaemonError::new(
+            "extension_reload_failed",
+            format!(
+                "extension reload worker failed while reading {source}: {error}; retry the reload; the active extension registry was left unchanged"
+            ),
+        )
+    })?
+    .map_err(|error| {
+        DaemonError::new(
+            "extension_reload_failed",
+            format!(
+                "could not reload extensions from {source}: {error:#}; fix the configuration or extension package and retry; the active extension registry was left unchanged"
+            ),
+        )
+    })?;
+
+    shared.lock().await.prepare_extension_candidate(candidate)
+}
+
+async fn reload_extensions(shared: &Shared) -> Result<ExtensionReload, DaemonError> {
+    let prepared = prepare_extension_reload(shared).await?;
+    let base_generation = prepared.base_generation;
+    shared
+        .lock()
+        .await
+        .commit_extension_candidate(prepared, base_generation)
 }
 
 #[derive(Clone, Copy)]
@@ -1362,8 +1532,18 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     let config_location = global_config::resolve_location(config.config_dir.as_deref())?;
     let loaded_extensions = global_config::load_extensions_location(&config_location)?;
     let projects = global_config::load_projects(config.config_dir.as_deref())?;
-    let extensions = loaded_extensions.extensions;
-    let extension_config = loaded_extensions.config;
+    let extension_registry = Arc::new(crate::extensions::ExtensionRegistry::new(
+        1,
+        loaded_extensions.extensions,
+        loaded_extensions.config,
+    )?);
+    let initial_extension_catalog = extension_registry.catalog()?;
+    tracing::debug!(
+        generation = extension_registry.generation(),
+        fingerprint = extension_registry.fingerprint(),
+        extensions = extension_registry.extensions().len(),
+        "built daemon extension registry"
+    );
     let fut_bin = std::env::current_exe().context("resolve current Fut executable")?;
     let (hook_queue, hook_receiver) = crate::extensions::hook_queue();
     let resolved = ProjectResolver::default()
@@ -1380,6 +1560,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     initial_spawn.cwd = resolved.cwd.clone();
     let child_env = initial_spawn.env.clone();
     let (resource_changes, _) = watch::channel(0);
+    let (extension_catalog, _) = watch::channel(initial_extension_catalog);
     let (agent_events, _) = broadcast::channel(AGENT_EVENT_CAPACITY);
     let mut state = SharedState {
         resources: ResourceTree::default(),
@@ -1391,7 +1572,9 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
         agent_events,
         child_env,
         projects,
-        extensions: extensions.clone(),
+        config_location,
+        extension_registry,
+        extension_catalog,
         hook_queue,
         accepting: true,
     };
@@ -1423,8 +1606,6 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     let (hook_shutdown_tx, hook_shutdown_rx) = watch::channel(false);
     let mut hooks = tokio::spawn(crate::extensions::run_hooks(
         hook_receiver,
-        extensions,
-        extension_config,
         fut_bin,
         config.socket_path.clone(),
         hook_shutdown_rx,
@@ -2272,6 +2453,13 @@ async fn handle_connection(
     let mut presence = leased
         .as_ref()
         .map(|attachment| presence.attach(client, attachment.focused.selected.session_id));
+    let (extension_catalog, mut extension_changes) = {
+        let state = shared.lock().await;
+        (
+            state.extension_catalog.borrow().clone(),
+            state.extension_catalog.subscribe(),
+        )
+    };
     send(
         &mut connection,
         first.request_id,
@@ -2279,6 +2467,7 @@ async fn handle_connection(
             version: PROTOCOL_VERSION,
             server_version: env!("CARGO_PKG_VERSION").into(),
             selected: leased.as_ref().map(Attachment::selected),
+            extension_catalog,
         },
     )
     .await?;
@@ -2287,6 +2476,7 @@ async fn handle_connection(
         return control_loop(&mut connection, shared, exited, shutdown).await;
     };
     let mut attachment = leased.expect("interactive connection selected a tab view");
+    let mut prepared_extension_reload: Option<PreparedExtensionReload> = None;
 
     let connection_result: Result<()> = async {
         loop {
@@ -2304,6 +2494,75 @@ async fn handle_connection(
                     continue;
                 }
                 match envelope.message {
+                    ClientMessage::PrepareExtensionReload => {
+                        if envelope.request_id.is_none() {
+                            send_error(
+                                &mut connection,
+                                None,
+                                "request_id_required",
+                                "extension reload prepare requires a request ID",
+                            ).await?;
+                            continue;
+                        }
+                        match prepare_extension_reload(&shared).await {
+                            Ok(prepared) => {
+                                let base_generation = prepared.base_generation;
+                                let catalog = prepared.catalog.clone();
+                                prepared_extension_reload = Some(prepared);
+                                send(
+                                    &mut connection,
+                                    envelope.request_id,
+                                    ServerMessage::ExtensionReloadPrepared {
+                                        base_generation,
+                                        catalog,
+                                    },
+                                ).await?;
+                            }
+                            Err(error) => send_error(
+                                &mut connection,
+                                envelope.request_id,
+                                error.code,
+                                &error.message,
+                            ).await?,
+                        }
+                    }
+                    ClientMessage::CommitExtensionReload { base_generation } => {
+                        if envelope.request_id.is_none() {
+                            send_error(
+                                &mut connection,
+                                None,
+                                "request_id_required",
+                                "extension reload commit requires a request ID",
+                            ).await?;
+                            continue;
+                        }
+                        let result = match prepared_extension_reload.take() {
+                            Some(prepared) => shared
+                                .lock()
+                                .await
+                                .commit_extension_candidate(prepared, base_generation),
+                            None => Err(DaemonError::new(
+                                "extension_reload_not_prepared",
+                                "prepare an extension reload on this connection before committing",
+                            )),
+                        };
+                        match result {
+                            Ok(reloaded) => send(
+                                &mut connection,
+                                envelope.request_id,
+                                ServerMessage::ExtensionsReloaded {
+                                    catalog: reloaded.catalog,
+                                    changed: reloaded.changed,
+                                },
+                            ).await?,
+                            Err(error) => send_error(
+                                &mut connection,
+                                envelope.request_id,
+                                error.code,
+                                &error.message,
+                            ).await?,
+                        }
+                    }
                     ClientMessage::Input { bytes } => {
                         if attachment.copy_mode_active() {
                             send_error(
@@ -2868,7 +3127,7 @@ async fn handle_connection(
                             ).await?,
                         }
                     }
-                    ClientMessage::OpenLocation { .. } | ClientMessage::MovePane { .. } | ClientMessage::Contextual { .. } | ClientMessage::RetireWorkspace { .. } | ClientMessage::PublishToken { .. } | ClientMessage::ReportAgent { .. } | ClientMessage::TerminalInput { .. } | ClientMessage::ReadTerminalOutput { .. } | ClientMessage::WaitTerminalOutput { .. } | ClientMessage::PromptAgent { .. } | ClientMessage::WaitAgent { .. } | ClientMessage::WatchResources | ClientMessage::Shutdown => send_error(&mut connection, envelope.request_id, "control_only", "command requires a control connection").await?,
+                    ClientMessage::OpenLocation { .. } | ClientMessage::MovePane { .. } | ClientMessage::Contextual { .. } | ClientMessage::RetireWorkspace { .. } | ClientMessage::PublishToken { .. } | ClientMessage::ReloadExtensions | ClientMessage::ReportAgent { .. } | ClientMessage::TerminalInput { .. } | ClientMessage::ReadTerminalOutput { .. } | ClientMessage::WaitTerminalOutput { .. } | ClientMessage::PromptAgent { .. } | ClientMessage::WaitAgent { .. } | ClientMessage::GetExtensionCatalog | ClientMessage::WatchResources | ClientMessage::Shutdown => send_error(&mut connection, envelope.request_id, "control_only", "command requires a control connection").await?,
                     ClientMessage::Hello { .. } => send_error(&mut connection, envelope.request_id, "already_hello", "hello was already received").await?,
                 }
             },
@@ -2902,6 +3161,17 @@ async fn handle_connection(
                     &mut connection,
                     None,
                     ServerMessage::PresenceChanged { presence },
+                ).await?;
+            }
+            changed = extension_changes.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let catalog = extension_changes.borrow_and_update().clone();
+                send(
+                    &mut connection,
+                    None,
+                    ServerMessage::ExtensionCatalogChanged { catalog },
                 ).await?;
             }
             update = attachment.updates.recv() => match update {
@@ -3035,6 +3305,7 @@ async fn control_loop(
     let mut watched_changes: Option<watch::Receiver<u64>> = None;
     let mut watched_presence: Option<watch::Receiver<ClientPresenceSnapshot>> = None;
     let mut retirement = None;
+    let mut prepared_extension_reload: Option<PreparedExtensionReload> = None;
     loop {
         let frame = tokio::select! {
             frame = connection.next() => frame,
@@ -3077,6 +3348,96 @@ async fn control_loop(
                 )
                 .await?
             }
+            ClientMessage::GetExtensionCatalog => {
+                let catalog = shared.lock().await.extension_catalog.borrow().clone();
+                send(
+                    connection,
+                    envelope.request_id,
+                    ServerMessage::ExtensionCatalog { catalog },
+                )
+                .await?;
+            }
+            ClientMessage::PrepareExtensionReload => {
+                if envelope.request_id.is_none() {
+                    send_error(
+                        connection,
+                        None,
+                        "request_id_required",
+                        "extension reload prepare requires a request ID",
+                    ).await?;
+                    continue;
+                }
+                match prepare_extension_reload(&shared).await {
+                    Ok(prepared) => {
+                        let base_generation = prepared.base_generation;
+                        let catalog = prepared.catalog.clone();
+                        prepared_extension_reload = Some(prepared);
+                        send(
+                            connection,
+                            envelope.request_id,
+                            ServerMessage::ExtensionReloadPrepared {
+                                base_generation,
+                                catalog,
+                            },
+                        ).await?;
+                    }
+                    Err(error) => {
+                        send_error(connection, envelope.request_id, error.code, &error.message)
+                            .await?;
+                    }
+                }
+            }
+            ClientMessage::CommitExtensionReload { base_generation } => {
+                if envelope.request_id.is_none() {
+                    send_error(
+                        connection,
+                        None,
+                        "request_id_required",
+                        "extension reload commit requires a request ID",
+                    ).await?;
+                    continue;
+                }
+                let result = match prepared_extension_reload.take() {
+                    Some(prepared) => shared
+                        .lock()
+                        .await
+                        .commit_extension_candidate(prepared, base_generation),
+                    None => Err(DaemonError::new(
+                        "extension_reload_not_prepared",
+                        "prepare an extension reload on this connection before committing",
+                    )),
+                };
+                match result {
+                    Ok(reloaded) => send(
+                        connection,
+                        envelope.request_id,
+                        ServerMessage::ExtensionsReloaded {
+                            catalog: reloaded.catalog,
+                            changed: reloaded.changed,
+                        },
+                    ).await?,
+                    Err(error) => {
+                        send_error(connection, envelope.request_id, error.code, &error.message)
+                            .await?;
+                    }
+                }
+            }
+            ClientMessage::ReloadExtensions => match reload_extensions(&shared).await {
+                Ok(reloaded) => {
+                    send(
+                        connection,
+                        envelope.request_id,
+                        ServerMessage::ExtensionsReloaded {
+                            catalog: reloaded.catalog,
+                            changed: reloaded.changed,
+                        },
+                    )
+                    .await?
+                }
+                Err(error) => {
+                    send_error(connection, envelope.request_id, error.code, &error.message).await?
+                }
+            },
             ClientMessage::OpenLocation {
                 project,
                 name,
@@ -6519,6 +6880,15 @@ mod tests {
         let path = initial_path(&resolved, "test".into(), TerminalId::new());
         let mut resources = ResourceTree::default();
         resources.create_session(path.clone()).unwrap();
+        let extension_registry = Arc::new(
+            crate::extensions::ExtensionRegistry::new(
+                1,
+                Vec::new(),
+                global_config::ExtensionConfigCatalog::default(),
+            )
+            .unwrap(),
+        );
+        let extension_catalog = watch::channel(extension_registry.catalog().unwrap()).0;
         (
             SharedState {
                 resources,
@@ -6530,12 +6900,236 @@ mod tests {
                 agent_events: broadcast::channel(AGENT_EVENT_CAPACITY).0,
                 child_env: HashMap::new(),
                 projects: global_config::ProjectCatalog::default(),
-                extensions: Vec::new(),
+                config_location: global_config::ConfigLocation {
+                    path: None,
+                    explicit: false,
+                    source: "test",
+                },
+                extension_registry,
+                extension_catalog,
                 hook_queue: crate::extensions::hook_queue().0,
                 accepting: true,
             },
             path,
         )
+    }
+
+    fn reload_fixture(root: &Path) -> (PathBuf, global_config::ConfigLocation) {
+        let extension = root.join("extension");
+        fs::create_dir(&extension).unwrap();
+        fs::write(
+            extension.join(crate::extensions::MANIFEST_FILE_NAME),
+            r#"api_version = 1
+version = "1.0.0"
+fut = ">=0.7.0, <1.0.0"
+id = "reload-test"
+capabilities = ["presentation_tokens"]
+[[presentation_tokens]]
+name = "state"
+scope = "workspace"
+"#,
+        )
+        .unwrap();
+        let config = root.join("config.toml");
+        fs::write(
+            &config,
+            format!("extensions = [{:?}]\n", extension.display().to_string()),
+        )
+        .unwrap();
+        let location = global_config::ConfigLocation {
+            path: Some(config.clone()),
+            explicit: true,
+            source: "test",
+        };
+        (config, location)
+    }
+
+    fn load_reload_registry(
+        location: &global_config::ConfigLocation,
+        generation: u64,
+    ) -> crate::extensions::ExtensionRegistry {
+        let loaded = global_config::load_extensions_location(location).unwrap();
+        crate::extensions::ExtensionRegistry::new(generation, loaded.extensions, loaded.config)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn extension_activation_swaps_generation_prunes_and_snapshots_hooks_atomically() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (_, location) = reload_fixture(temporary.path());
+        let candidate = load_reload_registry(&location, 1);
+        let equivalent = load_reload_registry(&location, 1);
+        let (mut state, path) = inconsistent_state();
+        state.config_location = location;
+        let (hook_queue, mut hook_receiver) = crate::extensions::hook_queue();
+        state.hook_queue = hook_queue;
+        let old_fingerprint = state.extension_registry.fingerprint().to_owned();
+        state
+            .resources
+            .publish_presentation_token(
+                PresentationTokenTarget::Workspace(path.workspace_id),
+                "workspace.extension.removed.state".into(),
+                "stale".into(),
+            )
+            .unwrap();
+        let before_revision = state.resources.revision();
+        let mut resource_changes = state.resource_changes.subscribe();
+        let mutation = |revision| Mutation {
+            revision,
+            events: vec![crate::resources::ResourceEvent::WorkspaceCreated {
+                session_id: path.session_id,
+                id: path.workspace_id,
+                name: "main".into(),
+                root: path.root.clone(),
+            }],
+            terminals_to_close: Vec::new(),
+            multiplexer_empty: false,
+        };
+        state.enqueue_committed_mutation(&mutation(10));
+
+        let activated = state.activate_extension_candidate(candidate).unwrap();
+        state.enqueue_committed_mutation(&mutation(11));
+
+        assert!(activated.changed);
+        assert_eq!(activated.catalog.generation, 2);
+        assert_eq!(state.extension_registry.generation(), 2);
+        assert_eq!(state.resources.revision(), before_revision + 1);
+        assert!(
+            state.resources.snapshot().sessions[0].workspaces[0]
+                .tokens
+                .is_empty()
+        );
+        assert!(resource_changes.has_changed().unwrap());
+        assert_eq!(
+            *resource_changes.borrow_and_update(),
+            state.resources.revision()
+        );
+        assert_eq!(
+            hook_receiver.receive_snapshot_identity().await.unwrap(),
+            (10, 1, old_fingerprint)
+        );
+        assert_eq!(
+            hook_receiver.receive_snapshot_identity().await.unwrap(),
+            (11, 2, activated.catalog.fingerprint.clone())
+        );
+
+        let active = Arc::clone(&state.extension_registry);
+        let revision = state.resources.revision();
+        let unchanged = state.activate_extension_candidate(equivalent).unwrap();
+        assert_eq!(
+            unchanged,
+            ExtensionReload {
+                catalog: activated.catalog,
+                changed: false,
+            }
+        );
+        assert!(Arc::ptr_eq(&active, &state.extension_registry));
+        assert_eq!(state.resources.revision(), revision);
+        assert!(!resource_changes.has_changed().unwrap());
+    }
+
+    #[tokio::test]
+    async fn failed_extension_reload_preserves_registry_generation_and_tokens_exactly() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (config, location) = reload_fixture(temporary.path());
+        let registry = Arc::new(load_reload_registry(&location, 7));
+        let (mut state, path) = inconsistent_state();
+        state.config_location = location;
+        state.extension_registry = Arc::clone(&registry);
+        state.extension_catalog = watch::channel(registry.catalog().unwrap()).0;
+        state
+            .publish_token(
+                "reload-test",
+                "state",
+                "ready".into(),
+                PresentationTokenTarget::Workspace(path.workspace_id),
+            )
+            .unwrap();
+        let before = state.resources.snapshot();
+        fs::write(&config, "extensions = [\n").unwrap();
+        let shared = Arc::new(Mutex::new(state));
+
+        let error = reload_extensions(&shared).await.unwrap_err();
+
+        assert_eq!(error.code, "extension_reload_failed");
+        assert!(error.message.contains(&config.display().to_string()));
+        assert!(error.message.contains("fix the configuration"));
+        assert!(error.message.contains("left unchanged"));
+        let state = shared.lock().await;
+        assert!(Arc::ptr_eq(&registry, &state.extension_registry));
+        assert_eq!(state.extension_registry.generation(), 7);
+        assert_eq!(
+            state.extension_registry.fingerprint(),
+            registry.fingerprint()
+        );
+        assert_eq!(state.resources.snapshot(), before);
+    }
+
+    #[test]
+    fn prepared_extension_candidate_is_invisible_and_stale_commit_cannot_overwrite_winner() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (_, location) = reload_fixture(temporary.path());
+        let prepared_candidate = load_reload_registry(&location, 1);
+        let winning_candidate = load_reload_registry(&location, 1);
+        let (mut state, _) = inconsistent_state();
+        let mut catalogs = state.extension_catalog.subscribe();
+
+        let prepared = state
+            .prepare_extension_candidate(prepared_candidate)
+            .unwrap();
+        assert_eq!(prepared.base_generation, 1);
+        assert_eq!(prepared.catalog.generation, 2);
+        assert_eq!(state.extension_registry.generation(), 1);
+        assert!(!catalogs.has_changed().unwrap());
+
+        let winner = state
+            .activate_extension_candidate(winning_candidate)
+            .unwrap();
+        assert_eq!(winner.catalog.generation, 2);
+        assert!(catalogs.has_changed().unwrap());
+        assert_eq!(catalogs.borrow_and_update().generation, 2);
+        let active_fingerprint = state.extension_registry.fingerprint().to_owned();
+
+        let error = state.commit_extension_candidate(prepared, 1).unwrap_err();
+        assert_eq!(error.code, "stale_extension_generation");
+        assert_eq!(state.extension_registry.generation(), 2);
+        assert_eq!(state.extension_registry.fingerprint(), active_fingerprint);
+        assert!(!catalogs.has_changed().unwrap());
+    }
+
+    #[test]
+    fn exhausted_extension_generation_rejects_activation_before_pruning() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (_, location) = reload_fixture(temporary.path());
+        let candidate = load_reload_registry(&location, 1);
+        let (mut state, path) = inconsistent_state();
+        state.extension_registry = Arc::new(
+            crate::extensions::ExtensionRegistry::new(
+                u64::MAX,
+                Vec::new(),
+                global_config::ExtensionConfigCatalog::default(),
+            )
+            .unwrap(),
+        );
+        state.extension_catalog = watch::channel(state.extension_registry.catalog().unwrap()).0;
+        state
+            .resources
+            .publish_presentation_token(
+                PresentationTokenTarget::Workspace(path.workspace_id),
+                "workspace.extension.removed.state".into(),
+                "stale".into(),
+            )
+            .unwrap();
+        let active = Arc::clone(&state.extension_registry);
+        let before = state.resources.snapshot();
+
+        let error = state.activate_extension_candidate(candidate).unwrap_err();
+
+        assert_eq!(error.code, "extension_reload_failed");
+        assert!(error.message.contains("generation is exhausted"));
+        assert!(Arc::ptr_eq(&active, &state.extension_registry));
+        assert_eq!(state.extension_registry.generation(), u64::MAX);
+        assert_eq!(state.resources.snapshot(), before);
     }
 
     #[tokio::test]
@@ -6921,6 +7515,15 @@ mod tests {
         let path = initial_path(&resolved, "test".into(), focused.id());
         let sibling_pane_id = PaneId::new();
         let (resource_changes, _) = watch::channel(0);
+        let extension_registry = Arc::new(
+            crate::extensions::ExtensionRegistry::new(
+                1,
+                Vec::new(),
+                global_config::ExtensionConfigCatalog::default(),
+            )
+            .unwrap(),
+        );
+        let extension_catalog = watch::channel(extension_registry.catalog().unwrap()).0;
         let mut state = SharedState {
             resources: ResourceTree::default(),
             runtimes: HashMap::new(),
@@ -6931,7 +7534,13 @@ mod tests {
             agent_events: broadcast::channel(AGENT_EVENT_CAPACITY).0,
             child_env: HashMap::new(),
             projects: global_config::ProjectCatalog::default(),
-            extensions: Vec::new(),
+            config_location: global_config::ConfigLocation {
+                path: None,
+                explicit: false,
+                source: "test",
+            },
+            extension_registry,
+            extension_catalog,
             hook_queue: crate::extensions::hook_queue().0,
             accepting: true,
         };

@@ -91,14 +91,21 @@ pub async fn run(socket: &Path, config_dir: Option<&Path>) -> DoctorReport {
                 ));
                 let present = loaded.present;
                 let extension_count = loaded.extensions.len();
+                let extension_packages = loaded
+                    .extensions
+                    .iter()
+                    .map(configured_extension_details)
+                    .collect::<Vec<_>>();
                 let path = location.path.as_deref().map(path_text);
                 checks.push(check(
                     "config",
                     CheckStatus::Ok,
                     if present {
                         format!(
-                            "valid {}",
-                            path.as_deref().expect("present config has a path")
+                            "valid {}; {} extension candidate{}",
+                            path.as_deref().expect("present config has a path"),
+                            extension_count,
+                            if extension_count == 1 { "" } else { "s" },
                         )
                     } else {
                         "valid defaults; no configuration file".into()
@@ -108,13 +115,14 @@ pub async fn run(socket: &Path, config_dir: Option<&Path>) -> DoctorReport {
                         "path": path,
                         "present": present,
                         "extensions": extension_count,
+                        "extension_packages": extension_packages,
                     }),
                 ));
             }
             Err(error) => checks.push(check(
                 "config",
                 CheckStatus::Error,
-                error.to_string(),
+                format!("{error:#}"),
                 json!({ "source": location.source, "path": location.path.as_deref().map(path_text) }),
             )),
         },
@@ -273,7 +281,7 @@ pub async fn run(socket: &Path, config_dir: Option<&Path>) -> DoctorReport {
                 json!({ "path": path_text(socket), "mode": metadata.permissions().mode() & 0o777, "uid": metadata.uid() }),
             ));
             if safe {
-                checks.push(probe_protocol(socket).await);
+                checks.extend(probe_daemon(socket).await);
             }
         }
     }
@@ -284,6 +292,14 @@ pub async fn run(socket: &Path, config_dir: Option<&Path>) -> DoctorReport {
             CheckStatus::Info,
             "skipped because no safe running socket is available".into(),
             json!({ "client_protocol": PROTOCOL_VERSION }),
+        ));
+    }
+    if !checks.iter().any(|check| check.id == "extensions") {
+        checks.push(check(
+            "extensions",
+            CheckStatus::Info,
+            "active daemon catalog unavailable because no safe running socket is available".into(),
+            Value::Null,
         ));
     }
 
@@ -329,7 +345,7 @@ pub async fn run(socket: &Path, config_dir: Option<&Path>) -> DoctorReport {
     DoctorReport { status, checks }
 }
 
-async fn probe_protocol(socket: &Path) -> DoctorCheck {
+async fn probe_daemon(socket: &Path) -> Vec<DoctorCheck> {
     let request_id = Uuid::new_v4();
     let result = time::timeout(Duration::from_millis(500), async {
         let stream = UnixStream::connect(socket).await?;
@@ -359,37 +375,129 @@ async fn probe_protocol(socket: &Path) -> DoctorCheck {
             version,
             server_version,
             selected: None,
-        })) if version == PROTOCOL_VERSION => check(
-            "protocol",
-            CheckStatus::Ok,
-            format!("daemon {server_version} answered compatible protocol {version}"),
-            json!({ "client_protocol": PROTOCOL_VERSION, "server_protocol": version, "client_version": env!("CARGO_PKG_VERSION"), "server_version": server_version }),
-        ),
-        Ok(Ok(ServerMessage::IncompatibleProtocol { client, server })) => check(
-            "protocol",
-            CheckStatus::Error,
-            format!("incompatible protocol: client {client}, server {server}"),
-            json!({ "client_protocol": client, "server_protocol": server }),
-        ),
-        Ok(Ok(message)) => check(
-            "protocol",
-            CheckStatus::Error,
-            format!("unexpected handshake response: {message:?}"),
-            Value::Null,
-        ),
-        Ok(Err(error)) => check(
-            "protocol",
-            CheckStatus::Error,
-            format!("protocol probe failed: {error}"),
-            Value::Null,
-        ),
-        Err(_) => check(
-            "protocol",
-            CheckStatus::Error,
-            "protocol probe timed out".into(),
-            Value::Null,
-        ),
+            extension_catalog,
+        })) if version == PROTOCOL_VERSION => vec![
+            check(
+                "protocol",
+                CheckStatus::Ok,
+                format!("daemon {server_version} answered compatible protocol {version}"),
+                json!({ "client_protocol": PROTOCOL_VERSION, "server_protocol": version, "client_version": env!("CARGO_PKG_VERSION"), "server_version": server_version }),
+            ),
+            active_extensions_check(&extension_catalog),
+        ],
+        Ok(Ok(ServerMessage::IncompatibleProtocol { client, server })) => vec![
+            check(
+                "protocol",
+                CheckStatus::Error,
+                format!("incompatible protocol: client {client}, server {server}"),
+                json!({ "client_protocol": client, "server_protocol": server }),
+            ),
+            unavailable_extensions_check(
+                "active catalog unavailable through an incompatible daemon protocol",
+            ),
+        ],
+        Ok(Ok(message)) => vec![
+            check(
+                "protocol",
+                CheckStatus::Error,
+                format!("unexpected handshake response: {message:?}"),
+                Value::Null,
+            ),
+            unavailable_extensions_check(
+                "active catalog unavailable after an unexpected handshake response",
+            ),
+        ],
+        Ok(Err(error)) => vec![
+            check(
+                "protocol",
+                CheckStatus::Error,
+                format!("protocol probe failed: {error}"),
+                Value::Null,
+            ),
+            unavailable_extensions_check(
+                "active catalog unavailable because the protocol probe failed",
+            ),
+        ],
+        Err(_) => vec![
+            check(
+                "protocol",
+                CheckStatus::Error,
+                "protocol probe timed out".into(),
+                Value::Null,
+            ),
+            unavailable_extensions_check(
+                "active catalog unavailable because the protocol probe timed out",
+            ),
+        ],
     }
+}
+
+fn configured_extension_details(extension: &crate::extensions::Extension) -> Value {
+    json!({
+        "id": extension.id(),
+        "api_version": extension.api_version(),
+        "version": extension.version().to_string(),
+        "fut": extension.fut_requirement().to_string(),
+        "capabilities": extension
+            .capabilities()
+            .iter()
+            .map(|capability| capability.as_str())
+            .collect::<Vec<_>>(),
+        "root": path_text(extension.root()),
+        "manifest": path_text(&extension.root().join(crate::extensions::MANIFEST_FILE_NAME)),
+        "commands": extension.commands().map(|command| command.name()).collect::<Vec<_>>(),
+        "presentation_tokens": extension.presentation_tokens().len(),
+        "provenance": "configured_package",
+    })
+}
+
+fn active_extensions_check(catalog: &crate::protocol::ExtensionCatalog) -> DoctorCheck {
+    let packages = catalog
+        .extensions
+        .iter()
+        .map(|extension| {
+            json!({
+                "id": extension.id,
+                "api_version": extension.api_version,
+                "version": extension.version,
+                "fut": extension.fut,
+                "capabilities": extension.capabilities,
+                "root": path_text(&extension.root),
+                "manifest": path_text(&extension.root.join(crate::extensions::MANIFEST_FILE_NAME)),
+                "hooks": extension.hooks.keys().collect::<Vec<_>>(),
+                "commands": extension.commands.keys().collect::<Vec<_>>(),
+                "presentation_tokens": extension.presentation_tokens.iter().map(|token| &token.name).collect::<Vec<_>>(),
+                "has_config_defaults": catalog.config.defaults.contains_key(&extension.id),
+                "provenance": "active_daemon_catalog",
+            })
+        })
+        .collect::<Vec<_>>();
+    check(
+        "extensions",
+        CheckStatus::Ok,
+        format!(
+            "active generation {} fingerprint {} with {} extension{}",
+            catalog.generation,
+            catalog.fingerprint,
+            catalog.extensions.len(),
+            if catalog.extensions.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
+        ),
+        json!({
+            "generation": catalog.generation,
+            "fingerprint": catalog.fingerprint,
+            "count": catalog.extensions.len(),
+            "config_source": catalog.config.source.as_deref().map(path_text),
+            "packages": packages,
+        }),
+    )
+}
+
+fn unavailable_extensions_check(summary: &str) -> DoctorCheck {
+    check("extensions", CheckStatus::Info, summary.into(), Value::Null)
 }
 
 fn check(id: &'static str, status: CheckStatus, summary: String, details: Value) -> DoctorCheck {
@@ -439,6 +547,15 @@ fn safe_text(value: &str) -> String {
 mod tests {
     use super::*;
 
+    fn empty_extension_catalog() -> crate::protocol::ExtensionCatalog {
+        crate::protocol::ExtensionCatalog {
+            generation: 1,
+            fingerprint: "0".repeat(64),
+            extensions: Vec::new(),
+            config: crate::protocol::ExtensionCatalogConfig::default(),
+        }
+    }
+
     #[tokio::test]
     async fn matching_protocol_is_reported_as_compatible() {
         let temporary = tempfile::tempdir().unwrap();
@@ -457,6 +574,7 @@ mod tests {
                             version: PROTOCOL_VERSION,
                             server_version: "0.2.0".into(),
                             selected: None,
+                            extension_catalog: empty_extension_catalog(),
                         },
                     })
                     .unwrap(),
@@ -465,13 +583,21 @@ mod tests {
                 .unwrap();
         });
 
-        let protocol = probe_protocol(&socket).await;
+        let checks = probe_daemon(&socket).await;
+        let protocol = checks.iter().find(|check| check.id == "protocol").unwrap();
+        let extensions = checks
+            .iter()
+            .find(|check| check.id == "extensions")
+            .unwrap();
 
         assert_eq!(protocol.status, CheckStatus::Ok);
         assert_eq!(
             protocol.summary,
             format!("daemon 0.2.0 answered compatible protocol {PROTOCOL_VERSION}")
         );
+        assert_eq!(extensions.status, CheckStatus::Ok);
+        assert_eq!(extensions.details["generation"], 1);
+        assert_eq!(extensions.details["count"], 0);
         server.await.unwrap();
     }
 

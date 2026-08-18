@@ -37,7 +37,10 @@ use chrome::{
     sanitize, sidebar_drawer,
 };
 use command_bar::{CommandBarAction, CommandBarState};
-use config::{MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH, PaneLayoutPolicy, SidebarDisplay, UiConfig};
+use config::{
+    MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH, PaneLayoutPolicy, SidebarDisplay, StagedUiConfig,
+    UiConfig,
+};
 use context_menu::{ContextMenuAction, ContextMenuState};
 use copy_mode::{
     CopyModeErrorDisposition, CopyModeInput, CopyModePaste, CopyModeReply, CopyModeState,
@@ -115,6 +118,19 @@ enum ClientSurface {
     TabBar(TabBarState),
     CommandBar(CommandBarState),
     ContextMenu(ContextMenuState),
+}
+
+enum ExtensionReloadState {
+    Preparing {
+        request_id: Uuid,
+        staged: StagedUiConfig,
+    },
+    Committing {
+        request_id: Uuid,
+        base_generation: u64,
+        ui: UiConfig,
+        catalog: crate::protocol::ExtensionCatalog,
+    },
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -215,7 +231,7 @@ pub async fn attach(
     attach_with_ui(
         socket_path,
         selector,
-        load_ui_config(config_dir)?,
+        stage_ui_config(config_dir)?,
         config_dir,
     )
     .await
@@ -224,8 +240,9 @@ pub async fn attach(
 /// Open a lease-free global navigator on an existing daemon, then attach only
 /// after the user chooses a destination.
 pub async fn attach_navigator(socket_path: &Path, config_dir: Option<&Path>) -> anyhow::Result<()> {
-    let ui = load_ui_config(config_dir)?;
-    let mut navigator_connection = connect_control_navigator(socket_path).await?;
+    let staged = stage_ui_config(config_dir)?;
+    let (mut navigator_connection, catalog) = connect_control_navigator(socket_path).await?;
+    let ui = staged.materialize(&catalog)?;
     let (snapshot, presence) =
         match time::timeout(Duration::from_secs(2), receive(&mut navigator_connection))
             .await
@@ -253,14 +270,18 @@ pub async fn attach_navigator(socket_path: &Path, config_dir: Option<&Path>) -> 
         return Ok(());
     };
 
+    let staged = stage_ui_config(config_dir)?;
     let (columns, rows) = crossterm::terminal::size().context("read terminal size")?;
     let size = TerminalSize { columns, rows };
-    let (mut framed, selected) = connect_interactive(socket_path, Some(selector), size).await?;
+    let (mut framed, selected, catalog) =
+        connect_interactive(socket_path, Some(selector), size).await?;
+    let ui = staged.materialize(&catalog)?;
     let result = run(
         &mut terminal,
         &mut framed,
         selected,
         ui,
+        catalog.generation,
         socket_path,
         config_dir,
     )
@@ -270,19 +291,20 @@ pub async fn attach_navigator(socket_path: &Path, config_dir: Option<&Path>) -> 
     result
 }
 
-pub(crate) fn load_ui_config(config_dir: Option<&Path>) -> anyhow::Result<UiConfig> {
-    config::load(config_dir)
+pub(crate) fn stage_ui_config(config_dir: Option<&Path>) -> anyhow::Result<StagedUiConfig> {
+    config::stage(config_dir)
 }
 
 pub(crate) async fn attach_with_ui(
     socket_path: &Path,
     selector: Option<TargetSelector>,
-    ui: UiConfig,
+    staged: StagedUiConfig,
     config_dir: Option<&Path>,
 ) -> anyhow::Result<()> {
     let (columns, rows) = crossterm::terminal::size().context("read terminal size")?;
-    let (mut framed, selected) =
+    let (mut framed, selected, catalog) =
         connect_interactive(socket_path, selector, TerminalSize { columns, rows }).await?;
+    let ui = staged.materialize(&catalog)?;
 
     // Host terminal state is changed only after a successful handshake.
     let guard = TerminalGuard::enter()?;
@@ -292,6 +314,7 @@ pub(crate) async fn attach_with_ui(
         &mut framed,
         selected,
         ui,
+        catalog.generation,
         socket_path,
         config_dir,
     )
@@ -308,6 +331,7 @@ async fn connect_interactive(
 ) -> anyhow::Result<(
     Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     SelectedView,
+    crate::protocol::ExtensionCatalog,
 )> {
     let stream = UnixStream::connect(socket_path)
         .await
@@ -329,8 +353,9 @@ async fn connect_interactive(
         ServerMessage::Welcome {
             version,
             selected: Some(selected),
+            extension_catalog,
             ..
-        } if version == PROTOCOL_VERSION => selected,
+        } if version == PROTOCOL_VERSION => (selected, extension_catalog),
         ServerMessage::Welcome { selected: None, .. } => bail!("daemon did not select a terminal"),
         ServerMessage::Welcome { version, .. } => {
             bail!("daemon welcomed client with unsupported protocol version {version}")
@@ -341,12 +366,15 @@ async fn connect_interactive(
         ServerMessage::Error { code, message } => bail!("daemon error ({code}): {message}"),
         message => bail!("expected welcome from daemon, received {message:?}"),
     };
-    Ok((framed, selected))
+    Ok((framed, selected.0, selected.1))
 }
 
 async fn connect_control_navigator(
     socket_path: &Path,
-) -> anyhow::Result<Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>> {
+) -> anyhow::Result<(
+    Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    crate::protocol::ExtensionCatalog,
+)> {
     let stream = UnixStream::connect(socket_path)
         .await
         .with_context(|| format!("connect to {}", socket_path.display()))?;
@@ -360,28 +388,29 @@ async fn connect_control_navigator(
         },
     )
     .await?;
-    match time::timeout(Duration::from_secs(2), receive(&mut framed))
+    let extension_catalog = match time::timeout(Duration::from_secs(2), receive(&mut framed))
         .await
         .context("daemon handshake timed out")??
     {
         ServerMessage::Welcome {
             version,
             selected: None,
+            extension_catalog,
             ..
-        } if version == PROTOCOL_VERSION => {}
+        } if version == PROTOCOL_VERSION => extension_catalog,
         ServerMessage::IncompatibleProtocol { client, server } => {
             bail!("incompatible protocol: client {client}, server {server}")
         }
         ServerMessage::Error { code, message } => bail!("daemon error ({code}): {message}"),
         message => bail!("expected control welcome from daemon, received {message:?}"),
-    }
+    };
     send_request(
         &mut framed,
         Some(Uuid::new_v4()),
         ClientMessage::WatchResources,
     )
     .await?;
-    Ok(framed)
+    Ok((framed, extension_catalog))
 }
 
 async fn initial_navigator(
@@ -445,6 +474,7 @@ async fn run(
     framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     selected: SelectedView,
     ui: UiConfig,
+    catalog_generation: u64,
     socket_path: &Path,
     config_dir: Option<&Path>,
 ) -> anyhow::Result<()> {
@@ -458,6 +488,7 @@ async fn run(
         framed,
         selected,
         ui,
+        catalog_generation,
         socket_path,
         config_dir,
         &mut client_hooks,
@@ -467,11 +498,16 @@ async fn run(
     result
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the event loop owns the coordinated terminal, protocol, UI, and hook runtimes"
+)]
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     selected: SelectedView,
     mut ui: UiConfig,
+    mut extension_generation: u64,
     socket_path: &Path,
     config_dir: Option<&Path>,
     client_hooks: &mut crate::extensions::ClientHookRuntime,
@@ -500,6 +536,7 @@ async fn run_loop(
     let mut host_cursor = HostCursorState::default();
     let mut kitty_graphics = graphics::Renderer::new();
     let mut perf = perf::PerfLog::from_env();
+    let mut extension_reload: Option<ExtensionReloadState> = None;
     let mut redraw = time::interval(Duration::from_millis(16));
     redraw.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut spinner = time::interval(Duration::from_millis(100));
@@ -696,6 +733,117 @@ async fn run_loop(
                             );
                             force_draw = true;
                         }
+                    }
+                    ServerMessage::ExtensionReloadPrepared {
+                        base_generation,
+                        catalog,
+                    } => {
+                        let Some(ExtensionReloadState::Preparing {
+                            request_id: expected,
+                            staged,
+                        }) = extension_reload.take()
+                        else {
+                            bail!("unexpected extension reload preparation from daemon");
+                        };
+                        if request_id != Some(expected) {
+                            bail!("extension reload preparation used an unexpected request ID");
+                        }
+                        match staged.materialize(&catalog) {
+                            Ok(candidate_ui) => {
+                                let commit_request = Uuid::new_v4();
+                                send_request(
+                                    framed,
+                                    Some(commit_request),
+                                    ClientMessage::CommitExtensionReload { base_generation },
+                                ).await?;
+                                extension_reload = Some(ExtensionReloadState::Committing {
+                                    request_id: commit_request,
+                                    base_generation,
+                                    ui: candidate_ui,
+                                    catalog,
+                                });
+                            }
+                            Err(error) => {
+                                toasts.error(format!(
+                                    "config reload failed · {}",
+                                    one_line_error(&error)
+                                ));
+                                force_draw = true;
+                            }
+                        }
+                    }
+                    ServerMessage::ExtensionsReloaded { catalog, .. } => {
+                        let Some(ExtensionReloadState::Committing {
+                            request_id: expected,
+                            base_generation,
+                            ui: candidate_ui,
+                            catalog: prepared_catalog,
+                        }) = extension_reload.take()
+                        else {
+                            bail!("unexpected extension reload commit from daemon");
+                        };
+                        if request_id != Some(expected) {
+                            bail!("extension reload commit used an unexpected request ID");
+                        }
+                        if catalog != prepared_catalog
+                            || !matches!(
+                                catalog.generation,
+                                generation if generation == base_generation
+                                    || generation == base_generation.saturating_add(1)
+                            )
+                        {
+                            bail!("daemon committed a different extension catalog than it prepared");
+                        }
+                        install_ui_config(
+                            candidate_ui,
+                            framed,
+                            terminal.size()?.into(),
+                            &mut view,
+                            &resources,
+                            &mut surface,
+                            &workspace_history,
+                            &mut prefix,
+                            &mut ui,
+                            client_hooks,
+                        ).await?;
+                        extension_generation = catalog.generation;
+                        toasts.info("config reloaded");
+                        force_draw = true;
+                    }
+                    ServerMessage::ExtensionCatalogChanged { catalog } => {
+                        if catalog.generation <= extension_generation {
+                            continue;
+                        }
+                        // Every attached client stages the same complete local
+                        // config on publication, so command overrides and
+                        // bindings advance with the daemon declarations too.
+                        let staged = stage_ui_config(config_dir).with_context(|| {
+                            format!(
+                                "stage local UI for daemon extension generation {}",
+                                catalog.generation
+                            )
+                        })?;
+                        let candidate_ui = staged.materialize(&catalog).with_context(|| {
+                            format!(
+                                "install daemon extension generation {} without retaining stale client capabilities",
+                                catalog.generation
+                            )
+                        })?;
+                        install_ui_config(
+                            candidate_ui,
+                            framed,
+                            terminal.size()?.into(),
+                            &mut view,
+                            &resources,
+                            &mut surface,
+                            &workspace_history,
+                            &mut prefix,
+                            &mut ui,
+                            client_hooks,
+                        ).await?;
+                        extension_generation = catalog.generation;
+                        toasts.info("extensions reloaded");
+                        force_draw = true;
                     }
                     ServerMessage::CopyModeFinalized { terminal_id, screen } => {
                         let accepted = copy_mode.as_mut().is_some_and(|state| {
@@ -980,6 +1128,19 @@ async fn run_loop(
                     }
                     ServerMessage::Detached => break,
                     ServerMessage::Error { code, message } => {
+                        let reload_failed = extension_reload.as_ref().is_some_and(|reload| {
+                            let expected = match reload {
+                                ExtensionReloadState::Preparing { request_id, .. }
+                                | ExtensionReloadState::Committing { request_id, .. } => *request_id,
+                            };
+                            request_id == Some(expected)
+                        });
+                        if reload_failed {
+                            extension_reload = None;
+                            toasts.error(format!("config reload failed · {message}"));
+                            force_draw = true;
+                            continue;
+                        }
                         if view.reject_resize(request_id) {
                             continue;
                         }
@@ -1082,6 +1243,7 @@ async fn run_loop(
                     | ServerMessage::TerminalOutputMatched { .. }
                     | ServerMessage::AgentPrompted { .. }
                     | ServerMessage::AgentSettled { .. }
+                    | ServerMessage::ExtensionCatalog { .. }
                     | ServerMessage::TokenPublished { .. } => {
                         bail!("unexpected control response on interactive connection")
                     }
@@ -1630,13 +1792,13 @@ async fn run_loop(
                                     &mut close_target,
                                     &mut focus,
                                     &mut copy_mode,
-                                    &mut prefix,
                                     terminal.size()?.into(),
                                     &mut ui,
                                     &mut temporary_command,
                                     socket_path,
                                     &background_results,
                                     config_dir,
+                                    &mut extension_reload,
                                 ).await?);
                                 force_draw = true;
                             }
@@ -2163,13 +2325,13 @@ async fn run_loop(
                                     &mut close_target,
                                     &mut focus,
                                     &mut copy_mode,
-                                    &mut prefix,
                                     terminal.size()?.into(),
                                     &mut ui,
                                     &mut temporary_command,
                                     socket_path,
                                     &background_results,
                                     config_dir,
+                                    &mut extension_reload,
                                 ).await?);
                                 force_draw = true;
                             }
@@ -3211,6 +3373,52 @@ async fn release_captured_mouse_input(
 
 #[allow(
     clippy::too_many_arguments,
+    reason = "catalog installation synchronously swaps the coordinated client UI states"
+)]
+async fn install_ui_config(
+    candidate: UiConfig,
+    framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    host: Rect,
+    view: &mut ViewState,
+    resources: &ResourceState,
+    surface: &mut Option<ClientSurface>,
+    workspace_history: &NavigationHistory,
+    prefix: &mut PrefixState,
+    ui: &mut UiConfig,
+    client_hooks: &mut crate::extensions::ClientHookRuntime,
+) -> anyhow::Result<()> {
+    // A command bar owns positional RunCommand values derived from its binding
+    // snapshot. Closing it before the swap prevents an old index from being
+    // dispatched against the new catalog.
+    if matches!(surface, Some(ClientSurface::CommandBar(_))) {
+        *surface = None;
+    }
+    prefix.replace_bindings(candidate.bindings.clone());
+    client_hooks.reconfigure(candidate.extensions.clone());
+    *ui = candidate;
+    let close_sidebar = if let (Some(ClientSurface::Sidebar(sidebar)), Some(snapshot)) =
+        (surface.as_mut(), resources.snapshot())
+    {
+        !sidebar.reconfigure(
+            snapshot,
+            view.focused(),
+            workspace_history,
+            resources.notifications(),
+            ui,
+        )
+    } else {
+        false
+    };
+    if close_sidebar {
+        *surface = None;
+    }
+    resize_view(framed, host, view, resources, ui).await?;
+    view.invalidate_drawn();
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
     reason = "the dispatcher explicitly borrows the small client states it coordinates"
 )]
 async fn dispatch_client_action(
@@ -3224,13 +3432,13 @@ async fn dispatch_client_action(
     close_target: &mut CloseTargetState,
     focus: &mut FocusState,
     copy_mode: &mut Option<CopyModeState>,
-    prefix: &mut PrefixState,
     host: Rect,
     ui: &mut UiConfig,
     temporary_command: &mut Option<TemporaryCommandSurface>,
     socket_path: &Path,
     background_results: &mpsc::UnboundedSender<BackgroundCommandResult>,
     config_dir: Option<&Path>,
+    extension_reload: &mut Option<ExtensionReloadState>,
 ) -> anyhow::Result<Option<Toast>> {
     match action {
         ClientAction::RunCommand(index) => {
@@ -3333,37 +3541,29 @@ async fn dispatch_client_action(
                 CommandBarState::open_with_bindings(ui.bindings.clone()),
             ));
         }
-        ClientAction::ReloadConfig => match load_ui_config(config_dir) {
-            Ok(reloaded) => {
-                prefix.replace_bindings(reloaded.bindings.clone());
-                *ui = reloaded;
-                let close_sidebar = if let (Some(ClientSurface::Sidebar(sidebar)), Some(snapshot)) =
-                    (surface.as_mut(), resources.snapshot())
-                {
-                    !sidebar.reconfigure(
-                        snapshot,
-                        view.focused(),
-                        workspace_history,
-                        resources.notifications(),
-                        ui,
-                    )
-                } else {
-                    false
-                };
-                if close_sidebar {
-                    *surface = None;
+        ClientAction::ReloadConfig => {
+            if extension_reload.is_some() {
+                return Ok(Some(Toast::info("config reload already in progress")));
+            }
+            let staged = match stage_ui_config(config_dir) {
+                Ok(staged) => staged,
+                Err(error) => {
+                    return Ok(Some(Toast::error(format!(
+                        "config reload failed · {}",
+                        one_line_error(&error)
+                    ))));
                 }
-                resize_view(framed, host, view, resources, ui).await?;
-                view.invalidate_drawn();
-                return Ok(Some(Toast::info("config reloaded")));
-            }
-            Err(error) => {
-                return Ok(Some(Toast::error(format!(
-                    "config reload failed · {}",
-                    one_line_error(&error)
-                ))));
-            }
-        },
+            };
+            let request_id = Uuid::new_v4();
+            send_request(
+                framed,
+                Some(request_id),
+                ClientMessage::PrepareExtensionReload,
+            )
+            .await?;
+            *extension_reload = Some(ExtensionReloadState::Preparing { request_id, staged });
+            return Ok(Some(Toast::info("validating config reload")));
+        }
         ClientAction::EnterCopyMode => {
             if copy_mode.is_none() {
                 let mut state = CopyModeState::enter(view.focused().terminal_id);
