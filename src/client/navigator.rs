@@ -25,7 +25,7 @@ use super::navigation::NavigationHistory;
 use super::notifications::{ActivityIndicator, NotificationState};
 
 const MAX_WIDTH: u16 = 80;
-const MAX_HEIGHT: u16 = 20;
+const MAX_HEIGHT: u16 = 30;
 const MAX_QUERY_BYTES: usize = 512;
 const BREADCRUMB_WIDTH: usize = 10;
 

@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Added a single run-status token for showing managed command state in workspace lists.
+- Made the global navigator taller so more resources are visible at once.
 - Fixed shared-terminal attachment sizing, failed last-terminal replacement recovery, and transient Codex screen-capture errors.
 
 ## 0.8
