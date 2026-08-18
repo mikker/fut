@@ -2,7 +2,7 @@
 id: thr-tind
 status: closed
 deps: []
-links: []
+links: [de-8pyh]
 created: 2026-08-14T09:38:16Z
 type: epic
 priority: 2
