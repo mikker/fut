@@ -589,6 +589,20 @@ fn git(cwd: &std::path::Path, arguments: &[&str]) {
     assert!(status.success());
 }
 
+fn git_stdout(cwd: &std::path::Path, arguments: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(arguments)
+        .current_dir(cwd)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", cwd)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
 fn project_trust_cli(root: &std::path::Path, operation: &str, name: &str) -> Value {
     let output = Command::new(env!("CARGO_BIN_EXE_fut"))
         .env_clear()
@@ -2788,6 +2802,197 @@ argv = ["./run"]
     );
 
     harness.shutdown().await;
+}
+
+#[test]
+fn pinned_git_extension_install_update_and_rollback_are_daemonless() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let remote = root.path().join("remote.git");
+    let data = root.path().join("data");
+    let temporary = root.path().join("tmp");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&temporary).unwrap();
+    git(&source, &["init", "-b", "main"]);
+    fs::write(
+        source.join("fut-extension.toml"),
+        r#"
+api_version = 1
+version = "1.0.0"
+fut = ">=0.7.0, <1.0.0"
+capabilities = []
+id = "remote-test"
+"#,
+    )
+    .unwrap();
+    fs::write(source.join("content.txt"), "first\n").unwrap();
+    git(&source, &["add", "."]);
+    git(&source, &["commit", "-m", "first"]);
+    let first_commit = git_stdout(&source, &["rev-parse", "HEAD"]);
+    git(
+        root.path(),
+        &[
+            "clone",
+            "--bare",
+            source.to_str().unwrap(),
+            remote.to_str().unwrap(),
+        ],
+    );
+    let remote_url = format!("file://{}", remote.display());
+
+    let cli = |arguments: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_fut"))
+            .env_clear()
+            .env("HOME", root.path())
+            .env("XDG_DATA_HOME", &data)
+            .env("TMPDIR", &temporary)
+            .env("PATH", "/usr/bin:/bin")
+            .args(arguments)
+            .output()
+            .unwrap()
+    };
+
+    let invalid = cli(&[
+        "--json",
+        "extension",
+        "install-git",
+        &remote_url,
+        "--rev",
+        "main",
+    ]);
+    assert_eq!(invalid.status.code(), Some(1));
+    let invalid: Value = serde_json::from_slice(&invalid.stderr).unwrap();
+    assert_eq!(invalid["error"]["code"], "extension_git_install_failed");
+    assert!(
+        invalid["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("exact full")
+    );
+    assert!(!data.join("fut/extensions/index.json").exists());
+
+    let installed = cli(&[
+        "--json",
+        "extension",
+        "install-git",
+        &remote_url,
+        "--rev",
+        &first_commit,
+    ]);
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let installed: Value = serde_json::from_slice(&installed.stdout).unwrap();
+    assert_eq!(installed["command"], "extension.install-git");
+    assert_eq!(installed["result"]["extension"]["id"], "remote-test");
+    assert_eq!(
+        installed["result"]["extension"]["provenance"]["kind"],
+        "git"
+    );
+    assert_eq!(
+        installed["result"]["extension"]["provenance"]["remote_url"],
+        remote_url
+    );
+    assert_eq!(
+        installed["result"]["extension"]["provenance"]["commit"],
+        first_commit
+    );
+    assert!(installed["result"]["extension"].get("source").is_none());
+    assert_eq!(installed["result"]["scripts_executed"], false);
+    let first_path = PathBuf::from(
+        installed["result"]["extension"]["install_path"]
+            .as_str()
+            .unwrap(),
+    );
+    let first_digest = installed["result"]["extension"]["content_sha256"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(first_path.is_dir());
+
+    fs::write(
+        source.join("fut-extension.toml"),
+        r#"
+api_version = 1
+version = "2.0.0"
+fut = ">=0.7.0, <1.0.0"
+capabilities = []
+id = "remote-test"
+"#,
+    )
+    .unwrap();
+    fs::write(source.join("content.txt"), "second\n").unwrap();
+    git(&source, &["add", "."]);
+    git(&source, &["commit", "-m", "second"]);
+    let second_commit = git_stdout(&source, &["rev-parse", "HEAD"]);
+    git(&source, &["push", remote.to_str().unwrap(), "HEAD:main"]);
+
+    let index_path = data.join("fut/extensions/index.json");
+    let old_index = fs::read(&index_path).unwrap();
+    let mismatch = cli(&[
+        "--json",
+        "extension",
+        "update",
+        "remote-test",
+        "--rev",
+        &second_commit,
+        "--sha256",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+    ]);
+    assert_eq!(mismatch.status.code(), Some(1));
+    let mismatch: Value = serde_json::from_slice(&mismatch.stderr).unwrap();
+    assert_eq!(mismatch["error"]["code"], "extension_git_update_failed");
+    assert!(
+        mismatch["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("SHA-256 mismatch")
+    );
+    assert_eq!(fs::read(&index_path).unwrap(), old_index);
+    assert!(first_path.is_dir());
+
+    let updated = cli(&[
+        "--json",
+        "extension",
+        "update",
+        "remote-test",
+        "--rev",
+        &second_commit,
+    ]);
+    assert!(
+        updated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&updated.stderr)
+    );
+    let updated: Value = serde_json::from_slice(&updated.stdout).unwrap();
+    assert_eq!(updated["command"], "extension.update");
+    assert_eq!(updated["result"]["previous"]["version"], "1.0.0");
+    assert_eq!(updated["result"]["extension"]["version"], "2.0.0");
+    assert_eq!(
+        updated["result"]["previous"]["provenance"]["commit"],
+        first_commit
+    );
+    assert_eq!(
+        updated["result"]["extension"]["provenance"]["commit"],
+        second_commit
+    );
+    assert_ne!(
+        updated["result"]["extension"]["content_sha256"],
+        first_digest
+    );
+    assert!(first_path.is_dir(), "superseded bytes remain immutable");
+
+    fs::rename(&remote, root.path().join("remote-offline.git")).unwrap();
+    let removed = cli(&["--json", "extension", "remove", "remote-test"]);
+    assert!(removed.status.success());
+    assert!(
+        serde_json::from_slice::<Value>(&fs::read(&index_path).unwrap()).unwrap()["extensions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]

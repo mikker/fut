@@ -3,13 +3,16 @@
 use std::{
     collections::HashSet,
     env,
+    ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{self, Read, Write},
     os::unix::{
         ffi::OsStrExt,
         fs::{OpenOptionsExt, PermissionsExt},
     },
     path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -17,6 +20,12 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    process::{Child, Command},
+    task::JoinHandle,
+    time,
+};
 use uuid::Uuid;
 
 use crate::extensions;
@@ -28,6 +37,9 @@ const MAX_INDEX_BYTES: u64 = 1024 * 1024;
 const MAX_MANAGED_EXTENSIONS: usize = 32;
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_VERSION_BYTES: usize = 128;
+const MAX_REMOTE_URL_BYTES: usize = 4096;
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const GIT_OUTPUT_LIMIT: usize = 256 * 1024;
 
 pub(crate) const MAX_PACKAGE_FILES: usize = 1024;
 pub(crate) const MAX_PACKAGE_ENTRIES: usize = 2048;
@@ -39,16 +51,45 @@ pub(crate) const MAX_PACKAGE_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) struct ManagedExtension {
     pub(crate) id: String,
     pub(crate) version: String,
-    pub(crate) source: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) provenance: Option<ExtensionProvenance>,
     pub(crate) content_sha256: String,
     pub(crate) install_path: PathBuf,
     pub(crate) enabled: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum ExtensionProvenance {
+    Git { remote_url: String, commit: String },
+}
+
+impl ExtensionProvenance {
+    fn git(&self) -> (&str, &str) {
+        match self {
+            Self::Git { remote_url, commit } => (remote_url, commit),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct InstallOrigin {
+    source: Option<PathBuf>,
+    provenance: Option<ExtensionProvenance>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StoreChange {
     pub(crate) extension: ManagedExtension,
     pub(crate) changed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GitUpdateChange {
+    pub(crate) previous: ManagedExtension,
+    pub(crate) current: StoreChange,
 }
 
 #[derive(Debug, Error)]
@@ -203,14 +244,6 @@ pub(crate) fn install(configured_source: &Path) -> Result<StoreChange> {
 
 fn install_at(configured_source: &Path, configured_store: &Path) -> Result<StoreChange> {
     let source = prepare_source(configured_source)?;
-    let initial = extensions::validate_package(&source)
-        .with_context(|| format!("validate extension package {}", source.display()))?;
-    if initial.version.len() > MAX_VERSION_BYTES {
-        bail!(
-            "extension {:?} version exceeds {MAX_VERSION_BYTES} bytes",
-            initial.id
-        );
-    }
     if configured_store.starts_with(&source) {
         bail!(
             "managed extension store {} cannot be inside source package {}",
@@ -218,45 +251,77 @@ fn install_at(configured_source: &Path, configured_store: &Path) -> Result<Store
             source.display()
         );
     }
+    let origin = InstallOrigin {
+        source: Some(source.clone()),
+        provenance: None,
+    };
+    install_prepared_at(&source, configured_store, origin, None, None)
+}
+
+fn install_prepared_at(
+    source: &Path,
+    configured_store: &Path,
+    origin: InstallOrigin,
+    expected_digest: Option<&str>,
+    expected_previous: Option<&ManagedExtension>,
+) -> Result<StoreChange> {
     let store = Store::open_for_write(configured_store)?;
     let mut index = store.read_index()?;
-    let previous = index
-        .extensions
-        .iter()
-        .find(|extension| extension.id == initial.id)
-        .cloned();
-    if previous.is_none() && index.extensions.len() >= MAX_MANAGED_EXTENSIONS {
-        bail!(
-            "managed extension store contains {} extensions; maximum is {MAX_MANAGED_EXTENSIONS}",
-            index.extensions.len()
-        );
-    }
-
-    let version_parent = ensure_package_parent(&store.root, &initial.id, &initial.version)?;
-    let staging = version_parent.join(format!(".install-{}", Uuid::new_v4()));
+    let staging = store.root.join(format!(".install-{}", Uuid::new_v4()));
     fs::create_dir(&staging)
         .with_context(|| format!("create extension staging directory {}", staging.display()))?;
 
-    let staged_result = (|| -> Result<(ManagedExtension, bool)> {
-        copy_package(&source, &staging)?;
+    let staged_result = (|| -> Result<(ManagedExtension, Option<ManagedExtension>, bool)> {
+        copy_package(source, &staging)?;
         make_tree_read_only(&staging)?;
         let staged = extensions::validate_package(&staging)
             .with_context(|| format!("validate staged extension {}", staging.display()))?;
-        if staged.id != initial.id || staged.version != initial.version {
+        if staged.version.len() > MAX_VERSION_BYTES {
             bail!(
-                "extension manifest changed while installing (expected {} {}, copied {} {})",
-                initial.id,
-                initial.version,
-                staged.id,
-                staged.version
+                "extension {:?} version exceeds {MAX_VERSION_BYTES} bytes",
+                staged.id
+            );
+        }
+        let previous = index
+            .extensions
+            .iter()
+            .find(|extension| extension.id == staged.id)
+            .cloned();
+        if let Some(expected) = expected_previous {
+            if staged.id != expected.id {
+                bail!(
+                    "Git update for extension {:?} fetched package {:?}",
+                    expected.id,
+                    staged.id
+                );
+            }
+            if previous.as_ref() != Some(expected) {
+                bail!(
+                    "managed extension {:?} changed while its Git update was being staged",
+                    expected.id
+                );
+            }
+        }
+        if previous.is_none() && index.extensions.len() >= MAX_MANAGED_EXTENSIONS {
+            bail!(
+                "managed extension store contains {} extensions; maximum is {MAX_MANAGED_EXTENSIONS}",
+                index.extensions.len()
             );
         }
         let digest = hash_package(&staging)?;
+        if expected_digest.is_some_and(|expected| expected != digest) {
+            bail!(
+                "extension content SHA-256 mismatch: expected {}, got {digest}",
+                expected_digest.expect("checked expected digest")
+            );
+        }
+        let version_parent = ensure_package_parent(&store.root, &staged.id, &staged.version)?;
         let install_path = version_parent.join(&digest);
         let metadata = ManagedExtension {
             id: staged.id,
             version: staged.version,
-            source: source.clone(),
+            source: origin.source.clone(),
+            provenance: origin.provenance.clone(),
             content_sha256: digest,
             install_path: install_path.clone(),
             enabled: previous.as_ref().is_some_and(|extension| extension.enabled),
@@ -273,6 +338,18 @@ fn install_at(configured_source: &Path, configured_store: &Path) -> Result<Store
                 false
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // macOS requires write permission on a directory when moving
+                // it between parents so it can update the directory's `..`
+                // entry. The package hash excludes its root mode; restore the
+                // immutable mode immediately after the atomic rename.
+                fs::set_permissions(&staging, fs::Permissions::from_mode(0o755)).with_context(
+                    || {
+                        format!(
+                            "prepare staged extension for atomic rename {}",
+                            staging.display()
+                        )
+                    },
+                )?;
                 fs::rename(&staging, &install_path).with_context(|| {
                     format!(
                         "atomically install staged extension {} at {}",
@@ -280,6 +357,17 @@ fn install_at(configured_source: &Path, configured_store: &Path) -> Result<Store
                         install_path.display()
                     )
                 })?;
+                if let Err(error) =
+                    fs::set_permissions(&install_path, fs::Permissions::from_mode(0o555))
+                {
+                    let _ = remove_tree(&install_path);
+                    return Err(error).with_context(|| {
+                        format!(
+                            "make installed extension root read-only {}",
+                            install_path.display()
+                        )
+                    });
+                }
                 true
             }
             Err(error) => {
@@ -288,10 +376,10 @@ fn install_at(configured_source: &Path, configured_store: &Path) -> Result<Store
                 });
             }
         };
-        Ok((metadata, created))
+        Ok((metadata, previous, created))
     })();
 
-    let (metadata, created) = match staged_result {
+    let (metadata, previous, created) = match staged_result {
         Ok(result) => result,
         Err(error) => {
             let _ = remove_tree(&staging);
@@ -329,6 +417,261 @@ fn install_at(configured_source: &Path, configured_store: &Path) -> Result<Store
         extension: metadata,
         changed,
     })
+}
+
+/// Fetch one exact Git commit into an isolated checkout and pass its files
+/// through the same bounded package installer used by local sources.
+pub(crate) async fn install_git(
+    remote_url: &str,
+    revision: &str,
+    expected_digest: Option<&str>,
+) -> Result<StoreChange> {
+    validate_remote_url(remote_url)?;
+    let commit = normalize_commit(revision)?;
+    if let Some(digest) = expected_digest {
+        validate_digest(digest).context("invalid expected extension content SHA-256")?;
+    }
+    let configured_store = default_store_root()?
+        .context("cannot resolve managed extension store; set absolute XDG_DATA_HOME or HOME")?;
+    let checkout = acquire_git_checkout(remote_url, &commit).await?;
+    let source = prepare_source(checkout.path())?;
+    install_prepared_at(
+        &source,
+        &configured_store,
+        InstallOrigin {
+            source: None,
+            provenance: Some(ExtensionProvenance::Git {
+                remote_url: remote_url.to_owned(),
+                commit,
+            }),
+        },
+        expected_digest,
+        None,
+    )
+}
+
+/// Update only an existing Git-sourced extension, using its recorded remote
+/// and a newly supplied exact commit. The index is checked again after the
+/// fetch so a concurrent mutation cannot be overwritten.
+pub(crate) async fn update_git(
+    id: &str,
+    revision: &str,
+    expected_digest: Option<&str>,
+) -> Result<GitUpdateChange> {
+    validate_id(id)?;
+    let commit = normalize_commit(revision)?;
+    if let Some(digest) = expected_digest {
+        validate_digest(digest).context("invalid expected extension content SHA-256")?;
+    }
+    let configured_store = default_store_root()?
+        .context("cannot resolve managed extension store; set absolute XDG_DATA_HOME or HOME")?;
+    let existing = {
+        let store = Store::open_existing(&configured_store)?
+            .with_context(|| format!("managed extension {id:?} is not installed"))?;
+        store
+            .read_index()?
+            .extensions
+            .into_iter()
+            .find(|extension| extension.id == id)
+            .with_context(|| format!("managed extension {id:?} is not installed"))?
+    };
+    let (remote_url, previous_commit) = existing
+        .provenance
+        .as_ref()
+        .map(ExtensionProvenance::git)
+        .with_context(|| {
+            format!(
+                "managed extension {id:?} was installed from a local path and cannot be updated from Git"
+            )
+        })?;
+    if commit == previous_commit {
+        bail!(
+            "Git update for extension {id:?} must supply a commit different from its installed commit {previous_commit}"
+        );
+    }
+    let remote_url = remote_url.to_owned();
+    let checkout = acquire_git_checkout(&remote_url, &commit).await?;
+    let source = prepare_source(checkout.path())?;
+    let current = install_prepared_at(
+        &source,
+        &configured_store,
+        InstallOrigin {
+            source: None,
+            provenance: Some(ExtensionProvenance::Git { remote_url, commit }),
+        },
+        expected_digest,
+        Some(&existing),
+    )?;
+    Ok(GitUpdateChange {
+        previous: existing,
+        current,
+    })
+}
+
+async fn acquire_git_checkout(remote_url: &str, commit: &str) -> Result<tempfile::TempDir> {
+    let checkout = tempfile::Builder::new()
+        .prefix("fut-extension-git-")
+        .tempdir()
+        .context("create temporary Git extension checkout")?;
+    let init_arguments = if commit.len() == 64 {
+        vec!["init", "--quiet", "--object-format=sha256"]
+    } else {
+        vec!["init", "--quiet"]
+    };
+    git_success(
+        run_git(checkout.path(), &init_arguments).await?,
+        "initialize temporary repository",
+    )?;
+    git_success(
+        run_git(
+            checkout.path(),
+            &[
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--depth=1",
+                "--no-recurse-submodules",
+                "--",
+                remote_url,
+                commit,
+            ],
+        )
+        .await?,
+        "fetch pinned extension commit",
+    )?;
+
+    let peeled = format!("{commit}^{{commit}}");
+    let resolved = git_success(
+        run_git(checkout.path(), &["rev-parse", "--verify", &peeled]).await?,
+        "verify fetched extension commit",
+    )?;
+    let resolved = required_git_line(&resolved.stdout, "resolved commit")?;
+    if resolved != commit.as_bytes() {
+        bail!(
+            "fetched Git object did not resolve to requested commit {commit} (got {})",
+            String::from_utf8_lossy(resolved)
+        );
+    }
+
+    let tree = git_success(
+        run_git(
+            checkout.path(),
+            &[
+                "ls-tree",
+                "-r",
+                "-t",
+                "--format=%(objectmode) %(objectsize)",
+                commit,
+            ],
+        )
+        .await?,
+        "inspect extension tree",
+    )?;
+    inspect_git_tree(&tree.stdout, commit)?;
+
+    git_success(
+        run_git(
+            checkout.path(),
+            &[
+                "checkout",
+                "--quiet",
+                "--detach",
+                "--force",
+                "--no-recurse-submodules",
+                commit,
+            ],
+        )
+        .await?,
+        "check out pinned extension commit",
+    )?;
+    remove_tree(&checkout.path().join(".git"))
+        .context("remove temporary Git metadata before package installation")?;
+    normalize_checkout_permissions(checkout.path())?;
+    Ok(checkout)
+}
+
+fn inspect_git_tree(output: &[u8], commit: &str) -> Result<()> {
+    let mut entries = 0_usize;
+    let mut files = 0_usize;
+    let mut bytes = 0_u64;
+    for line in output
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        entries += 1;
+        if entries > MAX_PACKAGE_ENTRIES {
+            bail!(
+                "Git extension commit {commit} contains more than {MAX_PACKAGE_ENTRIES} filesystem entries"
+            );
+        }
+        let separator = line
+            .iter()
+            .position(|byte| *byte == b' ')
+            .with_context(|| format!("Git returned an invalid tree entry for commit {commit}"))?;
+        let (mode, size) = (&line[..separator], &line[separator + 1..]);
+        if mode == b"160000" {
+            bail!(
+                "Git extension commit {commit} contains a submodule; submodules are not installed"
+            );
+        }
+        if mode == b"040000" {
+            continue;
+        }
+        if !matches!(mode, b"100644" | b"100755" | b"120000") {
+            bail!(
+                "Git extension commit {commit} contains unsupported tree mode {}",
+                String::from_utf8_lossy(mode)
+            );
+        }
+        files += 1;
+        if files > MAX_PACKAGE_FILES {
+            bail!("Git extension commit {commit} contains more than {MAX_PACKAGE_FILES} files");
+        }
+        let size = std::str::from_utf8(size)
+            .context("Git returned a non-UTF-8 tree object size")?
+            .parse::<u64>()
+            .context("Git returned an invalid tree object size")?;
+        if size > MAX_PACKAGE_FILE_BYTES {
+            bail!(
+                "Git extension commit {commit} contains a {size}-byte file; maximum is {MAX_PACKAGE_FILE_BYTES}"
+            );
+        }
+        bytes = bytes
+            .checked_add(size)
+            .context("Git extension package total size overflow")?;
+        if bytes > MAX_PACKAGE_TOTAL_BYTES {
+            bail!(
+                "Git extension commit {commit} contents exceed the {MAX_PACKAGE_TOTAL_BYTES}-byte total maximum"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn normalize_checkout_permissions(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect Git checkout entry {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    if metadata.file_type().is_dir() {
+        for entry in fs::read_dir(path)
+            .with_context(|| format!("read Git checkout directory {}", path.display()))?
+        {
+            normalize_checkout_permissions(&entry?.path())?;
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("normalize Git checkout directory {}", path.display()))?;
+    } else if metadata.file_type().is_file() {
+        let mode = if metadata.permissions().mode() & 0o111 == 0 {
+            0o644
+        } else {
+            0o755
+        };
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+            .with_context(|| format!("normalize Git checkout file {}", path.display()))?;
+    }
+    Ok(())
 }
 
 pub(crate) fn enable(id: &str) -> std::result::Result<StoreChange, StoreMutationError> {
@@ -610,11 +953,40 @@ fn validate_index(root: &Path, index: &StoreIndex) -> Result<()> {
                 extension.id
             )
         })?;
-        validate_path("managed extension source", &extension.source)?;
-        validate_path("managed extension install_path", &extension.install_path)?;
-        if !extension.source.is_absolute() || !extension.install_path.is_absolute() {
+        if extension.source.is_some() == extension.provenance.is_some() {
             bail!(
-                "managed extension {:?} source and install_path must be absolute",
+                "managed extension {:?} must have exactly one local source or remote provenance",
+                extension.id
+            );
+        }
+        if let Some(source) = &extension.source {
+            validate_path("managed extension source", source)?;
+            if !source.is_absolute() {
+                bail!(
+                    "managed extension {:?} source must be absolute",
+                    extension.id
+                );
+            }
+        }
+        if let Some(provenance) = &extension.provenance {
+            let (remote_url, commit) = provenance.git();
+            validate_remote_url(remote_url).with_context(|| {
+                format!(
+                    "managed extension {:?} has invalid Git remote URL",
+                    extension.id
+                )
+            })?;
+            validate_commit(commit).with_context(|| {
+                format!(
+                    "managed extension {:?} has invalid Git commit",
+                    extension.id
+                )
+            })?;
+        }
+        validate_path("managed extension install_path", &extension.install_path)?;
+        if !extension.install_path.is_absolute() {
+            bail!(
+                "managed extension {:?} install_path must be absolute",
                 extension.id
             );
         }
@@ -1088,6 +1460,251 @@ fn validate_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_remote_url(remote_url: &str) -> Result<()> {
+    if remote_url.is_empty() || remote_url.len() > MAX_REMOTE_URL_BYTES {
+        bail!("Git remote URL must be 1 through {MAX_REMOTE_URL_BYTES} bytes");
+    }
+    if remote_url.bytes().any(|byte| byte.is_ascii_control()) {
+        bail!("Git remote URL must not contain control characters");
+    }
+    if !(remote_url.starts_with("https://") || remote_url.starts_with("file:///")) {
+        bail!("Git remote URL must use https:// or an absolute file:/// URL");
+    }
+    if remote_url.contains(['?', '#']) {
+        bail!("Git remote URL must not contain a query or fragment");
+    }
+    if let Some(authority) = remote_url
+        .strip_prefix("https://")
+        .and_then(|rest| rest.split('/').next())
+        && authority.contains('@')
+    {
+        bail!("Git remote URL must not embed credentials");
+    }
+    Ok(())
+}
+
+fn normalize_commit(revision: &str) -> Result<String> {
+    if !matches!(revision.len(), 40 | 64) || !revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("Git revision must be an exact full 40- or 64-character hexadecimal commit SHA");
+    }
+    Ok(revision.to_ascii_lowercase())
+}
+
+fn validate_commit(commit: &str) -> Result<()> {
+    if !matches!(commit.len(), 40 | 64)
+        || !commit
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        bail!("Git commit must be a canonical full lowercase hexadecimal SHA");
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct GitOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+async fn run_git(cwd: &Path, arguments: &[&str]) -> Result<GitOutput> {
+    run_git_with(OsStr::new("git"), GIT_COMMAND_TIMEOUT, cwd, arguments).await
+}
+
+async fn run_git_with(
+    git_executable: &OsStr,
+    command_timeout: Duration,
+    cwd: &Path,
+    arguments: &[&str],
+) -> Result<GitOutput> {
+    let mut command = Command::new(git_executable);
+    sanitize_git_environment(&mut command, env::vars_os());
+    command
+        .args(["-c", "core.hooksPath=/dev/null"])
+        .args(["-c", "credential.helper="])
+        .args(["-c", "filter.lfs.smudge="])
+        .args(["-c", "filter.lfs.required=false"])
+        .args(arguments)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .env("GIT_ALLOW_PROTOCOL", "https:file")
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_ATTRIBUTES_FILE", null_device())
+        .env("GIT_CONFIG_GLOBAL", null_device())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_LFS_SKIP_SMUDGE", "1")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_PROTOCOL_FROM_USER", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C");
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command.spawn().map_err(|error| match error.kind() {
+        io::ErrorKind::NotFound => anyhow::anyhow!("Git executable was not found"),
+        _ => anyhow::anyhow!(error).context("start bounded Git command"),
+    })?;
+    let process_group = child.id();
+    let stdout = child.stdout.take().expect("piped Git stdout");
+    let stderr = child.stderr.take().expect("piped Git stderr");
+    let mut stdout = tokio::spawn(read_git_output(stdout));
+    let mut stderr = tokio::spawn(read_git_output(stderr));
+    let result = time::timeout(command_timeout, async {
+        let status = child.wait().await.context("wait for Git command")?;
+        let stdout = (&mut stdout)
+            .await
+            .context("Git stdout reader stopped unexpectedly")??;
+        let stderr = (&mut stderr)
+            .await
+            .context("Git stderr reader stopped unexpectedly")??;
+        Ok(GitOutput {
+            status,
+            stdout,
+            stderr,
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(error)) => {
+            clean_up_git(&mut child, process_group, &mut stdout, &mut stderr).await;
+            Err(error)
+        }
+        Err(_) => {
+            clean_up_git(&mut child, process_group, &mut stdout, &mut stderr).await;
+            bail!("Git command timed out after {command_timeout:?}")
+        }
+    }
+}
+
+fn sanitize_git_environment(
+    command: &mut Command,
+    inherited: impl IntoIterator<Item = (OsString, OsString)>,
+) {
+    const GIT_ENVIRONMENT: &[&str] = &[
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_INDEX_VERSION",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_EXEC_PATH",
+        "GIT_TEMPLATE_DIR",
+        "GIT_CONFIG",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_ATTRIBUTES_FILE",
+        "GIT_ATTR_NOSYSTEM",
+        "GIT_ALLOW_PROTOCOL",
+        "GIT_PROTOCOL_FROM_USER",
+        "GIT_LFS_SKIP_SMUDGE",
+        "GIT_OPTIONAL_LOCKS",
+        "GIT_TERMINAL_PROMPT",
+        "GIT_ASKPASS",
+        "GIT_SSH",
+        "GIT_SSH_COMMAND",
+        "GIT_PROXY_COMMAND",
+        "GIT_EXTERNAL_DIFF",
+    ];
+    for variable in GIT_ENVIRONMENT {
+        command.env_remove(variable);
+    }
+    for (name, _) in inherited {
+        if name.to_str().is_some_and(|name| {
+            name.starts_with("GIT_CONFIG_KEY_") || name.starts_with("GIT_CONFIG_VALUE_")
+        }) {
+            command.env_remove(name);
+        }
+    }
+}
+
+async fn read_git_output(mut reader: impl AsyncRead + Unpin) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    let mut oversized = false;
+    loop {
+        let read = reader.read(&mut chunk).await.context("read Git output")?;
+        if read == 0 {
+            break;
+        }
+        if output.len() + read > GIT_OUTPUT_LIMIT {
+            oversized = true;
+        } else if !oversized {
+            output.extend_from_slice(&chunk[..read]);
+        }
+    }
+    if oversized {
+        bail!("Git output exceeded {GIT_OUTPUT_LIMIT} bytes");
+    }
+    Ok(output)
+}
+
+async fn clean_up_git<R>(
+    child: &mut Child,
+    process_group: Option<u32>,
+    stdout: &mut JoinHandle<R>,
+    stderr: &mut JoinHandle<R>,
+) {
+    #[cfg(unix)]
+    if let Some(pid) = process_group {
+        // Each Git process is its group's leader, so this also terminates
+        // remote helpers and any descendants retaining inherited pipes.
+        unsafe {
+            let pgid = pid as libc::pid_t;
+            if pgid > 0 && pgid != libc::getpgrp() {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    stdout.abort();
+    stderr.abort();
+    let _ = stdout.await;
+    let _ = stderr.await;
+}
+
+fn git_success(output: GitOutput, operation: &str) -> Result<GitOutput> {
+    if output.status.success() {
+        Ok(output)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "could not {operation} (Git status {:?}): {}",
+            output.status.code(),
+            stderr.trim_end()
+        )
+    }
+}
+
+fn required_git_line<'a>(output: &'a [u8], kind: &str) -> Result<&'a [u8]> {
+    let line = output.strip_suffix(b"\n").unwrap_or(output);
+    if line.is_empty() || line.contains(&0) || line.contains(&b'\n') {
+        bail!("Git returned invalid or missing {kind}");
+    }
+    Ok(line)
+}
+
+#[cfg(unix)]
+fn null_device() -> &'static OsStr {
+    OsStr::new("/dev/null")
+}
+
+#[cfg(not(unix))]
+fn null_device() -> &'static OsStr {
+    OsStr::new("NUL")
+}
+
 fn validate_digest(digest: &str) -> Result<()> {
     if digest.len() != 64
         || !digest
@@ -1152,8 +1769,9 @@ mod tests {
         assert_eq!(installed.extension.version, "1.2.3");
         assert_eq!(
             installed.extension.source,
-            fs::canonicalize(&source).unwrap()
+            Some(fs::canonicalize(&source).unwrap())
         );
+        assert_eq!(installed.extension.provenance, None);
         assert!(installed.extension.install_path.is_dir());
         assert_eq!(installed.extension.content_sha256.len(), 64);
         assert_eq!(
@@ -1286,5 +1904,73 @@ mod tests {
         let error = install_at(&source, &store_root).unwrap_err().to_string();
         assert!(error.contains("not a real directory"), "{error}");
         assert!(fs::read_dir(outside).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn git_revisions_urls_and_trees_are_narrowly_validated() {
+        assert_eq!(
+            normalize_commit("ABCDEF0123456789ABCDEF0123456789ABCDEF01").unwrap(),
+            "abcdef0123456789abcdef0123456789abcdef01"
+        );
+        for revision in ["main", "HEAD", "abcdef0", "refs/tags/v1"] {
+            assert!(normalize_commit(revision).is_err(), "accepted {revision:?}");
+        }
+        assert!(validate_remote_url("https://example.invalid/extension.git").is_ok());
+        assert!(validate_remote_url("file:///tmp/extension.git").is_ok());
+        for url in [
+            "/tmp/extension.git",
+            "file://relative/path",
+            "ssh://example.invalid/extension.git",
+            "ext::sh -c bad",
+            "https://token@example.invalid/extension.git",
+            "https://example.invalid/extension.git?token=secret",
+            "https://example.invalid/extension.git#main",
+        ] {
+            assert!(validate_remote_url(url).is_err(), "accepted {url:?}");
+        }
+
+        let error = inspect_git_tree(b"040000 12\n160000 0\n", &"a".repeat(40))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("submodule"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn timed_out_git_process_kills_its_descendants() {
+        let temporary = tempfile::tempdir().unwrap();
+        let fake_git = temporary.path().join("git");
+        fs::write(
+            &fake_git,
+            "#!/bin/sh\nsleep 10 &\necho $! > descendant.pid\nwait\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_git, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = run_git_with(
+            fake_git.as_os_str(),
+            Duration::from_millis(500),
+            temporary.path(),
+            &["fetch"],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("timed out"), "{error}");
+
+        let pid: libc::pid_t = fs::read_to_string(temporary.path().join("descendant.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        for _ in 0..100 {
+            if unsafe { libc::kill(pid, 0) } == -1
+                && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                return;
+            }
+            time::sleep(Duration::from_millis(10)).await;
+        }
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        panic!("Git descendant {pid} survived process-group cleanup");
     }
 }

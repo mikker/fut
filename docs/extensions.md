@@ -8,17 +8,18 @@ permalink: /extensions/
 # Extensions
 
 > **TL;DR:** Install a reviewed local package with `fut extension install
-> PATH`, enable its ID, then run `fut extension reload`. Extensions are trusted
-> code that may execute programs with your user permissions.
+> PATH`, or one exact Git commit with `fut extension install-git URL --rev
+> COMMIT`; enable its ID, then run `fut extension reload`. Extensions are
+> trusted code that may execute programs with your user permissions.
 
 Extensions are trusted local packages that add command-palette actions,
 lifecycle hooks, and presentation values without changing Fut
 itself. They are ordinary directories containing a strict TOML manifest and,
 usually, a few executables.
 
-Fut never discovers or downloads extensions. You can either copy a local
-package into Fut's managed store or choose a directory explicitly by absolute
-path:
+Fut never discovers extensions or checks for updates. You can copy a local
+package into Fut's managed store, fetch one explicitly named immutable Git
+commit, or choose a directory explicitly by absolute path:
 
 ```toml
 extensions = [
@@ -91,6 +92,67 @@ Installation is not an endorsement or a sandbox. Enabling a managed extension
 is the same executable trust decision as adding an explicit root: its declared
 commands and hooks run with your user permissions. Review the copied local code
 before enabling it.
+
+## Install a pinned Git package
+
+Fut supports one deliberately narrow remote workflow for repositories served
+over HTTPS or an absolute `file:///` URL:
+
+```sh
+fut extension install-git https://example.com/review-status.git \
+  --rev 0123456789abcdef0123456789abcdef01234567
+fut extension enable review-status
+fut extension reload
+```
+
+`--rev` is required and accepts only a full 40- or 64-character hexadecimal
+commit SHA. Branches, tags, abbreviated SHAs, and `HEAD` are rejected. The
+fetched object must itself be that commit, so a tag object cannot stand in for
+one. There is no registry, package-name lookup, dependency resolution, or
+background update check.
+
+Git acquisition happens in a private temporary directory with a per-command
+timeout and output limit. Fut fetches only the named commit, without tags or
+submodules, checks it out detached, and removes Git metadata before handing the
+tree to the normal package installer. Git and package hooks, credential
+helpers, submodules, LFS smudge filters, installer scripts, and build scripts
+are not run. Only HTTPS and absolute local-file remotes are accepted. The tree
+is rejected before installation if it exceeds the package entry or byte limits,
+contains a submodule, symbolic link, or special file, or has an invalid
+manifest.
+
+Git checkout permissions are normalized from Git's executable bit before Fut
+computes its usual package SHA-256. To require bytes published by a package
+author, pass that installed-content digest explicitly:
+
+```sh
+fut extension install-git https://example.com/review-status.git \
+  --rev 0123456789abcdef0123456789abcdef01234567 \
+  --sha256 89abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567
+```
+
+A mismatch leaves any installed package with that ID selected and unchanged.
+The strict store index records the remote URL, canonical commit, normalized
+content digest, immutable install path, version, and enabled state. Local
+entries from `fut extension install PATH` retain their existing `source`
+record.
+
+Updates are equally explicit. `update` is available only for a package already
+installed from Git, reuses its recorded remote URL, requires a different full
+commit SHA, and accepts the same optional digest check:
+
+```sh
+fut extension update review-status \
+  --rev fedcba9876543210fedcba9876543210fedcba98 \
+  --sha256 76543210fedcba9876543210fedcba9876543210fedcba9876543210fedcba98
+fut extension reload
+```
+
+The result reports the old and new version, commit, and content digest. Fetch,
+digest, compatibility, manifest, or index failures preserve the installed and
+active version. Installation and update never reload automatically. Once a
+commit is installed, normal loading, catalog listing, enable/disable, and
+removal use only the local store and do not contact the recorded remote.
 
 ## Inspect, validate, and reload
 

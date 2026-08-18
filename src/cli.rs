@@ -773,6 +773,29 @@ enum ExtensionCommand {
         #[arg(value_name = "PATH", value_hint = ValueHint::DirPath)]
         path: PathBuf,
     },
+    /// Fetch and install one exact commit from an explicit Git remote.
+    InstallGit {
+        /// HTTPS or absolute file URL of the Git repository.
+        #[arg(value_name = "URL")]
+        url: String,
+        /// Exact full commit SHA; branches, tags, and HEAD are rejected.
+        #[arg(long, value_name = "COMMIT")]
+        rev: String,
+        /// Expected SHA-256 of Fut's normalized installed package content.
+        #[arg(long, value_name = "DIGEST")]
+        sha256: Option<String>,
+    },
+    /// Replace a Git-installed extension with a newly supplied exact commit.
+    Update {
+        /// Installed Git extension ID.
+        id: String,
+        /// New exact full commit SHA; branches, tags, and HEAD are rejected.
+        #[arg(long, value_name = "COMMIT")]
+        rev: String,
+        /// Expected SHA-256 of Fut's normalized installed package content.
+        #[arg(long, value_name = "DIGEST")]
+        sha256: Option<String>,
+    },
     /// Include an installed managed extension in future loads.
     Enable {
         /// Installed managed extension ID.
@@ -919,6 +942,12 @@ async fn execute(cli: Cli) -> Result<()> {
             }
             ExtensionCommand::Install { path } => {
                 return install_extension_package(path, cli.json);
+            }
+            ExtensionCommand::InstallGit { url, rev, sha256 } => {
+                return install_git_extension_package(url, rev, sha256.as_deref(), cli.json).await;
+            }
+            ExtensionCommand::Update { id, rev, sha256 } => {
+                return update_git_extension_package(id, rev, sha256.as_deref(), cli.json).await;
             }
             ExtensionCommand::Enable { id } => {
                 return mutate_managed_extension(id, true, cli.json);
@@ -1904,6 +1933,8 @@ async fn execute(cli: Cli) -> Result<()> {
             command:
                 ExtensionCommand::Validate { .. }
                 | ExtensionCommand::Install { .. }
+                | ExtensionCommand::InstallGit { .. }
+                | ExtensionCommand::Update { .. }
                 | ExtensionCommand::Enable { .. }
                 | ExtensionCommand::Disable { .. }
                 | ExtensionCommand::Remove { .. },
@@ -2017,6 +2048,104 @@ fn install_extension_package(path: &std::path::Path, json_output: bool) -> Resul
             extension.install_path,
         ),
     )
+}
+
+async fn install_git_extension_package(
+    url: &str,
+    revision: &str,
+    expected_digest: Option<&str>,
+    json_output: bool,
+) -> Result<()> {
+    let change = crate::extension_store::install_git(url, revision, expected_digest)
+        .await
+        .map_err(|error| {
+            CliError::new(
+                "extension_git_install_failed",
+                format!("could not install extension from Git: {error:#}"),
+            )
+        })?;
+    let extension = &change.extension;
+    let (remote_url, commit) = git_extension_provenance(extension)
+        .expect("a successful Git install records Git provenance");
+    output(
+        json_output,
+        "extension.install-git",
+        json!({
+            "extension": extension,
+            "changed": change.changed,
+            "scripts_executed": false,
+            "trust": EXTENSION_TRUST,
+            "reload_required": extension.enabled,
+        }),
+        format!(
+            "installed Git extension {} version={} enabled={} changed={} sha256={} remote={remote_url:?} commit={commit} path={:?}\nNo hooks, submodules, LFS filters, package scripts, or build scripts were executed. Installed extensions are trusted local code; review this package before enabling it.",
+            extension.id,
+            extension.version,
+            extension.enabled,
+            change.changed,
+            extension.content_sha256,
+            extension.install_path,
+        ),
+    )
+}
+
+async fn update_git_extension_package(
+    id: &str,
+    revision: &str,
+    expected_digest: Option<&str>,
+    json_output: bool,
+) -> Result<()> {
+    let update = crate::extension_store::update_git(id, revision, expected_digest)
+        .await
+        .map_err(|error| {
+            CliError::new(
+                "extension_git_update_failed",
+                format!("could not update extension from Git: {error:#}"),
+            )
+        })?;
+    let previous = &update.previous;
+    let extension = &update.current.extension;
+    let (remote_url, previous_commit) =
+        git_extension_provenance(previous).expect("Git updates start from Git provenance");
+    let (_, commit) =
+        git_extension_provenance(extension).expect("Git updates retain Git provenance");
+    output(
+        json_output,
+        "extension.update",
+        json!({
+            "previous": previous,
+            "extension": extension,
+            "changed": update.current.changed,
+            "scripts_executed": false,
+            "trust": EXTENSION_TRUST,
+            "reload_required": extension.enabled,
+        }),
+        format!(
+            "updated Git extension {} version={}->{} enabled={} changed={} sha256={}->{} remote={remote_url:?} commit={previous_commit}->{commit}\nNo hooks, submodules, LFS filters, package scripts, or build scripts were executed.{}",
+            extension.id,
+            previous.version,
+            extension.version,
+            extension.enabled,
+            update.current.changed,
+            previous.content_sha256,
+            extension.content_sha256,
+            if extension.enabled {
+                " Run `fut extension reload` to activate the updated package in a running daemon."
+            } else {
+                ""
+            },
+        ),
+    )
+}
+
+fn git_extension_provenance(
+    extension: &crate::extension_store::ManagedExtension,
+) -> Option<(&str, &str)> {
+    match extension.provenance.as_ref()? {
+        crate::extension_store::ExtensionProvenance::Git { remote_url, commit } => {
+            Some((remote_url, commit))
+        }
+    }
 }
 
 fn mutate_managed_extension(id: &str, enabled: bool, json_output: bool) -> Result<()> {
@@ -4447,7 +4576,16 @@ mod tests {
                 .map(clap::Command::get_name)
                 .collect::<Vec<_>>(),
             [
-                "list", "show", "validate", "install", "enable", "disable", "remove", "reload"
+                "list",
+                "show",
+                "validate",
+                "install",
+                "install-git",
+                "update",
+                "enable",
+                "disable",
+                "remove",
+                "reload"
             ]
         );
         let validate = extension.find_subcommand("validate").unwrap();
@@ -4458,6 +4596,24 @@ mod tests {
                 .map(ToString::to_string)
                 .collect::<Vec<_>>(),
             ["path"]
+        );
+        let install_git = extension.find_subcommand("install-git").unwrap();
+        assert_eq!(
+            install_git
+                .get_arguments()
+                .map(clap::Arg::get_id)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["url", "rev", "sha256"]
+        );
+        let update = extension.find_subcommand("update").unwrap();
+        assert_eq!(
+            update
+                .get_arguments()
+                .map(clap::Arg::get_id)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["id", "rev", "sha256"]
         );
 
         let command = cli_command();

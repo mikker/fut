@@ -128,6 +128,8 @@ fut extension list
 fut extension show EXTENSION_ID
 fut extension validate PATH
 fut extension install PATH
+fut extension install-git URL --rev COMMIT [--sha256 DIGEST]
+fut extension update EXTENSION_ID --rev COMMIT [--sha256 DIGEST]
 fut extension enable EXTENSION_ID
 fut extension disable EXTENSION_ID
 fut extension remove EXTENSION_ID

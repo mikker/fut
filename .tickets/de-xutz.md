@@ -1,6 +1,6 @@
 ---
 id: de-xutz
-status: open
+status: closed
 deps: [de-ahh4]
 links: []
 created: 2026-08-18T19:55:11Z
@@ -22,3 +22,9 @@ Accept a narrow documented remote source form, resolve it to immutable content, 
 
 Users can install and explicitly update a package from a supported remote source; the installed bytes are pinned and auditable; checksum or compatibility failures preserve the installed and active version; offline listing/removal works; no automatic discovery, central registry, dependency resolver, or background update is added.
 
+
+## Notes
+
+**2026-08-18T22:41:41Z**
+
+Implemented explicit pinned Git installation and updates using exact full commit IDs, HTTPS/absolute file URLs, bounded isolated Git execution, strict provenance, optional content-digest verification, and rollback-safe immutable installation. Remote credentials/queries/fragments, branches, tags, hooks, LFS smudging, submodules, symlinks, special files, and automatic updates are rejected. Full test/build passed before final URL hardening; strict Clippy, store unit tests, focused Git E2E, and build passed afterward.
