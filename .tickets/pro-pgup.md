@@ -26,3 +26,7 @@ Configured projects resolve by name; a new project/worktree applies its recipe; 
 **2026-08-18T07:22:35Z**
 
 Started with the catalog foundation: strict [projects.NAME] paths, CLI open-by-name, linked-worktree identity validation, and completion. Recipes, trust, and the in-client picker remain on the parent feature.
+
+**2026-08-19T08:56:14Z**
+
+Shipped project catalog and recipe work through 21eeacb. Project opens now attach by default with an explicit background mode; daemonless project listing and CLI aliases are included. The in-client project opener remains tracked separately.
