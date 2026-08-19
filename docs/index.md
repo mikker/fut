@@ -44,6 +44,7 @@ brew install mikker/tap/fut
   - [Claude Code](agents/claude-code.md)
   - [Codex](agents/codex.md)
   - [Pi](agents/pi.md)
+- [Projects](projects.md)
 - [Configuration](configuration.md)
 - [Extensions](extensions.md)
 - [Extension authoring](extension-authoring.md)

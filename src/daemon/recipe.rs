@@ -401,10 +401,11 @@ async fn prepare_recipe(
                     .iter()
                     .map(|(name, value)| (name.clone(), value.clone())),
             );
-            let (mut program, mut argv) =
-                pane.command().map_or_else(default_shell_command, |argv| {
-                    (PathBuf::from(&argv[0]), argv[1..].to_vec())
-                });
+            let (mut program, mut argv) = match pane.command() {
+                None => default_shell_command(),
+                Some(command) if pane.exec() => (PathBuf::from(&command[0]), command[1..].to_vec()),
+                Some(command) => returning_shell_command(command),
+            };
             if focused && let Some((override_program, override_argv)) = &command_override {
                 program = override_program.clone();
                 argv = override_argv.clone();
@@ -436,6 +437,16 @@ fn default_shell_command() -> (PathBuf, Vec<String>) {
             .unwrap_or_else(|| PathBuf::from("/bin/sh")),
         Vec::new(),
     )
+}
+
+fn returning_shell_command(command: &[String]) -> (PathBuf, Vec<String>) {
+    let mut argv = vec![
+        "-c".into(),
+        r#""$@"; exec "${SHELL:-/bin/sh}""#.into(),
+        "fut-project-command".into(),
+    ];
+    argv.extend_from_slice(command);
+    (PathBuf::from("/bin/sh"), argv)
 }
 
 fn recipe_destination(
@@ -754,8 +765,7 @@ mod tests {
         let source = temporary.path().join("recipe.toml");
         fs::write(
             &source,
-            r#"version = 1
-focus = "code.agent"
+            r#"focus = "code.agent"
 environment = { LEVEL = "workspace" }
 [[tabs]]
 id = "code"
@@ -763,7 +773,7 @@ cwd = "tab-cwd"
 environment = { TAB_VALUE = "code" }
 panes = [
   { id = "editor", command = ["editor", "."] },
-  { id = "agent", cwd = "pane-cwd", environment = { LEVEL = "pane" }, command = ["agent", "--fast"], split = { target = "editor", direction = "down" } },
+  { id = "agent", cwd = "pane-cwd", environment = { LEVEL = "pane" }, command = ["agent", "--fast"], exec = true, split = { target = "editor", direction = "down" } },
 ]
 [[tabs]]
 id = "server"
@@ -827,8 +837,10 @@ auto_start = true
         assert_eq!(workspace.tabs[0].layout.leaf_ids().len(), 2);
         assert_eq!(workspace.tabs[0].panes[1].id, plan.selected.pane_id);
         assert_eq!(plan.terminals.len(), 3);
-        assert_eq!(plan.terminals[0].program, Path::new("editor"));
-        assert_eq!(plan.terminals[0].argv, ["."]);
+        assert_eq!(plan.terminals[0].program, Path::new("/bin/sh"));
+        assert_eq!(plan.terminals[0].argv[3..], ["editor", "."]);
+        assert_eq!(plan.terminals[1].program, Path::new("agent"));
+        assert_eq!(plan.terminals[1].argv, ["--fast"]);
         assert_eq!(
             plan.terminals[0].cwd,
             temporary.path().join("tab-cwd").canonicalize().unwrap()

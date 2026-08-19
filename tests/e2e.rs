@@ -7699,8 +7699,7 @@ async fn trusted_catalog_recipe_atomically_creates_linked_and_bare_workspaces_on
             fs::create_dir(checkout.join("frontend")).unwrap();
             fs::create_dir(checkout.join("agent")).unwrap();
         }
-        let recipe = r#"version = 1
-focus = "code.agent"
+        let recipe = r#"focus = "code.agent"
 environment = { PROJECT_LEVEL = "workspace", CASCADE = "workspace" }
 
 [[tabs]]
@@ -7893,8 +7892,7 @@ async fn repository_recipe_trust_change_and_untrust_apply_without_daemon_restart
         fs::create_dir_all(project.join(".fut")).unwrap();
         fs::write(
             project.join(".fut/project.toml"),
-            r#"version = 1
-tabs = [{ id = "unsafe", panes = [{ id = "unsafe", command = ["/bin/sh", "-c", "touch untrusted-marker; while :; do sleep 1; done"] }] }]
+            r#"tabs = [{ id = "unsafe", panes = [{ id = "unsafe", command = ["/bin/sh", "-c", "touch untrusted-marker; while :; do sleep 1; done"] }] }]
 "#,
         )
         .unwrap();
@@ -7965,8 +7963,7 @@ tabs = [{ id = "unsafe", panes = [{ id = "unsafe", command = ["/bin/sh", "-c", "
 
     fs::write(
         project.join(".fut/project.toml"),
-        r#"version = 1
-tabs = [{ id = "changed", panes = [{ id = "changed", command = ["/bin/sh", "-c", "touch changed-marker; while :; do sleep 1; done"] }] }]
+        r#"tabs = [{ id = "changed", panes = [{ id = "changed", command = ["/bin/sh", "-c", "touch changed-marker; while :; do sleep 1; done"] }] }]
 "#,
     )
     .unwrap();
@@ -8036,8 +8033,7 @@ async fn daemon_bootstrap_applies_the_matching_catalog_recipe_atomically() {
             let recipe = root.join("bootstrap-recipe.toml");
             fs::write(
                 &recipe,
-                r#"version = 1
-focus = "main.focus"
+                r#"focus = "main.focus"
 [[tabs]]
 id = "main"
 panes = [

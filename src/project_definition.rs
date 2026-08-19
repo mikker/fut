@@ -41,7 +41,6 @@ const MAX_ID_BYTES: usize = 64;
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WorkspaceRecipe {
-    version: u8,
     #[serde(default, deserialize_with = "deserialize_extension_config_catalog")]
     extension: BTreeMap<String, ExtensionConfigTable>,
     #[serde(default)]
@@ -70,6 +69,8 @@ pub(crate) struct RecipePane {
     id: String,
     #[serde(default)]
     command: Option<Vec<String>>,
+    #[serde(default)]
+    exec: bool,
     #[serde(default)]
     cwd: Option<PathBuf>,
     #[serde(default)]
@@ -258,6 +259,10 @@ impl RecipePane {
 
     pub(crate) fn command(&self) -> Option<&[String]> {
         self.command.as_deref()
+    }
+
+    pub(crate) const fn exec(&self) -> bool {
+        self.exec
     }
 
     pub(crate) fn cwd(&self) -> Option<&Path> {
@@ -805,9 +810,6 @@ fn storable_path(path: &Path) -> Result<&str> {
 }
 
 fn validate(recipe: &WorkspaceRecipe, extensions: &[Extension]) -> Result<()> {
-    if recipe.version != 1 {
-        bail!("unsupported recipe version {}; expected 1", recipe.version);
-    }
     if recipe.tabs.is_empty() || recipe.tabs.len() > MAX_TABS {
         bail!("recipe must contain between 1 and {MAX_TABS} tabs");
     }
@@ -939,7 +941,6 @@ mod tests {
     fn validates_named_tabs_direct_commands_splits_environment_and_focus() {
         let recipe = parse(
             r#"
-version = 1
 focus = "code.agent"
 environment = { RUST_BACKTRACE = "1" }
 
@@ -949,7 +950,7 @@ cwd = "."
 environment = { TAB = "code" }
 panes = [
   { id = "editor", command = ["nvim", "."] },
-  { id = "agent", command = ["pi", "--model", "fast"], environment = { ROLE = "agent" }, split = { target = "editor", direction = "right" } },
+  { id = "agent", command = ["pi", "--model", "fast"], exec = true, environment = { ROLE = "agent" }, split = { target = "editor", direction = "right" } },
 ]
 
 [[tabs]]
@@ -965,12 +966,13 @@ panes = [{ id = "server", command = ["mise", "run", "fresh"] }]
             "editor"
         );
         assert_eq!(recipe.tabs()[1].name(), "dev server");
+        assert!(!recipe.tabs()[0].panes()[0].exec());
+        assert!(recipe.tabs()[0].panes()[1].exec());
     }
 
     #[test]
     fn trusted_recipe_extension_config_requires_a_loaded_extension() {
         let source = r#"
-version = 1
 tabs = [{ id = "code", panes = [{ id = "shell" }] }]
 [extension.run]
 command = ["mise", "run", "dev"]
@@ -989,12 +991,11 @@ auto_start = true
     fn rejects_implicit_topology_reserved_environment_and_shellish_empty_commands() {
         for source in [
             r#"version = 1
-tabs = [{ id = "code", panes = [{ id = "one" }, { id = "two" }] }]"#,
-            r#"version = 1
-environment = { FUT_SOCKET = "hostile" }
 tabs = [{ id = "code", panes = [{ id = "one" }] }]"#,
-            r#"version = 1
-tabs = [{ id = "code", panes = [{ id = "one", command = [] }] }]"#,
+            r#"tabs = [{ id = "code", panes = [{ id = "one" }, { id = "two" }] }]"#,
+            r#"environment = { FUT_SOCKET = "hostile" }
+tabs = [{ id = "code", panes = [{ id = "one" }] }]"#,
+            r#"tabs = [{ id = "code", panes = [{ id = "one", command = [] }] }]"#,
         ] {
             assert!(parse(source).is_err(), "accepted {source}");
         }
@@ -1004,23 +1005,20 @@ tabs = [{ id = "code", panes = [{ id = "one", command = [] }] }]"#,
     fn rejects_whitespace_only_and_duplicate_effective_tab_names() {
         for (source, expected) in [
             (
-                r#"version = 1
-tabs = [
+                r#"tabs = [
   { id = "one", name = "  \t", panes = [{ id = "one" }] },
 ]"#,
                 "whitespace-only",
             ),
             (
-                r#"version = 1
-tabs = [
+                r#"tabs = [
   { id = "code", panes = [{ id = "one" }] },
   { id = "other", name = "code", panes = [{ id = "two" }] },
 ]"#,
                 "duplicate tab display name \"code\"",
             ),
             (
-                r#"version = 1
-tabs = [
+                r#"tabs = [
   { id = "one", name = "shared", panes = [{ id = "one" }] },
   { id = "two", name = "shared", panes = [{ id = "two" }] },
 ]"#,
@@ -1037,7 +1035,7 @@ tabs = [
         let temporary = tempfile::tempdir().unwrap();
         let project_root = temporary.path().join("project");
         fs::create_dir_all(project_root.join(".fut")).unwrap();
-        let source = b"version = 1\ntabs = [{ id = \"code\", panes = [{ id = \"shell\" }] }]\n";
+        let source = b"tabs = [{ id = \"code\", panes = [{ id = \"shell\" }] }]\n";
         let recipe_path = project_root.join(".fut/project.toml");
         fs::write(&recipe_path, source).unwrap();
         let digest = format!("{:x}", Sha256::digest(source));
@@ -1073,7 +1071,7 @@ tabs = [
 
         fs::write(
             &recipe_path,
-            "version = 1\ntabs = [{ id = \"changed\", panes = [{ id = \"shell\" }] }]\n",
+            "tabs = [{ id = \"changed\", panes = [{ id = \"shell\" }] }]\n",
         )
         .unwrap();
         assert!(matches!(
@@ -1104,7 +1102,7 @@ tabs = [
         let recipe_path = temporary.path().join("recipe.toml");
         fs::write(
             &recipe_path,
-            "version = 1\ntabs = [{ id = \"code\", panes = [{ id = \"shell\" }] }]\n",
+            "tabs = [{ id = \"code\", panes = [{ id = \"shell\" }] }]\n",
         )
         .unwrap();
         let project = ProjectConfig {
@@ -1129,7 +1127,7 @@ tabs = [
         fs::create_dir_all(project_root.join(".fut")).unwrap();
         fs::write(
             project_root.join(".fut/project.toml"),
-            "version = 1\ntabs = [{ id = \"code\", panes = [{ id = \"shell\" }] }]\n",
+            "tabs = [{ id = \"code\", panes = [{ id = \"shell\" }] }]\n",
         )
         .unwrap();
         let project = ProjectConfig {
@@ -1173,7 +1171,7 @@ tabs = [
         let temporary = tempfile::tempdir().unwrap();
         let project_root = temporary.path().join("project");
         fs::create_dir_all(project_root.join(".fut")).unwrap();
-        fs::write(project_root.join(".fut/project.toml"), "version = 1\n").unwrap();
+        fs::write(project_root.join(".fut/project.toml"), "").unwrap();
         let project = ProjectConfig {
             path: project_root,
             recipe: None,

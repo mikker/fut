@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Project recipe commands now return to a shell when they exit by default; set `exec = true` for the previous pane-closing behavior, and omit the former `version` field.
+
 ## 0.8
 
 - `fut open` now starts or reuses a location and attaches by default; use `-b`/`--background` for control-only opens.
