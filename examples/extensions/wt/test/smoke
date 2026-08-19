@@ -13,8 +13,9 @@ printf '%s\n' "$@" > "$CAPTURE"
 SH
 chmod +x "$TMP/wt"
 
-printf 'feature-name\n' | env \
+env \
   FUT_BIN=/opt/fut FUT_SOCKET=/tmp/fut.sock FUT_WT_BIN="$TMP/wt" \
+  FUT_EXTENSION_FORM='{"worktree":"feature-name","command":"","prompt":""}' \
   CAPTURE="$TMP/create-argv" "$HERE/bin/create" >/dev/null
 
 diff -u - "$TMP/create-argv" <<'EOF' || fail "create argv changed"
@@ -31,10 +32,39 @@ open
 feature-name
 EOF
 
-if printf 'feature-name\n' | env \
+env \
   FUT_BIN=/opt/fut FUT_SOCKET=/tmp/fut.sock FUT_WT_BIN="$TMP/wt" \
-  CAPTURE="$TMP/ignored" "$HERE/bin/create" pi 2>/dev/null; then
-  fail "obsolete post-open command was accepted"
+  FUT_EXTENSION_FORM='{"worktree":"agent-work","command":"pi --model sonnet","prompt":"start here"}' \
+  CAPTURE="$TMP/agent-argv" "$HERE/bin/create" >/dev/null
+
+diff -u - "$TMP/agent-argv" <<'EOF' || fail "agent create argv changed"
+create
+agent-work
+--
+/opt/fut
+--socket
+/tmp/fut.sock
+open
+--background
+.
+--name
+agent-work
+--
+pi
+--model
+sonnet
+start here
+EOF
+
+env FUT_BIN=/opt/fut FUT_SOCKET=/tmp/fut.sock FUT_WT_BIN="$TMP/wt" \
+  FUT_EXTENSION_FORM='{"worktree":"","command":"","prompt":""}' \
+  CAPTURE="$TMP/random-argv" "$HERE/bin/create" >/dev/null
+grep -Eq '^wt-[0-9a-f]{6}$' <(sed -n '2p' "$TMP/random-argv") || fail "blank worktree did not get a random name"
+
+if env FUT_BIN=/opt/fut FUT_SOCKET=/tmp/fut.sock FUT_WT_BIN="$TMP/wt" \
+  FUT_EXTENSION_FORM='{"worktree":"feature","command":"","prompt":"orphan"}' \
+  CAPTURE="$TMP/ignored" "$HERE/bin/create" 2>/dev/null; then
+  fail "prompt without a command was accepted"
 fi
 
 mkdir -p "$TMP/root" "$TMP/bin"

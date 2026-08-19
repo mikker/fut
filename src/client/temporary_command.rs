@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs,
     io::ErrorKind,
     path::{Path, PathBuf},
@@ -27,6 +27,7 @@ use crate::{
 use super::config::{PaletteCommand, ResolvedExtensionConfig, UiConfig, resolve_extension_config};
 
 const MAX_BACKGROUND_ERROR_BYTES: usize = 4 * 1024;
+const FUT_EXTENSION_FORM: &str = "FUT_EXTENSION_FORM";
 
 #[derive(Clone, Debug)]
 pub(super) struct ExtensionCommandContext {
@@ -53,6 +54,62 @@ impl ExtensionCommandContext {
             config: resolve_extension_config(ui, &extension.id, workspace_root, project)?,
         })
     }
+
+    pub(super) fn configured_field_default(&self, key: &str) -> anyhow::Result<Option<String>> {
+        let config: serde_json::Value = serde_json::from_str(&self.config.json)
+            .context("parse resolved extension config for command form")?;
+        let Some(value) = config.get(key) else {
+            return Ok(None);
+        };
+        match value {
+            serde_json::Value::String(value) => Ok(Some(value.clone())),
+            serde_json::Value::Array(values) if values.iter().all(serde_json::Value::is_string) => {
+                Ok(Some(
+                    values
+                        .iter()
+                        .map(|value| shell_display(value.as_str().expect("checked string")))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                ))
+            }
+            _ => anyhow::bail!(
+                "extension config {key:?} must be a string or an array of strings for a form default"
+            ),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn test() -> Self {
+        Self {
+            focused: SelectedTarget {
+                session_id: crate::domain::SessionId::new(),
+                workspace_id: crate::domain::WorkspaceId::new(),
+                tab_id: crate::domain::TabId::new(),
+                pane_id: PaneId::new(),
+                terminal_id: TerminalId::new(),
+                child_pid: 1,
+            },
+            workspace_root: PathBuf::from("/workspace"),
+            config: ResolvedExtensionConfig {
+                json: "{}".into(),
+                trusted_json: "{}".into(),
+                global_source: None,
+                project_source: None,
+                workspace_source: None,
+            },
+        }
+    }
+}
+
+fn shell_display(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&byte))
+    {
+        return value.to_owned();
+    }
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -87,6 +144,7 @@ impl TemporaryCommandSurface {
         size: TerminalSize,
         socket_path: &Path,
         extension_context: Option<&ExtensionCommandContext>,
+        form: Option<&BTreeMap<String, String>>,
     ) -> anyhow::Result<Self> {
         let crate::extensions::ExtensionCommandExecution::Interactive {
             size: popup_size,
@@ -106,6 +164,7 @@ impl TemporaryCommandSurface {
         if command.extension.is_some() {
             let context =
                 extension_context.context("extension command is missing runtime context")?;
+            add_form_environment(&mut env, form)?;
             add_extension_environment(&mut env, command, context, socket_path)?;
         }
         let terminal_id = TerminalId::new();
@@ -229,6 +288,17 @@ impl TemporaryCommandSurface {
     }
 }
 
+fn add_form_environment(
+    environment: &mut HashMap<String, String>,
+    form: Option<&BTreeMap<String, String>>,
+) -> anyhow::Result<()> {
+    environment.remove(FUT_EXTENSION_FORM);
+    if let Some(form) = form {
+        environment.insert(FUT_EXTENSION_FORM.into(), serde_json::to_string(form)?);
+    }
+    Ok(())
+}
+
 pub(super) fn dispatch_background_command(
     command: PaletteCommand,
     ui: UiConfig,
@@ -271,7 +341,9 @@ async fn run_background_command(
     socket_path: &Path,
 ) -> BackgroundCommandResult {
     let mut environment = std::env::vars().collect::<HashMap<_, _>>();
-    if let Err(error) = add_extension_environment(&mut environment, command, context, socket_path) {
+    if let Err(error) = add_form_environment(&mut environment, None)
+        .and_then(|()| add_extension_environment(&mut environment, command, context, socket_path))
+    {
         return BackgroundCommandResult::Failed(bounded_error(format!(
             "{} environment failed: {error:#}",
             command.title
@@ -565,6 +637,54 @@ mod tests {
         assert!(!path.exists());
     }
 
+    #[test]
+    fn form_environment_is_exact_and_never_inherited() {
+        let mut environment = HashMap::from([(FUT_EXTENSION_FORM.into(), "stale".into())]);
+        add_form_environment(&mut environment, None).unwrap();
+        assert!(!environment.contains_key(FUT_EXTENSION_FORM));
+
+        let form = BTreeMap::from([
+            ("command".into(), "pi --model sonnet".into()),
+            ("prompt".into(), "fix λ".into()),
+            ("worktree".into(), String::new()),
+        ]);
+        add_form_environment(&mut environment, Some(&form)).unwrap();
+        assert_eq!(
+            environment[FUT_EXTENSION_FORM],
+            r#"{"command":"pi --model sonnet","prompt":"fix λ","worktree":""}"#
+        );
+    }
+
+    #[test]
+    fn configured_form_defaults_accept_strings_and_quote_argv() {
+        let context = ExtensionCommandContext {
+            focused: SelectedTarget {
+                session_id: crate::domain::SessionId::new(),
+                workspace_id: crate::domain::WorkspaceId::new(),
+                tab_id: crate::domain::TabId::new(),
+                pane_id: PaneId::new(),
+                terminal_id: TerminalId::new(),
+                child_pid: 1,
+            },
+            workspace_root: PathBuf::from("/workspace"),
+            config: ResolvedExtensionConfig {
+                json: r#"{"command":["pi","two words","it's"]}"#.into(),
+                trusted_json: "{}".into(),
+                global_source: None,
+                project_source: None,
+                workspace_source: None,
+            },
+        };
+        assert_eq!(
+            context
+                .configured_field_default("command")
+                .unwrap()
+                .as_deref(),
+            Some("pi 'two words' 'it'\"'\"'s'")
+        );
+        assert_eq!(context.configured_field_default("missing").unwrap(), None);
+    }
+
     fn command(program: &str, args: &[&str]) -> PaletteCommand {
         PaletteCommand {
             title: "Test command".into(),
@@ -576,6 +696,7 @@ mod tests {
                 activate_opened: false,
             },
             extension: None,
+            fields: Vec::new(),
         }
     }
 
@@ -591,6 +712,7 @@ mod tests {
                 rows: 10,
             },
             Path::new("/tmp/fut-test.sock"),
+            None,
             None,
         )
         .await
@@ -621,6 +743,7 @@ mod tests {
                 },
                 Path::new("/tmp/fut-test.sock"),
                 None,
+                None,
             )
             .await
             .is_err()
@@ -640,6 +763,7 @@ mod tests {
                 rows: 10,
             },
             &socket,
+            None,
             None,
         )
         .await
@@ -722,6 +846,7 @@ mod tests {
             },
             &socket,
             Some(&context),
+            None,
         )
         .await
         .unwrap();

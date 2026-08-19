@@ -66,6 +66,7 @@ const MAX_EXTENSIONS: usize = 32;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_HOOKS: usize = 32;
 const MAX_COMMANDS: usize = 32;
+const MAX_COMMAND_FIELDS: usize = 16;
 const MAX_PRESENTATION_TOKENS: usize = 64;
 const MAX_ARGV: usize = 64;
 const MAX_IDENTIFIER_BYTES: usize = 64;
@@ -178,6 +179,7 @@ pub(crate) struct ExtensionLauncher {
     title: String,
     command: ExtensionCommand,
     execution: ExtensionCommandExecution,
+    fields: Vec<ExtensionCommandField>,
 }
 
 impl ExtensionLauncher {
@@ -196,6 +198,20 @@ impl ExtensionLauncher {
     pub(crate) const fn execution(&self) -> &ExtensionCommandExecution {
         &self.execution
     }
+
+    pub(crate) fn fields(&self) -> &[ExtensionCommandField] {
+        &self.fields
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExtensionCommandField {
+    pub(crate) name: String,
+    pub(crate) label: String,
+    pub(crate) prefix: String,
+    pub(crate) placeholder: String,
+    pub(crate) default: Option<String>,
+    pub(crate) default_config: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
@@ -409,6 +425,18 @@ fn extension_declaration(extension: &Extension) -> Result<ExtensionDeclaration> 
                     title: launcher.title.clone(),
                     argv: protocol_argv(&launcher.command.argv)?,
                     execution,
+                    fields: launcher
+                        .fields
+                        .iter()
+                        .map(|field| crate::protocol::ExtensionCommandFieldDeclaration {
+                            name: field.name.clone(),
+                            label: field.label.clone(),
+                            prefix: field.prefix.clone(),
+                            placeholder: field.placeholder.clone(),
+                            default: field.default.clone(),
+                            default_config: field.default_config.clone(),
+                        })
+                        .collect(),
                 },
             ))
         })
@@ -459,6 +487,61 @@ fn protocol_argv(argv: &[OsString]) -> Result<Vec<String>> {
         .map(|(index, value)| {
             value.to_str().map(str::to_owned).with_context(|| {
                 format!("extension argv[{index}] is not valid UTF-8 for the local protocol")
+            })
+        })
+        .collect()
+}
+
+fn validate_command_fields(
+    fields: Vec<crate::protocol::ExtensionCommandFieldDeclaration>,
+) -> Result<Vec<ExtensionCommandField>> {
+    if fields.len() > MAX_COMMAND_FIELDS {
+        bail!(
+            "extension command declares {} fields; maximum is {MAX_COMMAND_FIELDS}",
+            fields.len()
+        );
+    }
+    let mut names = HashSet::new();
+    fields
+        .into_iter()
+        .map(|field| {
+            validate_identifier("command field name", &field.name)?;
+            if !names.insert(field.name.clone()) {
+                bail!("extension command repeats field {:?}", field.name);
+            }
+            validate_title(&field.label).context("validate command field label")?;
+            for (kind, value) in [
+                ("prefix", field.prefix.as_str()),
+                ("placeholder", field.placeholder.as_str()),
+            ] {
+                if value.len() > MAX_ARG_BYTES || contains_unsafe_text(value) {
+                    bail!("command field {kind} is too large or contains a control character");
+                }
+            }
+            if field.default.is_some() && field.default_config.is_some() {
+                bail!(
+                    "command field {:?} cannot set both default and default_config",
+                    field.name
+                );
+            }
+            if let Some(value) = &field.default
+                && (value.len() > MAX_ARG_BYTES || contains_unsafe_text(value))
+            {
+                bail!(
+                    "command field {:?} default is too large or contains a control character",
+                    field.name
+                );
+            }
+            if let Some(key) = &field.default_config {
+                validate_identifier("command field default_config", key)?;
+            }
+            Ok(ExtensionCommandField {
+                name: field.name,
+                label: field.label,
+                prefix: field.prefix,
+                placeholder: field.placeholder,
+                default: field.default,
+                default_config: field.default_config,
             })
         })
         .collect()
@@ -573,10 +656,16 @@ fn extension_from_declaration(declaration: ExtensionDeclaration) -> Result<Exten
                     }
                 }
                 ExtensionCommandExecutionDeclaration::Background => {
+                    if !command.fields.is_empty() {
+                        bail!(
+                            "extension catalog background command {name:?} cannot declare fields"
+                        );
+                    }
                     ExtensionCommandExecution::Background
                 }
             };
             let command_argv = validate_command(&declaration.root, command.argv)?;
+            let fields = validate_command_fields(command.fields)?;
             let launcher_name = name.clone();
             Ok((
                 name,
@@ -585,6 +674,7 @@ fn extension_from_declaration(declaration: ExtensionDeclaration) -> Result<Exten
                     title: command.title,
                     command: command_argv,
                     execution,
+                    fields,
                 },
             ))
         })
@@ -757,6 +847,17 @@ fn registry_fingerprint(extensions: &[Extension], config: &ExtensionConfigCatalo
                     fingerprint.boolean(*activate_opened);
                 }
                 ExtensionCommandExecution::Background => fingerprint.bytes(b"background"),
+            }
+            fingerprint.count(launcher.fields.len());
+            for field in &launcher.fields {
+                fingerprint.string(&field.name);
+                fingerprint.string(&field.label);
+                fingerprint.string(&field.prefix);
+                fingerprint.string(&field.placeholder);
+                fingerprint.boolean(field.default.is_some());
+                fingerprint.string(field.default.as_deref().unwrap_or(""));
+                fingerprint.boolean(field.default_config.is_some());
+                fingerprint.string(field.default_config.as_deref().unwrap_or(""));
             }
         }
 
@@ -1549,6 +1650,23 @@ struct CommandDeclaration {
     activate_opened: bool,
     #[serde(default)]
     mode: ExtensionCommandMode,
+    #[serde(default)]
+    fields: Vec<CommandFieldDeclaration>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommandFieldDeclaration {
+    name: String,
+    label: String,
+    #[serde(default)]
+    prefix: String,
+    #[serde(default)]
+    placeholder: String,
+    #[serde(default)]
+    default: Option<String>,
+    #[serde(default)]
+    default_config: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1751,9 +1869,29 @@ fn load_one(root: &Path) -> Result<Extension> {
                             manifest.id
                         );
                     }
+                    if !declaration.fields.is_empty() {
+                        bail!(
+                            "extension {:?} background command {name:?} cannot declare fields",
+                            manifest.id
+                        );
+                    }
                     ExtensionCommandExecution::Background
                 }
             };
+            let fields = validate_command_fields(
+                declaration
+                    .fields
+                    .into_iter()
+                    .map(|field| crate::protocol::ExtensionCommandFieldDeclaration {
+                        name: field.name,
+                        label: field.label,
+                        prefix: field.prefix,
+                        placeholder: field.placeholder,
+                        default: field.default,
+                        default_config: field.default_config,
+                    })
+                    .collect(),
+            )?;
             let command = validate_command(root, declaration.argv).with_context(|| {
                 format!("validate extension {:?} command {name:?} argv", manifest.id)
             })?;
@@ -1765,6 +1903,7 @@ fn load_one(root: &Path) -> Result<Extension> {
                     title: declaration.title,
                     command,
                     execution,
+                    fields,
                 },
             ))
         })
@@ -1968,7 +2107,14 @@ fn validate_title(value: &str) -> Result<()> {
     if value.is_empty() || value.len() > MAX_ARG_BYTES {
         bail!("title must be 1 through {MAX_ARG_BYTES} bytes");
     }
-    if value.chars().any(|character| {
+    if contains_unsafe_text(value) {
+        bail!("title contains a control or bidirectional formatting character");
+    }
+    Ok(())
+}
+
+pub(crate) fn contains_unsafe_text(value: &str) -> bool {
+    value.chars().any(|character| {
         character.is_control()
             || matches!(
                 character,
@@ -1978,10 +2124,7 @@ fn validate_title(value: &str) -> Result<()> {
                     | '\u{202a}'..='\u{202e}'
                     | '\u{2066}'..='\u{2069}'
             )
-    }) {
-        bail!("title contains a control or bidirectional formatting character");
-    }
-    Ok(())
+    })
 }
 
 fn validate_os_value(label: &str, value: &OsStr, maximum: usize) -> Result<()> {
@@ -3037,6 +3180,55 @@ scope = "tab"
                 .collect::<Vec<_>>(),
             ["session.created"]
         );
+        let launcher = extension.commands().next().unwrap();
+        assert_eq!(
+            launcher
+                .fields()
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            ["worktree", "command", "prompt"]
+        );
+        assert_eq!(launcher.fields()[1].prefix, "$ ");
+        assert_eq!(
+            launcher.fields()[1].default_config.as_deref(),
+            Some("command")
+        );
+    }
+
+    #[test]
+    fn command_fields_are_unique_bounded_and_interactive_only() {
+        for (body, expected) in [
+            (
+                "[[commands.open.fields]]\nname='same'\nlabel='One'\n[[commands.open.fields]]\nname='same'\nlabel='Two'\n",
+                "repeats field",
+            ),
+            (
+                "mode='background'\n[[commands.open.fields]]\nname='value'\nlabel='Value'\n",
+                "background command",
+            ),
+            (
+                "[[commands.open.fields]]\nname='value'\nlabel='Value'\ndefault='one'\ndefault_config='value'\n",
+                "both default and default_config",
+            ),
+        ] {
+            let extension = extension_root(&format!(
+                "id='forms'\ncapabilities=['commands']\n[commands.open]\ntitle='Open'\nargv=['helper']\n{body}"
+            ));
+            let error = format!("{:#}", load(&[extension.path().to_owned()]).unwrap_err());
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+
+        let fields = (0..=MAX_COMMAND_FIELDS)
+            .map(|index| {
+                format!("[[commands.open.fields]]\nname='field-{index}'\nlabel='Field {index}'\n")
+            })
+            .collect::<String>();
+        let extension = extension_root(&format!(
+            "id='forms'\ncapabilities=['commands']\n[commands.open]\ntitle='Open'\nargv=['helper']\n{fields}"
+        ));
+        let error = format!("{:#}", load(&[extension.path().to_owned()]).unwrap_err());
+        assert!(error.contains("maximum is 16"), "unexpected error: {error}");
     }
 
     #[test]

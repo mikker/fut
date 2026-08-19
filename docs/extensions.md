@@ -301,12 +301,22 @@ Extension commands run from the focused workspace root and receive:
 | `FUT_EXTENSION_CONFIG_GLOBAL_PATH` | Global source path, when it contributed values |
 | `FUT_EXTENSION_CONFIG_PROJECT_PATH` | Trusted project recipe path, when it contributed values |
 | `FUT_EXTENSION_CONFIG_WORKSPACE_PATH` | Workspace source path, when it contributed values |
+| `FUT_EXTENSION_FORM` | Submitted command fields as compact JSON, when declared |
+
+Interactive commands may declare `[[commands.NAME.fields]]` entries with a
+required `name` and `label`, plus optional `prefix`, `placeholder`, `default`,
+or `default_config`. Fut collects those values in a native form before opening
+the command surface. `default_config` reads one string or string-array key from
+the resolved extension config; a prefix such as `$ ` is display-only. The
+command receives all submitted strings in `FUT_EXTENSION_FORM`. See the
+[extension authoring guide](extension-authoring.md#command-forms) for the full
+contract.
 
 Set `mode = "background"` for a non-interactive command. Fut starts it
 asynchronously without opening a temporary surface, keeps successful commands
 silent, and shows a bounded spawn or nonzero-exit error as a toast. Background
 commands have null stdin and stdout and may not declare `size` or
-`activate_opened`; stderr is retained only for the bounded failure diagnostic.
+`activate_opened` or fields; stderr is retained only for the bounded failure diagnostic.
 The default mode is `interactive`.
 
 `size` requests the centered outer popup dimensions. Omit either dimension to

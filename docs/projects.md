@@ -87,6 +87,7 @@ environment = { RUST_BACKTRACE = "1" }
 
 [extension.wt]
 open_existing = true
+command = ["pi"]
 
 [extension.run]
 command = ["mise", "run", "dev"]
@@ -133,6 +134,11 @@ workspaces share one approved project configuration. The bundled `wt`
 extension can open existing worktrees with `open_existing = true`; the bundled
 `run` extension can start its managed command in every new workspace with
 `auto_start = true`. Both are disabled by default.
+
+The `wt` extension's optional `command` array supplies the default command in
+its **New worktree** form. For example, `["pi"]` launches Pi in the new
+worktree and allows a one-off initial prompt. Clear the form's command field to
+leave process selection to the project recipe.
 
 `fut open -- COMMAND...` still takes priority for the recipe-selected focus
 pane when it creates a workspace; the rest of the recipe is unchanged. An

@@ -189,6 +189,7 @@ receive the client process environment plus these API v1 values:
 | `FUT_EXTENSION_CONFIG` | Resolved config object as compact JSON; at minimum `{}`. |
 | `FUT_EXTENSION_CONFIG_GLOBAL_PATH` | Present only when global config contributed values. |
 | `FUT_EXTENSION_CONFIG_WORKSPACE_PATH` | Present only when workspace config contributed values. |
+| `FUT_EXTENSION_FORM` | Present only for a command with fields; a compact JSON object mapping every field name to its submitted string. |
 
 Inherited variables that are not listed here are host environment, not Fut
 API. Do not give them semantic meaning. Future compatible releases may add new
@@ -203,6 +204,41 @@ args = ["inspect", "--format=long"]
 
 Keep the executable useful with alternate direct argv and reject unsupported
 arguments clearly.
+
+### Command forms
+
+An interactive command may collect bounded text values in Fut before its
+temporary PTY starts:
+
+```toml
+[[commands.open.fields]]
+name = "branch"
+label = "Branch"
+placeholder = "generated when empty"
+
+[[commands.open.fields]]
+name = "command"
+label = "Command"
+prefix = "$ "
+default_config = "command"
+
+[[commands.open.fields]]
+name = "prompt"
+label = "Prompt"
+```
+
+`name` and `label` are required. `prefix` is cosmetic and is not included in
+the submitted value. `placeholder` appears only for an empty inactive field.
+Set either a literal string `default` or `default_config`, which names one key
+under the resolved `[extension.<id>]` table. A configured default must be a
+string or an array of strings; arrays are displayed as a safely quoted command
+line. Fields are optional by default and the extension owns semantic
+validation after submission.
+
+Tab, Shift-Tab, and the arrow keys move between fields. Enter advances and
+submits from the last field; Escape cancels without starting the command. Fut
+passes the submitted strings in `FUT_EXTENSION_FORM`. Forms are limited to
+interactive commands and do not change the command's direct-argv execution.
 
 ## Configuration
 
@@ -364,6 +400,7 @@ versions may change independently of manifest API v1.
 | Packages indexed by the managed store | 32 |
 | Manifest size | 64 KiB |
 | Commands / hooks / presentation tokens | 32 / 32 / 64 |
+| Fields per interactive command | 16 |
 | Values in one argv array | 64 |
 | Bytes in one argv value or command title | 4,096 |
 | Identifier bytes | 64 |

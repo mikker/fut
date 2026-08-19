@@ -1,6 +1,6 @@
 api_version = 1
 version = "1.0.0"
-fut = ">=0.7.0, <1.0.0"
+fut = ">=0.8.0, <1.0.0"
 capabilities = ["commands", "hooks"]
 id = "wt"
 
@@ -12,3 +12,18 @@ title = "New worktree"
 argv = ["./bin/create"]
 size = { width = 64, height = 10 }
 activate_opened = true
+
+[[commands.new-worktree.fields]]
+name = "worktree"
+label = "Worktree"
+placeholder = "random name"
+
+[[commands.new-worktree.fields]]
+name = "command"
+label = "Command"
+prefix = "$ "
+default_config = "command"
+
+[[commands.new-worktree.fields]]
+name = "prompt"
+label = "Prompt"

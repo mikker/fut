@@ -21,7 +21,7 @@ use crate::{
 /// Protocol version used by released Fut 0.1 builds.
 pub const PROTOCOL_VERSION_0_1: u16 = 0;
 /// Current clients and daemons require an exact protocol match.
-pub const PROTOCOL_VERSION: u16 = 29;
+pub const PROTOCOL_VERSION: u16 = 30;
 /// Enough for 50,000 individually styled MessagePack-encoded cells while
 /// remaining a firm pre-allocation bound for the length-delimited transport.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
@@ -247,6 +247,22 @@ pub struct ExtensionCommandDeclaration {
     pub title: String,
     pub argv: Vec<String>,
     pub execution: ExtensionCommandExecutionDeclaration,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<ExtensionCommandFieldDeclaration>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExtensionCommandFieldDeclaration {
+    pub name: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prefix: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub placeholder: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_config: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -717,6 +733,14 @@ mod tests {
                             height: Some(24),
                             activate_opened: true,
                         },
+                        fields: vec![ExtensionCommandFieldDeclaration {
+                            name: "query".into(),
+                            label: "Query".into(),
+                            prefix: "> ".into(),
+                            placeholder: "optional".into(),
+                            default: None,
+                            default_config: Some("query".into()),
+                        }],
                     },
                 )]),
                 presentation_tokens: vec![ExtensionPresentationTokenDeclaration {
@@ -1416,7 +1440,7 @@ mod tests {
             switched
         );
         assert_eq!(PROTOCOL_VERSION_0_1, 0);
-        assert_eq!(PROTOCOL_VERSION, 29);
+        assert_eq!(PROTOCOL_VERSION, 30);
 
         let watch = ClientMessage::WatchResources;
         assert_eq!(

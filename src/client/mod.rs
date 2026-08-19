@@ -6,6 +6,7 @@ mod agents;
 mod cheatsheet;
 mod chrome;
 mod command_bar;
+mod command_form;
 pub(crate) mod config;
 mod context_menu;
 mod copy_mode;
@@ -26,7 +27,14 @@ mod tab_bar;
 mod temporary_command;
 mod toast;
 
-use std::{collections::HashMap, io, num::NonZeroU16, path::Path, process::Stdio, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    io,
+    num::NonZeroU16,
+    path::Path,
+    process::Stdio,
+    time::Duration,
+};
 
 use actions::{ClientAction, FocusDirection, HistoryScope, NavigationScope};
 use agent_dialog::{AgentsAction, AgentsDialog};
@@ -37,9 +45,10 @@ use chrome::{
     sanitize, sidebar_drawer,
 };
 use command_bar::{CommandBarAction, CommandBarState};
+use command_form::{CommandFormAction, CommandFormState};
 use config::{
-    MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH, PaneLayoutPolicy, SidebarDisplay, StagedUiConfig,
-    UiConfig,
+    MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH, PaletteCommand, PaneLayoutPolicy, SidebarDisplay,
+    StagedUiConfig, UiConfig,
 };
 use context_menu::{ContextMenuAction, ContextMenuState};
 use copy_mode::{
@@ -118,6 +127,7 @@ enum ClientSurface {
     TabBar(TabBarState),
     CommandBar(CommandBarState),
     ContextMenu(ContextMenuState),
+    CommandForm(Box<CommandFormState>),
 }
 
 enum ExtensionReloadState {
@@ -1297,6 +1307,42 @@ async fn run_loop(
                         force_draw = true;
                     }
                     Event::Mouse(_) if temporary_command.is_some() => {}
+                    Event::Key(key) if matches!(surface.as_ref(), Some(ClientSurface::CommandForm(_))) => {
+                        toasts.clear();
+                        let action = match surface.as_mut().expect("command form exists") {
+                            ClientSurface::CommandForm(form) => form.key(key),
+                            _ => unreachable!("surface guard ensures command form"),
+                        };
+                        match action {
+                            CommandFormAction::Stay => {}
+                            CommandFormAction::Cancel => surface = None,
+                            CommandFormAction::Submit => {
+                                let Some(ClientSurface::CommandForm(form)) = surface.take() else {
+                                    unreachable!("surface guard ensures command form")
+                                };
+                                let submission = form.submit();
+                                let host: Rect = terminal.size()?.into();
+                                match spawn_temporary_command(
+                                    &submission.command,
+                                    view.focused().child_pid,
+                                    host,
+                                    socket_path,
+                                    Some(&submission.context),
+                                    Some(&submission.values),
+                                ).await {
+                                    Ok(command) => temporary_command = Some(command),
+                                    Err(error) => toasts.error(format!("command failed · {}", one_line_error(&error))),
+                                }
+                            }
+                        }
+                        force_draw = true;
+                    }
+                    Event::Paste(text) if matches!(surface.as_ref(), Some(ClientSurface::CommandForm(_))) => {
+                        if let Some(ClientSurface::CommandForm(form)) = surface.as_mut() {
+                            form.paste(&text);
+                            force_draw = true;
+                        }
+                    }
                     Event::Key(key) if copy_mode.is_some() => {
                         toasts.clear();
                         let input = copy_mode.as_mut().expect("copy mode exists").key(key);
@@ -2542,6 +2588,9 @@ async fn run_loop(
                             Some(ClientSurface::ContextMenu(menu)) => {
                                 menu.render(area, &ui.styles, frame.buffer_mut());
                             }
+                            Some(ClientSurface::CommandForm(form)) => {
+                                form.render(layout.terminal, frame.buffer_mut());
+                            }
                             Some(ClientSurface::Sidebar(_))
                             | Some(ClientSurface::TabBar(_))
                             | None => {}
@@ -2748,7 +2797,12 @@ fn refresh_surface_resources(
         Some(ClientSurface::Notifications(dialog)) => {
             dialog.accept_resources(snapshot, notifications);
         }
-        Some(ClientSurface::CommandBar(_) | ClientSurface::ContextMenu(_)) | None => {}
+        Some(
+            ClientSurface::CommandBar(_)
+            | ClientSurface::ContextMenu(_)
+            | ClientSurface::CommandForm(_),
+        )
+        | None => {}
     }
 }
 
@@ -3387,10 +3441,12 @@ async fn install_ui_config(
     ui: &mut UiConfig,
     client_hooks: &mut crate::extensions::ClientHookRuntime,
 ) -> anyhow::Result<()> {
-    // A command bar owns positional RunCommand values derived from its binding
-    // snapshot. Closing it before the swap prevents an old index from being
-    // dispatched against the new catalog.
-    if matches!(surface, Some(ClientSurface::CommandBar(_))) {
+    // Command launch surfaces own declarations derived from the current
+    // extension generation. Close them before replacing that generation.
+    if matches!(
+        surface,
+        Some(ClientSurface::CommandBar(_) | ClientSurface::CommandForm(_))
+    ) {
         *surface = None;
     }
     prefix.replace_bindings(candidate.bindings.clone());
@@ -3505,25 +3561,26 @@ async fn dispatch_client_action(
                     ))));
                 }
             };
-            let crate::extensions::ExtensionCommandExecution::Interactive {
-                size: popup_size, ..
-            } = &command.execution
-            else {
-                unreachable!("background commands returned after dispatch")
-            };
-            let content = temporary_command_content(popup_size.area(host));
-            let size = TerminalSize {
-                columns: content.width,
-                rows: content.height,
-            };
-            let fallback = std::env::current_dir().unwrap_or_else(|_| "/".into());
-            match TemporaryCommandSurface::spawn(
+            if !command.fields.is_empty() {
+                let context = extension_context.expect("extension form has extension context");
+                match CommandFormState::open(command, context) {
+                    Ok(form) => *surface = Some(ClientSurface::CommandForm(Box::new(form))),
+                    Err(error) => {
+                        return Ok(Some(Toast::error(format!(
+                            "command form failed · {}",
+                            one_line_error(&error)
+                        ))));
+                    }
+                }
+                return Ok(None);
+            }
+            match spawn_temporary_command(
                 &command,
                 view.focused().child_pid,
-                &fallback,
-                size,
+                host,
                 socket_path,
                 extension_context.as_ref(),
+                None,
             )
             .await
             {
@@ -3879,6 +3936,35 @@ async fn dispatch_client_action(
         ClientAction::Detach => send(framed, ClientMessage::Detach).await?,
     }
     Ok(None)
+}
+
+async fn spawn_temporary_command(
+    command: &PaletteCommand,
+    child_pid: u32,
+    host: Rect,
+    socket_path: &Path,
+    extension_context: Option<&ExtensionCommandContext>,
+    form: Option<&BTreeMap<String, String>>,
+) -> anyhow::Result<TemporaryCommandSurface> {
+    let crate::extensions::ExtensionCommandExecution::Interactive { size, .. } = &command.execution
+    else {
+        anyhow::bail!("background commands cannot open an interactive surface");
+    };
+    let content = temporary_command_content(size.area(host));
+    let fallback = std::env::current_dir().unwrap_or_else(|_| "/".into());
+    TemporaryCommandSurface::spawn(
+        command,
+        child_pid,
+        &fallback,
+        TerminalSize {
+            columns: content.width,
+            rows: content.height,
+        },
+        socket_path,
+        extension_context,
+        form,
+    )
+    .await
 }
 
 async fn pump_copy_mode(

@@ -8,7 +8,7 @@ import sys
 
 
 CONFIG_ENV = "FUT_EXTENSION_TRUSTED_CONFIG"
-CONFIG_KEYS = {"open_existing"}
+CONFIG_KEYS = {"command", "open_existing"}
 MAX_CONFIG_BYTES = 16 * 1024
 
 

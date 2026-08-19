@@ -169,6 +169,7 @@ pub(super) struct PaletteCommand {
     pub args: Vec<String>,
     pub execution: ExtensionCommandExecution,
     pub extension: Option<ExtensionCommandIdentity>,
+    pub fields: Vec<crate::extensions::ExtensionCommandField>,
 }
 
 #[derive(Deserialize)]
@@ -241,6 +242,7 @@ impl<'de> Deserialize<'de> for PaletteCommand {
             args: dto.args,
             execution,
             extension: None,
+            fields: Vec::new(),
         })
     }
 }
@@ -1806,6 +1808,7 @@ fn materialize_config(
                 ),
                 execution: launcher.execution().clone(),
                 extension: Some(identity),
+                fields: launcher.fields().to_vec(),
             });
         }
     }

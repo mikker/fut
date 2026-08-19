@@ -2226,16 +2226,13 @@ fn checked_in_wt_extension_composes_project_open_and_retirement_commands() {
         .env("FUT_EXTENSION_ROOT", &extension)
         .env("FUT_SOCKET", "/tmp/fut.sock")
         .env("FUT_WT_BIN", &fake_wt)
+        .env(
+            "FUT_EXTENSION_FORM",
+            r#"{"worktree":"feature-name","command":"","prompt":""}"#,
+        )
         .env("CAPTURE", &capture)
-        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .spawn()
-        .unwrap();
-    create
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(b"feature-name\n")
         .unwrap();
     assert!(create.wait().unwrap().success());
     let expected = vec![
@@ -2266,16 +2263,10 @@ fn checked_in_wt_extension_composes_project_open_and_retirement_commands() {
         .env("FUT_EXTENSION_ROOT", &extension)
         .env("FUT_SOCKET", "/tmp/fut.sock")
         .env("FUT_WT_BIN", &fake_wt)
+        .env("FUT_EXTENSION_FORM", "{}")
         .env("CAPTURE", &capture)
-        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .spawn()
-        .unwrap();
-    obsolete
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(b"obsolete\n")
         .unwrap();
     assert!(!obsolete.wait().unwrap().success());
 
@@ -10910,13 +10901,13 @@ async fn extension_commands_launch_from_the_palette_with_focused_context() {
         fs::create_dir_all(&bin).unwrap();
         fs::write(
             extension.join("fut-extension.toml"),
-            "api_version = 1\nversion = '1.0.0'\nfut = '>=0.7.0, <1.0.0'\ncapabilities = ['commands']\nid = 'palette-test'\n[commands.probe]\ntitle = 'Extension context probe'\nargv = ['./bin/probe']\n",
+            "api_version = 1\nversion = '1.0.0'\nfut = '>=0.8.0, <1.0.0'\ncapabilities = ['commands']\nid = 'palette-test'\n[commands.probe]\ntitle = 'Extension context probe'\nargv = ['./bin/probe']\n[[commands.probe.fields]]\nname = 'worktree'\nlabel = 'Worktree'\nplaceholder = 'random'\n[[commands.probe.fields]]\nname = 'command'\nlabel = 'Command'\nprefix = '$ '\ndefault_config = 'command'\n[[commands.probe.fields]]\nname = 'prompt'\nlabel = 'Prompt'\n",
         )
         .unwrap();
         let probe = bin.join("probe");
         fs::write(
             &probe,
-            "#!/bin/sh\nprintf 'ID=%s\\nCOMMAND=%s\\nROOT=%s\\nSOCKET=%s\\nCWD=%s\\n' \"$FUT_EXTENSION_ID\" \"$FUT_EXTENSION_COMMAND\" \"$FUT_EXTENSION_ROOT\" \"$FUT_SOCKET\" \"$PWD\" > \"$FUT_EXTENSION_ROOT/context\"\nprintf 'EXTENSION_COMMAND_READY\\r\\n'\nread -r _\n",
+            "#!/bin/sh\nprintf 'ID=%s\\nCOMMAND=%s\\nROOT=%s\\nSOCKET=%s\\nCWD=%s\\nFORM=%s\\n' \"$FUT_EXTENSION_ID\" \"$FUT_EXTENSION_COMMAND\" \"$FUT_EXTENSION_ROOT\" \"$FUT_SOCKET\" \"$PWD\" \"$FUT_EXTENSION_FORM\" > \"$FUT_EXTENSION_ROOT/context\"\nprintf 'EXTENSION_COMMAND_READY\\r\\n'\nread -r _\n",
         )
         .unwrap();
         fs::set_permissions(&probe, fs::Permissions::from_mode(0o755)).unwrap();
@@ -10924,7 +10915,10 @@ async fn extension_commands_launch_from_the_palette_with_focused_context() {
         fs::create_dir_all(config.parent().unwrap()).unwrap();
         fs::write(
             config,
-            format!("extensions = [{:?}]\n", extension.display().to_string()),
+            format!(
+                "extensions = [{:?}]\n[extension.palette-test]\ncommand = ['pi']\n",
+                extension.display().to_string()
+            ),
         )
         .unwrap();
     })
@@ -10958,6 +10952,8 @@ async fn extension_commands_launch_from_the_palette_with_focused_context() {
     client.send(b"\x02:");
     client.wait_for("Search commands").await;
     client.send(b"extension context probe\r");
+    client.wait_for("Worktree").await;
+    client.send(b"feature-name\t\tinitial prompt\r");
     client.wait_for("EXTENSION_COMMAND_READY").await;
     let context = fs::read_to_string(extension.join("context")).unwrap();
     assert!(context.contains("ID=palette-test\n"), "{context:?}");
@@ -10972,6 +10968,12 @@ async fn extension_commands_launch_from_the_palette_with_focused_context() {
     );
     assert!(
         context.contains(&format!("CWD={}\n", cwd.display())),
+        "{context:?}"
+    );
+    assert!(
+        context.contains(
+            "FORM={\"command\":\"pi\",\"prompt\":\"initial prompt\",\"worktree\":\"feature-name\"}\n"
+        ),
         "{context:?}"
     );
     client.send(b"\r");

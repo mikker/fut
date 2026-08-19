@@ -1,23 +1,98 @@
-#!/bin/sh
-set -eu
+#!/usr/bin/env python3
+"""Create a worktree and open it as a Fut workspace."""
 
-: "${FUT_BIN:?}"
-: "${FUT_SOCKET:?}"
+import json
+import os
+import secrets
+import shlex
+import sys
 
-wt_bin=${FUT_WT_BIN:-wt}
 
-if [ "$#" -ne 0 ]; then
-  printf 'wt:new-worktree no longer accepts a post-open command; configure the project recipe instead.\n' >&2
-  exit 2
-fi
+FORM_ENV = "FUT_EXTENSION_FORM"
+FORM_KEYS = {"worktree", "command", "prompt"}
+MAX_FORM_BYTES = 16 * 1024
 
-printf 'Worktree name: '
-IFS= read -r name || exit 0
-if [ -z "$name" ]; then
-  printf 'A worktree name is required.\n' >&2
-  exit 2
-fi
 
-printf '\nCreating %s…\n' "$name"
-exec "$wt_bin" create "$name" -- \
-  "$FUT_BIN" --socket "$FUT_SOCKET" open --background . --name "$name"
+def fail(message):
+    print("wt extension: %s" % message, file=sys.stderr)
+    raise SystemExit(2)
+
+
+def required_env(name):
+    value = os.environ.get(name)
+    if not value:
+        fail("%s is not set" % name)
+    return value
+
+
+def reject_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            fail("duplicate key %r in %s" % (key, FORM_ENV))
+        result[key] = value
+    return result
+
+
+def load_form():
+    raw = os.environ.get(FORM_ENV) or "{}"
+    if len(raw.encode("utf-8", "surrogatepass")) > MAX_FORM_BYTES:
+        fail("%s exceeds %d bytes" % (FORM_ENV, MAX_FORM_BYTES))
+    try:
+        form = json.loads(raw, object_pairs_hook=reject_duplicate_keys)
+    except (UnicodeError, json.JSONDecodeError) as error:
+        fail("%s is not valid JSON: %s" % (FORM_ENV, error))
+    if not isinstance(form, dict):
+        fail("%s must be a JSON object" % FORM_ENV)
+    unknown = sorted(set(form) - FORM_KEYS)
+    if unknown:
+        fail("unknown form field(s): %s" % ", ".join(unknown))
+    for key, value in form.items():
+        if not isinstance(value, str):
+            fail("form field %r must be a string" % key)
+    return form
+
+
+def main():
+    if sys.argv[1:]:
+        fail("usage: create")
+
+    form = load_form()
+    name = form.get("worktree", "").strip() or "wt-%s" % secrets.token_hex(3)
+    command_line = form.get("command", "").strip()
+    prompt = form.get("prompt", "")
+    try:
+        command = shlex.split(command_line) if command_line else []
+    except ValueError as error:
+        fail("invalid command: %s" % error)
+    if prompt and not command:
+        fail("a prompt requires a command")
+    if prompt:
+        command.append(prompt)
+
+    fut_bin = required_env("FUT_BIN")
+    socket = required_env("FUT_SOCKET")
+    wt_bin = os.environ.get("FUT_WT_BIN") or "wt"
+    argv = [
+        wt_bin,
+        "create",
+        name,
+        "--",
+        fut_bin,
+        "--socket",
+        socket,
+        "open",
+        "--background",
+        ".",
+        "--name",
+        name,
+    ]
+    if command:
+        argv.extend(["--", *command])
+
+    print("Creating %s…" % name)
+    os.execvp(wt_bin, argv)
+
+
+if __name__ == "__main__":
+    main()
