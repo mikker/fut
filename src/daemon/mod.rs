@@ -6957,6 +6957,7 @@ scope = "workspace"
                 id: path.workspace_id,
                 name: "main".into(),
                 root: path.root.clone(),
+                trusted_project_config: None,
             }],
             terminals_to_close: Vec::new(),
             multiplexer_empty: false,

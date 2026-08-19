@@ -2038,6 +2038,7 @@ fut = ">=0.7.0, <1.0.0"
                 id: WorkspaceId::new(),
                 name: "main".into(),
                 root: "/workspace".into(),
+                trusted_project_config: None,
             }],
             terminals_to_close: Vec::new(),
             multiplexer_empty: false,

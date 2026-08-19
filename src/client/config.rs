@@ -3100,7 +3100,7 @@ components = [
             "tab.extension.catalog.badge"
         );
         assert_eq!(
-            resolve_extension_config(&ui, "catalog", temporary.path())
+            resolve_extension_config(&ui, "catalog", temporary.path(), None)
                 .unwrap()
                 .json,
             r#"{"enabled":true}"#
