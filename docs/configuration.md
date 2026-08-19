@@ -49,11 +49,19 @@ recipe = "~/.config/fut/recipes/website.toml"
 
 Project names use ASCII letters, numbers, `-`, or `_` and must be unique. Paths
 must be absolute or begin with `~/`; Fut performs no filesystem scanning or
-shell interpolation. Open a catalog entry with `fut open --project fut`. An
+shell interpolation. Open and attach to a catalog entry with
+`fut open -p fut` (or `--project fut`), or add `-b` to open it in the background. An
 optional path may select a linked checkout, for example
 `fut open ../fut-feature --project fut`; Fut verifies that the path has the same
 Git project identity as the configured root before opening it as a peer
 workspace.
+
+List the configured catalog without starting a daemon:
+
+```sh
+fut project list
+fut project ls
+```
 
 The daemon loads the catalog at startup. Restart it after changing a project
 path or `recipe`; client-only `Ctrl-b Shift-R` reload does not change daemon

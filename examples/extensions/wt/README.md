@@ -45,7 +45,7 @@ project-recipe configuration, never from a workspace `.fut/config.toml`.
 
 The package contains two direct executables:
 
-- `bin/create` composes `wt create` and `fut open`; the project recipe supplies
+- `bin/create` composes `wt create` and `fut open --background`; the project recipe supplies
   the workspace's processes.
 - `bin/open-existing` handles trusted `session.created` discovery.
 - `bin/worktree-event` is an adapter for a versioned `worktree.removed` event;

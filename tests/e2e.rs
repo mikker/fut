@@ -1915,7 +1915,7 @@ async fn public_cli_lists_creates_and_closes_resources() {
     let marker = harness.root.path().join("second.started");
     let created = harness
         .cli()
-        .args(["open"])
+        .args(["open", "--background"])
         .arg(&cwd)
         .args(["--name", "second", "--", "/bin/sh", "-c"])
         .arg(format!(
@@ -2059,7 +2059,7 @@ id = "lifecycle"
     fs::create_dir(&second_root).unwrap();
     let opened = harness
         .cli()
-        .arg("open")
+        .args(["open", "--background"])
         .arg(&second_root)
         .args([
             "--name",
@@ -2246,6 +2246,7 @@ fn checked_in_wt_extension_composes_project_open_and_retirement_commands() {
         "--socket".to_owned(),
         "/tmp/fut.sock".to_owned(),
         "open".to_owned(),
+        "--background".to_owned(),
         ".".to_owned(),
         "--name".to_owned(),
         "feature-name".to_owned(),
@@ -6185,6 +6186,7 @@ async fn top_level_attach_is_navigator_only_until_selection_then_attaches_normal
         .cli()
         .args([
             "open",
+            "--background",
             other.to_str().unwrap(),
             "--name",
             "other-session",
@@ -6524,7 +6526,7 @@ async fn public_json_commands_emit_compact_canonical_envelopes() {
     let opened = json(
         harness
             .cli()
-            .args(["--json", "open"])
+            .args(["--json", "open", "--background"])
             .arg(&cwd)
             .args(["--name", "json-open", "--", "/bin/sh", "-c"])
             .arg(format!(
@@ -6546,7 +6548,7 @@ async fn public_json_commands_emit_compact_canonical_envelopes() {
     fs::create_dir(&child_json_cwd).unwrap();
     let child_json = harness
         .cli()
-        .args(["open"])
+        .args(["open", "--background"])
         .arg(&child_json_cwd)
         .args(["--", "/bin/sh", "-c"])
         .arg(format!(
@@ -7300,8 +7302,24 @@ async fn public_json_control_mutations_use_dotted_commands_and_raw_ids() {
     let session_dir = harness.root.path().join("json-session-close");
     fs::create_dir(&workspace_dir).unwrap();
     fs::create_dir(&session_dir).unwrap();
-    json(&["open", workspace_dir.to_str().unwrap(), "--json"], "open");
-    json(&["open", session_dir.to_str().unwrap(), "--json"], "open");
+    json(
+        &[
+            "open",
+            "--background",
+            workspace_dir.to_str().unwrap(),
+            "--json",
+        ],
+        "open",
+    );
+    json(
+        &[
+            "open",
+            "--background",
+            session_dir.to_str().unwrap(),
+            "--json",
+        ],
+        "open",
+    );
     let resources = harness.resources().await;
     let workspace_to_close = resources
         .sessions
@@ -8155,6 +8173,7 @@ async fn public_open_resolves_relative_paths_from_its_calling_process() {
         .args([
             "--json",
             "open",
+            "--background",
             ".",
             "--",
             "/bin/sh",
@@ -11133,7 +11152,7 @@ async fn extension_command_can_activate_the_target_opened_by_its_child() {
         let open = bin.join("open");
         fs::write(
             &open,
-            "#!/bin/sh\nexec \"$FUT_BIN\" --socket \"$FUT_SOCKET\" open \"$FUT_EXTENSION_ROOT/opened\" --name activated -- /bin/sh -c \"printf 'ACTIVATED_READY\\r\\n'; while :; do sleep 1; done\"\n",
+            "#!/bin/sh\nexec \"$FUT_BIN\" --socket \"$FUT_SOCKET\" open --background \"$FUT_EXTENSION_ROOT/opened\" --name activated -- /bin/sh -c \"printf 'ACTIVATED_READY\\r\\n'; while :; do sleep 1; done\"\n",
         )
         .unwrap();
         fs::set_permissions(&open, fs::Permissions::from_mode(0o755)).unwrap();
@@ -13972,6 +13991,62 @@ fn agent_skill_prints_the_bundled_skill_without_daemon_setup() {
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         include_str!("../skills/fut/SKILL.md")
+    );
+    assert!(!runtime.exists());
+}
+
+#[test]
+fn project_list_and_ls_are_daemonless_ordered_and_versioned() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("config");
+    let alpha = root.path().join("alpha");
+    let beta = root.path().join("beta");
+    let runtime = root.path().join("runtime");
+    fs::create_dir(&config).unwrap();
+    fs::create_dir(&alpha).unwrap();
+    fs::create_dir(&beta).unwrap();
+    fs::write(
+        config.join("config.toml"),
+        format!(
+            "[projects.beta]\npath = {:?}\n[projects.alpha]\npath = {:?}\n",
+            beta, alpha
+        ),
+    )
+    .unwrap();
+
+    let command = |operation: &str, json: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fut"));
+        command
+            .env_clear()
+            .env("HOME", root.path())
+            .env("FUT_RUNTIME_DIR", &runtime)
+            .args(["--config-dir", config.to_str().unwrap()]);
+        if json {
+            command.arg("--json");
+        }
+        command.args(["project", operation]).output().unwrap()
+    };
+
+    let human = command("ls", false);
+    assert!(human.status.success());
+    assert_eq!(
+        String::from_utf8(human.stdout).unwrap(),
+        format!("alpha\t{}\nbeta\t{}\n", alpha.display(), beta.display())
+    );
+
+    let machine = command("list", true);
+    assert!(machine.status.success());
+    let machine: Value = serde_json::from_slice(&machine.stdout).unwrap();
+    assert_eq!(machine["command"], "project.list");
+    assert_eq!(machine["result"]["projects"][0]["name"], "alpha");
+    assert_eq!(
+        machine["result"]["projects"][0]["path"],
+        alpha.to_str().unwrap()
+    );
+    assert_eq!(machine["result"]["projects"][1]["name"], "beta");
+    assert_eq!(
+        machine["result"]["projects"][1]["path"],
+        beta.to_str().unwrap()
     );
     assert!(!runtime.exists());
 }

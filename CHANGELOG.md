@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `fut open` now starts or reuses a location and attaches by default; use `-b`/`--background` for control-only opens.
+- Added `fut project list` (`project ls`), the `fut o` alias for opening locations, and `-p` as shorthand for `--project`.
 - Failed popup commands now retain their terminal output and show its log path.
 - Added a language-neutral extension authoring contract, public-boundary conformance smoke test, and source-only compiled Rust example.
 - Added explicit extension installation and updates from exact Git commits, with optional content-digest verification and recorded source provenance.

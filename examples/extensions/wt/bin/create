@@ -20,4 +20,4 @@ fi
 
 printf '\nCreating %s…\n' "$name"
 exec "$wt_bin" create "$name" -- \
-  "$FUT_BIN" --socket "$FUT_SOCKET" open . --name "$name"
+  "$FUT_BIN" --socket "$FUT_SOCKET" open --background . --name "$name"

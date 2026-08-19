@@ -25,6 +25,7 @@ feature-name
 --socket
 /tmp/fut.sock
 open
+--background
 .
 --name
 feature-name
@@ -84,8 +85,8 @@ python3 - "$TMP/fut-calls" <<'PY' || fail "unexpected fut open calls"
 import sys
 calls = [line.split(b"\0") for line in open(sys.argv[1], "rb").read().splitlines()]
 assert calls == [
-    [b"--socket", b"/tmp/fut.sock", b"open", b"/repo/main"],
-    [b"--socket", b"/tmp/fut.sock", b"open", b"/repo/feature with spaces"],
+    [b"--socket", b"/tmp/fut.sock", b"open", b"--background", b"/repo/main"],
+    [b"--socket", b"/tmp/fut.sock", b"open", b"--background", b"/repo/feature with spaces"],
 ], calls
 PY
 

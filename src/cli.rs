@@ -102,13 +102,15 @@ enum Command {
     /// Attach to an existing daemon with the global navigator open.
     #[command(alias = "a")]
     Attach,
-    /// Open a location through an existing daemon without attaching.
+    /// Open a location and attach to it.
+    #[command(alias = "o")]
     Open {
         /// Directory to open; defaults to the current directory.
         #[arg(value_name = "PATH", value_hint = ValueHint::DirPath)]
         path: Option<PathBuf>,
         /// Open a project from the configured project catalog.
         #[arg(
+            short = 'p',
             long,
             value_name = "NAME",
             add = ArgValueCompleter::new(completion::project)
@@ -117,6 +119,9 @@ enum Command {
         /// Name for the new session or workspace created for this location.
         #[arg(long)]
         name: Option<String>,
+        /// Open in the background without attaching.
+        #[arg(short = 'b', long)]
+        background: bool,
         /// Child program and its direct argv, following `--`; defaults to the shell.
         #[arg(last = true, value_hint = ValueHint::CommandWithArguments)]
         command: Vec<String>,
@@ -203,6 +208,9 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ProjectCommand {
+    /// List configured projects.
+    #[command(alias = "ls")]
+    List,
     /// Approve the exact current repository recipe after validating it.
     Trust {
         /// Configured project name.
@@ -976,6 +984,7 @@ async fn execute(cli: Cli) -> Result<()> {
             path,
             project,
             name,
+            background,
             command,
         }) => {
             let current_dir = std::env::current_dir()?;
@@ -986,39 +995,49 @@ async fn execute(cli: Cli) -> Result<()> {
                 config_dir.as_deref(),
             )?;
             let (program, argv) = child_command(command);
-            match control(
+            let ui = if background {
+                None
+            } else {
+                Some(client::stage_ui_config(config_dir.as_deref())?)
+            };
+            let (selected, disposition) = open_location_with_config(
                 &socket,
                 ClientMessage::OpenLocation {
                     project,
                     name,
-                    cwd,
+                    cwd: cwd.clone(),
                     program,
                     argv,
                 },
+                &cwd,
+                config_dir.as_deref(),
             )
-            .await?
-            {
-                ServerMessage::LocationOpened {
-                    selected,
-                    disposition,
-                } => {
-                    notify_command_activation(selected.pane_id)?;
-                    output(
-                        cli.json,
-                        "open",
-                        json!({ "disposition": disposition, "selected": selected }),
-                        format!(
-                            "disposition={disposition:?} session={} workspace={} tab={} pane={} terminal={} pid={}",
-                            selected.session_id,
-                            selected.workspace_id,
-                            selected.tab_id,
-                            selected.pane_id,
-                            selected.terminal_id,
-                            selected.child_pid
-                        ),
+            .await?;
+            notify_command_activation(selected.pane_id)?;
+            match ui {
+                Some(ui) => {
+                    client::attach_with_ui(
+                        &socket,
+                        Some(TargetSelector::Terminal(selected.terminal_id)),
+                        ui,
+                        config_dir.as_deref(),
                     )
+                    .await
                 }
-                other => unexpected(other),
+                None => output(
+                    cli.json,
+                    "open",
+                    json!({ "disposition": disposition, "selected": selected }),
+                    format!(
+                        "disposition={disposition:?} session={} workspace={} tab={} pane={} terminal={} pid={}",
+                        selected.session_id,
+                        selected.workspace_id,
+                        selected.tab_id,
+                        selected.pane_id,
+                        selected.terminal_id,
+                        selected.child_pid
+                    ),
+                ),
             }
         }
         Some(Command::Project { command }) => {
@@ -1951,11 +1970,36 @@ fn run_project_command(
     json_output: bool,
     command: ProjectCommand,
 ) -> Result<()> {
+    let catalog = client::config::load_projects(config_dir)?;
+    if matches!(command, ProjectCommand::List) {
+        let projects = catalog
+            .iter()
+            .map(|(name, project)| {
+                json!({
+                    "name": name,
+                    "path": project.path(),
+                    "recipe": project.recipe(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let human = catalog
+            .iter()
+            .map(|(name, project)| format!("{name}\t{}", project.path().display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return output(
+            json_output,
+            "project.list",
+            json!({ "projects": projects }),
+            human,
+        );
+    }
+
     let (name, trust, command_name) = match command {
         ProjectCommand::Trust { name } => (name, true, "project.trust"),
         ProjectCommand::Untrust { name } => (name, false, "project.untrust"),
+        ProjectCommand::List => unreachable!("project list returned above"),
     };
-    let catalog = client::config::load_projects(config_dir)?;
     let project = catalog_project(&catalog, &name)?;
     let change = if trust {
         let location = client::config::resolve_location(config_dir)?;
@@ -2668,6 +2712,13 @@ fn attaches_client(command: &Option<Command>) -> bool {
         || matches!(command, Some(Command::Attach))
         || matches!(
             command,
+            Some(Command::Open {
+                background: false,
+                ..
+            })
+        )
+        || matches!(
+            command,
             Some(Command::Session {
                 command: SessionCommand::Attach { .. }
             }) | Some(Command::Workspace {
@@ -3042,24 +3093,42 @@ async fn open_current_location_with_config(
     cwd: &std::path::Path,
     config_dir: Option<&std::path::Path>,
 ) -> Result<crate::protocol::SelectedTarget> {
+    open_location_with_config(
+        socket,
+        ClientMessage::OpenLocation {
+            project: None,
+            name: None,
+            cwd: cwd.to_owned(),
+            program: None,
+            argv: vec![],
+        },
+        cwd,
+        config_dir,
+    )
+    .await
+    .map(|(selected, _)| selected)
+}
+
+async fn open_location_with_config(
+    socket: &std::path::Path,
+    message: ClientMessage,
+    daemon_cwd: &std::path::Path,
+    config_dir: Option<&std::path::Path>,
+) -> Result<(
+    crate::protocol::SelectedTarget,
+    crate::protocol::OpenDisposition,
+)> {
     const RETRIES: usize = 2;
 
-    ensure_daemon(socket, cwd, config_dir).await?;
+    ensure_daemon(socket, daemon_cwd, config_dir).await?;
     for attempt in 0..=RETRIES {
-        let response = control(
-            socket,
-            ClientMessage::OpenLocation {
-                project: None,
-                name: None,
-                cwd: cwd.to_owned(),
-                program: None,
-                argv: vec![],
-            },
-        )
-        .await;
+        let response = control(socket, message.clone()).await;
 
         match response {
-            Ok(ServerMessage::LocationOpened { selected, .. }) => return Ok(selected),
+            Ok(ServerMessage::LocationOpened {
+                selected,
+                disposition,
+            }) => return Ok((selected, disposition)),
             Ok(ServerMessage::Error { ref code, .. }) if code == "shutting_down" => {}
             Ok(other) => return unexpected(other),
             Err(error) => {
@@ -3074,11 +3143,11 @@ async fn open_current_location_with_config(
         if attempt == RETRIES {
             bail!(
                 "daemon repeatedly shut down while opening {}",
-                cwd.display()
+                daemon_cwd.display()
             );
         }
         wait_until_protocol_stops(socket).await;
-        ensure_daemon(socket, cwd, config_dir).await?;
+        ensure_daemon(socket, daemon_cwd, config_dir).await?;
     }
     unreachable!()
 }
@@ -4382,19 +4451,58 @@ mod tests {
 
     #[test]
     fn open_accepts_a_catalog_project_with_an_optional_worktree_path() {
-        let cli = Cli::try_parse_from(["fut", "open", "../feature", "--project", "fut"]).unwrap();
+        for flag in ["-p", "--project"] {
+            let cli = Cli::try_parse_from(["fut", "open", "../feature", flag, "fut"]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Some(Command::Open {
+                    path: Some(path),
+                    project: Some(project),
+                    ..
+                }) if path == std::path::Path::new("../feature") && project == "fut"
+            ));
+        }
+    }
+
+    #[test]
+    fn open_attaches_by_default_and_accepts_a_background_flag() {
+        let foreground = Cli::try_parse_from(["fut", "open"]).unwrap();
+        assert!(attaches_client(&foreground.command));
+
+        let alias = Cli::try_parse_from(["fut", "o", "--background"]).unwrap();
         assert!(matches!(
-            cli.command,
+            alias.command,
             Some(Command::Open {
-                path: Some(path),
-                project: Some(project),
+                background: true,
                 ..
-            }) if path == std::path::Path::new("../feature") && project == "fut"
+            })
         ));
+
+        for flag in ["-b", "--background"] {
+            let background = Cli::try_parse_from(["fut", "open", flag]).unwrap();
+            assert!(!attaches_client(&background.command));
+            assert!(matches!(
+                background.command,
+                Some(Command::Open {
+                    background: true,
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]
     fn project_trust_commands_parse_with_global_json() {
+        for command in ["list", "ls"] {
+            let cli = Cli::try_parse_from(["fut", "project", command]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Some(Command::Project {
+                    command: ProjectCommand::List
+                })
+            ));
+        }
+
         let cli = Cli::try_parse_from(["fut", "--json", "project", "trust", "fut"]).unwrap();
         assert!(cli.json);
         assert!(matches!(
@@ -4470,6 +4578,7 @@ mod tests {
         for args in [
             vec!["fut", "--json"],
             vec!["fut", "--json", "attach"],
+            vec!["fut", "--json", "open"],
             vec!["fut", "--json", "terminal", "attach", &terminal],
             vec!["fut", "--json", "daemon", "run"],
         ] {
@@ -4477,6 +4586,8 @@ mod tests {
             assert!(reject_interactive_json(&cli).is_err());
         }
         let cli = Cli::try_parse_from(["fut", "--json", "list"]).unwrap();
+        assert!(reject_interactive_json(&cli).is_ok());
+        let cli = Cli::try_parse_from(["fut", "--json", "open", "--background"]).unwrap();
         assert!(reject_interactive_json(&cli).is_ok());
         let tab = TabId::new().to_string();
         let cli = Cli::try_parse_from(["fut", "--json", "pane", "new", &tab]).unwrap();
@@ -4505,7 +4616,7 @@ mod tests {
 
         for args in [
             vec!["fut", "list"],
-            vec!["fut", "open"],
+            vec!["fut", "open", "--background"],
             vec!["fut", "daemon", "run"],
         ] {
             let cli = Cli::try_parse_from(args).unwrap();
@@ -4556,7 +4667,7 @@ mod tests {
         cli_command().write_long_help(&mut help).unwrap();
         let help = String::from_utf8(help).unwrap();
         assert!(help.contains("versioned JSON for noninteractive commands only"));
-        assert!(help.contains("existing daemon without attaching"));
+        assert!(help.contains("Open a location and attach to it"));
 
         let command = cli_command();
         let project = command.find_subcommand("project").unwrap();
@@ -4565,7 +4676,7 @@ mod tests {
                 .get_subcommands()
                 .map(clap::Command::get_name)
                 .collect::<Vec<_>>(),
-            ["trust", "untrust"]
+            ["list", "trust", "untrust"]
         );
 
         let command = cli_command();

@@ -93,7 +93,7 @@ def worker():
     for path in worktree_paths(root):
         try:
             subprocess.run(
-                [fut_bin, "--socket", socket, "open", path],
+                [fut_bin, "--socket", socket, "open", "--background", path],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
