@@ -153,9 +153,9 @@ pub(super) async fn open_location(
         state.projects.clone()
     };
     let configured = configured_project(&catalog, project.as_deref(), &resolved).await?;
-    let extensions = {
+    let extension_registry = {
         let state = shared.lock().await;
-        state.extensions.clone()
+        Arc::clone(&state.extension_registry)
     };
 
     // Existing resources win before recipe I/O. A changed, removed, or newly
@@ -170,7 +170,7 @@ pub(super) async fn open_location(
         }
     }
 
-    let loaded = match load_project_recipe(configured.as_ref(), &extensions) {
+    let loaded = match load_project_recipe(configured.as_ref(), extension_registry.extensions()) {
         Ok(loaded) => loaded,
         Err(error) => {
             let mut state = shared.lock().await;

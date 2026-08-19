@@ -1524,8 +1524,13 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     let command_override = config
         .recipe_command_override
         .then(|| (config.spawn.program.clone(), config.spawn.argv.clone()));
-    let prepared_recipe =
-        recipe::prepare_initial(&projects, &extensions, &resolved, command_override).await?;
+    let prepared_recipe = recipe::prepare_initial(
+        &projects,
+        extension_registry.extensions(),
+        &resolved,
+        command_override,
+    )
+    .await?;
     let socket = bind_socket(&config.socket_path).await?;
     let mut initial_spawn = config.spawn;
     initial_spawn.cwd = resolved.cwd.clone();
