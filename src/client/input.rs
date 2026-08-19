@@ -259,6 +259,16 @@ mod tests {
         );
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
         assert_eq!(
+            prefix.feed(vec![20]),
+            PrefixAction::Dispatch(ClientAction::FocusLast(HistoryScope::Tab))
+        );
+        assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
+        assert_eq!(
+            prefix.feed(vec![23]),
+            PrefixAction::Dispatch(ClientAction::FocusLast(HistoryScope::Workspace))
+        );
+        assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
+        assert_eq!(
             prefix.feed(vec![19]),
             PrefixAction::Dispatch(ClientAction::FocusLast(HistoryScope::Session))
         );

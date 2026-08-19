@@ -63,6 +63,9 @@ open_command_bar = "space"
 # focus_next_notification = "prefix"
 # create_workspace = "C"
 # create_tab = "c"
+# focus_last_tab = "ctrl-t"
+# focus_last_workspace = "ctrl-w"
+# focus_last_session = "ctrl-s"
 # close_pane = "x"
 
 [trusted_commands.git_diff]
@@ -202,10 +205,14 @@ discovery.
 
 ## Bindings
 
-Bindings are suffixes after the fixed `Ctrl-b` prefix. `Ctrl-b :` opens the command palette. Override any action under `ui.bindings`; accepted values are one printable character or the names `prefix`, `ctrl-s`, `space`, `enter`, `tab`, `esc`, `up`, and `down`. `prefix` means pressing `Ctrl-b` again. Keys must remain unique. Action names are `open_command_bar`, `reload_config`, `enter_copy_mode`, `open_navigator`, `open_agents`, `open_left_sidebar`, `open_right_sidebar`, `open_tab_bar`, `open_notifications`, `focus_next_notification`, `create_workspace`, `create_tab`, `focus_next_tab`, `focus_previous_tab`, `split_pane_right`, `split_pane_down`, `focus_next_pane`, `focus_previous_pane`, `focus_pane_left`, `focus_pane_down`, `focus_pane_up`, `focus_pane_right`, `focus_last_pane`, `focus_last_tab`, `focus_last_workspace`, `focus_last_session`, `focus_next_workspace`, `focus_previous_workspace`, `focus_tab_1` through `focus_tab_10`, `toggle_pane_zoom`, `close_pane`, and `detach`. Extension commands use their quoted qualified palette slug, for example `"wt:new-worktree" = "N"`. `Ctrl-b Ctrl-s` switches to the last active session, so repeating it toggles between the two most recent sessions. Rebinding `focus_next_notification` away from `prefix` restores `Ctrl-b Ctrl-b` as a literal prefix unless another action uses `prefix`. The palette displays tmux-style command names, descriptions, and configured bindings, and searches all three.
+Bindings are unique suffixes after the fixed `Ctrl-b` prefix. Set a built-in
+action or quoted extension command slug under `[ui.bindings]`; see the
+[complete defaults table](usage.md#everyday-controls) for action names.
 
-The delayed binding sheet always shows the effective keys. See
-[Using Fut](usage.md#everyday-controls) for the defaults.
+A suffix may be one printable character or `prefix`, `ctrl-s`, `ctrl-t`,
+`ctrl-w`, `space`, `enter`, `tab`, `esc`, `up`, or `down`. `prefix` means
+pressing `Ctrl-b` again. Pause after the prefix to see the effective bindings,
+or press `Ctrl-b :` to search them in the command palette.
 
 An `[extension_commands."EXTENSION:COMMAND"]` table can set `args` to replace
 the arguments supplied after that extension command's manifest executable.

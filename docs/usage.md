@@ -47,26 +47,40 @@ workspaces.
 
 ## Everyday controls
 
-All bindings below follow the `Ctrl-b` prefix.
+All bindings below follow the `Ctrl-b` prefix. The configuration name is the
+key to override under `[ui.bindings]`.
 
-| Keys | Action |
-| --- | --- |
-| `:` | Search every command and configured extension action |
-| `s` | Search sessions, workspaces, tabs, and panes |
-| `a` | Search agents and see their live status |
-| `c` / `C` | Create a tab / workspace |
-| `t` | Focus the tab bar; use arrows, Enter, `c`, or `r` |
-| `w` / `]` | Open the left / right sidebar |
-| `n` / `p` | Next / previous tab |
-| `1`–`9`, `0` | Select tab 1–10 |
-| `|` / `_` | Split right / down |
-| `h j k l` | Focus a pane by direction |
-| `o` / `;` | Next / previous pane |
-| `z` | Toggle pane zoom |
-| `x` | Close the focused pane, with confirmation by default |
-| `[` | Enter copy mode |
-| `u` / `Ctrl-b` | List unread agent notifications / jump to the next one |
-| `d` | Detach |
+| Key | Action | Configuration name |
+| --- | --- | --- |
+| `:` | Search every command and configured extension action | `open_command_bar` |
+| `R` | Reload configuration | `reload_config` |
+| `[` | Enter copy mode | `enter_copy_mode` |
+| `s` | Search sessions, workspaces, tabs, and panes | `open_navigator` |
+| `a` | Search agents and see their live status | `open_agents` |
+| `w` | Open the left sidebar | `open_left_sidebar` |
+| `]` | Open the right sidebar | `open_right_sidebar` |
+| `t` | Focus the tab bar | `open_tab_bar` |
+| `u` | List unread agent notifications | `open_notifications` |
+| `Ctrl-b` | Jump to the next unread notification | `focus_next_notification` |
+| `C` | Create a workspace | `create_workspace` |
+| `c` | Create a tab | `create_tab` |
+| `n` | Switch to the next tab | `focus_next_tab` |
+| `p` | Switch to the previous tab | `focus_previous_tab` |
+| `Down` | Switch to the next workspace | `focus_next_workspace` |
+| `Up` | Switch to the previous workspace | `focus_previous_workspace` |
+| `|` | Split the pane right | `split_pane_right` |
+| `_` | Split the pane down | `split_pane_down` |
+| `o` | Focus the next pane | `focus_next_pane` |
+| `;` | Focus the previous pane | `focus_previous_pane` |
+| `h` / `j` / `k` / `l` | Focus the pane left / down / up / right | `focus_pane_left` / `focus_pane_down` / `focus_pane_up` / `focus_pane_right` |
+| `P` | Switch to the last active pane | `focus_last_pane` |
+| `Ctrl-t` | Switch to the last active tab | `focus_last_tab` |
+| `Ctrl-w` | Switch to the last active workspace | `focus_last_workspace` |
+| `Ctrl-s` | Switch to the last active session | `focus_last_session` |
+| `1`–`9`, `0` | Select tab 1–10 | `focus_tab_1` through `focus_tab_10` |
+| `z` | Toggle pane zoom | `toggle_pane_zoom` |
+| `x` | Close the focused pane | `close_pane` |
+| `d` | Detach | `detach` |
 
 Pause for 700 ms after `Ctrl-b` to see the complete, current binding list.
 Bindings can be changed in [Configuration](../configuration/).

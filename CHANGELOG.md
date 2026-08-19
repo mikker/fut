@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Project recipe commands now return to a shell when they exit by default; set `exec = true` for the previous pane-closing behavior, and omit the former `version` field.
+- Added `Ctrl-b Ctrl-t` and `Ctrl-b Ctrl-w` shortcuts for switching to the last active tab and workspace.
 
 ## 0.8
 
