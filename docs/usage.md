@@ -47,8 +47,8 @@ workspaces.
 
 ## Everyday controls
 
-All bindings below follow the `Ctrl-b` prefix. The configuration name is the
-key to override under `[ui.bindings]`.
+These default bindings follow the `Ctrl-b` prefix, configurable as `ui.prefix`.
+The configuration name is the key to override under `[ui.bindings]`.
 
 | Key | Action | Configuration name |
 | --- | --- | --- |
@@ -61,7 +61,7 @@ key to override under `[ui.bindings]`.
 | `]` | Open the right sidebar | `open_right_sidebar` |
 | `t` | Focus the tab bar | `open_tab_bar` |
 | `u` | List unread agent notifications | `open_notifications` |
-| `Ctrl-b` | Jump to the next unread notification | `focus_next_notification` |
+| `Prefix` | Jump to the next unread notification | `focus_next_notification` |
 | `C` | Create a workspace | `create_workspace` |
 | `c` | Create a tab | `create_tab` |
 | `n` | Switch to the next tab | `focus_next_tab` |

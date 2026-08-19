@@ -28,7 +28,7 @@ pub(super) fn render(bindings: &BindingsConfig, host: Rect, buffer: &mut Buffer)
     }
     let header = usize::from(area.height >= 2);
     if header == 1 {
-        render_title(area, " Ctrl-b …", buffer);
+        render_title(area, &format!(" {} …", bindings.prefix_label()), buffer);
     }
     let body_rows = usize::from(area.height).saturating_sub(header).max(1);
     let columns = entries.len().div_ceil(body_rows).max(1);
@@ -72,7 +72,8 @@ fn entries(bindings: &BindingsConfig) -> Vec<(String, String)> {
     entries.extend(bindings.commands().filter_map(|(_, command)| {
         command.binding.as_ref().map(|binding| {
             (
-                super::actions::parse_suffix(binding)
+                bindings
+                    .parse_suffix(binding)
                     .expect("validated command binding")
                     .1,
                 command.title.clone(),

@@ -48,6 +48,7 @@ extensions = [
 [ui]
 pane_layout = "splits" # "splits" or "accordion"
 confirm_close = true   # Require confirmation before closing panes, tabs, or workspaces.
+prefix = "ctrl-b"
 
 [ui.bindings]
 open_command_bar = "space"
@@ -205,14 +206,15 @@ discovery.
 
 ## Bindings
 
-Bindings are unique suffixes after the fixed `Ctrl-b` prefix. Set a built-in
-action or quoted extension command slug under `[ui.bindings]`; see the
-[complete defaults table](usage.md#everyday-controls) for action names.
+Set `ui.prefix` to change the default `ctrl-b` prefix. Bindings are unique
+suffixes after it. Set a built-in action or quoted extension command slug under
+`[ui.bindings]`; see the [complete defaults table](usage.md#everyday-controls)
+for action names.
 
-A suffix may be one printable character or `prefix`, `ctrl-s`, `ctrl-t`,
-`ctrl-w`, `space`, `enter`, `tab`, `esc`, `up`, or `down`. `prefix` means
-pressing `Ctrl-b` again. Pause after the prefix to see the effective bindings,
-or press `Ctrl-b :` to search them in the command palette.
+A prefix or suffix may be one printable character, `ctrl-a` through `ctrl-z`,
+`space`, `enter`, `tab`, `esc`, `up`, or `down`. Suffixes also accept `prefix`,
+meaning the configured prefix key again. Pause after the prefix to see the
+effective bindings, or press prefix then `:` to search the command palette.
 
 An `[extension_commands."EXTENSION:COMMAND"]` table can set `args` to replace
 the arguments supplied after that extension command's manifest executable.

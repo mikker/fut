@@ -13,7 +13,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::actions::{
-    ALL_ACTIONS, ClientAction, config_key, default_suffix, parse_suffix, suffix_name,
+    ALL_ACTIONS, ClientAction, config_key, default_suffix, parse_key, suffix_name,
 };
 use crate::{
     command::PopupSize,
@@ -137,12 +137,28 @@ pub(super) enum SemanticStyle {
     Deleted,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 #[serde(transparent)]
 pub(super) struct BindingsConfig {
     values: BTreeMap<String, String>,
     #[serde(skip)]
     commands: Vec<PaletteCommand>,
+    #[serde(skip, default = "default_prefix")]
+    prefix: Vec<u8>,
+}
+
+fn default_prefix() -> Vec<u8> {
+    vec![2]
+}
+
+impl Default for BindingsConfig {
+    fn default() -> Self {
+        Self {
+            values: BTreeMap::new(),
+            commands: Vec::new(),
+            prefix: default_prefix(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -230,6 +246,33 @@ impl<'de> Deserialize<'de> for PaletteCommand {
 }
 
 impl BindingsConfig {
+    pub(super) fn parse_suffix(&self, value: &str) -> Option<(Vec<u8>, String)> {
+        if value == "prefix" {
+            return Some((self.prefix.clone(), self.prefix_label()));
+        }
+        parse_key(value)
+    }
+
+    fn set_prefix(&mut self, prefix: Vec<u8>) {
+        self.prefix = prefix;
+    }
+
+    pub(super) fn prefix(&self) -> &[u8] {
+        &self.prefix
+    }
+
+    pub(super) fn prefix_label(&self) -> String {
+        suffix_name(&self.prefix)
+    }
+
+    fn default_suffix(&self, action: ClientAction) -> &[u8] {
+        if action == ClientAction::FocusNextNotification {
+            &self.prefix
+        } else {
+            default_suffix(action)
+        }
+    }
+
     pub(super) fn command(&self, index: usize) -> Option<&PaletteCommand> {
         self.commands.get(index)
     }
@@ -237,14 +280,14 @@ impl BindingsConfig {
     pub(super) fn suffix(&self, action: ClientAction) -> Vec<u8> {
         self.values
             .get(config_key(action))
-            .and_then(|value| parse_suffix(value))
-            .map_or_else(|| default_suffix(action).to_vec(), |(bytes, _)| bytes)
+            .and_then(|value| self.parse_suffix(value))
+            .map_or_else(|| self.default_suffix(action).to_vec(), |(bytes, _)| bytes)
     }
 
     pub(super) fn suffix_label(&self, action: ClientAction) -> String {
         self.values.get(config_key(action)).map_or_else(
-            || suffix_name(default_suffix(action)),
-            |value| parse_suffix(value).expect("bindings are validated").1,
+            || suffix_name(self.default_suffix(action)),
+            |value| self.parse_suffix(value).expect("bindings are validated").1,
         )
     }
 
@@ -258,8 +301,11 @@ impl BindingsConfig {
                         .as_ref()
                         .map_or_else(String::new, |binding| {
                             format!(
-                                "Ctrl-b {}",
-                                parse_suffix(binding).expect("commands are validated").1
+                                "{} {}",
+                                self.prefix_label(),
+                                self.parse_suffix(binding)
+                                    .expect("commands are validated")
+                                    .1
                             )
                         })
                 },
@@ -267,18 +313,20 @@ impl BindingsConfig {
         }
         if self.commands.iter().any(|command| {
             command.binding.as_ref().is_some_and(|binding| {
-                parse_suffix(binding).is_some_and(|(suffix, _)| suffix == self.suffix(action))
+                self.parse_suffix(binding)
+                    .is_some_and(|(suffix, _)| suffix == self.suffix(action))
             })
         }) {
             return "Unbound".into();
         }
-        format!("Ctrl-b {}", self.suffix_label(action))
+        format!("{} {}", self.prefix_label(), self.suffix_label(action))
     }
 
     pub(super) fn action_for_suffix(&self, suffix: &[u8]) -> Option<ClientAction> {
         if let Some(index) = self.commands.iter().position(|command| {
             command.binding.as_ref().is_some_and(|binding| {
-                parse_suffix(binding).is_some_and(|(bytes, _)| bytes == suffix)
+                self.parse_suffix(binding)
+                    .is_some_and(|(bytes, _)| bytes == suffix)
             })
         }) {
             return Some(ClientAction::RunCommand(index));
@@ -1294,6 +1342,7 @@ pub(super) struct SidebarConfig {
 pub(crate) struct UiConfig {
     pub(super) pane_layout: PaneLayoutPolicy,
     pub(super) confirm_close: bool,
+    prefix: String,
     pub(super) bindings: BindingsConfig,
     pub(super) icons: IconsConfig,
     pub(super) styles: StylesConfig,
@@ -1310,6 +1359,7 @@ impl Default for UiConfig {
         Self {
             pane_layout: PaneLayoutPolicy::Splits,
             confirm_close: true,
+            prefix: "ctrl-b".into(),
             bindings: BindingsConfig::default(),
             icons: IconsConfig::default(),
             styles: StylesConfig::default(),
@@ -1720,6 +1770,10 @@ fn materialize_config(
     extension_config: ExtensionConfigCatalog,
     source: Option<&Path>,
 ) -> Result<UiConfig> {
+    let prefix = parse_key(&config.ui.prefix)
+        .map(|(bytes, _)| bytes)
+        .context("ui.prefix must be one character or a named key such as ctrl-a")?;
+    config.ui.bindings.set_prefix(prefix);
     config.ui.bindings.commands = config.trusted_commands.into_values().collect();
     for extension in &extensions {
         for launcher in extension.commands() {
@@ -2190,9 +2244,9 @@ fn validate(ui: &UiConfig, extensions: &[Extension]) -> Result<()> {
         if !valid_binding_keys.contains(key.as_str()) {
             bail!("unknown ui.bindings action {key:?}");
         }
-        if parse_suffix(value).is_none() {
+        if ui.bindings.parse_suffix(value).is_none() {
             bail!(
-                "ui.bindings.{key} must be one character or prefix, ctrl-s, ctrl-t, ctrl-w, space, enter, tab, esc, up, or down"
+                "ui.bindings.{key} must be one character, prefix, ctrl-a through ctrl-z, space, enter, tab, esc, up, or down"
             );
         }
     }
@@ -2217,7 +2271,7 @@ fn validate(ui: &UiConfig, extensions: &[Extension]) -> Result<()> {
             size.validate().context("validate command popup size")?;
         }
         if let Some(binding) = &command.binding {
-            let Some((suffix, _)) = parse_suffix(binding) else {
+            let Some((suffix, _)) = ui.bindings.parse_suffix(binding) else {
                 bail!("command bindings must be one character or a named key");
             };
             if !command_suffixes.insert(suffix.clone()) {
@@ -2833,6 +2887,33 @@ components = [
     }
 
     #[test]
+    fn command_prefix_is_configurable_and_updates_prefix_bindings() {
+        use crate::client::input::{PrefixAction, PrefixState};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("config.toml");
+        fs::write(&path, "[ui]\nprefix = 'ctrl-a'\n").unwrap();
+        let config = load_path(&path, true).unwrap();
+        assert_eq!(config.bindings.prefix(), b"\x01");
+        assert_eq!(
+            config.bindings.label(ClientAction::OpenCommandBar),
+            "Ctrl-a :"
+        );
+        assert_eq!(
+            config.bindings.label(ClientAction::FocusNextNotification),
+            "Ctrl-a Ctrl-a"
+        );
+
+        let mut prefix = PrefixState::new(config.bindings);
+        assert_eq!(prefix.feed(vec![2]), PrefixAction::Send(vec![2]));
+        assert_eq!(prefix.feed(vec![1]), PrefixAction::Wait);
+        assert_eq!(
+            prefix.feed(vec![1]),
+            PrefixAction::Dispatch(ClientAction::FocusNextNotification)
+        );
+    }
+
+    #[test]
     fn strict_validation_rejects_ambiguous_unsafe_and_out_of_scope_segments() {
         let temporary = tempfile::tempdir().unwrap();
         for source in [
@@ -2853,7 +2934,8 @@ components = [
             "[ui.tab_bar.item]\nmin_width = 8\n",
             "[ui.bindings]\nunknown = 'x'\n",
             "[ui.bindings]\nopen_command_bar = 's'\n",
-            "[ui.bindings]\nopen_command_bar = 'ctrl-x'\n",
+            "[ui.bindings]\nopen_command_bar = 'ctrl-aa'\n",
+            "[ui]\nprefix = 'prefix'\n",
             "[ui.icons]\nvertical_divider = '||'\n",
             "[ui.styles.normal]\nforeground = '#aéabc'\n",
         ] {

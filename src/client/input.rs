@@ -102,12 +102,13 @@ impl PrefixState {
     }
 
     pub(super) fn replace_bindings(&mut self, bindings: BindingsConfig) {
+        self.waiting = false;
         self.bindings = bindings;
     }
 
     pub(super) fn feed(&mut self, bytes: Vec<u8>) -> PrefixAction {
         if !self.waiting {
-            if bytes == [2] {
+            if bytes == self.bindings.prefix() {
                 self.waiting = true;
                 PrefixAction::Wait
             } else {
@@ -117,10 +118,10 @@ impl PrefixState {
             self.waiting = false;
             if let Some(action) = self.bindings.action_for_suffix(&bytes) {
                 PrefixAction::Dispatch(action)
-            } else if bytes == [2] {
-                PrefixAction::Send(vec![2])
+            } else if bytes == self.bindings.prefix() {
+                PrefixAction::Send(self.bindings.prefix().to_vec())
             } else {
-                PrefixAction::Send([vec![2], bytes].concat())
+                PrefixAction::Send([self.bindings.prefix(), bytes.as_slice()].concat())
             }
         }
     }

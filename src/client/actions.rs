@@ -653,18 +653,21 @@ pub(super) fn default_suffix(action: ClientAction) -> &'static [u8] {
         .suffix
 }
 
-pub(super) fn parse_suffix(value: &str) -> Option<(Vec<u8>, String)> {
+pub(super) fn parse_key(value: &str) -> Option<(Vec<u8>, String)> {
     let bytes = match value {
-        "prefix" => b"\x02".to_vec(),
-        "ctrl-s" => b"\x13".to_vec(),
-        "ctrl-t" => b"\x14".to_vec(),
-        "ctrl-w" => b"\x17".to_vec(),
         "space" => b" ".to_vec(),
         "enter" => b"\r".to_vec(),
         "tab" => b"\t".to_vec(),
         "escape" | "esc" => b"\x1b".to_vec(),
         "up" => UP.to_vec(),
         "down" => DOWN.to_vec(),
+        _ if value.len() == 6 && value.starts_with("ctrl-") => {
+            let letter = value.as_bytes()[5];
+            if !letter.is_ascii_lowercase() {
+                return None;
+            }
+            vec![letter - b'a' + 1]
+        }
         _ if value.chars().count() == 1 && !value.chars().next()?.is_control() => {
             value.as_bytes().to_vec()
         }
@@ -676,16 +679,13 @@ pub(super) fn parse_suffix(value: &str) -> Option<(Vec<u8>, String)> {
 
 pub(super) fn suffix_name(suffix: &[u8]) -> String {
     match suffix {
-        b"\x02" => "Ctrl-b".into(),
-        b"\x13" => "Ctrl-s".into(),
-        b"\x14" => "Ctrl-t".into(),
-        b"\x17" => "Ctrl-w".into(),
         b" " => "Space".into(),
         b"\r" => "Enter".into(),
         b"\t" => "Tab".into(),
         b"\x1b" => "Esc".into(),
         _ if suffix == UP => "Up".into(),
         _ if suffix == DOWN => "Down".into(),
+        [control @ 1..=26] => format!("Ctrl-{}", char::from(b'a' + control - 1)),
         _ => String::from_utf8_lossy(suffix).into_owned(),
     }
 }
