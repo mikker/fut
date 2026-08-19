@@ -5429,8 +5429,12 @@ async fn focused_application_mouse_returns_only_its_attachment_viewport_to_botto
     let (mut client_b, selected_b) =
         attach_once(&harness, TargetSelector::Terminal(pane_b.terminal_id)).await;
     assert_eq!(selected_b, pane_b);
+    let (mut readiness_client, readiness_target) =
+        attach_once(&harness, TargetSelector::Terminal(terminal_a)).await;
+    assert_eq!(readiness_target.terminal_id, terminal_a);
     snapshot_containing(&mut client_a, terminal_a, "APP_HIST_40").await;
     snapshot_containing(&mut client_b, terminal_a, "APP_HIST_40").await;
+    snapshot_containing(&mut readiness_client, terminal_a, "APP_HIST_40").await;
 
     let wheel = mouse_wheel_message(terminal_a);
     send_uncorrelated(&mut client_a, wheel.clone()).await;
@@ -5445,9 +5449,7 @@ async fn focused_application_mouse_returns_only_its_attachment_viewport_to_botto
     else {
         unreachable!()
     };
-    let ServerMessage::Snapshot {
-        screen: history_b, ..
-    } = receive_matching(&mut client_b, |message| {
+    let ServerMessage::Snapshot { .. } = receive_matching(&mut client_b, |message| {
         matches!(message, ServerMessage::Snapshot { terminal_id, screen }
             if *terminal_id == terminal_a && !snapshot_text(screen).contains("APP_HIST_40"))
     })
@@ -5457,11 +5459,7 @@ async fn focused_application_mouse_returns_only_its_attachment_viewport_to_botto
     };
 
     fs::write(harness.root.path().join("cwd/app-mouse-go"), b"").unwrap();
-    receive_matching(&mut client_a, |message| {
-        matches!(message, ServerMessage::Snapshot { terminal_id, screen }
-            if *terminal_id == terminal_a && screen.revision > history_a.revision)
-    })
-    .await;
+    snapshot_containing(&mut readiness_client, terminal_a, "APP_MOUSE_READY").await;
     let mut buttons = MouseButtons::default();
     buttons.set(MouseButton::Left, true);
     send_uncorrelated(
@@ -5494,12 +5492,19 @@ async fn focused_application_mouse_returns_only_its_attachment_viewport_to_botto
         expected
     );
 
+    send_uncorrelated(
+        &mut client_b,
+        ClientMessage::RefreshTerminal {
+            terminal_id: terminal_a,
+        },
+    )
+    .await;
     let ServerMessage::Snapshot {
         screen: history_b_after_mouse,
         ..
     } = receive_matching(&mut client_b, |message| {
-        matches!(message, ServerMessage::Snapshot { terminal_id, screen }
-            if *terminal_id == terminal_a && screen.revision > history_b.revision)
+        matches!(message, ServerMessage::Snapshot { terminal_id, .. }
+            if *terminal_id == terminal_a)
     })
     .await
     else {
@@ -5514,6 +5519,7 @@ async fn focused_application_mouse_returns_only_its_attachment_viewport_to_botto
 
     harness.detach(&mut client_a).await;
     harness.detach(&mut client_b).await;
+    harness.detach(&mut readiness_client).await;
     harness.shutdown().await;
 }
 
