@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Project recipe tabs and panes now open only when initially booting a project session, not in every new workspace.
+
 ## 0.9
 
 - Added native extension command forms, and let the bundled `wt` workflow create random worktree names and launch a project-configured Pi agent with an optional prompt.

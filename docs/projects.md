@@ -1,14 +1,14 @@
 ---
 layout: default
 title: Projects
-description: Configure Fut's project catalog and trusted workspace recipes.
+description: Configure Fut's project catalog and trusted bootstrap recipes.
 permalink: /projects/
 ---
 
 # Projects
 
-Fut can keep an explicit project catalog and initialize new sessions and
-workspaces from trusted recipes.
+Fut can keep an explicit project catalog and bootstrap new project sessions
+from trusted recipes.
 
 ## Project catalog
 
@@ -42,15 +42,19 @@ fut project ls
 The daemon loads the catalog at startup. Restart it after changing a project
 path or `recipe`; client-only `Ctrl-b Shift-R` reload does not change daemon
 project configuration. Repository recipe approvals are checked separately each
-time Fut creates a workspace, so approving or revoking one does not require a
-daemon restart.
+time Fut boots a project session, so approving or revoking one does not require
+a daemon restart.
 
 ## Trusted recipes
 
-Each catalog entry may initialize a newly created session or workspace from a
-recipe. Reopening a live workspace never rereads or reconciles its recipe and
-never reruns its commands. A linked Git worktree uses the recipe configured for
-the catalog root, not a file from the linked checkout.
+Each catalog entry may initialize the first workspace of a newly created
+project session from a recipe. Once the project session is live, opening a
+linked checkout or creating another workspace starts one ordinary terminal; it
+does not recreate the recipe's tabs, panes, or commands. Reopening a live
+workspace never rereads or reconciles its recipe and never reruns its commands.
+A linked Git worktree uses the recipe configured for the catalog root when it
+is the checkout that initially boots the project session, not a file from the
+linked checkout.
 
 By default Fut looks for `.fut/project.toml` under the configured catalog root.
 Because that repository-owned file can run commands, review it and approve its
@@ -64,9 +68,9 @@ This command works without a running daemon. It resolves the configured
 project, reads a canonical regular recipe file, and fully validates the recipe
 before recording machine-local approval for its exact bytes. Changing any byte
 makes the recipe untrusted again. Run `fut project untrust fut` to revoke
-approval. The next attempt to create a workspace will fail before running
-recipe commands. Existing live workspaces are unaffected because Fut never
-rereads their recipes.
+approval. The next attempt to bootstrap the project session will fail before
+running recipe commands. Existing live sessions and their new workspaces are
+unaffected because Fut never rereads their recipes.
 
 Approval state is managed exclusively by Fut under
 `$XDG_STATE_HOME/fut/trusted-recipes.toml`, falling back to
@@ -141,11 +145,13 @@ worktree and allows a one-off initial prompt. Clear the form's command field to
 leave process selection to the project recipe.
 
 `fut open -- COMMAND...` still takes priority for the recipe-selected focus
-pane when it creates a workspace; the rest of the recipe is unchanged. An
-explicit open command remains the pane's top-level process. Recipe topology and
-working directories are fully validated before processes start. Fut starts
-every declared terminal before publishing the new resources and closes any
-terminals already started if a later spawn fails.
+pane when it bootstraps a project session; the rest of the recipe is unchanged.
+When it adds a workspace to a live session, the explicit command instead runs
+in that workspace's single initial terminal. An explicit open command remains
+the pane's top-level process. Recipe topology and working directories are fully
+validated before processes start. Fut starts every declared terminal before
+publishing the initial resources and closes any terminals already started if a
+later spawn fails.
 
 ## Related
 

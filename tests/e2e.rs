@@ -7667,7 +7667,7 @@ async fn linked_git_worktree_is_a_peer_workspace_and_reopens_idempotently() {
 }
 
 #[tokio::test]
-async fn trusted_catalog_recipe_atomically_creates_linked_and_bare_workspaces_once() {
+async fn trusted_catalog_recipe_bootstraps_only_the_initial_workspace() {
     let harness = Harness::start_with("while :; do sleep 1; done", |root| {
         let main = root.join("main");
         fs::create_dir(&main).unwrap();
@@ -7809,13 +7809,21 @@ panes = [
         "workspace|workspace"
     );
 
+    fs::write(
+        main.join(".fut/project.toml"),
+        "this is no longer valid TOML",
+    )
+    .unwrap();
     let bare = harness
         .control_command(ClientMessage::OpenLocation {
             project: None,
             name: Some("main".into()),
             cwd: main.clone(),
-            program: None,
-            argv: Vec::new(),
+            program: Some("/bin/sh".into()),
+            argv: vec![
+                "-c".into(),
+                "touch workspace.marker; while :; do sleep 1; done".into(),
+            ],
         })
         .await;
     let ServerMessage::LocationOpened {
@@ -7823,15 +7831,13 @@ panes = [
         disposition: fut::protocol::OpenDisposition::WorkspaceCreated,
     } = bare
     else {
-        panic!("bare catalog identity did not create a recipe workspace: {bare:?}")
+        panic!("bare catalog identity did not create a workspace: {bare:?}")
     };
     assert_eq!(main_focus.session_id, linked_focus.session_id);
-    wait_for(DEADLINE, || {
-        main.join("frontend/editor.marker").exists()
-            && main.join("agent/agent.marker").exists()
-            && main.join("server.marker").exists()
-    })
-    .await;
+    wait_for(DEADLINE, || main.join("workspace.marker").exists()).await;
+    assert!(!main.join("frontend/editor.marker").exists());
+    assert!(!main.join("agent/agent.marker").exists());
+    assert!(!main.join("server.marker").exists());
     let snapshot = harness.resources().await;
     let session = snapshot
         .sessions
@@ -7844,14 +7850,11 @@ panes = [
         .iter()
         .find(|workspace| workspace.id == main_focus.workspace_id)
         .unwrap();
-    assert_eq!(main_workspace.tabs.len(), 2);
-    assert_eq!(main_workspace.tabs[0].panes[1].id, main_focus.pane_id);
+    assert_eq!(main_workspace.tabs.len(), 1);
+    assert_eq!(main_workspace.tabs[0].name, "");
+    assert_eq!(main_workspace.tabs[0].panes.len(), 1);
+    assert_eq!(main_workspace.tabs[0].panes[0].id, main_focus.pane_id);
 
-    fs::write(
-        main.join(".fut/project.toml"),
-        "this is no longer valid TOML",
-    )
-    .unwrap();
     let ignored_marker = linked.join("must-not-run");
     let reopened = harness
         .control_command(ClientMessage::OpenLocation {
@@ -9664,7 +9667,7 @@ async fn public_tab_navigation_and_right_down_splits_share_the_command_catalog()
     })
     .await
     .unwrap_or_else(|_| panic!("tab navigation never reconciled: {:?}", client.text()));
-    client.send(b"\x02T");
+    client.send(b"\x02\x14");
     client.send(b"back\n");
     wait_for(DEADLINE, || {
         fs::metadata(&back_marker).is_ok_and(|metadata| metadata.len() >= 1)
@@ -10167,7 +10170,7 @@ async fn isolated_keyboard_chaos_journey() {
                 "pane-last"
             }
             13 => {
-                client.send(b"\x02T");
+                client.send(b"\x02\x14");
                 current_tab = last_tab.expect("last tab action was validated");
                 let tab = workspace
                     .tabs
@@ -10450,12 +10453,12 @@ done
     left.send(b"linked\nsize-linked\n");
     left.wait_for("ZETA_INPUT").await;
     left.wait_for("ZETA_SIZE_23_96").await;
-    left.send(b"\x02W");
+    left.send(b"\x02\x17");
     left.send(b"main\n");
     left.wait_for("BRAVO_ACK").await;
-    left.send(b"\x02Wlinked\n");
+    left.send(b"\x02\x17linked\n");
     left.wait_for_count("ZETA_INPUT", 2).await;
-    left.send(b"\x02Wmain\n");
+    left.send(b"\x02\x17main\n");
     left.wait_for_count("BRAVO_ACK", 2).await;
     left.send(
         &[

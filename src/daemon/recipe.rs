@@ -14,7 +14,7 @@ use crate::{
     protocol::{OpenDisposition, SelectedTarget},
     resources::{
         CheckoutDestination, InitialPath, Mutation, ResolvedTerminalPath, ResourceTree, TabPath,
-        TrustedProjectConfig, WorkspacePath,
+        TrustedProjectConfig,
     },
     splits::SplitDirection,
     terminal::{SpawnSpec, TerminalHandle, TerminalLifecycle, spawn_terminal},
@@ -112,8 +112,7 @@ pub(super) async fn create_initial(
     resolved: &ResolvedLocation,
     recipe: &PreparedRecipe,
 ) -> Result<SpawnedRecipeTerminals, DaemonError> {
-    let plan = plan_recipe_creation(
-        CheckoutDestination::CreateSession,
+    let plan = plan_recipe_session(
         ResourceTree::default(),
         Vec::new(),
         None,
@@ -158,16 +157,34 @@ pub(super) async fn open_location(
         Arc::clone(&state.extension_registry)
     };
 
-    // Existing resources win before recipe I/O. A changed, removed, or newly
-    // untrusted recipe never prevents an already-live workspace from opening.
-    {
+    // Recipes bootstrap a project session from nothing. Once that session
+    // exists, new workspaces start with a single ordinary terminal and inherit
+    // only the trusted project extension configuration captured by the session.
+    let add_workspace_without_recipe = {
         let mut state = shared.lock().await;
         if !state.accepting {
             return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
         }
-        if let RecipeDestination::Existing(selected) = recipe_destination(&mut state, &resolved)? {
-            return Ok((selected, OpenDisposition::Existing));
+        match recipe_destination(&mut state, &resolved)? {
+            RecipeDestination::Existing(selected) => {
+                return Ok((selected, OpenDisposition::Existing));
+            }
+            RecipeDestination::Create {
+                destination: CheckoutDestination::AddWorkspace { .. },
+                ..
+            } => true,
+            RecipeDestination::Create {
+                destination: CheckoutDestination::CreateSession,
+                ..
+            } => false,
+            RecipeDestination::Create {
+                destination: CheckoutDestination::Existing(_),
+                ..
+            } => unreachable!("creation destination is new"),
         }
+    };
+    if add_workspace_without_recipe {
+        return open_location_without_recipe(shared, exited, name, resolved, program, argv).await;
     }
 
     let loaded = match load_project_recipe(configured.as_ref(), extension_registry.extensions()) {
@@ -205,27 +222,30 @@ pub(super) async fn open_location(
     if !state.accepting {
         return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
     }
-    let (destination, resources, mutations, replacing) =
-        match recipe_destination(&mut state, &resolved)? {
-            RecipeDestination::Existing(selected) => {
-                return Ok((selected, OpenDisposition::Existing));
-            }
-            RecipeDestination::Create {
-                destination,
-                resources,
-                mutations,
-                replacing,
-            } => (destination, resources, mutations, replacing),
-        };
-    let plan = plan_recipe_creation(
-        destination,
-        resources,
-        mutations,
-        replacing,
-        &resolved,
-        name,
-        &recipe,
-    )?;
+    let (resources, mutations, replacing) = match recipe_destination(&mut state, &resolved)? {
+        RecipeDestination::Existing(selected) => {
+            return Ok((selected, OpenDisposition::Existing));
+        }
+        RecipeDestination::Create {
+            destination: CheckoutDestination::CreateSession,
+            resources,
+            mutations,
+            replacing,
+        } => (resources, mutations, replacing),
+        RecipeDestination::Create {
+            destination: CheckoutDestination::AddWorkspace { .. },
+            ..
+        } => {
+            drop(state);
+            return open_location_without_recipe(shared, exited, name, resolved, program, argv)
+                .await;
+        }
+        RecipeDestination::Create {
+            destination: CheckoutDestination::Existing(_),
+            ..
+        } => unreachable!("creation destination is new"),
+    };
+    let plan = plan_recipe_session(resources, mutations, replacing, &resolved, name, &recipe)?;
     let selected_path = plan.selected;
     let disposition = plan.disposition;
     let terminals = match spawn_recipe_terminals(&plan, &state.child_env) {
@@ -505,8 +525,7 @@ fn recipe_destination(
     })
 }
 
-fn plan_recipe_creation(
-    destination: CheckoutDestination,
+fn plan_recipe_session(
     mut resources: ResourceTree,
     mut mutations: Vec<Mutation>,
     replacing: Option<TerminalId>,
@@ -514,19 +533,9 @@ fn plan_recipe_creation(
     name: Option<String>,
     recipe: &PreparedRecipe,
 ) -> Result<RecipeCreationPlan, DaemonError> {
-    let session_name = name
-        .clone()
-        .unwrap_or_else(|| resources.available_session_name(&resolved.suggested_session_name));
-    let workspace_name = match destination {
-        CheckoutDestination::AddWorkspace { .. } => name.unwrap_or_default(),
-        CheckoutDestination::CreateSession => String::new(),
-        CheckoutDestination::Existing(_) => unreachable!("creation destination is new"),
-    };
-    let session_id = match destination {
-        CheckoutDestination::AddWorkspace { session_id } => session_id,
-        CheckoutDestination::CreateSession => SessionId::new(),
-        CheckoutDestination::Existing(_) => unreachable!("creation destination is new"),
-    };
+    let session_name =
+        name.unwrap_or_else(|| resources.available_session_name(&resolved.suggested_session_name));
+    let session_id = SessionId::new();
     let workspace_id = WorkspaceId::new();
     let first_tab = &recipe.tabs[0];
     let first_path = ResolvedTerminalPath {
@@ -536,34 +545,19 @@ fn plan_recipe_creation(
         pane_id: PaneId::new(),
         terminal_id: TerminalId::new(),
     };
-    let first_mutation = match destination {
-        CheckoutDestination::CreateSession => resources.create_session(InitialPath {
-            session_id,
-            session_name,
-            project: resolved.project.clone(),
-            trusted_project_config: recipe.trusted_project_config.clone(),
-            workspace_id,
-            workspace_name,
-            root: resolved.workspace_root.clone(),
-            tab_id: first_path.tab_id,
-            tab_name: first_tab.name.clone(),
-            pane_id: first_path.pane_id,
-            terminal_id: first_path.terminal_id,
-        })?,
-        CheckoutDestination::AddWorkspace { .. } => resources.add_workspace(
-            session_id,
-            WorkspacePath {
-                workspace_id,
-                workspace_name,
-                root: resolved.workspace_root.clone(),
-                tab_id: first_path.tab_id,
-                tab_name: first_tab.name.clone(),
-                pane_id: first_path.pane_id,
-                terminal_id: first_path.terminal_id,
-            },
-        )?,
-        CheckoutDestination::Existing(_) => unreachable!("creation destination is new"),
-    };
+    let first_mutation = resources.create_session(InitialPath {
+        session_id,
+        session_name,
+        project: resolved.project.clone(),
+        trusted_project_config: recipe.trusted_project_config.clone(),
+        workspace_id,
+        workspace_name: String::new(),
+        root: resolved.workspace_root.clone(),
+        tab_id: first_path.tab_id,
+        tab_name: first_tab.name.clone(),
+        pane_id: first_path.pane_id,
+        terminal_id: first_path.terminal_id,
+    })?;
     mutations.push(first_mutation);
 
     let mut terminals = Vec::new();
@@ -632,11 +626,7 @@ fn plan_recipe_creation(
         mutations,
         terminals,
         selected,
-        disposition: match destination {
-            CheckoutDestination::CreateSession => OpenDisposition::SessionCreated,
-            CheckoutDestination::AddWorkspace { .. } => OpenDisposition::WorkspaceCreated,
-            CheckoutDestination::Existing(_) => unreachable!("creation destination is new"),
-        },
+        disposition: OpenDisposition::SessionCreated,
         replacing,
     })
 }
@@ -810,8 +800,7 @@ auto_start = true
             .resolve(temporary.path())
             .await
             .unwrap();
-        let plan = plan_recipe_creation(
-            CheckoutDestination::CreateSession,
+        let plan = plan_recipe_session(
             ResourceTree::default(),
             Vec::new(),
             None,
