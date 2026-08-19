@@ -2,10 +2,12 @@
 
 ## Unreleased
 
+## 0.9
+
 - Added native extension command forms, and let the bundled `wt` workflow create random worktree names and launch a project-configured Pi agent with an optional prompt.
 - Project recipe commands now return to a shell when they exit by default; set `exec = true` for the previous pane-closing behavior, and omit the former `version` field.
-- The `Ctrl-b` command prefix can now be changed with `ui.prefix`.
-- Added `Ctrl-b Ctrl-t` and `Ctrl-b Ctrl-w` shortcuts for switching to the last active tab and workspace.
+- Made the `Ctrl-b` command prefix configurable with `ui.prefix`.
+- Added shortcuts for switching to the last active tab and workspace.
 
 ## 0.8
 
