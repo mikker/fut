@@ -1,6 +1,6 @@
 ---
 id: pro-pgup
-status: in_progress
+status: closed
 deps: []
 links: []
 created: 2026-08-18T07:10:31Z
@@ -30,3 +30,7 @@ Started with the catalog foundation: strict [projects.NAME] paths, CLI open-by-n
 **2026-08-19T08:56:14Z**
 
 Shipped project catalog and recipe work through 21eeacb. Project opens now attach by default with an explicit background mode; daemonless project listing and CLI aliases are included. The in-client project opener remains tracked separately.
+
+**2026-08-19T10:31:27Z**
+
+Shipped the final project recipe refinements in 7655c84: configured commands now return to a shell by default with explicit exec opt-in, the premature recipe version field is removed, and project docs have a dedicated page. Full check and build pass.
