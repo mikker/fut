@@ -2,22 +2,18 @@
 
 ## Unreleased
 
+## 0.8
+
 - `fut open` now starts or reuses a location and attaches by default; use `-b`/`--background` for control-only opens.
 - Added `fut project list` (`project ls`), the `fut o` alias for opening locations, and `-p` as shorthand for `--project`.
 - Failed popup commands now retain their terminal output and show its log path.
-- Added a language-neutral extension authoring contract, public-boundary conformance smoke test, and source-only compiled Rust example.
-- Added explicit extension installation and updates from exact Git commits, with optional content-digest verification and recorded source provenance.
-- Added a bounded local extension store with safe package installation, explicit enablement, immutable content verification, and daemonless management commands.
-- Added extension catalog inspection, daemonless package validation, atomic CLI reloads, active-generation diagnostics, and extension ID completion.
-- Added atomic live extension reloads that synchronize commands, bindings, presentation tokens, and hooks across attached clients while preserving active configuration on validation failure.
-- Added versioned extension manifest compatibility and exact capability declarations, rejecting incompatible packages before activation.
+- Added a language-neutral extension authoring contract, public-boundary conformance test, and source-only compiled Rust example.
+- Added safe extension installation and updates from exact Git commits, with optional digest verification, source provenance, explicit enablement, and daemonless management and validation commands.
+- Added atomic live extension reloads across attached clients, versioned manifest compatibility, exact capability declarations, catalog inspection, diagnostics, and extension ID completion.
 - Added a single run-status token for showing managed command state in workspace lists.
 - Made the global navigator taller so more resources are visible at once.
-- Added a project catalog with daemonless recipe approval commands and trusted one-time layouts, commands, environments, working directories, and focus for projects and linked worktrees.
-- Project recipes can now auto-open existing worktrees and auto-start each workspace's managed run command.
+- Added a project catalog with daemonless recipe approval and trusted layouts, commands, environments, working directories, focus, automatic worktree opening, and managed run commands.
 - Fixed shared-terminal attachment sizing, failed last-terminal replacement recovery, and transient Codex screen-capture errors.
-
-## 0.8
 
 - Added a searchable global agents dialog on `Ctrl-b a`, with color-coded sidebar statuses and startup Codex detection.
 - Added a managed run extension with restart/stop controls, output readiness signals, animated workspace status, live logs, and project-local configuration.
