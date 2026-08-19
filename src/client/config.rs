@@ -1412,12 +1412,8 @@ impl ExtensionConfigCatalog {
     /// has the same representation regardless of declaration order.
     pub(crate) fn fingerprint_data(&self) -> ExtensionConfigFingerprintData<'_> {
         ExtensionConfigFingerprintData {
-            normalized_defaults: normalized_json(&serde_json::Value::Object(
-                self.defaults
-                    .iter()
-                    .map(|(id, table)| (id.clone(), serde_json::Value::Object(table.clone())))
-                    .collect(),
-            )),
+            normalized_defaults: serde_json::to_string(&self.defaults)
+                .expect("extension config defaults always serialize as JSON"),
             source: self.source.as_deref(),
         }
     }
@@ -1443,52 +1439,6 @@ impl ExtensionConfigCatalog {
             source: config.source,
         })
     }
-}
-
-fn normalized_json(value: &serde_json::Value) -> String {
-    fn write(value: &serde_json::Value, output: &mut String) {
-        match value {
-            serde_json::Value::Null => output.push_str("null"),
-            serde_json::Value::Bool(value) => {
-                output.push_str(if *value { "true" } else { "false" });
-            }
-            serde_json::Value::Number(value) => output.push_str(&value.to_string()),
-            serde_json::Value::String(value) => output.push_str(
-                &serde_json::to_string(value).expect("serializing a JSON string cannot fail"),
-            ),
-            serde_json::Value::Array(values) => {
-                output.push('[');
-                for (index, value) in values.iter().enumerate() {
-                    if index > 0 {
-                        output.push(',');
-                    }
-                    write(value, output);
-                }
-                output.push(']');
-            }
-            serde_json::Value::Object(values) => {
-                output.push('{');
-                let mut entries = values.iter().collect::<Vec<_>>();
-                entries.sort_unstable_by_key(|(key, _)| *key);
-                for (index, (key, value)) in entries.into_iter().enumerate() {
-                    if index > 0 {
-                        output.push(',');
-                    }
-                    output.push_str(
-                        &serde_json::to_string(key)
-                            .expect("serializing a JSON object key cannot fail"),
-                    );
-                    output.push(':');
-                    write(value, output);
-                }
-                output.push('}');
-            }
-        }
-    }
-
-    let mut output = String::new();
-    write(value, &mut output);
-    output
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

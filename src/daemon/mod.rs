@@ -321,58 +321,14 @@ impl SharedState {
         Ok(publication)
     }
 
+    #[cfg(test)]
     fn activate_extension_candidate(
         &mut self,
         candidate: crate::extensions::ExtensionRegistry,
     ) -> Result<ExtensionReload, DaemonError> {
-        if candidate.fingerprint() == self.extension_registry.fingerprint() {
-            return Ok(ExtensionReload {
-                catalog: self.extension_registry.catalog().map_err(|error| {
-                    DaemonError::new(
-                        "extension_reload_failed",
-                        format!("could not serialize active extension catalog: {error:#}"),
-                    )
-                })?,
-                changed: false,
-            });
-        }
-
-        let generation = self
-            .extension_registry
-            .generation()
-            .checked_add(1)
-            .ok_or_else(|| {
-                DaemonError::new(
-                    "extension_reload_failed",
-                    "extension generation is exhausted; restart the daemon before retrying",
-                )
-            })?;
-        let candidate = candidate.at_generation(generation).map_err(|error| {
-            DaemonError::new(
-                "extension_reload_failed",
-                format!("could not activate extension generation {generation}: {error:#}"),
-            )
-        })?;
-        let catalog = candidate.catalog().map_err(|error| {
-            DaemonError::new(
-                "extension_reload_failed",
-                format!(
-                    "could not publish extension generation {generation}: {error:#}; the active extension registry was left unchanged"
-                ),
-            )
-        })?;
-        let pruned = self
-            .resources
-            .prune_extension_presentation_tokens(candidate.declared_presentation_tokens());
-        self.extension_registry = Arc::new(candidate);
-        self.extension_catalog.send_replace(catalog.clone());
-        if pruned.changed {
-            self.publish_resource_change(pruned.revision);
-        }
-        Ok(ExtensionReload {
-            catalog,
-            changed: true,
-        })
+        let prepared = self.prepare_extension_candidate(candidate)?;
+        let base_generation = prepared.base_generation;
+        self.commit_extension_candidate(prepared, base_generation)
     }
 
     fn prepare_extension_candidate(
@@ -429,7 +385,22 @@ impl SharedState {
                 ),
             ));
         }
-        self.activate_extension_candidate(prepared.candidate)
+        let changed = prepared.candidate.fingerprint() != self.extension_registry.fingerprint();
+        if changed {
+            let pruned = self.resources.prune_extension_presentation_tokens(
+                prepared.candidate.declared_presentation_tokens(),
+            );
+            self.extension_registry = Arc::new(prepared.candidate);
+            self.extension_catalog
+                .send_replace(prepared.catalog.clone());
+            if pruned.changed {
+                self.publish_resource_change(pruned.revision);
+            }
+        }
+        Ok(ExtensionReload {
+            catalog: prepared.catalog,
+            changed,
+        })
     }
 
     fn report_agent(

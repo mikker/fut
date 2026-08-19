@@ -179,6 +179,14 @@ impl Store {
     }
 
     fn open_existing(root: &Path) -> Result<Option<Self>> {
+        Self::open_existing_with_lock(root, libc::LOCK_SH)
+    }
+
+    fn open_existing_for_write(root: &Path) -> Result<Option<Self>> {
+        Self::open_existing_with_lock(root, libc::LOCK_EX)
+    }
+
+    fn open_existing_with_lock(root: &Path, operation: libc::c_int) -> Result<Option<Self>> {
         match fs::symlink_metadata(root) {
             Ok(metadata) if metadata.file_type().is_dir() || metadata.file_type().is_symlink() => {}
             Ok(_) => bail!(
@@ -193,7 +201,7 @@ impl Store {
             }
         }
         let root = canonical_store_root(root)?;
-        let lock = StoreLock::acquire(&root, libc::LOCK_SH)?;
+        let lock = StoreLock::acquire(&root, operation)?;
         Ok(Some(Self { root, _lock: lock }))
     }
 
@@ -393,6 +401,12 @@ fn install_prepared_at(
     }
 
     let changed = previous.as_ref() != Some(&metadata);
+    if !changed && !created {
+        return Ok(StoreChange {
+            extension: metadata,
+            changed: false,
+        });
+    }
     index
         .extensions
         .retain(|extension| extension.id != metadata.id);
@@ -695,14 +709,10 @@ fn set_enabled_at(
     enabled: bool,
 ) -> std::result::Result<StoreChange, StoreMutationError> {
     validate_id(id)?;
-    let mut store = match Store::open_existing(configured_root)? {
+    let store = match Store::open_existing_for_write(configured_root)? {
         Some(store) => store,
         None => return Err(StoreMutationError::NotFound { id: id.to_owned() }),
     };
-    // Upgrade the shared reader lock to an exclusive mutation lock while no
-    // state is retained from before the upgrade.
-    drop(store);
-    store = Store::open_for_write(configured_root)?;
     let mut index = store.read_index()?;
     let extension = index
         .extensions
@@ -734,10 +744,8 @@ fn remove_at(
     id: &str,
 ) -> std::result::Result<StoreChange, StoreMutationError> {
     validate_id(id)?;
-    if Store::open_existing(configured_root)?.is_none() {
-        return Err(StoreMutationError::NotFound { id: id.to_owned() });
-    }
-    let store = Store::open_for_write(configured_root)?;
+    let store = Store::open_existing_for_write(configured_root)?
+        .ok_or_else(|| StoreMutationError::NotFound { id: id.to_owned() })?;
     let mut index = store.read_index()?;
     let position = index
         .extensions
@@ -1436,28 +1444,7 @@ fn remove_tree(path: &Path) -> Result<()> {
 }
 
 fn validate_id(id: &str) -> Result<()> {
-    if id.is_empty() || id.len() > 64 {
-        bail!("extension ID must be 1 through 64 bytes");
-    }
-    let bytes = id.as_bytes();
-    if !bytes[0].is_ascii_lowercase() || !bytes[bytes.len() - 1].is_ascii_alphanumeric() {
-        bail!(
-            "extension ID {id:?} must start with a lowercase letter and end with a lowercase letter or digit"
-        );
-    }
-    let mut separator = false;
-    for &byte in bytes {
-        if byte.is_ascii_lowercase() || byte.is_ascii_digit() {
-            separator = false;
-        } else if matches!(byte, b'.' | b'_' | b'-') && !separator {
-            separator = true;
-        } else {
-            bail!(
-                "extension ID {id:?} may contain lowercase ASCII letters, digits, and single '.', '_', or '-' separators"
-            );
-        }
-    }
-    Ok(())
+    extensions::validate_identifier("extension ID", id)
 }
 
 fn validate_remote_url(remote_url: &str) -> Result<()> {

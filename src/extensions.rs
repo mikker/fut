@@ -1939,7 +1939,7 @@ fn validate_command(root: &Path, argv: Vec<String>) -> Result<ExtensionCommand> 
     Ok(ExtensionCommand { argv })
 }
 
-fn validate_identifier(label: &str, value: &str) -> Result<()> {
+pub(crate) fn validate_identifier(label: &str, value: &str) -> Result<()> {
     if value.is_empty() || value.len() > MAX_IDENTIFIER_BYTES {
         bail!("{label} must be 1 through {MAX_IDENTIFIER_BYTES} bytes");
     }

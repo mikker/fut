@@ -809,49 +809,30 @@ impl ResourceTree {
         &mut self,
         declared: &HashSet<String>,
     ) -> TokenPublication {
-        let is_stale = |name: &String| !is_builtin_token(name) && !declared.contains(name);
-        let changed = self
-            .sessions
-            .values()
-            .any(|resource| resource.tokens.keys().any(is_stale))
-            || self
-                .workspaces
-                .values()
-                .any(|resource| resource.tokens.keys().any(is_stale))
-            || self
-                .tabs
-                .values()
-                .any(|resource| resource.tokens.keys().any(is_stale))
-            || self
-                .panes
-                .values()
-                .any(|resource| resource.tokens.keys().any(is_stale));
-        if !changed {
-            return TokenPublication {
-                revision: self.revision,
-                changed: false,
-            };
-        }
-
-        self.revision += 1;
         let retain = |tokens: &mut MaterializedTokenMap| {
+            let previous_len = tokens.len();
             tokens.retain(|name, _| is_builtin_token(name) || declared.contains(name));
+            tokens.len() != previous_len
         };
+        let mut changed = false;
         for resource in self.sessions.values_mut() {
-            retain(&mut resource.tokens);
+            changed |= retain(&mut resource.tokens);
         }
         for resource in self.workspaces.values_mut() {
-            retain(&mut resource.tokens);
+            changed |= retain(&mut resource.tokens);
         }
         for resource in self.tabs.values_mut() {
-            retain(&mut resource.tokens);
+            changed |= retain(&mut resource.tokens);
         }
         for resource in self.panes.values_mut() {
-            retain(&mut resource.tokens);
+            changed |= retain(&mut resource.tokens);
+        }
+        if changed {
+            self.revision += 1;
         }
         TokenPublication {
             revision: self.revision,
-            changed: true,
+            changed,
         }
     }
 
