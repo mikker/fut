@@ -44,9 +44,9 @@ installed Fut release.
 
 Fut ships first-party lifecycle adapters for:
 
-- [Claude Code](https://github.com/mikker/fut/tree/main/integrations/claude-code)
-- [Codex](https://github.com/mikker/fut/tree/main/integrations/codex)
-- [Pi](#pi)
+- [Claude Code](agents/claude-code.md)
+- [Codex](agents/codex.md)
+- [Pi](agents/pi.md)
 
 Claude Code and Codex require their Fut plugin; Codex also requires the
 documented `notify` adapter for authoritative turn completion. Follow the
@@ -208,14 +208,3 @@ Each line is versioned JSON with the complete resource snapshot — sessions,
 workspaces, tabs, panes, and agent activity. The first line is the current
 state; every later line is the state after a change. The stream ends when the
 daemon exits.
-
-## Pi
-
-Install Fut's Pi extension directly from the repository:
-
-```sh
-pi install git:github.com/mikker/fut
-```
-
-The extension reports Pi's working, blocked, completed, idle, and exited transitions
-when Pi runs inside Fut. Exiting Pi removes that terminal from the Agents sidebar.

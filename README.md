@@ -20,84 +20,30 @@ brew install mikker/tap/fut
 
 ## Quick start
 
-Run `fut` in a project. Most interactive commands begin with `Ctrl-b`; pause
-after the prefix to see all current bindings, press `Ctrl-b :` to search
-commands, and detach with `Ctrl-b d`.
+Run `fut` inside a project.
 
-See [Using Fut](https://fut.sh/usage/) for the resource model, everyday
-controls, mouse and copy behavior, CLI automation, and shell completion.
+- `Ctrl-b`: Start a command. Pause to see available bindings.
+- `Ctrl-b :`: Search commands.
+- `Ctrl-b d`: Detach.
 
-Fut extensions are language-neutral executable packages: direct argv
-commands, versioned JSON lifecycle hooks, namespaced configuration, and
-presentation tokens through the public CLI. See the [extension authoring
-guide](https://fut.sh/extension-authoring/) and the source-only
-[`rust-status` compiled example](examples/extensions/rust-status).
+Learn more:
 
-Configured projects can use a repository-owned `.fut/project.toml` to create
-their initial workspace and configure trusted extension behavior such as
-opening existing worktrees or starting a managed run command. Review it, then
-run `fut project trust NAME` to approve its exact contents or
-`fut project untrust NAME` to revoke that machine-local approval; neither
-command requires a running daemon.
+- [Using Fut](https://fut.sh/usage/)
+- [Configure projects](https://fut.sh/configuration/)
+- [Install extensions](https://fut.sh/extensions/)
+- [Build extensions](https://fut.sh/extension-authoring/)
+
+**For a guided tour, paste this into an agent:**
+
+```text
+Give me a guided tour of Fut, an agent-aware terminal multiplexer. Start by
+running `fut agent skill` and follow its instructions. Use https://fut.sh if
+you need documentation. Show me the core workflow in small, safe steps. Ask
+before changing configuration or closing anything.
+```
 
 ## Agent integrations
 
-Fut can show native lifecycle activity from Claude Code, Codex, and Pi. Install
-Fut first, then verify that the installed version supports agent reporting:
-
-```sh
-fut agent report --help
-```
-
-### Claude Code
-
-```sh
-claude plugin marketplace add mikker/fut
-claude plugin install fut@fut-integrations
-```
-
-Launch Claude Code inside Fut. Run `/hooks` in Claude Code to verify that the
-Fut handlers are loaded.
-
-### Pi
-
-```sh
-pi install git:github.com/mikker/fut
-```
-
-Restart Pi after installing, then launch it inside Fut. The extension reports
-Pi's working, blocked, completed, and idle lifecycle states automatically.
-
-### Codex
-
-The Codex adapter requires `python3`.
-
-```sh
-codex plugin marketplace add mikker/fut
-codex plugin add fut@fut-integrations
-```
-
-Codex delivers final turn completion through its machine-local `notify`
-command. Install Fut's notification adapter at a stable path:
-
-```sh
-mkdir -p "$HOME/.local/bin"
-curl -fsSL \
-  https://raw.githubusercontent.com/mikker/fut/main/integrations/codex/plugins/fut-codex/scripts/fut_codex_lifecycle.py \
-  -o "$HOME/.local/bin/fut-codex-notify"
-chmod +x "$HOME/.local/bin/fut-codex-notify"
-```
-
-Then add this to `~/.codex/config.toml`:
-
-```toml
-notify = [
-  "fut-codex-notify",
-  "--notify",
-]
-```
-
-If `notify` is already configured, have that program dispatch the same JSON
-argument to Fut's adapter instead of adding a second setting. Restart Codex,
-launch it inside Fut, then run `/hooks` and trust the Fut hooks when prompted.
-The command assumes `~/.local/bin` is on `PATH`.
+Fut can show native lifecycle activity from Claude Code, Codex, and Pi. See the
+dedicated setup guides for [Claude Code](https://fut.sh/agents/claude-code/),
+[Codex](https://fut.sh/agents/codex/), and [Pi](https://fut.sh/agents/pi/).

@@ -28,7 +28,7 @@ body {
   color: var(--ink);
   font-family:
     "SFMono-Regular", "Cascadia Code", "Roboto Mono", ui-monospace, monospace;
-  font-size: 12px;
+  font-size: 14px;
 }
 
 a {
