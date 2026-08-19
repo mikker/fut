@@ -542,12 +542,38 @@ async fn run_loop(
                         } else {
                             None
                         };
+                        let failure_log = if exit_code == Some(0) {
+                            None
+                        } else {
+                            Some(
+                                temporary_command
+                                    .as_ref()
+                                    .expect("command exists")
+                                    .write_failure_log(socket_path)
+                                    .await,
+                            )
+                        };
                         temporary_command = None;
                         view.invalidate_drawn();
-                        match exit_code {
-                            Some(0) => {}
-                            Some(code) => toasts.error(format!("command exited · status {code}")),
-                            None => toasts.error("command exited · status unknown"),
+                        match (exit_code, failure_log) {
+                            (Some(0), _) => {}
+                            (Some(code), Some(Ok(path))) => toasts.error(format!(
+                                "command exited · status {code} · see {}",
+                                path.display()
+                            )),
+                            (None, Some(Ok(path))) => toasts.error(format!(
+                                "command exited · status unknown · see {}",
+                                path.display()
+                            )),
+                            (Some(code), Some(Err(error))) => toasts.error(format!(
+                                "command exited · status {code} · log failed: {}",
+                                one_line_error(&error)
+                            )),
+                            (None, Some(Err(error))) => toasts.error(format!(
+                                "command exited · status unknown · log failed: {}",
+                                one_line_error(&error)
+                            )),
+                            (_, None) => unreachable!("failures produce a log result"),
                         }
                         resize_view(framed, terminal.size()?.into(), &mut view, &resources, &ui).await?;
                         if let Some(pane_id) = activated_target

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Failed popup commands now retain their terminal output and show its log path.
 - Added a single run-status token for showing managed command state in workspace lists.
 - Made the global navigator taller so more resources are visible at once.
 - Added a project catalog with daemonless recipe approval commands and trusted one-time layouts, commands, environments, working directories, and focus for projects and linked worktrees.

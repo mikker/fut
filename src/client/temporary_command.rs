@@ -15,7 +15,10 @@ use tokio::{
 
 use crate::{
     command::{ACTIVATE_OPENED_SOCKET_ENV, PopupSize},
-    domain::{PaneId, ScreenSnapshot, TerminalId, TerminalSize},
+    domain::{
+        MAX_TERMINAL_OUTPUT_ROWS, PaneId, ScreenSnapshot, TerminalId, TerminalOutputSource,
+        TerminalSize,
+    },
     protocol::SelectedTarget,
     resources::TrustedProjectConfig,
     terminal::{SpawnSpec, TerminalEvent, TerminalHandle, TerminalLifecycle, spawn_terminal},
@@ -169,6 +172,30 @@ impl TemporaryCommandSurface {
             .resize(size)
             .await
             .context("resize command surface")
+    }
+
+    pub(super) async fn write_failure_log(&self, socket_path: &Path) -> anyhow::Result<PathBuf> {
+        let output = self
+            .handle
+            .read_output(
+                TerminalOutputSource::RecentUnwrapped,
+                MAX_TERMINAL_OUTPUT_ROWS,
+                false,
+            )
+            .await
+            .context("read failed command output")?;
+        let directory = socket_path
+            .parent()
+            .context("resolve command log directory")?
+            .join("command-logs");
+        tokio::fs::create_dir_all(&directory)
+            .await
+            .with_context(|| format!("create command log directory {}", directory.display()))?;
+        let path = directory.join(format!("command-{}.log", self.handle.id()));
+        tokio::fs::write(&path, output.text)
+            .await
+            .with_context(|| format!("write command log {}", path.display()))?;
+        Ok(path)
     }
 
     pub(super) async fn update(&mut self) -> TemporaryCommandUpdate {
@@ -597,6 +624,49 @@ mod tests {
             )
             .await
             .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_command_output_is_written_beside_the_socket() {
+        let temporary = tempfile::tempdir().unwrap();
+        let socket = temporary.path().join("fut.sock");
+        let mut surface = TemporaryCommandSurface::spawn(
+            &command("/bin/sh", &["-c", "printf 'actionable failure\\n'; exit 2"]),
+            std::process::id(),
+            temporary.path(),
+            TerminalSize {
+                columns: 40,
+                rows: 10,
+            },
+            &socket,
+            None,
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    surface.update().await,
+                    TemporaryCommandUpdate::Exited(Some(2))
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        let path = surface.write_failure_log(&socket).await.unwrap();
+
+        assert_eq!(
+            path.parent(),
+            Some(temporary.path().join("command-logs").as_path())
+        );
+        assert!(
+            fs::read_to_string(path)
+                .unwrap()
+                .contains("actionable failure")
         );
     }
 
