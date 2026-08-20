@@ -226,7 +226,7 @@ mod tests {
 
     fn run_extension_ui() -> UiConfig {
         let mut ui = UiConfig::default();
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/extensions/run");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("extensions/run");
         ui.extensions = extensions::load(&[root]).unwrap();
         ui
     }

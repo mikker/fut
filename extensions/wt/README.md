@@ -14,7 +14,7 @@ Add the extension's absolute directory to `~/.config/fut/config.toml`:
 
 ```toml
 extensions = [
-  "/absolute/path/to/fut/examples/extensions/wt",
+  "/absolute/path/to/fut/extensions/wt",
 ]
 ```
 

@@ -1086,7 +1086,7 @@ auto_start = true
         let recipe: WorkspaceRecipe = toml::from_str(source).unwrap();
         assert!(validate(&recipe, &[]).is_err());
 
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/extensions/run");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("extensions/run");
         let extensions = crate::extensions::load(&[root]).unwrap();
         validate(&recipe, &extensions).unwrap();
         assert_eq!(recipe.extension()["run"]["auto_start"], true);

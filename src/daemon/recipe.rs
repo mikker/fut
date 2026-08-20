@@ -842,7 +842,7 @@ auto_start = true
             path: temporary.path().to_owned(),
             recipe: Some(source),
         };
-        let extension_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/extensions/run");
+        let extension_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("extensions/run");
         let extensions = crate::extensions::load(&[extension_root]).unwrap();
         let loaded = crate::project_definition::load(Some("test"), &project, &extensions)
             .unwrap()

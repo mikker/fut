@@ -2210,8 +2210,8 @@ async fn checked_in_example_extension_smokes_hooks_cli_tokens_and_configuration(
 }
 
 #[test]
-fn checked_in_wt_extension_composes_project_open_and_retirement_commands() {
-    let extension = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/extensions/wt");
+fn bundled_wt_extension_composes_project_open_and_retirement_commands() {
+    let extension = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("extensions/wt");
     let temporary = tempfile::tempdir().unwrap();
     let capture = temporary.path().join("create-argv");
     let fake_wt = temporary.path().join("wt");

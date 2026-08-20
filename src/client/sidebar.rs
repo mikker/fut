@@ -2478,7 +2478,7 @@ mod tests {
             &NotificationState::default(),
         );
         let mut ui = UiConfig::default();
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/extensions/run");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("extensions/run");
         ui.extensions = extensions::load(&[root]).unwrap();
         let SidebarComponentConfig::Workspaces { row, .. } = &mut ui.sidebar.left.components[0]
         else {

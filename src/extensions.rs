@@ -3147,8 +3147,8 @@ scope = "tab"
     }
 
     #[test]
-    fn checked_in_ghostty_title_extension_uses_only_client_hooks() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/extensions/ghostty-title");
+    fn bundled_ghostty_title_extension_uses_only_client_hooks() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("extensions/ghostty-title");
         let extension = load(&[root]).unwrap().remove(0);
 
         assert_eq!(extension.id(), "ghostty-title");
@@ -3167,8 +3167,8 @@ scope = "tab"
     }
 
     #[test]
-    fn checked_in_wt_extension_discovers_once_per_session() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/extensions/wt");
+    fn bundled_wt_extension_discovers_once_per_session() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("extensions/wt");
         let extension = load(&[root]).unwrap().remove(0);
 
         assert_eq!(extension.id(), "wt");
@@ -3232,8 +3232,8 @@ scope = "tab"
     }
 
     #[test]
-    fn checked_in_run_extension_manifest_and_smoke_are_valid() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/extensions/run");
+    fn bundled_run_extension_manifest_and_smoke_are_valid() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("extensions/run");
         let extension = load(std::slice::from_ref(&root)).unwrap().remove(0);
 
         assert_eq!(extension.id(), "run");

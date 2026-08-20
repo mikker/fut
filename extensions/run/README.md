@@ -31,7 +31,7 @@ affect automatic execution.
 Load the extension and bind restart:
 
 ```toml
-extensions = ["/absolute/path/to/fut/examples/extensions/run"]
+extensions = ["/absolute/path/to/fut/extensions/run"]
 
 [ui.bindings]
 "run:restart" = "r"

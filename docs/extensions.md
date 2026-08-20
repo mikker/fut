@@ -552,20 +552,22 @@ retains at most 16 KiB each of hook stdout and stderr for diagnostics. A new
 event is dropped when the queue is full. Daemon shutdown gives the current hook
 a one-second grace period before cancellation.
 
-## Examples
+## Bundled extensions and examples
 
-The repository includes five complete extensions:
+The repository includes three ready-to-use extensions:
 
-- [`ghostty-title`](https://github.com/mikker/fut/tree/main/examples/extensions/ghostty-title)
+- [`ghostty-title`](https://github.com/mikker/fut/tree/main/extensions/ghostty-title)
   follows the selected Fut session in the current Ghostty window title.
+- [`wt`](https://github.com/mikker/fut/tree/main/extensions/wt)
+  creates a worktree, opens it as a workspace, and runs a configurable action.
+- [`run`](https://github.com/mikker/fut/tree/main/extensions/run)
+  explicitly manages one long-running command per workspace, with safe
+  restart/stop, optional output readiness, live logs, and styled status tokens.
+
+Two complete examples demonstrate extension authoring patterns:
 
 - [`example-workspace-status`](https://github.com/mikker/fut/tree/main/examples/extensions/example-workspace-status)
   turns workspace events into a sidebar token.
-- [`wt`](https://github.com/mikker/fut/tree/main/examples/extensions/wt)
-  creates a worktree, opens it as a workspace, and runs a configurable action.
-- [`run`](https://github.com/mikker/fut/tree/main/examples/extensions/run)
-  explicitly manages one long-running command per workspace, with safe
-  restart/stop, optional output readiness, live logs, and styled status tokens.
 - [`rust-status`](https://github.com/mikker/fut/tree/main/examples/extensions/rust-status)
   is a dependency-free compiled Rust example covering commands, hooks, JSON
   config, and token publication without checking in a platform binary.
