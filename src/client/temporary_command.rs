@@ -8,6 +8,11 @@ use std::{
 };
 
 use anyhow::Context;
+use crossterm::event::{
+    KeyModifiers, MouseButton as HostMouseButton, MouseEvent as HostMouseEvent,
+    MouseEventKind as HostMouseEventKind,
+};
+use ratatui::layout::Rect;
 use tokio::{
     io::AsyncReadExt,
     sync::{broadcast, mpsc, watch},
@@ -16,12 +21,16 @@ use tokio::{
 use crate::{
     command::{ACTIVATE_OPENED_SOCKET_ENV, PopupSize},
     domain::{
-        MAX_TERMINAL_OUTPUT_ROWS, PaneId, ScreenSnapshot, TerminalId, TerminalOutputSource,
-        TerminalSize,
+        ClientId, CopyModeAction, MAX_TERMINAL_OUTPUT_ROWS, MouseButton, MouseButtons, MouseEvent,
+        MouseEventKind, MouseModifiers, MouseWheelDirection, PaneId, ScreenSnapshot, TerminalId,
+        TerminalOutputSource, TerminalSize,
     },
     protocol::SelectedTarget,
     resources::TrustedProjectConfig,
-    terminal::{SpawnSpec, TerminalEvent, TerminalHandle, TerminalLifecycle, spawn_terminal},
+    terminal::{
+        CopyModeOutcome, MouseInputOutcome, SpawnSpec, TerminalEvent, TerminalHandle,
+        TerminalLifecycle, spawn_terminal,
+    },
 };
 
 use super::config::{PaletteCommand, ResolvedExtensionConfig, UiConfig, resolve_extension_config};
@@ -126,7 +135,35 @@ pub(super) struct TemporaryCommandSurface {
     events: broadcast::Receiver<TerminalEvent>,
     lifecycle: watch::Receiver<TerminalLifecycle>,
     activation: Option<ActivationSocket>,
+    mouse: TemporaryMouseState,
     pub screen: ScreenSnapshot,
+}
+
+#[derive(Default)]
+struct TemporaryMouseState {
+    owner: ClientId,
+    buttons: MouseButtons,
+    mode: TemporaryMouseMode,
+    viewport_offset: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum TemporaryMouseMode {
+    #[default]
+    Idle,
+    Selecting {
+        anchor: (u16, u16),
+        position: Option<(u16, u16)>,
+    },
+    Copying {
+        request_id: uuid::Uuid,
+        copy_id: uuid::Uuid,
+    },
+}
+
+pub(super) struct TemporaryClipboardCopy {
+    pub request_id: uuid::Uuid,
+    pub text: String,
 }
 
 pub(super) enum TemporaryCommandUpdate {
@@ -198,6 +235,7 @@ impl TemporaryCommandSurface {
             events,
             lifecycle,
             activation,
+            mouse: TemporaryMouseState::default(),
             screen,
         })
     }
@@ -218,19 +256,314 @@ impl TemporaryCommandSurface {
             .map(Option::flatten)
     }
 
-    pub(super) async fn input(&self, bytes: Vec<u8>) -> anyhow::Result<()> {
-        self.handle.input(bytes).await.context("send command input")
+    pub(super) async fn input(&mut self, bytes: Vec<u8>) -> anyhow::Result<()> {
+        if self.prepare_input().await? {
+            self.handle
+                .input(bytes)
+                .await
+                .context("send command input")?;
+        }
+        Ok(())
     }
 
-    pub(super) async fn paste(&self, text: String) -> anyhow::Result<()> {
-        self.handle.paste(text).await.context("paste command input")
+    pub(super) async fn paste(&mut self, text: String) -> anyhow::Result<()> {
+        if self.prepare_input().await? {
+            self.handle
+                .paste(text)
+                .await
+                .context("paste command input")?;
+        }
+        Ok(())
     }
 
-    pub(super) async fn resize(&self, size: TerminalSize) -> anyhow::Result<()> {
+    pub(super) async fn resize(&mut self, size: TerminalSize) -> anyhow::Result<()> {
+        if !self.prepare_input().await? {
+            return Ok(());
+        }
         self.handle
             .resize(size)
             .await
             .context("resize command surface")
+    }
+
+    pub(super) async fn mouse(
+        &mut self,
+        event: HostMouseEvent,
+        content: Rect,
+    ) -> anyhow::Result<Option<TemporaryClipboardCopy>> {
+        if matches!(self.mouse.mode, TemporaryMouseMode::Copying { .. }) {
+            return Ok(None);
+        }
+        let owner = self.mouse.owner;
+        match event.kind {
+            HostMouseEventKind::Down(HostMouseButton::Left)
+                if !self.screen.mouse_tracking || event.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                if let Some(anchor) = popup_cell(content, event.column, event.row, false) {
+                    self.mouse.mode = TemporaryMouseMode::Selecting {
+                        anchor,
+                        position: None,
+                    };
+                }
+                return Ok(None);
+            }
+            HostMouseEventKind::Drag(HostMouseButton::Left) => {
+                if let TemporaryMouseMode::Selecting {
+                    anchor,
+                    mut position,
+                } = self.mouse.mode
+                {
+                    let Some(cell) = popup_cell(content, event.column, event.row, true) else {
+                        return Ok(None);
+                    };
+                    if position.is_none() {
+                        self.apply_copy_action(
+                            CopyModeAction::BeginSelection {
+                                column: anchor.0,
+                                row: anchor.1,
+                            },
+                            "begin command mouse selection",
+                        )
+                        .await?;
+                    }
+                    if position != Some(cell) {
+                        self.apply_copy_action(
+                            CopyModeAction::SetSelectionEnd {
+                                column: cell.0,
+                                row: cell.1,
+                            },
+                            "extend command mouse selection",
+                        )
+                        .await?;
+                        position = Some(cell);
+                    }
+                    self.mouse.mode = TemporaryMouseMode::Selecting { anchor, position };
+                    return Ok(None);
+                }
+            }
+            HostMouseEventKind::Up(HostMouseButton::Left) => {
+                if let TemporaryMouseMode::Selecting { position, .. } = self.mouse.mode {
+                    let Some(cell) = popup_cell(content, event.column, event.row, true) else {
+                        self.mouse.mode = TemporaryMouseMode::Idle;
+                        return Ok(None);
+                    };
+                    let Some(previous) = position else {
+                        self.mouse.mode = TemporaryMouseMode::Idle;
+                        return Ok(None);
+                    };
+                    if previous != cell {
+                        self.apply_copy_action(
+                            CopyModeAction::SetSelectionEnd {
+                                column: cell.0,
+                                row: cell.1,
+                            },
+                            "finish command mouse selection",
+                        )
+                        .await?;
+                    }
+                    let CopyModeOutcome::Prepared { copy_id, text } = self
+                        .handle
+                        .copy_mode(owner, CopyModeAction::Copy, self.mouse.viewport_offset)
+                        .await
+                        .context("prepare command mouse copy")?
+                    else {
+                        anyhow::bail!("command mouse copy did not prepare clipboard text");
+                    };
+                    let request_id = uuid::Uuid::new_v4();
+                    self.mouse.mode = TemporaryMouseMode::Copying {
+                        request_id,
+                        copy_id,
+                    };
+                    return Ok(Some(TemporaryClipboardCopy { request_id, text }));
+                }
+            }
+            _ => {}
+        }
+
+        self.forward_mouse(event, content).await?;
+        Ok(None)
+    }
+
+    pub(super) async fn finish_clipboard(
+        &mut self,
+        request_id: uuid::Uuid,
+        copied: bool,
+    ) -> anyhow::Result<bool> {
+        let TemporaryMouseMode::Copying {
+            request_id: expected,
+            copy_id,
+        } = self.mouse.mode
+        else {
+            return Ok(false);
+        };
+        if request_id != expected {
+            return Ok(false);
+        }
+        let action = if copied {
+            CopyModeAction::FinalizeCopy { copy_id }
+        } else {
+            CopyModeAction::Cancel
+        };
+        self.apply_copy_action(action, "finish command mouse copy")
+            .await?;
+        self.mouse.mode = TemporaryMouseMode::Idle;
+        Ok(true)
+    }
+
+    pub(super) async fn cancel_mouse_copy(&mut self) {
+        if let Ok(Some(screen)) = self.handle.clear_client(self.mouse.owner).await {
+            self.screen = screen;
+        }
+        self.mouse.mode = TemporaryMouseMode::Idle;
+        self.mouse.viewport_offset = None;
+    }
+
+    async fn prepare_input(&mut self) -> anyhow::Result<bool> {
+        if matches!(self.mouse.mode, TemporaryMouseMode::Copying { .. }) {
+            return Ok(false);
+        }
+        if self.copy_mode_active() {
+            let screen = self
+                .handle
+                .clear_client(self.mouse.owner)
+                .await
+                .context("cancel command mouse selection before input")?;
+            if let Some(screen) = screen {
+                self.screen = screen;
+            }
+        }
+        self.mouse.mode = TemporaryMouseMode::Idle;
+        if self.mouse.viewport_offset.take().is_some() {
+            self.screen = self
+                .handle
+                .viewport_snapshot(None)
+                .await
+                .context("return command viewport to bottom before input")?
+                .screen;
+        }
+        Ok(true)
+    }
+
+    fn copy_mode_active(&self) -> bool {
+        matches!(
+            self.mouse.mode,
+            TemporaryMouseMode::Selecting {
+                position: Some(_),
+                ..
+            } | TemporaryMouseMode::Copying { .. }
+        )
+    }
+
+    async fn apply_copy_action(
+        &mut self,
+        action: CopyModeAction,
+        context: &'static str,
+    ) -> anyhow::Result<()> {
+        let outcome = self
+            .handle
+            .copy_mode(self.mouse.owner, action, self.mouse.viewport_offset)
+            .await
+            .context(context)?;
+        self.accept_copy_outcome(outcome);
+        Ok(())
+    }
+
+    async fn forward_mouse(&mut self, event: HostMouseEvent, content: Rect) -> anyhow::Result<()> {
+        let button = match event.kind {
+            HostMouseEventKind::Down(button)
+            | HostMouseEventKind::Up(button)
+            | HostMouseEventKind::Drag(button) => Some(normalize_button(button)),
+            _ => None,
+        };
+        let clamp = matches!(
+            event.kind,
+            HostMouseEventKind::Up(_) | HostMouseEventKind::Drag(_)
+        );
+        let Some((column, row)) = popup_cell(content, event.column, event.row, clamp) else {
+            return Ok(());
+        };
+        match event.kind {
+            HostMouseEventKind::Down(button) => {
+                let button = normalize_button(button);
+                self.mouse.buttons.set(button, true);
+            }
+            HostMouseEventKind::Up(button) => {
+                let button = normalize_button(button);
+                if !self.mouse.buttons.contains(button) {
+                    return Ok(());
+                }
+                self.mouse.buttons.set(button, false);
+                if button == MouseButton::Left {
+                    self.mouse.mode = TemporaryMouseMode::Idle;
+                }
+            }
+            HostMouseEventKind::Drag(button)
+                if !self.mouse.buttons.contains(normalize_button(button)) =>
+            {
+                return Ok(());
+            }
+            _ => {}
+        }
+        let kind = match event.kind {
+            HostMouseEventKind::Down(button) => MouseEventKind::Press {
+                button: normalize_button(button),
+            },
+            HostMouseEventKind::Up(button) => MouseEventKind::Release {
+                button: normalize_button(button),
+            },
+            HostMouseEventKind::Drag(_) => MouseEventKind::Motion { button },
+            HostMouseEventKind::Moved => MouseEventKind::Motion { button: None },
+            HostMouseEventKind::ScrollUp | HostMouseEventKind::ScrollDown => {
+                MouseEventKind::Wheel {
+                    direction: if matches!(event.kind, HostMouseEventKind::ScrollUp) {
+                        MouseWheelDirection::Up
+                    } else {
+                        MouseWheelDirection::Down
+                    },
+                }
+            }
+            HostMouseEventKind::ScrollLeft | HostMouseEventKind::ScrollRight => return Ok(()),
+        };
+        let outcome = self
+            .handle
+            .mouse_input(
+                MouseEvent {
+                    kind,
+                    column,
+                    row,
+                    modifiers: MouseModifiers {
+                        shift: event.modifiers.contains(KeyModifiers::SHIFT),
+                        control: event.modifiers.contains(KeyModifiers::CONTROL),
+                        alt: event.modifiers.contains(KeyModifiers::ALT),
+                    },
+                    buttons: self.mouse.buttons,
+                },
+                self.mouse.viewport_offset,
+                true,
+            )
+            .await
+            .context("send command mouse input")?;
+        if let MouseInputOutcome::Scrolled(viewport)
+        | MouseInputOutcome::ReturnedToBottom(viewport) = outcome
+        {
+            self.mouse.viewport_offset = viewport.offset;
+            self.screen = viewport.screen;
+        }
+        Ok(())
+    }
+
+    fn accept_copy_outcome(&mut self, outcome: CopyModeOutcome) {
+        match outcome {
+            CopyModeOutcome::Active(viewport) => {
+                self.mouse.viewport_offset = viewport.offset;
+                self.screen = viewport.screen;
+            }
+            CopyModeOutcome::Finalized { screen } | CopyModeOutcome::Cancelled { screen } => {
+                self.mouse.viewport_offset = None;
+                self.screen = screen;
+            }
+            CopyModeOutcome::Prepared { .. } => {}
+        }
     }
 
     pub(super) async fn write_failure_log(&self, socket_path: &Path) -> anyhow::Result<PathBuf> {
@@ -264,8 +597,32 @@ impl TemporaryCommandSurface {
         tokio::select! {
             changed = self.snapshots.changed() => {
                 if changed.is_ok() {
-                    self.screen = self.snapshots.borrow_and_update().clone();
-                    TemporaryCommandUpdate::Screen
+                    let canonical = self.snapshots.borrow_and_update().clone();
+                    let viewport = if self.copy_mode_active() {
+                        self.handle
+                            .copy_mode_snapshot(self.mouse.owner, self.mouse.viewport_offset)
+                            .await
+                    } else if self.mouse.viewport_offset.is_some() {
+                        self.handle.viewport_snapshot(self.mouse.viewport_offset).await
+                    } else {
+                        self.screen = canonical;
+                        return TemporaryCommandUpdate::Screen;
+                    };
+                    match viewport {
+                        Ok(viewport) => {
+                            self.mouse.viewport_offset = viewport.offset;
+                            self.screen = viewport.screen;
+                            TemporaryCommandUpdate::Screen
+                        }
+                        Err(error) => {
+                            self.mouse.mode = TemporaryMouseMode::Idle;
+                            self.mouse.viewport_offset = None;
+                            self.screen = canonical;
+                            TemporaryCommandUpdate::Error(format!(
+                                "mouse selection cancelled: {error}"
+                            ))
+                        }
+                    }
                 } else {
                     TemporaryCommandUpdate::Stopped
                 }
@@ -286,6 +643,28 @@ impl TemporaryCommandSurface {
             }
         }
     }
+}
+
+fn normalize_button(button: HostMouseButton) -> MouseButton {
+    match button {
+        HostMouseButton::Left => MouseButton::Left,
+        HostMouseButton::Middle => MouseButton::Middle,
+        HostMouseButton::Right => MouseButton::Right,
+    }
+}
+
+fn popup_cell(area: Rect, column: u16, row: u16, clamp: bool) -> Option<(u16, u16)> {
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    if !clamp && (column < area.x || column >= area.right() || row < area.y || row >= area.bottom())
+    {
+        return None;
+    }
+    Some((
+        column.clamp(area.x, area.right() - 1) - area.x,
+        row.clamp(area.y, area.bottom() - 1) - area.y,
+    ))
 }
 
 fn add_form_environment(
@@ -611,6 +990,38 @@ mod tests {
     use super::*;
     use crate::client::config::ExtensionCommandIdentity;
 
+    fn mouse(kind: HostMouseEventKind, column: u16, row: u16) -> HostMouseEvent {
+        HostMouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn shifted_mouse(kind: HostMouseEventKind, column: u16, row: u16) -> HostMouseEvent {
+        HostMouseEvent {
+            modifiers: KeyModifiers::SHIFT,
+            ..mouse(kind, column, row)
+        }
+    }
+
+    async fn wait_for_screen(
+        surface: &mut TemporaryCommandSurface,
+        predicate: impl Fn(&ScreenSnapshot) -> bool,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !predicate(&surface.screen) {
+                assert!(!matches!(
+                    surface.update().await,
+                    TemporaryCommandUpdate::Exited(_) | TemporaryCommandUpdate::Stopped
+                ));
+            }
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn live_process_cwd_is_inherited() {
         assert_eq!(
@@ -727,6 +1138,172 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(event, Some(0));
+    }
+
+    #[tokio::test]
+    async fn mouse_drag_selects_popup_text_and_prepares_a_clipboard_copy() {
+        let temporary = tempfile::tempdir().unwrap();
+        let input = temporary.path().join("input");
+        let script = format!(
+            "printf COPY_TARGET; stty raw -echo; dd bs=1 count=1 of='{}' 2>/dev/null; sleep 60",
+            input.display()
+        );
+        let mut surface = TemporaryCommandSurface::spawn(
+            &command("/bin/sh", &["-c", &script]),
+            std::process::id(),
+            temporary.path(),
+            TerminalSize {
+                columns: 20,
+                rows: 4,
+            },
+            Path::new("/tmp/fut-test.sock"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        wait_for_screen(&mut surface, |screen| {
+            screen
+                .cells
+                .iter()
+                .map(|cell| cell.contents.as_str())
+                .collect::<String>()
+                .contains("COPY_TARGET")
+        })
+        .await;
+
+        let content = Rect::new(5, 3, 20, 4);
+        assert!(
+            surface
+                .mouse(
+                    mouse(HostMouseEventKind::Down(HostMouseButton::Left), 5, 3),
+                    content,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        surface
+            .mouse(
+                mouse(HostMouseEventKind::Drag(HostMouseButton::Left), 15, 3),
+                content,
+            )
+            .await
+            .unwrap();
+        let Some(TemporaryClipboardCopy { request_id, text }) = surface
+            .mouse(
+                mouse(HostMouseEventKind::Up(HostMouseButton::Left), 15, 3),
+                content,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("mouse release did not prepare a popup copy")
+        };
+        assert_eq!(text, "COPY_TARGET");
+        assert!(surface.screen.cells.iter().any(|cell| cell.selected));
+        assert!(
+            surface
+                .mouse(
+                    mouse(HostMouseEventKind::Down(HostMouseButton::Left), 5, 3),
+                    content,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        surface.input(b"x".to_vec()).await.unwrap();
+        assert!(
+            !input.exists(),
+            "input escaped while clipboard copy was pending"
+        );
+        assert!(surface.finish_clipboard(request_id, true).await.unwrap());
+        assert!(surface.screen.cells.iter().all(|cell| !cell.selected));
+        surface.input(b"y".to_vec()).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !fs::read(&input).is_ok_and(|bytes| bytes == b"y") {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn mouse_aware_popup_receives_content_local_gestures() {
+        let temporary = tempfile::tempdir().unwrap();
+        let capture = temporary.path().join("mouse.capture");
+        let script = format!(
+            "stty raw -echo; printf '\\033[?1000h\\033[?1006hREADY'; dd bs=1 count=18 of='{}' 2>/dev/null; sleep 60",
+            capture.display()
+        );
+        let mut surface = TemporaryCommandSurface::spawn(
+            &command("/bin/sh", &["-c", &script]),
+            std::process::id(),
+            temporary.path(),
+            TerminalSize {
+                columns: 20,
+                rows: 4,
+            },
+            Path::new("/tmp/fut-test.sock"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        wait_for_screen(&mut surface, |screen| screen.mouse_tracking).await;
+
+        let content = Rect::new(5, 3, 20, 4);
+        for kind in [
+            HostMouseEventKind::Down(HostMouseButton::Left),
+            HostMouseEventKind::Up(HostMouseButton::Left),
+        ] {
+            assert!(
+                surface
+                    .mouse(mouse(kind, 7, 4), content)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if fs::read(&capture).is_ok_and(|bytes| bytes.len() == 18) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(fs::read(capture).unwrap(), b"\x1b[<0;3;2M\x1b[<0;3;2m");
+
+        surface
+            .mouse(
+                shifted_mouse(HostMouseEventKind::Down(HostMouseButton::Left), 5, 3),
+                content,
+            )
+            .await
+            .unwrap();
+        surface
+            .mouse(
+                shifted_mouse(HostMouseEventKind::Drag(HostMouseButton::Left), 10, 3),
+                content,
+            )
+            .await
+            .unwrap();
+        let Some(TemporaryClipboardCopy { request_id, text }) = surface
+            .mouse(
+                shifted_mouse(HostMouseEventKind::Up(HostMouseButton::Left), 10, 3),
+                content,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("Shift-drag did not override popup mouse tracking")
+        };
+        assert_eq!(text, "READY");
+        assert!(surface.finish_clipboard(request_id, true).await.unwrap());
     }
 
     #[tokio::test]

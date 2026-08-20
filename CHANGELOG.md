@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Interactive command popups now support mouse scrolling, application mouse input, and drag-to-copy text selection, with Shift-drag forcing selection.
 - Added `--no-config` to start Fut with built-in defaults without loading configuration files.
 - Added command-palette actions for renaming and closing the focused session, workspace, or tab, with configurable but unbound shortcuts.
 - Added `fut project init` to create a schema-enabled starter project recipe without overwriting existing configuration.

@@ -1295,15 +1295,15 @@ async fn run_loop(
                     }
                     Event::Key(key) if temporary_command.is_some() => {
                         if let Some(bytes) = encode_key(key) {
-                            temporary_command.as_ref().expect("command exists").input(bytes).await?;
+                            temporary_command.as_mut().expect("command exists").input(bytes).await?;
                         }
                     }
                     Event::Paste(text) if temporary_command.is_some() => {
-                        temporary_command.as_ref().expect("command exists").paste(text).await?;
+                        temporary_command.as_mut().expect("command exists").paste(text).await?;
                     }
                     Event::Resize(columns, rows) if temporary_command.is_some() && columns > 0 && rows > 0 => {
                         let host = Rect::new(0, 0, columns, rows);
-                        let command = temporary_command.as_ref().expect("command exists");
+                        let command = temporary_command.as_mut().expect("command exists");
                         let content = temporary_command_content(command.size().area(host));
                         command.resize(TerminalSize {
                             columns: content.width,
@@ -1311,7 +1311,22 @@ async fn run_loop(
                         }).await?;
                         force_draw = true;
                     }
-                    Event::Mouse(_) if temporary_command.is_some() => {}
+                    Event::Mouse(mouse) if temporary_command.is_some() => {
+                        let host: Rect = terminal.size()?.into();
+                        let command = temporary_command.as_mut().expect("command exists");
+                        let content = temporary_command_content(command.size().area(host));
+                        match command.mouse(mouse, content).await {
+                            Ok(Some(copy)) => {
+                                spawn_pbcopy(copy.request_id, copy.text, clipboard_results.clone());
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                command.cancel_mouse_copy().await;
+                                toasts.error(format!("COPY FAILED · {}", one_line_error(&error)));
+                            }
+                        }
+                        force_draw = true;
+                    }
                     Event::Key(key) if matches!(surface.as_ref(), Some(ClientSurface::CommandForm(_))) => {
                         toasts.clear();
                         let action = match surface.as_mut().expect("command form exists") {
@@ -2424,6 +2439,22 @@ async fn run_loop(
                 if let Some(result) = result {
                     match result {
                         ClipboardResult::Copied { request_id, bytes } => {
+                            if let Some(command) = temporary_command.as_mut() {
+                                match command.finish_clipboard(request_id, true).await {
+                                    Ok(true) => {
+                                        toasts.info(format!("copied {bytes} bytes"));
+                                        force_draw = true;
+                                        continue;
+                                    }
+                                    Ok(false) => {}
+                                    Err(error) => {
+                                        command.cancel_mouse_copy().await;
+                                        toasts.error(format!("COPY FAILED · {}", one_line_error(&error)));
+                                        force_draw = true;
+                                        continue;
+                                    }
+                                }
+                            }
                             if let Some(copy_id) = copy_mode
                                 .as_mut()
                                 .and_then(|state| state.finish_clipboard(request_id))
@@ -2438,6 +2469,22 @@ async fn run_loop(
                             }
                         }
                         ClipboardResult::Failed { request_id, message } => {
+                            if let Some(command) = temporary_command.as_mut() {
+                                match command.finish_clipboard(request_id, false).await {
+                                    Ok(true) => {
+                                        toasts.error(format!("COPY FAILED · {message}"));
+                                        force_draw = true;
+                                        continue;
+                                    }
+                                    Ok(false) => {}
+                                    Err(error) => {
+                                        command.cancel_mouse_copy().await;
+                                        toasts.error(format!("COPY FAILED · {}", one_line_error(&error)));
+                                        force_draw = true;
+                                        continue;
+                                    }
+                                }
+                            }
                             if copy_mode
                                 .as_mut()
                                 .and_then(|state| state.finish_clipboard(request_id))
@@ -2511,6 +2558,12 @@ async fn run_loop(
                                     blinking: command.screen.cursor.blinking,
                                 });
                             }
+                            toasts.render(
+                                area,
+                                ui.tab_bar.position,
+                                &ui.styles,
+                                frame.buffer_mut(),
+                            );
                             return;
                         }
                         let layout = client_layout(
