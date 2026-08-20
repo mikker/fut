@@ -72,14 +72,27 @@ pub struct Cli {
     #[arg(long, global = true, value_hint = ValueHint::FilePath)]
     socket: Option<PathBuf>,
     /// Read config.toml from this directory instead of the standard location.
-    #[arg(long, global = true, value_hint = ValueHint::DirPath)]
+    #[arg(long, global = true, value_hint = ValueHint::DirPath, conflicts_with = "no_config")]
     config_dir: Option<PathBuf>,
+    /// Use built-in defaults without loading configuration files.
+    #[arg(long, global = true)]
+    no_config: bool,
     /// Emit versioned JSON for noninteractive commands only.
     #[arg(long, global = true)]
     json: bool,
     /// Command to run; omit it to open the current directory and attach.
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+impl Cli {
+    fn config_location(&self) -> Result<client::config::ConfigLocation> {
+        if self.no_config {
+            Ok(client::config::ConfigLocation::disabled())
+        } else {
+            client::config::resolve_location(self.config_dir.as_deref())
+        }
+    }
 }
 
 fn cli_command() -> clap::Command {
@@ -901,7 +914,18 @@ async fn run_from(args: impl IntoIterator<Item = OsString>) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let report = crate::doctor::run(&socket, cli.config_dir.as_deref()).await;
+        let config_location = match cli.config_location() {
+            Ok(location) => location,
+            Err(error) => {
+                if json_output {
+                    render_json_error("command_failed", format!("{error:#}"));
+                } else {
+                    eprintln!("Error: {error:#}");
+                }
+                return ExitCode::FAILURE;
+            }
+        };
+        let report = crate::doctor::run(&socket, &config_location).await;
         if json_output {
             if let Err(error) = output(true, "doctor", &report, "") {
                 render_json_error("command_failed", format!("{error:#}"));
@@ -977,16 +1001,16 @@ async fn execute(cli: Cli) -> Result<()> {
         }
     }
 
+    let config_location = cli.config_location()?;
     let socket = socket_path(cli.socket.as_deref())?;
     reject_interactive_json(&cli)?;
     reject_nested_client(&cli)?;
-    let config_dir = cli.config_dir.clone();
     match cli.command {
         None => {
             let cwd = std::env::current_dir().context("read current directory")?;
-            open_and_attach(&socket, cwd, config_dir.as_deref()).await
+            open_and_attach(&socket, cwd, &config_location).await
         }
-        Some(Command::Attach) => client::attach_navigator(&socket, config_dir.as_deref()).await,
+        Some(Command::Attach) => client::attach_navigator(&socket, &config_location).await,
         Some(Command::Open {
             path,
             project,
@@ -995,20 +1019,16 @@ async fn execute(cli: Cli) -> Result<()> {
             command,
         }) => {
             let current_dir = std::env::current_dir()?;
-            let (cwd, configured_project) = resolve_project_open(
-                path,
-                project.as_deref(),
-                &current_dir,
-                config_dir.as_deref(),
-            )?;
+            let (cwd, configured_project) =
+                resolve_project_open(path, project.as_deref(), &current_dir, &config_location)?;
             if let Some((name, configured)) = project.as_deref().zip(configured_project.as_ref()) {
-                confirm_project_recipe(name, configured, config_dir.as_deref(), cli.json)?;
+                confirm_project_recipe(name, configured, &config_location, cli.json)?;
             }
             let (program, argv) = child_command(command);
             let ui = if background {
                 None
             } else {
-                Some(client::stage_ui_config(config_dir.as_deref())?)
+                Some(client::stage_ui_config(&config_location)?)
             };
             let (selected, disposition) = open_location_with_config(
                 &socket,
@@ -1020,7 +1040,7 @@ async fn execute(cli: Cli) -> Result<()> {
                     argv,
                 },
                 &cwd,
-                config_dir.as_deref(),
+                &config_location,
             )
             .await?;
             notify_command_activation(selected.pane_id)?;
@@ -1030,7 +1050,7 @@ async fn execute(cli: Cli) -> Result<()> {
                         &socket,
                         Some(TargetSelector::Terminal(selected.terminal_id)),
                         ui,
-                        config_dir.as_deref(),
+                        &config_location,
                     )
                     .await
                 }
@@ -1051,7 +1071,7 @@ async fn execute(cli: Cli) -> Result<()> {
             }
         }
         Some(Command::Project { command }) => {
-            run_project_command(config_dir.as_deref(), cli.json, command)
+            run_project_command(&config_location, cli.json, command)
         }
         Some(Command::Session {
             command: SessionCommand::Attach { session },
@@ -1059,7 +1079,7 @@ async fn execute(cli: Cli) -> Result<()> {
             client::attach(
                 &socket,
                 Some(TargetSelector::Session(session_selector(&session))),
-                config_dir.as_deref(),
+                &config_location,
             )
             .await
         }
@@ -1069,27 +1089,20 @@ async fn execute(cli: Cli) -> Result<()> {
             client::attach(
                 &socket,
                 Some(TargetSelector::Workspace(workspace_id)),
-                config_dir.as_deref(),
+                &config_location,
             )
             .await
         }
         Some(Command::Tab {
             command: TabCommand::Attach { tab_id },
-        }) => {
-            client::attach(
-                &socket,
-                Some(TargetSelector::Tab(tab_id)),
-                config_dir.as_deref(),
-            )
-            .await
-        }
+        }) => client::attach(&socket, Some(TargetSelector::Tab(tab_id)), &config_location).await,
         Some(Command::Pane {
             command: PaneCommand::Attach { pane_id },
         }) => {
             client::attach(
                 &socket,
                 Some(TargetSelector::Pane(pane_id)),
-                config_dir.as_deref(),
+                &config_location,
             )
             .await
         }
@@ -1484,7 +1497,7 @@ async fn execute(cli: Cli) -> Result<()> {
             client::attach(
                 &socket,
                 Some(TargetSelector::Terminal(terminal_id)),
-                config_dir.as_deref(),
+                &config_location,
             )
             .await
         }
@@ -1914,13 +1927,12 @@ async fn execute(cli: Cli) -> Result<()> {
             command: DaemonCommand::Run { cwd, command },
         }) => {
             let cwd = cwd.unwrap_or(std::env::current_dir()?);
-            let mut config = DaemonConfig::shell(socket, cwd);
+            let mut config = DaemonConfig::shell(socket, cwd, config_location);
             if let Some(program) = command.first() {
                 config.spawn.program = program.into();
                 config.spawn.argv = command[1..].to_vec();
                 config.recipe_command_override = true;
             }
-            config.config_dir = config_dir;
             run_daemon(config).await
         }
         Some(Command::Daemon {
@@ -1976,14 +1988,14 @@ async fn execute(cli: Cli) -> Result<()> {
 }
 
 fn run_project_command(
-    config_dir: Option<&std::path::Path>,
+    config_location: &client::config::ConfigLocation,
     json_output: bool,
     command: ProjectCommand,
 ) -> Result<()> {
     if matches!(command, ProjectCommand::Init) {
         return init_project(json_output);
     }
-    let catalog = client::config::load_projects(config_dir)?;
+    let catalog = client::config::load_projects_location(config_location)?;
     if matches!(command, ProjectCommand::List) {
         let projects = catalog
             .iter()
@@ -2017,8 +2029,7 @@ fn run_project_command(
     };
     let project = catalog_project(&catalog, &name)?;
     let change = if trust {
-        let location = client::config::resolve_location(config_dir)?;
-        let loaded = client::config::load_extensions_location(&location)?;
+        let loaded = client::config::load_extensions_location(config_location)?;
         crate::project_definition::trust(project, &loaded.extensions)
     } else {
         crate::project_definition::untrust(&name, project)
@@ -2465,12 +2476,12 @@ fn resolve_project_open(
     path: Option<PathBuf>,
     project: Option<&str>,
     current_dir: &std::path::Path,
-    config_dir: Option<&std::path::Path>,
+    config_location: &client::config::ConfigLocation,
 ) -> Result<(PathBuf, Option<client::config::ProjectConfig>)> {
     let Some(project_name) = project else {
         return Ok((resolve_open_path(path, current_dir), None));
     };
-    let catalog = client::config::load_projects(config_dir)?;
+    let catalog = client::config::load_projects_location(config_location)?;
     let configured = catalog_project(&catalog, project_name)?.clone();
     let cwd = path.map_or_else(
         || configured.path().to_owned(),
@@ -2501,11 +2512,10 @@ fn catalog_project<'a>(
 fn confirm_project_recipe(
     name: &str,
     project: &client::config::ProjectConfig,
-    config_dir: Option<&std::path::Path>,
+    config_location: &client::config::ConfigLocation,
     json_output: bool,
 ) -> Result<()> {
-    let location = client::config::resolve_location(config_dir)?;
-    let loaded = client::config::load_extensions_location(&location)?;
+    let loaded = client::config::load_extensions_location(config_location)?;
     let error = match crate::project_definition::load(Some(name), project, &loaded.extensions) {
         Ok(_) => return Ok(()),
         Err(error) => error,
@@ -3176,15 +3186,15 @@ fn render_json_error(code: &str, message: impl Into<String>) {
 async fn open_and_attach(
     socket: &std::path::Path,
     cwd: PathBuf,
-    config_dir: Option<&std::path::Path>,
+    config_location: &client::config::ConfigLocation,
 ) -> Result<()> {
-    let ui = client::stage_ui_config(config_dir)?;
-    let selected = open_current_location_with_config(socket, &cwd, config_dir).await?;
+    let ui = client::stage_ui_config(config_location)?;
+    let selected = open_current_location_with_config(socket, &cwd, config_location).await?;
     client::attach_with_ui(
         socket,
         Some(TargetSelector::Terminal(selected.terminal_id)),
         ui,
-        config_dir,
+        config_location,
     )
     .await
 }
@@ -3198,13 +3208,14 @@ pub async fn open_current_location(
     socket: &std::path::Path,
     cwd: &std::path::Path,
 ) -> Result<crate::protocol::SelectedTarget> {
-    open_current_location_with_config(socket, cwd, None).await
+    let config_location = client::config::resolve_location(None)?;
+    open_current_location_with_config(socket, cwd, &config_location).await
 }
 
 async fn open_current_location_with_config(
     socket: &std::path::Path,
     cwd: &std::path::Path,
-    config_dir: Option<&std::path::Path>,
+    config_location: &client::config::ConfigLocation,
 ) -> Result<crate::protocol::SelectedTarget> {
     open_location_with_config(
         socket,
@@ -3216,7 +3227,7 @@ async fn open_current_location_with_config(
             argv: vec![],
         },
         cwd,
-        config_dir,
+        config_location,
     )
     .await
     .map(|(selected, _)| selected)
@@ -3226,14 +3237,14 @@ async fn open_location_with_config(
     socket: &std::path::Path,
     message: ClientMessage,
     daemon_cwd: &std::path::Path,
-    config_dir: Option<&std::path::Path>,
+    config_location: &client::config::ConfigLocation,
 ) -> Result<(
     crate::protocol::SelectedTarget,
     crate::protocol::OpenDisposition,
 )> {
     const RETRIES: usize = 2;
 
-    ensure_daemon(socket, daemon_cwd, config_dir).await?;
+    ensure_daemon(socket, daemon_cwd, config_location).await?;
     for attempt in 0..=RETRIES {
         let response = control(socket, message.clone()).await;
 
@@ -3260,7 +3271,7 @@ async fn open_location_with_config(
             );
         }
         wait_until_protocol_stops(socket).await;
-        ensure_daemon(socket, daemon_cwd, config_dir).await?;
+        ensure_daemon(socket, daemon_cwd, config_location).await?;
     }
     unreachable!()
 }
@@ -4189,6 +4200,25 @@ mod tests {
     }
 
     #[test]
+    fn no_config_disables_files_and_conflicts_with_config_dir() {
+        let cli = try_parse_cli_from(["fut", "--no-config", "list"]).unwrap();
+        let location = cli.config_location().unwrap();
+        assert!(location.is_disabled());
+        assert_eq!(location.path, None);
+
+        assert!(
+            try_parse_cli_from([
+                "fut",
+                "--no-config",
+                "--config-dir",
+                "/tmp/fut-config",
+                "list",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn parses_entire_command_tree() {
         let session = SessionId::new().to_string();
         let workspace = WorkspaceId::new().to_string();
@@ -4654,9 +4684,10 @@ mod tests {
             format!("[projects.fut]\npath = {:?}\n", main),
         )
         .unwrap();
+        let config_location = client::config::resolve_location(Some(&config)).unwrap();
 
         assert_eq!(
-            resolve_project_open(None, Some("fut"), temporary.path(), Some(&config),)
+            resolve_project_open(None, Some("fut"), temporary.path(), &config_location)
                 .unwrap()
                 .0,
             main
@@ -4666,7 +4697,7 @@ mod tests {
                 Some(PathBuf::from("linked")),
                 Some("fut"),
                 temporary.path(),
-                Some(&config),
+                &config_location,
             )
             .unwrap()
             .0,

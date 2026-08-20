@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added `--no-config` to start Fut with built-in defaults without loading configuration files.
 - Added command-palette actions for renaming and closing the focused session, workspace, or tab, with configurable but unbound shortcuts.
 - Added `fut project init` to create a schema-enabled starter project recipe without overwriting existing configuration.
 - Project recipes now bootstrap declared workspaces and titled tabs, with IDs needed only for focus and split references.

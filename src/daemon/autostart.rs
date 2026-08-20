@@ -31,7 +31,11 @@ enum ProtocolProbe {
 }
 
 /// Start a detached daemon if needed and wait until its real protocol responds.
-pub async fn ensure_daemon(socket: &Path, cwd: &Path, config_dir: Option<&Path>) -> Result<()> {
+pub async fn ensure_daemon(
+    socket: &Path,
+    cwd: &Path,
+    config_location: &crate::client::config::ConfigLocation,
+) -> Result<()> {
     let should_start = match probe_protocol(socket).await {
         ProtocolProbe::Ready => return Ok(()),
         ProtocolProbe::Incompatible { server } => {
@@ -55,8 +59,12 @@ pub async fn ensure_daemon(socket: &Path, cwd: &Path, config_dir: Option<&Path>)
         let stderr = stdout.try_clone()?;
         let mut command = Command::new(std::env::current_exe().context("locate fut executable")?);
         command.arg("--socket").arg(socket);
-        if let Some(config_dir) = config_dir {
-            command.arg("--config-dir").arg(config_dir);
+        if config_location.is_disabled() {
+            command.arg("--no-config");
+        } else if config_location.source == "--config-dir"
+            && let Some(path) = config_location.path.as_deref().and_then(Path::parent)
+        {
+            command.arg("--config-dir").arg(path);
         }
         command
             .arg("daemon")
@@ -191,7 +199,8 @@ mod tests {
                 .unwrap();
         });
 
-        let error = ensure_daemon(&socket, temporary.path(), None)
+        let config_location = crate::client::config::resolve_location(None).unwrap();
+        let error = ensure_daemon(&socket, temporary.path(), &config_location)
             .await
             .unwrap_err();
 

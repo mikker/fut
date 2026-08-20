@@ -73,12 +73,16 @@ use presence::ClientPresence;
 pub struct DaemonConfig {
     pub socket_path: PathBuf,
     pub spawn: SpawnSpec,
-    pub config_dir: Option<PathBuf>,
+    pub config_location: global_config::ConfigLocation,
     pub recipe_command_override: bool,
 }
 
 impl DaemonConfig {
-    pub fn shell(socket_path: PathBuf, cwd: PathBuf) -> Self {
+    pub fn shell(
+        socket_path: PathBuf,
+        cwd: PathBuf,
+        config_location: global_config::ConfigLocation,
+    ) -> Self {
         let program = std::env::var_os("SHELL")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/bin/sh"));
@@ -86,7 +90,7 @@ impl DaemonConfig {
         env.insert("FUT_SOCKET".into(), socket_path.display().to_string());
         Self {
             socket_path,
-            config_dir: None,
+            config_location,
             recipe_command_override: false,
             spawn: SpawnSpec {
                 id: TerminalId::new(),
@@ -1500,9 +1504,9 @@ fn watch_attachment(
 
 /// Bind Fut's sole socket and run while at least one session is alive.
 pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
-    let config_location = global_config::resolve_location(config.config_dir.as_deref())?;
+    let config_location = config.config_location;
     let loaded_extensions = global_config::load_extensions_location(&config_location)?;
-    let projects = global_config::load_projects(config.config_dir.as_deref())?;
+    let projects = global_config::load_projects_location(&config_location)?;
     let extension_registry = Arc::new(crate::extensions::ExtensionRegistry::new(
         1,
         loaded_extensions.extensions,

@@ -78,59 +78,48 @@ impl DoctorReport {
     }
 }
 
-pub async fn run(socket: &Path, config_dir: Option<&Path>) -> DoctorReport {
+pub async fn run(socket: &Path, location: &config::ConfigLocation) -> DoctorReport {
     let mut checks = Vec::new();
     let mut configured_icons = None;
 
-    match config::resolve_location(config_dir) {
-        Ok(location) => match config::load_location(&location) {
-            Ok(loaded) => {
-                configured_icons = Some((
-                    loaded.ui.icon_preset_name(),
-                    loaded.ui.icon_probe(),
-                ));
-                let present = loaded.present;
-                let extension_count = loaded.extensions.len();
-                let extension_packages = loaded
-                    .extensions
-                    .iter()
-                    .map(configured_extension_details)
-                    .collect::<Vec<_>>();
-                let path = location.path.as_deref().map(path_text);
-                checks.push(check(
-                    "config",
-                    CheckStatus::Ok,
-                    if present {
-                        format!(
-                            "valid {}; {} extension candidate{}",
-                            path.as_deref().expect("present config has a path"),
-                            extension_count,
-                            if extension_count == 1 { "" } else { "s" },
-                        )
-                    } else {
-                        "valid defaults; no configuration file".into()
-                    },
-                    json!({
-                        "source": location.source,
-                        "path": path,
-                        "present": present,
-                        "extensions": extension_count,
-                        "extension_packages": extension_packages,
-                    }),
-                ));
-            }
-            Err(error) => checks.push(check(
+    match config::load_location(location) {
+        Ok(loaded) => {
+            configured_icons = Some((loaded.ui.icon_preset_name(), loaded.ui.icon_probe()));
+            let present = loaded.present;
+            let extension_count = loaded.extensions.len();
+            let extension_packages = loaded
+                .extensions
+                .iter()
+                .map(configured_extension_details)
+                .collect::<Vec<_>>();
+            let path = location.path.as_deref().map(path_text);
+            checks.push(check(
                 "config",
-                CheckStatus::Error,
-                format!("{error:#}"),
-                json!({ "source": location.source, "path": location.path.as_deref().map(path_text) }),
-            )),
-        },
+                CheckStatus::Ok,
+                if present {
+                    format!(
+                        "valid {}; {} extension candidate{}",
+                        path.as_deref().expect("present config has a path"),
+                        extension_count,
+                        if extension_count == 1 { "" } else { "s" },
+                    )
+                } else {
+                    "valid defaults; no configuration file".into()
+                },
+                json!({
+                    "source": location.source,
+                    "path": path,
+                    "present": present,
+                    "extensions": extension_count,
+                    "extension_packages": extension_packages,
+                }),
+            ));
+        }
         Err(error) => checks.push(check(
             "config",
             CheckStatus::Error,
-            error.to_string(),
-            Value::Null,
+            format!("{error:#}"),
+            json!({ "source": location.source, "path": location.path.as_deref().map(path_text) }),
         )),
     }
 

@@ -1515,10 +1515,24 @@ pub(crate) struct ResolvedHookExtensionConfig {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ConfigLocation {
+pub struct ConfigLocation {
     pub path: Option<PathBuf>,
     pub explicit: bool,
     pub source: &'static str,
+}
+
+impl ConfigLocation {
+    pub fn disabled() -> Self {
+        Self {
+            path: None,
+            explicit: false,
+            source: "--no-config",
+        }
+    }
+
+    pub fn is_disabled(&self) -> bool {
+        self.source == "--no-config"
+    }
 }
 
 #[derive(Debug)]
@@ -1557,7 +1571,7 @@ impl StagedUiConfig {
     }
 }
 
-pub(crate) fn resolve_location(config_dir: Option<&std::path::Path>) -> Result<ConfigLocation> {
+pub fn resolve_location(config_dir: Option<&std::path::Path>) -> Result<ConfigLocation> {
     if let Some(directory) = config_dir {
         if !directory.is_absolute() {
             bail!("--config-dir must be an absolute path");
@@ -1607,8 +1621,7 @@ pub(crate) fn resolve_location(config_dir: Option<&std::path::Path>) -> Result<C
     })
 }
 
-pub(crate) fn stage(config_dir: Option<&Path>) -> Result<StagedUiConfig> {
-    let location = resolve_location(config_dir)?;
+pub(crate) fn stage_location(location: &ConfigLocation) -> Result<StagedUiConfig> {
     let Some(path) = &location.path else {
         return Ok(StagedUiConfig {
             config: Config::default(),
@@ -1641,8 +1654,7 @@ pub(crate) fn load_location(location: &ConfigLocation) -> Result<LoadedConfig> {
 /// Load the durable project catalog without making control commands depend on
 /// unrelated presentation configuration. Project entries are still strict and
 /// bounded by the same global configuration file reader.
-pub(crate) fn load_projects(config_dir: Option<&Path>) -> Result<ProjectCatalog> {
-    let location = resolve_location(config_dir)?;
+pub(crate) fn load_projects_location(location: &ConfigLocation) -> Result<ProjectCatalog> {
     let Some(path) = &location.path else {
         return Ok(ProjectCatalog::default());
     };
@@ -2567,7 +2579,8 @@ unknown_future_option = true
             ),
         )
         .unwrap();
-        let catalog = load_projects(Some(&config_dir)).unwrap();
+        let location = resolve_location(Some(&config_dir)).unwrap();
+        let catalog = load_projects_location(&location).unwrap();
 
         assert_eq!(
             catalog.get("fut").unwrap().path(),
@@ -3219,7 +3232,7 @@ components = [
             ),
         )
         .unwrap();
-        let staged = stage(Some(temporary.path())).unwrap();
+        let staged = stage_location(&resolve_location(Some(temporary.path())).unwrap()).unwrap();
         let location = resolve_location(Some(temporary.path())).unwrap();
         let loaded = load_extensions_location(&location).unwrap();
         let catalog = extensions::ExtensionRegistry::new(3, loaded.extensions, loaded.config)

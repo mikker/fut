@@ -83,8 +83,17 @@ pub(super) fn pane_split_direction(_: &OsStr) -> Vec<CompletionCandidate> {
 }
 
 pub(super) fn project(_: &OsStr) -> Vec<CompletionCandidate> {
-    let config_dir = explicit_config_dir(std::env::args_os());
-    let Ok(catalog) = crate::client::config::load_projects(config_dir.as_deref()) else {
+    let args = std::env::args_os().collect::<Vec<_>>();
+    let location = if no_config_requested(args.clone()) {
+        crate::client::config::ConfigLocation::disabled()
+    } else {
+        let config_dir = explicit_config_dir(args);
+        let Ok(location) = crate::client::config::resolve_location(config_dir.as_deref()) else {
+            return vec![];
+        };
+        location
+    };
+    let Ok(catalog) = crate::client::config::load_projects_location(&location) else {
         return vec![];
     };
     catalog
@@ -286,6 +295,16 @@ fn explicit_config_dir(
         }
     }
     None
+}
+
+fn no_config_requested(args: impl IntoIterator<Item = impl Into<std::ffi::OsString>>) -> bool {
+    let Some(argv) = completion_argv(args) else {
+        return false;
+    };
+    argv.into_iter()
+        .skip(1)
+        .take_while(|argument| argument != "--")
+        .any(|argument| argument == "--no-config")
 }
 
 #[derive(Debug, Eq, PartialEq)]

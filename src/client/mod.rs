@@ -7,7 +7,7 @@ mod cheatsheet;
 mod chrome;
 mod command_bar;
 mod command_form;
-pub(crate) mod config;
+pub mod config;
 mod context_menu;
 mod copy_mode;
 mod dialog;
@@ -236,21 +236,24 @@ const PBCOPY_REAP_TIMEOUT: Duration = Duration::from_secs(1);
 pub async fn attach(
     socket_path: &Path,
     selector: Option<TargetSelector>,
-    config_dir: Option<&Path>,
+    config_location: &config::ConfigLocation,
 ) -> anyhow::Result<()> {
     attach_with_ui(
         socket_path,
         selector,
-        stage_ui_config(config_dir)?,
-        config_dir,
+        stage_ui_config(config_location)?,
+        config_location,
     )
     .await
 }
 
 /// Open a lease-free global navigator on an existing daemon, then attach only
 /// after the user chooses a destination.
-pub async fn attach_navigator(socket_path: &Path, config_dir: Option<&Path>) -> anyhow::Result<()> {
-    let staged = stage_ui_config(config_dir)?;
+pub async fn attach_navigator(
+    socket_path: &Path,
+    config_location: &config::ConfigLocation,
+) -> anyhow::Result<()> {
+    let staged = stage_ui_config(config_location)?;
     let (mut navigator_connection, catalog) = connect_control_navigator(socket_path).await?;
     let ui = staged.materialize(&catalog)?;
     let (snapshot, presence) =
@@ -280,7 +283,7 @@ pub async fn attach_navigator(socket_path: &Path, config_dir: Option<&Path>) -> 
         return Ok(());
     };
 
-    let staged = stage_ui_config(config_dir)?;
+    let staged = stage_ui_config(config_location)?;
     let (columns, rows) = crossterm::terminal::size().context("read terminal size")?;
     let size = TerminalSize { columns, rows };
     let (mut framed, selected, catalog) =
@@ -293,7 +296,7 @@ pub async fn attach_navigator(socket_path: &Path, config_dir: Option<&Path>) -> 
         ui,
         catalog.generation,
         socket_path,
-        config_dir,
+        config_location,
     )
     .await;
     drop(terminal);
@@ -301,15 +304,17 @@ pub async fn attach_navigator(socket_path: &Path, config_dir: Option<&Path>) -> 
     result
 }
 
-pub(crate) fn stage_ui_config(config_dir: Option<&Path>) -> anyhow::Result<StagedUiConfig> {
-    config::stage(config_dir)
+pub(crate) fn stage_ui_config(
+    config_location: &config::ConfigLocation,
+) -> anyhow::Result<StagedUiConfig> {
+    config::stage_location(config_location)
 }
 
 pub(crate) async fn attach_with_ui(
     socket_path: &Path,
     selector: Option<TargetSelector>,
     staged: StagedUiConfig,
-    config_dir: Option<&Path>,
+    config_location: &config::ConfigLocation,
 ) -> anyhow::Result<()> {
     let (columns, rows) = crossterm::terminal::size().context("read terminal size")?;
     let (mut framed, selected, catalog) =
@@ -326,7 +331,7 @@ pub(crate) async fn attach_with_ui(
         ui,
         catalog.generation,
         socket_path,
-        config_dir,
+        config_location,
     )
     .await;
     drop(terminal);
@@ -486,7 +491,7 @@ async fn run(
     ui: UiConfig,
     catalog_generation: u64,
     socket_path: &Path,
-    config_dir: Option<&Path>,
+    config_location: &config::ConfigLocation,
 ) -> anyhow::Result<()> {
     let mut client_hooks = crate::extensions::ClientHookRuntime::new(
         ui.extensions.clone(),
@@ -500,7 +505,7 @@ async fn run(
         ui,
         catalog_generation,
         socket_path,
-        config_dir,
+        config_location,
         &mut client_hooks,
     )
     .await;
@@ -519,7 +524,7 @@ async fn run_loop(
     mut ui: UiConfig,
     mut extension_generation: u64,
     socket_path: &Path,
-    config_dir: Option<&Path>,
+    config_location: &config::ConfigLocation,
     client_hooks: &mut crate::extensions::ClientHookRuntime,
 ) -> anyhow::Result<()> {
     let mut events = EventStream::new();
@@ -827,7 +832,7 @@ async fn run_loop(
                         // Every attached client stages the same complete local
                         // config on publication, so command overrides and
                         // bindings advance with the daemon declarations too.
-                        let staged = stage_ui_config(config_dir).with_context(|| {
+                        let staged = stage_ui_config(config_location).with_context(|| {
                             format!(
                                 "stage local UI for daemon extension generation {}",
                                 catalog.generation
@@ -1844,7 +1849,7 @@ async fn run_loop(
                                     &mut temporary_command,
                                     socket_path,
                                     &background_results,
-                                    config_dir,
+                                    config_location,
                                     &mut extension_reload,
                                 ).await?);
                                 force_draw = true;
@@ -2378,7 +2383,7 @@ async fn run_loop(
                                     &mut temporary_command,
                                     socket_path,
                                     &background_results,
-                                    config_dir,
+                                    config_location,
                                     &mut extension_reload,
                                 ).await?);
                                 force_draw = true;
@@ -3496,7 +3501,7 @@ async fn dispatch_client_action(
     temporary_command: &mut Option<TemporaryCommandSurface>,
     socket_path: &Path,
     background_results: &mpsc::UnboundedSender<BackgroundCommandResult>,
-    config_dir: Option<&Path>,
+    config_location: &config::ConfigLocation,
     extension_reload: &mut Option<ExtensionReloadState>,
 ) -> anyhow::Result<Option<Toast>> {
     match action {
@@ -3605,7 +3610,7 @@ async fn dispatch_client_action(
             if extension_reload.is_some() {
                 return Ok(Some(Toast::info("config reload already in progress")));
             }
-            let staged = match stage_ui_config(config_dir) {
+            let staged = match stage_ui_config(config_location) {
                 Ok(staged) => staged,
                 Err(error) => {
                     return Ok(Some(Toast::error(format!(

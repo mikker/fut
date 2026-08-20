@@ -28,7 +28,7 @@ Fut checks, in order:
 3. `$XDG_CONFIG_HOME/fut/config.toml` when `XDG_CONFIG_HOME` is absolute;
 4. `~/.config/fut/config.toml`.
 
-A missing implicit file, including one selected through `--config-dir`, uses defaults and is not created. `--config-dir` and `FUT_CONFIG` must be absolute; `FUT_CONFIG` must exist. Configuration is loaded before an interactive client changes terminal state. Press `Ctrl-b Shift-R` to reload the invoking client's configuration; a valid configuration applies bindings and layout immediately, while any location, read, parse, or validation error leaves the complete previous configuration active and appears as a one-line notice. Control commands and shell completion do not load UI configuration; `fut doctor` reads it without creating runtime state.
+A missing implicit file, including one selected through `--config-dir`, uses defaults and is not created. Pass `--no-config` to use built-in defaults without reading any configuration file; it cannot be combined with `--config-dir`. `--config-dir` and `FUT_CONFIG` must be absolute; `FUT_CONFIG` must exist. Configuration is loaded before an interactive client changes terminal state. Press `Ctrl-b Shift-R` to reload the invoking client's configuration; a valid configuration applies bindings and layout immediately, while any location, read, parse, or validation error leaves the complete previous configuration active and appears as a one-line notice. Control commands and shell completion do not load UI configuration; `fut doctor` reads it without creating runtime state.
 
 Files must be regular UTF-8 files no larger than 64 KiB. Unknown fields, invalid values, unsafe control or bidirectional-formatting characters, ambiguous segments, and out-of-scope tokens are errors.
 
