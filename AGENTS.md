@@ -10,5 +10,5 @@ This project uses a CLI ticket system for task management. Run `tk help` when yo
 
 ## Release
 
-- From a clean, synchronized `main`, run `mise run release`.
+- From a clean `main` that is not behind or diverged from `origin/main`, run `mise run release`. The script pushes local commits when needed.
 - It tests, advances the `0.x` version, tags and pushes. GitHub builds both macOS binaries, publishes the release, and updates `mikker/homebrew-tap`.

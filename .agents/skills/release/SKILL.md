@@ -8,7 +8,7 @@ description: Release a new Fut version. Use when the user asks to release, publi
 Keep this mechanical and brief.
 
 1. On `main`, review the `CHANGELOG.md` `Unreleased` entries. Remove project website, installer, distribution, release-process, and other non-app items unless they changed the installed app's behavior. Consolidate related entries, turn the remainder into a concise section for the next `0.x` version, and leave a fresh empty `Unreleased` section. Commit that change.
-2. Ensure `main` is clean and synchronized with `origin/main`.
+2. Ensure `main` is clean and is not behind or diverged from `origin/main`. The release script pushes local commits when needed.
 3. Run:
 
 ```sh

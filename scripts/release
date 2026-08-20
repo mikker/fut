@@ -12,7 +12,12 @@ die() {
 [[ -z "$(git status --porcelain)" ]] || die "working tree is not clean"
 
 git fetch origin main --tags
-[[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/main)" ]] || die "main is not synchronized with origin/main"
+read -r behind ahead < <(git rev-list --left-right --count origin/main...main)
+[[ "$behind" == "0" ]] || die "main is behind or has diverged from origin/main"
+if [[ "$ahead" != "0" ]]; then
+  echo "Pushing $ahead unreleased main commit(s)"
+  git push origin main || die "could not synchronize main with origin/main"
+fi
 
 latest="$(git ls-remote --tags --refs origin \
   | awk '{ sub("refs/tags/", "", $2); if ($2 ~ /^0\.[1-9][0-9]*$/) print $2 }' \
