@@ -2,11 +2,12 @@
 
 ## Unreleased
 
+## 0.10
+
 - Interactive command popups now support mouse scrolling, application mouse input, and drag-to-copy text selection, with Shift-drag forcing selection.
 - Added `--no-config` to start Fut with built-in defaults without loading configuration files.
 - Added command-palette actions for renaming and closing the focused session, workspace, or tab, with configurable but unbound shortcuts.
-- Added `fut project init` to create a schema-enabled starter project recipe without overwriting existing configuration.
-- Project recipes now bootstrap declared workspaces and titled tabs, with IDs needed only for focus and split references.
+- Added `fut project init` and expanded project recipes to bootstrap declared workspaces and titled tabs, with IDs needed only for focus and split references.
 - Project run commands configured with `auto_start` now start once in the initial workspace instead of repeating in every new workspace.
 - Project opens now prompt to trust an unapproved repository recipe before launching it.
 - The bundled `wt` workflow now retires its Fut workspace after an agent successfully removes the worktree with `wt done` or `wt ship`.
