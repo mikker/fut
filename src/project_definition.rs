@@ -341,13 +341,25 @@ pub(crate) fn trust(
     project: &ProjectConfig,
     extensions: &[Extension],
 ) -> std::result::Result<RecipeTrustChange, ProjectDefinitionError> {
-    trust_with_store(project, extensions, None)
+    trust_with_store(project, extensions, None, None)
+}
+
+/// Validate and approve only the repository recipe whose digest was shown to
+/// the user. This keeps an interactive approval from trusting bytes changed
+/// while the prompt was open.
+pub(crate) fn trust_digest(
+    project: &ProjectConfig,
+    extensions: &[Extension],
+    expected_digest: &str,
+) -> std::result::Result<RecipeTrustChange, ProjectDefinitionError> {
+    trust_with_store(project, extensions, None, Some(expected_digest))
 }
 
 fn trust_with_store(
     project: &ProjectConfig,
     extensions: &[Extension],
     state_path: Option<&Path>,
+    expected_digest: Option<&str>,
 ) -> std::result::Result<RecipeTrustChange, ProjectDefinitionError> {
     if let Some(source) = project.recipe() {
         let file = read_recipe(source, true)?.ok_or_else(|| {
@@ -373,6 +385,12 @@ fn trust_with_store(
             configured_source.display()
         )
     })?;
+    if expected_digest.is_some_and(|expected| expected != file.digest) {
+        return Err(ProjectDefinitionError::Invalid(anyhow::anyhow!(
+            "project recipe {} changed while awaiting approval; review it and retry",
+            file.source.display()
+        )));
+    }
     // Approval is only written after strict UTF-8, TOML, version, and semantic
     // validation of the exact bytes whose digest will be stored.
     parse_recipe_ref(&file, extensions)?;
@@ -1055,7 +1073,7 @@ tabs = [{ id = "code", panes = [{ id = "one" }] }]"#,
         assert!(error.contains(&digest), "{error}");
         assert!(error.contains("fut project trust fut"), "{error}");
 
-        let trusted = trust_with_store(&project, &[], Some(&state_path)).unwrap();
+        let trusted = trust_with_store(&project, &[], Some(&state_path), None).unwrap();
         assert!(trusted.changed);
         assert_eq!(trusted.source, recipe_path.canonicalize().unwrap());
         assert_eq!(trusted.digest.as_deref(), Some(digest.as_str()));
@@ -1078,7 +1096,18 @@ tabs = [{ id = "code", panes = [{ id = "one" }] }]"#,
             load_with_trust_store(Some("fut"), &project, &[], Some(&state_path)),
             Err(ProjectDefinitionError::UntrustedRecipe { .. })
         ));
-        let retrusted = trust_with_store(&project, &[], Some(&state_path)).unwrap();
+        let changed_error =
+            trust_with_store(&project, &[], Some(&state_path), Some(digest.as_str())).unwrap_err();
+        assert!(
+            changed_error
+                .to_string()
+                .contains("changed while awaiting approval")
+        );
+        assert!(matches!(
+            load_with_trust_store(Some("fut"), &project, &[], Some(&state_path)),
+            Err(ProjectDefinitionError::UntrustedRecipe { .. })
+        ));
+        let retrusted = trust_with_store(&project, &[], Some(&state_path), None).unwrap();
         assert!(retrusted.changed);
         assert_ne!(retrusted.digest.as_deref(), Some(digest.as_str()));
         assert!(
@@ -1178,7 +1207,7 @@ tabs = [{ id = "code", panes = [{ id = "one" }] }]"#,
         };
         let state_path = temporary.path().join("state/fut/trusted-recipes.toml");
 
-        assert!(trust_with_store(&project, &[], Some(&state_path)).is_err());
+        assert!(trust_with_store(&project, &[], Some(&state_path), None).is_err());
         assert!(!state_path.exists());
     }
 

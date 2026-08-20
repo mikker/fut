@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Project opens now prompt to trust an unapproved repository recipe before launching it.
 - Project recipe tabs and panes now open only when initially booting a project session, not in every new workspace.
 
 ## 0.9

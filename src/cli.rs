@@ -1,5 +1,10 @@
 use std::{
-    ffi::OsString, io::Write, path::PathBuf, process::ExitCode, str::FromStr, time::Duration,
+    ffi::OsString,
+    io::{BufRead, Write},
+    path::PathBuf,
+    process::ExitCode,
+    str::FromStr,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -988,12 +993,15 @@ async fn execute(cli: Cli) -> Result<()> {
             command,
         }) => {
             let current_dir = std::env::current_dir()?;
-            let cwd = resolve_project_open_path(
+            let (cwd, configured_project) = resolve_project_open(
                 path,
                 project.as_deref(),
                 &current_dir,
                 config_dir.as_deref(),
             )?;
+            if let Some((name, configured)) = project.as_deref().zip(configured_project.as_ref()) {
+                confirm_project_recipe(name, configured, config_dir.as_deref(), cli.json)?;
+            }
             let (program, argv) = child_command(command);
             let ui = if background {
                 None
@@ -2391,21 +2399,22 @@ fn joined_or_dash(values: impl IntoIterator<Item = impl AsRef<str>>) -> String {
     }
 }
 
-fn resolve_project_open_path(
+fn resolve_project_open(
     path: Option<PathBuf>,
     project: Option<&str>,
     current_dir: &std::path::Path,
     config_dir: Option<&std::path::Path>,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, Option<client::config::ProjectConfig>)> {
     let Some(project_name) = project else {
-        return Ok(resolve_open_path(path, current_dir));
+        return Ok((resolve_open_path(path, current_dir), None));
     };
     let catalog = client::config::load_projects(config_dir)?;
-    let configured = catalog_project(&catalog, project_name)?;
-    Ok(path.map_or_else(
+    let configured = catalog_project(&catalog, project_name)?.clone();
+    let cwd = path.map_or_else(
         || configured.path().to_owned(),
         |path| resolve_open_path(Some(path), current_dir),
-    ))
+    );
+    Ok((cwd, Some(configured)))
 }
 
 fn catalog_project<'a>(
@@ -2425,6 +2434,48 @@ fn catalog_project<'a>(
         };
         anyhow::Error::new(CliError::new("unknown_project", message))
     })
+}
+
+fn confirm_project_recipe(
+    name: &str,
+    project: &client::config::ProjectConfig,
+    config_dir: Option<&std::path::Path>,
+    json_output: bool,
+) -> Result<()> {
+    let location = client::config::resolve_location(config_dir)?;
+    let loaded = client::config::load_extensions_location(&location)?;
+    let error = match crate::project_definition::load(Some(name), project, &loaded.extensions) {
+        Ok(_) => return Ok(()),
+        Err(error) => error,
+    };
+    let crate::project_definition::ProjectDefinitionError::UntrustedRecipe { path, digest, .. } =
+        &error
+    else {
+        return Err(error.into());
+    };
+    if json_output {
+        return Err(error.into());
+    }
+
+    eprintln!(
+        "Project {name:?} contains an untrusted recipe:\n  {}\n  SHA-256 {digest}",
+        path.display()
+    );
+    eprint!("Trust this recipe and continue? [y/N] ");
+    std::io::stderr().flush().context("flush trust prompt")?;
+    let mut answer = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut answer)
+        .context("read trust response")?;
+    let answer = answer.trim();
+    if !answer.eq_ignore_ascii_case("y") && !answer.eq_ignore_ascii_case("yes") {
+        bail!("project recipe was not trusted");
+    }
+
+    crate::project_definition::trust_digest(project, &loaded.extensions, digest)?;
+    eprintln!("Trusted project recipe for {name:?}.");
+    Ok(())
 }
 
 fn notify_command_activation(pane_id: PaneId) -> anyhow::Result<()> {
@@ -4535,17 +4586,20 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            resolve_project_open_path(None, Some("fut"), temporary.path(), Some(&config),).unwrap(),
+            resolve_project_open(None, Some("fut"), temporary.path(), Some(&config),)
+                .unwrap()
+                .0,
             main
         );
         assert_eq!(
-            resolve_project_open_path(
+            resolve_project_open(
                 Some(PathBuf::from("linked")),
                 Some("fut"),
                 temporary.path(),
                 Some(&config),
             )
-            .unwrap(),
+            .unwrap()
+            .0,
             linked
         );
     }
