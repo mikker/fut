@@ -64,6 +64,12 @@ open_command_bar = "space"
 # focus_next_notification = "prefix"
 # create_workspace = "C"
 # create_tab = "c"
+# rename_session = "S"   # These rename and close actions have no default binding.
+# rename_workspace = "W"
+# rename_tab = "T"
+# close_session = "q"
+# close_workspace = "Q"
+# close_tab = "X"
 # focus_last_tab = "ctrl-t"
 # focus_last_workspace = "ctrl-w"
 # focus_last_session = "ctrl-s"
@@ -210,6 +216,11 @@ Set `ui.prefix` to change the default `ctrl-b` prefix. Bindings are unique
 suffixes after it. Set a built-in action or quoted extension command slug under
 `[ui.bindings]`; see the [complete defaults table](usage.md#everyday-controls)
 for action names.
+
+The command palette also includes `rename-session`, `rename-workspace`,
+`rename-tab`, `kill-session`, `kill-workspace`, and `kill-tab`. They have no
+default bindings; configure the corresponding `rename_*` or `close_*` keys to
+add shortcuts. `kill-pane` remains bound through `close_pane` by default.
 
 A prefix or suffix may be one printable character, `ctrl-a` through `ctrl-z`,
 `space`, `enter`, `tab`, `esc`, `up`, or `down`. Suffixes also accept `prefix`,

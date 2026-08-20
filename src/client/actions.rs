@@ -96,6 +96,9 @@ pub(super) enum ClientAction {
     FocusNextNotification,
     CreateWorkspace,
     CreateTab,
+    RenameSession,
+    RenameWorkspace,
+    RenameTab,
     FocusNextTab,
     FocusPreviousTab,
     FocusNextWorkspace,
@@ -108,6 +111,9 @@ pub(super) enum ClientAction {
     FocusLast(HistoryScope),
     FocusTab(TabNumber),
     TogglePaneZoom,
+    CloseSession,
+    CloseWorkspace,
+    CloseTab,
     ClosePane,
     Detach,
 }
@@ -125,7 +131,7 @@ pub(super) struct DirectBinding {
     pub action: ClientAction,
 }
 
-pub(super) const ALL_ACTIONS: [ClientAction; 41] = [
+pub(super) const ALL_ACTIONS: [ClientAction; 47] = [
     ClientAction::OpenCommandBar,
     ClientAction::ReloadConfig,
     ClientAction::EnterCopyMode,
@@ -138,6 +144,9 @@ pub(super) const ALL_ACTIONS: [ClientAction; 41] = [
     ClientAction::FocusNextNotification,
     ClientAction::CreateWorkspace,
     ClientAction::CreateTab,
+    ClientAction::RenameSession,
+    ClientAction::RenameWorkspace,
+    ClientAction::RenameTab,
     ClientAction::FocusNextTab,
     ClientAction::FocusPreviousTab,
     ClientAction::FocusNextWorkspace,
@@ -165,11 +174,14 @@ pub(super) const ALL_ACTIONS: [ClientAction; 41] = [
     ClientAction::FocusTab(TabNumber::Nine),
     ClientAction::FocusTab(TabNumber::Ten),
     ClientAction::TogglePaneZoom,
+    ClientAction::CloseSession,
+    ClientAction::CloseWorkspace,
+    ClientAction::CloseTab,
     ClientAction::ClosePane,
     ClientAction::Detach,
 ];
 
-pub(super) const COMMANDS: [ActionDefinition; 40] = [
+pub(super) const COMMANDS: [ActionDefinition; 46] = [
     ActionDefinition {
         action: ClientAction::ReloadConfig,
         title: "Reload configuration",
@@ -219,6 +231,21 @@ pub(super) const COMMANDS: [ActionDefinition; 40] = [
         action: ClientAction::CreateTab,
         title: "Create tab",
         keywords: "create new tab shell",
+    },
+    ActionDefinition {
+        action: ClientAction::RenameSession,
+        title: "Rename session",
+        keywords: "rename session project title name",
+    },
+    ActionDefinition {
+        action: ClientAction::RenameWorkspace,
+        title: "Rename workspace",
+        keywords: "rename workspace worktree title name",
+    },
+    ActionDefinition {
+        action: ClientAction::RenameTab,
+        title: "Rename tab",
+        keywords: "rename tab title name",
     },
     ActionDefinition {
         action: ClientAction::FocusNextTab,
@@ -354,6 +381,21 @@ pub(super) const COMMANDS: [ActionDefinition; 40] = [
         action: ClientAction::TogglePaneZoom,
         title: "Toggle pane zoom",
         keywords: "pane zoom maximize restore fullscreen",
+    },
+    ActionDefinition {
+        action: ClientAction::CloseSession,
+        title: "Close session",
+        keywords: "close kill terminate session project",
+    },
+    ActionDefinition {
+        action: ClientAction::CloseWorkspace,
+        title: "Close workspace",
+        keywords: "close kill terminate workspace worktree",
+    },
+    ActionDefinition {
+        action: ClientAction::CloseTab,
+        title: "Close tab",
+        keywords: "close kill terminate tab",
     },
     ActionDefinition {
         action: ClientAction::ClosePane,
@@ -566,6 +608,9 @@ pub(super) const fn command_name(action: ClientAction) -> &'static str {
         ClientAction::FocusNextNotification => "next-notification",
         ClientAction::CreateWorkspace => "new-workspace",
         ClientAction::CreateTab => "new-tab",
+        ClientAction::RenameSession => "rename-session",
+        ClientAction::RenameWorkspace => "rename-workspace",
+        ClientAction::RenameTab => "rename-tab",
         ClientAction::FocusNextTab => "next-tab",
         ClientAction::FocusPreviousTab => "previous-tab",
         ClientAction::FocusNextWorkspace => "next-workspace",
@@ -593,6 +638,9 @@ pub(super) const fn command_name(action: ClientAction) -> &'static str {
         ClientAction::FocusTab(TabNumber::Nine) => "select-tab -t 9",
         ClientAction::FocusTab(TabNumber::Ten) => "select-tab -t 10",
         ClientAction::TogglePaneZoom => "resize-pane -Z",
+        ClientAction::CloseSession => "kill-session",
+        ClientAction::CloseWorkspace => "kill-workspace",
+        ClientAction::CloseTab => "kill-tab",
         ClientAction::ClosePane => "kill-pane",
         ClientAction::Detach => "detach-client",
     }
@@ -613,6 +661,9 @@ pub(super) fn config_key(action: ClientAction) -> &'static str {
         ClientAction::FocusNextNotification => "focus_next_notification",
         ClientAction::CreateWorkspace => "create_workspace",
         ClientAction::CreateTab => "create_tab",
+        ClientAction::RenameSession => "rename_session",
+        ClientAction::RenameWorkspace => "rename_workspace",
+        ClientAction::RenameTab => "rename_tab",
         ClientAction::FocusNextTab => "focus_next_tab",
         ClientAction::FocusPreviousTab => "focus_previous_tab",
         ClientAction::FocusNextWorkspace => "focus_next_workspace",
@@ -640,17 +691,19 @@ pub(super) fn config_key(action: ClientAction) -> &'static str {
         ClientAction::FocusTab(TabNumber::Nine) => "focus_tab_9",
         ClientAction::FocusTab(TabNumber::Ten) => "focus_tab_10",
         ClientAction::TogglePaneZoom => "toggle_pane_zoom",
+        ClientAction::CloseSession => "close_session",
+        ClientAction::CloseWorkspace => "close_workspace",
+        ClientAction::CloseTab => "close_tab",
         ClientAction::ClosePane => "close_pane",
         ClientAction::Detach => "detach",
     }
 }
 
-pub(super) fn default_suffix(action: ClientAction) -> &'static [u8] {
+pub(super) fn default_suffix(action: ClientAction) -> Option<&'static [u8]> {
     DIRECT_BINDINGS
         .iter()
         .find(|binding| binding.action == action)
-        .expect("every action has a default binding")
-        .suffix
+        .map(|binding| binding.suffix)
 }
 
 pub(super) fn parse_key(value: &str) -> Option<(Vec<u8>, String)> {
@@ -706,6 +759,9 @@ const fn requires_launcher(action: ClientAction) -> bool {
         | ClientAction::FocusNextNotification
         | ClientAction::CreateWorkspace
         | ClientAction::CreateTab
+        | ClientAction::RenameSession
+        | ClientAction::RenameWorkspace
+        | ClientAction::RenameTab
         | ClientAction::FocusNextTab
         | ClientAction::FocusPreviousTab
         | ClientAction::FocusNextWorkspace
@@ -733,6 +789,9 @@ const fn requires_launcher(action: ClientAction) -> bool {
         | ClientAction::FocusTab(TabNumber::Nine)
         | ClientAction::FocusTab(TabNumber::Ten)
         | ClientAction::TogglePaneZoom
+        | ClientAction::CloseSession
+        | ClientAction::CloseWorkspace
+        | ClientAction::CloseTab
         | ClientAction::ClosePane
         | ClientAction::Detach => true,
     }
@@ -746,11 +805,11 @@ mod tests {
     use crate::client::config::BindingsConfig;
 
     #[test]
-    fn every_command_has_bindings_from_the_same_catalog() {
+    fn every_command_is_in_the_action_catalog() {
         let bindings = BindingsConfig::default();
         for command in COMMANDS {
             let label = bindings.label(command.action);
-            assert!(!label.is_empty(), "{} has no direct binding", command.title);
+            assert!(!label.is_empty(), "{} has no binding label", command.title);
             for binding in DIRECT_BINDINGS
                 .iter()
                 .filter(|binding| binding.action == command.action)
@@ -802,6 +861,12 @@ mod tests {
         assert_eq!(bindings.label(ClientAction::TogglePaneZoom), "Ctrl-b z");
         assert_eq!(bindings.label(ClientAction::OpenLeftSidebar), "Ctrl-b w");
         assert_eq!(bindings.label(ClientAction::OpenRightSidebar), "Ctrl-b ]");
+        assert_eq!(bindings.label(ClientAction::RenameSession), "Unbound");
+        assert_eq!(bindings.label(ClientAction::RenameWorkspace), "Unbound");
+        assert_eq!(bindings.label(ClientAction::RenameTab), "Unbound");
+        assert_eq!(bindings.label(ClientAction::CloseSession), "Unbound");
+        assert_eq!(bindings.label(ClientAction::CloseWorkspace), "Unbound");
+        assert_eq!(bindings.label(ClientAction::CloseTab), "Unbound");
         assert_eq!(
             bindings.label(ClientAction::FocusLast(HistoryScope::Tab)),
             "Ctrl-b Ctrl-t"

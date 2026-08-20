@@ -84,6 +84,9 @@ The configuration name is the key to override under `[ui.bindings]`.
 
 Pause for 700 ms after `Ctrl-b` to see the complete, current binding list.
 Bindings can be changed in [Configuration](../configuration/).
+The command palette also provides unbound `rename-session`, `rename-workspace`,
+`rename-tab`, `kill-session`, `kill-workspace`, and `kill-tab` actions for the
+focused resource.
 
 The tab bar and workspace rows also support the mouse: left-click to switch,
 right-click for create, rename, close, and sidebar display actions. Drag pane

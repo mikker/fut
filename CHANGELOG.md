@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added command-palette actions for renaming and closing the focused session, workspace, or tab, with configurable but unbound shortcuts.
 - Project opens now prompt to trust an unapproved repository recipe before launching it.
 - Project recipe tabs and panes now open only when initially booting a project session, not in every new workspace.
 

@@ -267,9 +267,9 @@ impl BindingsConfig {
         suffix_name(&self.prefix)
     }
 
-    fn default_suffix(&self, action: ClientAction) -> &[u8] {
+    fn default_suffix(&self, action: ClientAction) -> Option<&[u8]> {
         if action == ClientAction::FocusNextNotification {
-            &self.prefix
+            Some(&self.prefix)
         } else {
             default_suffix(action)
         }
@@ -279,16 +279,19 @@ impl BindingsConfig {
         self.commands.get(index)
     }
 
-    pub(super) fn suffix(&self, action: ClientAction) -> Vec<u8> {
-        self.values
-            .get(config_key(action))
-            .and_then(|value| self.parse_suffix(value))
-            .map_or_else(|| self.default_suffix(action).to_vec(), |(bytes, _)| bytes)
+    pub(super) fn suffix(&self, action: ClientAction) -> Option<Vec<u8>> {
+        match self.values.get(config_key(action)) {
+            Some(value) => self.parse_suffix(value).map(|(bytes, _)| bytes),
+            None => self.default_suffix(action).map(<[u8]>::to_vec),
+        }
     }
 
     pub(super) fn suffix_label(&self, action: ClientAction) -> String {
         self.values.get(config_key(action)).map_or_else(
-            || suffix_name(self.default_suffix(action)),
+            || {
+                self.default_suffix(action)
+                    .map_or_else(|| "Unbound".into(), suffix_name)
+            },
             |value| self.parse_suffix(value).expect("bindings are validated").1,
         )
     }
@@ -316,9 +319,12 @@ impl BindingsConfig {
         if self.commands.iter().any(|command| {
             command.binding.as_ref().is_some_and(|binding| {
                 self.parse_suffix(binding)
-                    .is_some_and(|(suffix, _)| suffix == self.suffix(action))
+                    .is_some_and(|(suffix, _)| self.suffix(action).as_deref() == Some(&suffix))
             })
         }) {
+            return "Unbound".into();
+        }
+        if self.suffix(action).is_none() {
             return "Unbound".into();
         }
         format!("{} {}", self.prefix_label(), self.suffix_label(action))
@@ -333,9 +339,9 @@ impl BindingsConfig {
         }) {
             return Some(ClientAction::RunCommand(index));
         }
-        ALL_ACTIONS
-            .into_iter()
-            .find(|action| self.suffix(*action) == suffix && self.label(*action) != "Unbound")
+        ALL_ACTIONS.into_iter().find(|action| {
+            self.suffix(*action).as_deref() == Some(suffix) && self.label(*action) != "Unbound"
+        })
     }
 
     pub(super) fn commands(&self) -> impl Iterator<Item = (usize, &PaletteCommand)> {
@@ -2254,7 +2260,10 @@ fn validate(ui: &UiConfig, extensions: &[Extension]) -> Result<()> {
         }
     }
     for action in ALL_ACTIONS {
-        if !bound_suffixes.insert(ui.bindings.suffix(action)) {
+        let Some(suffix) = ui.bindings.suffix(action) else {
+            continue;
+        };
+        if !bound_suffixes.insert(suffix) {
             bail!("ui.bindings must not assign the same key to multiple actions");
         }
     }
@@ -2282,7 +2291,7 @@ fn validate(ui: &UiConfig, extensions: &[Extension]) -> Result<()> {
             }
             if ALL_ACTIONS.into_iter().any(|action| {
                 explicitly_bound.contains(config_key(action))
-                    && ui.bindings.suffix(action) == suffix
+                    && ui.bindings.suffix(action).as_deref() == Some(&suffix)
             }) {
                 bail!("a command conflicts with an explicitly configured ui binding");
             }
@@ -2887,6 +2896,54 @@ components = [
         let mut prefix = PrefixState::new(config.bindings);
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Send(vec![2]));
+    }
+
+    #[test]
+    fn rename_and_upper_level_close_actions_are_unbound_but_configurable() {
+        let defaults = UiConfig::default();
+        for action in [
+            ClientAction::RenameSession,
+            ClientAction::RenameWorkspace,
+            ClientAction::RenameTab,
+            ClientAction::CloseSession,
+            ClientAction::CloseWorkspace,
+            ClientAction::CloseTab,
+        ] {
+            assert_eq!(defaults.bindings.label(action), "Unbound");
+        }
+
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("config.toml");
+        fs::write(
+            &path,
+            "[ui.bindings]\nrename_session = 'S'\nrename_workspace = 'W'\nrename_tab = 'T'\nclose_session = 'q'\nclose_workspace = 'Q'\nclose_tab = 'X'\n",
+        )
+        .unwrap();
+        let config = load_path(&path, true).unwrap();
+        assert_eq!(
+            config.bindings.action_for_suffix(b"S"),
+            Some(ClientAction::RenameSession)
+        );
+        assert_eq!(
+            config.bindings.action_for_suffix(b"W"),
+            Some(ClientAction::RenameWorkspace)
+        );
+        assert_eq!(
+            config.bindings.action_for_suffix(b"T"),
+            Some(ClientAction::RenameTab)
+        );
+        assert_eq!(
+            config.bindings.action_for_suffix(b"q"),
+            Some(ClientAction::CloseSession)
+        );
+        assert_eq!(
+            config.bindings.action_for_suffix(b"Q"),
+            Some(ClientAction::CloseWorkspace)
+        );
+        assert_eq!(
+            config.bindings.action_for_suffix(b"X"),
+            Some(ClientAction::CloseTab)
+        );
     }
 
     #[test]

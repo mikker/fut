@@ -1838,6 +1838,7 @@ async fn run_loop(
                                     &mut close_target,
                                     &mut focus,
                                     &mut copy_mode,
+                                    &mut rename,
                                     terminal.size()?.into(),
                                     &mut ui,
                                     &mut temporary_command,
@@ -2371,6 +2372,7 @@ async fn run_loop(
                                     &mut close_target,
                                     &mut focus,
                                     &mut copy_mode,
+                                    &mut rename,
                                     terminal.size()?.into(),
                                     &mut ui,
                                     &mut temporary_command,
@@ -3488,6 +3490,7 @@ async fn dispatch_client_action(
     close_target: &mut CloseTargetState,
     focus: &mut FocusState,
     copy_mode: &mut Option<CopyModeState>,
+    rename: &mut Option<RenameState>,
     host: Rect,
     ui: &mut UiConfig,
     temporary_command: &mut Option<TemporaryCommandSurface>,
@@ -3760,6 +3763,63 @@ async fn dispatch_client_action(
                 .await?;
             }
         }
+        ClientAction::RenameSession | ClientAction::RenameWorkspace | ClientAction::RenameTab => {
+            let Some(snapshot) = resources.snapshot() else {
+                return Ok(Some(Toast::error("resources are still loading")));
+            };
+            if !view.resources_are_current(snapshot) {
+                return Ok(Some(Toast::error("resources are syncing")));
+            }
+            let Some(session) = snapshot
+                .sessions
+                .iter()
+                .find(|session| session.id == view.focused().session_id)
+            else {
+                return Ok(Some(Toast::error("focused session is unavailable")));
+            };
+            let target = match action {
+                ClientAction::RenameSession => Some((
+                    crate::protocol::RenameSelector::Session(
+                        crate::resources::SessionSelector::Id(session.id),
+                    ),
+                    "session",
+                    session.name.clone(),
+                )),
+                ClientAction::RenameWorkspace => session
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.id == view.focused().workspace_id)
+                    .map(|workspace| {
+                        (
+                            crate::protocol::RenameSelector::Workspace(workspace.id),
+                            "workspace",
+                            workspace.name.clone(),
+                        )
+                    }),
+                ClientAction::RenameTab => session
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.id == view.focused().workspace_id)
+                    .and_then(|workspace| {
+                        workspace
+                            .tabs
+                            .iter()
+                            .find(|tab| tab.id == view.focused().tab_id)
+                    })
+                    .map(|tab| {
+                        (
+                            crate::protocol::RenameSelector::Tab(tab.id),
+                            "tab",
+                            tab.name.clone(),
+                        )
+                    }),
+                _ => unreachable!("rename action guard"),
+            };
+            let Some((selector, kind, name)) = target else {
+                return Ok(Some(Toast::error("focused resource is unavailable")));
+            };
+            *rename = Some(RenameState::open(selector, kind, name));
+        }
         ClientAction::FocusNextTab | ClientAction::FocusPreviousTab => {
             let Some(snapshot) = resources.snapshot() else {
                 return Ok(Some(Toast::error("tabs are still loading")));
@@ -3923,15 +3983,27 @@ async fn dispatch_client_action(
             };
             resize_view(framed, host, view, resources, ui).await?;
         }
-        ClientAction::ClosePane => {
-            return start_target_close(
-                framed,
-                close_target,
-                TargetSelector::Pane(view.focused().pane_id),
-                "pane",
-                ui.confirm_close,
-            )
-            .await;
+        ClientAction::CloseSession
+        | ClientAction::CloseWorkspace
+        | ClientAction::CloseTab
+        | ClientAction::ClosePane => {
+            let (selector, label) = match action {
+                ClientAction::CloseSession => (
+                    TargetSelector::Session(crate::resources::SessionSelector::Id(
+                        view.focused().session_id,
+                    )),
+                    "session",
+                ),
+                ClientAction::CloseWorkspace => (
+                    TargetSelector::Workspace(view.focused().workspace_id),
+                    "workspace",
+                ),
+                ClientAction::CloseTab => (TargetSelector::Tab(view.focused().tab_id), "tab"),
+                ClientAction::ClosePane => (TargetSelector::Pane(view.focused().pane_id), "pane"),
+                _ => unreachable!("close action guard"),
+            };
+            return start_target_close(framed, close_target, selector, label, ui.confirm_close)
+                .await;
         }
         ClientAction::Detach => send(framed, ClientMessage::Detach).await?,
     }
