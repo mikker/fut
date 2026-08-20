@@ -1213,10 +1213,13 @@ mod tests {
                 .is_none()
         );
         surface.input(b"x".to_vec()).await.unwrap();
-        assert!(
-            !input.exists(),
-            "input escaped while clipboard copy was pending"
-        );
+        match fs::read(&input) {
+            Ok(bytes) => assert!(
+                bytes.is_empty(),
+                "input escaped while clipboard copy was pending"
+            ),
+            Err(error) => assert_eq!(error.kind(), ErrorKind::NotFound),
+        }
         assert!(surface.finish_clipboard(request_id, true).await.unwrap());
         assert!(surface.screen.cells.iter().all(|cell| !cell.selected));
         surface.input(b"y".to_vec()).await.unwrap();
