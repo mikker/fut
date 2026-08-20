@@ -3243,7 +3243,7 @@ scope = "tab"
                 .keys()
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
-            ["workspace.closed", "workspace.created"]
+            ["session.created", "workspace.closed", "workspace.created"]
         );
         assert_eq!(
             extension

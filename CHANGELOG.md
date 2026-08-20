@@ -3,8 +3,10 @@
 ## Unreleased
 
 - Added command-palette actions for renaming and closing the focused session, workspace, or tab, with configurable but unbound shortcuts.
+- Added `fut project init` to create a schema-enabled starter project recipe without overwriting existing configuration.
+- Project recipes now bootstrap declared workspaces and titled tabs, with IDs needed only for focus and split references.
+- Project run commands configured with `auto_start` now start once in the initial workspace instead of repeating in every new workspace.
 - Project opens now prompt to trust an unapproved repository recipe before launching it.
-- Project recipe tabs and panes now open only when initially booting a project session, not in every new workspace.
 
 ## 0.9
 

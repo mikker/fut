@@ -22,10 +22,11 @@ auto_start = true            # optional; trusted global/project config only
 ```
 
 Put `auto_start` in `.fut/project.toml` when the project should run the command
-for every new workspace or worktree. The trusted command and all settings used
-for that automatic start come from global configuration plus the exact approved
-project recipe. A `.fut/config.toml` may still override manual `run:restart`,
-but cannot affect automatic execution.
+once in the first workspace as its session starts. New workspaces and worktrees
+do not start it again. The trusted command and all settings used for that
+automatic start come from global configuration plus the exact approved project
+recipe. A `.fut/config.toml` may still override manual `run:restart`, but cannot
+affect automatic execution.
 
 Load the extension and bind restart:
 

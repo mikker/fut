@@ -777,13 +777,18 @@ def cmd_hook():
     workspace = os.environ.get("FUT_WORKSPACE_ID")
     if not workspace:
         return
-    if event == "workspace.created":
+    if event == "session.created":
         trusted = load_config(require_command=False, environment=TRUSTED_CONFIG_ENV)
         trusted_command, _, _, auto_start = trusted
         if auto_start:
             if trusted_command is None:
                 fail("trusted [extension.run] auto_start requires command")
             restart_runner(trusted)
+    elif event == "workspace.created":
+        _, _, _, auto_start = load_config(
+            require_command=False, environment=TRUSTED_CONFIG_ENV
+        )
+        if auto_start:
             return
         command, _, _, _ = load_config(require_command=False)
         if command is None:

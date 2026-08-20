@@ -131,9 +131,9 @@ enum Command {
         #[arg(last = true, value_hint = ValueHint::CommandWithArguments)]
         command: Vec<String>,
     },
-    /// Approve or revoke repository-owned project recipes on this machine.
+    /// Initialize, list, approve, or revoke project recipes.
     Project {
-        /// Project trust operation to perform.
+        /// Project operation to perform.
         #[command(subcommand)]
         command: ProjectCommand,
     },
@@ -213,6 +213,8 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ProjectCommand {
+    /// Create .fut/project.toml in the current directory.
+    Init,
     /// List configured projects.
     #[command(alias = "ls")]
     List,
@@ -1978,6 +1980,9 @@ fn run_project_command(
     json_output: bool,
     command: ProjectCommand,
 ) -> Result<()> {
+    if matches!(command, ProjectCommand::Init) {
+        return init_project(json_output);
+    }
     let catalog = client::config::load_projects(config_dir)?;
     if matches!(command, ProjectCommand::List) {
         let projects = catalog
@@ -2006,7 +2011,9 @@ fn run_project_command(
     let (name, trust, command_name) = match command {
         ProjectCommand::Trust { name } => (name, true, "project.trust"),
         ProjectCommand::Untrust { name } => (name, false, "project.untrust"),
-        ProjectCommand::List => unreachable!("project list returned above"),
+        ProjectCommand::Init | ProjectCommand::List => {
+            unreachable!("daemonless project command returned above")
+        }
     };
     let project = catalog_project(&catalog, &name)?;
     let change = if trust {
@@ -2044,6 +2051,61 @@ fn run_project_command(
             change.changed,
             change.source.display()
         ),
+    )
+}
+
+const PROJECT_RECIPE_TEMPLATE: &str = r#"#:schema https://fut.sh/schemas/project.json
+# Project recipe documentation: https://fut.sh/projects/
+
+[[workspaces]]
+
+[[workspaces.tabs]]
+title = "agent"
+panes = [{ command = ["codex"] }]
+
+[[workspaces.tabs]]
+title = "vim"
+panes = [{ command = ["vim"] }]
+"#;
+
+fn init_project(json_output: bool) -> Result<()> {
+    let root = std::env::current_dir().context("read current directory")?;
+    let directory = root.join(".fut");
+    let path = directory.join("project.toml");
+    std::fs::create_dir_all(&directory).with_context(|| {
+        format!(
+            "create project configuration directory {}",
+            directory.display()
+        )
+    })?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                anyhow::Error::new(CliError::new(
+                    "already_exists",
+                    format!("project recipe already exists at {}", path.display()),
+                ))
+            } else {
+                anyhow::Error::new(error)
+                    .context(format!("create project recipe {}", path.display()))
+            }
+        })?;
+    if let Err(error) = file
+        .write_all(PROJECT_RECIPE_TEMPLATE.as_bytes())
+        .with_context(|| format!("write project recipe {}", path.display()))
+    {
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return Err(error);
+    }
+    output(
+        json_output,
+        "project.init",
+        json!({ "path": path }),
+        format!("created={}", path.display()),
     )
 }
 
@@ -4543,7 +4605,15 @@ mod tests {
     }
 
     #[test]
-    fn project_trust_commands_parse_with_global_json() {
+    fn project_commands_parse_with_global_json() {
+        let init = Cli::try_parse_from(["fut", "project", "init"]).unwrap();
+        assert!(matches!(
+            init.command,
+            Some(Command::Project {
+                command: ProjectCommand::Init
+            })
+        ));
+
         for command in ["list", "ls"] {
             let cli = Cli::try_parse_from(["fut", "project", command]).unwrap();
             assert!(matches!(
@@ -4730,7 +4800,7 @@ mod tests {
                 .get_subcommands()
                 .map(clap::Command::get_name)
                 .collect::<Vec<_>>(),
-            ["list", "trust", "untrust"]
+            ["init", "list", "trust", "untrust"]
         );
 
         let command = cli_command();

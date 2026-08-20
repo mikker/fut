@@ -23,6 +23,7 @@ title = "Edit run logs"
 argv = ["./bin/runctl", "edit-logs"]
 
 [hooks]
+"session.created" = ["./bin/runctl", "hook"]
 "workspace.created" = ["./bin/runctl", "hook"]
 "workspace.closed" = ["./bin/runctl", "hook"]
 

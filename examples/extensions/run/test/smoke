@@ -256,8 +256,8 @@ grep -q "log rotated" "$D7/run.log" || fail "missing rotation separator"
 grep -q "fut-run · exit · generation 1 · code 0" "$D7/run.log" || fail "missing exit separator"
 ok "log rotation copies then truncates; run.log inode stays stable and both files stay bounded"
 
-# --- 12. workspace.created hook: trusted auto-start or merged-config pause -----------
-mkdir -p "$TMP/roots/w8" "$TMP/roots/w9" "$TMP/roots/w-auto"
+# --- 12. creation hooks: project auto-start or merged-config pause ------------------
+mkdir -p "$TMP/roots/w8" "$TMP/roots/w9" "$TMP/roots/w-auto" "$TMP/roots/w-new"
 HOOK_CFG=$(printf '{"command":["sh","-c","touch %s","fut-run-smoke-w8"],"auto_start":true}' "$TMP/w8-started")
 hook() { # <workspace-id> <event> <root> [resolved-config-json] [trusted-config-json]
   local cfg=${4-}
@@ -279,7 +279,7 @@ pgrep -f "fut-run-smoke-w8" >/dev/null && fail "created hook left a process behi
 
 AUTO_PIDS="$TMP/pids-w-auto"; : > "$AUTO_PIDS"
 AUTO_TRUSTED=$(printf '{"command":["sh","-c","echo $$ >> %s; sleep 300","%s"],"auto_start":true}' "$AUTO_PIDS" "$MARKER")
-hook w-auto workspace.created "$TMP/roots/w-auto" \
+hook w-auto session.created "$TMP/roots/w-auto" \
   '{"command":["/merged/config/must/not/run"],"auto_start":true}' \
   "$AUTO_TRUSTED" || fail "trusted auto-start hook failed"
 phase_is w-auto running || fail "trusted auto-start runner is not running"
@@ -287,8 +287,13 @@ wait_for 5 child_alive w-auto || fail "trusted auto-start child is not alive"
 [ "$(state_get w-auto "s.get('command') == ['sh', '-c', 'echo \$\$ >> $AUTO_PIDS; sleep 300', '$MARKER']")" = True ] || \
   fail "auto-start did not use trusted command"
 token_is w-auto play || fail "trusted auto-start did not publish play"
+hook w-new workspace.created "$TMP/roots/w-new" "$AUTO_TRUSTED" "$AUTO_TRUSTED" || \
+  fail "new workspace hook failed"
+[ ! -e "$(dirname "$(state_dir w1)")/w-new/state.json" ] || \
+  fail "new workspace repeated project auto-start"
+[ "$(wc -l < "$AUTO_PIDS" | tr -d ' ')" = 1 ] || fail "project command started more than once"
 D_AUTO=$(state_dir w-auto)
-ok "created hook pauses from merged config or auto-starts only trusted config"
+ok "creation hooks pause manual commands and auto-start once per project session"
 
 # --- 13. workspace.closed hook terminates and cleans up ------------------------------
 PIDS10="$TMP/pids-w10"; : > "$PIDS10"

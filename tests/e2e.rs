@@ -7690,11 +7690,15 @@ async fn trusted_catalog_recipe_bootstraps_only_the_initial_workspace() {
             fs::create_dir(checkout.join("frontend")).unwrap();
             fs::create_dir(checkout.join("agent")).unwrap();
         }
-        let recipe = r#"focus = "code.agent"
+        let recipe = r#"focus = "main.code.agent"
 environment = { PROJECT_LEVEL = "workspace", CASCADE = "workspace" }
 
-[[tabs]]
+[[workspaces]]
+id = "main"
+
+[[workspaces.tabs]]
 id = "code"
+title = "code"
 cwd = "frontend"
 environment = { CASCADE = "tab" }
 panes = [
@@ -7702,9 +7706,9 @@ panes = [
   { id = "agent", cwd = "agent", environment = { CASCADE = "pane" }, command = ["/bin/sh", "-c", 'printf "%s|%s|%s" "$PWD" "$PROJECT_LEVEL" "$CASCADE" > agent.marker; while :; do sleep 1; done'], split = { target = "editor", direction = "right" } },
 ]
 
-[[tabs]]
+[[workspaces.tabs]]
 id = "server"
-name = "development server"
+title = "development server"
 panes = [
   { id = "server", command = ["/bin/sh", "-c", 'printf "%s|%s" "$PROJECT_LEVEL" "$CASCADE" > server.marker; while :; do sleep 1; done'] },
 ]
@@ -7886,7 +7890,7 @@ async fn repository_recipe_trust_change_and_untrust_apply_without_daemon_restart
         fs::create_dir_all(project.join(".fut")).unwrap();
         fs::write(
             project.join(".fut/project.toml"),
-            r#"tabs = [{ id = "unsafe", panes = [{ id = "unsafe", command = ["/bin/sh", "-c", "touch untrusted-marker; while :; do sleep 1; done"] }] }]
+            r#"workspaces = [{ tabs = [{ panes = [{ command = ["/bin/sh", "-c", "touch untrusted-marker; while :; do sleep 1; done"] }] }] }]
 "#,
         )
         .unwrap();
@@ -7957,7 +7961,7 @@ async fn repository_recipe_trust_change_and_untrust_apply_without_daemon_restart
 
     fs::write(
         project.join(".fut/project.toml"),
-        r#"tabs = [{ id = "changed", panes = [{ id = "changed", command = ["/bin/sh", "-c", "touch changed-marker; while :; do sleep 1; done"] }] }]
+        r#"workspaces = [{ tabs = [{ panes = [{ command = ["/bin/sh", "-c", "touch changed-marker; while :; do sleep 1; done"] }] }] }]
 "#,
     )
     .unwrap();
@@ -8027,8 +8031,11 @@ async fn daemon_bootstrap_applies_the_matching_catalog_recipe_atomically() {
             let recipe = root.join("bootstrap-recipe.toml");
             fs::write(
                 &recipe,
-                r#"focus = "main.focus"
-[[tabs]]
+                r#"focus = "main.main.focus"
+[[workspaces]]
+id = "main"
+
+[[workspaces.tabs]]
 id = "main"
 panes = [
   { id = "first", command = ["/bin/sh", "-c", "touch bootstrap-first.marker; while :; do sleep 1; done"] },
@@ -13999,6 +14006,44 @@ fn agent_skill_prints_the_bundled_skill_without_daemon_setup() {
         String::from_utf8(output.stdout).unwrap(),
         include_str!("../skills/fut/SKILL.md")
     );
+    assert!(!runtime.exists());
+}
+
+#[test]
+fn project_init_creates_a_schema_enabled_recipe_without_overwriting() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = root.path().join("runtime");
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_fut"))
+            .env_clear()
+            .env("HOME", root.path())
+            .env("FUT_RUNTIME_DIR", &runtime)
+            .current_dir(root.path())
+            .args(["--json", "project", "init"])
+            .output()
+            .unwrap()
+    };
+
+    let created = run();
+    assert!(created.status.success());
+    let response: Value = serde_json::from_slice(&created.stdout).unwrap();
+    let recipe = root.path().join(".fut/project.toml");
+    assert_eq!(response["command"], "project.init");
+    assert_eq!(
+        response["result"]["path"],
+        recipe.canonicalize().unwrap().to_str().unwrap()
+    );
+    let source = fs::read_to_string(&recipe).unwrap();
+    assert!(source.starts_with("#:schema https://fut.sh/schemas/project.json\n"));
+    assert!(source.contains("# Project recipe documentation: https://fut.sh/projects/"));
+    assert!(source.contains("title = \"agent\"\npanes = [{ command = [\"codex\"] }]"));
+    assert!(source.contains("title = \"vim\"\npanes = [{ command = [\"vim\"] }]"));
+
+    let duplicate = run();
+    assert!(!duplicate.status.success());
+    let error: Value = serde_json::from_slice(&duplicate.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "already_exists");
+    assert_eq!(fs::read_to_string(recipe).unwrap(), source);
     assert!(!runtime.exists());
 }
 

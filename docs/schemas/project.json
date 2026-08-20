@@ -1,0 +1,202 @@
+{
+  "$schema": "http://json-schema.org/draft-04/schema#",
+  "id": "https://fut.sh/schemas/project.json",
+  "title": "Fut project recipe",
+  "description": "Trusted repository configuration for bootstrapping a Fut project session.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "focus": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,64}\\.[A-Za-z0-9_-]{1,64}\\.[A-Za-z0-9_-]{1,64}$",
+      "description": "Initially focused pane as WORKSPACE.TAB.PANE. All three IDs must exist in this recipe."
+    },
+    "environment": {
+      "$ref": "#/definitions/environment"
+    },
+    "extension": {
+      "type": "object",
+      "description": "Project-scoped configuration keyed by installed extension ID.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": {
+          "$ref": "#/definitions/tomlValue"
+        }
+      }
+    },
+    "workspaces": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "items": {
+        "$ref": "#/definitions/workspace"
+      }
+    }
+  },
+  "required": ["workspaces"],
+  "definitions": {
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,64}$"
+    },
+    "cwd": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Working directory relative to the workspace root, or an absolute path."
+    },
+    "environment": {
+      "type": "object",
+      "maxProperties": 128,
+      "description": "Environment variables. Names must be shell identifiers and cannot start with FUT_.",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "command": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Program followed by its arguments, executed directly without a shell."
+    },
+    "split": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "target": {
+          "$ref": "#/definitions/id",
+          "description": "ID of an earlier pane in this tab."
+        },
+        "direction": {
+          "enum": ["right", "down"]
+        }
+      },
+      "required": ["target", "direction"]
+    },
+    "firstPane": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/id"
+        },
+        "command": {
+          "$ref": "#/definitions/command"
+        },
+        "exec": {
+          "type": "boolean",
+          "default": false
+        },
+        "cwd": {
+          "$ref": "#/definitions/cwd"
+        },
+        "environment": {
+          "$ref": "#/definitions/environment"
+        }
+      }
+    },
+    "splitPane": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/id"
+        },
+        "command": {
+          "$ref": "#/definitions/command"
+        },
+        "exec": {
+          "type": "boolean",
+          "default": false
+        },
+        "cwd": {
+          "$ref": "#/definitions/cwd"
+        },
+        "environment": {
+          "$ref": "#/definitions/environment"
+        },
+        "split": {
+          "$ref": "#/definitions/split"
+        }
+      },
+      "required": ["split"]
+    },
+    "tab": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/id"
+        },
+        "title": {
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "cwd": {
+          "$ref": "#/definitions/cwd"
+        },
+        "environment": {
+          "$ref": "#/definitions/environment"
+        },
+        "panes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": [
+            {
+              "$ref": "#/definitions/firstPane"
+            }
+          ],
+          "additionalItems": {
+            "$ref": "#/definitions/splitPane"
+          }
+        }
+      },
+      "required": ["panes"]
+    },
+    "workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/id"
+        },
+        "title": {
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "tabs": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/definitions/tab"
+          }
+        }
+      },
+      "required": ["tabs"]
+    },
+    "tomlValue": {
+      "oneOf": [
+        {
+          "type": ["string", "number", "integer", "boolean"]
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/tomlValue"
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/tomlValue"
+          }
+        }
+      ]
+    }
+  }
+}

@@ -37,6 +37,7 @@ const MAX_ARGUMENT_BYTES: usize = 4 * 1024;
 const MAX_ENVIRONMENT: usize = 128;
 const MAX_ENVIRONMENT_VALUE_BYTES: usize = 4 * 1024;
 const MAX_ID_BYTES: usize = 64;
+const MAX_WORKSPACES: usize = 32;
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -47,15 +48,26 @@ pub(crate) struct WorkspaceRecipe {
     environment: BTreeMap<String, String>,
     #[serde(default)]
     focus: Option<String>,
+    workspaces: Vec<RecipeWorkspace>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecipeWorkspace {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
     tabs: Vec<RecipeTab>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RecipeTab {
-    id: String,
     #[serde(default)]
-    name: Option<String>,
+    id: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
     #[serde(default)]
     cwd: Option<PathBuf>,
     #[serde(default)]
@@ -66,7 +78,8 @@ pub(crate) struct RecipeTab {
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RecipePane {
-    id: String,
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     command: Option<Vec<String>>,
     #[serde(default)]
@@ -217,8 +230,8 @@ impl WorkspaceRecipe {
         &self.extension
     }
 
-    pub(crate) fn tabs(&self) -> &[RecipeTab] {
-        &self.tabs
+    pub(crate) fn workspaces(&self) -> &[RecipeWorkspace] {
+        &self.workspaces
     }
 
     pub(crate) fn environment(&self) -> &BTreeMap<String, String> {
@@ -230,13 +243,27 @@ impl WorkspaceRecipe {
     }
 }
 
-impl RecipeTab {
-    pub(crate) fn id(&self) -> &str {
-        &self.id
+impl RecipeWorkspace {
+    pub(crate) fn id(&self) -> Option<&str> {
+        self.id.as_deref()
     }
 
-    pub(crate) fn name(&self) -> &str {
-        self.name.as_deref().unwrap_or(&self.id)
+    pub(crate) fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    pub(crate) fn tabs(&self) -> &[RecipeTab] {
+        &self.tabs
+    }
+}
+
+impl RecipeTab {
+    pub(crate) fn id(&self) -> Option<&str> {
+        self.id.as_deref()
+    }
+
+    pub(crate) fn title(&self) -> Option<&str> {
+        self.title.as_deref()
     }
 
     pub(crate) fn cwd(&self) -> Option<&Path> {
@@ -253,8 +280,8 @@ impl RecipeTab {
 }
 
 impl RecipePane {
-    pub(crate) fn id(&self) -> &str {
-        &self.id
+    pub(crate) fn id(&self) -> Option<&str> {
+        self.id.as_deref()
     }
 
     pub(crate) fn command(&self) -> Option<&[String]> {
@@ -828,63 +855,106 @@ fn storable_path(path: &Path) -> Result<&str> {
 }
 
 fn validate(recipe: &WorkspaceRecipe, extensions: &[Extension]) -> Result<()> {
-    if recipe.tabs.is_empty() || recipe.tabs.len() > MAX_TABS {
-        bail!("recipe must contain between 1 and {MAX_TABS} tabs");
+    if recipe.workspaces.is_empty() || recipe.workspaces.len() > MAX_WORKSPACES {
+        bail!("recipe must contain between 1 and {MAX_WORKSPACES} workspaces");
     }
     validate_extension_config_catalog(&recipe.extension, extensions, Path::new("project recipe"))?;
     validate_environment(&recipe.environment, "environment")?;
-    let mut tab_ids = HashSet::new();
-    let mut tab_names = HashSet::new();
+    let mut workspace_ids = HashSet::new();
+    let mut workspace_titles = HashSet::new();
+    let mut tab_count = 0;
     let mut pane_count = 0;
     let mut focus_targets = HashSet::new();
-    for (tab_index, tab) in recipe.tabs.iter().enumerate() {
-        let tab_path = format!("tabs[{tab_index}]");
-        validate_id(&tab.id, &format!("{tab_path}.id"))?;
-        if !tab_ids.insert(&tab.id) {
-            bail!("duplicate tab ID {:?}", tab.id);
-        }
-        if tab.name.as_ref().is_some_and(|name| name.trim().is_empty()) {
-            bail!("{tab_path}.name cannot be empty or whitespace-only");
-        }
-        if !tab_names.insert(tab.name()) {
-            bail!("duplicate tab display name {:?}", tab.name());
-        }
-        validate_cwd(tab.cwd.as_deref(), &format!("{tab_path}.cwd"))?;
-        validate_environment(&tab.environment, &format!("{tab_path}.environment"))?;
-        if tab.panes.is_empty() || tab.panes.len() > MAX_PANES_PER_TAB {
-            bail!("{tab_path} must contain between 1 and {MAX_PANES_PER_TAB} panes");
-        }
-        pane_count += tab.panes.len();
-        if pane_count > MAX_PANES {
-            bail!("recipe contains more than {MAX_PANES} panes");
-        }
-        let mut pane_ids = HashSet::new();
-        for (pane_index, pane) in tab.panes.iter().enumerate() {
-            let pane_path = format!("{tab_path}.panes[{pane_index}]");
-            validate_id(&pane.id, &format!("{pane_path}.id"))?;
-            if !pane_ids.insert(&pane.id) {
-                bail!("duplicate pane ID {:?} in tab {:?}", pane.id, tab.id);
+    for (workspace_index, workspace) in recipe.workspaces.iter().enumerate() {
+        let workspace_path = format!("workspaces[{workspace_index}]");
+        if let Some(id) = &workspace.id {
+            validate_id(id, &format!("{workspace_path}.id"))?;
+            if !workspace_ids.insert(id) {
+                bail!("duplicate workspace ID {id:?}");
             }
-            focus_targets.insert(format!("{}.{}", tab.id, pane.id));
-            validate_command(pane.command.as_deref(), &format!("{pane_path}.command"))?;
-            validate_cwd(pane.cwd.as_deref(), &format!("{pane_path}.cwd"))?;
-            validate_environment(&pane.environment, &format!("{pane_path}.environment"))?;
-            match (pane_index, &pane.split) {
-                (0, None) => {}
-                (0, Some(_)) => bail!("the first pane in tab {:?} cannot split", tab.id),
-                (_, None) => bail!("{pane_path}.split is required"),
-                (_, Some(split)) if !pane_ids.contains(&split.target) => bail!(
-                    "{pane_path}.split target {:?} must name an earlier pane in the same tab",
-                    split.target
-                ),
-                _ => {}
+        }
+        validate_title(
+            workspace.title.as_deref(),
+            &format!("{workspace_path}.title"),
+        )?;
+        if let Some(title) = &workspace.title
+            && !workspace_titles.insert(title)
+        {
+            bail!("duplicate workspace title {title:?}");
+        }
+        if workspace.tabs.is_empty() {
+            bail!("{workspace_path} must contain at least one tab");
+        }
+        let mut workspace_tab_ids = HashSet::new();
+        let mut tab_titles = HashSet::new();
+        for (tab_index, tab) in workspace.tabs.iter().enumerate() {
+            tab_count += 1;
+            if tab_count > MAX_TABS {
+                bail!("recipe contains more than {MAX_TABS} tabs");
+            }
+            let tab_path = format!("{workspace_path}.tabs[{tab_index}]");
+            if let Some(id) = &tab.id {
+                validate_id(id, &format!("{tab_path}.id"))?;
+                if !workspace_tab_ids.insert(id) {
+                    bail!("duplicate tab ID {id:?} in {workspace_path}");
+                }
+            }
+            validate_title(tab.title.as_deref(), &format!("{tab_path}.title"))?;
+            if let Some(title) = &tab.title
+                && !tab_titles.insert(title)
+            {
+                bail!("duplicate tab title {title:?} in {workspace_path}");
+            }
+            validate_cwd(tab.cwd.as_deref(), &format!("{tab_path}.cwd"))?;
+            validate_environment(&tab.environment, &format!("{tab_path}.environment"))?;
+            if tab.panes.is_empty() || tab.panes.len() > MAX_PANES_PER_TAB {
+                bail!("{tab_path} must contain between 1 and {MAX_PANES_PER_TAB} panes");
+            }
+            pane_count += tab.panes.len();
+            if pane_count > MAX_PANES {
+                bail!("recipe contains more than {MAX_PANES} panes");
+            }
+            let mut pane_ids = HashSet::new();
+            for (pane_index, pane) in tab.panes.iter().enumerate() {
+                let pane_path = format!("{tab_path}.panes[{pane_index}]");
+                if let Some(id) = &pane.id {
+                    validate_id(id, &format!("{pane_path}.id"))?;
+                    if !pane_ids.insert(id) {
+                        bail!("duplicate pane ID {id:?} in {tab_path}");
+                    }
+                }
+                if let (Some(workspace_id), Some(tab_id), Some(pane_id)) =
+                    (&workspace.id, &tab.id, &pane.id)
+                {
+                    focus_targets.insert(format!("{workspace_id}.{tab_id}.{pane_id}"));
+                }
+                validate_command(pane.command.as_deref(), &format!("{pane_path}.command"))?;
+                validate_cwd(pane.cwd.as_deref(), &format!("{pane_path}.cwd"))?;
+                validate_environment(&pane.environment, &format!("{pane_path}.environment"))?;
+                match (pane_index, &pane.split) {
+                    (0, None) => {}
+                    (0, Some(_)) => bail!("the first pane in {tab_path} cannot split"),
+                    (_, None) => bail!("{pane_path}.split is required"),
+                    (_, Some(split)) if !pane_ids.contains(&split.target) => bail!(
+                        "{pane_path}.split target {:?} must name an earlier pane in the same tab",
+                        split.target
+                    ),
+                    _ => {}
+                }
             }
         }
     }
     if let Some(focus) = &recipe.focus
         && !focus_targets.contains(focus)
     {
-        bail!("focus {focus:?} does not name a recipe pane as TAB.PANE");
+        bail!("focus {focus:?} does not name a recipe pane as WORKSPACE.TAB.PANE");
+    }
+    Ok(())
+}
+
+fn validate_title(title: Option<&str>, path: &str) -> Result<()> {
+    if title.is_some_and(|title| title.trim().is_empty()) {
+        bail!("{path} cannot be empty or whitespace-only");
     }
     Ok(())
 }
@@ -959,10 +1029,13 @@ mod tests {
     fn validates_named_tabs_direct_commands_splits_environment_and_focus() {
         let recipe = parse(
             r#"
-focus = "code.agent"
+focus = "main.code.agent"
 environment = { RUST_BACKTRACE = "1" }
 
-[[tabs]]
+[[workspaces]]
+id = "main"
+
+[[workspaces.tabs]]
 id = "code"
 cwd = "."
 environment = { TAB = "code" }
@@ -971,27 +1044,41 @@ panes = [
   { id = "agent", command = ["pi", "--model", "fast"], exec = true, environment = { ROLE = "agent" }, split = { target = "editor", direction = "right" } },
 ]
 
-[[tabs]]
+[[workspaces.tabs]]
 id = "server"
-name = "dev server"
+title = "dev server"
 panes = [{ id = "server", command = ["mise", "run", "fresh"] }]
 "#,
         )
         .unwrap();
-        assert_eq!(recipe.focus(), Some("code.agent"));
+        assert_eq!(recipe.focus(), Some("main.code.agent"));
         assert_eq!(
-            recipe.tabs()[0].panes()[1].split().unwrap().target(),
+            recipe.workspaces()[0].tabs()[0].panes()[1]
+                .split()
+                .unwrap()
+                .target(),
             "editor"
         );
-        assert_eq!(recipe.tabs()[1].name(), "dev server");
-        assert!(!recipe.tabs()[0].panes()[0].exec());
-        assert!(recipe.tabs()[0].panes()[1].exec());
+        assert_eq!(recipe.workspaces()[0].tabs()[1].title(), Some("dev server"));
+        assert!(!recipe.workspaces()[0].tabs()[0].panes()[0].exec());
+        assert!(recipe.workspaces()[0].tabs()[0].panes()[1].exec());
+    }
+
+    #[test]
+    fn allows_ids_to_be_omitted_when_nothing_references_them() {
+        let recipe = parse("workspaces = [{ tabs = [{ panes = [{}] }] }]").unwrap();
+
+        assert_eq!(recipe.workspaces()[0].id(), None);
+        assert_eq!(recipe.workspaces()[0].title(), None);
+        assert_eq!(recipe.workspaces()[0].tabs()[0].id(), None);
+        assert_eq!(recipe.workspaces()[0].tabs()[0].title(), None);
+        assert_eq!(recipe.workspaces()[0].tabs()[0].panes()[0].id(), None);
     }
 
     #[test]
     fn trusted_recipe_extension_config_requires_a_loaded_extension() {
         let source = r#"
-tabs = [{ id = "code", panes = [{ id = "shell" }] }]
+workspaces = [{ tabs = [{ panes = [{}] }] }]
 [extension.run]
 command = ["mise", "run", "dev"]
 auto_start = true
@@ -1009,38 +1096,38 @@ auto_start = true
     fn rejects_implicit_topology_reserved_environment_and_shellish_empty_commands() {
         for source in [
             r#"version = 1
-tabs = [{ id = "code", panes = [{ id = "one" }] }]"#,
-            r#"tabs = [{ id = "code", panes = [{ id = "one" }, { id = "two" }] }]"#,
+workspaces = [{ tabs = [{ panes = [{}] }] }]"#,
+            r#"workspaces = [{ tabs = [{ panes = [{}, {}] }] }]"#,
             r#"environment = { FUT_SOCKET = "hostile" }
-tabs = [{ id = "code", panes = [{ id = "one" }] }]"#,
-            r#"tabs = [{ id = "code", panes = [{ id = "one", command = [] }] }]"#,
+workspaces = [{ tabs = [{ panes = [{}] }] }]"#,
+            r#"workspaces = [{ tabs = [{ panes = [{ command = [] }] }] }]"#,
         ] {
             assert!(parse(source).is_err(), "accepted {source}");
         }
     }
 
     #[test]
-    fn rejects_whitespace_only_and_duplicate_effective_tab_names() {
+    fn rejects_whitespace_only_and_duplicate_titles() {
         for (source, expected) in [
             (
-                r#"tabs = [
-  { id = "one", name = "  \t", panes = [{ id = "one" }] },
-]"#,
+                r#"workspaces = [{ tabs = [
+  { title = "  \t", panes = [{}] },
+] }]"#,
                 "whitespace-only",
             ),
             (
-                r#"tabs = [
-  { id = "code", panes = [{ id = "one" }] },
-  { id = "other", name = "code", panes = [{ id = "two" }] },
-]"#,
-                "duplicate tab display name \"code\"",
+                r#"workspaces = [{ tabs = [
+  { title = "shared", panes = [{}] },
+  { title = "shared", panes = [{}] },
+] }]"#,
+                "duplicate tab title \"shared\"",
             ),
             (
-                r#"tabs = [
-  { id = "one", name = "shared", panes = [{ id = "one" }] },
-  { id = "two", name = "shared", panes = [{ id = "two" }] },
+                r#"workspaces = [
+  { title = "shared", tabs = [{ panes = [{}] }] },
+  { title = "shared", tabs = [{ panes = [{}] }] },
 ]"#,
-                "duplicate tab display name \"shared\"",
+                "duplicate workspace title \"shared\"",
             ),
         ] {
             let error = parse(source).unwrap_err().to_string();
@@ -1053,7 +1140,7 @@ tabs = [{ id = "code", panes = [{ id = "one" }] }]"#,
         let temporary = tempfile::tempdir().unwrap();
         let project_root = temporary.path().join("project");
         fs::create_dir_all(project_root.join(".fut")).unwrap();
-        let source = b"tabs = [{ id = \"code\", panes = [{ id = \"shell\" }] }]\n";
+        let source = b"workspaces = [{ tabs = [{ panes = [{}] }] }]\n";
         let recipe_path = project_root.join(".fut/project.toml");
         fs::write(&recipe_path, source).unwrap();
         let digest = format!("{:x}", Sha256::digest(source));
@@ -1085,11 +1172,11 @@ tabs = [{ id = "code", panes = [{ id = "one" }] }]"#,
             .unwrap()
             .unwrap();
         assert_eq!(loaded.digest, digest);
-        assert_eq!(loaded.recipe.tabs()[0].id(), "code");
+        assert_eq!(loaded.recipe.workspaces()[0].id(), None);
 
         fs::write(
             &recipe_path,
-            "tabs = [{ id = \"changed\", panes = [{ id = \"shell\" }] }]\n",
+            "workspaces = [{ title = \"changed\", tabs = [{ panes = [{}] }] }]\n",
         )
         .unwrap();
         assert!(matches!(
@@ -1131,7 +1218,7 @@ tabs = [{ id = "code", panes = [{ id = "one" }] }]"#,
         let recipe_path = temporary.path().join("recipe.toml");
         fs::write(
             &recipe_path,
-            "tabs = [{ id = \"code\", panes = [{ id = \"shell\" }] }]\n",
+            "workspaces = [{ tabs = [{ panes = [{}] }] }]\n",
         )
         .unwrap();
         let project = ProjectConfig {
@@ -1156,7 +1243,7 @@ tabs = [{ id = "code", panes = [{ id = "one" }] }]"#,
         fs::create_dir_all(project_root.join(".fut")).unwrap();
         fs::write(
             project_root.join(".fut/project.toml"),
-            "tabs = [{ id = \"code\", panes = [{ id = \"shell\" }] }]\n",
+            "workspaces = [{ tabs = [{ panes = [{}] }] }]\n",
         )
         .unwrap();
         let project = ProjectConfig {

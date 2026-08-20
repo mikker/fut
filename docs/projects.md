@@ -47,10 +47,10 @@ a daemon restart.
 
 ## Trusted recipes
 
-Each catalog entry may initialize the first workspace of a newly created
+Each catalog entry may initialize the declared workspaces of a newly created
 project session from a recipe. Once the project session is live, opening a
 linked checkout or creating another workspace starts one ordinary terminal; it
-does not recreate the recipe's tabs, panes, or commands. Reopening a live
+does not recreate the recipe's workspaces, tabs, panes, or commands. Reopening a live
 workspace never rereads or reconciles its recipe and never reruns its commands.
 A linked Git worktree uses the recipe configured for the catalog root when it
 is the checkout that initially boots the project session, not a file from the
@@ -61,8 +61,13 @@ Because that repository-owned file can run commands, review it and approve its
 exact current contents with:
 
 ```sh
+fut project init
 fut project trust fut
 ```
+
+`fut project init` creates a small starter recipe in the current directory with
+the published schema, an agent tab, a Vim tab, and a link back to this page. It
+refuses to overwrite an existing `.fut/project.toml`.
 
 This command works without a running daemon. It resolves the configured
 project, reads a canonical regular recipe file, and fully validates the recipe
@@ -86,7 +91,9 @@ regular UTF-8 files no larger than 64 KiB.
 ## Recipe format
 
 ```toml
-focus = "code.agent"
+#:schema https://fut.sh/schemas/project.json
+
+focus = "main.code.agent"
 environment = { RUST_BACKTRACE = "1" }
 
 [extension.wt]
@@ -97,8 +104,12 @@ command = ["pi"]
 command = ["mise", "run", "dev"]
 auto_start = true
 
-[[tabs]]
+[[workspaces]]
+id = "main"
+
+[[workspaces.tabs]]
 id = "code"
+title = "Code"
 cwd = "."
 environment = { PROJECT_ROLE = "development" }
 panes = [
@@ -106,19 +117,35 @@ panes = [
   { id = "agent", command = ["pi", "--model", "fast"], exec = true, environment = { AGENT_ROLE = "reviewer" }, split = { target = "editor", direction = "right" } },
 ]
 
-[[tabs]]
-id = "console"
-name = "project console"
+[[workspaces.tabs]]
+title = "project console"
 panes = [
-  { id = "shell" },
+  { },
 ]
 ```
 
-Tab and pane IDs use ASCII letters, numbers, `-`, or `_`. They are recipe-local
-names used by split targets and by `focus = "TAB.PANE"`; a tab's ID is also its
-display name when `name` is omitted. The first pane in a tab has no `split`.
-Every later pane must split an earlier pane in the same tab with direction
-`right` or `down`.
+## Editor completion
+
+Fut publishes a [JSON Schema](/schemas/project.json) for project recipes. Add
+this Taplo schema directive as the first line of `.fut/project.toml` to get
+validation, documentation, and completion in compatible TOML editors:
+
+```toml
+#:schema https://fut.sh/schemas/project.json
+```
+
+The schema catches structural errors such as missing pane splits. Fut remains
+the authority for checks that JSON Schema cannot express, including unique IDs,
+valid focus targets, split targets that name earlier panes, installed extension
+configuration, and the total pane limit.
+
+Workspace, tab, and pane IDs are optional recipe-local references. Add an ID
+only when the item must be referenced by `focus = "WORKSPACE.TAB.PANE"` or a
+pane's `split.target`. IDs use ASCII letters, numbers, `-`, or `_` and never
+affect presentation. Set `title` on a workspace or tab when it needs a fixed
+display name; without one it follows Fut's normal automatic naming. The first
+pane in a tab has no `split`. Every later pane must split an earlier, named pane
+in the same tab with direction `right` or `down`.
 
 Commands are direct argument arrays and are never evaluated by a shell. By
 default, Fut runs a configured command as a child process and starts the user's
@@ -136,8 +163,10 @@ They layer over global extension defaults and are captured when the project
 session is created, so the main checkout, linked worktrees, and logical peer
 workspaces share one approved project configuration. The bundled `wt`
 extension can open existing worktrees with `open_existing = true`; the bundled
-`run` extension can start its managed command in every new workspace with
-`auto_start = true`. Both are disabled by default.
+`run` extension can start its managed command once in the first declared
+workspace when the project session starts with `auto_start = true`. It does not
+repeat that command in other declared or subsequently created workspaces. Both
+extensions are disabled by default.
 
 The `wt` extension's optional `command` array supplies the default command in
 its **New worktree** form. For example, `["pi"]` launches Pi in the new

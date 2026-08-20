@@ -14,7 +14,7 @@ use crate::{
     protocol::{OpenDisposition, SelectedTarget},
     resources::{
         CheckoutDestination, InitialPath, Mutation, ResolvedTerminalPath, ResourceTree, TabPath,
-        TrustedProjectConfig,
+        TrustedProjectConfig, WorkspacePath,
     },
     splits::SplitDirection,
     terminal::{SpawnSpec, TerminalHandle, TerminalLifecycle, spawn_terminal},
@@ -27,13 +27,19 @@ use super::{
 
 #[derive(Clone, Debug)]
 pub(super) struct PreparedRecipe {
-    tabs: Vec<PreparedRecipeTab>,
+    workspaces: Vec<PreparedRecipeWorkspace>,
     trusted_project_config: Option<TrustedProjectConfig>,
 }
 
 #[derive(Clone, Debug)]
+struct PreparedRecipeWorkspace {
+    title: String,
+    tabs: Vec<PreparedRecipeTab>,
+}
+
+#[derive(Clone, Debug)]
 struct PreparedRecipeTab {
-    name: String,
+    title: String,
     panes: Vec<PreparedRecipePane>,
 }
 
@@ -380,72 +386,95 @@ async fn prepare_recipe(
         source: source.clone(),
         extension: recipe.extension().clone(),
     });
-    let focus = recipe.focus().and_then(|focus| focus.split_once('.'));
-    let mut tabs = Vec::with_capacity(recipe.tabs().len());
-    for (tab_index, tab) in recipe.tabs().iter().enumerate() {
-        let tab_cwd = resolve_spawn_cwd(workspace_root, tab.cwd().map(Path::to_path_buf)).await?;
-        let mut panes = Vec::with_capacity(tab.panes().len());
-        let mut pane_indices = HashMap::with_capacity(tab.panes().len());
-        for (pane_index, pane) in tab.panes().iter().enumerate() {
-            let focused = match focus {
-                Some((tab_id, pane_id)) => tab_id == tab.id() && pane_id == pane.id(),
-                None => tab_index == 0 && pane_index == 0,
-            };
-            let placement = match pane.split() {
-                None => PreparedPanePlacement::Initial,
-                Some(split) => PreparedPanePlacement::Split {
-                    target: pane_indices
-                        .get(split.target())
-                        .copied()
-                        .expect("validated recipe split targets an earlier pane"),
-                    direction: split.direction(),
-                },
-            };
-            pane_indices.insert(pane.id(), pane_index);
-            let cwd = match pane.cwd() {
-                Some(cwd) => resolve_spawn_cwd(workspace_root, Some(cwd.to_owned())).await?,
-                None => tab_cwd.clone(),
-            };
-            let mut environment = recipe
-                .environment()
-                .iter()
-                .map(|(name, value)| (name.clone(), value.clone()))
-                .collect::<HashMap<_, _>>();
-            environment.extend(
-                tab.environment()
+    let focus = recipe.focus().map(|focus| {
+        let mut parts = focus.split('.');
+        (
+            parts.next().expect("validated recipe focus workspace"),
+            parts.next().expect("validated recipe focus tab"),
+            parts.next().expect("validated recipe focus pane"),
+        )
+    });
+    let mut workspaces = Vec::with_capacity(recipe.workspaces().len());
+    for (workspace_index, workspace) in recipe.workspaces().iter().enumerate() {
+        let mut tabs = Vec::with_capacity(workspace.tabs().len());
+        for (tab_index, tab) in workspace.tabs().iter().enumerate() {
+            let tab_cwd =
+                resolve_spawn_cwd(workspace_root, tab.cwd().map(Path::to_path_buf)).await?;
+            let mut panes = Vec::with_capacity(tab.panes().len());
+            let mut pane_indices = HashMap::with_capacity(tab.panes().len());
+            for (pane_index, pane) in tab.panes().iter().enumerate() {
+                let focused = match focus {
+                    Some((workspace_id, tab_id, pane_id)) => {
+                        Some(workspace_id) == workspace.id()
+                            && Some(tab_id) == tab.id()
+                            && Some(pane_id) == pane.id()
+                    }
+                    None => workspace_index == 0 && tab_index == 0 && pane_index == 0,
+                };
+                let placement = match pane.split() {
+                    None => PreparedPanePlacement::Initial,
+                    Some(split) => PreparedPanePlacement::Split {
+                        target: pane_indices
+                            .get(split.target())
+                            .copied()
+                            .expect("validated recipe split targets an earlier pane"),
+                        direction: split.direction(),
+                    },
+                };
+                if let Some(id) = pane.id() {
+                    pane_indices.insert(id, pane_index);
+                }
+                let cwd = match pane.cwd() {
+                    Some(cwd) => resolve_spawn_cwd(workspace_root, Some(cwd.to_owned())).await?,
+                    None => tab_cwd.clone(),
+                };
+                let mut environment = recipe
+                    .environment()
                     .iter()
-                    .map(|(name, value)| (name.clone(), value.clone())),
-            );
-            environment.extend(
-                pane.environment()
-                    .iter()
-                    .map(|(name, value)| (name.clone(), value.clone())),
-            );
-            let (mut program, mut argv) = match pane.command() {
-                None => default_shell_command(),
-                Some(command) if pane.exec() => (PathBuf::from(&command[0]), command[1..].to_vec()),
-                Some(command) => returning_shell_command(command),
-            };
-            if focused && let Some((override_program, override_argv)) = &command_override {
-                program = override_program.clone();
-                argv = override_argv.clone();
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect::<HashMap<_, _>>();
+                environment.extend(
+                    tab.environment()
+                        .iter()
+                        .map(|(name, value)| (name.clone(), value.clone())),
+                );
+                environment.extend(
+                    pane.environment()
+                        .iter()
+                        .map(|(name, value)| (name.clone(), value.clone())),
+                );
+                let (mut program, mut argv) = match pane.command() {
+                    None => default_shell_command(),
+                    Some(command) if pane.exec() => {
+                        (PathBuf::from(&command[0]), command[1..].to_vec())
+                    }
+                    Some(command) => returning_shell_command(command),
+                };
+                if focused && let Some((override_program, override_argv)) = &command_override {
+                    program = override_program.clone();
+                    argv = override_argv.clone();
+                }
+                panes.push(PreparedRecipePane {
+                    placement,
+                    focused,
+                    program,
+                    argv,
+                    cwd,
+                    environment,
+                });
             }
-            panes.push(PreparedRecipePane {
-                placement,
-                focused,
-                program,
-                argv,
-                cwd,
-                environment,
+            tabs.push(PreparedRecipeTab {
+                title: tab.title().unwrap_or_default().to_owned(),
+                panes,
             });
         }
-        tabs.push(PreparedRecipeTab {
-            name: tab.name().to_owned(),
-            panes,
+        workspaces.push(PreparedRecipeWorkspace {
+            title: workspace.title().unwrap_or_default().to_owned(),
+            tabs,
         });
     }
     Ok(PreparedRecipe {
-        tabs,
+        workspaces,
         trusted_project_config,
     })
 }
@@ -537,7 +566,8 @@ fn plan_recipe_session(
         name.unwrap_or_else(|| resources.available_session_name(&resolved.suggested_session_name));
     let session_id = SessionId::new();
     let workspace_id = WorkspaceId::new();
-    let first_tab = &recipe.tabs[0];
+    let first_workspace = &recipe.workspaces[0];
+    let first_tab = &first_workspace.tabs[0];
     let first_path = ResolvedTerminalPath {
         session_id,
         workspace_id,
@@ -551,10 +581,10 @@ fn plan_recipe_session(
         project: resolved.project.clone(),
         trusted_project_config: recipe.trusted_project_config.clone(),
         workspace_id,
-        workspace_name: String::new(),
+        workspace_name: first_workspace.title.clone(),
         root: resolved.workspace_root.clone(),
         tab_id: first_path.tab_id,
-        tab_name: first_tab.name.clone(),
+        tab_name: first_tab.title.clone(),
         pane_id: first_path.pane_id,
         terminal_id: first_path.terminal_id,
     })?;
@@ -562,61 +592,86 @@ fn plan_recipe_session(
 
     let mut terminals = Vec::new();
     let mut selected = first_path;
-    for (tab_index, tab) in recipe.tabs.iter().enumerate() {
-        let tab_id = if tab_index == 0 {
-            first_path.tab_id
+    for (workspace_index, workspace) in recipe.workspaces.iter().enumerate() {
+        let workspace_path = if workspace_index == 0 {
+            first_path
         } else {
             let path = ResolvedTerminalPath {
                 session_id,
-                workspace_id,
+                workspace_id: WorkspaceId::new(),
                 tab_id: TabId::new(),
                 pane_id: PaneId::new(),
                 terminal_id: TerminalId::new(),
             };
-            mutations.push(resources.add_tab(
-                workspace_id,
-                TabPath {
+            mutations.push(resources.add_workspace(
+                session_id,
+                WorkspacePath {
+                    workspace_id: path.workspace_id,
+                    workspace_name: workspace.title.clone(),
+                    root: resolved.workspace_root.clone(),
                     tab_id: path.tab_id,
-                    tab_name: tab.name.clone(),
+                    tab_name: workspace.tabs[0].title.clone(),
                     pane_id: path.pane_id,
                     terminal_id: path.terminal_id,
                 },
             )?);
-            path.tab_id
+            path
         };
-        let mut panes = Vec::<ResolvedTerminalPath>::with_capacity(tab.panes.len());
-        for pane in &tab.panes {
-            let path = match pane.placement {
-                PreparedPanePlacement::Initial if tab_index == 0 => first_path,
-                PreparedPanePlacement::Initial => resources.open_terminal_paths_for_tab(tab_id)?[0],
-                PreparedPanePlacement::Split { target, direction } => {
-                    let path = ResolvedTerminalPath {
-                        session_id,
-                        workspace_id,
-                        tab_id,
-                        pane_id: PaneId::new(),
-                        terminal_id: TerminalId::new(),
-                    };
-                    mutations.push(resources.split_pane(
-                        panes[target].pane_id,
-                        direction,
-                        path.pane_id,
-                        path.terminal_id,
-                    )?);
-                    path
-                }
+        for (tab_index, tab) in workspace.tabs.iter().enumerate() {
+            let tab_path = if tab_index == 0 {
+                workspace_path
+            } else {
+                let path = ResolvedTerminalPath {
+                    session_id,
+                    workspace_id: workspace_path.workspace_id,
+                    tab_id: TabId::new(),
+                    pane_id: PaneId::new(),
+                    terminal_id: TerminalId::new(),
+                };
+                mutations.push(resources.add_tab(
+                    workspace_path.workspace_id,
+                    TabPath {
+                        tab_id: path.tab_id,
+                        tab_name: tab.title.clone(),
+                        pane_id: path.pane_id,
+                        terminal_id: path.terminal_id,
+                    },
+                )?);
+                path
             };
-            if pane.focused {
-                selected = path;
+            let mut panes = Vec::<ResolvedTerminalPath>::with_capacity(tab.panes.len());
+            for pane in &tab.panes {
+                let path = match pane.placement {
+                    PreparedPanePlacement::Initial => tab_path,
+                    PreparedPanePlacement::Split { target, direction } => {
+                        let path = ResolvedTerminalPath {
+                            session_id,
+                            workspace_id: workspace_path.workspace_id,
+                            tab_id: tab_path.tab_id,
+                            pane_id: PaneId::new(),
+                            terminal_id: TerminalId::new(),
+                        };
+                        mutations.push(resources.split_pane(
+                            panes[target].pane_id,
+                            direction,
+                            path.pane_id,
+                            path.terminal_id,
+                        )?);
+                        path
+                    }
+                };
+                if pane.focused {
+                    selected = path;
+                }
+                panes.push(path);
+                terminals.push(PlannedRecipeTerminal {
+                    path,
+                    program: pane.program.clone(),
+                    argv: pane.argv.clone(),
+                    cwd: pane.cwd.clone(),
+                    environment: pane.environment.clone(),
+                });
             }
-            panes.push(path);
-            terminals.push(PlannedRecipeTerminal {
-                path,
-                program: pane.program.clone(),
-                argv: pane.argv.clone(),
-                cwd: pane.cwd.clone(),
-                environment: pane.environment.clone(),
-            });
         }
     }
     resources.focus_pane(selected.pane_id)?;
@@ -755,9 +810,12 @@ mod tests {
         let source = temporary.path().join("recipe.toml");
         fs::write(
             &source,
-            r#"focus = "code.agent"
+            r#"focus = "main.code.agent"
 environment = { LEVEL = "workspace" }
-[[tabs]]
+[[workspaces]]
+id = "main"
+
+[[workspaces.tabs]]
 id = "code"
 cwd = "tab-cwd"
 environment = { TAB_VALUE = "code" }
@@ -765,9 +823,15 @@ panes = [
   { id = "editor", command = ["editor", "."] },
   { id = "agent", cwd = "pane-cwd", environment = { LEVEL = "pane" }, command = ["agent", "--fast"], exec = true, split = { target = "editor", direction = "down" } },
 ]
-[[tabs]]
-id = "server"
-panes = [{ id = "server" }]
+[[workspaces.tabs]]
+panes = [{}]
+
+[[workspaces]]
+title = "tools"
+
+[[workspaces.tabs]]
+title = "logs"
+panes = [{}]
 [extension.run]
 command = ["mise", "run", "dev"]
 auto_start = true
@@ -787,14 +851,14 @@ auto_start = true
             .await
             .unwrap();
         assert_eq!(
-            recipe.tabs[0].panes[1].placement,
+            recipe.workspaces[0].tabs[0].panes[1].placement,
             PreparedPanePlacement::Split {
                 target: 0,
                 direction: SplitDirection::Down,
             }
         );
-        assert!(recipe.tabs[0].panes[1].focused);
-        assert!(!recipe.tabs[0].panes[0].focused);
+        assert!(recipe.workspaces[0].tabs[0].panes[1].focused);
+        assert!(!recipe.workspaces[0].tabs[0].panes[0].focused);
 
         let resolved = ProjectResolver::default()
             .resolve(temporary.path())
@@ -820,12 +884,16 @@ auto_start = true
                 .extension["run"]["auto_start"],
             true
         );
+        assert_eq!(snapshot.sessions[0].workspaces.len(), 2);
         let workspace = &snapshot.sessions[0].workspaces[0];
         assert_eq!(workspace.tabs.len(), 2);
+        assert_eq!(workspace.tabs[1].name, "");
+        assert_eq!(snapshot.sessions[0].workspaces[1].name, "tools");
+        assert_eq!(snapshot.sessions[0].workspaces[1].tabs[0].name, "logs");
         assert_eq!(workspace.tabs[0].panes.len(), 2);
         assert_eq!(workspace.tabs[0].layout.leaf_ids().len(), 2);
         assert_eq!(workspace.tabs[0].panes[1].id, plan.selected.pane_id);
-        assert_eq!(plan.terminals.len(), 3);
+        assert_eq!(plan.terminals.len(), 4);
         assert_eq!(plan.terminals[0].program, Path::new("/bin/sh"));
         assert_eq!(plan.terminals[0].argv[3..], ["editor", "."]);
         assert_eq!(plan.terminals[1].program, Path::new("agent"));
@@ -840,6 +908,61 @@ auto_start = true
         );
         assert_eq!(plan.terminals[1].environment["LEVEL"], "pane");
         assert_eq!(plan.terminals[1].environment["TAB_VALUE"], "code");
+    }
+
+    #[tokio::test]
+    async fn unnamed_workspace_and_tabs_keep_titles_separate_from_recipe_ids() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("recipe.toml");
+        fs::write(
+            &source,
+            r#"[[workspaces]]
+
+[[workspaces.tabs]]
+panes = [{ command = ["suite"] }]
+
+[[workspaces.tabs]]
+title = "agent"
+panes = [{ command = ["pi"] }]
+"#,
+        )
+        .unwrap();
+        let project = global_config::ProjectConfig {
+            path: temporary.path().to_owned(),
+            recipe: Some(source),
+        };
+        let loaded = crate::project_definition::load(Some("test"), &project, &[])
+            .unwrap()
+            .unwrap();
+        let recipe = prepare_recipe(loaded, temporary.path(), None)
+            .await
+            .unwrap();
+        let resolved = ProjectResolver::default()
+            .resolve(temporary.path())
+            .await
+            .unwrap();
+        let plan = plan_recipe_session(
+            ResourceTree::default(),
+            Vec::new(),
+            None,
+            &resolved,
+            None,
+            &recipe,
+        )
+        .unwrap();
+
+        assert_eq!(recipe.workspaces[0].title, "");
+        let workspace = &plan.resources.snapshot().sessions[0].workspaces[0];
+        assert_eq!(
+            workspace
+                .tabs
+                .iter()
+                .map(|tab| tab.name.as_str())
+                .collect::<Vec<_>>(),
+            ["", "agent"]
+        );
+        assert_eq!(plan.terminals[0].argv[3..], ["suite"]);
+        assert_eq!(plan.terminals[1].argv[3..], ["pi"]);
     }
 
     #[tokio::test]
