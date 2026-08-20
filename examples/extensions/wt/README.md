@@ -64,4 +64,5 @@ The package contains three direct executables:
 - `bin/open-existing` handles trusted `session.created` discovery.
 - `bin/worktree-event` is an adapter for a versioned `worktree.removed` event;
   it calls `fut workspace retire` using the agent terminal's validated caller
-  context. Current `wt` releases do not invoke this adapter automatically.
+  context. Commands launched by **New worktree** install this adapter so a
+  successful `wt done` or `wt ship` retires the removed worktree's workspace.

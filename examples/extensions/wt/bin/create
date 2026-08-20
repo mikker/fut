@@ -71,6 +71,7 @@ def main():
         command.append(prompt)
 
     fut_bin = required_env("FUT_BIN")
+    extension_root = required_env("FUT_EXTENSION_ROOT")
     socket = required_env("FUT_SOCKET")
     wt_bin = os.environ.get("FUT_WT_BIN") or "wt"
     argv = [
@@ -88,7 +89,17 @@ def main():
         name,
     ]
     if command:
-        argv.extend(["--", *command])
+        argv.extend(
+            [
+                "--",
+                "env",
+                "FUT_BIN=%s" % fut_bin,
+                "FUT_SOCKET=%s" % socket,
+                "WT_EVENT_HANDLER=%s"
+                % os.path.join(extension_root, "bin", "worktree-event"),
+                *command,
+            ]
+        )
 
     print("Creating %s…" % name)
     os.execvp(wt_bin, argv)

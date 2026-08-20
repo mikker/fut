@@ -2257,6 +2257,52 @@ fn checked_in_wt_extension_composes_project_open_and_retirement_commands() {
         expected
     );
 
+    let mut create_with_agent = Command::new(extension.join("bin/create"))
+        .env("FUT_BIN", "/opt/fut")
+        .env("FUT_EXTENSION_ROOT", &extension)
+        .env("FUT_SOCKET", "/tmp/fut.sock")
+        .env("FUT_WT_BIN", &fake_wt)
+        .env(
+            "FUT_EXTENSION_FORM",
+            r#"{"worktree":"agent-work","command":"pi","prompt":"finish it"}"#,
+        )
+        .env("CAPTURE", &capture)
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(create_with_agent.wait().unwrap().success());
+    let expected_agent = vec![
+        "create".to_owned(),
+        "agent-work".to_owned(),
+        "--".to_owned(),
+        "/opt/fut".to_owned(),
+        "--socket".to_owned(),
+        "/tmp/fut.sock".to_owned(),
+        "open".to_owned(),
+        "--background".to_owned(),
+        ".".to_owned(),
+        "--name".to_owned(),
+        "agent-work".to_owned(),
+        "--".to_owned(),
+        "env".to_owned(),
+        "FUT_BIN=/opt/fut".to_owned(),
+        "FUT_SOCKET=/tmp/fut.sock".to_owned(),
+        format!(
+            "WT_EVENT_HANDLER={}",
+            extension.join("bin/worktree-event").display()
+        ),
+        "pi".to_owned(),
+        "finish it".to_owned(),
+    ];
+    assert_eq!(
+        fs::read_to_string(&capture)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>(),
+        expected_agent
+    );
+
     let mut obsolete = Command::new(extension.join("bin/create"))
         .arg("test-agent")
         .env("FUT_BIN", "/opt/fut")

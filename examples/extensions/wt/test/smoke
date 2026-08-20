@@ -14,7 +14,7 @@ SH
 chmod +x "$TMP/wt"
 
 env \
-  FUT_BIN=/opt/fut FUT_SOCKET=/tmp/fut.sock FUT_WT_BIN="$TMP/wt" \
+  FUT_BIN=/opt/fut FUT_EXTENSION_ROOT="$HERE" FUT_SOCKET=/tmp/fut.sock FUT_WT_BIN="$TMP/wt" \
   FUT_EXTENSION_FORM='{"worktree":"feature-name","command":"","prompt":""}' \
   CAPTURE="$TMP/create-argv" "$HERE/bin/create" >/dev/null
 
@@ -33,11 +33,11 @@ feature-name
 EOF
 
 env \
-  FUT_BIN=/opt/fut FUT_SOCKET=/tmp/fut.sock FUT_WT_BIN="$TMP/wt" \
+  FUT_BIN=/opt/fut FUT_EXTENSION_ROOT="$HERE" FUT_SOCKET=/tmp/fut.sock FUT_WT_BIN="$TMP/wt" \
   FUT_EXTENSION_FORM='{"worktree":"agent-work","command":"pi --model sonnet","prompt":"start here"}' \
   CAPTURE="$TMP/agent-argv" "$HERE/bin/create" >/dev/null
 
-diff -u - "$TMP/agent-argv" <<'EOF' || fail "agent create argv changed"
+diff -u - "$TMP/agent-argv" <<EOF || fail "agent create argv changed"
 create
 agent-work
 --
@@ -50,18 +50,22 @@ open
 --name
 agent-work
 --
+env
+FUT_BIN=/opt/fut
+FUT_SOCKET=/tmp/fut.sock
+WT_EVENT_HANDLER=$HERE/bin/worktree-event
 pi
 --model
 sonnet
 start here
 EOF
 
-env FUT_BIN=/opt/fut FUT_SOCKET=/tmp/fut.sock FUT_WT_BIN="$TMP/wt" \
+env FUT_BIN=/opt/fut FUT_EXTENSION_ROOT="$HERE" FUT_SOCKET=/tmp/fut.sock FUT_WT_BIN="$TMP/wt" \
   FUT_EXTENSION_FORM='{"worktree":"","command":"","prompt":""}' \
   CAPTURE="$TMP/random-argv" "$HERE/bin/create" >/dev/null
 grep -Eq '^wt-[0-9a-f]{6}$' <(sed -n '2p' "$TMP/random-argv") || fail "blank worktree did not get a random name"
 
-if env FUT_BIN=/opt/fut FUT_SOCKET=/tmp/fut.sock FUT_WT_BIN="$TMP/wt" \
+if env FUT_BIN=/opt/fut FUT_EXTENSION_ROOT="$HERE" FUT_SOCKET=/tmp/fut.sock FUT_WT_BIN="$TMP/wt" \
   FUT_EXTENSION_FORM='{"worktree":"feature","command":"","prompt":"orphan"}' \
   CAPTURE="$TMP/ignored" "$HERE/bin/create" 2>/dev/null; then
   fail "prompt without a command was accepted"

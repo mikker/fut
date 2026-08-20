@@ -7,6 +7,7 @@
 - Project recipes now bootstrap declared workspaces and titled tabs, with IDs needed only for focus and split references.
 - Project run commands configured with `auto_start` now start once in the initial workspace instead of repeating in every new workspace.
 - Project opens now prompt to trust an unapproved repository recipe before launching it.
+- The bundled `wt` workflow now retires its Fut workspace after an agent successfully removes the worktree with `wt done` or `wt ship`.
 
 ## 0.9
 
