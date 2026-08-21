@@ -20,11 +20,28 @@ use crate::{
 
 /// Protocol version used by released Fut 0.1 builds.
 pub const PROTOCOL_VERSION_0_1: u16 = 0;
-/// Current clients and daemons require an exact protocol match.
-pub const PROTOCOL_VERSION: u16 = 31;
+/// Current clients and daemons require an exact protocol match. The protocol is
+/// the package version's minor component: Fut 0.12.x uses protocol 12.
+pub const PROTOCOL_VERSION: u16 = parse_protocol_version(env!("CARGO_PKG_VERSION_MINOR"));
 /// Enough for 50,000 individually styled MessagePack-encoded cells while
 /// remaining a firm pre-allocation bound for the length-delimited transport.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
+
+const fn parse_protocol_version(value: &str) -> u16 {
+    let bytes = value.as_bytes();
+    let mut version = 0_u16;
+    let mut index = 0;
+    while index < bytes.len() {
+        let digit = bytes[index];
+        assert!(
+            digit >= b'0' && digit <= b'9',
+            "invalid package minor version"
+        );
+        version = version * 10 + (digit - b'0') as u16;
+        index += 1;
+    }
+    version
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClientPresenceSnapshot {
@@ -1453,7 +1470,10 @@ mod tests {
             switched
         );
         assert_eq!(PROTOCOL_VERSION_0_1, 0);
-        assert_eq!(PROTOCOL_VERSION, 31);
+        assert_eq!(
+            PROTOCOL_VERSION.to_string(),
+            env!("CARGO_PKG_VERSION_MINOR")
+        );
 
         let watch = ClientMessage::WatchResources;
         assert_eq!(

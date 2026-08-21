@@ -35,9 +35,11 @@ Doctor reports:
   metadata, canonical roots, and configuration provenance;
 - the configured icon preset and a visual glyph probe.
 
-Client and daemon protocol versions must match exactly. Doctor reports both
-versions when it can safely reach a daemon; an older or newer endpoint is
-incompatible.
+Released client and daemon protocol versions must match exactly. Compatible
+source changes keep the current release's protocol during development. The
+protocol is derived from the package version's minor component, so Fut 0.12.x
+uses protocol 12 and the next minor release advances it automatically. Doctor
+reports both versions when it can safely reach a daemon.
 
 Configuration validation and active extension reporting are independent. If a
 changed package on disk is incompatible or malformed, the config check explains
