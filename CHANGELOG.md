@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- The Pi package now teaches Pi to inspect and control Fut resources, including other agent panes.
 - Configuration reloads now refresh the focused project's extension settings, with a separate command-palette action for project-only reloads.
 
 ## 0.12

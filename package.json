@@ -6,6 +6,7 @@
     "@earendil-works/pi-coding-agent": "*"
   },
   "pi": {
-    "extensions": ["./integrations/pi/fut.ts"]
+    "extensions": ["./integrations/pi/fut.ts"],
+    "skills": ["./skills"]
   }
 }

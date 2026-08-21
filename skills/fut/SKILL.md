@@ -55,6 +55,14 @@ fut --json list
 fut --json agent list
 ```
 
+If a client reports that its protocol does not match the running daemon, do not
+give up on read-only inspection. Find the daemon process which owns
+`FUT_SOCKET`, resolve that process's executable, and use that exact binary with
+`--socket "$FUT_SOCKET"` for `get`, `list`, `agent get`, `agent read`, and
+`terminal read`. On macOS, `lsof -p DAEMON_PID` shows the executable as its
+`txt` entry. Never use this fallback for mutations or lifecycle reports;
+restart Fut so the normal `fut` on `PATH` matches the daemon first.
+
 Read IDs from JSON responses. Creation commands put the new resource IDs under
 `.result.selected`; agent commands use `.result.agent` or `.result.agents`.
 Pass those IDs explicitly to every later command. Check the exit status, parse

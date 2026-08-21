@@ -26,7 +26,9 @@ pi install -l /absolute/path/to/fut
 ```
 
 The root `package.json` registers `integrations/pi/fut.ts` as the package's Pi
-extension. Restart Pi after installing it.
+extension and the bundled Fut skill. Restart Pi after installing it. The skill
+teaches Pi to inspect and control Fut resources without changing visual focus,
+including reading another agent pane's lifecycle state and terminal output.
 
 The adapter is inert unless both `FUT_SOCKET` and `FUT_TERMINAL_ID` are present,
 as they are for Pi started inside Fut. The `fut` binary must be on `PATH` and
