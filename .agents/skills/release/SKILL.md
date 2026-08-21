@@ -15,6 +15,6 @@ Keep this mechanical and brief.
 mise run release
 ```
 
-Do not manually repeat the release script's work. It runs checks, updates the Cargo version, commits it, tags the release, and atomically pushes `main` and the tag. GitHub then builds the macOS binaries, publishes the release, and updates Homebrew.
+Do not manually repeat the release script's work. It runs checks, updates the Cargo version, commits it, tags the release, atomically pushes `main` and the tag, then waits for GitHub to build the binaries, publish the release, and update Homebrew. The command succeeds only after the complete workflow succeeds.
 
 Report the released version and the GitHub Actions URL printed by the command. If the command fails, report the error and stop; do not improvise a partial release.

@@ -8,6 +8,9 @@ die() {
   exit 1
 }
 
+command -v gh >/dev/null || die "GitHub CLI (gh) is required to monitor the release"
+gh auth status >/dev/null 2>&1 || die "GitHub CLI is not authenticated"
+
 [[ "$(git branch --show-current)" == "main" ]] || die "run this from main"
 [[ -z "$(git status --porcelain)" ]] || die "working tree is not clean"
 
@@ -42,7 +45,7 @@ perl -0pi -e "s/^version: \x22[^\x22]+\x22/version: \x22$version\x22/m" docs/_co
 echo "Releasing $version"
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets --all-features
+RUST_TEST_THREADS=1 cargo test --all-targets --all-features
 
 if ! git diff --quiet -- Cargo.toml Cargo.lock docs/_config.yml; then
   git add Cargo.toml Cargo.lock docs/_config.yml
@@ -59,4 +62,23 @@ if ! git push --atomic origin main "$version"; then
   die "push failed; no remote release was created"
 fi
 
-echo "Release $version is running at https://github.com/mikker/fut/actions"
+release_sha="$(git rev-parse HEAD)"
+run_id=""
+for _ in {1..30}; do
+  run_id="$(gh run list \
+    --repo mikker/fut \
+    --workflow release.yml \
+    --branch "$version" \
+    --event push \
+    --limit 5 \
+    --json databaseId,headSha \
+    --jq "map(select(.headSha == \"$release_sha\"))[0].databaseId // empty")"
+  [[ -z "$run_id" ]] || break
+  sleep 2
+done
+[[ -n "$run_id" ]] || die "GitHub Actions did not start for $version"
+
+run_url="https://github.com/mikker/fut/actions/runs/$run_id"
+echo "Release $version is running at $run_url"
+gh run watch "$run_id" --repo mikker/fut --exit-status || die "release workflow failed: $run_url"
+echo "Released $version and updated mikker/homebrew-tap"
