@@ -40,10 +40,10 @@ fut project ls
 ```
 
 The daemon loads the catalog at startup. Restart it after changing a project
-path or `recipe`; client-only `Ctrl-b Shift-R` reload does not change daemon
-project configuration. Repository recipe approvals are checked separately each
-time Fut boots a project session, so approving or revoking one does not require
-a daemon restart.
+path or `recipe`; `Ctrl-b Shift-R` reloads the active recipe's extension table,
+but does not change the daemon's project catalog. Repository recipe approvals
+are checked separately each time Fut boots or reloads a project session, so
+approving or revoking one does not require a daemon restart.
 
 ## Trusted recipes
 
@@ -73,9 +73,10 @@ This command works without a running daemon. It resolves the configured
 project, reads a canonical regular recipe file, and fully validates the recipe
 before recording machine-local approval for its exact bytes. Changing any byte
 makes the recipe untrusted again. Run `fut project untrust fut` to revoke
-approval. The next attempt to bootstrap the project session will fail before
-running recipe commands. Existing live sessions and their new workspaces are
-unaffected because Fut never rereads their recipes.
+approval. The next attempt to bootstrap or reload the project session will fail
+before running recipe commands. Existing live layouts and processes are not
+reconciled on reload; only the extension configuration captured by the session
+is replaced.
 
 Approval state is managed exclusively by Fut under
 `$XDG_STATE_HOME/fut/trusted-recipes.toml`, falling back to

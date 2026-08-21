@@ -21,7 +21,7 @@ use crate::{
 /// Protocol version used by released Fut 0.1 builds.
 pub const PROTOCOL_VERSION_0_1: u16 = 0;
 /// Current clients and daemons require an exact protocol match.
-pub const PROTOCOL_VERSION: u16 = 30;
+pub const PROTOCOL_VERSION: u16 = 31;
 /// Enough for 50,000 individually styled MessagePack-encoded cells while
 /// remaining a firm pre-allocation bound for the length-delimited transport.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
@@ -472,6 +472,9 @@ pub enum ClientMessage {
     CommitExtensionReload {
         base_generation: u64,
     },
+    ReloadProjectConfig {
+        session_id: SessionId,
+    },
     /// Compatibility control operation. Interactive clients use the staged
     /// prepare/commit flow so local UI validation happens before visibility.
     ReloadExtensions,
@@ -521,6 +524,10 @@ pub enum ServerMessage {
         resource_revision: u64,
     },
     TokenPublished {
+        resource_revision: u64,
+        changed: bool,
+    },
+    ProjectConfigReloaded {
         resource_revision: u64,
         changed: bool,
     },
@@ -705,6 +712,7 @@ mod tests {
 
     #[test]
     fn extension_reload_transaction_and_complete_catalog_round_trip() {
+        let session_id = SessionId::new();
         let catalog = ExtensionCatalog {
             generation: 8,
             fingerprint: "abcdef0123456789".repeat(4),
@@ -772,6 +780,10 @@ mod tests {
             ServerMessage::ExtensionCatalog {
                 catalog: catalog.clone(),
             },
+            ServerMessage::ProjectConfigReloaded {
+                resource_revision: 42,
+                changed: true,
+            },
         ] {
             assert_eq!(
                 decode_payload::<ServerMessage>(&encode_payload(&message).unwrap()).unwrap(),
@@ -781,6 +793,7 @@ mod tests {
         for message in [
             ClientMessage::PrepareExtensionReload,
             ClientMessage::CommitExtensionReload { base_generation: 7 },
+            ClientMessage::ReloadProjectConfig { session_id },
             ClientMessage::GetExtensionCatalog,
         ] {
             assert_eq!(
@@ -1440,7 +1453,7 @@ mod tests {
             switched
         );
         assert_eq!(PROTOCOL_VERSION_0_1, 0);
-        assert_eq!(PROTOCOL_VERSION, 30);
+        assert_eq!(PROTOCOL_VERSION, 31);
 
         let watch = ClientMessage::WatchResources;
         assert_eq!(

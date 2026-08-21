@@ -53,7 +53,7 @@ The configuration name is the key to override under `[ui.bindings]`.
 | Key | Action | Configuration name |
 | --- | --- | --- |
 | `:` | Search every command and configured extension action | `open_command_bar` |
-| `R` | Reload configuration | `reload_config` |
+| `R` | Reload global and focused-project configuration | `reload_config` |
 | `[` | Enter copy mode | `enter_copy_mode` |
 | `s` | Search sessions, workspaces, tabs, and panes | `open_navigator` |
 | `a` | Search agents and see their live status | `open_agents` |

@@ -494,7 +494,7 @@ mod tests {
         bar.key(key(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(
             bar.key(key(KeyCode::Enter, KeyModifiers::NONE)),
-            CommandBarAction::Dispatch(ClientAction::OpenNavigator)
+            CommandBarAction::Dispatch(ClientAction::ReloadProjectConfig)
         );
         bar.key(key(KeyCode::End, KeyModifiers::NONE));
         assert_eq!(bar.selected_action(), Some(ClientAction::Detach));

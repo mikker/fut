@@ -735,6 +735,27 @@ impl ResourceTree {
             .ok_or(ResourceError::NotFound("workspace"))
     }
 
+    pub fn session_project_context(
+        &self,
+        session_id: SessionId,
+    ) -> Result<(Project, PathBuf), ResourceError> {
+        let session = self
+            .sessions
+            .get(&session_id)
+            .ok_or(ResourceError::NotFound("session"))?;
+        if self.session_is_closing(session_id) {
+            return Err(ResourceError::Closing("session"));
+        }
+        let workspace_id = session
+            .workspaces
+            .first()
+            .ok_or_else(|| ResourceError::Invariant("session has no workspace".into()))?;
+        Ok((
+            session.project.clone(),
+            self.workspaces[workspace_id].root.clone(),
+        ))
+    }
+
     pub fn session_id_for_workspace(
         &self,
         workspace_id: WorkspaceId,
@@ -1155,6 +1176,26 @@ impl ResourceTree {
         tab.automatic_name.clear();
         self.revision += 1;
         Ok(self.revision)
+    }
+
+    pub fn reload_project_config(
+        &mut self,
+        session_id: SessionId,
+        config: Option<TrustedProjectConfig>,
+    ) -> Result<(u64, bool), ResourceError> {
+        if self.session_is_closing(session_id) {
+            return Err(ResourceError::Closing("session"));
+        }
+        let session = self
+            .sessions
+            .get_mut(&session_id)
+            .ok_or(ResourceError::NotFound("session"))?;
+        if session.trusted_project_config == config {
+            return Ok((self.revision, false));
+        }
+        session.trusted_project_config = config;
+        self.revision += 1;
+        Ok((self.revision, true))
     }
 
     pub fn report_agent_with_metadata(
@@ -2617,6 +2658,41 @@ mod tests {
             pane_id: PaneId::new(),
             terminal_id: TerminalId::new(),
         }
+    }
+
+    #[test]
+    fn project_config_reload_is_revisioned_and_exact_no_ops_are_silent() {
+        let mut tree = ResourceTree::default();
+        let path = initial("project-config", "/project-config");
+        let session_id = path.session_id;
+        tree.create_session(path).unwrap();
+        let before = tree.revision();
+        let config = TrustedProjectConfig {
+            source: "/project-config/.fut/project.toml".into(),
+            extension: BTreeMap::from([(
+                "wt".into(),
+                serde_json::json!({ "command": ["pi"] })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )]),
+        };
+
+        let (revision, changed) = tree
+            .reload_project_config(session_id, Some(config.clone()))
+            .unwrap();
+        assert!(changed);
+        assert_eq!(revision, before + 1);
+        assert_eq!(
+            tree.snapshot().sessions[0].trusted_project_config,
+            Some(config.clone())
+        );
+
+        let (unchanged_revision, changed) = tree
+            .reload_project_config(session_id, Some(config))
+            .unwrap();
+        assert!(!changed);
+        assert_eq!(unchanged_revision, revision);
     }
 
     #[test]

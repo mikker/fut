@@ -143,6 +143,33 @@ enum ExtensionReloadState {
     },
 }
 
+struct ProjectConfigReloadState {
+    request_id: Uuid,
+    kind: ProjectConfigReloadKind,
+}
+
+#[derive(Clone, Copy)]
+enum ProjectConfigReloadKind {
+    Configuration,
+    ProjectOnly,
+}
+
+impl ProjectConfigReloadKind {
+    fn success_message(self) -> &'static str {
+        match self {
+            Self::Configuration => "config reloaded",
+            Self::ProjectOnly => "project config reloaded",
+        }
+    }
+
+    fn error_message(self) -> &'static str {
+        match self {
+            Self::Configuration => "project config reload failed after global config reloaded",
+            Self::ProjectOnly => "project config reload failed",
+        }
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum PaneMouseAction {
     Input {
@@ -552,6 +579,7 @@ async fn run_loop(
     let mut kitty_graphics = graphics::Renderer::new();
     let mut perf = perf::PerfLog::from_env();
     let mut extension_reload: Option<ExtensionReloadState> = None;
+    let mut project_config_reload: Option<ProjectConfigReloadState> = None;
     let mut redraw = time::interval(Duration::from_millis(16));
     redraw.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut spinner = time::interval(Duration::from_millis(100));
@@ -822,7 +850,19 @@ async fn run_loop(
                             client_hooks,
                         ).await?;
                         extension_generation = catalog.generation;
-                        toasts.info("config reloaded");
+                        let request_id = Uuid::new_v4();
+                        send_request(
+                            framed,
+                            Some(request_id),
+                            ClientMessage::ReloadProjectConfig {
+                                session_id: view.focused().session_id,
+                            },
+                        )
+                        .await?;
+                        project_config_reload = Some(ProjectConfigReloadState {
+                            request_id,
+                            kind: ProjectConfigReloadKind::Configuration,
+                        });
                         force_draw = true;
                     }
                     ServerMessage::ExtensionCatalogChanged { catalog } => {
@@ -1102,6 +1142,16 @@ async fn run_loop(
                         // Pane movement is currently a control-plane operation.
                         bail!("unexpected pane movement response")
                     }
+                    ServerMessage::ProjectConfigReloaded { .. } => {
+                        let Some(reload) = project_config_reload.take() else {
+                            bail!("unexpected project configuration reload response");
+                        };
+                        if request_id != Some(reload.request_id) {
+                            bail!("project configuration reload used an unexpected request ID");
+                        }
+                        toasts.info(reload.kind.success_message());
+                        force_draw = true;
+                    }
                     ServerMessage::TargetRenamed { resource_revision } => {
                         if rename
                             .as_mut()
@@ -1153,6 +1203,16 @@ async fn run_loop(
                         if reload_failed {
                             extension_reload = None;
                             toasts.error(format!("config reload failed · {message}"));
+                            force_draw = true;
+                            continue;
+                        }
+                        let project_reload_failed = project_config_reload
+                            .as_ref()
+                            .is_some_and(|reload| request_id == Some(reload.request_id));
+                        if project_reload_failed {
+                            let reload = project_config_reload.take().expect("checked reload");
+                            let prefix = reload.kind.error_message();
+                            toasts.error(format!("{prefix} · {message}"));
                             force_draw = true;
                             continue;
                         }
@@ -1866,6 +1926,7 @@ async fn run_loop(
                                     &background_results,
                                     config_location,
                                     &mut extension_reload,
+                                    &mut project_config_reload,
                                 ).await?);
                                 force_draw = true;
                             }
@@ -2400,6 +2461,7 @@ async fn run_loop(
                                     &background_results,
                                     config_location,
                                     &mut extension_reload,
+                                    &mut project_config_reload,
                                 ).await?);
                                 force_draw = true;
                             }
@@ -3556,6 +3618,7 @@ async fn dispatch_client_action(
     background_results: &mpsc::UnboundedSender<BackgroundCommandResult>,
     config_location: &config::ConfigLocation,
     extension_reload: &mut Option<ExtensionReloadState>,
+    project_config_reload: &mut Option<ProjectConfigReloadState>,
 ) -> anyhow::Result<Option<Toast>> {
     match action {
         ClientAction::RunCommand(index) => {
@@ -3660,7 +3723,7 @@ async fn dispatch_client_action(
             ));
         }
         ClientAction::ReloadConfig => {
-            if extension_reload.is_some() {
+            if extension_reload.is_some() || project_config_reload.is_some() {
                 return Ok(Some(Toast::info("config reload already in progress")));
             }
             let staged = match stage_ui_config(config_location) {
@@ -3681,6 +3744,25 @@ async fn dispatch_client_action(
             .await?;
             *extension_reload = Some(ExtensionReloadState::Preparing { request_id, staged });
             return Ok(Some(Toast::info("validating config reload")));
+        }
+        ClientAction::ReloadProjectConfig => {
+            if extension_reload.is_some() || project_config_reload.is_some() {
+                return Ok(Some(Toast::info("config reload already in progress")));
+            }
+            let request_id = Uuid::new_v4();
+            send_request(
+                framed,
+                Some(request_id),
+                ClientMessage::ReloadProjectConfig {
+                    session_id: view.focused().session_id,
+                },
+            )
+            .await?;
+            *project_config_reload = Some(ProjectConfigReloadState {
+                request_id,
+                kind: ProjectConfigReloadKind::ProjectOnly,
+            });
+            return Ok(Some(Toast::info("validating project config reload")));
         }
         ClientAction::EnterCopyMode => {
             if copy_mode.is_none() {

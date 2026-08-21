@@ -788,6 +788,39 @@ async fn reload_extensions(shared: &Shared) -> Result<ExtensionReload, DaemonErr
         .commit_extension_candidate(prepared, base_generation)
 }
 
+async fn respond_to_project_config_reload(
+    connection: &mut ClientConnection,
+    shared: &Shared,
+    request_id: Option<Uuid>,
+    session_id: SessionId,
+    synchronize_snapshot: bool,
+) -> Result<()> {
+    match recipe::reload_project_config(shared, session_id).await {
+        Ok((resource_revision, changed)) => {
+            if changed && synchronize_snapshot {
+                let snapshot = shared.lock().await.resources.snapshot();
+                send(
+                    connection,
+                    None,
+                    ServerMessage::ResourcesChanged { snapshot },
+                )
+                .await?;
+            }
+            send(
+                connection,
+                request_id,
+                ServerMessage::ProjectConfigReloaded {
+                    resource_revision,
+                    changed,
+                },
+            )
+            .await?
+        }
+        Err(error) => send_error(connection, request_id, error.code, &error.message).await?,
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum CloseScope {
     Session(SessionId),
@@ -2543,6 +2576,15 @@ async fn handle_connection(
                             ).await?,
                         }
                     }
+                    ClientMessage::ReloadProjectConfig { session_id } => {
+                        respond_to_project_config_reload(
+                            &mut connection,
+                            &shared,
+                            envelope.request_id,
+                            session_id,
+                            true,
+                        ).await?;
+                    }
                     ClientMessage::Input { bytes } => {
                         if attachment.copy_mode_active() {
                             send_error(
@@ -3401,6 +3443,15 @@ async fn control_loop(
                             .await?;
                     }
                 }
+            }
+            ClientMessage::ReloadProjectConfig { session_id } => {
+                respond_to_project_config_reload(
+                    connection,
+                    &shared,
+                    envelope.request_id,
+                    session_id,
+                    false,
+                ).await?;
             }
             ClientMessage::ReloadExtensions => match reload_extensions(&shared).await {
                 Ok(reloaded) => {

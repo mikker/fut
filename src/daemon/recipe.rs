@@ -371,6 +371,50 @@ fn load_project_recipe(
     )
 }
 
+pub(super) async fn reload_project_config(
+    shared: &Shared,
+    session_id: SessionId,
+) -> Result<(u64, bool), DaemonError> {
+    let (catalog, extensions, project, workspace_root) = {
+        let state = shared.lock().await;
+        let (project, workspace_root) = state.resources.session_project_context(session_id)?;
+        (
+            state.projects.clone(),
+            Arc::clone(&state.extension_registry),
+            project,
+            workspace_root,
+        )
+    };
+    let resolved = ProjectResolver::default().resolve(&workspace_root).await?;
+    if resolved.project != project {
+        return Err(DaemonError::new(
+            "project_mismatch",
+            "the live session no longer matches its configured project",
+        ));
+    }
+    let configured = configured_project(&catalog, None, &resolved).await?;
+    let config = load_project_recipe(configured.as_ref(), extensions.extensions())?.and_then(
+        |LoadedRecipe {
+             source,
+             digest,
+             recipe,
+         }| {
+            tracing::debug!(path = %source.display(), %digest, "reloaded trusted project recipe");
+            (!recipe.extension().is_empty()).then(|| TrustedProjectConfig {
+                source,
+                extension: recipe.extension().clone(),
+            })
+        },
+    );
+
+    let mut state = shared.lock().await;
+    let (revision, changed) = state.resources.reload_project_config(session_id, config)?;
+    if changed {
+        state.publish_resource_change(revision);
+    }
+    Ok((revision, changed))
+}
+
 async fn prepare_recipe(
     loaded: LoadedRecipe,
     workspace_root: &Path,

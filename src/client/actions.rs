@@ -86,6 +86,7 @@ pub(super) enum ClientAction {
     RunCommand(usize),
     OpenCommandBar,
     ReloadConfig,
+    ReloadProjectConfig,
     EnterCopyMode,
     OpenNavigator,
     OpenAgents,
@@ -131,9 +132,10 @@ pub(super) struct DirectBinding {
     pub action: ClientAction,
 }
 
-pub(super) const ALL_ACTIONS: [ClientAction; 47] = [
+pub(super) const ALL_ACTIONS: [ClientAction; 48] = [
     ClientAction::OpenCommandBar,
     ClientAction::ReloadConfig,
+    ClientAction::ReloadProjectConfig,
     ClientAction::EnterCopyMode,
     ClientAction::OpenNavigator,
     ClientAction::OpenAgents,
@@ -181,11 +183,16 @@ pub(super) const ALL_ACTIONS: [ClientAction; 47] = [
     ClientAction::Detach,
 ];
 
-pub(super) const COMMANDS: [ActionDefinition; 46] = [
+pub(super) const COMMANDS: [ActionDefinition; 47] = [
     ActionDefinition {
         action: ClientAction::ReloadConfig,
         title: "Reload configuration",
         keywords: "reload config configuration refresh settings",
+    },
+    ActionDefinition {
+        action: ClientAction::ReloadProjectConfig,
+        title: "Reload project extension configuration",
+        keywords: "reload refresh project config configuration recipe project.toml",
     },
     ActionDefinition {
         action: ClientAction::OpenNavigator,
@@ -598,6 +605,7 @@ pub(super) const fn command_name(action: ClientAction) -> &'static str {
         ClientAction::RunCommand(_) => "run-command",
         ClientAction::OpenCommandBar => "command-palette",
         ClientAction::ReloadConfig => "reload-config",
+        ClientAction::ReloadProjectConfig => "reload-project-config",
         ClientAction::EnterCopyMode => "copy-mode",
         ClientAction::OpenNavigator => "choose-tree",
         ClientAction::OpenAgents => "choose-agent",
@@ -651,6 +659,7 @@ pub(super) fn config_key(action: ClientAction) -> &'static str {
         ClientAction::RunCommand(_) => panic!("configured commands do not have built-in keys"),
         ClientAction::OpenCommandBar => "open_command_bar",
         ClientAction::ReloadConfig => "reload_config",
+        ClientAction::ReloadProjectConfig => "reload_project_config",
         ClientAction::EnterCopyMode => "enter_copy_mode",
         ClientAction::OpenNavigator => "open_navigator",
         ClientAction::OpenAgents => "open_agents",
@@ -749,6 +758,7 @@ const fn requires_launcher(action: ClientAction) -> bool {
         ClientAction::RunCommand(_) => true,
         ClientAction::OpenCommandBar => false,
         ClientAction::ReloadConfig
+        | ClientAction::ReloadProjectConfig
         | ClientAction::EnterCopyMode
         | ClientAction::OpenNavigator
         | ClientAction::OpenAgents

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Configuration reloads now refresh the focused project's extension settings, with a separate command-palette action for project-only reloads.
+
 ## 0.12
 
 - Avoided rejecting project opens when Git starts slowly on a busy or freshly provisioned machine.
