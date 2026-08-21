@@ -19,7 +19,7 @@ use tokio::{
 
 use crate::resources::{Project, ProjectIdentity};
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTPUT_LIMIT: usize = 64 * 1024;
 const GIT_ENVIRONMENT: &[&str] = &[
     "GIT_DIR",

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Avoided rejecting project opens when Git starts slowly on a busy or freshly provisioned machine.
+
 ## 0.10
 
 - Interactive command popups now support mouse scrolling, application mouse input, and drag-to-copy text selection, with Shift-drag forcing selection.
