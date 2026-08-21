@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.12
+
 - Avoided rejecting project opens when Git starts slowly on a busy or freshly provisioned machine.
 
 ## 0.10
