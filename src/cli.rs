@@ -42,9 +42,9 @@ use crate::{
         run_daemon,
     },
     domain::{
-        AgentActivity, AgentReport, AgentReportMetadata, AgentState, MAX_TERMINAL_OUTPUT_ROWS,
-        PaneId, SessionId, TabId, TerminalId, TerminalOutput, TerminalOutputMatcher,
-        TerminalOutputSource, WorkspaceId,
+        AgentActivity, AgentReport, AgentReportMetadata, AgentState, AttentionKind,
+        MAX_TERMINAL_OUTPUT_ROWS, PaneId, SessionId, TabId, TerminalId, TerminalOutput,
+        TerminalOutputMatcher, TerminalOutputSource, WorkspaceId,
     },
     protocol::{
         AcknowledgedCommand, AgentPromptMode, ClientMessage, ClientMode, ContextScope,
@@ -54,8 +54,8 @@ use crate::{
         encode_payload,
     },
     resources::{
-        PanePathRef, PresentationTokenTarget, ResourceSnapshot, SessionSelector, TabSnapshot,
-        TargetSelector,
+        PanePathRef, PaneSnapshot, PresentationTokenTarget, ResourceSnapshot, SessionSelector,
+        TabSnapshot, TargetSelector,
     },
     splits::{SplitAxis, SplitDirection, SplitTree},
 };
@@ -208,7 +208,11 @@ enum Command {
     },
     /// List resources from the existing daemon.
     #[command(alias = "ls")]
-    List,
+    List {
+        /// Include resource IDs, roots, terminals, and the snapshot revision.
+        #[arg(short, long)]
+        verbose: bool,
+    },
     /// Stream resource changes from the existing daemon as JSON lines.
     ///
     /// The first line is the current state; every later line is the complete
@@ -1798,12 +1802,19 @@ async fn execute(cli: Cli) -> Result<()> {
                 render_discovered_target(snapshot.revision, &target),
             )
         }
-        Some(Command::List) => {
+        Some(Command::List { verbose }) => {
             let snapshot = list_resources(&socket).await?;
             if cli.json {
                 output(true, "list", &snapshot, String::new())
             } else {
-                print_resources(&snapshot);
+                println!(
+                    "{}",
+                    if verbose {
+                        render_verbose_resources(&snapshot)
+                    } else {
+                        render_resource_tree(&snapshot)
+                    }
+                );
                 Ok(())
             }
         }
@@ -3681,40 +3692,140 @@ fn render_layout(layout: &SplitTree) -> String {
     }
 }
 
-fn print_resources(snapshot: &ResourceSnapshot) {
-    println!("revision={}", snapshot.revision);
+fn render_resource_tree(snapshot: &ResourceSnapshot) -> String {
+    if snapshot.sessions.is_empty() {
+        return "No resources".into();
+    }
+
+    let mut lines = Vec::new();
     for session in &snapshot.sessions {
-        println!(
-            "session {} {:?}{}",
-            session.id,
-            session.name,
-            if session.closing { " closing" } else { "" }
-        );
+        lines.push(resource_line(
+            0,
+            &session.name,
+            session.closing,
+            session
+                .workspaces
+                .iter()
+                .flat_map(|workspace| &workspace.tabs)
+                .flat_map(|tab| &tab.panes),
+        ));
         for workspace in &session.workspaces {
-            println!(
-                "  workspace {} {:?} {}",
-                workspace.id,
-                workspace.name,
-                workspace.root.display()
-            );
-            for tab in &workspace.tabs {
-                println!(
-                    "    tab {} {:?}{}",
-                    tab.id,
-                    tab.name,
-                    if tab.closing { " closing" } else { "" }
-                );
-                for pane in &tab.panes {
-                    println!(
-                        "      pane {} terminal={}{}",
-                        pane.id,
-                        pane.terminal_id,
-                        if pane.closing { " closing" } else { "" }
-                    );
+            let workspace_closing = session.closing || workspace.closing;
+            lines.push(resource_line(
+                1,
+                &workspace.name,
+                workspace_closing,
+                workspace.tabs.iter().flat_map(|tab| &tab.panes),
+            ));
+            for (tab_index, tab) in workspace.tabs.iter().enumerate() {
+                let label = if tab.name.is_empty() {
+                    format!("tab {}", tab_index + 1)
+                } else {
+                    tab.name.clone()
+                };
+                let single_pane = match tab.panes.as_slice() {
+                    [pane] => Some(pane),
+                    _ => None,
+                };
+                let label = if single_pane.is_some() {
+                    format!("{label} · pane")
+                } else {
+                    label
+                };
+                let tab_closing = workspace_closing
+                    || tab.closing
+                    || single_pane.is_some_and(|pane| pane.closing);
+                lines.push(resource_line(2, &label, tab_closing, &tab.panes));
+                if single_pane.is_none() {
+                    for (pane_index, pane) in tab.panes.iter().enumerate() {
+                        lines.push(resource_line(
+                            3,
+                            &format!("pane {}", pane_index + 1),
+                            tab_closing || pane.closing,
+                            std::iter::once(pane),
+                        ));
+                    }
                 }
             }
         }
     }
+    lines.join("\n")
+}
+
+fn resource_line<'a>(
+    depth: usize,
+    label: &str,
+    closing: bool,
+    panes: impl IntoIterator<Item = &'a PaneSnapshot>,
+) -> String {
+    let marker = if closing {
+        "×"
+    } else {
+        activity_marker(panes)
+    };
+    format!("{}{marker} {label}", "  ".repeat(depth))
+}
+
+fn activity_marker<'a>(panes: impl IntoIterator<Item = &'a PaneSnapshot>) -> &'static str {
+    let mut blocked = false;
+    let mut completed = false;
+    let mut working = false;
+    for pane in panes {
+        let attention = pane
+            .activity
+            .attention()
+            .filter(|_| pane.activity.has_unread_attention());
+        blocked |= pane.activity.state == AgentState::Blocked
+            || attention.is_some_and(|attention| attention.kind == AttentionKind::Blocked);
+        completed |= attention.is_some_and(|attention| attention.kind == AttentionKind::Completed);
+        working |= pane.activity.state == AgentState::Working;
+    }
+    if blocked {
+        "!"
+    } else if completed {
+        "•"
+    } else if working {
+        "⠋"
+    } else {
+        " "
+    }
+}
+
+fn render_verbose_resources(snapshot: &ResourceSnapshot) -> String {
+    let mut lines = vec![format!("revision={}", snapshot.revision)];
+    for session in &snapshot.sessions {
+        lines.push(format!(
+            "session {} {:?}{}",
+            session.id,
+            session.name,
+            if session.closing { " closing" } else { "" }
+        ));
+        for workspace in &session.workspaces {
+            lines.push(format!(
+                "  workspace {} {:?} {}",
+                workspace.id,
+                workspace.name,
+                workspace.root.display()
+            ));
+            for tab in &workspace.tabs {
+                lines.push(format!(
+                    "    tab {} {:?}{}",
+                    tab.id,
+                    tab.name,
+                    if tab.closing { " closing" } else { "" }
+                ));
+                for pane in &tab.panes {
+                    lines.push(format!(
+                        "      pane {} terminal={}{}",
+                        pane.id,
+                        pane.terminal_id,
+                        if pane.closing { " closing" } else { "" }
+                    ));
+                }
+            }
+        }
+    }
+    lines.join("\n")
 }
 
 async fn send(
@@ -4501,6 +4612,35 @@ mod tests {
         assert!(lines[3].starts_with(&format!("  pane {second} terminal=")));
 
         assert_eq!(render_tabs(3, &[]), "revision=3");
+    }
+
+    #[test]
+    fn resource_listing_matches_the_navigator_tree_and_verbose_keeps_ids() {
+        let snapshot = agent_fixture();
+
+        assert_eq!(
+            render_resource_tree(&snapshot),
+            "! session\n  ! workspace\n    ! tab · pane"
+        );
+
+        let verbose = render_verbose_resources(&snapshot);
+        assert!(verbose.starts_with("revision=42\nsession 11111111-1111-1111-1111-111111111111"));
+        assert!(verbose.contains("terminal=55555555-5555-5555-5555-555555555555"));
+        assert_eq!(
+            render_resource_tree(&ResourceSnapshot {
+                revision: 43,
+                sessions: Vec::new(),
+            }),
+            "No resources"
+        );
+    }
+
+    #[test]
+    fn resource_listing_accepts_verbose_after_list_or_ls() {
+        for command in ["list", "ls"] {
+            let cli = try_parse_cli_from(["fut", command, "-v"]).unwrap();
+            assert!(matches!(cli.command, Some(Command::List { verbose: true })));
+        }
     }
 
     #[test]

@@ -1905,7 +1905,11 @@ async fn current_location_open_recovers_from_last_terminal_exit_race() {
         open.send(b"\x02d");
         open.wait_success().await;
 
-        let output = harness.cli().arg("list").output().expect("run public list");
+        let output = harness
+            .cli()
+            .args(["list", "--verbose"])
+            .output()
+            .expect("run public list");
         assert!(
             output.status.success(),
             "iteration {iteration}: {}",
@@ -1970,9 +1974,16 @@ async fn public_cli_lists_creates_and_closes_resources() {
     let listed = harness.cli().arg("list").output().unwrap();
     assert!(listed.status.success());
     let listed = String::from_utf8(listed.stdout).unwrap();
-    assert!(listed.contains(workspace));
-    assert!(listed.contains(cwd.to_str().unwrap()));
-    assert!(listed.contains("session "));
+    assert!(listed.contains("second"));
+    assert!(!listed.contains(workspace));
+    assert!(!listed.contains("revision="));
+
+    let verbose = harness.cli().args(["list", "--verbose"]).output().unwrap();
+    assert!(verbose.status.success());
+    let verbose = String::from_utf8(verbose.stdout).unwrap();
+    assert!(verbose.contains(workspace));
+    assert!(verbose.contains(cwd.to_str().unwrap()));
+    assert!(verbose.contains("session "));
 
     let tabs = harness
         .cli()

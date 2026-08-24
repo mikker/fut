@@ -141,6 +141,7 @@ fut tab new --name tests -- mise run test
 fut pane split right --cwd ../api -- zsh
 fut pane move PANE_ID DESTINATION_TAB_ID
 fut list
+fut list --verbose
 fut events
 fut extension list
 fut extension show EXTENSION_ID
