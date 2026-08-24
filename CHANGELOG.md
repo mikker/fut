@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Extensions can now detect other active extensions and their versions through `FUT_EXTENSIONS`.
 - `fut list` now shows the navigator's concise resource tree, with `-v`/`--verbose` retaining the detailed machine-oriented view.
 - The Pi package now teaches Pi to inspect and control Fut resources, including other agent panes.
 - Configuration reloads now refresh the focused project's extension settings, with a separate command-palette action for project-only reloads.

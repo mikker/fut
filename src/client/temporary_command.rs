@@ -43,6 +43,7 @@ pub(super) struct ExtensionCommandContext {
     focused: SelectedTarget,
     workspace_root: PathBuf,
     config: ResolvedExtensionConfig,
+    active_extensions: String,
 }
 
 impl ExtensionCommandContext {
@@ -61,6 +62,7 @@ impl ExtensionCommandContext {
             focused: focused.clone(),
             workspace_root: workspace_root.to_owned(),
             config: resolve_extension_config(ui, &extension.id, workspace_root, project)?,
+            active_extensions: crate::extensions::active_extensions_json(&ui.extensions),
         })
     }
 
@@ -106,6 +108,7 @@ impl ExtensionCommandContext {
                 project_source: None,
                 workspace_source: None,
             },
+            active_extensions: "{}".into(),
         }
     }
 }
@@ -796,6 +799,7 @@ fn add_extension_environment(
         "FUT_BIN".into(),
         std::env::current_exe()?.display().to_string(),
     );
+    environment.insert("FUT_EXTENSIONS".into(), context.active_extensions.clone());
     environment.insert("FUT_EXTENSION_COMMAND".into(), extension.command.clone());
     environment.insert("FUT_EXTENSION_ID".into(), extension.id.clone());
     environment.insert(
@@ -1085,6 +1089,7 @@ mod tests {
                 project_source: None,
                 workspace_source: None,
             },
+            active_extensions: "{}".into(),
         };
         assert_eq!(
             context
@@ -1383,7 +1388,7 @@ mod tests {
             "/bin/sh",
             &[
                 "-c",
-                "printf '%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s' \"$FUT_EXTENSION_ID\" \"$FUT_EXTENSION_COMMAND\" \"$FUT_EXTENSION_ROOT\" \"$FUT_SOCKET\" \"$FUT_BIN\" \"$FUT_SESSION_ID\" \"$FUT_WORKSPACE_ID\" \"$FUT_TAB_ID\" \"$FUT_PANE_ID\" \"$FUT_TERMINAL_ID\" \"$FUT_EXTENSION_CONFIG\" \"$FUT_EXTENSION_CONFIG_GLOBAL_PATH\" \"$FUT_EXTENSION_CONFIG_WORKSPACE_PATH\" \"$PWD\" > \"$1\"",
+                "printf '%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n%s' \"$FUT_EXTENSION_ID\" \"$FUT_EXTENSION_COMMAND\" \"$FUT_EXTENSION_ROOT\" \"$FUT_SOCKET\" \"$FUT_BIN\" \"$FUT_EXTENSIONS\" \"$FUT_SESSION_ID\" \"$FUT_WORKSPACE_ID\" \"$FUT_TAB_ID\" \"$FUT_PANE_ID\" \"$FUT_TERMINAL_ID\" \"$FUT_EXTENSION_CONFIG\" \"$FUT_EXTENSION_CONFIG_GLOBAL_PATH\" \"$FUT_EXTENSION_CONFIG_WORKSPACE_PATH\" \"$PWD\" > \"$1\"",
                 "sh",
                 output.to_str().unwrap(),
             ],
@@ -1414,6 +1419,7 @@ mod tests {
                 project_source: None,
                 workspace_source: Some(workspace_config.clone()),
             },
+            active_extensions: r#"{"other":"2.0.0","test-extension":"1.0.0"}"#.into(),
         };
         let cwd = std::env::current_dir().unwrap();
         let mut surface = TemporaryCommandSurface::spawn(
@@ -1451,6 +1457,10 @@ mod tests {
         assert_eq!(
             values.next(),
             Some(std::env::current_exe().unwrap().to_str().unwrap())
+        );
+        assert_eq!(
+            values.next(),
+            Some(r#"{"other":"2.0.0","test-extension":"1.0.0"}"#)
         );
         let focused_ids = [
             focused.session_id.to_string(),
@@ -1562,6 +1572,7 @@ mod tests {
                 project_source: None,
                 workspace_source: None,
             },
+            active_extensions: "{}".into(),
         };
 
         let BackgroundCommandResult::Failed(message) =

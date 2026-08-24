@@ -288,6 +288,7 @@ Extension commands run from the focused workspace root and receive:
 | --- | --- |
 | `FUT_BIN` | Exact running Fut executable |
 | `FUT_SOCKET` | Current daemon socket |
+| `FUT_EXTENSIONS` | Compact JSON object mapping every active extension ID to its package SemVer version |
 | `FUT_EXTENSION_ID` | Manifest ID |
 | `FUT_EXTENSION_COMMAND` | Command declaration name |
 | `FUT_EXTENSION_ROOT` | Canonical extension directory |
@@ -423,7 +424,7 @@ The hook receives one versioned JSON object on stdin:
 ```
 
 Only rename events include `previous_name`. Hook processes inherit the daemon
-environment plus `FUT_BIN`, `FUT_SOCKET`, `FUT_EXTENSION_ID`,
+environment plus `FUT_BIN`, `FUT_SOCKET`, `FUT_EXTENSIONS`, `FUT_EXTENSION_ID`,
 `FUT_EXTENSION_ROOT`, `FUT_EVENT`, `FUT_EVENT_VERSION`, `FUT_SESSION_ID`, and
 `FUT_WORKSPACE_ID`. Resource hooks also receive `FUT_EXTENSION_CONFIG`,
 `FUT_EXTENSION_TRUSTED_CONFIG`, and their optional global/project/workspace
@@ -477,7 +478,7 @@ The hook receives one versioned JSON object on stdin:
 
 `previous_session` appears only for `client.session_changed`. Hook processes
 inherit the client environment plus `FUT_BIN`, `FUT_SOCKET`,
-`FUT_EXTENSION_ID`, `FUT_EXTENSION_ROOT`, `FUT_EVENT`, `FUT_EVENT_VERSION`,
+`FUT_EXTENSIONS`, `FUT_EXTENSION_ID`, `FUT_EXTENSION_ROOT`, `FUT_EVENT`, `FUT_EVENT_VERSION`,
 `FUT_SESSION_ID`, and `FUT_SESSION_NAME`.
 
 ## Presentation tokens

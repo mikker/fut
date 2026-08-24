@@ -44,6 +44,7 @@ use crate::{
 pub(crate) const MANIFEST_FILE_NAME: &str = "fut-extension.toml";
 const MANIFEST_API_VERSION: u64 = 1;
 const FUT_BIN: &str = "FUT_BIN";
+const FUT_EXTENSIONS: &str = "FUT_EXTENSIONS";
 const FUT_EXTENSION_ID: &str = "FUT_EXTENSION_ID";
 const FUT_EXTENSION_ROOT: &str = "FUT_EXTENSION_ROOT";
 const EVENT_VERSION: u8 = 1;
@@ -135,6 +136,14 @@ impl Extension {
             ),
         ]
     }
+}
+
+pub(crate) fn active_extensions_json(extensions: &[Extension]) -> String {
+    let versions = extensions
+        .iter()
+        .map(|extension| (extension.id(), extension.version().to_string()))
+        .collect::<BTreeMap<_, _>>();
+    serde_json::to_string(&versions).expect("extension IDs and versions are valid JSON strings")
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1266,6 +1275,7 @@ async fn run_client_event(
             return;
         }
     };
+    let active_extensions = active_extensions_json(extensions);
     for extension in extensions {
         let Some(command) = extension.hooks.get(event.kind) else {
             continue;
@@ -1282,6 +1292,7 @@ async fn run_client_event(
                 workspace_root: None,
                 session_name: Some(&event.session.name),
                 extension_config: None,
+                active_extensions: &active_extensions,
                 payload: &payload,
             },
         )
@@ -1297,6 +1308,7 @@ async fn run_event(registry: &ExtensionRegistry, fut_bin: &Path, socket: &Path, 
             return;
         }
     };
+    let active_extensions = active_extensions_json(registry.extensions());
     for extension in registry.extensions() {
         let Some(command) = extension.hooks.get(event.kind) else {
             continue;
@@ -1328,6 +1340,7 @@ async fn run_event(registry: &ExtensionRegistry, fut_bin: &Path, socket: &Path, 
                 workspace_root: Some(&event.workspace_root),
                 session_name: None,
                 extension_config: Some(&resolved_config.config),
+                active_extensions: &active_extensions,
                 payload: &payload,
             },
         )
@@ -1342,6 +1355,7 @@ struct HookInvocation<'a> {
     workspace_root: Option<&'a Path>,
     session_name: Option<&'a str>,
     extension_config: Option<&'a ResolvedExtensionConfig>,
+    active_extensions: &'a str,
     payload: &'a [u8],
 }
 
@@ -1359,6 +1373,7 @@ async fn run_command(
         .current_dir(&extension.root)
         .envs(extension.command_environment())
         .env(FUT_BIN, fut_bin)
+        .env(FUT_EXTENSIONS, invocation.active_extensions)
         .env("FUT_EVENT", event)
         .env("FUT_EVENT_VERSION", EVENT_VERSION.to_string())
         .env("FUT_SOCKET", socket)
@@ -2578,6 +2593,10 @@ presentation = "spinner"
                 )
             ]
         );
+        assert_eq!(
+            active_extensions_json(std::slice::from_ref(&extension)),
+            r#"{"acme.git-status":"1.2.3"}"#
+        );
     }
 
     #[test]
@@ -2943,6 +2962,7 @@ scope = "tab"
             format!("FUT_BIN={}", fut_bin.display()),
             format!("FUT_EVENT={}", event.kind),
             format!("FUT_EVENT_VERSION={EVENT_VERSION}"),
+            r#"FUT_EXTENSIONS={"capture":"1.2.3"}"#.to_owned(),
             "FUT_EXTENSION_ID=capture".to_owned(),
             format!(
                 "FUT_EXTENSION_ROOT={}",

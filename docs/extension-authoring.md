@@ -178,6 +178,7 @@ receive the client process environment plus these API v1 values:
 | --- | --- |
 | `FUT_BIN` | Exact running Fut executable; do not replace it with a `PATH` lookup. |
 | `FUT_SOCKET` | Socket belonging to that Fut daemon; pass it back with `--socket`. |
+| `FUT_EXTENSIONS` | Compact JSON object mapping every active extension ID to its package SemVer version. |
 | `FUT_EXTENSION_ID` | Manifest `id`. |
 | `FUT_EXTENSION_COMMAND` | Unqualified command declaration name. |
 | `FUT_EXTENSION_ROOT` | Canonical package root. |
@@ -194,6 +195,12 @@ receive the client process environment plus these API v1 values:
 Inherited variables that are not listed here are host environment, not Fut
 API. Do not give them semantic meaning. Future compatible releases may add new
 `FUT_*` variables, so ignore unknown names.
+
+`FUT_EXTENSIONS` describes the atomic extension generation that launched the
+process, including the current extension. A managed package that is installed
+but disabled, or enabled but not yet loaded by a successful reload, is absent.
+Test object membership by ID and use the value only when an integration needs
+to distinguish versions.
 
 Users may replace all arguments after your executable with:
 
@@ -302,7 +309,7 @@ Every workspace event has this shape:
 
 Only `workspace.renamed` has `previous_name`. Workspace hooks run from the
 package root and inherit the daemon environment plus `FUT_BIN`, `FUT_SOCKET`,
-`FUT_EXTENSION_ID`, `FUT_EXTENSION_ROOT`, `FUT_EVENT`,
+`FUT_EXTENSIONS`, `FUT_EXTENSION_ID`, `FUT_EXTENSION_ROOT`, `FUT_EVENT`,
 `FUT_EVENT_VERSION`, `FUT_SESSION_ID`, `FUT_WORKSPACE_ID`,
 `FUT_WORKSPACE_ROOT`, resolved config, and its optional provenance paths.
 
@@ -319,7 +326,7 @@ Client events have this shape:
 
 Only `client.session_changed` has `previous_session`. Client hooks run from the
 package root and inherit the client environment plus `FUT_BIN`, `FUT_SOCKET`,
-`FUT_EXTENSION_ID`, `FUT_EXTENSION_ROOT`, `FUT_EVENT`,
+`FUT_EXTENSIONS`, `FUT_EXTENSION_ID`, `FUT_EXTENSION_ROOT`, `FUT_EVENT`,
 `FUT_EVENT_VERSION`, `FUT_SESSION_ID`, and `FUT_SESSION_NAME`. They deliberately
 run in the interactive client, where `/dev/tty` is available. They have no
 workspace IDs or config.
