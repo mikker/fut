@@ -67,13 +67,14 @@ impl AgentItem {
         &self,
         spinner_frame: usize,
         path_separator: &str,
-        style: Style,
+        title_style: Style,
+        detail_style: Style,
         status_style: Style,
     ) -> Line<'static> {
         let marker = self.marker(spinner_frame);
         Line::from(vec![
             Span::styled(format!(" {marker}"), status_style),
-            Span::styled(format!(" {} ", self.source), style),
+            Span::styled(format!(" {} ", self.source), title_style),
             Span::styled(self.status(), status_style),
             Span::styled(
                 format!(
@@ -85,7 +86,7 @@ impl AgentItem {
                     ]
                     .join(path_separator)
                 ),
-                style,
+                detail_style,
             ),
         ])
     }

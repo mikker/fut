@@ -203,7 +203,7 @@ impl AgentsDialog {
                 buffer.set_line(
                     body.x,
                     y,
-                    &row.line(spinner_frame, " › ", style, status_style),
+                    &row.line(spinner_frame, " › ", style, style, status_style),
                     body.width,
                 );
             }

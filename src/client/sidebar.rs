@@ -25,8 +25,8 @@ use super::{
     navigation::NavigationHistory,
     notifications::{ActivityIndicator, NotificationState},
     presentation::{
-        ItemState, TokenValue, apply_item_state, extension_token_value, pill_cap_style,
-        render_token_segments, truncate_line,
+        ItemState, TokenValue, apply_item_state, extension_token_value, render_token_segments,
+        truncate_line,
     },
 };
 
@@ -1305,23 +1305,28 @@ fn render_agent_row(
     ui: &UiConfig,
     buffer: &mut Buffer,
 ) {
-    let state = ItemState {
-        current: item.current,
+    let row_state = ItemState {
+        current: false,
         selected,
         closing: false,
         attention: false,
     };
-    let style = apply_item_state(
+    let normal = ui.styles.apply(SemanticStyle::Normal, Style::default());
+    let detail_style = apply_item_state(&ui.styles, row_state, normal);
+    clear(area, detail_style, buffer);
+    let title_style = apply_item_state(
         &ui.styles,
-        state,
-        ui.styles.apply(SemanticStyle::Normal, Style::default()),
+        ItemState {
+            current: item.current,
+            ..row_state
+        },
+        normal,
     );
-    clear(area, style, buffer);
-    let status_style = ui.styles.apply(item.status_style(), style);
+    let status_style = ui.styles.apply(item.status_style(), detail_style);
     buffer.set_line(
         area.x,
         area.y,
-        &item.line(spinner_frame, "/", style, status_style),
+        &item.line(spinner_frame, "/", title_style, detail_style, status_style),
         area.width,
     );
 }
@@ -2091,38 +2096,21 @@ fn render_workspace_row(
     }
     let icons = ui.icons.resolve();
     let state = ItemState {
-        // Keyboard selection owns the whole row; current styling is added to the
-        // title line below so workspace details remain quiet.
+        // Keyboard selection and closing own the whole row. Current styling is
+        // applied only to the workspace name so status colors stay visible.
         current: false,
         selected,
         closing: item.closing,
-        attention: matches!(
-            item.activity,
-            Some(ActivityIndicator::Blocked | ActivityIndicator::Completed)
-        ),
+        attention: false,
     };
     let surface = ui.styles.apply(SemanticStyle::Normal, Style::default());
     let row_style = apply_item_state(&ui.styles, state, surface);
     clear(area, row_style, buffer);
-    let title_state = ItemState {
-        current: item.current,
-        ..state
-    };
-    let title_style = apply_item_state(&ui.styles, title_state, surface);
-    let pill = !icons.pill_left.is_empty() && !icons.pill_right.is_empty() && area.width >= 2;
-    let title = if pill {
-        Rect::new(area.x + 1, area.y, area.width - 2, 1)
-    } else {
-        Rect::new(area.x, area.y, area.width, 1)
-    };
-    clear(title, title_style, buffer);
-    if pill && item.current {
-        let cap_style = pill_cap_style(title_style, surface);
-        buffer.set_stringn(area.x, area.y, &icons.pill_left, 1, cap_style);
-        buffer.set_stringn(area.right() - 1, area.y, &icons.pill_right, 1, cap_style);
-    }
     let resolve = |token: &str| match token {
         "workspace.index" => TokenValue::plain((item.index + 1).to_string()),
+        "workspace.name" if item.current => {
+            TokenValue::styled(sanitize(&item.name), SemanticStyle::Current)
+        }
         "workspace.name" => TokenValue::plain(sanitize(&item.name)),
         "workspace.id" => TokenValue::plain(item.id.to_string()),
         "workspace.root" => match item.location.as_ref() {
@@ -2166,7 +2154,7 @@ fn render_workspace_row(
     let left = render_token_segments(
         &workspace_config(ui, side).row.left,
         None,
-        title_state,
+        state,
         &ui.styles,
         &icons,
         resolve,
@@ -2174,7 +2162,7 @@ fn render_workspace_row(
     let body = render_token_segments(
         &workspace_config(ui, side).row.body,
         None,
-        title_state,
+        state,
         &ui.styles,
         &icons,
         resolve,
@@ -2182,30 +2170,30 @@ fn render_workspace_row(
     let right = render_token_segments(
         &workspace_config(ui, side).row.right,
         None,
-        title_state,
+        state,
         &ui.styles,
         &icons,
         resolve,
     );
-    let title_width = usize::from(title.width);
+    let title_width = usize::from(area.width);
     let left_width = left.width().min(title_width);
     let right_width = right.width().min(title_width.saturating_sub(left_width));
     let body_width = title_width.saturating_sub(left_width + right_width);
     buffer.set_line(
-        title.x,
-        title.y,
+        area.x,
+        area.y,
         &truncate_line(&left, left_width),
         left_width as u16,
     );
     buffer.set_line(
-        title.x.saturating_add(left_width as u16),
-        title.y,
+        area.x.saturating_add(left_width as u16),
+        area.y,
         &truncate_line(&body, body_width),
         body_width as u16,
     );
     buffer.set_line(
-        title.x.saturating_add((title_width - right_width) as u16),
-        title.y,
+        area.x.saturating_add((title_width - right_width) as u16),
+        area.y,
         &truncate_line(&right, right_width),
         right_width as u16,
     );
@@ -2858,7 +2846,12 @@ mod tests {
         assert_eq!(left_buffer[(1, 3)].symbol(), "1");
         assert_eq!(left_buffer[(2, 3)].symbol(), " ");
         assert_eq!(left_buffer[(22, 7)].symbol(), " ");
-        assert!(left_buffer[(0, 3)].modifier.contains(Modifier::REVERSED));
+        assert!(!left_buffer[(0, 3)].modifier.contains(Modifier::REVERSED));
+        assert!((2..7).all(|column| {
+            left_buffer[(column, 3)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        }));
         assert!(!left_buffer[(0, 4)].modifier.contains(Modifier::REVERSED));
         assert_eq!(left_buffer[(23, 0)].symbol(), "│");
         assert_eq!(left_buffer[(23, 0)].fg, ratatui::style::Color::DarkGray);
@@ -2869,7 +2862,7 @@ mod tests {
     }
 
     #[test]
-    fn nerd_font_draws_only_the_focused_workspace_title_as_a_pill() {
+    fn current_workspace_styles_only_its_name() {
         let (snapshot, focused) = fixture(&["main"], 0);
         let model = WorkspaceModel::from_snapshot(
             &snapshot,
@@ -2877,7 +2870,7 @@ mod tests {
             &NavigationHistory::default(),
             &NotificationState::default(),
         );
-        let ui: UiConfig = toml::from_str("[icons]\npreset = 'nerd_font'\n").unwrap();
+        let ui = UiConfig::default();
         let area = Rect::new(0, 0, 24, 6);
         let mut buffer = Buffer::empty(area);
         render_model(
@@ -2892,14 +2885,38 @@ mod tests {
             &mut buffer,
         );
 
-        assert_eq!(buffer[(0, 3)].symbol(), "\u{e0b6}");
-        assert_eq!(buffer[(22, 3)].symbol(), "\u{e0b4}");
-        for cap in [0, 22] {
-            assert_eq!(buffer[(cap, 3)].fg, ratatui::style::Color::Blue);
-            assert_eq!(buffer[(cap, 3)].bg, ratatui::style::Color::Reset);
-        }
-        assert!((1..22).all(|column| buffer[(column, 3)].modifier.contains(Modifier::REVERSED)));
+        assert!((2..7).all(|column| buffer[(column, 3)].modifier.contains(Modifier::REVERSED)));
+        assert!((0..2).all(|column| !buffer[(column, 3)].modifier.contains(Modifier::REVERSED)));
+        assert!((7..23).all(|column| !buffer[(column, 3)].modifier.contains(Modifier::REVERSED)));
         assert!((0..23).all(|column| !buffer[(column, 4)].modifier.contains(Modifier::REVERSED)));
+    }
+
+    #[test]
+    fn current_agent_styles_only_its_source_and_keeps_status_color() {
+        let item = AgentItem {
+            terminal_id: TerminalId::new(),
+            pane_id: PaneId::new(),
+            session: "session".into(),
+            workspace: "workspace".into(),
+            tab: "tab".into(),
+            source: "codex".into(),
+            current: true,
+            indicator: Some(ActivityIndicator::Working),
+        };
+        let ui = UiConfig::default();
+        let area = Rect::new(0, 0, 40, 1);
+        let mut buffer = Buffer::empty(area);
+        render_agent_row(&item, false, 0, area, &ui, &mut buffer);
+
+        assert!((2..9).all(|column| buffer[(column, 0)].modifier.contains(Modifier::REVERSED)));
+        assert!((9..40).all(|column| !buffer[(column, 0)].modifier.contains(Modifier::REVERSED)));
+        assert_eq!(
+            buffer[(9, 0)].fg,
+            ui.styles
+                .apply(SemanticStyle::Activity, Style::default())
+                .fg
+                .expect("activity foreground")
+        );
     }
 
     #[test]
@@ -2959,13 +2976,15 @@ mod tests {
         );
         for width in 1..24 {
             let (_, buffer) = rendered(&model, None, None, width, 3, SidebarSide::Left);
-            assert!(
-                buffer
-                    .content()
-                    .iter()
-                    .any(|cell| cell.modifier.contains(Modifier::REVERSED)),
-                "width {width}"
-            );
+            if width >= 7 {
+                assert!(
+                    buffer
+                        .content()
+                        .iter()
+                        .any(|cell| cell.modifier.contains(Modifier::REVERSED)),
+                    "width {width}"
+                );
+            }
         }
     }
 
