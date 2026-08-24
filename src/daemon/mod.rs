@@ -10,6 +10,7 @@ pub mod autostart;
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    ffi::OsString,
     fs::{self, File, OpenOptions},
     io,
     os::{
@@ -86,8 +87,7 @@ impl DaemonConfig {
         let program = std::env::var_os("SHELL")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/bin/sh"));
-        let mut env = std::env::vars().collect::<HashMap<_, _>>();
-        env.insert("FUT_SOCKET".into(), socket_path.display().to_string());
+        let env = shell_environment(&socket_path, std::env::vars_os());
         Self {
             socket_path,
             config_location,
@@ -107,6 +107,15 @@ impl DaemonConfig {
     }
 }
 
+fn shell_environment(
+    socket_path: &Path,
+    inherited: impl IntoIterator<Item = (OsString, OsString)>,
+) -> HashMap<OsString, OsString> {
+    let mut environment = inherited.into_iter().collect::<HashMap<_, _>>();
+    environment.insert("FUT_SOCKET".into(), socket_path.as_os_str().to_owned());
+    environment
+}
+
 const CONNECTION_GRACE_PERIOD: Duration = Duration::from_secs(1);
 const HOOK_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(1);
 
@@ -123,7 +132,7 @@ struct SharedState {
     exited_terminals: VecDeque<(TerminalId, Option<i32>)>,
     resource_changes: watch::Sender<u64>,
     agent_events: broadcast::Sender<AgentLifecycleUpdate>,
-    child_env: HashMap<String, String>,
+    child_env: HashMap<OsString, OsString>,
     projects: global_config::ProjectCatalog,
     config_location: global_config::ConfigLocation,
     extension_registry: Arc<crate::extensions::ExtensionRegistry>,
@@ -1971,9 +1980,9 @@ fn initial_path(resolved: &ResolvedLocation, name: String, terminal_id: Terminal
 }
 
 fn terminal_env(
-    base: &HashMap<String, String>,
+    base: &HashMap<OsString, OsString>,
     target: crate::resources::ResolvedTerminalPath,
-) -> HashMap<String, String> {
+) -> HashMap<OsString, OsString> {
     let mut env = base.clone();
     for (key, value) in [
         ("FUT_SESSION_ID", target.session_id.to_string()),
@@ -1982,7 +1991,7 @@ fn terminal_env(
         ("FUT_PANE_ID", target.pane_id.to_string()),
         ("FUT_TERMINAL_ID", target.terminal_id.to_string()),
     ] {
-        env.insert(key.into(), value);
+        env.insert(key.into(), value.into());
     }
     env
 }
@@ -6237,6 +6246,27 @@ async fn send_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_environment_preserves_unix_bytes_and_the_exact_socket_path() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid_value = OsString::from_vec(vec![b'x', 0xff]);
+        let socket = PathBuf::from(OsString::from_vec(b"/tmp/fut-\xff.sock".to_vec()));
+        let environment = shell_environment(
+            &socket,
+            [(OsString::from("NON_UNICODE"), invalid_value.clone())],
+        );
+
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new("NON_UNICODE")),
+            Some(&invalid_value)
+        );
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new("FUT_SOCKET")),
+            Some(&socket.into_os_string())
+        );
+    }
 
     #[tokio::test]
     async fn process_names_are_read_without_control_characters() {

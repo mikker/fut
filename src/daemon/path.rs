@@ -6,21 +6,60 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 
+fn absolute_path(value: &std::ffi::OsStr, source: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(value);
+    if path.as_os_str().is_empty() {
+        bail!("{source} must not be empty");
+    }
+    if !path.is_absolute() {
+        bail!("{source} must be an absolute path: {}", path.display());
+    }
+    Ok(path)
+}
+
+fn socket_at(path: PathBuf, source: &str) -> Result<PathBuf> {
+    if path.file_name().is_none() {
+        bail!("{source} must name a socket file, not {}", path.display());
+    }
+    if path.parent() == Some(Path::new("/")) {
+        bail!(
+            "{source} must not place the Fut socket directly in the filesystem root: {}",
+            path.display()
+        );
+    }
+    Ok(path)
+}
+
+fn runtime_at(value: &std::ffi::OsStr, source: &str) -> Result<PathBuf> {
+    let directory = absolute_path(value, source)?;
+    if directory == Path::new("/") {
+        bail!("{source} must not be the filesystem root");
+    }
+    Ok(directory)
+}
+
 /// Resolve Fut's single per-user socket. An explicit path always wins.
 pub fn socket_path(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = explicit {
-        return Ok(path.to_path_buf());
+        return socket_at(absolute_path(path.as_os_str(), "--socket")?, "--socket");
     }
     if let Some(path) = env::var_os("FUT_SOCKET") {
-        return Ok(path.into());
+        return socket_at(absolute_path(&path, "FUT_SOCKET")?, "FUT_SOCKET");
     }
     if let Some(directory) = env::var_os("FUT_RUNTIME_DIR") {
-        return Ok(PathBuf::from(directory).join("fut.sock"));
+        return Ok(runtime_at(&directory, "FUT_RUNTIME_DIR")?.join("fut.sock"));
     }
-    if let Some(directory) = env::var_os("XDG_RUNTIME_DIR") {
+    // The XDG Base Directory specification says empty or relative values are
+    // invalid and must be ignored.
+    if let Some(directory) = env::var_os("XDG_RUNTIME_DIR")
+        && !directory.is_empty()
+        && Path::new(&directory).is_absolute()
+    {
         return Ok(PathBuf::from(directory).join("fut/fut.sock"));
     }
-    let temporary = env::var_os("TMPDIR").unwrap_or_else(|| "/tmp".into());
+    let temporary = env::var_os("TMPDIR")
+        .filter(|path| !path.is_empty() && Path::new(path).is_absolute())
+        .unwrap_or_else(|| "/tmp".into());
     // SAFETY: geteuid has no preconditions and cannot fail.
     let uid = unsafe { libc::geteuid() };
     Ok(PathBuf::from(temporary).join(format!("fut-{uid}/fut.sock")))
@@ -76,6 +115,28 @@ mod tests {
         assert_eq!(
             socket_path(Some(Path::new("/tmp/e2e/fut.sock"))).unwrap(),
             PathBuf::from("/tmp/e2e/fut.sock")
+        );
+    }
+
+    #[test]
+    fn explicit_socket_requires_an_absolute_file_path() {
+        assert!(
+            socket_path(Some(Path::new("relative.sock")))
+                .unwrap_err()
+                .to_string()
+                .contains("--socket must be an absolute path")
+        );
+        assert!(
+            socket_path(Some(Path::new("/")))
+                .unwrap_err()
+                .to_string()
+                .contains("must name a socket file")
+        );
+        assert!(
+            socket_at(PathBuf::from("/fut.sock"), "FUT_SOCKET")
+                .unwrap_err()
+                .to_string()
+                .contains("filesystem root")
         );
     }
 

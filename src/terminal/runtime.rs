@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    ffi::OsString,
     io::{Read, Write},
     path::PathBuf,
     sync::{
@@ -31,6 +32,7 @@ const QUEUE_CAPACITY: usize = 64;
 const OUTPUT_QUEUE_CAPACITY: usize = 16;
 const DROP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const CLOSE_REAP_TIMEOUT: Duration = Duration::from_secs(3);
+const CLOSE_GRACE_PERIOD: Duration = Duration::from_millis(500);
 const CLOSE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const CLOSE_REAP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 // Bound how much PTY output one drain pass parses before it snapshots, so a
@@ -49,7 +51,7 @@ pub struct SpawnSpec {
     pub program: PathBuf,
     pub argv: Vec<String>,
     pub cwd: PathBuf,
-    pub env: HashMap<String, String>,
+    pub env: HashMap<OsString, OsString>,
     pub size: TerminalSize,
 }
 
@@ -568,10 +570,10 @@ pub fn spawn_terminal(spec: SpawnSpec) -> Result<TerminalHandle> {
     let mut command = CommandBuilder::new(&spec.program);
     command.args(&spec.argv);
     command.cwd(&spec.cwd);
-    if !spec.env.contains_key("TERM") {
+    if !spec.env.contains_key(std::ffi::OsStr::new("TERM")) {
         command.env("TERM", "xterm-ghostty");
     }
-    if !spec.env.contains_key("COLORTERM") {
+    if !spec.env.contains_key(std::ffi::OsStr::new("COLORTERM")) {
         command.env("COLORTERM", "truecolor");
     }
     for (key, value) in &spec.env {
@@ -895,24 +897,34 @@ fn run(
                         last_snapshot = Instant::now();
                         dirty = false;
                     }
-                    kill_terminal_processes(&*master, child_pid);
-                    if exit_code.is_none()
-                        && let Err(error) = child.kill()
-                    {
-                        send_error(publishers.events, error.into());
-                    }
-                    // A shell may be concurrently handing the tty to a newly
-                    // forked foreground group. Re-read the tty group after
-                    // killing the session leader before entering wait().
-                    kill_terminal_processes(&*master, child_pid);
-                    match reap_child_while_draining(
+                    signal_terminal_processes(&*master, child_pid, libc::SIGHUP);
+                    let graceful = reap_child_while_draining(
                         || child.try_wait(),
                         &mut queues.output,
                         terminal,
                         &publishers,
                         &mut reader_complete,
-                        CLOSE_REAP_TIMEOUT,
-                    ) {
+                        CLOSE_GRACE_PERIOD,
+                    );
+                    let status = match graceful {
+                        Ok(status) => Ok(status),
+                        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                            // The shell may have handed the tty to a new foreground
+                            // group while handling SIGHUP. Re-read both groups, then
+                            // force only survivors down before the final reap.
+                            signal_terminal_processes(&*master, child_pid, libc::SIGKILL);
+                            reap_child_while_draining(
+                                || child.try_wait(),
+                                &mut queues.output,
+                                terminal,
+                                &publishers,
+                                &mut reader_complete,
+                                CLOSE_REAP_TIMEOUT.saturating_sub(CLOSE_GRACE_PERIOD),
+                            )
+                        }
+                        Err(error) => Err(error),
+                    };
+                    match status {
                         Ok(status) => {
                             let code = Some(status.exit_code() as i32);
                             drain_output_until(
@@ -1389,7 +1401,7 @@ fn drain_output_until(
 }
 
 #[cfg(unix)]
-fn kill_terminal_processes(master: &dyn MasterPty, child_pid: u32) {
+fn signal_terminal_processes(master: &dyn MasterPty, child_pid: u32, signal: libc::c_int) {
     // A shell can put its foreground command in a different process group.
     // Kill that tty foreground group as well as the child's session group so
     // no descendant can retain the PTY and prevent confirmed reap.
@@ -1398,16 +1410,16 @@ fn kill_terminal_processes(master: &dyn MasterPty, child_pid: u32) {
         if let Some(foreground_group) = master.process_group_leader()
             && foreground_group != libc::getpgrp()
         {
-            libc::kill(-foreground_group, libc::SIGKILL);
+            libc::kill(-foreground_group, signal);
         }
         let process_group = libc::getpgid(child_pid as i32);
         if process_group > 0 && process_group != libc::getpgrp() {
-            libc::kill(-process_group, libc::SIGKILL);
+            libc::kill(-process_group, signal);
         } else {
             // Some PTY implementations do not place the command in a distinct
             // process group. Never signal Fut's own group, but still kill the
             // child itself before the confirmed wait below.
-            libc::kill(child_pid as i32, libc::SIGKILL);
+            libc::kill(child_pid as i32, signal);
         }
     }
 }
@@ -1556,7 +1568,7 @@ mod tests {
         .unwrap()
     }
 
-    fn shell(script: &str, env: HashMap<String, String>) -> SpawnSpec {
+    fn shell(script: &str, env: HashMap<OsString, OsString>) -> SpawnSpec {
         SpawnSpec {
             id: TerminalId::new(),
             program: "/bin/sh".into(),
@@ -2211,6 +2223,25 @@ mod tests {
                 .success()
         );
         handle.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_gives_the_terminal_session_a_hup_grace_period() {
+        let temporary = tempfile::tempdir().unwrap();
+        let marker = temporary.path().join("hup-handled");
+        let mut env = HashMap::new();
+        env.insert(OsString::from("MARKER"), marker.as_os_str().to_owned());
+        let handle = spawn_terminal(shell(
+            "trap 'printf handled > \"$MARKER\"; exit 0' HUP; printf READY; while :; do sleep 1; done",
+            env,
+        ))
+        .unwrap();
+        let mut snapshots = handle.subscribe_snapshots();
+        wait_for_text(&mut snapshots, "READY").await;
+
+        handle.close().await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "handled");
     }
 
     #[tokio::test]

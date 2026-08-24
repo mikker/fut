@@ -1382,6 +1382,7 @@ async fn run_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    command.process_group(0);
     if let Some(workspace_id) = invocation.workspace_id {
         command.env("FUT_WORKSPACE_ID", workspace_id.to_string());
     }
@@ -1426,6 +1427,7 @@ async fn run_command(
             return;
         }
     };
+    let child_pid = child.id();
     let mut stdin = child.stdin.take().expect("hook stdin was piped");
     let payload = invocation.payload.to_owned();
     let input = tokio::spawn(async move {
@@ -1442,8 +1444,7 @@ async fn run_command(
     let status = match timeout(HOOK_TIMEOUT, child.wait()).await {
         Ok(status) => status,
         Err(_) => {
-            let _ = child.start_kill();
-            let _ = timeout(Duration::from_millis(100), child.wait()).await;
+            terminate_hook_group(&mut child, child_pid).await;
             input.abort();
             let stdout = finish_output(stdout).await;
             let stderr = finish_output(stderr).await;
@@ -1489,6 +1490,29 @@ async fn run_command(
             "extension hook wait failed"
         ),
     }
+}
+
+async fn terminate_hook_group(child: &mut tokio::process::Child, child_pid: Option<u32>) {
+    if let Some(pid) = child_pid {
+        // SAFETY: every hook is spawned as its own process-group leader.
+        unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGTERM);
+        }
+        let child_reaped = matches!(
+            timeout(Duration::from_millis(250), child.wait()).await,
+            Ok(Ok(_))
+        );
+        // SAFETY: bounded escalation targets the same dedicated hook group.
+        unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+        }
+        if child_reaped {
+            return;
+        }
+    } else {
+        let _ = child.start_kill();
+    }
+    let _ = timeout(Duration::from_millis(100), child.wait()).await;
 }
 
 async fn finish_input(mut task: JoinHandle<std::io::Result<()>>) -> Option<String> {
@@ -3366,7 +3390,7 @@ scope = "tab"
                 "id = 'slow'\ncapabilities = ['hooks']\n[hooks]\n'workspace.created' = ['./hook', {:?}]\n",
                 output_path
             ),
-            "#!/bin/sh\nprintf 'slow\\n' >> \"$1\"\nsleep 30\n",
+            "#!/bin/sh\nprintf 'slow\\n' >> \"$1\"\n(trap '' TERM; sleep 6; printf 'orphan\\n' >> \"$1\") &\nsleep 30\n",
         );
         let later = executable_hook(
             &format!(
@@ -3397,6 +3421,7 @@ scope = "tab"
         .await;
 
         assert!(started.elapsed() >= HOOK_TIMEOUT);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
         assert_eq!(fs::read_to_string(output.path()).unwrap(), "slow\nlater\n");
     }
 

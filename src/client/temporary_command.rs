@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
+    ffi::OsString,
     fs,
     io::ErrorKind,
     path::{Path, PathBuf},
@@ -200,7 +201,7 @@ impl TemporaryCommandSurface {
                 .await
                 .unwrap_or_else(|| fallback.to_path_buf())
         };
-        let mut env = std::env::vars().collect::<HashMap<_, _>>();
+        let mut env = std::env::vars_os().collect::<HashMap<_, _>>();
         if command.extension.is_some() {
             let context =
                 extension_context.context("extension command is missing runtime context")?;
@@ -214,7 +215,7 @@ impl TemporaryCommandSurface {
         if let Some(activation) = &activation {
             env.insert(
                 ACTIVATE_OPENED_SOCKET_ENV.into(),
-                activation.path.display().to_string(),
+                activation.path.as_os_str().to_owned(),
             );
         }
         let handle = spawn_terminal(SpawnSpec {
@@ -671,12 +672,15 @@ fn popup_cell(area: Rect, column: u16, row: u16, clamp: bool) -> Option<(u16, u1
 }
 
 fn add_form_environment(
-    environment: &mut HashMap<String, String>,
+    environment: &mut HashMap<OsString, OsString>,
     form: Option<&BTreeMap<String, String>>,
 ) -> anyhow::Result<()> {
-    environment.remove(FUT_EXTENSION_FORM);
+    environment.remove(std::ffi::OsStr::new(FUT_EXTENSION_FORM));
     if let Some(form) = form {
-        environment.insert(FUT_EXTENSION_FORM.into(), serde_json::to_string(form)?);
+        environment.insert(
+            FUT_EXTENSION_FORM.into(),
+            serde_json::to_string(form)?.into(),
+        );
     }
     Ok(())
 }
@@ -722,7 +726,7 @@ async fn run_background_command(
     context: &ExtensionCommandContext,
     socket_path: &Path,
 ) -> BackgroundCommandResult {
-    let mut environment = std::env::vars().collect::<HashMap<_, _>>();
+    let mut environment = std::env::vars_os().collect::<HashMap<_, _>>();
     if let Err(error) = add_form_environment(&mut environment, None)
         .and_then(|()| add_extension_environment(&mut environment, command, context, socket_path))
     {
@@ -786,7 +790,7 @@ async fn run_background_command(
 }
 
 fn add_extension_environment(
-    environment: &mut HashMap<String, String>,
+    environment: &mut HashMap<OsString, OsString>,
     command: &PaletteCommand,
     context: &ExtensionCommandContext,
     socket_path: &Path,
@@ -795,60 +799,72 @@ fn add_extension_environment(
         .extension
         .as_ref()
         .context("extension command is missing its identity")?;
+    environment.insert("FUT_BIN".into(), std::env::current_exe()?.into_os_string());
     environment.insert(
-        "FUT_BIN".into(),
-        std::env::current_exe()?.display().to_string(),
+        "FUT_EXTENSION_COMMAND".into(),
+        extension.command.clone().into(),
     );
-    environment.insert("FUT_EXTENSIONS".into(), context.active_extensions.clone());
-    environment.insert("FUT_EXTENSION_COMMAND".into(), extension.command.clone());
-    environment.insert("FUT_EXTENSION_ID".into(), extension.id.clone());
+    environment.insert(
+        "FUT_EXTENSIONS".into(),
+        context.active_extensions.clone().into(),
+    );
+    environment.insert("FUT_EXTENSION_ID".into(), extension.id.clone().into());
     environment.insert(
         "FUT_EXTENSION_ROOT".into(),
-        extension.root.display().to_string(),
+        extension.root.as_os_str().to_owned(),
     );
-    environment.insert("FUT_SOCKET".into(), socket_path.display().to_string());
+    environment.insert("FUT_SOCKET".into(), socket_path.as_os_str().to_owned());
     environment.insert(
         "FUT_SESSION_ID".into(),
-        context.focused.session_id.to_string(),
+        context.focused.session_id.to_string().into(),
     );
     environment.insert(
         "FUT_WORKSPACE_ID".into(),
-        context.focused.workspace_id.to_string(),
+        context.focused.workspace_id.to_string().into(),
     );
-    environment.insert("FUT_TAB_ID".into(), context.focused.tab_id.to_string());
-    environment.insert("FUT_PANE_ID".into(), context.focused.pane_id.to_string());
+    environment.insert(
+        "FUT_TAB_ID".into(),
+        context.focused.tab_id.to_string().into(),
+    );
+    environment.insert(
+        "FUT_PANE_ID".into(),
+        context.focused.pane_id.to_string().into(),
+    );
     environment.insert(
         "FUT_TERMINAL_ID".into(),
-        context.focused.terminal_id.to_string(),
+        context.focused.terminal_id.to_string().into(),
     );
-    environment.insert("FUT_EXTENSION_CONFIG".into(), context.config.json.clone());
+    environment.insert(
+        "FUT_EXTENSION_CONFIG".into(),
+        context.config.json.clone().into(),
+    );
     environment.insert(
         "FUT_EXTENSION_TRUSTED_CONFIG".into(),
-        context.config.trusted_json.clone(),
+        context.config.trusted_json.clone().into(),
     );
     if let Some(path) = &context.config.global_source {
         environment.insert(
             "FUT_EXTENSION_CONFIG_GLOBAL_PATH".into(),
-            path.display().to_string(),
+            path.as_os_str().to_owned(),
         );
     } else {
-        environment.remove("FUT_EXTENSION_CONFIG_GLOBAL_PATH");
+        environment.remove(std::ffi::OsStr::new("FUT_EXTENSION_CONFIG_GLOBAL_PATH"));
     }
     if let Some(path) = &context.config.project_source {
         environment.insert(
             "FUT_EXTENSION_CONFIG_PROJECT_PATH".into(),
-            path.display().to_string(),
+            path.as_os_str().to_owned(),
         );
     } else {
-        environment.remove("FUT_EXTENSION_CONFIG_PROJECT_PATH");
+        environment.remove(std::ffi::OsStr::new("FUT_EXTENSION_CONFIG_PROJECT_PATH"));
     }
     if let Some(path) = &context.config.workspace_source {
         environment.insert(
             "FUT_EXTENSION_CONFIG_WORKSPACE_PATH".into(),
-            path.display().to_string(),
+            path.as_os_str().to_owned(),
         );
     } else {
-        environment.remove("FUT_EXTENSION_CONFIG_WORKSPACE_PATH");
+        environment.remove(std::ffi::OsStr::new("FUT_EXTENSION_CONFIG_WORKSPACE_PATH"));
     }
     Ok(())
 }
@@ -1056,7 +1072,7 @@ mod tests {
     fn form_environment_is_exact_and_never_inherited() {
         let mut environment = HashMap::from([(FUT_EXTENSION_FORM.into(), "stale".into())]);
         add_form_environment(&mut environment, None).unwrap();
-        assert!(!environment.contains_key(FUT_EXTENSION_FORM));
+        assert!(!environment.contains_key(std::ffi::OsStr::new(FUT_EXTENSION_FORM)));
 
         let form = BTreeMap::from([
             ("command".into(), "pi --model sonnet".into()),
@@ -1065,8 +1081,10 @@ mod tests {
         ]);
         add_form_environment(&mut environment, Some(&form)).unwrap();
         assert_eq!(
-            environment[FUT_EXTENSION_FORM],
-            r#"{"command":"pi --model sonnet","prompt":"fix λ","worktree":""}"#
+            environment[std::ffi::OsStr::new(FUT_EXTENSION_FORM)],
+            std::ffi::OsStr::new(
+                r#"{"command":"pi --model sonnet","prompt":"fix λ","worktree":""}"#
+            )
         );
     }
 

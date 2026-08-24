@@ -7,6 +7,8 @@
 - `fut list` now shows the navigator's concise resource tree, with `-v`/`--verbose` retaining the detailed machine-oriented view.
 - The Pi package now teaches Pi to inspect and control Fut resources, including other agent panes.
 - Configuration reloads now refresh the focused project's extension settings, with a separate command-palette action for project-only reloads.
+- Reject malformed explicit socket and runtime paths with actionable errors, ignore invalid XDG/TMPDIR fallbacks, and preserve non-UTF-8 Unix environment values.
+- Give terminal processes a SIGHUP grace period before forced shutdown, and terminate complete extension-hook process groups after timeouts.
 
 ## 0.12
 

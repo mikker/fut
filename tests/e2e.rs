@@ -12088,9 +12088,12 @@ fn public_doctor_is_read_only_and_json_reports_configuration_errors() {
         .output()
         .unwrap();
     assert_eq!(relative_socket.status.code(), Some(1));
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&relative_socket.stdout).unwrap()["result"]["status"],
-        "error"
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(&relative_socket.stderr).unwrap()["error"]
+            ["message"]
+            .as_str()
+            .unwrap()
+            .contains("--socket must be an absolute path")
     );
 
     let relative_runtime = Command::new(env!("CARGO_BIN_EXE_fut"))
@@ -12103,8 +12106,49 @@ fn public_doctor_is_read_only_and_json_reports_configuration_errors() {
         .args(["--json", "doctor"])
         .output()
         .unwrap();
-    assert!(relative_runtime.status.success());
+    assert_eq!(relative_runtime.status.code(), Some(1));
+    let relative_runtime_error: serde_json::Value =
+        serde_json::from_slice(&relative_runtime.stderr).unwrap();
+    assert!(
+        relative_runtime_error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("FUT_RUNTIME_DIR must be an absolute path")
+    );
     assert!(!root.path().join("relative-runtime").exists());
+
+    let root_socket = Command::new(env!("CARGO_BIN_EXE_fut"))
+        .env_clear()
+        .env("HOME", &home)
+        .env("FUT_SOCKET", "/")
+        .args(["--json", "doctor"])
+        .output()
+        .unwrap();
+    assert_eq!(root_socket.status.code(), Some(1));
+    let root_socket_error: serde_json::Value = serde_json::from_slice(&root_socket.stderr).unwrap();
+    assert!(
+        root_socket_error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("FUT_SOCKET must name a socket file")
+    );
+
+    let root_runtime = Command::new(env!("CARGO_BIN_EXE_fut"))
+        .env_clear()
+        .env("HOME", &home)
+        .env("FUT_RUNTIME_DIR", "/")
+        .args(["--json", "doctor"])
+        .output()
+        .unwrap();
+    assert_eq!(root_runtime.status.code(), Some(1));
+    let root_runtime_error: serde_json::Value =
+        serde_json::from_slice(&root_runtime.stderr).unwrap();
+    assert!(
+        root_runtime_error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("FUT_RUNTIME_DIR must not be the filesystem root")
+    );
 
     let real_parent = root.path().join("real-runtime-parent");
     let linked_parent = root.path().join("linked-runtime-parent");

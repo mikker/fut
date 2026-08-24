@@ -19,6 +19,17 @@ extension directories, and trusted project recipes are executable boundaries; se
 
 Fut refuses to start or attach another interactive Fut client from inside one of its terminals. If nesting is intentional, set `FUT_ALLOW_NESTED` in the command's environment to force it, for example `FUT_ALLOW_NESTED=1 fut`.
 
+## Runtime location
+
+Fut keeps its private Unix socket, lock, and daemon log under
+`$XDG_RUNTIME_DIR/fut` when `XDG_RUNTIME_DIR` is an absolute path. Otherwise it
+uses `${TMPDIR:-/tmp}/fut-UID`. Set `FUT_RUNTIME_DIR` to an absolute directory
+to override that location, `FUT_SOCKET` to an absolute socket pathname, or pass
+`--socket` explicitly. Fut rejects empty or relative explicit overrides; empty
+or relative XDG and temporary-directory values are ignored according to their
+fallback semantics. Run `fut doctor` to inspect the resolved location without
+creating it.
+
 ## Location and lifecycle
 
 Fut checks, in order:

@@ -732,12 +732,17 @@ fn plan_recipe_session(
 
 fn spawn_recipe_terminals(
     plan: &RecipeCreationPlan,
-    child_env: &HashMap<String, String>,
+    child_env: &HashMap<std::ffi::OsString, std::ffi::OsString>,
 ) -> RecipeSpawnResult {
     let mut terminals = Vec::with_capacity(plan.terminals.len());
     for terminal in &plan.terminals {
         let mut env = child_env.clone();
-        env.extend(terminal.environment.clone());
+        env.extend(
+            terminal
+                .environment
+                .iter()
+                .map(|(key, value)| (key.into(), value.into())),
+        );
         let spec = SpawnSpec {
             id: terminal.path.terminal_id,
             program: terminal.program.clone(),
