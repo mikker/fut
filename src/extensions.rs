@@ -2618,7 +2618,7 @@ presentation = "spinner"
             ]
         );
         assert_eq!(
-            active_extensions_json(std::slice::from_ref(&extension)),
+            active_extensions_json(std::slice::from_ref(extension)),
             r#"{"acme.git-status":"1.2.3"}"#
         );
     }
