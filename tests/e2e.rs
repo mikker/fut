@@ -38,10 +38,25 @@ use uuid::Uuid;
 
 const DEADLINE: Duration = Duration::from_secs(8);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
+const TEST_SHELL_PROMPT: &str = "FUT_TEST_SHELL_READY>";
 const SIZE: TerminalSize = TerminalSize {
     columns: 80,
     rows: 24,
 };
+
+/// Arguments accepted by the host's `script(1)` for running a command in a
+/// pseudoterminal without retaining a transcript.
+fn script_command_args() -> &'static [&'static str] {
+    #[cfg(target_os = "linux")]
+    {
+        &["-q", "/dev/null", "-c"]
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        &["-q", "/dev/null", "/bin/sh", "-c"]
+    }
+}
 
 struct ChaosRng(u64);
 
@@ -264,6 +279,10 @@ impl PtyChild {
     }
 
     async fn wait_success(&mut self) {
+        // `script(1)` implementations differ in how eagerly their stdin
+        // forwarding process exits after the child command is done. Closing
+        // our input makes completion deterministic on both BSD and util-linux.
+        self.input.take();
         let status = time::timeout(DEADLINE, async {
             loop {
                 if let Some(status) = self.child.try_wait().unwrap() {
@@ -687,6 +706,7 @@ fn spawn_daemon(
         .env("TMPDIR", runtime)
         .env("FUT_RUNTIME_DIR", runtime)
         .env("TERM", "xterm-256color")
+        .env("PS1", TEST_SHELL_PROMPT)
         .arg("--socket")
         .arg(socket)
         .arg("daemon")
@@ -1869,14 +1889,14 @@ async fn current_location_open_recovers_from_last_terminal_exit_race() {
             .env_clear()
             .env("HOME", harness.root.path().join("home"))
             .env("PATH", "/usr/bin:/bin")
-            .env("SHELL", &shell)
             .env("TMPDIR", harness.root.path().join("runtime"))
             .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
             .env("TERM", "xterm-256color")
             .current_dir(harness.root.path().join("cwd"))
-            .args(["-q", "/dev/null", "/bin/sh", "-c"])
+            .args(script_command_args())
             .arg(format!(
-                "stty rows 24 cols 80; exec '{}' --socket '{}'",
+                "stty rows 24 cols 80; SHELL='{}' exec '{}' --socket '{}'",
+                shell.display(),
                 env!("CARGO_BIN_EXE_fut"),
                 harness.socket.display()
             ));
@@ -6190,7 +6210,7 @@ async fn public_noun_first_attach_accepts_names_and_raw_typed_ids() {
             .env("TMPDIR", harness.root.path().join("runtime"))
             .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
             .env("TERM", "xterm-256color")
-            .args(["-q", "/dev/null", "/bin/sh", "-c"])
+            .args(script_command_args())
             .arg(format!(
                 "stty rows 24 cols 80; exec '{}' --socket '{}' {invocation}",
                 env!("CARGO_BIN_EXE_fut"),
@@ -6256,7 +6276,7 @@ async fn top_level_attach_is_navigator_only_until_selection_then_attaches_normal
             .env("TMPDIR", &attach_runtime)
             .env("FUT_RUNTIME_DIR", &attach_runtime)
             .env("TERM", "xterm-256color")
-            .args(["-q", "/dev/null", "/bin/sh", "-c"])
+            .args(script_command_args())
             .arg(format!(
                 "stty rows 24 cols 80; exec '{}' --socket '{}' attach",
                 env!("CARGO_BIN_EXE_fut"),
@@ -7538,7 +7558,7 @@ async fn public_last_session_navigation_toggles_after_global_selection() {
         .env("TMPDIR", harness.root.path().join("runtime"))
         .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
         .env("TERM", "xterm-256color")
-        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .args(script_command_args())
         .arg(format!(
             "stty rows 24 cols 90; exec '{}' --socket '{}' pane attach {first_pane}",
             env!("CARGO_BIN_EXE_fut"),
@@ -8506,7 +8526,7 @@ async fn public_client_navigator_switches_live_pty_and_preserves_terminal_isolat
         .env("TMPDIR", harness.root.path().join("runtime"))
         .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
         .env("TERM", "xterm-256color")
-        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .args(script_command_args())
         .arg(format!(
             "stty rows 24 cols 80; exec '{}' --socket '{}' terminal attach {}",
             env!("CARGO_BIN_EXE_fut"),
@@ -8582,7 +8602,7 @@ async fn public_agent_activity_spins_lists_waiting_terminals_and_navigates_unrea
         .env("TMPDIR", harness.root.path().join("runtime"))
         .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
         .env("TERM", "xterm-256color")
-        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .args(script_command_args())
         .arg(format!(
             "stty rows 24 cols 80; exec '{}' --socket '{}' terminal attach {}",
             env!("CARGO_BIN_EXE_fut"),
@@ -8675,7 +8695,7 @@ async fn public_client_preserves_host_palette_indices_and_truecolor() {
         .env("TMPDIR", harness.root.path().join("runtime"))
         .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
         .env("TERM", "xterm-256color")
-        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .args(script_command_args())
         .arg(format!(
             "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {pane}",
             env!("CARGO_BIN_EXE_fut"),
@@ -8749,7 +8769,7 @@ async fn public_held_mouse_releases_before_modal_focus_and_detach_transitions() 
         .env("TMPDIR", harness.root.path().join("runtime"))
         .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
         .env("TERM", "xterm-256color")
-        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .args(script_command_args())
         .arg(format!(
             "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {pane_a}",
             env!("CARGO_BIN_EXE_fut"),
@@ -8877,7 +8897,7 @@ async fn public_sgr_mouse_focuses_without_leaking_then_forwards_focused_app_inpu
         .env("TMPDIR", harness.root.path().join("runtime"))
         .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
         .env("TERM", "xterm-256color")
-        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .args(script_command_args())
         .arg(format!(
             "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {pane_a}",
             env!("CARGO_BIN_EXE_fut"),
@@ -9039,7 +9059,7 @@ async fn public_mouse_resizes_nested_shared_splits_without_stealing_application_
         .env("TMPDIR", harness.root.path().join("runtime"))
         .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
         .env("TERM", "xterm-256color")
-        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .args(script_command_args())
         .arg(format!(
             "stty rows 30 cols 100; exec '{}' --socket '{}' pane attach {pane_a}",
             env!("CARGO_BIN_EXE_fut"),
@@ -9201,7 +9221,7 @@ async fn public_wheel_uses_dec_alternate_scroll_and_terminal_cursor_key_mode() {
         .env("TMPDIR", harness.root.path().join("runtime"))
         .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
         .env("TERM", "xterm-256color")
-        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .args(script_command_args())
         .arg(format!(
             "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {pane}",
             env!("CARGO_BIN_EXE_fut"),
@@ -9247,7 +9267,7 @@ async fn public_client_renders_simultaneous_panes_and_cycles_focus() {
         .env("TMPDIR", harness.root.path().join("runtime"))
         .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
         .env("TERM", "xterm-256color")
-        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .args(script_command_args())
         .arg(format!(
             "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {}",
             env!("CARGO_BIN_EXE_fut"),
@@ -9384,7 +9404,7 @@ async fn public_directional_focus_follows_authored_geometry_when_zoomed_and_tiny
             .env("TMPDIR", harness.root.path().join("runtime"))
             .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
             .env("TERM", "xterm-256color")
-            .args(["-q", "/dev/null", "/bin/sh", "-c"])
+            .args(script_command_args())
             .arg(format!(
                 "stty rows 30 cols {columns}; exec '{}' --socket '{}' pane attach {pane}",
                 env!("CARGO_BIN_EXE_fut"),
@@ -9471,7 +9491,7 @@ async fn public_client_accordion_resizes_focus_and_falls_back_narrowly() {
             .env("TMPDIR", harness.root.path().join("runtime"))
             .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
             .env("TERM", "xterm-256color")
-            .args(["-q", "/dev/null", "/bin/sh", "-c"])
+            .args(script_command_args())
             .arg(format!(
                 "stty rows 24 cols {columns}; exec '{}' --socket '{}' pane attach {}",
                 env!("CARGO_BIN_EXE_fut"),
@@ -9547,7 +9567,7 @@ async fn public_client_reloads_config_immediately_and_retains_it_after_an_error(
         .env("TMPDIR", harness.root.path().join("runtime"))
         .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
         .env("TERM", "xterm-256color")
-        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .args(script_command_args())
         .arg(format!(
             "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {}",
             env!("CARGO_BIN_EXE_fut"),
@@ -9631,7 +9651,7 @@ async fn public_pane_zoom_toggles_full_width_and_matches_command_dispatch() {
         .env("TMPDIR", harness.root.path().join("runtime"))
         .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
         .env("TERM", "xterm-256color")
-        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .args(script_command_args())
         .arg(format!(
             "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {}",
             env!("CARGO_BIN_EXE_fut"),
@@ -9703,7 +9723,7 @@ async fn public_tab_navigation_and_right_down_splits_share_the_command_catalog()
         .env("TMPDIR", harness.root.path().join("runtime"))
         .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
         .env("TERM", "xterm-256color")
-        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .args(script_command_args())
         .arg(format!(
             "stty rows 30 cols 100; exec '{}' --socket '{}' pane attach {}",
             env!("CARGO_BIN_EXE_fut"),
@@ -9731,7 +9751,7 @@ async fn public_tab_navigation_and_right_down_splits_share_the_command_catalog()
 
     let inherited_marker = split_cwd.path().join("tab-cwd");
     client.send(b"\x02c");
-    client.wait_for("sh-3.2$").await;
+    client.wait_for(TEST_SHELL_PROMPT).await;
     client.send(b"pwd>tab-cwd\n");
     wait_for_nonempty_file(&inherited_marker).await;
     assert_eq!(
@@ -9838,7 +9858,7 @@ async fn isolated_daily_driver_journey() {
             .env("TMPDIR", harness.root.path().join("runtime"))
             .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
             .env("TERM", "xterm-256color")
-            .args(["-q", "/dev/null", "/bin/sh", "-c"])
+            .args(script_command_args())
             .arg(format!(
                 "stty rows 30 cols {columns}; exec '{}' --socket '{}' pane attach {pane}",
                 env!("CARGO_BIN_EXE_fut"),
@@ -9961,7 +9981,7 @@ async fn isolated_keyboard_chaos_journey() {
             .env("TMPDIR", harness.root.path().join("runtime"))
             .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
             .env("TERM", "xterm-256color")
-            .args(["-q", "/dev/null", "/bin/sh", "-c"])
+            .args(script_command_args())
             .arg(format!(
                 "stty rows 30 cols {columns}; exec '{}' --socket '{}' pane attach {pane}",
                 env!("CARGO_BIN_EXE_fut"),
@@ -9971,7 +9991,7 @@ async fn isolated_keyboard_chaos_journey() {
     };
 
     let mut client = spawn_client(current_pane, 100);
-    client.wait_for("sh-3.2$").await;
+    client.wait_for(TEST_SHELL_PROMPT).await;
     pane_processes.insert(
         current_pane,
         chaos_identify_pane(&mut client, harness.root.path(), 0, seed).await,
@@ -10308,7 +10328,7 @@ async fn public_tab_bar_tracks_live_tabs_resizes_content_and_honors_global_posit
             .env("TMPDIR", harness.root.path().join("runtime"))
             .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
             .env("TERM", "xterm-256color")
-            .args(["-q", "/dev/null", "/bin/sh", "-c"])
+            .args(script_command_args())
             .arg(format!(
                 "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {}",
                 env!("CARGO_BIN_EXE_fut"),
@@ -10485,7 +10505,7 @@ done
             .env("TMPDIR", harness.root.path().join("runtime"))
             .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
             .env("TERM", "xterm-256color")
-            .args(["-q", "/dev/null", "/bin/sh", "-c"])
+            .args(script_command_args())
             .arg(format!(
                 "stty rows 24 cols {columns}; exec '{}' --socket '{}' pane attach {pane}",
                 env!("CARGO_BIN_EXE_fut"),
@@ -10699,7 +10719,7 @@ async fn workspace_and_tab_bars_create_and_rename_logical_contexts() {
         .env("TMPDIR", harness.root.path().join("runtime"))
         .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
         .env("TERM", "xterm-256color")
-        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .args(script_command_args())
         .arg(format!(
             "stty rows 24 cols 120; exec '{}' --socket '{}' pane attach {original_pane}",
             env!("CARGO_BIN_EXE_fut"),
@@ -10915,7 +10935,7 @@ async fn public_command_bar_filters_labels_actions_and_matches_direct_dispatch()
         .env("TMPDIR", harness.root.path().join("runtime"))
         .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
         .env("TERM", "xterm-256color")
-        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .args(script_command_args())
         .arg(format!(
             "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {pane_a}",
             env!("CARGO_BIN_EXE_fut"),
@@ -10997,7 +11017,7 @@ async fn extension_commands_launch_from_the_palette_with_focused_context() {
         .env("TMPDIR", harness.root.path().join("runtime"))
         .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
         .env("TERM", "xterm-256color")
-        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .args(script_command_args())
         .arg(format!(
             "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {pane}",
             env!("CARGO_BIN_EXE_fut"),
@@ -11142,7 +11162,7 @@ async fn compiled_rust_extension_conforms_through_public_fut_boundaries() {
         .env("TMPDIR", harness.root.path().join("runtime"))
         .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
         .env("TERM", "xterm-256color")
-        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .args(script_command_args())
         .arg(format!(
             "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {pane_id}",
             env!("CARGO_BIN_EXE_fut"),
@@ -11236,7 +11256,7 @@ async fn extension_command_can_activate_the_target_opened_by_its_child() {
         .env("TMPDIR", harness.root.path().join("runtime"))
         .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
         .env("TERM", "xterm-256color")
-        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .args(script_command_args())
         .arg(format!(
             "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {pane}",
             env!("CARGO_BIN_EXE_fut"),
@@ -11291,7 +11311,7 @@ async fn keyboard_copy_search_uses_client_pbcopy_and_surfaces_success_and_failur
             .env("TMPDIR", harness.root.path().join("runtime"))
             .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
             .env("TERM", "xterm-256color")
-            .args(["-q", "/dev/null", "/bin/sh", "-c"])
+            .args(script_command_args())
             .arg(format!(
                 "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {pane}",
                 env!("CARGO_BIN_EXE_fut"),
@@ -11556,7 +11576,7 @@ async fn public_client_exits_copy_mode_on_unsolicited_cursor_loss() {
         .env("TMPDIR", harness.root.path().join("runtime"))
         .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
         .env("TERM", "xterm-256color")
-        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .args(script_command_args())
         .arg(format!(
             "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {pane}",
             env!("CARGO_BIN_EXE_fut"),
@@ -11885,7 +11905,7 @@ async fn public_client_paste_is_mode_aware_focused_literal_and_not_a_fut_prefix(
         .env("TMPDIR", harness.root.path().join("runtime"))
         .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
         .env("TERM", "xterm-256color")
-        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .args(script_command_args())
         .arg(format!(
             "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {}",
             env!("CARGO_BIN_EXE_fut"),
@@ -11938,7 +11958,7 @@ async fn command_bar_create_failure_releases_input_to_the_original_terminal() {
         .env("TMPDIR", harness.root.path().join("runtime"))
         .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
         .env("TERM", "xterm-256color")
-        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .args(script_command_args())
         .arg(format!(
             "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {pane}",
             env!("CARGO_BIN_EXE_fut"),
@@ -12231,7 +12251,7 @@ async fn public_client_transfers_focus_when_the_focused_pane_exits() {
         .env("TMPDIR", harness.root.path().join("runtime"))
         .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
         .env("TERM", "xterm-256color")
-        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .args(script_command_args())
         .arg(format!(
             "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {}",
             env!("CARGO_BIN_EXE_fut"),
@@ -12274,7 +12294,7 @@ async fn public_client_ctrl_b_c_creates_routes_and_navigates_back() {
         .env("TMPDIR", harness.root.path().join("runtime"))
         .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
         .env("TERM", "xterm-256color")
-        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .args(script_command_args())
         .arg(format!(
             "stty rows 24 cols 80; exec '{}' --socket '{}' terminal attach {}",
             env!("CARGO_BIN_EXE_fut"),
@@ -13066,7 +13086,7 @@ async fn public_ctrl_d_closes_a_tab_and_returns_to_its_predecessor() {
         .env("TMPDIR", harness.root.path().join("runtime"))
         .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
         .env("TERM", "xterm-256color")
-        .args(["-q", "/dev/null", "/bin/sh", "-c"])
+        .args(script_command_args())
         .arg(format!(
             "stty rows 24 cols 80; exec '{}' --socket '{}' terminal attach {}",
             env!("CARGO_BIN_EXE_fut"),

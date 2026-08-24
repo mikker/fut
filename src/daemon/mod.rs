@@ -1872,11 +1872,11 @@ async fn process_name(pid: u32) -> Option<String> {
     }
     #[cfg(target_os = "linux")]
     {
-        return tokio::fs::read_to_string(format!("/proc/{pid}/comm"))
+        tokio::fs::read_to_string(format!("/proc/{pid}/comm"))
             .await
             .ok()
             .map(|name| name.trim().to_owned())
-            .filter(|name| !name.is_empty());
+            .filter(|name| !name.is_empty())
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
