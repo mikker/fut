@@ -123,13 +123,6 @@ pub(super) fn items(
                     .integration
                     .as_ref()
                     .and_then(|integration| integration.source.as_deref())
-                    .or_else(|| {
-                        path.pane
-                            .activity
-                            .detection
-                            .as_ref()
-                            .map(|detection| detection.agent.as_str())
-                    })
                     .unwrap_or("agent"),
             ),
             current: path.pane.id == focused.pane_id,
@@ -169,7 +162,7 @@ fn focused_ancestry(snapshot: &ResourceSnapshot, focused: &SelectedTarget) -> Fo
 
 fn in_scope(path: PanePathRef<'_>, focused: FocusedAncestry, scope: AgentScope) -> bool {
     path_is_live(path)
-        && (path.pane.activity.has_active_integration() || path.pane.activity.detection.is_some())
+        && path.pane.activity.has_active_integration()
         && match scope {
             AgentScope::Tab => path.tab.id == focused.tab_id,
             AgentScope::Workspace => path.workspace.id == focused.workspace_id,

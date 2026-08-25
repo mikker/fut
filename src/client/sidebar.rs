@@ -3140,7 +3140,7 @@ mod tests {
     }
 
     #[test]
-    fn screen_detected_codex_is_visible_before_its_first_lifecycle_report() {
+    fn interactive_agent_projections_require_an_active_integration() {
         let (mut snapshot, focused) = fixture(&["main"], 0);
         let pane = &mut snapshot.sessions[0].workspaces[0].tabs[0].panes[0];
         pane.activity.detection = Some(AgentDetection {
@@ -3155,9 +3155,46 @@ mod tests {
             AgentScope::Global,
         );
 
+        assert!(
+            agents.items.is_empty(),
+            "screen detection alone is excluded"
+        );
+        assert!(
+            !agents::has_items(&snapshot, &focused, AgentScope::Global),
+            "screen detection alone does not make an automatic sidebar relevant"
+        );
+
+        let pane = &mut snapshot.sessions[0].workspaces[0].tabs[0].panes[0];
+        pane.activity.integration = Some(AgentIntegration {
+            active: false,
+            source: Some("codex".into()),
+            ..AgentIntegration::default()
+        });
+        let agents = AgentsComponent::open(
+            &snapshot,
+            &focused,
+            &NotificationState::default(),
+            AgentScope::Global,
+        );
+        assert!(
+            agents.items.is_empty(),
+            "an exited integration is not reactivated by screen detection"
+        );
+
+        integrate(
+            &mut snapshot.sessions[0].workspaces[0].tabs[0].panes[0],
+            "codex",
+            AgentState::Idle,
+        );
+        let agents = AgentsComponent::open(
+            &snapshot,
+            &focused,
+            &NotificationState::default(),
+            AgentScope::Global,
+        );
+
         assert_eq!(agents.items.len(), 1);
         assert_eq!(agents.items[0].source, "codex");
-        assert_eq!(agents.items[0].status(), "idle");
     }
 
     #[test]

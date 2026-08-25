@@ -107,18 +107,19 @@ fut --json agent read TERMINAL_ID --source recent-unwrapped --lines 200
 `available` means the integrated terminal is open and not currently working.
 Blocked agents remain available for a follow-up prompt.
 
-## Client sidebar
+## Interactive agent projections
 
-The default right sidebar lists live explicitly integrated terminals in the
-focused session and stays undocked when that projection is empty. Configure an
-Agents component on either side with `scope = "tab"`, `"workspace"`,
-`"session"`, or `"global"`. Tab, workspace, and session scope use fresh live
-focus ancestry when available and otherwise fall back to the selected IDs;
-global scope needs no focus anchor. Any closing agent-row ancestor excludes the
-row, and detection-only activity does not qualify. Global rows navigate directly
-across sessions by pane ID. The
-Notifications dialog remains separate and tracks daemon-wide unread blocked or
-completed attention.
+The global Agents dialog (`Ctrl-b a`) and Agents sidebars list only live,
+explicitly integrated terminals. The default right sidebar uses the focused
+session and stays undocked when that projection is empty. Configure an Agents
+component on either side with `scope = "tab"`, `"workspace"`, `"session"`, or
+`"global"`. Tab, workspace, and session scope use fresh live focus ancestry
+when available and otherwise fall back to the selected IDs; global scope needs
+no focus anchor. Any closing agent-row ancestor excludes the row, and
+detection-only activity does not qualify. Global rows navigate directly across
+sessions by pane ID. The Notifications dialog remains separate and tracks
+daemon-wide unread blocked or completed attention, including attention inferred
+by best-effort screen detection.
 
 ## Terminal output
 
