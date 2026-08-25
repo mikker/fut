@@ -8749,6 +8749,60 @@ async fn public_client_preserves_host_palette_indices_and_truecolor() {
 }
 
 #[tokio::test]
+async fn public_close_confirmation_consumes_paste_and_mouse_input() {
+    let expected = b"SAFE_INPUT";
+    let harness = Harness::start(&format!(
+        "stty raw -echo; printf '\\033[?1000h\\033[?1006hCLOSE_INPUT_READY\\r\\n'; dd bs=1 count={} of=close-input.tmp 2>/dev/null; mv close-input.tmp close-input.capture; printf 'CLOSE_INPUT_CAPTURED\\r\\n'; exec cat >/dev/null",
+        expected.len(),
+    ))
+    .await;
+    let pane = harness.resources().await.sessions[0].workspaces[0].tabs[0].panes[0].id;
+
+    let mut command = Command::new("/usr/bin/script");
+    command
+        .env_clear()
+        .env("HOME", harness.root.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", harness.root.path().join("runtime"))
+        .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+        .env("TERM", "xterm-256color")
+        .args(script_command_args())
+        .arg(format!(
+            "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {pane}",
+            env!("CARGO_BIN_EXE_fut"),
+            harness.socket.display(),
+        ));
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("CLOSE_INPUT_READY").await;
+    client.send(b"\x02x");
+    client.wait_for("Close pane? (y/n)").await;
+
+    client.send(
+        &[
+            b"\x1b[200~LEAKED_PASTE\x1b[201~".to_vec(),
+            sgr_mouse(0, 8, 10, false),
+            sgr_mouse(0, 8, 10, true),
+        ]
+        .concat(),
+    );
+    time::sleep(Duration::from_millis(100)).await;
+    assert!(client.text().contains("Close pane? (y/n)"));
+    assert!(!harness.root.path().join("cwd/close-input.capture").exists());
+
+    client.send(b"n");
+    client.send(expected);
+    client.wait_for("CLOSE_INPUT_CAPTURED").await;
+    assert_eq!(
+        fs::read(harness.root.path().join("cwd/close-input.capture")).unwrap(),
+        expected
+    );
+
+    client.send(b"\x02d");
+    client.wait_success().await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn public_held_mouse_releases_before_modal_focus_and_detach_transitions() {
     let modal_expected = b"\x1b[<0;8;5M\x1b[<0;8;5m";
     let copy_expected = b"\x1b[<0;8;6M\x1b[<0;8;6m";

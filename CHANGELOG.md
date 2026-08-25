@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Close confirmations now prevent pasted or pointer input from reaching terminals and controls behind the prompt.
+
 ## 0.13
 
 - `fut agent prompt --stdin` now accepts multiline and generated prompts without shell argument interpolation.

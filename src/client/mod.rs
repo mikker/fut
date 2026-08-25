@@ -1466,22 +1466,30 @@ async fn run_loop(
                 if !matches!(&event, Event::Mouse(_)) {
                     mouse_input.cancel_local_drags();
                 }
-                match event {
-                    Event::Key(key) if close_target.is_confirming() && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                match close_target.route_confirmation_input(&event) {
+                    CloseConfirmationInput::Pass => {}
+                    CloseConfirmationInput::Confirm {
+                        request_id,
+                        selector,
+                    } => {
                         toasts.clear();
-                        if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
-                            if let Some((request_id, selector)) = close_target.confirm() {
-                                send_request(
-                                    framed,
-                                    Some(request_id),
-                                    ClientMessage::CloseTarget { selector },
-                                ).await?;
-                            }
-                        } else {
-                            close_target.cancel();
-                        }
+                        send_request(
+                            framed,
+                            Some(request_id),
+                            ClientMessage::CloseTarget { selector },
+                        )
+                        .await?;
                         force_draw = true;
+                        continue;
                     }
+                    CloseConfirmationInput::Cancel => {
+                        toasts.clear();
+                        force_draw = true;
+                        continue;
+                    }
+                    CloseConfirmationInput::Consume => continue,
+                }
+                match event {
                     Event::Key(key) if temporary_command.is_some() => {
                         if let Some(bytes) = encode_key(key) {
                             temporary_command.as_mut().expect("command exists").input(bytes).await?;
@@ -4861,6 +4869,17 @@ enum CloseTargetStart {
     },
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum CloseConfirmationInput {
+    Pass,
+    Confirm {
+        request_id: Uuid,
+        selector: TargetSelector,
+    },
+    Cancel,
+    Consume,
+}
+
 impl CloseTargetState {
     fn begin(&mut self, selector: TargetSelector, confirm: bool) -> CloseTargetStart {
         if !matches!(self, Self::Idle) {
@@ -4880,6 +4899,30 @@ impl CloseTargetState {
 
     fn is_confirming(&self) -> bool {
         matches!(self, Self::Confirming { .. })
+    }
+
+    fn route_confirmation_input(&mut self, event: &Event) -> CloseConfirmationInput {
+        if !self.is_confirming() {
+            return CloseConfirmationInput::Pass;
+        }
+        match event {
+            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                    let (request_id, selector) = self
+                        .confirm()
+                        .expect("confirming close has a captured target");
+                    CloseConfirmationInput::Confirm {
+                        request_id,
+                        selector,
+                    }
+                } else {
+                    self.cancel();
+                    CloseConfirmationInput::Cancel
+                }
+            }
+            Event::Resize(_, _) => CloseConfirmationInput::Pass,
+            _ => CloseConfirmationInput::Consume,
+        }
     }
 
     fn confirm(&mut self) -> Option<(Uuid, TargetSelector)> {
@@ -6205,6 +6248,35 @@ mod tests {
         };
         assert_eq!(selector, pane);
         assert!(state.complete(Some(request_id)));
+    }
+
+    #[test]
+    fn close_confirmation_exclusively_owns_paste_and_pointer_input() {
+        let pane = TargetSelector::Pane(crate::domain::PaneId::new());
+        let mut state = CloseTargetState::default();
+        assert!(matches!(
+            state.begin(pane, true),
+            CloseTargetStart::Confirming
+        ));
+
+        assert_eq!(
+            state.route_confirmation_input(&Event::Paste("echo leaked".into())),
+            CloseConfirmationInput::Consume
+        );
+        assert_eq!(
+            state.route_confirmation_input(&Event::Mouse(HostMouseEvent {
+                kind: HostMouseEventKind::Down(HostMouseButton::Left),
+                column: 12,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            })),
+            CloseConfirmationInput::Consume
+        );
+        assert_eq!(
+            state.route_confirmation_input(&Event::Resize(120, 40)),
+            CloseConfirmationInput::Pass
+        );
+        assert!(state.is_confirming());
     }
 
     #[test]
