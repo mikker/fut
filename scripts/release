@@ -45,7 +45,7 @@ perl -0pi -e "s/^version: \x22[^\x22]+\x22/version: \x22$version\x22/m" docs/_co
 echo "Releasing $version"
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
-RUST_TEST_THREADS=1 cargo test --all-targets --all-features
+RUST_TEST_THREADS=4 cargo test --all-targets --all-features
 
 if ! git diff --quiet -- Cargo.toml Cargo.lock docs/_config.yml; then
   git add Cargo.toml Cargo.lock docs/_config.yml
