@@ -2287,7 +2287,7 @@ mod tests {
         let mut env = HashMap::new();
         env.insert(OsString::from("MARKER"), marker.as_os_str().to_owned());
         let handle = spawn_terminal(shell(
-            "trap 'printf handled > \"$MARKER\"; exit 0' HUP; printf READY; while :; do sleep 1; done",
+            "trap 'printf handled > \"$MARKER\"; exit 0' HUP; printf READY; while :; do read -r _ || :; done",
             env,
         ))
         .unwrap();
