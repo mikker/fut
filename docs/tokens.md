@@ -42,8 +42,8 @@ These may appear in groups under `ui.tab_bar.left`, `center`, or `right`.
 | `tab.pane_count` | Number of panes in the current tab |
 | `client.zoom` | Configured zoom icon while zoomed; otherwise empty |
 | `client.help` | Contextual create/rename/close help while the tab bar is keyboard-active |
-| `client.waiting` | `•` and the count of terminals with daemon-wide unread blocked or completed attention across Fut; empty when zero |
-| `session.waiting` | `•` and the count of terminals with daemon-wide unread blocked or completed attention in the current session; empty when zero |
+| `client.waiting` | Configured `ui.icons.notification` and this client's count of unread agent notifications and terminal bells across Fut; empty when zero |
+| `session.waiting` | Configured `ui.icons.notification` and this client's count of unread agent notifications and terminal bells in the current session; empty when zero |
 
 The special `{ component = "tabs" }` segment renders the focus-aware repeated tab collection. At most one may occur in a tab bar.
 
@@ -60,7 +60,7 @@ These may appear only under `ui.tab_bar.item.segments`.
 | `tab.closing` | Closing icon while closing; otherwise empty |
 | `tab.pane_count` | Number of panes in the tab |
 | `tab.icon` | Tab icon from the selected preset |
-| `tab.activity` | A spinner for working, `!` for blocked, or `•` for unseen completion; empty when inactive |
+| `tab.activity` | Rolled-up agent/terminal attention: spinner for working, `!` for blocked or BEL, or `•` for completion; empty when inactive |
 
 Current, closing, and keyboard-selected styles are composed over every item segment.
 
@@ -78,7 +78,7 @@ These may appear in the `row.left`, `body`, `right`, or `detail` fields of a `co
 | `workspace.closing` | Closing icon while closing; otherwise empty |
 | `workspace.tab_count` | Number of tabs in the workspace |
 | `workspace.icon` | Workspace icon from the selected preset |
-| `workspace.activity` | A spinner for working, `!` for blocked, or `•` for unseen completion; empty when inactive |
+| `workspace.activity` | Rolled-up agent/terminal attention: spinner for working, `!` for blocked or BEL, or `•` for completion; empty when inactive |
 | `workspace.git_branch` | Current branch at the live workspace location; `multiple` when panes disagree, empty outside a Git work tree or until resolved |
 | `workspace.git_added` | `+N` inserted lines against `HEAD`, styled `added`; empty when none |
 | `workspace.git_deleted` | `-N` deleted lines against `HEAD`, styled `deleted`; empty when none |

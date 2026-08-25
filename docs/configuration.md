@@ -45,6 +45,19 @@ Files must be regular UTF-8 files no larger than 64 KiB. Unknown fields, invalid
 
 Closing a pane, tab, or workspace asks for confirmation by default. Set `ui.confirm_close = false` to perform those close actions immediately. This setting is client-local and applies to both keyboard commands and contextual menus.
 
+Terminal-native alerts are configured at the top level. They are separate
+from coding-agent lifecycle notifications:
+
+```toml
+[alerts]
+signal_outer_terminal = true # Optional; default false.
+```
+
+`signal_outer_terminal` is client-local and emits one BEL when a newly unseen
+terminal bell arrives; whether that BEL is audible, visual, or ignored remains
+under the containing terminal emulator's control. It is deliberately off by
+default.
+
 ## Example
 
 This example is intentionally customized; it is not a dump of the defaults.
@@ -55,6 +68,9 @@ extensions = [
   "/Users/me/.config/fut/extensions/review-status",
   "/Users/me/.config/fut/extensions/run",
 ]
+
+[alerts]
+signal_outer_terminal = false
 
 [ui]
 pane_layout = "splits" # "splits" or "accordion"
@@ -103,6 +119,7 @@ preset = "nerd_font" # "ascii", "unicode", or "nerd_font"
 # workspace = "W"
 # tab = "T"
 # zoom = "zoom"
+# notification = "• " # Prefix before the unread notification count; spacing is preserved.
 # vertical_divider = "|"
 # pill_left = ""       # Focused tab/workspace pill caps; empty outside "nerd_font".
 # pill_right = ""

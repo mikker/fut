@@ -1737,7 +1737,9 @@ fn render_minimized_workspace_row(
     } else if let Some(activity) = item.activity {
         let role = match activity {
             ActivityIndicator::Working => SemanticStyle::Activity,
-            ActivityIndicator::Blocked | ActivityIndicator::Completed => SemanticStyle::Attention,
+            ActivityIndicator::Blocked | ActivityIndicator::Completed | ActivityIndicator::Bell => {
+                SemanticStyle::Attention
+            }
         };
         (
             activity.marker(spinner_frame).into(),
@@ -2145,9 +2147,9 @@ fn render_workspace_row(
             |activity| {
                 let style = match activity {
                     ActivityIndicator::Working => SemanticStyle::Activity,
-                    ActivityIndicator::Blocked | ActivityIndicator::Completed => {
-                        SemanticStyle::Attention
-                    }
+                    ActivityIndicator::Blocked
+                    | ActivityIndicator::Completed
+                    | ActivityIndicator::Bell => SemanticStyle::Attention,
                 };
                 TokenValue::styled(activity.marker(spinner_frame), style)
             },

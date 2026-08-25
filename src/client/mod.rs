@@ -30,7 +30,8 @@ mod toast;
 
 use std::{
     collections::{BTreeMap, HashMap},
-    io,
+    fs,
+    io::{self, Write},
     num::NonZeroU16,
     path::{Path, PathBuf},
     process::Stdio,
@@ -317,13 +318,19 @@ pub async fn attach_navigator(
     let staged = stage_ui_config(config_location)?;
     let (columns, rows) = crossterm::terminal::size().context("read terminal size")?;
     let size = TerminalSize { columns, rows };
-    let (mut framed, selected, catalog) =
-        connect_interactive(socket_path, Some(selector), size).await?;
+    let (mut framed, selected, catalog, alerts) = connect_interactive(
+        socket_path,
+        Some(selector),
+        size,
+        alert_client_id(socket_path)?,
+    )
+    .await?;
     let ui = staged.materialize(&catalog)?;
     let result = run(
         &mut terminal,
         &mut framed,
         selected,
+        alerts,
         ui,
         catalog.generation,
         socket_path,
@@ -348,8 +355,14 @@ pub(crate) async fn attach_with_ui(
     config_location: &config::ConfigLocation,
 ) -> anyhow::Result<()> {
     let (columns, rows) = crossterm::terminal::size().context("read terminal size")?;
-    let (mut framed, selected, catalog) =
-        connect_interactive(socket_path, selector, TerminalSize { columns, rows }).await?;
+    let alert_client_id = alert_client_id(socket_path)?;
+    let (mut framed, selected, catalog, alerts) = connect_interactive(
+        socket_path,
+        selector,
+        TerminalSize { columns, rows },
+        alert_client_id,
+    )
+    .await?;
     let ui = staged.materialize(&catalog)?;
 
     // Host terminal state is changed only after a successful handshake.
@@ -359,6 +372,7 @@ pub(crate) async fn attach_with_ui(
         &mut terminal,
         &mut framed,
         selected,
+        alerts,
         ui,
         catalog.generation,
         socket_path,
@@ -370,14 +384,43 @@ pub(crate) async fn attach_with_ui(
     result
 }
 
+fn alert_client_id(socket_path: &Path) -> anyhow::Result<crate::domain::ClientId> {
+    if let Ok(value) = std::env::var("FUT_ALERT_CLIENT_ID") {
+        return value.parse().context("parse FUT_ALERT_CLIENT_ID");
+    }
+    let identity = fs::canonicalize("/dev/fd/0")
+        .map(|path| path.to_string_lossy().into_owned())
+        .or_else(|_| std::env::var("TERM_SESSION_ID"))
+        .unwrap_or_else(|_| format!("pid-{}", std::process::id()));
+    let digest = Sha256::digest(identity.as_bytes());
+    let key = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let directory = socket_path.parent().unwrap_or_else(|| Path::new("."));
+    let path = directory.join(format!("alert-client-{key}"));
+    if let Ok(value) = fs::read_to_string(&path) {
+        return value
+            .trim()
+            .parse()
+            .context("parse retained alert client ID");
+    }
+    let client_id = crate::domain::ClientId::new();
+    fs::write(&path, client_id.to_string())
+        .with_context(|| format!("retain alert client identity at {}", path.display()))?;
+    Ok(client_id)
+}
+
 async fn connect_interactive(
     socket_path: &Path,
     selector: Option<TargetSelector>,
     size: TerminalSize,
+    alert_client_id: crate::domain::ClientId,
 ) -> anyhow::Result<(
     Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     SelectedView,
     crate::protocol::ExtensionCatalog,
+    crate::alerts::ClientAlertSnapshot,
 )> {
     let stream = UnixStream::connect(socket_path)
         .await
@@ -412,7 +455,20 @@ async fn connect_interactive(
         ServerMessage::Error { code, message } => bail!("daemon error ({code}): {message}"),
         message => bail!("expected welcome from daemon, received {message:?}"),
     };
-    Ok((framed, selected.0, selected.1))
+    send_request(
+        &mut framed,
+        None,
+        ClientMessage::WatchAlerts {
+            client_id: alert_client_id,
+        },
+    )
+    .await?;
+    Ok((
+        framed,
+        selected.0,
+        selected.1,
+        crate::alerts::ClientAlertSnapshot::default(),
+    ))
 }
 
 async fn connect_control_navigator(
@@ -515,10 +571,15 @@ async fn initial_navigator(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the client runtime coordinates transport, initial snapshots, UI, and configuration"
+)]
 async fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     selected: SelectedView,
+    alerts: crate::alerts::ClientAlertSnapshot,
     ui: UiConfig,
     catalog_generation: u64,
     socket_path: &Path,
@@ -533,6 +594,7 @@ async fn run(
         terminal,
         framed,
         selected,
+        alerts,
         ui,
         catalog_generation,
         socket_path,
@@ -552,6 +614,7 @@ async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     selected: SelectedView,
+    alerts: crate::alerts::ClientAlertSnapshot,
     mut ui: UiConfig,
     mut extension_generation: u64,
     socket_path: &Path,
@@ -564,6 +627,7 @@ async fn run_loop(
     let mut mouse_input = MouseInputState::default();
     let mut view = ViewState::new(selected)?;
     let mut resources = ResourceState::default();
+    resources.accept_alerts(alerts);
     let mut surface: Option<ClientSurface> = None;
     let mut temporary_command: Option<TemporaryCommandSurface> = None;
     let mut copy_mode: Option<CopyModeState> = None;
@@ -720,6 +784,30 @@ async fn run_loop(
                             };
                         if switching_completed {
                             surface = None;
+                        }
+                    }
+                    ServerMessage::AlertsChanged { snapshot } => {
+                        let waiting_before = resources.snapshot().map_or(0, |snapshot| {
+                            resources.notifications().waiting_count(snapshot)
+                        });
+                        if resources.accept_alerts(snapshot) {
+                            let waiting_after = resources.snapshot().map_or(0, |snapshot| {
+                                resources.notifications().waiting_count(snapshot)
+                            });
+                            if ui.alerts.signal_outer_terminal && waiting_after > waiting_before {
+                                io::stdout().write_all(b"\x07")?;
+                                io::stdout().flush()?;
+                            }
+                            if let Some(snapshot) = resources.snapshot() {
+                                refresh_surface_resources(
+                                    &mut surface,
+                                    snapshot,
+                                    view.focused(),
+                                    &workspace_history,
+                                    resources.notifications(),
+                                );
+                            }
+                            force_draw = true;
                         }
                     }
                     ServerMessage::SnapshotDelta { terminal_id, delta } => {
@@ -1718,6 +1806,14 @@ async fn run_loop(
                                 }
                                 force_draw = true;
                             }
+                            NotificationsAction::Acknowledge(terminal_id, observed) => {
+                                send(
+                                    framed,
+                                    ClientMessage::AcknowledgeAlerts { terminal_id, observed },
+                                )
+                                .await?;
+                                force_draw = true;
+                            }
                         }
                     }
                     Event::Key(key) if matches!(surface.as_ref(), Some(ClientSurface::Navigator(_))) => {
@@ -2686,6 +2782,18 @@ async fn run_loop(
                 .then(|| resources.attention_revision(focused_terminal_id))
                 .flatten()
                 .filter(|_| rename.is_none() && !toasts.is_visible());
+                let rendered_alert = matches!(
+                    surface.as_ref(),
+                    None
+                        | Some(ClientSurface::Sidebar(_))
+                        | Some(ClientSurface::TabBar(_))
+                        | Some(ClientSurface::ContextMenu(_))
+                )
+                .then(|| resources.notifications().terminal_alert(focused_terminal_id))
+                .flatten()
+                .filter(|alert| alert.unseen())
+                .map(|alert| alert.state.cursor())
+                .filter(|_| rename.is_none() && !toasts.is_visible());
                 let draw_started = std::time::Instant::now();
                 io::stdout().sync_update(|stdout| -> io::Result<()> {
                     let mut rendered_cursor = None;
@@ -2869,6 +2977,16 @@ async fn run_loop(
                         ClientMessage::AcknowledgeAgent {
                             terminal_id: focused_terminal_id,
                             event_revision,
+                        },
+                    )
+                    .await?;
+                }
+                if let Some(observed) = rendered_alert {
+                    send(
+                        framed,
+                        ClientMessage::AcknowledgeAlerts {
+                            terminal_id: focused_terminal_id,
+                            observed,
                         },
                     )
                     .await?;

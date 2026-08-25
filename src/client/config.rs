@@ -709,6 +709,7 @@ pub(super) struct IconsConfig {
     pub workspace: Option<String>,
     pub tab: Option<String>,
     pub zoom: Option<String>,
+    pub notification: Option<String>,
     pub vertical_divider: Option<String>,
     pub pill_left: Option<String>,
     pub pill_right: Option<String>,
@@ -724,6 +725,7 @@ impl Default for IconsConfig {
             workspace: None,
             tab: None,
             zoom: None,
+            notification: None,
             vertical_divider: None,
             pill_left: None,
             pill_right: None,
@@ -739,6 +741,7 @@ pub(super) struct IconSet {
     pub workspace: String,
     pub tab: String,
     pub zoom: String,
+    pub notification: String,
     pub vertical_divider: String,
     pub pill_left: String,
     pub pill_right: String,
@@ -747,9 +750,11 @@ pub(super) struct IconSet {
 impl IconsConfig {
     pub fn resolve(&self) -> IconSet {
         let defaults = match self.preset {
-            IconPreset::Ascii => ["*", "x", "...", "", "", "zoom", "|", "", ""],
-            IconPreset::Unicode => ["•", "×", "…", "", "", "zoom", "│", "", ""],
-            IconPreset::NerdFont => ["󰄬", "󰅖", "…", "󰉋", "󰓩", "󰍉", "│", "\u{e0b6}", "\u{e0b4}"],
+            IconPreset::Ascii => ["*", "x", "...", "", "", "zoom", "• ", "|", "", ""],
+            IconPreset::Unicode => ["•", "×", "…", "", "", "zoom", "• ", "│", "", ""],
+            IconPreset::NerdFont => [
+                "󰄬", "󰅖", "…", "󰉋", "󰓩", "󰍉", "• ", "│", "\u{e0b6}", "\u{e0b4}",
+            ],
         };
         IconSet {
             current: self.current.clone().unwrap_or_else(|| defaults[0].into()),
@@ -758,15 +763,19 @@ impl IconsConfig {
             workspace: self.workspace.clone().unwrap_or_else(|| defaults[3].into()),
             tab: self.tab.clone().unwrap_or_else(|| defaults[4].into()),
             zoom: self.zoom.clone().unwrap_or_else(|| defaults[5].into()),
+            notification: self
+                .notification
+                .clone()
+                .unwrap_or_else(|| defaults[6].into()),
             vertical_divider: self
                 .vertical_divider
                 .clone()
-                .unwrap_or_else(|| defaults[6].into()),
-            pill_left: self.pill_left.clone().unwrap_or_else(|| defaults[7].into()),
+                .unwrap_or_else(|| defaults[7].into()),
+            pill_left: self.pill_left.clone().unwrap_or_else(|| defaults[8].into()),
             pill_right: self
                 .pill_right
                 .clone()
-                .unwrap_or_else(|| defaults[8].into()),
+                .unwrap_or_else(|| defaults[9].into()),
         }
     }
 }
@@ -1370,6 +1379,8 @@ pub(crate) struct UiConfig {
     pub(super) tab_bar: TabBarConfig,
     pub(super) sidebar: SidebarConfig,
     #[serde(skip)]
+    pub(super) alerts: AlertsConfig,
+    #[serde(skip)]
     pub(super) extensions: Vec<Extension>,
     #[serde(skip)]
     extension_config: ExtensionConfigCatalog,
@@ -1386,10 +1397,17 @@ impl Default for UiConfig {
             styles: StylesConfig::default(),
             tab_bar: TabBarConfig::default(),
             sidebar: SidebarConfig::default(),
+            alerts: AlertsConfig::default(),
             extensions: Vec::new(),
             extension_config: ExtensionConfigCatalog::default(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct AlertsConfig {
+    pub(super) signal_outer_terminal: bool,
 }
 
 impl UiConfig {
@@ -1410,6 +1428,7 @@ impl UiConfig {
             icons.workspace,
             icons.tab,
             icons.zoom,
+            icons.notification,
             icons.vertical_divider,
             icons.pill_left,
             icons.pill_right,
@@ -1424,6 +1443,7 @@ impl UiConfig {
 #[serde(default, deny_unknown_fields)]
 struct Config {
     ui: UiConfig,
+    alerts: AlertsConfig,
     trusted_commands: BTreeMap<String, PaletteCommand>,
     extension_commands: BTreeMap<String, ExtensionCommandConfig>,
     extensions: Vec<PathBuf>,
@@ -1808,6 +1828,7 @@ fn materialize_config(
     extension_config: ExtensionConfigCatalog,
     source: Option<&Path>,
 ) -> Result<UiConfig> {
+    config.ui.alerts = config.alerts;
     let prefix = parse_key(&config.ui.prefix)
         .map(|(bytes, _)| bytes)
         .context("ui.prefix must be one character or a named key such as ctrl-a")?;
@@ -2362,6 +2383,7 @@ fn validate(ui: &UiConfig, extensions: &[Extension]) -> Result<()> {
         ("workspace", &ui.icons.workspace),
         ("tab", &ui.icons.tab),
         ("zoom", &ui.icons.zoom),
+        ("notification", &ui.icons.notification),
         ("vertical_divider", &ui.icons.vertical_divider),
         ("pill_left", &ui.icons.pill_left),
         ("pill_right", &ui.icons.pill_right),
@@ -2730,6 +2752,7 @@ confirm_close = false
 [ui.icons]
 preset = "nerd_font"
 workspace = "W"
+notification = "N "
 
 [ui.styles.attention]
 foreground = "#12abEF"
@@ -2778,6 +2801,7 @@ components = [
             }
         ));
         assert_eq!(config.icons.resolve().workspace, "W");
+        assert_eq!(config.icons.resolve().notification, "N ");
         assert_eq!(config.icons.resolve().pill_left, "\u{e0b6}");
         assert_eq!(config.icons.resolve().pill_right, "\u{e0b4}");
         assert_eq!(UiConfig::default().icons.resolve().pill_left, "");

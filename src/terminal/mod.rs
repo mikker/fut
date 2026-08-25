@@ -11,7 +11,8 @@ pub(crate) use ghostty::{
 };
 pub(crate) use runtime::AttachmentGeometry;
 pub use runtime::{
-    CommandError, SpawnSpec, TerminalEvent, TerminalHandle, TerminalLifecycle, spawn_terminal,
+    CommandError, SpawnSpec, TerminalActivity, TerminalEvent, TerminalHandle, TerminalLifecycle,
+    spawn_terminal,
 };
 
 /// Benchmark-only access to the VT feed → snapshot path. Not part of the API.

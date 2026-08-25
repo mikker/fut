@@ -1,7 +1,10 @@
 use std::{
     collections::HashMap,
     io::Write,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -155,6 +158,7 @@ pub(super) struct GhosttyTerminal {
     kitty_placements: PlacementIterator<'static>,
     kitty_png_cache: HashMap<u64, Vec<u8>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    bell_count: Arc<AtomicU64>,
     size: TerminalSize,
     revision: u64,
     synchronized_output_started: Option<Instant>,
@@ -188,6 +192,11 @@ impl GhosttyTerminal {
                 let _ = writer.flush();
             }
         })?;
+        let bell_count = Arc::new(AtomicU64::new(0));
+        let callback_bell_count = Arc::clone(&bell_count);
+        terminal.on_bell(move |_| {
+            callback_bell_count.fetch_add(1, Ordering::Relaxed);
+        })?;
 
         Ok(Self {
             terminal,
@@ -201,6 +210,7 @@ impl GhosttyTerminal {
             kitty_placements: PlacementIterator::new()?,
             kitty_png_cache: HashMap::new(),
             writer,
+            bell_count,
             size,
             revision: 0,
             synchronized_output_started: None,
@@ -217,6 +227,10 @@ impl GhosttyTerminal {
     /// through the parser and pay for one snapshot at the end of the batch.
     pub(super) fn vt_write(&mut self, bytes: &[u8]) {
         self.terminal.vt_write(bytes);
+    }
+
+    pub(super) fn bell_count(&self) -> u64 {
+        self.bell_count.load(Ordering::Relaxed)
     }
 
     /// Snapshot half of `feed`. Respects synchronized-output suppression the
@@ -2045,6 +2059,33 @@ mod tests {
         let actual = split.snapshot().unwrap();
         assert_eq!(actual.cells, expected.cells);
         assert_eq!(actual.cursor, expected.cursor);
+    }
+
+    #[test]
+    fn parser_counts_real_bells_across_fragmented_sequences() {
+        let bytes = b"\x1b[31m\x07red\x1b[0m\x07\x1b]2;title\x07done";
+        let mut whole = terminal(20, 2);
+        whole.vt_write(bytes);
+        let mut split = terminal(20, 2);
+        for byte in bytes {
+            split.vt_write(std::slice::from_ref(byte));
+        }
+
+        // The BEL ending OSC 2 is a string terminator, not an audible bell.
+        assert_eq!(whole.bell_count(), 2);
+        assert_eq!(split.bell_count(), 2);
+        assert_eq!(
+            split.snapshot().unwrap().cells,
+            whole.snapshot().unwrap().cells
+        );
+    }
+
+    #[test]
+    fn repeated_bells_are_a_compact_monotonic_counter() {
+        let mut terminal = terminal(4, 1);
+        terminal.vt_write(b"\x07\x07");
+        terminal.vt_write(b"\x07");
+        assert_eq!(terminal.bell_count(), 3);
     }
 
     #[test]

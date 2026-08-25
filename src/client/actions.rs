@@ -228,13 +228,13 @@ pub(super) const COMMANDS: [ActionDefinition; 48] = [
     },
     ActionDefinition {
         action: ClientAction::OpenNotifications,
-        title: "Open terminals waiting",
-        keywords: "notifications unread waiting agents completed blocked",
+        title: "Open alerts and notifications",
+        keywords: "alerts bell notifications unread waiting agents completed blocked",
     },
     ActionDefinition {
         action: ClientAction::FocusNextNotification,
-        title: "Switch to next waiting terminal",
-        keywords: "notifications unread next waiting agents completed blocked",
+        title: "Switch to next alert or notification",
+        keywords: "alerts bell notifications unread next waiting agents completed blocked",
     },
     ActionDefinition {
         action: ClientAction::CreateWorkspace,

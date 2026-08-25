@@ -40,6 +40,7 @@ use uuid::Uuid;
 
 use crate::{
     agent_detection::{CodexProbe, CodexStabilizer, detect_codex, is_codex_process},
+    alerts::AlertStore,
     client::config as global_config,
     domain::{
         AgentActivity, AgentDetection, AgentReport, AgentState, ClientId, CopyModeAction,
@@ -131,6 +132,8 @@ struct SharedState {
     expected_finalizations: HashSet<TerminalId>,
     exited_terminals: VecDeque<(TerminalId, Option<i32>)>,
     resource_changes: watch::Sender<u64>,
+    alerts: AlertStore,
+    alert_changes: watch::Sender<u64>,
     agent_events: broadcast::Sender<AgentLifecycleUpdate>,
     child_env: HashMap<OsString, OsString>,
     projects: global_config::ProjectCatalog,
@@ -155,6 +158,15 @@ impl FinalizationOutcome {
 }
 
 const AGENT_EVENT_CAPACITY: usize = 256;
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
 
 #[derive(Clone, Debug)]
 struct AgentLifecycleUpdate {
@@ -262,6 +274,13 @@ impl SharedState {
     fn publish_resource_change(&self, revision: u64) {
         if revision > *self.resource_changes.borrow() {
             self.resource_changes.send_replace(revision);
+        }
+    }
+
+    fn publish_alert_change(&self) {
+        let revision = self.alerts.revision();
+        if revision > *self.alert_changes.borrow() {
+            self.alert_changes.send_replace(revision);
         }
     }
 
@@ -460,6 +479,7 @@ impl SharedState {
         terminal: Arc<TerminalHandle>,
     ) -> Result<(), DaemonError> {
         let mutation = self.resources.create_session(path)?;
+        self.alerts.register_terminal(terminal.id());
         self.expected_finalizations.remove(&terminal.id());
         self.exited_terminals.retain(|(id, _)| *id != terminal.id());
         self.runtimes.insert(
@@ -480,6 +500,7 @@ impl SharedState {
         terminal: Arc<TerminalHandle>,
     ) -> Result<(), DaemonError> {
         let mutation = self.resources.add_workspace(session_id, path)?;
+        self.alerts.register_terminal(terminal.id());
         self.expected_finalizations.remove(&terminal.id());
         self.exited_terminals.retain(|(id, _)| *id != terminal.id());
         self.runtimes.insert(
@@ -500,6 +521,7 @@ impl SharedState {
         terminal: Arc<TerminalHandle>,
     ) -> Result<(), DaemonError> {
         let mutation = self.resources.add_tab(workspace_id, path)?;
+        self.alerts.register_terminal(terminal.id());
         self.expected_finalizations.remove(&terminal.id());
         self.exited_terminals.retain(|(id, _)| *id != terminal.id());
         self.runtimes.insert(
@@ -520,6 +542,7 @@ impl SharedState {
         terminal: Arc<TerminalHandle>,
     ) -> Result<(), DaemonError> {
         let mutation = self.resources.add_pane(tab_id, pane_id, terminal.id())?;
+        self.alerts.register_terminal(terminal.id());
         self.expected_finalizations.remove(&terminal.id());
         self.exited_terminals.retain(|(id, _)| *id != terminal.id());
         self.runtimes.insert(
@@ -543,6 +566,7 @@ impl SharedState {
         let mutation = self
             .resources
             .split_pane(anchor, direction, pane_id, terminal.id())?;
+        self.alerts.register_terminal(terminal.id());
         self.expected_finalizations.remove(&terminal.id());
         self.runtimes.insert(
             terminal.id(),
@@ -612,6 +636,8 @@ impl SharedState {
         };
         let mutation = self.resources.terminal_exited(terminal_id)?;
         self.runtimes.remove(&terminal_id);
+        self.alerts.remove_terminal(terminal_id);
+        self.publish_alert_change();
         self.exited_terminals.push_back((terminal_id, exit_code));
         if self.exited_terminals.len() > 256 {
             self.exited_terminals.pop_front();
@@ -1582,6 +1608,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     initial_spawn.cwd = resolved.cwd.clone();
     let child_env = initial_spawn.env.clone();
     let (resource_changes, _) = watch::channel(0);
+    let (alert_changes, _) = watch::channel(0);
     let (extension_catalog, _) = watch::channel(initial_extension_catalog);
     let (agent_events, _) = broadcast::channel(AGENT_EVENT_CAPACITY);
     let mut state = SharedState {
@@ -1591,6 +1618,8 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
         expected_finalizations: HashSet::new(),
         exited_terminals: VecDeque::new(),
         resource_changes,
+        alerts: AlertStore::default(),
+        alert_changes,
         agent_events,
         child_env,
         projects,
@@ -1634,7 +1663,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     ));
     let (exited_tx, mut exited_rx) = mpsc::unbounded_channel();
     for terminal in initial_terminals {
-        watch_terminal(terminal, exited_tx.clone());
+        watch_terminal(terminal, Arc::clone(&shared), exited_tx.clone());
     }
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let process_names = watch_process_names(Arc::clone(&shared), shutdown_tx.subscribe());
@@ -1996,16 +2025,51 @@ fn terminal_env(
     env
 }
 
-fn watch_terminal(terminal: Arc<TerminalHandle>, exited: mpsc::UnboundedSender<TerminalId>) {
+fn watch_terminal(
+    terminal: Arc<TerminalHandle>,
+    shared: Shared,
+    exited: mpsc::UnboundedSender<TerminalId>,
+) {
     tokio::spawn(async move {
         let mut lifecycle = terminal.subscribe_lifecycle();
-        while matches!(*lifecycle.borrow(), TerminalLifecycle::Running) {
-            if lifecycle.changed().await.is_err() {
-                return;
+        let mut activity = terminal.subscribe_activity();
+        let initial = *activity.borrow_and_update();
+        if initial.bell_count > 0 {
+            record_terminal_bells(&shared, terminal.id(), initial.bell_count).await;
+        }
+        loop {
+            tokio::select! {
+                biased;
+                changed = activity.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    let update = *activity.borrow_and_update();
+                    record_terminal_bells(&shared, terminal.id(), update.bell_count).await;
+                }
+                changed = lifecycle.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    if matches!(*lifecycle.borrow(), TerminalLifecycle::Exited { .. }) {
+                        if activity.has_changed().unwrap_or(false) {
+                            let update = *activity.borrow_and_update();
+                            record_terminal_bells(&shared, terminal.id(), update.bell_count).await;
+                        }
+                        break;
+                    }
+                }
             }
         }
         let _ = exited.send(terminal.id());
     });
+}
+
+async fn record_terminal_bells(shared: &Shared, terminal_id: TerminalId, bell_count: u64) {
+    let mut state = shared.lock().await;
+    if state.alerts.record_bells(terminal_id, bell_count, now_ms()) {
+        state.publish_alert_change();
+    }
 }
 
 async fn finalize_terminal(shared: &Shared, terminal_id: TerminalId) -> bool {
@@ -2499,6 +2563,8 @@ async fn handle_connection(
     };
     let mut attachment = leased.expect("interactive connection selected a tab view");
     let mut prepared_extension_reload: Option<PreparedExtensionReload> = None;
+    let mut alert_client_id = None;
+    let mut alert_changes = None;
 
     let connection_result: Result<()> = async {
         loop {
@@ -3180,6 +3246,38 @@ async fn handle_connection(
                             ).await?,
                         }
                     }
+                    ClientMessage::WatchAlerts { client_id } => {
+                        if alert_client_id.is_some() {
+                            send_error(&mut connection, envelope.request_id, "already_watching_alerts", "this connection already watches alerts").await?;
+                            continue;
+                        }
+                        let snapshot = {
+                            let mut state = shared.lock().await;
+                            state.alerts.attach(client_id);
+                            alert_changes = Some(state.alert_changes.subscribe());
+                            state.alerts.snapshot(client_id)
+                        };
+                        alert_client_id = Some(client_id);
+                        send(&mut connection, envelope.request_id, ServerMessage::AlertsChanged { snapshot }).await?;
+                    }
+                    ClientMessage::AcknowledgeAlerts { terminal_id, observed } => {
+                        let Some(client_id) = alert_client_id else {
+                            send_error(&mut connection, envelope.request_id, "alerts_not_watched", "watch alerts before acknowledging them").await?;
+                            continue;
+                        };
+                        let result = {
+                            let mut state = shared.lock().await;
+                            let result = state.alerts.acknowledge(client_id, terminal_id, observed);
+                            if matches!(result, Ok(true)) {
+                                state.publish_alert_change();
+                            }
+                            result
+                        };
+                        match result {
+                            Ok(_) => send(&mut connection, envelope.request_id, ServerMessage::CommandCompleted { command: AcknowledgedCommand::AcknowledgeAlerts }).await?,
+                            Err(message) => send_error(&mut connection, envelope.request_id, "invalid_alert", message).await?,
+                        }
+                    }
                     ClientMessage::Detach => {
                         match attachment.close().await {
                             Ok(()) => {
@@ -3274,6 +3372,15 @@ async fn handle_connection(
                     None,
                     ServerMessage::PresenceChanged { presence },
                 ).await?;
+            }
+            changed = watched_alert_change(&mut alert_changes) => {
+                if changed.is_err() {
+                    break;
+                }
+                if let Some(client_id) = alert_client_id {
+                    let snapshot = shared.lock().await.alerts.snapshot(client_id);
+                    send(&mut connection, None, ServerMessage::AlertsChanged { snapshot }).await?;
+                }
             }
             changed = extension_changes.changed() => {
                 if changed.is_err() {
@@ -3395,6 +3502,9 @@ async fn handle_connection(
         Ok(())
     }
     .await;
+    if let Some(client_id) = alert_client_id {
+        shared.lock().await.alerts.detach(client_id);
+    }
     let cleanup_result = attachment
         .close()
         .await
@@ -4052,7 +4162,9 @@ async fn control_loop(
             | ClientMessage::Paste { .. }
             | ClientMessage::CopyMode { .. }
             | ClientMessage::Resize { .. }
-            | ClientMessage::SelectTarget { .. } => {
+            | ClientMessage::SelectTarget { .. }
+            | ClientMessage::WatchAlerts { .. }
+            | ClientMessage::AcknowledgeAlerts { .. } => {
                 send_error(
                     connection,
                     envelope.request_id,
@@ -4306,6 +4418,15 @@ fn context_target(context: TerminalContext, scope: ContextScope) -> TargetSelect
 
 /// Pends forever until [`ClientMessage::WatchResources`] installs a receiver.
 async fn watched_resource_change(
+    changes: &mut Option<watch::Receiver<u64>>,
+) -> Result<(), tokio::sync::watch::error::RecvError> {
+    match changes {
+        Some(changes) => changes.changed().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn watched_alert_change(
     changes: &mut Option<watch::Receiver<u64>>,
 ) -> Result<(), tokio::sync::watch::error::RecvError> {
     match changes {
@@ -4891,7 +5012,7 @@ async fn open_location_without_recipe(
         let _ = terminal.close().await;
         return Err(error);
     }
-    watch_terminal(terminal, exited.clone());
+    watch_terminal(terminal, Arc::clone(shared), exited.clone());
     Ok((selected, disposition))
 }
 
@@ -5088,7 +5209,7 @@ async fn create_workspace(
             return Err(error);
         }
     };
-    watch_terminal(terminal, exited.clone());
+    watch_terminal(terminal, Arc::clone(shared), exited.clone());
     Ok(created)
 }
 
@@ -5210,7 +5331,7 @@ async fn create_tab(
             return Err(error);
         }
     };
-    watch_terminal(terminal, exited.clone());
+    watch_terminal(terminal, Arc::clone(shared), exited.clone());
     Ok(created)
 }
 
@@ -5383,7 +5504,7 @@ async fn create_pane(
             return Err(error);
         }
     };
-    watch_terminal(terminal, exited.clone());
+    watch_terminal(terminal, Arc::clone(shared), exited.clone());
     Ok(created)
 }
 
@@ -7039,6 +7160,8 @@ mod tests {
                 expected_finalizations: HashSet::new(),
                 exited_terminals: VecDeque::new(),
                 resource_changes: watch::channel(1).0,
+                alerts: AlertStore::default(),
+                alert_changes: watch::channel(0).0,
                 agent_events: broadcast::channel(AGENT_EVENT_CAPACITY).0,
                 child_env: HashMap::new(),
                 projects: global_config::ProjectCatalog::default(),
@@ -7674,6 +7797,8 @@ scope = "workspace"
             expected_finalizations: HashSet::new(),
             exited_terminals: VecDeque::new(),
             resource_changes,
+            alerts: AlertStore::default(),
+            alert_changes: watch::channel(0).0,
             agent_events: broadcast::channel(AGENT_EVENT_CAPACITY).0,
             child_env: HashMap::new(),
             projects: global_config::ProjectCatalog::default(),

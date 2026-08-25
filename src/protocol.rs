@@ -9,6 +9,7 @@ use uuid::Uuid;
 use std::{collections::BTreeMap, path::PathBuf};
 
 use crate::{
+    alerts::{AlertCursor, ClientAlertSnapshot},
     domain::{
         AgentActivity, AgentReport, AgentReportMetadata, CopyModeAction, CopyModeError, MouseEvent,
         PaneId, ScreenDelta, ScreenSnapshot, SessionId, SplitId, TabId, TerminalId, TerminalOutput,
@@ -90,6 +91,7 @@ pub enum AcknowledgedCommand {
     Paste,
     ReportAgent,
     AcknowledgeAgent,
+    AcknowledgeAlerts,
     TerminalInput,
     CloseTarget,
     RetireWorkspace,
@@ -505,6 +507,15 @@ pub enum ClientMessage {
         terminal_id: TerminalId,
         event_revision: u64,
     },
+    /// Subscribe this interactive connection to terminal bells using a stable
+    /// outer-terminal identity.
+    WatchAlerts {
+        client_id: crate::domain::ClientId,
+    },
+    AcknowledgeAlerts {
+        terminal_id: TerminalId,
+        observed: AlertCursor,
+    },
     Ping,
     Shutdown,
 }
@@ -576,6 +587,9 @@ pub enum ServerMessage {
     },
     PresenceChanged {
         presence: ClientPresenceSnapshot,
+    },
+    AlertsChanged {
+        snapshot: ClientAlertSnapshot,
     },
     Snapshot {
         terminal_id: TerminalId,
@@ -1614,6 +1628,35 @@ mod tests {
             decode_payload::<ServerMessage>(&encode_payload(&presence).unwrap()).unwrap(),
             presence
         );
+    }
+
+    #[test]
+    fn terminal_bell_subscription_and_bounded_snapshot_round_trip() {
+        let client_id = crate::domain::ClientId::new();
+        let terminal_id = TerminalId::new();
+        let watch = ClientMessage::WatchAlerts { client_id };
+        assert_eq!(
+            decode_payload::<ClientMessage>(&encode_payload(&watch).unwrap()).unwrap(),
+            watch
+        );
+        let snapshot = crate::alerts::ClientAlertSnapshot {
+            revision: 7,
+            terminals: vec![crate::alerts::TerminalAlertSnapshot {
+                terminal_id,
+                state: crate::alerts::TerminalAlertState {
+                    bell_count: 10_000,
+                    last_bell_at_ms: 2,
+                },
+                seen: crate::alerts::AlertCursor::default(),
+            }],
+        };
+        let message = ServerMessage::AlertsChanged { snapshot };
+        let encoded = encode_payload(&message).unwrap();
+        assert!(
+            encoded.len() < 512,
+            "one terminal alert snapshot is fixed-size"
+        );
+        assert_eq!(decode_payload::<ServerMessage>(&encoded).unwrap(), message);
     }
 
     #[test]

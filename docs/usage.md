@@ -61,8 +61,8 @@ The configuration name is the key to override under `[ui.bindings]`.
 | `w` | Open the left sidebar | `open_left_sidebar` |
 | `]` | Open the right sidebar | `open_right_sidebar` |
 | `t` | Focus the tab bar | `open_tab_bar` |
-| `u` | List unread agent notifications | `open_notifications` |
-| `Prefix` | Jump to the next unread notification | `focus_next_notification` |
+| `u` | List agent notifications and terminal alerts | `open_notifications` |
+| `Prefix` | Jump to the next notification or terminal alert | `focus_next_notification` |
 | `C` | Create a workspace | `create_workspace` |
 | `c` | Create a tab | `create_tab` |
 | `n` | Switch to the next tab | `focus_next_tab` |
@@ -128,6 +128,22 @@ Pane splits and divider sizes are shared daemon state. Client focus, zoom,
 scrollback, dialogs, and configuration are local. Multiple clients may attach
 to the same session; they share terminal input and output, and shared PTYs use
 the smallest attached client's dimensions.
+
+## Terminal alerts
+
+Fut reports real BEL characters as terminal-native attention without
+interpreting ordinary output as agent completion or blocking. An OSC string
+terminator is not a bell, and repeated bells are represented by a bounded
+counter rather than an event log.
+
+Bells roll up to tabs, workspace rows, sessions, and navigator results. Press
+`Ctrl-b u` to inspect them, Enter to switch to the pane, or `c` to clear the
+selected bell for this client. `Ctrl-b Ctrl-b` moves to the next alert using
+typed pane navigation. Rendering the focused pane acknowledges its current bell
+for this client only; another attached client keeps its own seen state. A new
+outer terminal starts at the current bell baseline. Agent lifecycle state
+remains separate.
+See [Configuration](../configuration/) for the opt-in outer-terminal BEL.
 
 Fut renders standard terminal mouse modes, indexed and RGB color, OSC 8
 hyperlinks, cursor shapes, bracketed paste, alternate screens, and Kitty

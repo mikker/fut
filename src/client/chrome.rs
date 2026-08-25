@@ -176,12 +176,11 @@ fn sidebar_rect(body: Rect, configured_width: u16, side: SidebarSide) -> Option<
     Some(Rect::new(x, body.y, width, body.height))
 }
 
-static NOTIFICATIONS: NotificationState = NotificationState::new();
-
 #[derive(Default)]
 pub(super) struct ResourceState {
     snapshot: Option<ResourceSnapshot>,
     presence: ClientPresenceSnapshot,
+    notifications: NotificationState,
 }
 
 impl ResourceState {
@@ -214,7 +213,11 @@ impl ResourceState {
     }
 
     pub fn notifications(&self) -> &NotificationState {
-        &NOTIFICATIONS
+        &self.notifications
+    }
+
+    pub fn accept_alerts(&mut self, alerts: crate::alerts::ClientAlertSnapshot) -> bool {
+        self.notifications.accept_alerts(alerts)
     }
 
     pub fn attention_revision(&self, terminal_id: crate::domain::TerminalId) -> Option<u64> {
@@ -699,11 +702,19 @@ fn render_bar_group(
                 TokenValue::plain(tab_bar_hotkeys(group.style, ui).line.to_string())
             }
             "client.waiting" if model.client_waiting > 0 => TokenValue::styled(
-                format!("• {}", model.client_waiting),
+                format!(
+                    "{}{count}",
+                    icons.notification,
+                    count = model.client_waiting
+                ),
                 SemanticStyle::Attention,
             ),
             "session.waiting" if model.session_waiting > 0 => TokenValue::styled(
-                format!("• {}", model.session_waiting),
+                format!(
+                    "{}{count}",
+                    icons.notification,
+                    count = model.session_waiting
+                ),
                 SemanticStyle::Attention,
             ),
             "tab.activity" => active.activity.map_or_else(
@@ -1067,7 +1078,9 @@ fn tab_token(
 fn activity_token(activity: ActivityIndicator, frame: usize) -> TokenValue {
     let style = match activity {
         ActivityIndicator::Working => SemanticStyle::Activity,
-        ActivityIndicator::Blocked | ActivityIndicator::Completed => SemanticStyle::Attention,
+        ActivityIndicator::Blocked | ActivityIndicator::Completed | ActivityIndicator::Bell => {
+            SemanticStyle::Attention
+        }
     };
     TokenValue::styled(activity.marker(frame), style)
 }

@@ -274,7 +274,7 @@ pub(super) async fn open_location(
     let selected = selected_target(selected_path, selected_terminal);
     drop(state);
     for terminal in terminals {
-        watch_terminal(terminal, exited.clone());
+        watch_terminal(terminal, Arc::clone(shared), exited.clone());
     }
     Ok((selected, disposition))
 }
@@ -818,6 +818,7 @@ fn install_recipe_plan(
     state.resources = plan.resources;
     if let Some((terminal_id, exit_code)) = replacement_exit {
         state.runtimes.remove(&terminal_id);
+        state.alerts.remove_terminal(terminal_id);
         state.expected_finalizations.insert(terminal_id);
         state.exited_terminals.push_back((terminal_id, exit_code));
         if state.exited_terminals.len() > 256 {
@@ -825,6 +826,7 @@ fn install_recipe_plan(
         }
     }
     for terminal in terminals {
+        state.alerts.register_terminal(terminal.id());
         state.expected_finalizations.remove(&terminal.id());
         state
             .exited_terminals
@@ -842,6 +844,7 @@ fn install_recipe_plan(
         state.enqueue_committed_mutation(mutation);
     }
     state.publish_resource_change(state.resources.revision());
+    state.publish_alert_change();
     Ok(())
 }
 

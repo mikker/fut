@@ -4,6 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use ratatui::{buffer::Buffer, layout::Rect, style::Style};
 
 use crate::{
+    alerts::{ClientAlertSnapshot, TerminalAlertSnapshot},
     domain::{AgentState, AttentionKind, PaneId, SessionId, TerminalId},
     resources::{PaneSnapshot, ResourceSnapshot},
 };
@@ -40,6 +41,7 @@ fn open_panes(snapshot: &ResourceSnapshot) -> impl Iterator<Item = &PaneSnapshot
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ActivityIndicator {
+    Bell,
     Working,
     Blocked,
     Completed,
@@ -48,6 +50,7 @@ pub(super) enum ActivityIndicator {
 impl ActivityIndicator {
     pub(super) fn marker(self, frame: usize) -> &'static str {
         match self {
+            Self::Bell => "!",
             Self::Working => spinner_marker(frame),
             Self::Blocked => "!",
             Self::Completed => "•",
@@ -56,15 +59,34 @@ impl ActivityIndicator {
 }
 
 #[derive(Default)]
-pub(super) struct NotificationState {}
+pub(super) struct NotificationState {
+    alerts: ClientAlertSnapshot,
+}
 
 impl NotificationState {
-    pub(super) const fn new() -> Self {
-        Self {}
+    pub(super) fn accept_alerts(&mut self, alerts: ClientAlertSnapshot) -> bool {
+        if alerts.revision < self.alerts.revision {
+            return false;
+        }
+        self.alerts = alerts;
+        true
+    }
+
+    pub(super) fn terminal_alert(&self, terminal_id: TerminalId) -> Option<TerminalAlertSnapshot> {
+        self.alerts
+            .terminals
+            .iter()
+            .find(|alert| alert.terminal_id == terminal_id)
+            .copied()
+    }
+
+    fn terminal_unseen(&self, pane: &PaneSnapshot) -> bool {
+        self.terminal_alert(pane.terminal_id)
+            .is_some_and(TerminalAlertSnapshot::unseen)
     }
 
     pub(super) fn is_unseen(&self, pane: &PaneSnapshot) -> bool {
-        pane.activity.has_unread_attention()
+        pane.activity.has_unread_attention() || self.terminal_unseen(pane)
     }
 
     pub(super) fn indicator(&self, panes: &[PaneSnapshot]) -> Option<ActivityIndicator> {
@@ -78,7 +100,44 @@ impl NotificationState {
             return Some(ActivityIndicator::Blocked);
         }
         if panes.iter().any(|pane| {
+            self.terminal_alert(pane.terminal_id)
+                .is_some_and(TerminalAlertSnapshot::unseen)
+        }) {
+            return Some(ActivityIndicator::Bell);
+        }
+        if panes.iter().any(|pane| {
             self.is_unseen(pane)
+                && pane
+                    .activity
+                    .attention()
+                    .is_some_and(|attention| attention.kind == AttentionKind::Completed)
+        }) {
+            return Some(ActivityIndicator::Completed);
+        }
+        if panes
+            .iter()
+            .any(|pane| pane.activity.state == AgentState::Blocked)
+        {
+            return Some(ActivityIndicator::Blocked);
+        }
+        panes
+            .iter()
+            .any(|pane| pane.activity.state == AgentState::Working)
+            .then_some(ActivityIndicator::Working)
+    }
+
+    pub(super) fn agent_indicator(&self, panes: &[PaneSnapshot]) -> Option<ActivityIndicator> {
+        if panes.iter().any(|pane| {
+            pane.activity.has_unread_attention()
+                && pane
+                    .activity
+                    .attention()
+                    .is_some_and(|attention| attention.kind == AttentionKind::Blocked)
+        }) {
+            return Some(ActivityIndicator::Blocked);
+        }
+        if panes.iter().any(|pane| {
+            pane.activity.has_unread_attention()
                 && pane
                     .activity
                     .attention()
@@ -113,22 +172,40 @@ impl NotificationState {
                         continue;
                     }
                     for pane in &tab.panes {
-                        let Some(attention) = pane.activity.attention() else {
-                            continue;
-                        };
-                        if !self.is_unseen(pane) || pane.closing {
+                        if pane.closing {
                             continue;
                         }
-                        waiting.push(WaitingTerminal {
-                            session_id: session.id,
-                            pane_id: pane.id,
-                            terminal_id: pane.terminal_id,
-                            session: session.name.clone(),
-                            workspace: workspace.name.clone(),
-                            tab: tab.name.clone(),
-                            kind: attention.kind,
-                            occurred_at_ms: attention.occurred_at_ms,
-                        });
+                        let mut push = |kind, occurred_at_ms, observed| {
+                            waiting.push(WaitingTerminal {
+                                session_id: session.id,
+                                pane_id: pane.id,
+                                terminal_id: pane.terminal_id,
+                                session: session.name.clone(),
+                                workspace: workspace.name.clone(),
+                                tab: tab.name.clone(),
+                                kind,
+                                occurred_at_ms,
+                                observed,
+                            })
+                        };
+                        if let Some(alert) = self.terminal_alert(pane.terminal_id)
+                            && alert.unseen()
+                        {
+                            push(
+                                NotificationKind::Bell,
+                                alert.state.last_bell_at_ms,
+                                Some(alert.state.cursor()),
+                            );
+                        }
+                        if let Some(attention) = pane.activity.attention()
+                            && pane.activity.has_unread_attention()
+                        {
+                            push(
+                                NotificationKind::Agent(attention.kind),
+                                attention.occurred_at_ms,
+                                None,
+                            );
+                        }
                     }
                 }
             }
@@ -176,8 +253,15 @@ pub(super) struct WaitingTerminal {
     pub session: String,
     pub workspace: String,
     pub tab: String,
-    pub kind: AttentionKind,
+    pub kind: NotificationKind,
     pub occurred_at_ms: u64,
+    pub observed: Option<crate::alerts::AlertCursor>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum NotificationKind {
+    Agent(AttentionKind),
+    Bell,
 }
 
 pub(super) struct NotificationsDialog {
@@ -190,6 +274,7 @@ pub(super) enum NotificationsAction {
     Stay,
     Close,
     Select(PaneId),
+    Acknowledge(TerminalId, crate::alerts::AlertCursor),
 }
 
 impl NotificationsDialog {
@@ -233,6 +318,15 @@ impl NotificationsDialog {
                         NotificationsAction::Select(row.pane_id)
                     });
             }
+            KeyCode::Char('c') => {
+                return self
+                    .rows
+                    .get(self.selected)
+                    .and_then(|row| row.observed.map(|observed| (row.terminal_id, observed)))
+                    .map_or(NotificationsAction::Stay, |(terminal_id, observed)| {
+                        NotificationsAction::Acknowledge(terminal_id, observed)
+                    });
+            }
             KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => {
                 self.selected = self.selected.saturating_sub(1);
             }
@@ -259,14 +353,14 @@ impl NotificationsDialog {
         let (header, footer) = chrome_rows(area.height);
         let body_height = usize::from(area.height.saturating_sub(header + footer));
         if header == 1 {
-            render_title(area, " terminals waiting", buffer);
+            render_title(area, " terminals waiting · alerts", buffer);
         }
         if self.rows.is_empty() {
             if body_height > 0 {
                 buffer.set_string(
                     area.x,
                     area.y + header,
-                    " No terminals waiting",
+                    " No alerts or notifications",
                     Style::default(),
                 );
             }
@@ -283,12 +377,13 @@ impl NotificationsDialog {
             {
                 let style = row_style(index == self.selected);
                 let marker = match row.kind {
-                    AttentionKind::Blocked => "!",
-                    AttentionKind::Completed => "•",
+                    NotificationKind::Agent(AttentionKind::Blocked) | NotificationKind::Bell => "!",
+                    NotificationKind::Agent(AttentionKind::Completed) => "•",
                 };
                 let kind = match row.kind {
-                    AttentionKind::Blocked => "blocked",
-                    AttentionKind::Completed => "completed",
+                    NotificationKind::Agent(AttentionKind::Blocked) => "agent blocked",
+                    NotificationKind::Agent(AttentionKind::Completed) => "agent completed",
+                    NotificationKind::Bell => "bell",
                 };
                 let age = age(row.occurred_at_ms);
                 let text = format!(
@@ -310,7 +405,11 @@ impl NotificationsDialog {
             render_list_scrollbar(self.scroll, self.rows.len(), body, buffer);
         }
         if footer == 1 {
-            render_footer(area, " ↑↓/jk move  enter switch  esc cancel", buffer);
+            render_footer(
+                area,
+                " ↑↓/jk move  enter switch  c clear  esc cancel",
+                buffer,
+            );
         }
     }
 }
@@ -441,6 +540,59 @@ mod tests {
         };
         let notifications = NotificationState::default();
         assert!(notifications.is_unseen(&pane));
+    }
+
+    #[test]
+    fn terminal_bells_roll_up_ahead_of_agent_completion() {
+        let pane = completed_pane(false);
+        let mut notifications = NotificationState::default();
+        notifications.accept_alerts(ClientAlertSnapshot {
+            revision: 9,
+            terminals: vec![TerminalAlertSnapshot {
+                terminal_id: pane.terminal_id,
+                state: crate::alerts::TerminalAlertState {
+                    bell_count: 2,
+                    last_bell_at_ms: 11,
+                },
+                seen: crate::alerts::AlertCursor::default(),
+            }],
+        });
+
+        // Agent completion and BEL remain independently represented; BEL wins
+        // the single ancestry marker.
+        let waiting = notifications.waiting(&ResourceSnapshot {
+            revision: 1,
+            sessions: vec![SessionSnapshot {
+                tokens: Default::default(),
+                id: SessionId::new(),
+                name: "project".into(),
+                project: Project {
+                    identity: ProjectIdentity::CanonicalDirectory(PathBuf::from("/project")),
+                },
+                trusted_project_config: None,
+                closing: false,
+                workspaces: vec![WorkspaceSnapshot {
+                    tokens: Default::default(),
+                    id: WorkspaceId::new(),
+                    name: "main".into(),
+                    root: PathBuf::from("/project"),
+                    closing: false,
+                    tabs: vec![TabSnapshot {
+                        tokens: Default::default(),
+                        id: TabId::new(),
+                        name: "alerts".into(),
+                        closing: false,
+                        layout: SplitTree::leaf(pane.id),
+                        panes: vec![pane.clone()],
+                    }],
+                }],
+            }],
+        });
+        assert_eq!(waiting.len(), 2);
+        assert_eq!(
+            notifications.indicator(&[pane]),
+            Some(ActivityIndicator::Bell)
+        );
     }
 
     #[test]

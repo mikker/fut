@@ -72,6 +72,11 @@ pub enum TerminalLifecycle {
     Exited { exit_code: Option<i32> },
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TerminalActivity {
+    pub bell_count: u64,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CommandError {
     #[error("terminal command queue is full")]
@@ -97,6 +102,7 @@ pub struct TerminalHandle {
     snapshots: watch::Sender<ScreenSnapshot>,
     events: broadcast::Sender<TerminalEvent>,
     lifecycle: watch::Sender<TerminalLifecycle>,
+    activity: watch::Sender<TerminalActivity>,
 }
 
 /// Command sender paired with the runtime thread's doorbell. The runtime
@@ -342,6 +348,11 @@ impl TerminalHandle {
         self.lifecycle.subscribe()
     }
 
+    #[must_use]
+    pub fn subscribe_activity(&self) -> watch::Receiver<TerminalActivity> {
+        self.activity.subscribe()
+    }
+
     fn send(&self, message: RuntimeMessage) -> Result<(), CommandError> {
         self.commands
             .try_send(message)
@@ -561,6 +572,7 @@ struct RuntimePublishers<'a> {
     snapshots: &'a watch::Sender<ScreenSnapshot>,
     events: &'a broadcast::Sender<TerminalEvent>,
     lifecycle: &'a watch::Sender<TerminalLifecycle>,
+    activity: &'a watch::Sender<TerminalActivity>,
 }
 
 pub fn spawn_terminal(spec: SpawnSpec) -> Result<TerminalHandle> {
@@ -593,6 +605,7 @@ pub fn spawn_terminal(spec: SpawnSpec) -> Result<TerminalHandle> {
     let (output, output_queue) = output_queue();
     let (events, _) = broadcast::channel(16);
     let (lifecycle, _) = watch::channel(TerminalLifecycle::Running);
+    let (activity, _) = watch::channel(TerminalActivity::default());
     let id = spec.id;
     let initial = ScreenSnapshot::new(
         0,
@@ -610,6 +623,7 @@ pub fn spawn_terminal(spec: SpawnSpec) -> Result<TerminalHandle> {
     let runtime_snapshots = snapshots.clone();
     let runtime_events = events.clone();
     let runtime_lifecycle = lifecycle.clone();
+    let runtime_activity = activity.clone();
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let (child_tx, child_rx) = mpsc::sync_channel(1);
     let size = spec.size;
@@ -642,6 +656,7 @@ pub fn spawn_terminal(spec: SpawnSpec) -> Result<TerminalHandle> {
                     snapshots: &runtime_snapshots,
                     events: &runtime_events,
                     lifecycle: &runtime_lifecycle,
+                    activity: &runtime_activity,
                 },
                 pair.master,
                 writer,
@@ -689,6 +704,7 @@ pub fn spawn_terminal(spec: SpawnSpec) -> Result<TerminalHandle> {
         snapshots,
         events,
         lifecycle,
+        activity,
     })
 }
 
@@ -1201,6 +1217,7 @@ fn drain_output_barrier(
             match output.receiver.recv() {
                 Ok(OutputMessage::Bytes(bytes)) => {
                     terminal.vt_write(&bytes);
+                    publish_activity(terminal, publishers.activity);
                     output.record_consumed();
                     fed = true;
                 }
@@ -1316,6 +1333,7 @@ fn drain_output_batch(
         };
         budget = budget.saturating_sub(bytes.len());
         terminal.vt_write(&bytes);
+        publish_activity(terminal, publishers.activity);
         output.record_consumed();
         if budget == 0 {
             break;
@@ -1347,6 +1365,7 @@ fn process_output_message(
                 publishers.snapshots,
                 publishers.events,
             );
+            publish_activity(terminal, publishers.activity);
             false
         }
         OutputMessage::ReaderError {
@@ -1372,6 +1391,17 @@ fn process_output_message(
             true
         }
     }
+}
+
+fn publish_activity(terminal: &GhosttyTerminal, publisher: &watch::Sender<TerminalActivity>) {
+    let bell_count = terminal.bell_count();
+    publisher.send_if_modified(|activity| {
+        if activity.bell_count == bell_count {
+            return false;
+        }
+        activity.bell_count = bell_count;
+        true
+    });
 }
 
 fn drain_output_until(
@@ -1698,10 +1728,12 @@ mod tests {
         let (snapshots, _) = watch::channel(initial);
         let (events, mut event_receiver) = broadcast::channel(4);
         let (lifecycle, _) = watch::channel(TerminalLifecycle::Running);
+        let (activity, _) = watch::channel(TerminalActivity::default());
         let publishers = RuntimePublishers {
             snapshots: &snapshots,
             events: &events,
             lifecycle: &lifecycle,
+            activity: &activity,
         };
         let (output, mut queued_output) = output_queue();
         let mut reader_complete = false;
@@ -1749,10 +1781,12 @@ mod tests {
         let (snapshots, mut snapshot_receiver) = watch::channel(initial);
         let (events, _) = broadcast::channel(4);
         let (lifecycle, _) = watch::channel(TerminalLifecycle::Running);
+        let (activity, _) = watch::channel(TerminalActivity::default());
         let publishers = RuntimePublishers {
             snapshots: &snapshots,
             events: &events,
             lifecycle: &lifecycle,
+            activity: &activity,
         };
         let (_output, mut queued_output) = output_queue();
 
@@ -1798,10 +1832,12 @@ mod tests {
         let (snapshots, _) = watch::channel(initial);
         let (events, _) = broadcast::channel(4);
         let (lifecycle, _) = watch::channel(TerminalLifecycle::Running);
+        let (activity, _) = watch::channel(TerminalActivity::default());
         let publishers = RuntimePublishers {
             snapshots: &snapshots,
             events: &events,
             lifecycle: &lifecycle,
+            activity: &activity,
         };
         let (output, mut queued_output) = output_queue();
         let mut reader_complete = false;
@@ -1919,10 +1955,12 @@ mod tests {
         let (snapshots, _) = watch::channel(initial);
         let (events, _) = broadcast::channel(4);
         let (lifecycle, _) = watch::channel(TerminalLifecycle::Running);
+        let (activity, _) = watch::channel(TerminalActivity::default());
         let publishers = RuntimePublishers {
             snapshots: &snapshots,
             events: &events,
             lifecycle: &lifecycle,
+            activity: &activity,
         };
         let (output, mut queued_output) = output_queue();
         let mut reader_complete = false;
@@ -1988,10 +2026,12 @@ mod tests {
         let (snapshots, _) = watch::channel(initial);
         let (events, mut event_receiver) = broadcast::channel(4);
         let (lifecycle, _) = watch::channel(TerminalLifecycle::Running);
+        let (activity, _) = watch::channel(TerminalActivity::default());
         let publishers = RuntimePublishers {
             snapshots: &snapshots,
             events: &events,
             lifecycle: &lifecycle,
+            activity: &activity,
         };
         let (_output, mut queued_output) = output_queue();
         let mut reader_complete = false;
@@ -2013,6 +2053,21 @@ mod tests {
             event_receiver.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn activity_changes_only_for_bells_not_ordinary_output() {
+        let mut terminal = test_terminal(Box::new(Vec::<u8>::new()));
+        let (activity, mut changes) = watch::channel(TerminalActivity::default());
+
+        terminal.vt_write(b"ordinary output");
+        publish_activity(&terminal, &activity);
+        assert!(!changes.has_changed().unwrap());
+
+        terminal.vt_write(b"\x07");
+        publish_activity(&terminal, &activity);
+        assert!(changes.has_changed().unwrap());
+        assert_eq!(changes.borrow_and_update().bell_count, 1);
     }
 
     #[tokio::test]
@@ -2278,10 +2333,12 @@ mod tests {
         let (snapshots, _) = watch::channel(initial);
         let (events, _) = broadcast::channel(4);
         let (lifecycle, _) = watch::channel(TerminalLifecycle::Running);
+        let (activity, _) = watch::channel(TerminalActivity::default());
         let publishers = RuntimePublishers {
             snapshots: &snapshots,
             events: &events,
             lifecycle: &lifecycle,
+            activity: &activity,
         };
         let (output, mut queued_output) = output_queue();
         for _ in 0..OUTPUT_QUEUE_CAPACITY {
@@ -2380,7 +2437,7 @@ mod tests {
     #[tokio::test]
     async fn lifecycle_exit_follows_all_queued_pty_output() {
         let handle = spawn_terminal(shell(
-            "head -c 8192 /dev/zero | tr '\\000' x; printf '\\r\\nFUT_FINAL_MARKER'",
+            "head -c 8192 /dev/zero | tr '\\000' x; printf '\\r\\nFUT_FINAL_MARKER\\007'",
             HashMap::new(),
         ))
         .unwrap();
@@ -2400,6 +2457,11 @@ mod tests {
             .map(|cell| cell.contents.as_str())
             .collect::<String>();
         assert!(contents.contains("FUT_FINAL_MARKER"), "{contents:?}");
+        let activity = *handle.subscribe_activity().borrow();
+        assert_eq!(
+            activity.bell_count, 1,
+            "final BEL must precede lifecycle exit"
+        );
     }
 
     #[tokio::test]

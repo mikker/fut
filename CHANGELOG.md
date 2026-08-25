@@ -4,6 +4,7 @@
 
 - `fut agent prompt --stdin` now accepts multiline and generated prompts without shell argument interpolation.
 - `Ctrl-b Shift-S` now opens projects from a fuzzy configured catalog or a typed path, reusing live sessions and reviewing untrusted recipes in-client.
+- Added per-client terminal bell alerts with ancestry markers, navigation, a configurable notification glyph, and opt-in outer-terminal signaling.
 - Codex can now report completed turns directly through `fut agent notify codex`, without a separately installed notification adapter.
 - Sidebar focus now highlights workspace indices with their titles and only agent titles, preserving status colors for faster scanning.
 - Extensions can now detect other active extensions and their versions through `FUT_EXTENSIONS`.

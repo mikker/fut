@@ -30,6 +30,7 @@ impl AgentItem {
     pub(super) fn status(&self) -> &'static str {
         match self.indicator {
             Some(ActivityIndicator::Working) => "working",
+            Some(ActivityIndicator::Bell) => "attention",
             Some(ActivityIndicator::Blocked) => "blocked",
             Some(ActivityIndicator::Completed) => "completed",
             None => "idle",
@@ -50,6 +51,7 @@ impl AgentItem {
     pub(super) fn status_style(&self) -> SemanticStyle {
         match self.indicator {
             Some(ActivityIndicator::Working) => SemanticStyle::Activity,
+            Some(ActivityIndicator::Bell) => SemanticStyle::Attention,
             Some(ActivityIndicator::Blocked) => SemanticStyle::Error,
             Some(ActivityIndicator::Completed) => SemanticStyle::Added,
             None => SemanticStyle::Muted,
@@ -131,7 +133,7 @@ pub(super) fn items(
                     .unwrap_or("agent"),
             ),
             current: path.pane.id == focused.pane_id,
-            indicator: notifications.indicator(std::slice::from_ref(path.pane)),
+            indicator: notifications.agent_indicator(std::slice::from_ref(path.pane)),
         })
         .collect()
 }
