@@ -2897,6 +2897,87 @@ async fn handle_connection(
                             Err(error) => send_error(&mut connection, envelope.request_id, error.code, &error.message).await?,
                         }
                     }
+                    ClientMessage::OpenLocation {
+                        project,
+                        name,
+                        cwd,
+                        program,
+                        argv,
+                    } => {
+                        let (selected, disposition) = match recipe::open_location(
+                            &shared, &exited, project, name, cwd, program, argv,
+                        ).await {
+                            Ok(opened) => opened,
+                            Err(error) => {
+                                send_error(&mut connection, envelope.request_id, error.code, &error.message).await?;
+                                continue;
+                            }
+                        };
+                        let selector = TargetSelector::Terminal(selected.terminal_id);
+                        let selection = match observe_selection(
+                            &shared,
+                            &selector,
+                            None,
+                            attachment.focused.selected.terminal_id,
+                        ).await {
+                            Ok(selection) => selection,
+                            Err(error) => {
+                                send_error(&mut connection, envelope.request_id, error.code, &error.message).await?;
+                                continue;
+                            }
+                        };
+                        if let TargetSelection::Focused {
+                            selected,
+                            panes,
+                            layout,
+                            fallback_terminal_ids,
+                            resource_revision,
+                        } = selection {
+                            attachment.reconcile(
+                                panes,
+                                selected,
+                                layout,
+                                fallback_terminal_ids,
+                                resource_revision,
+                            );
+                        } else {
+                            let candidate = match switch_candidate(
+                                &shared,
+                                selector,
+                                None,
+                                client,
+                                attachment.size(),
+                            ).await {
+                                Ok(candidate) => candidate,
+                                Err(error) => {
+                                    send_error(&mut connection, envelope.request_id, error.code, &error.message).await?;
+                                    continue;
+                                }
+                            };
+                            if let Err(error) = attachment.close().await {
+                                send_command_error(&mut connection, envelope.request_id, error).await?;
+                                continue;
+                            }
+                            attachment = candidate;
+                            presence
+                                .as_mut()
+                                .expect("interactive client has presence")
+                                .select(attachment.focused.selected.session_id);
+                        }
+                        send(
+                            &mut connection,
+                            envelope.request_id,
+                            ServerMessage::LocationOpened {
+                                selected,
+                                disposition,
+                            },
+                        ).await?;
+                        send(
+                            &mut connection,
+                            envelope.request_id,
+                            ServerMessage::TargetSelected { selected: attachment.selected() },
+                        ).await?;
+                    }
                     ClientMessage::CreateWorkspace { session_id, name, cwd, program, argv } => {
                         if session_id != attachment.focused.selected.session_id {
                             send_error(&mut connection, envelope.request_id, "outside_session", "workspace must be created in the attached session").await?;
@@ -3158,7 +3239,7 @@ async fn handle_connection(
                             ).await?,
                         }
                     }
-                    ClientMessage::OpenLocation { .. } | ClientMessage::MovePane { .. } | ClientMessage::Contextual { .. } | ClientMessage::RetireWorkspace { .. } | ClientMessage::PublishToken { .. } | ClientMessage::ReloadExtensions | ClientMessage::ReportAgent { .. } | ClientMessage::TerminalInput { .. } | ClientMessage::ReadTerminalOutput { .. } | ClientMessage::WaitTerminalOutput { .. } | ClientMessage::PromptAgent { .. } | ClientMessage::WaitAgent { .. } | ClientMessage::GetExtensionCatalog | ClientMessage::WatchResources | ClientMessage::Shutdown => send_error(&mut connection, envelope.request_id, "control_only", "command requires a control connection").await?,
+                    ClientMessage::MovePane { .. } | ClientMessage::Contextual { .. } | ClientMessage::RetireWorkspace { .. } | ClientMessage::PublishToken { .. } | ClientMessage::ReloadExtensions | ClientMessage::ReportAgent { .. } | ClientMessage::TerminalInput { .. } | ClientMessage::ReadTerminalOutput { .. } | ClientMessage::WaitTerminalOutput { .. } | ClientMessage::PromptAgent { .. } | ClientMessage::WaitAgent { .. } | ClientMessage::GetExtensionCatalog | ClientMessage::WatchResources | ClientMessage::Shutdown => send_error(&mut connection, envelope.request_id, "control_only", "command requires a control connection").await?,
                     ClientMessage::Hello { .. } => send_error(&mut connection, envelope.request_id, "already_hello", "hello was already received").await?,
                 }
             },

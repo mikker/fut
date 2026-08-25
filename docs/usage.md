@@ -53,6 +53,7 @@ The configuration name is the key to override under `[ui.bindings]`.
 | Key | Action | Configuration name |
 | --- | --- | --- |
 | `:` | Search every command and configured extension action | `open_command_bar` |
+| `Shift-S` | Open a configured project or path | `open_project` |
 | `R` | Reload global and focused-project configuration | `reload_config` |
 | `[` | Enter copy mode | `enter_copy_mode` |
 | `s` | Search sessions, workspaces, tabs, and panes | `open_navigator` |
@@ -87,6 +88,16 @@ Bindings can be changed in [Configuration](../configuration/).
 The command palette also provides unbound `rename-session`, `rename-workspace`,
 `rename-tab`, `kill-session`, `kill-workspace`, and `kill-tab` actions for the
 focused resource.
+
+Press `Ctrl-b Shift-S` to open a project without leaving the client. Fut fuzzy
+filters only the explicit `[projects]` catalog and never scans for repositories.
+Typing also adds an **Open path** row for the exact value, resolved relative to
+the focused workspace; obvious paths and queries without a project match select
+that row automatically. Opening a live project navigates to its existing
+terminal. A new project applies its recipe and focuses the terminal selected by
+that recipe.
+If a repository recipe is not yet trusted, Fut shows its exact contents for
+review and accepts or declines machine-local approval in the same dialog.
 
 The tab bar and workspace rows also support the mouse: left-click to switch,
 right-click for create, rename, close, and sidebar display actions. Drag pane

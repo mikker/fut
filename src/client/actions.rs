@@ -85,6 +85,7 @@ impl NavigationScope {
 pub(super) enum ClientAction {
     RunCommand(usize),
     OpenCommandBar,
+    OpenProject,
     ReloadConfig,
     ReloadProjectConfig,
     EnterCopyMode,
@@ -132,8 +133,9 @@ pub(super) struct DirectBinding {
     pub action: ClientAction,
 }
 
-pub(super) const ALL_ACTIONS: [ClientAction; 48] = [
+pub(super) const ALL_ACTIONS: [ClientAction; 49] = [
     ClientAction::OpenCommandBar,
+    ClientAction::OpenProject,
     ClientAction::ReloadConfig,
     ClientAction::ReloadProjectConfig,
     ClientAction::EnterCopyMode,
@@ -183,7 +185,7 @@ pub(super) const ALL_ACTIONS: [ClientAction; 48] = [
     ClientAction::Detach,
 ];
 
-pub(super) const COMMANDS: [ActionDefinition; 47] = [
+pub(super) const COMMANDS: [ActionDefinition; 48] = [
     ActionDefinition {
         action: ClientAction::ReloadConfig,
         title: "Reload configuration",
@@ -193,6 +195,11 @@ pub(super) const COMMANDS: [ActionDefinition; 47] = [
         action: ClientAction::ReloadProjectConfig,
         title: "Reload project extension configuration",
         keywords: "reload refresh project config configuration recipe project.toml",
+    },
+    ActionDefinition {
+        action: ClientAction::OpenProject,
+        title: "Open project",
+        keywords: "open switch project directory path configured catalog",
     },
     ActionDefinition {
         action: ClientAction::OpenNavigator,
@@ -424,10 +431,14 @@ pub(super) const COMMANDS: [ActionDefinition; 47] = [
 const UP: &[u8] = b"\x1b[A";
 const DOWN: &[u8] = b"\x1b[B";
 
-pub(super) const DIRECT_BINDINGS: [DirectBinding; 41] = [
+pub(super) const DIRECT_BINDINGS: [DirectBinding; 42] = [
     DirectBinding {
         suffix: b":",
         action: ClientAction::OpenCommandBar,
+    },
+    DirectBinding {
+        suffix: b"S",
+        action: ClientAction::OpenProject,
     },
     DirectBinding {
         suffix: b"R",
@@ -604,6 +615,7 @@ pub(super) const fn command_name(action: ClientAction) -> &'static str {
     match action {
         ClientAction::RunCommand(_) => "run-command",
         ClientAction::OpenCommandBar => "command-palette",
+        ClientAction::OpenProject => "open-project",
         ClientAction::ReloadConfig => "reload-config",
         ClientAction::ReloadProjectConfig => "reload-project-config",
         ClientAction::EnterCopyMode => "copy-mode",
@@ -658,6 +670,7 @@ pub(super) fn config_key(action: ClientAction) -> &'static str {
     match action {
         ClientAction::RunCommand(_) => panic!("configured commands do not have built-in keys"),
         ClientAction::OpenCommandBar => "open_command_bar",
+        ClientAction::OpenProject => "open_project",
         ClientAction::ReloadConfig => "reload_config",
         ClientAction::ReloadProjectConfig => "reload_project_config",
         ClientAction::EnterCopyMode => "enter_copy_mode",
@@ -757,7 +770,8 @@ const fn requires_launcher(action: ClientAction) -> bool {
     match action {
         ClientAction::RunCommand(_) => true,
         ClientAction::OpenCommandBar => false,
-        ClientAction::ReloadConfig
+        ClientAction::OpenProject
+        | ClientAction::ReloadConfig
         | ClientAction::ReloadProjectConfig
         | ClientAction::EnterCopyMode
         | ClientAction::OpenNavigator
@@ -869,6 +883,7 @@ mod tests {
             Some(ClientAction::TogglePaneZoom)
         );
         assert_eq!(bindings.label(ClientAction::TogglePaneZoom), "Ctrl-b z");
+        assert_eq!(bindings.label(ClientAction::OpenProject), "Ctrl-b S");
         assert_eq!(bindings.label(ClientAction::OpenLeftSidebar), "Ctrl-b w");
         assert_eq!(bindings.label(ClientAction::OpenRightSidebar), "Ctrl-b ]");
         assert_eq!(bindings.label(ClientAction::RenameSession), "Unbound");

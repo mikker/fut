@@ -216,7 +216,7 @@ open_workspace() {
   local name=$2
   local banner=$3
 
-  run_json open "$path" --name "$name" -- \
+  run_json open "$path" --background --name "$name" -- \
     /bin/sh -c 'printf "\033[1;36m%s\033[0m\r\n" "$2"; exec "$1"' \
     fut-demo "$DEMO_SHELL" "$banner"
 }
@@ -238,6 +238,13 @@ EOF
   git -C "$MAIN" worktree add -q -b docs "$DOCS"
   printf '# Feature workspace\n' >"$FEATURE/FEATURE.md"
   printf '# Documentation workspace\n' >"$DOCS/DOCS.md"
+}
+
+setup_config() {
+  cat >"$CONFIG_DIR/config.toml" <<EOF
+[projects.main]
+path = "$MAIN"
+EOF
 }
 
 setup_demo() {
@@ -263,11 +270,12 @@ setup_demo() {
   chmod 700 "$RUNTIME_DIR"
   : >"$CLIENT_LOG"
   setup_repository
+  setup_config
 
   trap 'clean_demo' ERR INT TERM
   fut daemon run --cwd "$MAIN" -- \
     /bin/sh -c \
-      'printf "\033[1;36mFut demo · main / shell\033[0m\r\nTry Ctrl-b w, Ctrl-b ], and Ctrl-b s.\r\n"; exec "$1"' \
+      'printf "\033[1;36mFut demo · main / shell\033[0m\r\nTry Ctrl-b Shift-S, Ctrl-b w, Ctrl-b ], and Ctrl-b s.\r\n"; exec "$1"' \
       fut-demo "$DEMO_SHELL" >"$DAEMON_LOG" 2>&1 &
   local daemon_pid=$!
   DEMO_DAEMON_PID=$daemon_pid
@@ -275,7 +283,7 @@ setup_demo() {
   wait_for_daemon
 
   local main_json feature_json docs_json
-  main_json=$(run_json open "$MAIN")
+  main_json=$(run_json open "$MAIN" --background)
   feature_json=$(open_workspace "$FEATURE" feature "Fut demo · feature / shell")
   docs_json=$(open_workspace "$DOCS" docs "Fut demo · docs / shell")
 
@@ -338,7 +346,7 @@ Fut demo is ready.
   reattach: mise run demo:attach
   clean up: mise run demo:clean
 
-Inside Fut try Ctrl-b w, Ctrl-b ], Ctrl-b s, and the pane focus bindings.
+Inside Fut try Ctrl-b Shift-S, Ctrl-b w, Ctrl-b ], Ctrl-b s, and the pane focus bindings.
 EOF
 }
 

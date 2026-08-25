@@ -32,6 +32,13 @@ An optional path may select a linked checkout, for example
 Git project identity as the configured root before opening it as a peer
 workspace.
 
+From an attached client, press `Ctrl-b Shift-S` to fuzzy-filter the configured
+catalog or type any path. Suggestions come only from configuration—Fut does not
+scan the filesystem. The exact typed value appears as an **Open path** choice,
+resolved relative to the focused workspace. Opening a location that is already
+live navigates to it rather than creating a duplicate. A newly bootstrapped
+project attaches directly to the focus terminal selected by its recipe.
+
 List the configured catalog without starting a daemon:
 
 ```sh
@@ -64,6 +71,12 @@ exact current contents with:
 fut project init
 fut project trust fut
 ```
+
+The in-client project opener performs the same approval safely without a shell:
+it displays the recipe contents, asks for `y` or `n`, and records approval
+through Fut's machine-local trust store. It never asks you to copy a hash or
+edit trust state. If the recipe changes while it is displayed, approval fails
+and the opener asks you to review the new contents again.
 
 `fut project init` creates a small starter recipe in the current directory with
 the published schema, an agent tab, a Vim tab, and a link back to this page. It

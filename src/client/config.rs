@@ -282,7 +282,20 @@ impl BindingsConfig {
     pub(super) fn suffix(&self, action: ClientAction) -> Option<Vec<u8>> {
         match self.values.get(config_key(action)) {
             Some(value) => self.parse_suffix(value).map(|(bytes, _)| bytes),
-            None => self.default_suffix(action).map(<[u8]>::to_vec),
+            None => {
+                let default = self.default_suffix(action)?;
+                // Shift-S was historically available for user-bound actions.
+                // Let an existing explicit binding keep it instead of making
+                // the newly added project opener invalidate that config.
+                let displaced = action == ClientAction::OpenProject
+                    && self.values.iter().any(|(key, value)| {
+                        key != config_key(action)
+                            && self
+                                .parse_suffix(value)
+                                .is_some_and(|(suffix, _)| suffix == default)
+                    });
+                (!displaced).then(|| default.to_vec())
+            }
         }
     }
 
@@ -1442,6 +1455,11 @@ pub(crate) struct ProjectCatalog {
 }
 
 impl ProjectCatalog {
+    #[cfg(test)]
+    pub(crate) fn from_projects(projects: BTreeMap<String, ProjectConfig>) -> Self {
+        Self { projects }
+    }
+
     pub(crate) fn get(&self, name: &str) -> Option<&ProjectConfig> {
         self.projects.get(name)
     }
@@ -2937,6 +2955,7 @@ components = [
             config.bindings.action_for_suffix(b"S"),
             Some(ClientAction::RenameSession)
         );
+        assert_eq!(config.bindings.label(ClientAction::OpenProject), "Unbound");
         assert_eq!(
             config.bindings.action_for_suffix(b"W"),
             Some(ClientAction::RenameWorkspace)

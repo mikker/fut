@@ -2097,7 +2097,7 @@ fn render_workspace_row(
     let icons = ui.icons.resolve();
     let state = ItemState {
         // Keyboard selection and closing own the whole row. Current styling is
-        // applied only to the workspace name so status colors stay visible.
+        // limited to the workspace index and name so status colors stay visible.
         current: false,
         selected,
         closing: item.closing,
@@ -2107,6 +2107,9 @@ fn render_workspace_row(
     let row_style = apply_item_state(&ui.styles, state, surface);
     clear(area, row_style, buffer);
     let resolve = |token: &str| match token {
+        "workspace.index" if item.current => {
+            TokenValue::styled((item.index + 1).to_string(), SemanticStyle::Current)
+        }
         "workspace.index" => TokenValue::plain((item.index + 1).to_string()),
         "workspace.name" if item.current => {
             TokenValue::styled(sanitize(&item.name), SemanticStyle::Current)
@@ -2862,7 +2865,7 @@ mod tests {
     }
 
     #[test]
-    fn current_workspace_styles_only_its_name() {
+    fn current_workspace_styles_its_index_and_name() {
         let (snapshot, focused) = fixture(&["main"], 0);
         let model = WorkspaceModel::from_snapshot(
             &snapshot,
@@ -2885,8 +2888,8 @@ mod tests {
             &mut buffer,
         );
 
-        assert!((2..7).all(|column| buffer[(column, 3)].modifier.contains(Modifier::REVERSED)));
-        assert!((0..2).all(|column| !buffer[(column, 3)].modifier.contains(Modifier::REVERSED)));
+        assert!((1..7).all(|column| buffer[(column, 3)].modifier.contains(Modifier::REVERSED)));
+        assert!(!buffer[(0, 3)].modifier.contains(Modifier::REVERSED));
         assert!((7..23).all(|column| !buffer[(column, 3)].modifier.contains(Modifier::REVERSED)));
         assert!((0..23).all(|column| !buffer[(column, 4)].modifier.contains(Modifier::REVERSED)));
     }

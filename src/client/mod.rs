@@ -21,6 +21,7 @@ mod navigator;
 mod notifications;
 mod perf;
 mod presentation;
+mod project_opener;
 mod rename;
 mod sidebar;
 mod tab_bar;
@@ -31,7 +32,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     io,
     num::NonZeroU16,
-    path::Path,
+    path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
 };
@@ -77,6 +78,7 @@ use layout::{
 use navigation::NavigationHistory;
 use navigator::{NavigatorAction, NavigatorState};
 use notifications::{NotificationsAction, NotificationsDialog};
+use project_opener::{ProjectOpenChoice, ProjectOpenerAction, ProjectOpenerState};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -86,6 +88,7 @@ use ratatui::{
     widgets::{Clear, Widget},
 };
 use rename::{RenameAction, RenameState};
+use sha2::{Digest, Sha256};
 use tokio::{
     io::AsyncWriteExt,
     net::UnixStream,
@@ -121,6 +124,7 @@ use crate::{
 
 enum ClientSurface {
     Navigator(NavigatorState),
+    ProjectOpener(ProjectOpenerState),
     Agents(AgentsDialog),
     Notifications(NotificationsDialog),
     Sidebar(SidebarState),
@@ -703,29 +707,35 @@ async fn run_loop(
                 match envelope.message {
                     ServerMessage::Snapshot { terminal_id, screen } => {
                         let accepted = view.accept(terminal_id, screen);
-                        let navigator_completed = accepted
+                        let switching_completed = accepted
                             && terminal_id == view.focused().terminal_id
                             && match surface.as_mut() {
                                 Some(ClientSurface::Navigator(nav)) => {
                                     nav.accept_switch_snapshot()
                                 }
+                                Some(ClientSurface::ProjectOpener(opener)) => {
+                                    opener.accept_snapshot()
+                                }
                                 _ => false,
                             };
-                        if navigator_completed {
+                        if switching_completed {
                             surface = None;
                         }
                     }
                     ServerMessage::SnapshotDelta { terminal_id, delta } => {
                         match view.accept_delta(terminal_id, delta) {
                             DeltaApplyResult::Applied => {
-                                let navigator_completed = terminal_id == view.focused().terminal_id
+                                let switching_completed = terminal_id == view.focused().terminal_id
                                     && match surface.as_mut() {
                                         Some(ClientSurface::Navigator(nav)) => {
                                             nav.accept_switch_snapshot()
                                         }
+                                        Some(ClientSurface::ProjectOpener(opener)) => {
+                                            opener.accept_snapshot()
+                                        }
                                         _ => false,
                                     };
-                                if navigator_completed {
+                                if switching_completed {
                                     surface = None;
                                 }
                             }
@@ -1029,6 +1039,12 @@ async fn run_loop(
                     ServerMessage::TargetSelected { selected: target } => {
                         let old_terminal = view.focused().terminal_id;
                         let previous_target = view.focused().clone();
+                        let project_open_selected = match surface.as_mut() {
+                            Some(ClientSurface::ProjectOpener(opener)) => {
+                                opener.selection_received(request_id)
+                            }
+                            _ => false,
+                        };
                         let navigator_selected = match surface.as_mut() {
                             Some(ClientSurface::Navigator(nav)) => nav.switch_selected(request_id),
                             _ => false,
@@ -1044,6 +1060,7 @@ async fn run_loop(
                             create.selected(request_id, &target, observed_revision);
                         if !view.replace(target)? {
                             if navigator_selected
+                                || project_open_selected
                                 || workspace_selected
                                 || tab_selected
                                 || sidebar_selected
@@ -1094,6 +1111,10 @@ async fn run_loop(
                             );
                         }
                         if navigator_selected && view.focused().terminal_id == old_terminal {
+                            surface = None;
+                            view.invalidate_drawn();
+                        }
+                        if project_open_selected && view.focused().terminal_id == old_terminal {
                             surface = None;
                             view.invalidate_drawn();
                         }
@@ -1173,7 +1194,17 @@ async fn run_loop(
                             force_draw = true;
                         }
                     }
-                    ServerMessage::Pong { .. } | ServerMessage::LocationOpened { .. } => {}
+                    ServerMessage::LocationOpened { .. } => {
+                        let accepted = match surface.as_mut() {
+                            Some(ClientSurface::ProjectOpener(opener)) => opener.opened(request_id),
+                            _ => false,
+                        };
+                        if !accepted {
+                            bail!("unexpected location-open response on interactive connection");
+                        }
+                        force_draw = true;
+                    }
+                    ServerMessage::Pong { .. } => {}
                     ServerMessage::TerminalExited { terminal_id, exit_code } => {
                         if copy_mode
                             .as_ref()
@@ -1256,6 +1287,16 @@ async fn run_loop(
                         }
                         if close_target.fail(request_id) {
                             toasts.error(format!("close failed · {message}"));
+                            force_draw = true;
+                            continue;
+                        }
+                        let project_open_failed = match surface.as_mut() {
+                            Some(ClientSurface::ProjectOpener(opener)) => {
+                                opener.fail(request_id, message.clone())
+                            }
+                            _ => false,
+                        };
+                        if project_open_failed {
                             force_draw = true;
                             continue;
                         }
@@ -1586,6 +1627,61 @@ async fn run_loop(
                             host,
                         ).await?;
                         force_draw = true;
+                    }
+                    Event::Key(key) if matches!(surface.as_ref(), Some(ClientSurface::ProjectOpener(_))) => {
+                        toasts.clear();
+                        let size = terminal.size()?;
+                        let visible = project_opener::dialog_body_rows(Rect::new(0, 0, size.width, size.height));
+                        let action = project_opener_mut(&mut surface).key(key, visible);
+                        match action {
+                            ProjectOpenerAction::Stay => {}
+                            ProjectOpenerAction::Close => {
+                                surface = None;
+                                view.invalidate_drawn();
+                            }
+                            ProjectOpenerAction::Submit(choice) => {
+                                match prepare_project_open(choice, config_location, &ui.extensions).await {
+                                    Ok(ProjectOpenPreparation::Ready { project, cwd }) => {
+                                        let opener = project_opener_mut(&mut surface);
+                                        request_project_open(framed, opener, project, cwd).await?;
+                                    }
+                                    Ok(ProjectOpenPreparation::Approval { project, cwd, path, digest, source }) => {
+                                        project_opener_mut(&mut surface)
+                                            .confirm_approval(project, cwd, path, digest, &source);
+                                    }
+                                    Err(error) => {
+                                        project_opener_mut(&mut surface)
+                                            .show_error(one_line_error(&error));
+                                    }
+                                }
+                            }
+                            ProjectOpenerAction::Approve { project, cwd, digest } => {
+                                match approve_project_recipe(
+                                    &project,
+                                    &digest,
+                                    config_location,
+                                    &ui.extensions,
+                                ) {
+                                    Ok(_) => {
+                                        let opener = project_opener_mut(&mut surface);
+                                        request_project_open(framed, opener, Some(project), cwd).await?;
+                                    }
+                                    Err(error) => {
+                                        project_opener_mut(&mut surface).show_error(format!(
+                                            "trust failed · {}",
+                                            one_line_error(&error)
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        force_draw = true;
+                    }
+                    Event::Paste(text) if matches!(surface.as_ref(), Some(ClientSurface::ProjectOpener(_))) => {
+                        if let Some(ClientSurface::ProjectOpener(opener)) = surface.as_mut() {
+                            opener.paste(&text);
+                            force_draw = true;
+                        }
                     }
                     Event::Key(key) if matches!(surface.as_ref(), Some(ClientSurface::Notifications(_))) => {
                         toasts.clear();
@@ -2698,6 +2794,9 @@ async fn run_loop(
                             Some(ClientSurface::Navigator(nav)) => {
                                 nav.render(area, spinner_frame, &ui.styles, frame.buffer_mut());
                             }
+                            Some(ClientSurface::ProjectOpener(opener)) => {
+                                opener.render(layout.terminal, frame.buffer_mut());
+                            }
                             Some(ClientSurface::Agents(dialog)) => {
                                 dialog.render(area, spinner_frame, &ui.styles, frame.buffer_mut());
                             }
@@ -2921,6 +3020,7 @@ fn refresh_surface_resources(
         }
         Some(
             ClientSurface::CommandBar(_)
+            | ClientSurface::ProjectOpener(_)
             | ClientSurface::ContextMenu(_)
             | ClientSurface::CommandForm(_),
         )
@@ -3567,7 +3667,11 @@ async fn install_ui_config(
     // extension generation. Close them before replacing that generation.
     if matches!(
         surface,
-        Some(ClientSurface::CommandBar(_) | ClientSurface::CommandForm(_))
+        Some(
+            ClientSurface::CommandBar(_)
+                | ClientSurface::ProjectOpener(_)
+                | ClientSurface::CommandForm(_),
+        )
     ) {
         *surface = None;
     }
@@ -3593,6 +3697,130 @@ async fn install_ui_config(
     resize_view(framed, host, view, resources, ui).await?;
     view.invalidate_drawn();
     Ok(())
+}
+
+enum ProjectOpenPreparation {
+    Ready {
+        project: Option<String>,
+        cwd: PathBuf,
+    },
+    Approval {
+        project: String,
+        cwd: PathBuf,
+        path: PathBuf,
+        digest: String,
+        source: String,
+    },
+}
+
+fn project_opener_mut(surface: &mut Option<ClientSurface>) -> &mut ProjectOpenerState {
+    let Some(ClientSurface::ProjectOpener(opener)) = surface else {
+        unreachable!("project opener event requires a project opener surface")
+    };
+    opener
+}
+
+async fn prepare_project_open(
+    choice: ProjectOpenChoice,
+    config_location: &config::ConfigLocation,
+    extensions: &[crate::extensions::Extension],
+) -> anyhow::Result<ProjectOpenPreparation> {
+    let catalog = config::load_projects_location(config_location)?;
+    let (project, cwd) = match choice {
+        ProjectOpenChoice::Configured { name, path } => (Some(name), path),
+        ProjectOpenChoice::Path(path) => {
+            let resolver = crate::project::ProjectResolver::default();
+            let requested = resolver
+                .resolve(&path)
+                .await
+                .with_context(|| format!("resolve project path {}", path.display()))?;
+            let mut matched = None;
+            for (name, configured) in catalog.iter() {
+                let Ok(candidate) = resolver.resolve(configured.path()).await else {
+                    continue;
+                };
+                if candidate.project != requested.project {
+                    continue;
+                }
+                if matched.is_some() {
+                    bail!(
+                        "project identity for {} matches multiple configured projects",
+                        path.display()
+                    );
+                }
+                matched = Some(name.to_owned());
+            }
+            (matched, path)
+        }
+    };
+    let Some(name) = project else {
+        return Ok(ProjectOpenPreparation::Ready { project: None, cwd });
+    };
+    let configured = catalog
+        .get(&name)
+        .with_context(|| format!("configured project {name:?} is unavailable"))?;
+    match crate::project_definition::load(Some(&name), configured, extensions) {
+        Ok(_) => Ok(ProjectOpenPreparation::Ready {
+            project: Some(name),
+            cwd,
+        }),
+        Err(crate::project_definition::ProjectDefinitionError::UntrustedRecipe {
+            path,
+            digest,
+            ..
+        }) => {
+            let source = std::fs::read_to_string(&path)
+                .with_context(|| format!("read project recipe {} for review", path.display()))?;
+            let reviewed_digest = format!("{:x}", Sha256::digest(source.as_bytes()));
+            if reviewed_digest != digest {
+                bail!("project recipe changed while preparing review; retry opening it");
+            }
+            Ok(ProjectOpenPreparation::Approval {
+                project: name,
+                cwd,
+                path,
+                digest,
+                source,
+            })
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn approve_project_recipe(
+    project: &str,
+    digest: &str,
+    config_location: &config::ConfigLocation,
+    extensions: &[crate::extensions::Extension],
+) -> anyhow::Result<()> {
+    let catalog = config::load_projects_location(config_location)?;
+    let configured = catalog
+        .get(project)
+        .with_context(|| format!("configured project {project:?} is unavailable"))?;
+    crate::project_definition::trust_digest(configured, extensions, digest)?;
+    Ok(())
+}
+
+async fn request_project_open(
+    framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    opener: &mut ProjectOpenerState,
+    project: Option<String>,
+    cwd: PathBuf,
+) -> anyhow::Result<()> {
+    let request_id = Uuid::new_v4();
+    opener.begin_open(request_id);
+    send_request(
+        framed,
+        Some(request_id),
+        ClientMessage::OpenLocation {
+            project,
+            name: None,
+            cwd,
+            program: None,
+            argv: Vec::new(),
+        },
+    )
+    .await
 }
 
 #[allow(
@@ -3721,6 +3949,33 @@ async fn dispatch_client_action(
             *surface = Some(ClientSurface::CommandBar(
                 CommandBarState::open_with_bindings(ui.bindings.clone()),
             ));
+        }
+        ClientAction::OpenProject => {
+            let catalog = match config::load_projects_location(config_location) {
+                Ok(catalog) => catalog,
+                Err(error) => {
+                    return Ok(Some(Toast::error(format!(
+                        "project catalog failed · {}",
+                        one_line_error(&error)
+                    ))));
+                }
+            };
+            let base = resources
+                .snapshot()
+                .and_then(|snapshot| {
+                    snapshot.sessions.iter().find_map(|session| {
+                        session
+                            .workspaces
+                            .iter()
+                            .find(|workspace| workspace.id == view.focused().workspace_id)
+                            .map(|workspace| workspace.root.clone())
+                    })
+                })
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_else(|| PathBuf::from("/"));
+            *surface = Some(ClientSurface::ProjectOpener(ProjectOpenerState::open(
+                &catalog, base,
+            )));
         }
         ClientAction::ReloadConfig => {
             if extension_reload.is_some() || project_config_reload.is_some() {

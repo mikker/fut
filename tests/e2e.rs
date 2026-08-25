@@ -9982,7 +9982,7 @@ async fn isolated_keyboard_chaos_journey() {
         "FUT_CHAOS_STEPS must be 1..=2000"
     );
 
-    let harness = Harness::start("exec /bin/sh").await;
+    let harness = Harness::start("PS1='FUT_TEST_SHELL_READY>'; export PS1; exec /bin/sh -i").await;
     let initial = harness.resources().await;
     let workspace_id = initial.sessions[0].workspaces[0].id;
     let mut current_tab = initial.sessions[0].workspaces[0].tabs[0].id;
@@ -12492,6 +12492,75 @@ async fn switching_is_atomic_reversible_and_keeps_protocol_routing_isolated() {
 
     select_and_require_next_snapshot(&mut connection, TargetSelector::Pane(b.pane_id), &b).await;
     select_and_require_next_snapshot(&mut connection, TargetSelector::Terminal(a_id), &a).await;
+    harness.detach(&mut connection).await;
+    drop(connection);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn interactive_open_location_reuses_the_connection_and_focuses_the_opened_terminal() {
+    let mut harness = Harness::start(
+        "printf 'A_READY\\r\\n'; while IFS= read -r line; do printf 'A_%s\\r\\n' \"$line\"; done",
+    )
+    .await;
+    let resources = harness.resources().await;
+    let a = resources.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
+    let (mut connection, _, _) = harness
+        .interactive_for(Some(TargetSelector::Terminal(a)))
+        .await;
+    snapshot_containing(&mut connection, a, "A_READY").await;
+
+    let cwd = harness.root.path().join("in-client-open");
+    fs::create_dir(&cwd).unwrap();
+    let request_id = Uuid::new_v4();
+    send_envelope(
+        &mut connection,
+        Envelope {
+            request_id: Some(request_id),
+            message: ClientMessage::OpenLocation {
+                project: None,
+                name: None,
+                cwd,
+                program: Some("/bin/sh".into()),
+                argv: vec![
+                    "-c".into(),
+                    "printf 'B_READY\\r\\n'; while IFS= read -r line; do printf 'B_%s\\r\\n' \"$line\"; done".into(),
+                ],
+            },
+        },
+    )
+    .await;
+
+    let mut opened = None;
+    let mut selected = None;
+    while opened.is_none() || selected.is_none() {
+        let envelope = receive_envelope(&mut connection)
+            .await
+            .expect("interactive project open disconnected");
+        if envelope.request_id != Some(request_id) {
+            continue;
+        }
+        match envelope.message {
+            ServerMessage::LocationOpened {
+                selected: target, ..
+            } => opened = Some(target),
+            ServerMessage::TargetSelected { selected: view } => selected = Some(view.focused),
+            message => panic!("unexpected interactive project-open response: {message:?}"),
+        }
+    }
+    let opened = opened.unwrap();
+    assert_eq!(selected.unwrap().terminal_id, opened.terminal_id);
+    assert_ne!(opened.terminal_id, a);
+    snapshot_containing(&mut connection, opened.terminal_id, "B_READY").await;
+    send(
+        &mut connection,
+        ClientMessage::Input {
+            bytes: b"after-open\n".to_vec(),
+        },
+    )
+    .await;
+    snapshot_containing(&mut connection, opened.terminal_id, "B_after-open").await;
+
     harness.detach(&mut connection).await;
     drop(connection);
     harness.shutdown().await;

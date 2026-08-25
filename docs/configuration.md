@@ -64,6 +64,7 @@ prefix = "ctrl-b"
 [ui.bindings]
 open_command_bar = "space"
 "run:restart" = "r"
+# open_project = "S"
 # reload_config = "R"
 # reload_project_config = "P"
 # enter_copy_mode = "["
