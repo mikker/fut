@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.13
+
 - `fut agent prompt --stdin` now accepts multiline and generated prompts without shell argument interpolation.
 - `Ctrl-b Shift-S` now opens projects from a fuzzy configured catalog or a typed path, reusing live sessions and reviewing untrusted recipes in-client.
 - Added per-client terminal bell alerts with ancestry markers, navigation, a configurable notification glyph, and opt-in outer-terminal signaling.
