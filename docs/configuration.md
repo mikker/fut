@@ -43,7 +43,7 @@ A missing implicit file, including one selected through `--config-dir`, uses def
 
 Files must be regular UTF-8 files no larger than 64 KiB. Unknown fields, invalid values, unsafe control or bidirectional-formatting characters, ambiguous segments, and out-of-scope tokens are errors.
 
-Closing a pane, tab, or workspace asks for confirmation by default. While the prompt is open, it exclusively owns keyboard, paste, and pointer input; resizing the host terminal remains available. Set `ui.confirm_close = false` to perform those close actions immediately. This setting is client-local and applies to both keyboard commands and contextual menus.
+Closing a pane, tab, or workspace asks for confirmation by default. While the prompt is open, it exclusively owns keyboard, paste, and pointer input; resizing the host terminal remains available. Set `ui.confirm_close = false` to perform those close actions immediately. This setting is client-local and applies to both keyboard commands and contextual menus. A tab, workspace, or session close can finish only partway if a later terminal cannot close; Fut reports how many terminals exited and keeps the target marked closing because those exits cannot be undone.
 
 Terminal-native alerts are configured at the top level. They are separate
 from coding-agent lifecycle notifications:

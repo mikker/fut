@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Close confirmations now prevent pasted or pointer input from reaching terminals and controls behind the prompt.
+- Failed multi-terminal closes now report partial progress and remain visibly closing instead of implying that already-terminated panes were restored.
 
 ## 0.13
 

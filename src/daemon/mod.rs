@@ -704,6 +704,35 @@ impl SharedState {
         }
     }
 
+    fn fail_target_close(
+        &mut self,
+        scope: CloseScope,
+        closed: usize,
+        total: usize,
+        error: CommandError,
+    ) -> DaemonError {
+        if closed > 0 {
+            return DaemonError::new(
+                "close_partial",
+                format!(
+                    "closed {closed} of {total} terminals; the target remains marked closing because completed exits cannot be rolled back · {error}"
+                ),
+            );
+        }
+
+        if matches!(error, CommandError::CloseTimeout) {
+            return DaemonError::new(
+                "close_incomplete",
+                format!(
+                    "terminal termination began but did not finish; the target remains marked closing because termination cannot be rolled back · {error}"
+                ),
+            );
+        }
+
+        self.cancel_target_close(scope);
+        DaemonError::command("close_failed", error)
+    }
+
     fn move_pane(
         &mut self,
         pane_id: PaneId,
@@ -5670,11 +5699,11 @@ async fn prepare_target_close(
 }
 
 async fn finish_target_close(shared: &Shared, pending: PendingClose) -> Result<(), DaemonError> {
-    for handle in pending.handles {
+    let total = pending.handles.len();
+    for (closed, handle) in pending.handles.into_iter().enumerate() {
         if let Err(error) = handle.close().await {
             let mut state = shared.lock().await;
-            state.cancel_target_close(pending.scope);
-            return Err(DaemonError::command("close_failed", error));
+            return Err(state.fail_target_close(pending.scope, closed, total, error));
         }
     }
     Ok(())
@@ -7461,6 +7490,55 @@ scope = "workspace"
 
         assert_eq!(error.code, "resource_error");
         assert!(!state.resources.snapshot().sessions[0].closing);
+    }
+
+    #[test]
+    fn close_failure_after_an_exit_preserves_partial_closing_state() {
+        let (mut state, path) = inconsistent_state();
+        state
+            .resources
+            .add_pane(path.tab_id, PaneId::new(), TerminalId::new())
+            .unwrap();
+        let scope = CloseScope::Tab(path.tab_id);
+        scope.begin(&mut state.resources).unwrap();
+        let revision = state.resources.revision();
+
+        let error = state.fail_target_close(scope, 1, 2, CommandError::Stopped);
+
+        assert_eq!(error.code, "close_partial");
+        assert!(error.message.contains("closed 1 of 2 terminals"));
+        assert!(error.message.contains("cannot be rolled back"));
+        assert_eq!(state.resources.revision(), revision);
+        let tab = &state.resources.snapshot().sessions[0].workspaces[0].tabs[0];
+        assert!(tab.closing);
+        assert!(tab.panes.iter().all(|pane| pane.closing));
+    }
+
+    #[test]
+    fn close_failure_before_termination_still_rolls_back_marker() {
+        let (mut state, path) = inconsistent_state();
+        let scope = CloseScope::Pane(path.pane_id);
+        scope.begin(&mut state.resources).unwrap();
+
+        let error = state.fail_target_close(scope, 0, 1, CommandError::Stopped);
+
+        assert_eq!(error.code, "close_failed");
+        assert!(!state.resources.snapshot().sessions[0].workspaces[0].tabs[0].panes[0].closing);
+    }
+
+    #[test]
+    fn close_timeout_preserves_marker_after_termination_started() {
+        let (mut state, path) = inconsistent_state();
+        let scope = CloseScope::Pane(path.pane_id);
+        scope.begin(&mut state.resources).unwrap();
+        let revision = state.resources.revision();
+
+        let error = state.fail_target_close(scope, 0, 1, CommandError::CloseTimeout);
+
+        assert_eq!(error.code, "close_incomplete");
+        assert!(error.message.contains("termination cannot be rolled back"));
+        assert_eq!(state.resources.revision(), revision);
+        assert!(state.resources.snapshot().sessions[0].workspaces[0].tabs[0].panes[0].closing);
     }
 
     #[test]
