@@ -19,31 +19,23 @@ Start Codex, run `/hooks`, and trust the Fut hooks. Codex skips new or changed
 non-managed plugin hooks until they are reviewed.
 
 Codex publishes final turn completion through its machine-local `notify`
-command. Install Fut's notification adapter at a stable path:
-
-```sh
-mkdir -p "$HOME/.local/bin"
-curl -fsSL \
-  https://raw.githubusercontent.com/mikker/fut/main/integrations/codex/plugins/fut-codex/scripts/fut_codex_lifecycle.py \
-  -o "$HOME/.local/bin/fut-codex-notify"
-chmod +x "$HOME/.local/bin/fut-codex-notify"
-```
-
-Add this user-level setting to `~/.codex/config.toml`:
+command. Add this user-level setting to `~/.codex/config.toml`:
 
 ```toml
 notify = [
-  "fut-codex-notify",
-  "--notify",
+  "fut",
+  "agent",
+  "notify",
+  "codex",
 ]
 ```
 
-The command assumes `~/.local/bin` is on `PATH`. If `notify` is already in
-use, configure the existing notification program to dispatch the same JSON
-argument to Fut's adapter; do not add a second `notify` key. Restart Codex
-after changing plugin or notification configuration.
+If `notify` is already in use, configure the existing notification program to
+dispatch the same JSON argument to `fut agent notify codex`; do not add a
+second `notify` key. Restart Codex after changing plugin or notification
+configuration.
 
-The adapter reports idle, working, blocked, and completed activity. It does
+The integration reports idle, working, blocked, and completed activity. It does
 not control prompts, permissions, tools, terminal layout, or worktrees, and it
 remains inactive when Codex is running outside Fut.
 

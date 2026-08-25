@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Codex can now report completed turns directly through `fut agent notify codex`, without a separately installed notification adapter.
 - Sidebar focus now highlights only workspace and agent titles, preserving status colors for faster scanning.
 - Extensions can now detect other active extensions and their versions through `FUT_EXTENSIONS`.
 - `fut list` now shows the navigator's concise resource tree, with `-v`/`--verbose` retaining the detailed machine-oriented view.

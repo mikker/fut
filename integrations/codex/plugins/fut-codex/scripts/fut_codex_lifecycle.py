@@ -27,36 +27,23 @@ def bounded_string(value: Any) -> str | None:
     return value
 
 
-def load_event(mode: str, arguments: list[str]) -> dict[str, Any] | None:
+def load_event() -> dict[str, Any] | None:
     try:
-        if mode == "--hook":
-            value = json.load(sys.stdin)
-        elif mode == "--notify" and arguments:
-            value = json.loads(arguments[0])
-        else:
-            return None
+        value = json.load(sys.stdin)
     except (json.JSONDecodeError, OSError, UnicodeError):
         return None
     return value if isinstance(value, dict) else None
 
 
-def transition(mode: str, event: dict[str, Any]) -> tuple[str, str | None, str | None] | None:
-    if mode == "--hook":
-        state = HOOK_STATES.get(event.get("hook_event_name"))
-        if state is None:
-            return None
-        return (
-            state,
-            bounded_string(event.get("session_id")),
-            bounded_string(event.get("turn_id")),
-        )
-    if mode == "--notify" and event.get("type") == "agent-turn-complete":
-        return (
-            "completed",
-            bounded_string(event.get("thread-id")),
-            bounded_string(event.get("turn-id")),
-        )
-    return None
+def transition(event: dict[str, Any]) -> tuple[str, str | None, str | None] | None:
+    state = HOOK_STATES.get(event.get("hook_event_name"))
+    if state is None:
+        return None
+    return (
+        state,
+        bounded_string(event.get("session_id")),
+        bounded_string(event.get("turn_id")),
+    )
 
 
 def report(state: str, session_id: str | None, turn_id: str | None) -> None:
@@ -92,13 +79,12 @@ def report(state: str, session_id: str | None, turn_id: str | None) -> None:
 
 
 def main(arguments: list[str]) -> int:
-    if not arguments:
+    if arguments != ["--hook"]:
         return 0
-    mode, *payload = arguments
-    event = load_event(mode, payload)
+    event = load_event()
     if event is None:
         return 0
-    mapped = transition(mode, event)
+    mapped = transition(event)
     if mapped is not None:
         report(*mapped)
     return 0

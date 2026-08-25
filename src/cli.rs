@@ -15,7 +15,7 @@ use clap::{
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use futures_util::{SinkExt, StreamExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::net::UnixStream;
 use tokio_util::codec::Framed;
@@ -43,8 +43,8 @@ use crate::{
     },
     domain::{
         AgentActivity, AgentReport, AgentReportMetadata, AgentState, AttentionKind,
-        MAX_TERMINAL_OUTPUT_ROWS, PaneId, SessionId, TabId, TerminalId, TerminalOutput,
-        TerminalOutputMatcher, TerminalOutputSource, WorkspaceId,
+        MAX_AGENT_METADATA_VALUE_BYTES, MAX_TERMINAL_OUTPUT_ROWS, PaneId, SessionId, TabId,
+        TerminalId, TerminalOutput, TerminalOutputMatcher, TerminalOutputSource, WorkspaceId,
     },
     protocol::{
         AcknowledgedCommand, AgentPromptMode, ClientMessage, ClientMode, ContextScope,
@@ -743,6 +743,19 @@ enum AgentCommand {
         #[arg(long)]
         turn_id: Option<String>,
     },
+    /// Receive a native coding-agent notification.
+    Notify {
+        /// Coding-agent notification format.
+        #[arg(value_enum)]
+        source: AgentNotificationSource,
+        /// JSON notification payload supplied by the coding agent.
+        payload: String,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum AgentNotificationSource {
+    Codex,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -976,6 +989,13 @@ async fn execute(cli: Cli) -> Result<()> {
         }
         print!("{AGENT_SKILL}");
         return Ok(());
+    }
+
+    if let Some(Command::Agent {
+        command: AgentCommand::Notify { source, payload },
+    }) = &cli.command
+    {
+        return receive_agent_notification(cli.socket.as_deref(), *source, payload).await;
     }
 
     if let Some(Command::Extension { command }) = &cli.command {
@@ -1994,6 +2014,9 @@ async fn execute(cli: Cli) -> Result<()> {
         Some(Command::Agent {
             command: AgentCommand::Skill,
         }) => unreachable!("agent skill is handled before daemon setup"),
+        Some(Command::Agent {
+            command: AgentCommand::Notify { .. },
+        }) => unreachable!("agent notifications are handled before daemon setup"),
         Some(command) => run_mutation(&socket, cli.json, command).await,
     }
 }
@@ -2686,6 +2709,69 @@ async fn report_agent_command(
             state.to_possible_value().expect("value enum").get_name()
         ),
     )
+}
+
+async fn receive_agent_notification(
+    socket_override: Option<&std::path::Path>,
+    source: AgentNotificationSource,
+    payload: &str,
+) -> Result<()> {
+    let Some(terminal_id) = std::env::var("FUT_TERMINAL_ID")
+        .ok()
+        .and_then(|value| value.parse().ok())
+    else {
+        return Ok(());
+    };
+    if socket_override.is_none() && std::env::var_os("FUT_SOCKET").is_none() {
+        return Ok(());
+    }
+
+    let metadata = match source {
+        AgentNotificationSource::Codex => codex_completion_metadata(payload),
+    };
+    let Some(metadata) = metadata else {
+        return Ok(());
+    };
+    let Ok(socket) = socket_path(socket_override) else {
+        return Ok(());
+    };
+
+    let _ = tokio::time::timeout(
+        Duration::from_secs(2),
+        control(
+            &socket,
+            ClientMessage::ReportAgent {
+                terminal_id,
+                report: AgentReport::Completed,
+                metadata,
+            },
+        ),
+    )
+    .await;
+    Ok(())
+}
+
+fn codex_completion_metadata(payload: &str) -> Option<AgentReportMetadata> {
+    let event = serde_json::from_str::<CodexNotification>(payload).ok()?;
+    (event.kind == "agent-turn-complete").then(|| AgentReportMetadata {
+        source: Some("codex".into()),
+        agent_session_id: bounded_notification_string(event.thread_id),
+        turn_id: bounded_notification_string(event.turn_id),
+    })
+}
+
+#[derive(Deserialize)]
+struct CodexNotification {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(rename = "thread-id")]
+    thread_id: Option<String>,
+    #[serde(rename = "turn-id")]
+    turn_id: Option<String>,
+}
+
+fn bounded_notification_string(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.is_empty() && value.len() <= MAX_AGENT_METADATA_VALUE_BYTES)
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -4430,6 +4516,13 @@ mod tests {
                 "--turn-id",
                 "turn",
             ],
+            vec![
+                "fut",
+                "agent",
+                "notify",
+                "codex",
+                r#"{"type":"agent-turn-complete"}"#,
+            ],
             vec!["fut", "context"],
             vec!["fut", "get", &terminal],
             vec!["fut", "daemon", "run"],
@@ -4438,6 +4531,32 @@ mod tests {
         ] {
             Cli::try_parse_from(args).unwrap();
         }
+    }
+
+    #[test]
+    fn codex_completion_notification_maps_supported_payloads_only() {
+        let metadata = codex_completion_metadata(
+            r#"{"type":"agent-turn-complete","thread-id":"session-1","turn-id":"turn-1"}"#,
+        )
+        .unwrap();
+        assert_eq!(metadata.source.as_deref(), Some("codex"));
+        assert_eq!(metadata.agent_session_id.as_deref(), Some("session-1"));
+        assert_eq!(metadata.turn_id.as_deref(), Some("turn-1"));
+
+        assert!(codex_completion_metadata("not-json").is_none());
+        assert!(codex_completion_metadata(r#"{"type":"approval-requested"}"#).is_none());
+        assert!(
+            codex_completion_metadata(
+                &json!({
+                    "type": "agent-turn-complete",
+                    "turn-id": "x".repeat(MAX_AGENT_METADATA_VALUE_BYTES + 1),
+                })
+                .to_string()
+            )
+            .unwrap()
+            .turn_id
+            .is_none()
+        );
     }
 
     #[test]

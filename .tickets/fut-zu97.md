@@ -36,3 +36,7 @@ Contract accepted by orchestration: reports are native Codex decision-point stat
 **2026-08-09T21:46:09Z**
 
 Final live verification completed after fut-dafg landed. Built target/debug/fut and ran the adapter against an isolated real daemon. Verified SessionStart -> idle with source=codex/session identity through agent get; UserPromptSubmit -> working/unavailable with turn identity; notify agent-turn-complete releases a blocking agent wait as completed; agent prompt --wait observes a fresh working revision and completed turn through its revision barrier; PermissionRequest -> blocked and agent wait returns blocked successfully. Added opt-in live test and repeatable test instructions. Final validation: plugin validator passed, 4 fast adapter tests passed, live real-binary test passed, JSON parsing and diff check passed. Contract remains explicitly limited to native decision-point truth; concurrent later hooks may change behavior and the next native event repairs state.
+
+**2026-08-25T08:12:54Z**
+
+Follow-up: moved authoritative Codex turn-completion handling into the Fut binary as `fut agent notify codex`, removing the separate downloaded notifier from setup. The command parses Codex agent-turn-complete payloads, preserves thread/turn identity, is silent and inert outside Fut, and bounds daemon feedback to two seconds. Simplified the Python plugin adapter back to hook events only and updated installation docs and live coverage. The ticket remains closed.

@@ -12,7 +12,8 @@ It is built only on documented Codex surfaces:
 - [Lifecycle hooks](https://learn.chatgpt.com/codex/hooks) provide the session,
   prompt, permission, and tool events plus Codex session and turn IDs.
 - [External notifications](https://developers.openai.com/codex/config-advanced#notifications)
-  currently provide `agent-turn-complete` and its thread and turn IDs.
+  currently provide `agent-turn-complete` and its thread and turn IDs. Fut
+  accepts these directly through `fut agent notify codex`.
 - [Plugin packaging](https://developers.openai.com/plugins/build/plugins#bundled-mcp-servers-and-lifecycle-hooks)
   supports a default `hooks/hooks.json` and the installed `PLUGIN_ROOT` path.
 
@@ -30,39 +31,30 @@ Start Codex, run `/hooks`, and trust the Fut Codex hooks. Codex deliberately
 skips new or changed non-managed plugin hooks until they are reviewed.
 
 Codex exposes final turn completion through its machine-local `notify` command,
-not through plugin hooks. Install the notification adapter at a stable path:
-
-```sh
-mkdir -p "$HOME/.local/bin"
-curl -fsSL \
-  https://raw.githubusercontent.com/mikker/fut/main/integrations/codex/plugins/fut-codex/scripts/fut_codex_lifecycle.py \
-  -o "$HOME/.local/bin/fut-codex-notify"
-chmod +x "$HOME/.local/bin/fut-codex-notify"
-```
-
-Then add the following user-level setting to `~/.codex/config.toml`:
+not through plugin hooks. Add the following user-level setting to
+`~/.codex/config.toml`:
 
 ```toml
 notify = [
-  "fut-codex-notify",
-  "--notify",
+  "fut",
+  "agent",
+  "notify",
+  "codex",
 ]
 ```
 
 `notify` is a single command setting. If it is already in use, configure the
-existing notification program to dispatch the same JSON argument to this
-adapter as well; do not add a second `notify` key.
-
-The command assumes `~/.local/bin` is on `PATH`.
+existing notification program to dispatch the same JSON argument to
+`fut agent notify codex` as well; do not add a second `notify` key.
 
 Restart Codex after changing plugin or notification configuration.
 
 ## Test
 
-The fast adapter contract tests use a fake `fut` executable. Set
+The fast hook-adapter contract tests use a fake `fut` executable. Set
 `FUT_LIVE_BIN` to a built Fut binary to additionally start an isolated daemon
-and verify real `agent report`, `agent get`, `agent wait`, and `agent prompt
---wait` behavior:
+and verify real `agent report`, `agent notify`, `agent get`, `agent wait`, and
+`agent prompt --wait` behavior:
 
 ```sh
 python3 -m unittest discover -s integrations/codex/tests -v
@@ -80,9 +72,10 @@ FUT_LIVE_BIN="$PWD/target/debug/fut" \
 | `PreToolUse`, `PostToolUse` | `working` | `session_id`, `turn_id` |
 | `notify: agent-turn-complete` | `completed` | `thread-id`, `turn-id` |
 
-The adapter is inert unless both `FUT_TERMINAL_ID` and `FUT_SOCKET` are set.
-Malformed events, missing `fut`, timeouts, and failed reports are ignored so a
-feedback failure cannot break Codex.
+The hook adapter and notification command are inert unless both
+`FUT_TERMINAL_ID` and `FUT_SOCKET` are set. Malformed events, missing `fut`,
+timeouts, and failed reports are ignored so a feedback failure cannot break
+Codex.
 
 `PermissionRequest` means Codex reached an approval decision point. Another
 policy hook may resolve that request immediately; the next tool or completion

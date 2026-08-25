@@ -124,13 +124,14 @@ class LiveAdapterTests(unittest.TestCase):
             }
         )
         result = subprocess.run(
-            ["python3", str(ADAPTER), "--notify", event],
+            [FUT, "agent", "notify", "codex", event],
             env=self.adapter_environment,
             text=True,
             capture_output=True,
             check=False,
         )
         self.assertEqual(result.returncode, 0)
+        self.assertEqual((result.stdout, result.stderr), ("", ""))
 
     def agent(self) -> dict[str, object]:
         return self.cli("agent", "get", self.terminal_id)["result"]["agent"]

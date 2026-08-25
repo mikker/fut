@@ -45,13 +45,8 @@ class AdapterTests(unittest.TestCase):
                 environment.pop("FUT_TERMINAL_ID", None)
                 environment.pop("FUT_SOCKET", None)
 
-            encoded = event if isinstance(event, str) else json.dumps(event)
+            stdin = event if isinstance(event, str) else json.dumps(event)
             command = [sys.executable, str(ADAPTER), mode]
-            stdin = None
-            if mode == "--hook":
-                stdin = encoded
-            else:
-                command.append(encoded)
             result = subprocess.run(
                 command,
                 input=stdin,
@@ -100,23 +95,6 @@ class AdapterTests(unittest.TestCase):
                         "turn-2",
                     ],
                 )
-
-    def test_notification_maps_only_final_turn_completion(self) -> None:
-        result, arguments = self.invoke(
-            "--notify",
-            {
-                "type": "agent-turn-complete",
-                "thread-id": "thread-1",
-                "turn-id": "turn-2",
-            },
-        )
-        self.assertEqual(result.returncode, 0)
-        self.assertEqual(arguments[2], "completed")
-        self.assertIn("thread-1", arguments)
-        self.assertIn("turn-2", arguments)
-
-        _, ignored = self.invoke("--notify", {"type": "approval-requested"})
-        self.assertEqual(ignored, [])
 
     def test_outside_fut_and_malformed_events_are_inert(self) -> None:
         result, arguments = self.invoke(
