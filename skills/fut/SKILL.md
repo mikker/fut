@@ -159,7 +159,11 @@ Submit a prompt atomically. Add `--wait` and `--timeout` when the result is need
 ```sh
 fut --json agent prompt "$terminal_id" 'Review the failing test.'
 fut --json agent prompt "$terminal_id" 'Review it, fix it, and report tests.' --wait --timeout 2m
+fut --json agent prompt "$terminal_id" --stdin < detailed-prompt.md
 ```
+
+Prefer `--stdin` for multiline or generated prompts so their contents never
+need to be interpolated into a shell argument.
 
 `prompt --wait` is the fresh-prompt barrier: it requires a new `working` report
 after submission before accepting a later `completed`, `blocked`, or `idle`

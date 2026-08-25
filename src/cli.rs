@@ -1,6 +1,6 @@
 use std::{
     ffi::OsString,
-    io::{BufRead, Write},
+    io::{BufRead, Read, Write},
     path::PathBuf,
     process::ExitCode,
     str::FromStr,
@@ -692,8 +692,11 @@ enum AgentCommand {
         #[arg(add = ArgValueCompleter::new(completion::agent))]
         terminal_id: TerminalId,
         /// Literal Unicode prompt text.
-        #[arg(allow_hyphen_values = true)]
-        text: String,
+        #[arg(allow_hyphen_values = true, required_unless_present = "stdin")]
+        text: Option<String>,
+        /// Read literal Unicode prompt text from standard input.
+        #[arg(long, conflicts_with = "text")]
+        stdin: bool,
         /// Wait for a fresh working transition and subsequent settled report.
         #[arg(long)]
         wait: bool,
@@ -1345,6 +1348,7 @@ async fn execute(cli: Cli) -> Result<()> {
                 AgentCommand::Prompt {
                     terminal_id,
                     text,
+                    stdin,
                     wait,
                     timeout,
                 },
@@ -1356,6 +1360,15 @@ async fn execute(cli: Cli) -> Result<()> {
                 )
                 .into());
             }
+            let text = if stdin {
+                let mut text = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut text)
+                    .context("failed to read agent prompt from standard input")?;
+                text
+            } else {
+                text.expect("clap requires prompt text unless --stdin is present")
+            };
             let mode = match timeout {
                 Some(timeout) => AgentPromptMode::Wait {
                     timeout_ms: timeout.as_millis() as u64,
@@ -4490,6 +4503,7 @@ mod tests {
             vec!["fut", "agent", "list"],
             vec!["fut", "agent", "get", &terminal],
             vec!["fut", "agent", "prompt", &terminal, "review this"],
+            vec!["fut", "agent", "prompt", &terminal, "--stdin"],
             vec![
                 "fut",
                 "agent",
@@ -4531,6 +4545,28 @@ mod tests {
         ] {
             Cli::try_parse_from(args).unwrap();
         }
+    }
+
+    #[test]
+    fn agent_prompt_requires_exactly_one_text_source() {
+        let terminal = TerminalId::new().to_string();
+        assert!(Cli::try_parse_from(["fut", "agent", "prompt", &terminal]).is_err());
+        assert!(
+            Cli::try_parse_from(["fut", "agent", "prompt", &terminal, "literal", "--stdin",])
+                .is_err()
+        );
+
+        let cli = Cli::try_parse_from(["fut", "agent", "prompt", &terminal, "--stdin"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Agent {
+                command: AgentCommand::Prompt {
+                    text: None,
+                    stdin: true,
+                    ..
+                }
+            })
+        ));
     }
 
     #[test]

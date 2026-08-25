@@ -1698,20 +1698,30 @@ async fn agent_cli_composes_lifecycle_input_and_bounded_output_without_stale_idl
     // The integration emits Working and Completed back-to-back. The prompt
     // waiter must consume both lifecycle events rather than coalescing to the
     // latest idle snapshot and incorrectly satisfying from the setup report.
-    let prompted = harness
+    let mut prompted = harness
         .cli()
         .args([
             "--json",
             "agent",
             "prompt",
             &terminal,
-            "hello λ",
+            "--stdin",
             "--wait",
             "--timeout",
             "2s",
         ])
-        .output()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
+    prompted
+        .stdin
+        .take()
+        .unwrap()
+        .write_all("hello λ".as_bytes())
+        .unwrap();
+    let prompted = prompted.wait_with_output().unwrap();
     assert!(
         prompted.status.success(),
         "{}",

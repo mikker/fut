@@ -81,8 +81,13 @@ explicit, and a currently working agent is rejected with `agent_busy`:
 ```sh
 fut --json agent prompt TERMINAL_ID 'review the failing test'
 fut --json agent prompt TERMINAL_ID 'review the failing test' --wait --timeout 2m
+fut --json agent prompt TERMINAL_ID --stdin < detailed-prompt.md
 fut --json agent wait TERMINAL_ID --timeout 30s
 ```
+
+Use `--stdin` instead of the text argument for multiline prompts or automation
+that should not pass prompt contents through shell argument parsing. Prompt text
+is read to EOF and submitted with the same atomic paste-and-Enter behavior.
 
 `prompt --wait` captures the current lifecycle revision, then requires a fresh
 `working` report before it accepts a later `completed`, `blocked`, or `idle`

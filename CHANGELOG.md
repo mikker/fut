@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `fut agent prompt --stdin` now accepts multiline and generated prompts without shell argument interpolation.
 - Codex can now report completed turns directly through `fut agent notify codex`, without a separately installed notification adapter.
 - Sidebar focus now highlights only workspace and agent titles, preserving status colors for faster scanning.
 - Extensions can now detect other active extensions and their versions through `FUT_EXTENSIONS`.
