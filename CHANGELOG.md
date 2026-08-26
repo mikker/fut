@@ -2,20 +2,16 @@
 
 ## Unreleased
 
-- Resource IDs in human-facing output, shell completion, and Fut environments now use stable 23-character compact selectors; CLI arguments continue to accept canonical UUIDs.
-- Animated terminals now use substantially less daemon CPU while detached or in an unobserved workspace.
-- Capable host terminals now preserve modified and unambiguous keys plus press, repeat, and release events for applications requesting extended keyboard input.
-- Close confirmations now prevent pasted or pointer input from reaching terminals and controls behind the prompt.
-- Failed multi-terminal closes now report partial progress and remain visibly closing instead of implying that already-terminated panes were restored.
-- Agents dialogs and sidebars now exclude terminals known only through best-effort screen detection.
-- Temporary command popups now preserve attention raised by the covered terminal until it is visible again.
-- Full configuration reloads now keep their original session target, clearly retain global changes when project reload fails, and no longer disconnect incompatible sibling clients.
-- Project opening now shows cancellable preparation progress without blocking other client updates.
-- Concurrent divider drags now reconcile to the last accepted shared layout, with a notice when a topology change cancels a stale drag.
-- Unnamed tabs now keep a stable shared title based on their oldest surviving pane instead of following client-local focus.
-- Arrow keys now honor applications that enable application-cursor mode.
-- Command-palette session rename and close actions now work for the attached session.
-- Clearing notifications now works for both agent events and bells, and next-attention handles the current terminal after all other candidates.
+## 0.14
+
+- Added stable 23-character resource selectors to human-facing output, shell completion, and Fut environments while retaining canonical UUID support.
+- Added mode-aware extended keyboard input for modified and unambiguous keys, application cursor mode, and press, repeat, and release events on capable hosts.
+- Reduced daemon CPU use for animated terminals while detached or in unobserved workspaces.
+- Isolated close confirmations from covered paste and pointer input, and made failed multi-terminal closes report irreversible partial progress honestly.
+- Refined agent and terminal attention: projections exclude detection-only agents, covered alerts remain unread, notification clearing handles agents and bells, and next-attention includes the current terminal.
+- Made full configuration reloads retain their invocation target and contain sibling-client failures, while project opening now prepares asynchronously with visible cancellation.
+- Reconciled concurrent divider drags to shared state and stabilized unnamed tab titles across clients.
+- Enabled command-palette rename and close actions for the attached session.
 
 ## 0.13
 
