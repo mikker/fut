@@ -11684,7 +11684,7 @@ async fn extension_command_keeps_covered_agent_attention_unread() {
 #[tokio::test]
 async fn compiled_rust_extension_conforms_through_public_fut_boundaries() {
     let mut harness = Harness::start_public_with(
-        "printf 'RUST_CONFORMANCE_HOST_READY\\r\\n'; while :; do sleep 1; done",
+        "printf 'RUST_CONFORMANCE_HOST_READY\\r\\n'; while IFS= read -r line; do [ \"$line\" = detach-ready ] && printf 'RUST_CONFORMANCE_DETACH_READY\\r\\n'; done",
         |root| {
             let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("examples/extensions/rust-status");
@@ -11798,6 +11798,12 @@ async fn compiled_rust_extension_conforms_through_public_fut_boundaries() {
             .is_ok_and(|contents| contents.contains("command=probe label=workspace"))
     })
     .await;
+    // The command records its side effect before its temporary PTY has
+    // necessarily exited. Prove that input ownership has returned to the
+    // managed terminal before sending Fut's detach binding; otherwise a slow
+    // command teardown can consume Ctrl-b d itself and leave the client open.
+    client.send(b"detach-ready\n");
+    client.wait_for("RUST_CONFORMANCE_DETACH_READY").await;
     client.send(b"\x02d");
     client.wait_success().await;
 
