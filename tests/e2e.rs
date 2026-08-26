@@ -13426,6 +13426,99 @@ async fn public_ctrl_d_closes_a_tab_and_returns_to_its_predecessor() {
 }
 
 #[tokio::test]
+async fn interactive_session_actions_apply_only_to_the_attached_session() {
+    let mut harness = Harness::start("while IFS= read -r line; do :; done").await;
+    let first = harness.resources().await.sessions[0].clone();
+    let first_terminal = first.workspaces[0].tabs[0].panes[0].terminal_id;
+    let second_cwd = harness.root.path().join("interactive-session-actions-peer");
+    fs::create_dir(&second_cwd).unwrap();
+    let ServerMessage::LocationOpened {
+        selected: second, ..
+    } = harness
+        .control_command(ClientMessage::OpenLocation {
+            project: None,
+            name: Some("session-actions-peer".into()),
+            cwd: second_cwd,
+            program: Some("/bin/sh".into()),
+            argv: vec!["-c".into(), "while IFS= read -r line; do :; done".into()],
+        })
+        .await
+    else {
+        panic!("failed to create peer session")
+    };
+
+    let (mut attached, _, first_pid) = harness
+        .interactive_for(Some(TargetSelector::Terminal(first_terminal)))
+        .await;
+    let second_session = harness
+        .resources()
+        .await
+        .sessions
+        .into_iter()
+        .find(|session| session.id != first.id)
+        .unwrap()
+        .id;
+
+    let renamed = correlated_command(
+        &mut attached,
+        ClientMessage::RenameTarget {
+            selector: RenameSelector::Session(SessionSelector::Id(first.id)),
+            name: "renamed interactively".into(),
+        },
+    )
+    .await;
+    assert!(matches!(renamed, ServerMessage::TargetRenamed { .. }));
+    let sessions = harness.resources().await;
+    assert_eq!(
+        sessions
+            .sessions
+            .iter()
+            .find(|session| session.id == first.id)
+            .unwrap()
+            .name,
+        "renamed interactively"
+    );
+
+    for message in [
+        ClientMessage::RenameTarget {
+            selector: RenameSelector::Session(SessionSelector::Id(second_session)),
+            name: "not allowed".into(),
+        },
+        ClientMessage::CloseTarget {
+            selector: TargetSelector::Session(SessionSelector::Id(second_session)),
+        },
+    ] {
+        let response = correlated_command(&mut attached, message).await;
+        assert!(matches!(
+            response,
+            ServerMessage::Error { ref code, .. } if code == "outside_scope"
+        ));
+    }
+    assert!(process_alive(second.child_pid));
+
+    let closed = correlated_command(
+        &mut attached,
+        ClientMessage::CloseTarget {
+            selector: TargetSelector::Session(SessionSelector::Id(first.id)),
+        },
+    )
+    .await;
+    assert_eq!(
+        closed,
+        ServerMessage::CommandCompleted {
+            command: fut::protocol::AcknowledgedCommand::CloseTarget,
+        }
+    );
+    wait_for(DEADLINE, || !process_alive(first_pid)).await;
+    let remaining = resources_when(&harness, |snapshot| snapshot.sessions.len() == 1).await;
+    assert_eq!(remaining.sessions[0].id, second_session);
+    assert!(process_alive(second.child_pid));
+
+    drop(attached);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn last_terminal_exit_detaches_instead_of_crossing_sessions() {
     let mut harness = Harness::start("while IFS= read -r line; do :; done").await;
     let first = harness.resources().await;
@@ -13773,6 +13866,26 @@ async fn send(connection: &mut Connection, message: ClientMessage) {
         },
     )
     .await;
+}
+
+async fn correlated_command(connection: &mut Connection, message: ClientMessage) -> ServerMessage {
+    let request_id = Uuid::new_v4();
+    send_envelope(
+        connection,
+        Envelope {
+            request_id: Some(request_id),
+            message,
+        },
+    )
+    .await;
+    loop {
+        let response = receive_envelope(connection)
+            .await
+            .expect("connection closed before correlated response");
+        if response.request_id == Some(request_id) {
+            return response.message;
+        }
+    }
 }
 
 async fn copy_command(

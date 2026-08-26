@@ -4604,13 +4604,15 @@ fn interactive_rename_allowed(
     selector: &RenameSelector,
 ) -> bool {
     match selector {
+        RenameSelector::Session(target) => {
+            interactive_session_allowed(resources, session_id, target)
+        }
         RenameSelector::Workspace(target) => resources
             .session_id_for_workspace(*target)
             .is_ok_and(|owner| owner == session_id),
         RenameSelector::Tab(target) => resources
             .workspace_id_for_tab(*target)
             .is_ok_and(|owner| owner == workspace_id),
-        RenameSelector::Session(_) => false,
     }
 }
 
@@ -4627,8 +4629,21 @@ fn interactive_close_allowed(
         TargetSelector::Workspace(target) => resources
             .session_id_for_workspace(*target)
             .is_ok_and(|owner| owner == focused.session_id),
-        TargetSelector::Session(_) | TargetSelector::Terminal(_) => false,
+        TargetSelector::Session(target) => {
+            interactive_session_allowed(resources, focused.session_id, target)
+        }
+        TargetSelector::Terminal(_) => false,
     }
+}
+
+fn interactive_session_allowed(
+    resources: &ResourceTree,
+    attached_session_id: SessionId,
+    target: &crate::resources::SessionSelector,
+) -> bool {
+    resources
+        .resolve_session(target.clone())
+        .is_ok_and(|target| target == attached_session_id)
 }
 
 async fn focus_leased_attachment(
@@ -7099,6 +7114,18 @@ mod tests {
             path.workspace_id,
             &RenameSelector::Tab(path.tab_id),
         ));
+        assert!(interactive_rename_allowed(
+            &state.resources,
+            path.session_id,
+            path.workspace_id,
+            &RenameSelector::Session(crate::resources::SessionSelector::Id(path.session_id)),
+        ));
+        assert!(interactive_rename_allowed(
+            &state.resources,
+            path.session_id,
+            path.workspace_id,
+            &RenameSelector::Session(crate::resources::SessionSelector::Name("test".into())),
+        ));
         assert!(!interactive_rename_allowed(
             &state.resources,
             path.session_id,
@@ -7109,7 +7136,7 @@ mod tests {
             &state.resources,
             path.session_id,
             path.workspace_id,
-            &RenameSelector::Session(crate::resources::SessionSelector::Id(path.session_id,)),
+            &RenameSelector::Session(crate::resources::SessionSelector::Id(SessionId::new())),
         ));
     }
 
@@ -7168,6 +7195,16 @@ mod tests {
             &focused,
             &TargetSelector::Workspace(peer_workspace),
         ));
+        assert!(interactive_close_allowed(
+            &state.resources,
+            &focused,
+            &TargetSelector::Session(crate::resources::SessionSelector::Id(path.session_id)),
+        ));
+        assert!(interactive_close_allowed(
+            &state.resources,
+            &focused,
+            &TargetSelector::Session(crate::resources::SessionSelector::Name("test".into())),
+        ));
         assert!(!interactive_close_allowed(
             &state.resources,
             &focused,
@@ -7177,6 +7214,11 @@ mod tests {
             &state.resources,
             &focused,
             &TargetSelector::Pane(PaneId::new()),
+        ));
+        assert!(!interactive_close_allowed(
+            &state.resources,
+            &focused,
+            &TargetSelector::Session(crate::resources::SessionSelector::Id(SessionId::new())),
         ));
     }
 

@@ -87,7 +87,8 @@ Pause for 700 ms after `Ctrl-b` to see the complete, current binding list.
 Bindings can be changed in [Configuration](../configuration/).
 The command palette also provides unbound `rename-session`, `rename-workspace`,
 `rename-tab`, `kill-session`, `kill-workspace`, and `kill-tab` actions for the
-focused resource.
+focused resource. Session actions target the session to which the client is
+attached; closing it ends that attachment along with its terminals.
 
 Press `Ctrl-b Shift-S` to open a project without leaving the client. Fut fuzzy
 filters only the explicit `[projects]` catalog and never scans for repositories.

@@ -8,6 +8,7 @@
 - Temporary command popups now preserve attention raised by the covered terminal until it is visible again.
 - Concurrent divider drags now reconcile to the last accepted shared layout, with a notice when a topology change cancels a stale drag.
 - Arrow keys now honor applications that enable application-cursor mode.
+- Command-palette session rename and close actions now work for the attached session.
 
 ## 0.13
 
