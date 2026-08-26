@@ -32,8 +32,8 @@ use crate::domain::{
     MAX_HYPERLINK_URI_BYTES, MAX_SCREEN_HYPERLINK_BYTES, MAX_SEARCH_CELL_CODEPOINTS,
     MAX_SEARCH_CELLS, MAX_SEARCH_QUERY_BYTES, MAX_SEARCH_TEXT_BYTES, MAX_TERMINAL_OUTPUT_BYTES,
     MAX_TERMINAL_OUTPUT_CELLS, MAX_TERMINAL_OUTPUT_ROWS, MouseButton, MouseEvent, MouseEventKind,
-    MouseModifiers, MouseWheelDirection, Rgb, ScreenSnapshot, SearchDirection,
-    TerminalOutputSource, TerminalSize,
+    MouseModifiers, MouseWheelDirection, Rgb, ScreenSnapshot, SearchDirection, TerminalKeyCode,
+    TerminalKeyEvent, TerminalOutputSource, TerminalSize,
 };
 
 const SYNCHRONIZED_OUTPUT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -1239,11 +1239,40 @@ impl GhosttyTerminal {
     }
 
     fn forward_alternate_scroll(&mut self, direction: MouseWheelDirection) -> Result<()> {
+        let event = TerminalKeyEvent {
+            code: match direction {
+                MouseWheelDirection::Up => TerminalKeyCode::Up,
+                MouseWheelDirection::Down => TerminalKeyCode::Down,
+            },
+            modifiers: Default::default(),
+        };
+        let mut response = Vec::with_capacity(64);
+        for _ in 0..MOUSE_WHEEL_LINES {
+            self.encode_key_input(event, &mut response)?;
+        }
+        self.write_encoded_input(&response, "alternate scroll")
+    }
+
+    pub(crate) fn key_input(&mut self, event: TerminalKeyEvent) -> Result<()> {
+        let mut response = Vec::with_capacity(16);
+        self.encode_key_input(event, &mut response)?;
+        self.write_encoded_input(&response, "key input")
+    }
+
+    fn encode_key_input(&mut self, event: TerminalKeyEvent, response: &mut Vec<u8>) -> Result<()> {
+        // Keep Fut's legacy modifier contract while retaining the structured
+        // modifiers for later enhanced-keyboard negotiation: Alt prefixes the
+        // sequence, while Shift and Control do not alter arrow bytes yet.
+        if event.modifiers.alt {
+            response.push(0x1b);
+        }
         self.key_event
             .set_action(key::Action::Press)
-            .set_key(match direction {
-                MouseWheelDirection::Up => key::Key::ArrowUp,
-                MouseWheelDirection::Down => key::Key::ArrowDown,
+            .set_key(match event.code {
+                TerminalKeyCode::Up => key::Key::ArrowUp,
+                TerminalKeyCode::Down => key::Key::ArrowDown,
+                TerminalKeyCode::Right => key::Key::ArrowRight,
+                TerminalKeyCode::Left => key::Key::ArrowLeft,
             })
             .set_mods(key::Mods::empty())
             .set_consumed_mods(key::Mods::empty())
@@ -1251,12 +1280,8 @@ impl GhosttyTerminal {
             .set_utf8(None::<String>)
             .set_unshifted_codepoint('\0');
         self.key_encoder.set_options_from_terminal(&self.terminal);
-        let mut response = Vec::with_capacity(64);
-        for _ in 0..MOUSE_WHEEL_LINES {
-            self.key_encoder
-                .encode_to_vec(&self.key_event, &mut response)?;
-        }
-        self.write_encoded_input(&response, "alternate scroll")
+        self.key_encoder.encode_to_vec(&self.key_event, response)?;
+        Ok(())
     }
 
     fn write_encoded_input(&self, response: &[u8], operation: &str) -> Result<()> {
@@ -2565,6 +2590,46 @@ mod tests {
             MouseInputOutcome::Handled
         ));
         assert!(take_output(&output).is_empty());
+    }
+
+    #[test]
+    fn physical_arrows_use_current_cursor_mode_and_preserve_legacy_modifiers() {
+        let (mut terminal, output) = recording_terminal(10, 4);
+        let arrow = |code, modifiers| TerminalKeyEvent { code, modifiers };
+
+        for code in [
+            TerminalKeyCode::Up,
+            TerminalKeyCode::Down,
+            TerminalKeyCode::Right,
+            TerminalKeyCode::Left,
+        ] {
+            terminal.key_input(arrow(code, Default::default())).unwrap();
+        }
+        assert_eq!(take_output(&output), b"\x1b[A\x1b[B\x1b[C\x1b[D");
+
+        terminal.feed(b"\x1b[?1h").unwrap().unwrap();
+        take_output(&output);
+        for code in [
+            TerminalKeyCode::Up,
+            TerminalKeyCode::Down,
+            TerminalKeyCode::Right,
+            TerminalKeyCode::Left,
+        ] {
+            terminal.key_input(arrow(code, Default::default())).unwrap();
+        }
+        assert_eq!(take_output(&output), b"\x1bOA\x1bOB\x1bOC\x1bOD");
+
+        terminal
+            .key_input(arrow(
+                TerminalKeyCode::Up,
+                crate::domain::TerminalKeyModifiers {
+                    shift: true,
+                    control: true,
+                    alt: true,
+                },
+            ))
+            .unwrap();
+        assert_eq!(take_output(&output), b"\x1b\x1bOA");
     }
 
     #[test]

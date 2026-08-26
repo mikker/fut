@@ -332,6 +332,9 @@ pub enum ClientMessage {
     Input {
         bytes: Vec<u8>,
     },
+    KeyInput {
+        event: crate::domain::TerminalKeyEvent,
+    },
     Paste {
         text: String,
     },
@@ -973,6 +976,25 @@ mod tests {
     fn typed_unicode_paste_round_trips() {
         let message = ClientMessage::Paste {
             text: "first λ 雪\nsecond\0\x1b[201~".into(),
+        };
+
+        assert_eq!(
+            decode_payload::<ClientMessage>(&encode_payload(&message).unwrap()).unwrap(),
+            message
+        );
+    }
+
+    #[test]
+    fn structured_arrow_input_round_trips() {
+        let message = ClientMessage::KeyInput {
+            event: crate::domain::TerminalKeyEvent {
+                code: crate::domain::TerminalKeyCode::Left,
+                modifiers: crate::domain::TerminalKeyModifiers {
+                    shift: true,
+                    control: false,
+                    alt: true,
+                },
+            },
         };
 
         assert_eq!(

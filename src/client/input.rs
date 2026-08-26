@@ -3,6 +3,29 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 #[cfg(test)]
 use super::actions::{FocusDirection, HistoryScope};
 use super::{actions::ClientAction, config::BindingsConfig};
+use crate::domain::{TerminalKeyCode, TerminalKeyEvent, TerminalKeyModifiers};
+
+pub(crate) fn terminal_key_event(key: KeyEvent) -> Option<TerminalKeyEvent> {
+    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        return None;
+    }
+
+    let code = match key.code {
+        KeyCode::Up => TerminalKeyCode::Up,
+        KeyCode::Down => TerminalKeyCode::Down,
+        KeyCode::Right => TerminalKeyCode::Right,
+        KeyCode::Left => TerminalKeyCode::Left,
+        _ => return None,
+    };
+    Some(TerminalKeyEvent {
+        code,
+        modifiers: TerminalKeyModifiers {
+            shift: key.modifiers.contains(KeyModifiers::SHIFT),
+            control: key.modifiers.contains(KeyModifiers::CONTROL),
+            alt: key.modifiers.contains(KeyModifiers::ALT),
+        },
+    })
+}
 
 pub(crate) fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
@@ -106,6 +129,10 @@ impl PrefixState {
         self.bindings = bindings;
     }
 
+    pub(super) fn waiting(&self) -> bool {
+        self.waiting
+    }
+
     pub(super) fn feed(&mut self, bytes: Vec<u8>) -> PrefixAction {
         if !self.waiting {
             if bytes == self.bindings.prefix() {
@@ -168,6 +195,28 @@ mod tests {
         let mut event = key(KeyCode::Char('x'), KeyModifiers::NONE);
         event.kind = KeyEventKind::Release;
         assert_eq!(encode_key(event), None);
+    }
+
+    #[test]
+    fn preserves_physical_arrow_identity_for_terminal_owned_encoding() {
+        assert_eq!(
+            terminal_key_event(key(
+                KeyCode::Up,
+                KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT,
+            )),
+            Some(TerminalKeyEvent {
+                code: TerminalKeyCode::Up,
+                modifiers: TerminalKeyModifiers {
+                    shift: true,
+                    control: true,
+                    alt: true,
+                },
+            })
+        );
+        assert_eq!(
+            terminal_key_event(key(KeyCode::Home, KeyModifiers::NONE)),
+            None
+        );
     }
 
     #[test]

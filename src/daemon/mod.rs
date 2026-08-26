@@ -2707,6 +2707,24 @@ async fn handle_connection(
                             ).await?;
                         }
                     }
+                    ClientMessage::KeyInput { event } => {
+                        if attachment.copy_mode_active() {
+                            send_error(
+                                &mut connection,
+                                envelope.request_id,
+                                "copy_mode_active",
+                                "terminal input is disabled while copy mode is active",
+                            ).await?;
+                        } else {
+                            focused_input_response(
+                                &mut connection,
+                                &mut attachment,
+                                envelope.request_id,
+                                AcknowledgedCommand::Input,
+                                FocusedInput::Key(event),
+                            ).await?;
+                        }
+                    }
                     ClientMessage::Paste { text } => {
                         if attachment.copy_mode_active() {
                             send_error(
@@ -4188,6 +4206,7 @@ async fn control_loop(
             | ClientMessage::ResizeSplit { .. } => {}
             ClientMessage::CreateWorkspace { .. }
             | ClientMessage::Input { .. }
+            | ClientMessage::KeyInput { .. }
             | ClientMessage::Paste { .. }
             | ClientMessage::CopyMode { .. }
             | ClientMessage::Resize { .. }
@@ -5766,6 +5785,7 @@ async fn command_response(
 
 enum FocusedInput {
     Bytes(Vec<u8>),
+    Key(crate::domain::TerminalKeyEvent),
     Paste(String),
 }
 
@@ -6282,6 +6302,7 @@ async fn focused_input_response(
     let reset_result = attachment.return_focused_to_bottom().await;
     let input_result = match input {
         FocusedInput::Bytes(bytes) => attachment.focused_terminal().input(bytes).await,
+        FocusedInput::Key(event) => attachment.focused_terminal().key_input(event).await,
         FocusedInput::Paste(text) => attachment.focused_terminal().paste(text).await,
     };
     let input_succeeded = input_result.is_ok();

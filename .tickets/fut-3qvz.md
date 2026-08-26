@@ -27,3 +27,9 @@ Negotiate enhanced keyboard reporting with capable host terminals so Fut receive
 - Press, repeat, and release semantics are forwarded when requested and supported, with safe fallback otherwise.
 - Focused unit tests cover mode negotiation and encoding, and an end-to-end PTY test verifies representative legacy and enhanced-keyboard behavior.
 - User-facing terminal capability documentation is updated.
+
+## Notes
+
+**2026-08-26T07:01:28Z**
+
+Implemented the focused B-10 application-cursor-mode correction: interactive and temporary-command arrow events now retain structured identity through the terminal runtime and use current DECCKM state, with unit and end-to-end coverage. This does not complete the remaining enhanced-keyboard acceptance criteria; keep this ticket open for modifier protocols, key disambiguation, and press/repeat/release support.

@@ -7,6 +7,7 @@
 - Agents dialogs and sidebars now exclude terminals known only through best-effort screen detection.
 - Temporary command popups now preserve attention raised by the covered terminal until it is visible again.
 - Concurrent divider drags now reconcile to the last accepted shared layout, with a notice when a topology change cancels a stale drag.
+- Arrow keys now honor applications that enable application-cursor mode.
 
 ## 0.13
 

@@ -9323,6 +9323,47 @@ async fn public_wheel_uses_dec_alternate_scroll_and_terminal_cursor_key_mode() {
 }
 
 #[tokio::test]
+async fn public_arrow_keys_use_the_daemon_terminals_current_cursor_mode() {
+    let harness = Harness::start(
+        "stty raw -echo; printf 'CURSOR_NORMAL_READY\\r\\n'; dd bs=1 count=12 of=cursor-normal.capture 2>/dev/null; printf '\\033[?1hCURSOR_APPLICATION_READY\\r\\n'; dd bs=1 count=12 of=cursor-application.capture 2>/dev/null; printf 'CURSOR_KEYS_CAPTURED\\r\\n'; exec cat >/dev/null",
+    )
+    .await;
+    let pane = harness.resources().await.sessions[0].workspaces[0].tabs[0].panes[0].id;
+    let mut command = Command::new("/usr/bin/script");
+    command
+        .env_clear()
+        .env("HOME", harness.root.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", harness.root.path().join("runtime"))
+        .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+        .env("TERM", "xterm-256color")
+        .args(script_command_args())
+        .arg(format!(
+            "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {pane}",
+            env!("CARGO_BIN_EXE_fut"),
+            harness.socket.display(),
+        ));
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("CURSOR_NORMAL_READY").await;
+    client.send(b"\x1b[A\x1b[B\x1b[C\x1b[D");
+    client.wait_for("CURSOR_APPLICATION_READY").await;
+    client.send(b"\x1b[A\x1b[B\x1b[C\x1b[D");
+    client.wait_for("CURSOR_KEYS_CAPTURED").await;
+
+    assert_eq!(
+        fs::read(harness.root.path().join("cwd/cursor-normal.capture")).unwrap(),
+        b"\x1b[A\x1b[B\x1b[C\x1b[D"
+    );
+    assert_eq!(
+        fs::read(harness.root.path().join("cwd/cursor-application.capture")).unwrap(),
+        b"\x1bOA\x1bOB\x1bOC\x1bOD"
+    );
+    client.send(b"\x02d");
+    client.wait_success().await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn public_client_renders_simultaneous_panes_and_cycles_focus() {
     let harness = Harness::start(
         "printf 'SPLIT_A_READY\r\n'; while IFS= read -r line; do [ \"$line\" = a ] && printf 'SPLIT_A_INPUT\r\n'; done",

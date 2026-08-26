@@ -149,8 +149,9 @@ remains separate.
 See [Configuration](../configuration/) for the opt-in outer-terminal BEL.
 
 Fut renders standard terminal mouse modes, indexed and RGB color, OSC 8
-hyperlinks, cursor shapes, bracketed paste, alternate screens, and Kitty
-graphics used by terminals such as Ghostty, Kitty, and WezTerm.
+hyperlinks, cursor shapes, bracketed paste, alternate screens, application
+cursor keys, and Kitty graphics used by terminals such as Ghostty, Kitty, and
+WezTerm.
 
 ## CLI and automation
 

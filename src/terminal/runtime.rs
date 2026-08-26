@@ -168,6 +168,13 @@ impl TerminalHandle {
         self.commands.send(RuntimeMessage::Input(bytes)).await
     }
 
+    pub async fn key_input(
+        &self,
+        event: crate::domain::TerminalKeyEvent,
+    ) -> Result<(), CommandError> {
+        self.commands.send(RuntimeMessage::KeyInput(event)).await
+    }
+
     pub async fn paste(&self, text: String) -> Result<(), CommandError> {
         send_paste_with_backpressure(&self.commands, text).await
     }
@@ -467,6 +474,7 @@ async fn send_mouse_input(
 
 enum RuntimeMessage {
     Input(Vec<u8>),
+    KeyInput(crate::domain::TerminalKeyEvent),
     Paste {
         text: String,
         completion: oneshot::Sender<Result<(), CommandError>>,
@@ -740,6 +748,17 @@ fn run(
                         .and_then(|mut writer| writer.write_all(&bytes).map_err(Into::into))
                     {
                         send_error(publishers.events, error);
+                    }
+                }
+                RuntimeMessage::KeyInput(event) => {
+                    if let Err(error) = key_input_after_output_barrier(
+                        &mut queues.output,
+                        terminal,
+                        &publishers,
+                        &mut reader_complete,
+                        event,
+                    ) {
+                        send_error(publishers.events, error.into());
                     }
                 }
                 RuntimeMessage::Paste { text, completion } => {
@@ -1156,6 +1175,7 @@ fn serve_exited(
                 let _ = completion.send(Err(CommandError::Stopped));
             }
             RuntimeMessage::Input(_)
+            | RuntimeMessage::KeyInput(_)
             | RuntimeMessage::Resize(_)
             | RuntimeMessage::AttachmentResize(_) => {}
         }
@@ -1172,6 +1192,19 @@ fn paste_after_output_barrier(
     drain_output_barrier(output, terminal, publishers, reader_complete);
     terminal
         .paste(text)
+        .map_err(|error| CommandError::Emulator(error.to_string()))
+}
+
+fn key_input_after_output_barrier(
+    output: &mut OutputQueue,
+    terminal: &mut GhosttyTerminal,
+    publishers: &RuntimePublishers<'_>,
+    reader_complete: &mut bool,
+    event: crate::domain::TerminalKeyEvent,
+) -> Result<(), CommandError> {
+    drain_output_barrier(output, terminal, publishers, reader_complete);
+    terminal
+        .key_input(event)
         .map_err(|error| CommandError::Emulator(error.to_string()))
 }
 

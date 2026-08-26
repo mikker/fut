@@ -71,7 +71,7 @@ use crossterm::{
     },
 };
 use futures_util::{SinkExt, StreamExt};
-use input::{PrefixAction, PrefixState, encode_key};
+use input::{PrefixAction, PrefixState, encode_key, terminal_key_event};
 use layout::{
     PaneLayout, SplitDivider, authored_layout, authored_navigation_layout, directional_neighbor,
     navigation_pane_layouts, pane_layouts,
@@ -1499,8 +1499,11 @@ async fn run_loop(
                 }
                 match event {
                     Event::Key(key) if temporary_command.is_some() => {
-                        if let Some(bytes) = encode_key(key) {
-                            temporary_command.as_mut().expect("command exists").input(bytes).await?;
+                        let command = temporary_command.as_mut().expect("command exists");
+                        if let Some(event) = terminal_key_event(key) {
+                            command.key_input(event).await?;
+                        } else if let Some(bytes) = encode_key(key) {
+                            command.input(bytes).await?;
                         }
                     }
                     Event::Paste(text) if temporary_command.is_some() => {
@@ -2620,6 +2623,8 @@ async fn run_loop(
                             }
                         }
                     Event::Key(key) if surface.is_none() && copy_mode.is_none() => if let Some(bytes) = encode_key(key) {
+                        let terminal_key = terminal_key_event(key);
+                        let prefix_was_waiting = prefix.waiting();
                         toasts.clear();
                         let was_visible = cheatsheet_visible;
                         cheatsheet_at = None;
@@ -2673,7 +2678,15 @@ async fn run_loop(
                                 ).await?);
                                 force_draw = true;
                             }
-                            PrefixAction::Send(bytes) => send(framed, ClientMessage::Input { bytes }).await?,
+                            PrefixAction::Send(bytes) => {
+                                if prefix_was_waiting {
+                                    send(framed, ClientMessage::Input { bytes }).await?;
+                                } else if let Some(event) = terminal_key {
+                                    send(framed, ClientMessage::KeyInput { event }).await?;
+                                } else {
+                                    send(framed, ClientMessage::Input { bytes }).await?;
+                                }
+                            }
                         }
                     },
                     Event::Paste(text) if surface.is_none() && copy_mode.is_none() => {

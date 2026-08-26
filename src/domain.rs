@@ -117,6 +117,30 @@ pub enum CopyModeMovement {
     PageDown,
 }
 
+/// A physical cursor key whose bytes must be chosen from terminal-owned modes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalKeyCode {
+    Up,
+    Down,
+    Right,
+    Left,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TerminalKeyModifiers {
+    pub shift: bool,
+    pub control: bool,
+    pub alt: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TerminalKeyEvent {
+    pub code: TerminalKeyCode,
+    #[serde(default)]
+    pub modifiers: TerminalKeyModifiers,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchDirection {

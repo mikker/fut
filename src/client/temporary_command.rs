@@ -270,6 +270,19 @@ impl TemporaryCommandSurface {
         Ok(())
     }
 
+    pub(super) async fn key_input(
+        &mut self,
+        event: crate::domain::TerminalKeyEvent,
+    ) -> anyhow::Result<()> {
+        if self.prepare_input().await? {
+            self.handle
+                .key_input(event)
+                .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        }
+        Ok(())
+    }
+
     pub(super) async fn paste(&mut self, text: String) -> anyhow::Result<()> {
         if self.prepare_input().await? {
             self.handle
