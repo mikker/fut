@@ -79,7 +79,9 @@ use layout::{
 };
 use navigation::NavigationHistory;
 use navigator::{NavigatorAction, NavigatorState};
-use notifications::{NotificationsAction, NotificationsDialog};
+use notifications::{
+    AttentionAcknowledgement, DirectAttentionAction, NotificationsAction, NotificationsDialog,
+};
 use project_opener::{ProjectOpenChoice, ProjectOpenerAction, ProjectOpenerState};
 use ratatui::{
     Terminal,
@@ -1966,12 +1968,8 @@ async fn run_loop(
                                 }
                                 force_draw = true;
                             }
-                            NotificationsAction::Acknowledge(terminal_id, observed) => {
-                                send(
-                                    framed,
-                                    ClientMessage::AcknowledgeAlerts { terminal_id, observed },
-                                )
-                                .await?;
+                            NotificationsAction::Acknowledge(acknowledgement) => {
+                                acknowledge_attention(framed, acknowledgement).await?;
                                 force_draw = true;
                             }
                         }
@@ -2279,6 +2277,7 @@ async fn run_loop(
                                     config_location,
                                     &mut extension_reload,
                                     &mut project_config_reload,
+                                    true,
                                 ).await?);
                                 force_draw = true;
                             }
@@ -2766,6 +2765,8 @@ async fn run_loop(
                     Event::Key(key) if surface.is_none() && copy_mode.is_none() => if let Some(bytes) = encode_key(key) {
                         let terminal_key = terminal_key_event(key);
                         let prefix_was_waiting = prefix.waiting();
+                        let focused_terminal_was_covered =
+                            cheatsheet_visible || toasts.is_visible();
                         toasts.clear();
                         let was_visible = cheatsheet_visible;
                         cheatsheet_at = None;
@@ -2816,6 +2817,7 @@ async fn run_loop(
                                     config_location,
                                     &mut extension_reload,
                                     &mut project_config_reload,
+                                    focused_terminal_was_covered,
                                 ).await?);
                                 force_draw = true;
                             }
@@ -4156,6 +4158,7 @@ async fn dispatch_client_action(
     config_location: &config::ConfigLocation,
     extension_reload: &mut Option<ExtensionReloadState>,
     project_config_reload: &mut Option<ProjectConfigReloadState>,
+    focused_terminal_was_covered: bool,
 ) -> anyhow::Result<Option<Toast>> {
     match action {
         ClientAction::RunCommand(index) => {
@@ -4420,22 +4423,40 @@ async fn dispatch_client_action(
             if !view.resources_are_current(snapshot) {
                 return Ok(Some(Toast::error("navigation is syncing")));
             }
-            let Some(pane_id) = resources
-                .notifications()
-                .next(snapshot, view.focused().terminal_id)
-            else {
+            let Some(action) = resources.notifications().next_action(
+                snapshot,
+                view.focused().terminal_id,
+                focused_terminal_was_covered,
+            ) else {
                 return Ok(None);
             };
-            if let Some(request) = focus.begin(FocusOrigin::Notification) {
-                send_request(
-                    framed,
-                    Some(request),
-                    ClientMessage::SelectTarget {
-                        selector: TargetSelector::Pane(pane_id),
-                        expected: None,
-                    },
-                )
-                .await?;
+            match action {
+                DirectAttentionAction::RevealCurrent => {
+                    // The invoking surface has just been dismissed. Do not
+                    // acknowledge content it covered; the next draw will do
+                    // that only after the managed terminal is visible.
+                    view.invalidate_drawn();
+                    return Ok(None);
+                }
+                DirectAttentionAction::AcknowledgeCurrent(acknowledgements) => {
+                    for acknowledgement in acknowledgements.into_iter().flatten() {
+                        acknowledge_attention(framed, acknowledgement).await?;
+                    }
+                    return Ok(Some(Toast::info("current attention cleared")));
+                }
+                DirectAttentionAction::Navigate(pane_id) => {
+                    if let Some(request) = focus.begin(FocusOrigin::Notification) {
+                        send_request(
+                            framed,
+                            Some(request),
+                            ClientMessage::SelectTarget {
+                                selector: TargetSelector::Pane(pane_id),
+                                expected: None,
+                            },
+                        )
+                        .await?;
+                    }
+                }
             }
         }
         ClientAction::CreateWorkspace => {
@@ -4843,6 +4864,29 @@ async fn send(
     message: ClientMessage,
 ) -> anyhow::Result<()> {
     send_request(framed, None, message).await
+}
+
+async fn acknowledge_attention(
+    framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    acknowledgement: AttentionAcknowledgement,
+) -> anyhow::Result<()> {
+    let message = match acknowledgement {
+        AttentionAcknowledgement::Agent {
+            terminal_id,
+            event_revision,
+        } => ClientMessage::AcknowledgeAgent {
+            terminal_id,
+            event_revision,
+        },
+        AttentionAcknowledgement::Alert {
+            terminal_id,
+            observed,
+        } => ClientMessage::AcknowledgeAlerts {
+            terminal_id,
+            observed,
+        },
+    };
+    send(framed, message).await
 }
 
 async fn send_request(

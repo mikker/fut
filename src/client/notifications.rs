@@ -80,13 +80,27 @@ impl NotificationState {
             .copied()
     }
 
-    fn terminal_unseen(&self, pane: &PaneSnapshot) -> bool {
+    fn agent_acknowledgement(&self, pane: &PaneSnapshot) -> Option<AttentionAcknowledgement> {
+        pane.activity
+            .attention()
+            .filter(|_| pane.activity.has_unread_attention())
+            .map(|attention| AttentionAcknowledgement::Agent {
+                terminal_id: pane.terminal_id,
+                event_revision: attention.revision,
+            })
+    }
+
+    fn alert_acknowledgement(&self, pane: &PaneSnapshot) -> Option<AttentionAcknowledgement> {
         self.terminal_alert(pane.terminal_id)
-            .is_some_and(TerminalAlertSnapshot::unseen)
+            .filter(|alert| alert.unseen())
+            .map(|alert| AttentionAcknowledgement::Alert {
+                terminal_id: pane.terminal_id,
+                observed: alert.state.cursor(),
+            })
     }
 
     pub(super) fn is_unseen(&self, pane: &PaneSnapshot) -> bool {
-        pane.activity.has_unread_attention() || self.terminal_unseen(pane)
+        self.agent_acknowledgement(pane).is_some() || self.alert_acknowledgement(pane).is_some()
     }
 
     pub(super) fn indicator(&self, panes: &[PaneSnapshot]) -> Option<ActivityIndicator> {
@@ -175,7 +189,7 @@ impl NotificationState {
                         if pane.closing {
                             continue;
                         }
-                        let mut push = |kind, occurred_at_ms, observed| {
+                        let mut push = |kind, occurred_at_ms, acknowledgement| {
                             waiting.push(WaitingTerminal {
                                 session_id: session.id,
                                 pane_id: pane.id,
@@ -185,7 +199,7 @@ impl NotificationState {
                                 tab: tab.name.clone(),
                                 kind,
                                 occurred_at_ms,
-                                observed,
+                                acknowledgement,
                             })
                         };
                         if let Some(alert) = self.terminal_alert(pane.terminal_id)
@@ -194,7 +208,10 @@ impl NotificationState {
                             push(
                                 NotificationKind::Bell,
                                 alert.state.last_bell_at_ms,
-                                Some(alert.state.cursor()),
+                                AttentionAcknowledgement::Alert {
+                                    terminal_id: pane.terminal_id,
+                                    observed: alert.state.cursor(),
+                                },
                             );
                         }
                         if let Some(attention) = pane.activity.attention()
@@ -203,7 +220,10 @@ impl NotificationState {
                             push(
                                 NotificationKind::Agent(attention.kind),
                                 attention.occurred_at_ms,
-                                None,
+                                AttentionAcknowledgement::Agent {
+                                    terminal_id: pane.terminal_id,
+                                    event_revision: attention.revision,
+                                },
                             );
                         }
                     }
@@ -228,7 +248,11 @@ impl NotificationState {
             .count()
     }
 
-    pub(super) fn next(&self, snapshot: &ResourceSnapshot, current: TerminalId) -> Option<PaneId> {
+    fn next_target(
+        &self,
+        snapshot: &ResourceSnapshot,
+        current: TerminalId,
+    ) -> Option<AttentionTarget> {
         let panes = open_panes(snapshot).collect::<Vec<_>>();
         let start = panes
             .iter()
@@ -236,8 +260,34 @@ impl NotificationState {
             .map_or(0, |index| index + 1);
         (0..panes.len())
             .map(|offset| panes[(start + offset) % panes.len()])
-            .find(|pane| pane.terminal_id != current && self.is_unseen(pane))
-            .map(|pane| pane.id)
+            .find(|pane| self.is_unseen(pane))
+            .map(|pane| AttentionTarget {
+                pane_id: pane.id,
+                terminal_id: pane.terminal_id,
+                acknowledgements: [
+                    self.agent_acknowledgement(pane),
+                    self.alert_acknowledgement(pane),
+                ],
+            })
+    }
+
+    pub(super) fn next_action(
+        &self,
+        snapshot: &ResourceSnapshot,
+        current: TerminalId,
+        current_was_covered: bool,
+    ) -> Option<DirectAttentionAction> {
+        let target = self.next_target(snapshot, current)?;
+        if target.terminal_id != current {
+            return Some(DirectAttentionAction::Navigate(target.pane_id));
+        }
+        if current_was_covered {
+            Some(DirectAttentionAction::RevealCurrent)
+        } else {
+            Some(DirectAttentionAction::AcknowledgeCurrent(
+                target.acknowledgements,
+            ))
+        }
     }
 
     pub(super) fn has_working(&self, snapshot: &ResourceSnapshot) -> bool {
@@ -255,7 +305,32 @@ pub(super) struct WaitingTerminal {
     pub tab: String,
     pub kind: NotificationKind,
     pub occurred_at_ms: u64,
-    pub observed: Option<crate::alerts::AlertCursor>,
+    pub acknowledgement: AttentionAcknowledgement,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum AttentionAcknowledgement {
+    Agent {
+        terminal_id: TerminalId,
+        event_revision: u64,
+    },
+    Alert {
+        terminal_id: TerminalId,
+        observed: crate::alerts::AlertCursor,
+    },
+}
+
+struct AttentionTarget {
+    pane_id: PaneId,
+    terminal_id: TerminalId,
+    acknowledgements: [Option<AttentionAcknowledgement>; 2],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DirectAttentionAction {
+    Navigate(PaneId),
+    RevealCurrent,
+    AcknowledgeCurrent([Option<AttentionAcknowledgement>; 2]),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -274,7 +349,7 @@ pub(super) enum NotificationsAction {
     Stay,
     Close,
     Select(PaneId),
-    Acknowledge(TerminalId, crate::alerts::AlertCursor),
+    Acknowledge(AttentionAcknowledgement),
 }
 
 impl NotificationsDialog {
@@ -322,9 +397,8 @@ impl NotificationsDialog {
                 return self
                     .rows
                     .get(self.selected)
-                    .and_then(|row| row.observed.map(|observed| (row.terminal_id, observed)))
-                    .map_or(NotificationsAction::Stay, |(terminal_id, observed)| {
-                        NotificationsAction::Acknowledge(terminal_id, observed)
+                    .map_or(NotificationsAction::Stay, |row| {
+                        NotificationsAction::Acknowledge(row.acknowledgement)
                     });
             }
             KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => {
@@ -475,6 +549,37 @@ mod tests {
         }
     }
 
+    fn snapshot_with_panes(panes: Vec<PaneSnapshot>) -> ResourceSnapshot {
+        ResourceSnapshot {
+            revision: 1,
+            sessions: vec![SessionSnapshot {
+                tokens: Default::default(),
+                id: SessionId::new(),
+                name: "project".into(),
+                project: Project {
+                    identity: ProjectIdentity::CanonicalDirectory(PathBuf::from("/project")),
+                },
+                trusted_project_config: None,
+                closing: false,
+                workspaces: vec![WorkspaceSnapshot {
+                    tokens: Default::default(),
+                    id: WorkspaceId::new(),
+                    name: "main".into(),
+                    root: PathBuf::from("/project"),
+                    closing: false,
+                    tabs: vec![TabSnapshot {
+                        tokens: Default::default(),
+                        id: TabId::new(),
+                        name: "agents".into(),
+                        closing: false,
+                        layout: SplitTree::leaf(panes[0].id),
+                        panes,
+                    }],
+                }],
+            }],
+        }
+    }
+
     #[test]
     fn spinner_uses_braille_frames() {
         assert_eq!(ActivityIndicator::Working.marker(0), "⠋");
@@ -560,34 +665,7 @@ mod tests {
 
         // Agent completion and BEL remain independently represented; BEL wins
         // the single ancestry marker.
-        let waiting = notifications.waiting(&ResourceSnapshot {
-            revision: 1,
-            sessions: vec![SessionSnapshot {
-                tokens: Default::default(),
-                id: SessionId::new(),
-                name: "project".into(),
-                project: Project {
-                    identity: ProjectIdentity::CanonicalDirectory(PathBuf::from("/project")),
-                },
-                trusted_project_config: None,
-                closing: false,
-                workspaces: vec![WorkspaceSnapshot {
-                    tokens: Default::default(),
-                    id: WorkspaceId::new(),
-                    name: "main".into(),
-                    root: PathBuf::from("/project"),
-                    closing: false,
-                    tabs: vec![TabSnapshot {
-                        tokens: Default::default(),
-                        id: TabId::new(),
-                        name: "alerts".into(),
-                        closing: false,
-                        layout: SplitTree::leaf(pane.id),
-                        panes: vec![pane.clone()],
-                    }],
-                }],
-            }],
-        });
+        let waiting = notifications.waiting(&snapshot_with_panes(vec![pane.clone()]));
         assert_eq!(waiting.len(), 2);
         assert_eq!(
             notifications.indicator(&[pane]),
@@ -596,51 +674,44 @@ mod tests {
     }
 
     #[test]
-    fn next_wraps_in_resource_order_and_skips_current_seen_and_closing_panes() {
+    fn next_wraps_in_resource_order_with_current_as_the_final_candidate() {
         let candidate = completed_pane(false);
         let seen = completed_pane(false);
         let current = completed_pane(false);
         let closing = completed_pane(true);
         let mut seen = seen;
         seen.activity.read_revision = 1;
-        let mut snapshot = ResourceSnapshot {
-            revision: 1,
-            sessions: vec![SessionSnapshot {
-                tokens: Default::default(),
-                id: SessionId::new(),
-                name: "project".into(),
-                project: Project {
-                    identity: ProjectIdentity::CanonicalDirectory(PathBuf::from("/project")),
-                },
-                trusted_project_config: None,
-                closing: false,
-                workspaces: vec![WorkspaceSnapshot {
-                    tokens: Default::default(),
-                    id: WorkspaceId::new(),
-                    name: "main".into(),
-                    root: PathBuf::from("/project"),
-                    closing: false,
-                    tabs: vec![TabSnapshot {
-                        tokens: Default::default(),
-                        id: TabId::new(),
-                        name: "agents".into(),
-                        closing: false,
-                        layout: SplitTree::leaf(candidate.id),
-                        panes: vec![candidate.clone(), seen.clone(), current.clone(), closing],
-                    }],
-                }],
-            }],
-        };
+        let mut snapshot = snapshot_with_panes(vec![
+            candidate.clone(),
+            seen.clone(),
+            current.clone(),
+            closing,
+        ]);
         let notifications = NotificationState::default();
 
         assert_eq!(
-            notifications.next(&snapshot, current.terminal_id),
-            Some(candidate.id)
+            notifications.next_action(&snapshot, current.terminal_id, false),
+            Some(DirectAttentionAction::Navigate(candidate.id)),
         );
         snapshot.sessions[0].workspaces[0].tabs[0].panes[0]
             .activity
             .read_revision = 1;
-        assert_eq!(notifications.next(&snapshot, current.terminal_id), None);
+        assert_eq!(
+            notifications.next_action(&snapshot, current.terminal_id, false),
+            Some(DirectAttentionAction::AcknowledgeCurrent([
+                Some(AttentionAcknowledgement::Agent {
+                    terminal_id: current.terminal_id,
+                    event_revision: 1,
+                }),
+                None,
+            ])),
+            "current attention follows every other waiting terminal"
+        );
+        assert_eq!(
+            notifications.next_action(&snapshot, current.terminal_id, true),
+            Some(DirectAttentionAction::RevealCurrent),
+            "covered current attention is revealed before rendering acknowledges it"
+        );
     }
 
     #[test]
@@ -740,12 +811,31 @@ mod tests {
             1
         );
         assert_eq!(
-            notifications.next(&snapshot, current.terminal_id),
-            Some(candidate.id)
+            notifications.next_action(&snapshot, current.terminal_id, false),
+            Some(DirectAttentionAction::Navigate(candidate.id)),
         );
         snapshot.sessions[2].workspaces[0].tabs[1].panes[1]
             .activity
             .read_revision = 1;
-        assert_eq!(notifications.next(&snapshot, current.terminal_id), None);
+        assert_eq!(
+            notifications.next_action(&snapshot, current.terminal_id, false),
+            None
+        );
+    }
+
+    #[test]
+    fn clear_acknowledges_the_selected_agent_event_without_changing_its_state() {
+        let pane = completed_pane(false);
+        let snapshot = snapshot_with_panes(vec![pane.clone()]);
+        let mut dialog = NotificationsDialog::open(&snapshot, &NotificationState::default());
+
+        assert!(matches!(
+            dialog.key(KeyEvent::new(KeyCode::Char('c'), crossterm::event::KeyModifiers::NONE), 10),
+            NotificationsAction::Acknowledge(AttentionAcknowledgement::Agent {
+                terminal_id,
+                event_revision: 1,
+            }) if terminal_id == pane.terminal_id
+        ));
+        assert_eq!(pane.activity.state, AgentState::Idle);
     }
 }

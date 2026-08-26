@@ -12,6 +12,7 @@
 - Unnamed tabs now keep a stable shared title based on their oldest surviving pane instead of following client-local focus.
 - Arrow keys now honor applications that enable application-cursor mode.
 - Command-palette session rename and close actions now work for the attached session.
+- Clearing notifications now works for both agent events and bells, and next-attention handles the current terminal after all other candidates.
 
 ## 0.13
 

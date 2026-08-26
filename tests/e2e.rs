@@ -8673,12 +8673,54 @@ async fn public_agent_activity_spins_lists_waiting_terminals_and_navigates_unrea
     client.send(b"\x02u");
     client.wait_for(" terminals waiting").await;
     client.wait_for("waiting-b").await;
+    client.send(b"c");
+    client.wait_for("No alerts or notifications").await;
+    let cleared = agent_list();
+    assert_eq!(cleared["result"]["unread_count"], 0);
+    assert_eq!(
+        cleared["result"]["agents"][1]["activity"]["state"],
+        unread["result"]["agents"][1]["activity"]["state"],
+        "clearing attention must not change agent lifecycle state"
+    );
+    client.send(b"q");
+
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::ReportAgent {
+                terminal_id: b.terminal_id,
+                report: AgentReport::Completed,
+                metadata: Default::default(),
+            })
+            .await,
+        ServerMessage::CommandCompleted { .. }
+    ));
+    client.wait_for("• 1").await;
+    client.send(b"\x02u");
+    client.wait_for("waiting-b").await;
     client.send(b"\r");
     client.wait_for("WAITING").await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     let read = agent_list();
     assert_eq!(read["result"]["unread_count"], 0);
     assert_eq!(read["result"]["agents"][1]["unread"], false);
+
+    client.send(b"\x02:");
+    client.wait_for(" commands").await;
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::ReportAgent {
+                terminal_id: b.terminal_id,
+                report: AgentReport::Completed,
+                metadata: Default::default(),
+            })
+            .await,
+        ServerMessage::CommandCompleted { .. }
+    ));
+    assert_eq!(agent_list()["result"]["unread_count"], 1);
+    client.clear_output();
+    client.send(b"switch to next alert\r");
+    client.wait_for("WAITING").await;
+    wait_for(DEADLINE, || agent_list()["result"]["unread_count"] == 0).await;
 
     client.clear_output();
     assert!(matches!(

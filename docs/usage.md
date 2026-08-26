@@ -142,12 +142,14 @@ terminator is not a bell, and repeated bells are represented by a bounded
 counter rather than an event log.
 
 Bells roll up to tabs, workspace rows, sessions, and navigator results. Press
-`Ctrl-b u` to inspect them, Enter to switch to the pane, or `c` to clear the
-selected bell for this client. `Ctrl-b Ctrl-b` moves to the next alert using
-typed pane navigation. Rendering the focused pane acknowledges its current bell
-for this client only; another attached client keeps its own seen state. A new
-outer terminal starts at the current bell baseline. Agent lifecycle state
-remains separate.
+`Ctrl-b u` to inspect them, Enter to switch to the pane, or `c` to acknowledge
+the selected bell or agent notification without changing agent lifecycle state.
+`Ctrl-b Ctrl-b` moves to the next alert using typed pane navigation, considering
+the current terminal last; when it is the only waiting terminal, Fut reveals and
+acknowledges it or confirms that its already-visible attention was cleared.
+Rendering the focused pane acknowledges its current bell for this client only;
+another attached client keeps its own seen state. A new outer terminal starts at
+the current bell baseline. Agent lifecycle state remains separate.
 See [Configuration](../configuration/) for the opt-in outer-terminal BEL.
 
 Fut renders standard terminal mouse modes, indexed and RGB color, OSC 8
