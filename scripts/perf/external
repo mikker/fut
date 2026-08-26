@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Reproduce the 300x65 four-pane external workload from PERF.md with a
+# disposable daemon. On macOS this records separate daemon/client CPU samples,
+# stack samples, FUT_PERF_LOG frame timing, control latency, and detached daemon
+# CPU in target/fut-perf-external.
+
+PROJECT_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+PERF_ROOT=${FUT_EXTERNAL_PERF_ROOT:-"$PROJECT_ROOT/target/fut-perf-external"}
+FUT_BIN=${FUT_BIN:-"$PROJECT_ROOT/target/release/fut"}
+SOCKET="$PERF_ROOT/fut.sock"
+DAEMON_PID=""
+SCRIPT_PID=""
+
+for command in cmatrix pipes.sh htop genact python3 script top sample; do
+  command -v "$command" >/dev/null || {
+    echo "Required command not found: $command" >&2
+    exit 1
+  }
+done
+
+if [[ ${FUT_PERF_SKIP_BUILD:-0} != 1 ]]; then
+  (cd "$PROJECT_ROOT" && cargo build --release --quiet --bin fut)
+fi
+
+cleanup() {
+  if [[ -n "$SCRIPT_PID" ]]; then
+    kill "$SCRIPT_PID" 2>/dev/null || true
+    wait "$SCRIPT_PID" 2>/dev/null || true
+  fi
+  "$FUT_BIN" --socket "$SOCKET" --no-config daemon shutdown >/dev/null 2>&1 || true
+  if [[ -n "$DAEMON_PID" ]]; then
+    kill "$DAEMON_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
+rm -rf "$PERF_ROOT"
+mkdir -p "$PERF_ROOT/work"
+chmod 700 "$PERF_ROOT"
+
+selected_field() {
+  python3 -c \
+    'import json, sys; print(json.load(sys.stdin)["result"]["selected"][sys.argv[1]])' \
+    "$1"
+}
+
+"$FUT_BIN" --socket "$SOCKET" --no-config daemon run \
+  --cwd "$PERF_ROOT/work" -- sleep 600 >"$PERF_ROOT/daemon.log" 2>&1 &
+DAEMON_PID=$!
+for _ in $(seq 1 100); do
+  "$FUT_BIN" --socket "$SOCKET" --no-config daemon ping >/dev/null 2>&1 && break
+  sleep 0.05
+done
+
+initial=$("$FUT_BIN" --socket "$SOCKET" --no-config --json open -b \
+  "$PERF_ROOT/work" --name external-perf -- cmatrix -ab -u 3)
+pane=$(printf '%s' "$initial" | selected_field pane_id)
+terminal=$(printf '%s' "$initial" | selected_field terminal_id)
+right=$("$FUT_BIN" --socket "$SOCKET" --no-config --json \
+  pane split "$pane" right -- pipes.sh -p 5 -f 30 -R -K)
+right_pane=$(printf '%s' "$right" | selected_field pane_id)
+"$FUT_BIN" --socket "$SOCKET" --no-config --json \
+  pane split "$pane" down -- htop >/dev/null
+"$FUT_BIN" --socket "$SOCKET" --no-config --json \
+  pane split "$right_pane" down -- /bin/sh -c \
+  'while :; do genact --speed-factor 2 --modules botnet --modules bruteforce --modules cryptomining --modules memdump --modules weblog; done' \
+  >/dev/null
+
+/usr/bin/script -q /dev/null /bin/sh -c \
+  "stty cols 300 rows 65; exec env FUT_ALLOW_NESTED=1 FUT_PERF_LOG='$PERF_ROOT/frames.csv' '$FUT_BIN' --socket '$SOCKET' --no-config pane attach '$pane'" \
+  >"$PERF_ROOT/client.out" 2>&1 &
+SCRIPT_PID=$!
+sleep "${FUT_PERF_WARMUP_SECONDS:-8}"
+CLIENT_PID=$(pgrep -P "$SCRIPT_PID" | head -1)
+if ! ps -p "$CLIENT_PID" -o command= | grep -q 'fut'; then
+  CLIENT_PID=$(pgrep -P "$CLIENT_PID" | head -1)
+fi
+
+printf 'daemon_pid=%s\nclient_pid=%s\npane_id=%s\nterminal_id=%s\n' \
+  "$DAEMON_PID" "$CLIENT_PID" "$pane" "$terminal" >"$PERF_ROOT/meta.txt"
+
+top -l "${FUT_PERF_TOP_SAMPLES:-16}" -s 1 \
+  -pid "$DAEMON_PID" -pid "$CLIENT_PID" -stats pid,command,cpu,mem \
+  >"$PERF_ROOT/visible-top.txt"
+sample "$DAEMON_PID" 3 -file "$PERF_ROOT/daemon.sample.txt" >/dev/null 2>&1
+sample "$CLIENT_PID" 3 -file "$PERF_ROOT/client.sample.txt" >/dev/null 2>&1
+
+TIMEFORMAT=$'real %R\nuser %U\nsys %S'
+{ time /bin/sh -c 'i=0; while [ "$i" -lt 50 ]; do "$0" --socket "$1" --no-config daemon ping >/dev/null || exit; i=$((i+1)); done' "$FUT_BIN" "$SOCKET"; } \
+  2>"$PERF_ROOT/control-50.txt"
+{ time /bin/sh -c 'i=0; while [ "$i" -lt 20 ]; do "$0" --socket "$1" --no-config terminal read "$2" >/dev/null || exit; i=$((i+1)); done' "$FUT_BIN" "$SOCKET" "$terminal"; } \
+  2>"$PERF_ROOT/read-20.txt"
+
+kill "$SCRIPT_PID" 2>/dev/null || true
+wait "$SCRIPT_PID" 2>/dev/null || true
+SCRIPT_PID=""
+sleep 3
+top -l "${FUT_PERF_TOP_SAMPLES:-16}" -s 1 -pid "$DAEMON_PID" \
+  -stats pid,command,cpu,mem >"$PERF_ROOT/background-top.txt"
+
+"$PROJECT_ROOT/scripts/perf/report" "$PERF_ROOT/frames.csv" \
+  | tee "$PERF_ROOT/frames-report.txt"
+python3 - "$PERF_ROOT" "$DAEMON_PID" "$CLIENT_PID" <<'PY'
+import pathlib, statistics, sys
+
+root, daemon, client = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+
+def cpus(path, pid):
+    values = []
+    for line in path.read_text().splitlines():
+        fields = line.split()
+        if fields and fields[0] == pid:
+            values.append(float(fields[2].rstrip("%")))
+    # macOS top's first process sample is an unmeasured 0.0 baseline.
+    return values[1:]
+
+def report(label, values):
+    print(f"{label}: avg={statistics.mean(values):.2f}% range={min(values):.1f}-{max(values):.1f}% n={len(values)}")
+
+visible = root / "visible-top.txt"
+report("visible daemon", cpus(visible, daemon))
+report("visible client", cpus(visible, client))
+report("background daemon", cpus(root / "background-top.txt", daemon))
+print("control 50:", (root / "control-50.txt").read_text().strip().replace("\n", ", "))
+print("visible reads 20:", (root / "read-20.txt").read_text().strip().replace("\n", ", "))
+PY

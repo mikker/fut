@@ -96,6 +96,10 @@ run = "bash scripts/perf/run"
 description = "Capture and compare less forward/backward paging output and Fut VT costs"
 run = "cargo run --release --example pager_measure"
 
+[tasks."perf:external"]
+description = "Measure the release daemon and client on the 300x65 four-pane animation workload"
+run = "bash scripts/perf/external"
+
 [tasks."docs:setup"]
 description = "Install local documentation dependencies"
 run = "cd docs && BUNDLE_PATH=../.bundle bundle install"

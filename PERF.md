@@ -25,22 +25,30 @@ by similar projects (Zellij, tmux, Ghostty, mosh).
 - `FUT_PERF_LOG=/tmp/frames.csv fut … attach` — the real client logs one CSV
   row per frame decode and per draw (`src/client/perf.rs`). Summarize with
   `scripts/perf/report /tmp/frames.csv`.
+- `mise run perf:external` — build release Fut and run the disposable 300x65
+  four-pane animation workload used for the whole-system budget. On macOS it
+  records separate visible daemon/client and detached daemon `top` samples,
+  daemon/client `sample` profiles, frame timing, and control latency under
+  `target/fut-perf-external`. Set `FUT_PERF_SKIP_BUILD=1` to measure an already
+  built release binary without another Cargo invocation.
 
 ## The pipeline today
 
 PTY bytes → 64 KiB `read()` (`runtime.rs:1361`) → crossbeam bounded(16) →
 VT thread drains up to 2 MiB per pass (`drain_output_batch`) and publishes at
-most once per 8 ms per terminal → full-grid snapshot (`snapshot_current`) →
-tokio `watch` (drops stale) → per-client clone and row diff → compact
+most once per 8 ms per observed terminal; terminals with no snapshot watchers
+keep parsing PTY output but defer snapshot construction until attachment →
+full-grid snapshot (`snapshot_current`) → tokio `watch` (drops stale) →
+per-client clone and row diff → compact
 MessagePack full snapshot or dirty-row delta → client apply → 16 ms paced draw
 with per-pane dirty revisions and CSI 2026 (`client/mod.rs`).
 
 The client loop is already shaped right (paced, dirty-gated, synchronized
-output). The costs are upstream, ranked:
+output). Remaining costs for observed terminals are upstream, ranked:
 
 1. **A full-grid rebuild for every published terminal revision.** Pacing caps
-   this at 125/s per terminal, but four independently animated panes can keep
-   paying it continuously even when their workspace is not visible.
+   this at 125/s per observed terminal, but four independently animated panes
+   in a visible layout can keep paying it continuously.
 2. **The daemon builds and clones a full snapshot before deriving a row
    delta.** Deltas save wire/decode work but do not make upstream capture or
    per-client diffing proportional to the changed area.
@@ -197,6 +205,46 @@ partial state without recreating or cloning a complete grid. Full-screen dense
 animations will still dirty every row, so this is primarily a typing and
 partial-update production win, not a universal replacement for faster
 full-grid extraction.
+
+### Round 6 (2026-08-26): demand-driven snapshot construction
+
+Fresh release profiles of the documented 300x65 workload separated the daemon
+from the client. While visible, `snapshot_current` remained the daemon's main
+rendering stack and ratatui buffer construction/diffing remained the client's;
+the client log measured 700 µs average draws and 34 µs average decode. While
+detached, no daemon consumer needed screen frames, but all four terminal threads
+continued constructing full snapshots at animation rate.
+
+Terminal runtimes now parse PTY output continuously but only construct paced
+screen snapshots while a snapshot receiver exists. A newly attached watcher
+explicitly asks the runtime for a current, output-barriered snapshot before it
+publishes its first frame. This preserves terminal state, attach correctness,
+and control scheduling while removing the entire full-grid publication path
+from detached terminals. A focused unit regression pins the no-observer rule,
+and `scripts/perf/external` captures the external recipe in-repo.
+
+Both runs used the same release binary methodology, 8-second warmup, fifteen
+steady one-second `top` samples after discarding `top`'s initial zero sample,
+and the same child commands. The five-thread batch made visible CPU noisier,
+so visible before/after should be read as acceptance checks, not an improvement
+claim; the architectural change is intentionally inactive while attached.
+
+| Metric | before | after |
+| --- | ---: | ---: |
+| visible daemon CPU | 3.11% (1.1–4.2%) | 3.64% (2.4–5.0%) |
+| visible client CPU | 3.13% (1.1–4.3%) | 4.11% (3.1–5.2%) |
+| visible total CPU | 6.24% | 7.75% |
+| detached daemon CPU | 2.62% (1.6–3.2%) | **1.11% (0.6–1.5%)** |
+| 50 control queries | 0.79 s | 0.267 s |
+| 20 visible reads | 0.34 s | 0.110 s |
+| client decode average / p95 | 34 / 90 µs | 29 / 53 µs |
+| client draw average / p95 | 700 / 1,646 µs | 679 / 1,707 µs |
+
+The after run meets the primary visible budget (<10% total), background budget
+(<2.5%, reaching the 1.5% stretch target), and both control budgets (≤0.40 s
+and ≤0.20 s). The before control timings exceeded the historical baseline under
+concurrent machine load; the after timings demonstrate that the new attach
+refresh does not put snapshot work on ordinary control requests.
 
 ### External multiplexer baseline (2026-08-10)
 

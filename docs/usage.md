@@ -20,8 +20,9 @@ fut
 
 Bare `fut` starts the daemon when needed, opens the current directory, and
 attaches a client. The daemon keeps sessions and terminal processes alive after
-you detach. Runtime state is not restored after the daemon exits or the machine
-restarts.
+you detach. Detached terminals keep consuming and parsing their output, but Fut
+defers screen rendering until a client observes them again. Runtime state is not
+restored after the daemon exits or the machine restarts.
 
 Run `fut` from another directory to open it in the existing daemon. Fut groups
 resources like this:

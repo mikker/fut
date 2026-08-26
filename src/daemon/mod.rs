@@ -1522,6 +1522,17 @@ fn watch_attachment(
         let mut events = terminal.subscribe_events();
         let mut lifecycle = terminal.subscribe_lifecycle();
 
+        if let Err(error) = terminal.refresh_snapshot().await {
+            let _ = updates
+                .send(AttachmentUpdate::Error {
+                    terminal_id,
+                    generation,
+                    message: error.to_string(),
+                })
+                .await;
+            return;
+        }
+
         let screen = snapshots.borrow_and_update().clone();
         if updates
             .send(AttachmentUpdate::Snapshot {

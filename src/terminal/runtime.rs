@@ -305,6 +305,17 @@ impl TerminalHandle {
         completed.await.unwrap_or(Err(CommandError::Stopped))
     }
 
+    /// Materialize the current screen for a newly attached snapshot watcher.
+    /// Animated terminals otherwise avoid snapshot construction while nobody
+    /// is watching them.
+    pub(crate) async fn refresh_snapshot(&self) -> Result<(), CommandError> {
+        let (completion, completed) = oneshot::channel();
+        self.commands
+            .send(RuntimeMessage::RefreshSnapshot { completion })
+            .await?;
+        completed.await.unwrap_or(Err(CommandError::Stopped))
+    }
+
     /// Last-resort cleanup for an unexpectedly dropped attachment. Normal
     /// lifecycle paths await [`Self::clear_client`] before dropping ownership.
     /// This fallback retries the bounded ordered queue and waits for runtime
@@ -519,6 +530,9 @@ enum RuntimeMessage {
         rows: usize,
         ansi: bool,
         completion: oneshot::Sender<Result<OutputCapture, CommandError>>,
+    },
+    RefreshSnapshot {
+        completion: oneshot::Sender<Result<(), CommandError>>,
     },
     Close(oneshot::Sender<Result<(), CommandError>>),
 }
@@ -916,6 +930,25 @@ fn run(
                         .map_err(CommandError::Output);
                     let _ = completion.send(result);
                 }
+                RuntimeMessage::RefreshSnapshot { completion } => {
+                    drain_output_barrier(
+                        &mut queues.output,
+                        terminal,
+                        &publishers,
+                        &mut reader_complete,
+                    );
+                    let result = terminal
+                        .snapshot_after_feed()
+                        .map(|screen| {
+                            if let Some(screen) = screen {
+                                publishers.snapshots.send_replace(screen);
+                            }
+                        })
+                        .map_err(|error| CommandError::Emulator(error.to_string()));
+                    // Synchronized output deliberately leaves the last complete
+                    // frame in place until the application ends it.
+                    let _ = completion.send(result);
+                }
                 RuntimeMessage::Close(completion) => {
                     // The throttle may be holding an unpublished snapshot for
                     // bytes already fed to the parser; shutdown reads state
@@ -1029,11 +1062,7 @@ fn run(
                         }
                         DrainOutcome::Fed => {
                             if last_snapshot.elapsed() >= SNAPSHOT_MIN_INTERVAL {
-                                publish_optional(
-                                    terminal.snapshot_after_feed(),
-                                    publishers.snapshots,
-                                    publishers.events,
-                                );
+                                publish_snapshot_after_feed(terminal, &publishers);
                                 last_snapshot = Instant::now();
                                 dirty = false;
                             } else {
@@ -1054,11 +1083,7 @@ fn run(
                 recv(queues.doorbell) -> _ => {}
                 default(default_timeout) => {
                     if dirty && last_snapshot.elapsed() >= SNAPSHOT_MIN_INTERVAL {
-                        publish_optional(
-                            terminal.snapshot_after_feed(),
-                            publishers.snapshots,
-                            publishers.events,
-                        );
+                        publish_snapshot_after_feed(terminal, &publishers);
                         last_snapshot = Instant::now();
                         dirty = false;
                     }
@@ -1172,6 +1197,9 @@ fn serve_exited(
                 let _ = completion.send(Ok(None));
             }
             RuntimeMessage::ForegroundProcessId { completion } => {
+                let _ = completion.send(Err(CommandError::Stopped));
+            }
+            RuntimeMessage::RefreshSnapshot { completion } => {
                 let _ = completion.send(Err(CommandError::Stopped));
             }
             RuntimeMessage::Input(_)
@@ -1562,6 +1590,20 @@ fn publish_optional(
         Err(error) => send_error(events, error),
     }
 }
+
+/// Snapshot construction is the dominant background cost for animated
+/// terminals. The emulator remains current without it, so only materialize a
+/// frame when an attachment (or another explicit observer) has subscribed.
+fn publish_snapshot_after_feed(terminal: &mut GhosttyTerminal, publishers: &RuntimePublishers<'_>) {
+    if publishers.snapshots.receiver_count() == 0 {
+        return;
+    }
+    publish_optional(
+        terminal.snapshot_after_feed(),
+        publishers.snapshots,
+        publishers.events,
+    );
+}
 fn publish_exit(lifecycle: &watch::Sender<TerminalLifecycle>, exit_code: Option<i32>) {
     lifecycle.send_replace(TerminalLifecycle::Exited { exit_code });
 }
@@ -1855,6 +1897,42 @@ mod tests {
             .map(|cell| cell.contents.as_str())
             .collect();
         assert!(text.contains("abcde"), "missing fed bytes: {text:?}");
+    }
+
+    #[test]
+    fn animated_output_is_only_snapshotted_while_observed() {
+        let mut terminal = test_terminal(Box::new(Vec::<u8>::new()));
+        let initial = terminal.snapshot().unwrap();
+        let initial_revision = initial.revision;
+        let (snapshots, receiver) = watch::channel(initial);
+        drop(receiver);
+        let (events, _) = broadcast::channel(4);
+        let (lifecycle, _) = watch::channel(TerminalLifecycle::Running);
+        let (activity, _) = watch::channel(TerminalActivity::default());
+        let publishers = RuntimePublishers {
+            snapshots: &snapshots,
+            events: &events,
+            lifecycle: &lifecycle,
+            activity: &activity,
+        };
+
+        terminal.vt_write(b"unobserved");
+        publish_snapshot_after_feed(&mut terminal, &publishers);
+        assert_eq!(snapshots.borrow().revision, initial_revision);
+
+        let mut observed = snapshots.subscribe();
+        terminal.vt_write(b" observed");
+        publish_snapshot_after_feed(&mut terminal, &publishers);
+        assert!(observed.has_changed().unwrap());
+        assert!(
+            observed
+                .borrow_and_update()
+                .cells
+                .iter()
+                .map(|cell| cell.contents.as_str())
+                .collect::<String>()
+                .contains("unobserved observed")
+        );
     }
 
     #[test]
