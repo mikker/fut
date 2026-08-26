@@ -31,6 +31,7 @@ mod toast;
 use std::{
     collections::{BTreeMap, HashMap},
     fs,
+    future::Future,
     io::{self, Write},
     num::NonZeroU16,
     path::{Path, PathBuf},
@@ -95,6 +96,7 @@ use tokio::{
     net::UnixStream,
     signal::unix::{Signal, SignalKind, signal},
     sync::mpsc,
+    task::JoinHandle,
     time,
 };
 use tokio_util::codec::Framed;
@@ -160,6 +162,57 @@ impl ExtensionReloadState {
             | ExtensionReloadPhase::Committing { request_id, .. } => request_id,
         }
     }
+}
+
+struct ProjectPreparationTask {
+    request_id: Uuid,
+    handle: JoinHandle<()>,
+}
+
+impl ProjectPreparationTask {
+    fn spawn(
+        choice: ProjectOpenChoice,
+        config_location: config::ConfigLocation,
+        extensions: Vec<crate::extensions::Extension>,
+        results: mpsc::UnboundedSender<ProjectPreparationCompletion>,
+    ) -> Self {
+        let request_id = Uuid::new_v4();
+        Self::spawn_with(
+            request_id,
+            async move { prepare_project_open(choice, &config_location, &extensions).await },
+            results,
+        )
+    }
+
+    fn spawn_with<F>(
+        request_id: Uuid,
+        preparation: F,
+        results: mpsc::UnboundedSender<ProjectPreparationCompletion>,
+    ) -> Self
+    where
+        F: Future<Output = anyhow::Result<ProjectOpenPreparation>> + Send + 'static,
+    {
+        let handle = tokio::spawn(async move {
+            let result = preparation.await;
+            let _ = results.send(ProjectPreparationCompletion { request_id, result });
+        });
+        Self { request_id, handle }
+    }
+
+    fn is_for(&self, request_id: Uuid) -> bool {
+        self.request_id == request_id
+    }
+}
+
+impl Drop for ProjectPreparationTask {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+struct ProjectPreparationCompletion {
+    request_id: Uuid,
+    result: anyhow::Result<ProjectOpenPreparation>,
 }
 
 struct ProjectConfigReloadState {
@@ -662,12 +715,15 @@ async fn run_loop(
     let mut perf = perf::PerfLog::from_env();
     let mut extension_reload: Option<ExtensionReloadState> = None;
     let mut project_config_reload: Option<ProjectConfigReloadState> = None;
+    let mut project_preparation: Option<ProjectPreparationTask> = None;
     let mut redraw = time::interval(Duration::from_millis(16));
     redraw.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut spinner = time::interval(Duration::from_millis(100));
     spinner.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let (clipboard_results, mut clipboard_result) = mpsc::channel(1);
     let (background_results, mut background_result) = mpsc::unbounded_channel();
+    let (project_preparation_results, mut project_preparation_result) =
+        mpsc::unbounded_channel::<ProjectPreparationCompletion>();
     send_request(framed, Some(Uuid::new_v4()), ClientMessage::ListResources).await?;
     resize_view(framed, terminal.size()?.into(), &mut view, &resources, &ui).await?;
 
@@ -767,6 +823,47 @@ async fn run_loop(
                     toasts.error(format!("command failed · {}", sanitize(&message)));
                     force_draw = true;
                 }
+            }
+            completion = project_preparation_result.recv() => {
+                let Some(completion) = completion else {
+                    unreachable!("the event loop retains a project preparation sender")
+                };
+                if !project_preparation
+                    .as_ref()
+                    .is_some_and(|task| task.is_for(completion.request_id))
+                {
+                    continue;
+                }
+                project_preparation = None;
+                let accepted = match surface.as_ref() {
+                    Some(ClientSurface::ProjectOpener(opener)) => {
+                        opener.accepts_preparation(completion.request_id)
+                    }
+                    _ => false,
+                };
+                if !accepted {
+                    continue;
+                }
+                match completion.result {
+                    Ok(ProjectOpenPreparation::Ready { project, cwd }) => {
+                        let opener = project_opener_mut(&mut surface);
+                        request_project_open(framed, opener, project, cwd).await?;
+                    }
+                    Ok(ProjectOpenPreparation::Approval {
+                        project,
+                        cwd,
+                        path,
+                        digest,
+                        source,
+                    }) => {
+                        project_opener_mut(&mut surface)
+                            .confirm_approval(project, cwd, path, digest, &source);
+                    }
+                    Err(error) => {
+                        project_opener_mut(&mut surface).show_error(one_line_error(&error));
+                    }
+                }
+                force_draw = true;
             }
             frame = framed.next() => {
                 let Some(frame) = frame else {
@@ -1786,19 +1883,24 @@ async fn run_loop(
                                 view.invalidate_drawn();
                             }
                             ProjectOpenerAction::Submit(choice) => {
-                                match prepare_project_open(choice, config_location, &ui.extensions).await {
-                                    Ok(ProjectOpenPreparation::Ready { project, cwd }) => {
-                                        let opener = project_opener_mut(&mut surface);
-                                        request_project_open(framed, opener, project, cwd).await?;
-                                    }
-                                    Ok(ProjectOpenPreparation::Approval { project, cwd, path, digest, source }) => {
-                                        project_opener_mut(&mut surface)
-                                            .confirm_approval(project, cwd, path, digest, &source);
-                                    }
-                                    Err(error) => {
-                                        project_opener_mut(&mut surface)
-                                            .show_error(one_line_error(&error));
-                                    }
+                                let task = ProjectPreparationTask::spawn(
+                                    choice,
+                                    config_location.clone(),
+                                    ui.extensions.clone(),
+                                    project_preparation_results.clone(),
+                                );
+                                project_opener_mut(&mut surface)
+                                    .begin_preparation(task.request_id);
+                                project_preparation = Some(task);
+                            }
+                            ProjectOpenerAction::CancelPreparation { request_id } => {
+                                if project_opener_mut(&mut surface)
+                                    .cancel_preparation(request_id)
+                                    && project_preparation
+                                        .as_ref()
+                                        .is_some_and(|task| task.is_for(request_id))
+                                {
+                                    project_preparation = None;
                                 }
                             }
                             ProjectOpenerAction::Approve { project, cwd, digest } => {
@@ -6260,6 +6362,59 @@ mod tests {
         };
 
         assert_eq!(reload.session_id, invocation_session);
+    }
+
+    #[tokio::test]
+    async fn background_project_preparation_keeps_unrelated_updates_responsive() {
+        let (preparation_results, _preparation_result) = mpsc::unbounded_channel();
+        let request_id = Uuid::new_v4();
+        let _task = ProjectPreparationTask::spawn_with(
+            request_id,
+            std::future::pending(),
+            preparation_results,
+        );
+        let (updates, mut update) = mpsc::unbounded_channel();
+
+        updates.send("resources changed").unwrap();
+
+        assert_eq!(
+            time::timeout(Duration::from_millis(50), update.recv())
+                .await
+                .unwrap(),
+            Some("resources changed")
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_project_preparation_cancels_its_background_work() {
+        struct CancellationSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for CancellationSignal {
+            fn drop(&mut self) {
+                if let Some(signal) = self.0.take() {
+                    let _ = signal.send(());
+                }
+            }
+        }
+
+        let (cancelled, cancellation) = tokio::sync::oneshot::channel();
+        let (results, _result) = mpsc::unbounded_channel();
+        let task = ProjectPreparationTask::spawn_with(
+            Uuid::new_v4(),
+            async move {
+                let _signal = CancellationSignal(Some(cancelled));
+                std::future::pending().await
+            },
+            results,
+        );
+        tokio::task::yield_now().await;
+
+        drop(task);
+
+        time::timeout(Duration::from_millis(50), cancellation)
+            .await
+            .expect("preparation task should be aborted")
+            .expect("preparation cancellation signal should be delivered");
     }
 
     fn targets(count: usize) -> Vec<SelectedTarget> {

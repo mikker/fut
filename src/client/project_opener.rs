@@ -31,6 +31,9 @@ pub(super) enum ProjectOpenerAction {
     Stay,
     Close,
     Submit(ProjectOpenChoice),
+    CancelPreparation {
+        request_id: Uuid,
+    },
     Approve {
         project: String,
         cwd: PathBuf,
@@ -47,6 +50,9 @@ struct ProjectEntry {
 #[derive(Clone, Debug)]
 enum Phase {
     Browsing,
+    Preparing {
+        request_id: Uuid,
+    },
     Approval {
         project: String,
         cwd: PathBuf,
@@ -105,6 +111,17 @@ impl ProjectOpenerState {
             Phase::Opening { .. } | Phase::AwaitingSelection { .. } | Phase::AwaitingSnapshot => {
                 ProjectOpenerAction::Stay
             }
+            Phase::Preparing { request_id } => match key.code {
+                KeyCode::Esc => ProjectOpenerAction::CancelPreparation {
+                    request_id: *request_id,
+                },
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    ProjectOpenerAction::CancelPreparation {
+                        request_id: *request_id,
+                    }
+                }
+                _ => ProjectOpenerAction::Stay,
+            },
             Phase::Approval {
                 project,
                 cwd,
@@ -238,6 +255,28 @@ impl ProjectOpenerState {
         };
     }
 
+    pub(super) fn begin_preparation(&mut self, request_id: Uuid) {
+        self.error = None;
+        self.phase = Phase::Preparing { request_id };
+    }
+
+    pub(super) fn accepts_preparation(&self, request_id: Uuid) -> bool {
+        matches!(
+            self.phase,
+            Phase::Preparing {
+                request_id: expected
+            } if request_id == expected
+        )
+    }
+
+    pub(super) fn cancel_preparation(&mut self, request_id: Uuid) -> bool {
+        if !self.accepts_preparation(request_id) {
+            return false;
+        }
+        self.phase = Phase::Browsing;
+        true
+    }
+
     pub(super) fn begin_open(&mut self, request_id: Uuid) {
         self.error = None;
         self.phase = Phase::Opening { request_id };
@@ -308,6 +347,20 @@ impl ProjectOpenerState {
                 scroll,
                 ..
             } => render_approval(area, project, path, recipe, scroll, buffer),
+            Phase::Preparing { .. } => {
+                fill_row(
+                    Rect::new(area.x, area.y, area.width, 1),
+                    title_style(),
+                    buffer,
+                );
+                buffer.set_stringn(
+                    area.x,
+                    area.y,
+                    " Open project · preparing… · esc cancel",
+                    usize::from(area.width),
+                    title_style(),
+                );
+            }
             Phase::Opening { .. } | Phase::AwaitingSelection { .. } | Phase::AwaitingSnapshot => {
                 fill_row(
                     Rect::new(area.x, area.y, area.width, 1),
@@ -673,5 +726,52 @@ mod tests {
                 digest: "secret-digest".into(),
             }
         );
+    }
+
+    #[test]
+    fn preparation_is_visible_and_escape_cancels_back_to_the_browser() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut opener =
+            ProjectOpenerState::open(&catalog(temporary.path()), temporary.path().into());
+        opener.paste("slow-project");
+        let request_id = Uuid::new_v4();
+        opener.begin_preparation(request_id);
+
+        let host = Rect::new(0, 0, 100, 30);
+        let mut buffer = Buffer::empty(host);
+        opener.render(host, &mut buffer);
+        let rendered = (0..host.height)
+            .flat_map(|row| (0..host.width).map(move |column| (column, row)))
+            .map(|position| buffer[position].symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Open project · preparing… · esc cancel"));
+        assert_eq!(
+            opener.key(key(KeyCode::Esc), 10),
+            ProjectOpenerAction::CancelPreparation { request_id }
+        );
+        assert!(opener.cancel_preparation(request_id));
+        opener.paste("-again");
+        assert_eq!(
+            opener.key(key(KeyCode::Enter), 10),
+            ProjectOpenerAction::Submit(ProjectOpenChoice::Path(
+                temporary.path().join("slow-project-again")
+            ))
+        );
+    }
+
+    #[test]
+    fn stale_preparation_completion_cannot_apply_to_a_later_submission() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut opener =
+            ProjectOpenerState::open(&catalog(temporary.path()), temporary.path().into());
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+
+        opener.begin_preparation(first);
+        assert!(opener.cancel_preparation(first));
+        opener.begin_preparation(second);
+
+        assert!(!opener.accepts_preparation(first));
+        assert!(opener.accepts_preparation(second));
     }
 }

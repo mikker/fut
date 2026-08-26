@@ -38,6 +38,10 @@ scan the filesystem. The exact typed value appears as an **Open path** choice,
 resolved relative to the focused workspace. Opening a location that is already
 live navigates to it rather than creating a duplicate. A newly bootstrapped
 project attaches directly to the focus terminal selected by its recipe.
+Path and recipe preparation runs in the background. The opener shows
+**preparing…** while it resolves the project, remains current as other client
+updates arrive, and can be cancelled with Escape or Ctrl-C. Once preparation
+has sent the open request, the existing **opening…** phase remains non-cancellable.
 
 List the configured catalog without starting a daemon:
 
