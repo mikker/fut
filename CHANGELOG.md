@@ -6,6 +6,7 @@
 - Failed multi-terminal closes now report partial progress and remain visibly closing instead of implying that already-terminated panes were restored.
 - Agents dialogs and sidebars now exclude terminals known only through best-effort screen detection.
 - Temporary command popups now preserve attention raised by the covered terminal until it is visible again.
+- Full configuration reloads now keep their original session target, clearly retain global changes when project reload fails, and no longer disconnect incompatible sibling clients.
 - Concurrent divider drags now reconcile to the last accepted shared layout, with a notice when a topology change cancels a stale drag.
 - Unnamed tabs now keep a stable shared title based on their oldest surviving pane instead of following client-local focus.
 - Arrow keys now honor applications that enable application-cursor mode.

@@ -112,8 +112,8 @@ use toast::{Toast, ToastState};
 use crate::{
     domain::{
         CellColor, CellStyle, CursorShape, MouseButton, MouseButtons, MouseEvent, MouseEventKind,
-        MouseModifiers, MouseWheelDirection, ScreenDelta, ScreenSnapshot, ScrollPosition, SplitId,
-        TerminalId, TerminalSize,
+        MouseModifiers, MouseWheelDirection, ScreenDelta, ScreenSnapshot, ScrollPosition,
+        SessionId, SplitId, TerminalId, TerminalSize,
     },
     protocol::{
         ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, SelectedTarget, SelectedView,
@@ -135,7 +135,12 @@ enum ClientSurface {
     CommandForm(Box<CommandFormState>),
 }
 
-enum ExtensionReloadState {
+struct ExtensionReloadState {
+    session_id: SessionId,
+    phase: ExtensionReloadPhase,
+}
+
+enum ExtensionReloadPhase {
     Preparing {
         request_id: Uuid,
         staged: StagedUiConfig,
@@ -146,6 +151,15 @@ enum ExtensionReloadState {
         ui: UiConfig,
         catalog: crate::protocol::ExtensionCatalog,
     },
+}
+
+impl ExtensionReloadState {
+    fn request_id(&self) -> Uuid {
+        match self.phase {
+            ExtensionReloadPhase::Preparing { request_id, .. }
+            | ExtensionReloadPhase::Committing { request_id, .. } => request_id,
+        }
+    }
 }
 
 struct ProjectConfigReloadState {
@@ -879,9 +893,13 @@ async fn run_loop(
                         base_generation,
                         catalog,
                     } => {
-                        let Some(ExtensionReloadState::Preparing {
-                            request_id: expected,
-                            staged,
+                        let Some(ExtensionReloadState {
+                            session_id,
+                            phase:
+                                ExtensionReloadPhase::Preparing {
+                                    request_id: expected,
+                                    staged,
+                                },
                         }) = extension_reload.take()
                         else {
                             bail!("unexpected extension reload preparation from daemon");
@@ -897,11 +915,14 @@ async fn run_loop(
                                     Some(commit_request),
                                     ClientMessage::CommitExtensionReload { base_generation },
                                 ).await?;
-                                extension_reload = Some(ExtensionReloadState::Committing {
-                                    request_id: commit_request,
-                                    base_generation,
-                                    ui: candidate_ui,
-                                    catalog,
+                                extension_reload = Some(ExtensionReloadState {
+                                    session_id,
+                                    phase: ExtensionReloadPhase::Committing {
+                                        request_id: commit_request,
+                                        base_generation,
+                                        ui: candidate_ui,
+                                        catalog,
+                                    },
                                 });
                             }
                             Err(error) => {
@@ -914,11 +935,15 @@ async fn run_loop(
                         }
                     }
                     ServerMessage::ExtensionsReloaded { catalog, .. } => {
-                        let Some(ExtensionReloadState::Committing {
-                            request_id: expected,
-                            base_generation,
-                            ui: candidate_ui,
-                            catalog: prepared_catalog,
+                        let Some(ExtensionReloadState {
+                            session_id,
+                            phase:
+                                ExtensionReloadPhase::Committing {
+                                    request_id: expected,
+                                    base_generation,
+                                    ui: candidate_ui,
+                                    catalog: prepared_catalog,
+                                },
                         }) = extension_reload.take()
                         else {
                             bail!("unexpected extension reload commit from daemon");
@@ -953,7 +978,7 @@ async fn run_loop(
                             framed,
                             Some(request_id),
                             ClientMessage::ReloadProjectConfig {
-                                session_id: view.focused().session_id,
+                                session_id,
                             },
                         )
                         .await?;
@@ -967,21 +992,39 @@ async fn run_loop(
                         if catalog.generation <= extension_generation {
                             continue;
                         }
-                        // Every attached client stages the same complete local
-                        // config on publication, so command overrides and
+                        // Each attached client stages its own complete local
+                        // config on publication, so its command overrides and
                         // bindings advance with the daemon declarations too.
-                        let staged = stage_ui_config(config_location).with_context(|| {
-                            format!(
-                                "stage local UI for daemon extension generation {}",
-                                catalog.generation
-                            )
-                        })?;
-                        let candidate_ui = staged.materialize(&catalog).with_context(|| {
-                            format!(
-                                "install daemon extension generation {} without retaining stale client capabilities",
-                                catalog.generation
-                            )
-                        })?;
+                        let candidate_ui = stage_ui_config(config_location)
+                            .with_context(|| {
+                                format!(
+                                    "stage local UI for daemon extension generation {}",
+                                    catalog.generation
+                                )
+                            })
+                            .and_then(|staged| {
+                                staged.materialize(&catalog).with_context(|| {
+                                    format!(
+                                        "materialize daemon extension generation {}",
+                                        catalog.generation
+                                    )
+                                })
+                            });
+                        let candidate_ui = match candidate_ui {
+                            Ok(candidate_ui) => candidate_ui,
+                            Err(error) => {
+                                // The shared generation is already committed. Keep this
+                                // client's last usable UI rather than ending its loop;
+                                // a later compatible generation can recover it.
+                                extension_generation = catalog.generation;
+                                toasts.error(format!(
+                                    "extensions reloaded, but this client kept its previous config · {}",
+                                    one_line_error(&error)
+                                ));
+                                force_draw = true;
+                                continue;
+                            }
+                        };
                         install_ui_config(
                             candidate_ui,
                             framed,
@@ -1320,13 +1363,9 @@ async fn run_loop(
                     }
                     ServerMessage::Detached => break,
                     ServerMessage::Error { code, message } => {
-                        let reload_failed = extension_reload.as_ref().is_some_and(|reload| {
-                            let expected = match reload {
-                                ExtensionReloadState::Preparing { request_id, .. }
-                                | ExtensionReloadState::Committing { request_id, .. } => *request_id,
-                            };
-                            request_id == Some(expected)
-                        });
+                        let reload_failed = extension_reload
+                            .as_ref()
+                            .is_some_and(|reload| request_id == Some(reload.request_id()));
                         if reload_failed {
                             extension_reload = None;
                             toasts.error(format!("config reload failed · {message}"));
@@ -4165,7 +4204,10 @@ async fn dispatch_client_action(
                 ClientMessage::PrepareExtensionReload,
             )
             .await?;
-            *extension_reload = Some(ExtensionReloadState::Preparing { request_id, staged });
+            *extension_reload = Some(ExtensionReloadState {
+                session_id: view.focused().session_id,
+                phase: ExtensionReloadPhase::Preparing { request_id, staged },
+            });
             return Ok(Some(Toast::info("validating config reload")));
         }
         ClientAction::ReloadProjectConfig => {
@@ -6177,6 +6219,48 @@ fn restore_host_cursor(writer: &mut impl io::Write) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::domain::{Cell, Cursor, PaneId, Rgb, SessionId, TabId, WorkspaceId};
+
+    #[test]
+    fn full_reload_retains_its_invocation_session_through_global_commit() {
+        let location = config::ConfigLocation {
+            path: None,
+            explicit: false,
+            source: "test defaults",
+        };
+        let catalog = crate::extensions::ExtensionRegistry::new(
+            1,
+            Vec::new(),
+            config::ExtensionConfigCatalog::default(),
+        )
+        .unwrap()
+        .catalog()
+        .unwrap();
+        let invocation_session = SessionId::new();
+        let reload = ExtensionReloadState {
+            session_id: invocation_session,
+            phase: ExtensionReloadPhase::Preparing {
+                request_id: Uuid::new_v4(),
+                staged: stage_ui_config(&location).unwrap(),
+            },
+        };
+        let candidate = stage_ui_config(&location)
+            .unwrap()
+            .materialize(&catalog)
+            .unwrap();
+
+        let ExtensionReloadState { session_id, .. } = reload;
+        let reload = ExtensionReloadState {
+            session_id,
+            phase: ExtensionReloadPhase::Committing {
+                request_id: Uuid::new_v4(),
+                base_generation: 0,
+                ui: candidate,
+                catalog,
+            },
+        };
+
+        assert_eq!(reload.session_id, invocation_session);
+    }
 
     fn targets(count: usize) -> Vec<SelectedTarget> {
         let session_id = SessionId::new();

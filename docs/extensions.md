@@ -47,9 +47,11 @@ client receives one complete generation containing the commands, hooks,
 presentation tokens, and extension defaults it needs; clients do not reread
 manifests to reconstruct that state. A successful reload publishes the same
 complete generation to every attached client, and a reconnect receives the
-latest generation with its welcome. An open command palette is closed during
-the swap so an entry from the old generation cannot select a command by a stale
-position.
+latest generation with its welcome. If another attached client's local
+configuration cannot materialize that generation, that client remains attached,
+keeps its previous usable UI, and reports the incompatibility locally. An open
+command palette is closed during a successful local swap so an entry from the
+old generation cannot select a command by a stale position.
 
 ## Install and manage local packages
 

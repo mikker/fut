@@ -9736,6 +9736,101 @@ async fn public_client_reloads_config_immediately_and_retains_it_after_an_error(
 }
 
 #[tokio::test]
+async fn extension_broadcast_incompatibility_stays_local_to_the_receiving_client() {
+    let harness = Harness::start_with(
+        "printf 'RELOAD_RECIPIENT_READY\r\n'; while IFS= read -r line; do :; done",
+        |root| {
+            let extension = root.join("extension");
+            fs::create_dir(&extension).unwrap();
+            fs::write(
+                extension.join("fut-extension.toml"),
+                r#"
+api_version = 1
+version = "1.0.0"
+fut = ">=0.7.0, <1.0.0"
+capabilities = ["commands"]
+id = "catalog"
+[commands.launch]
+title = "Launch"
+argv = ["./launch"]
+"#,
+            )
+            .unwrap();
+
+            let config_dir = root.join("home/.config/fut");
+            fs::create_dir_all(&config_dir).unwrap();
+            fs::write(
+                config_dir.join("config.toml"),
+                format!("extensions = [{:?}]\n", extension.display().to_string()),
+            )
+            .unwrap();
+            fs::write(
+                root.join("recipient.toml"),
+                format!(
+                    "extensions = [{:?}]\n[ui.bindings]\n\"catalog:launch\" = \"z\"\n",
+                    extension.display().to_string()
+                ),
+            )
+            .unwrap();
+        },
+    )
+    .await;
+    let resources = harness.resources().await;
+    let pane = resources.sessions[0].workspaces[0].tabs[0].panes[0].id;
+
+    let spawn_client = |config: Option<&std::path::Path>| {
+        let mut command = Command::new("/usr/bin/script");
+        command
+            .env_clear()
+            .env("HOME", harness.root.path().join("home"))
+            .env("PATH", "/usr/bin:/bin")
+            .env("TMPDIR", harness.root.path().join("runtime"))
+            .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+            .env("TERM", "xterm-256color")
+            .args(script_command_args())
+            .arg(format!(
+                "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {}",
+                env!("CARGO_BIN_EXE_fut"),
+                harness.socket.display(),
+                pane
+            ));
+        if let Some(config) = config {
+            command.env("FUT_CONFIG", config);
+        }
+        PtyChild::spawn(command)
+    };
+
+    let mut initiator = spawn_client(None);
+    let mut recipient = spawn_client(Some(&harness.root.path().join("recipient.toml")));
+    initiator.wait_for("RELOAD_RECIPIENT_READY").await;
+    recipient.wait_for("RELOAD_RECIPIENT_READY").await;
+
+    fs::write(
+        harness.root.path().join("extension/fut-extension.toml"),
+        r#"
+api_version = 1
+version = "1.1.0"
+fut = ">=0.7.0, <1.0.0"
+capabilities = []
+id = "catalog"
+"#,
+    )
+    .unwrap();
+    recipient.clear_output();
+    initiator.send(b"\x02R");
+    initiator.wait_for("config reloaded").await;
+    recipient
+        .wait_for("extensions reloaded, but this client kept")
+        .await;
+
+    recipient.send(b"\x02d");
+    recipient.wait_success().await;
+    initiator.send(b"\x02d");
+    initiator.wait_success().await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn public_pane_zoom_toggles_full_width_and_matches_command_dispatch() {
     let harness = Harness::start(
         "printf 'ZOOM_A_READY\r\n'; while IFS= read -r line; do set -- $(stty size); case \"$line\" in before) printf 'BEFORE_%s_%s\r\n' \"$1\" \"$2\";; zoomed) printf 'ZOOMED_%s_%s\r\n' \"$1\" \"$2\";; restored) printf 'RESTORED_%s_%s\r\n' \"$1\" \"$2\";; command) printf 'COMMAND_ZOOM_%s_%s\r\n' \"$1\" \"$2\";; esac; done",
