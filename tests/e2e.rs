@@ -5753,13 +5753,138 @@ async fn raw_mouse_input_reaches_only_the_attachments_focused_terminal() {
     harness.shutdown().await;
 }
 
+#[derive(Clone, Copy)]
+enum CreationResponse {
+    Tab,
+    Pane,
+}
+
+async fn await_correlated_creation(
+    connection: &mut Connection,
+    request_id: Uuid,
+    original_terminal: TerminalId,
+    response_kind: CreationResponse,
+    ready_marker: &str,
+    pane_count: usize,
+) -> SelectedTarget {
+    time::timeout(DEADLINE, async {
+        let mut created = None;
+        let mut selected = false;
+        let mut ready = false;
+        loop {
+            let response = receive_envelope(connection)
+                .await
+                .expect("connection ended before gated creation was selected");
+            match response.message {
+                ServerMessage::TabCreated { selected: target }
+                    if matches!(response_kind, CreationResponse::Tab) =>
+                {
+                    assert_eq!(response.request_id, Some(request_id));
+                    created = Some(target);
+                }
+                ServerMessage::PaneCreated { selected: target }
+                    if matches!(response_kind, CreationResponse::Pane) =>
+                {
+                    assert_eq!(response.request_id, Some(request_id));
+                    created = Some(target);
+                }
+                ServerMessage::TargetSelected { selected: view } => {
+                    assert_eq!(response.request_id, Some(request_id));
+                    let target = created.as_ref().expect("selection preceded creation");
+                    assert_eq!(view.focused, *target);
+                    assert_eq!(view.panes.len(), pane_count);
+                    selected = true;
+                }
+                ServerMessage::Snapshot {
+                    terminal_id,
+                    screen,
+                } => {
+                    if created
+                        .as_ref()
+                        .is_some_and(|target| target.terminal_id == terminal_id)
+                    {
+                        ready |= snapshot_text(&screen).contains(ready_marker);
+                    } else {
+                        assert_eq!(terminal_id, original_terminal);
+                    }
+                }
+                ServerMessage::ResourcesChanged { .. } => {}
+                other => panic!("unexpected frame before gated creation: {other:?}"),
+            }
+            if selected && ready {
+                break created.expect("created target");
+            }
+        }
+    })
+    .await
+    .expect("gated creation did not publish and select its terminal")
+}
+
+async fn await_gated_exit(
+    connection: &mut Connection,
+    exited_terminal: TerminalId,
+    fallback_terminal: TerminalId,
+    final_marker: &str,
+    mut removal_complete: impl FnMut(&fut::resources::ResourceSnapshot) -> bool,
+) -> fut::protocol::SelectedView {
+    time::timeout(DEADLINE, async {
+        let mut saw_final_snapshot = false;
+        let mut saw_exit = false;
+        let mut fallback = None;
+        let mut saw_complete_removal = false;
+        while !(saw_exit && fallback.is_some() && saw_complete_removal) {
+            let response = receive_envelope(connection)
+                .await
+                .expect("connection ended during gated terminal exit");
+            match response.message {
+                ServerMessage::Snapshot {
+                    terminal_id,
+                    screen,
+                } if terminal_id == exited_terminal => {
+                    saw_final_snapshot |= snapshot_text(&screen).contains(final_marker);
+                }
+                ServerMessage::TerminalExited {
+                    terminal_id,
+                    exit_code,
+                } if terminal_id == exited_terminal => {
+                    assert_eq!(response.request_id, None);
+                    assert_eq!(exit_code, Some(23));
+                    assert!(saw_final_snapshot, "TerminalExited preceded final snapshot");
+                    saw_exit = true;
+                }
+                ServerMessage::TargetSelected { selected }
+                    if selected.focused.terminal_id == fallback_terminal =>
+                {
+                    assert_eq!(response.request_id, None);
+                    assert!(saw_exit, "fallback preceded terminal exit");
+                    fallback = Some(selected);
+                }
+                ServerMessage::ResourcesChanged { snapshot } => {
+                    saw_complete_removal |= removal_complete(&snapshot);
+                }
+                ServerMessage::Snapshot { terminal_id, .. } => {
+                    assert_eq!(terminal_id, fallback_terminal);
+                }
+                other => panic!("unexpected frame during gated terminal exit: {other:?}"),
+            }
+        }
+        fallback.expect("fallback target")
+    })
+    .await
+    .expect("gated exit did not publish output, fallback, and complete removal")
+}
+
 #[tokio::test]
 async fn immediate_exit_interactive_create_tab_never_loses_exit_or_old_attachment() {
     let mut harness = Harness::start(
         "printf 'OLD_READY\\r\\n'; while IFS= read -r line; do printf 'OLD_%s\\r\\n' \"$line\"; done",
     )
     .await;
-    let workspace_id = harness.resources().await.sessions[0].workspaces[0].id;
+    let before = harness.resources().await;
+    let session_id = before.sessions[0].id;
+    let workspace_id = before.sessions[0].workspaces[0].id;
+    let old_tab_id = before.sessions[0].workspaces[0].tabs[0].id;
+    let gate = harness.root.path().join("immediate-tab-exit-gate");
     let (mut connection, old_terminal, _) = harness.interactive().await;
     snapshot_containing(&mut connection, old_terminal, "OLD_READY").await;
 
@@ -5773,106 +5898,68 @@ async fn immediate_exit_interactive_create_tab_never_loses_exit_or_old_attachmen
                 name: Some("immediate-exit".into()),
                 cwd: None,
                 program: Some("/bin/sh".into()),
-                argv: vec!["-c".into(), "printf 'FINAL_SNAPSHOT\\r\\n'; exit 23".into()],
+                argv: vec![
+                    "-c".into(),
+                    format!(
+                        "printf 'CREATED_READY\\r\\n'; while [ ! -e '{}' ]; do sleep 0.01; done; printf 'FINAL_SNAPSHOT\\r\\n'; exit 23",
+                        gate.display()
+                    ),
+                ],
             },
         },
     )
     .await;
 
-    let response = time::timeout(DEADLINE, async {
-        loop {
-            let response = receive_envelope(&mut connection)
-                .await
-                .expect("connection ended before create-tab response");
-            if response.request_id == Some(request_id) {
-                break response.message;
-            }
-            match response.message {
-                ServerMessage::Snapshot { terminal_id, .. } => {
-                    assert_eq!(terminal_id, old_terminal);
-                }
-                ServerMessage::ResourcesChanged { .. } => {}
-                other => panic!("unexpected frame before CreateTab response: {other:?}"),
-            }
-        }
-    })
-    .await
-    .expect("immediate-exit CreateTab hung");
+    let created = await_correlated_creation(
+        &mut connection,
+        request_id,
+        old_terminal,
+        CreationResponse::Tab,
+        "CREATED_READY",
+        1,
+    )
+    .await;
+    let created_tab_id = created.tab_id;
+    assert_eq!(created.workspace_id, workspace_id);
+    fs::write(&gate, "exit").unwrap();
 
-    match response {
-        ServerMessage::Error { code, .. } => {
-            assert_eq!(code, "terminal_exited");
-            send(
-                &mut connection,
-                ClientMessage::Input {
-                    bytes: b"STILL_USABLE\n".to_vec(),
-                },
-            )
-            .await;
-            snapshot_containing(&mut connection, old_terminal, "OLD_STILL_USABLE").await;
-            harness.detach(&mut connection).await;
-        }
-        ServerMessage::TabCreated { selected } => {
-            let terminal_id = selected.terminal_id;
-            let mut saw_final_snapshot = false;
-            loop {
-                let message = time::timeout(DEADLINE, receive(&mut connection))
-                    .await
-                    .expect("committed immediate-exit tab hung")
-                    .expect("connection ended before TerminalExited");
-                match message {
-                    ServerMessage::Snapshot {
-                        terminal_id: id,
-                        screen,
-                    } => {
-                        assert_eq!(id, terminal_id, "stale old snapshot after TabCreated");
-                        saw_final_snapshot |= snapshot_text(&screen).contains("FINAL_SNAPSHOT");
-                    }
-                    ServerMessage::TerminalExited {
-                        terminal_id: id,
-                        exit_code,
-                    } => {
-                        assert_eq!(id, terminal_id);
-                        assert_eq!(exit_code, Some(23));
-                        assert!(saw_final_snapshot, "TerminalExited preceded final snapshot");
-                        break;
-                    }
-                    ServerMessage::TargetSelected { selected } => {
-                        assert_eq!(selected.focused.terminal_id, terminal_id);
-                        assert_eq!(
-                            selected.panes.as_slice(),
-                            std::slice::from_ref(&selected.focused)
-                        );
-                    }
-                    ServerMessage::ResourcesChanged { snapshot } => {
-                        assert!(snapshot.revision >= 2);
-                    }
-                    other => panic!("unexpected frame after TabCreated: {other:?}"),
-                }
-            }
-            receive_matching(&mut connection, |message| {
-                matches!(message, ServerMessage::TargetSelected { selected } if selected.focused.terminal_id == old_terminal)
-            })
-            .await;
-            send(
-                &mut connection,
-                ClientMessage::Input {
-                    bytes: b"FELL_BACK\n".to_vec(),
-                },
-            )
-            .await;
-            snapshot_containing(&mut connection, old_terminal, "OLD_FELL_BACK").await;
-            harness.detach(&mut connection).await;
-        }
-        other => panic!("expected terminal_exited or TabCreated, got {other:?}"),
-    }
+    await_gated_exit(
+        &mut connection,
+        created.terminal_id,
+        old_terminal,
+        "FINAL_SNAPSHOT",
+        |snapshot| {
+            let session = snapshot
+                .sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .expect("original session survives");
+            let workspace = session
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+                .expect("original workspace survives");
+            workspace.tabs.len() == 1
+                && workspace.tabs[0].id == old_tab_id
+                && workspace.tabs.iter().all(|tab| tab.id != created_tab_id)
+        },
+    )
+    .await;
 
-    drop(connection);
+    send(
+        &mut connection,
+        ClientMessage::Input {
+            bytes: b"FELL_BACK\n".to_vec(),
+        },
+    )
+    .await;
+    snapshot_containing(&mut connection, old_terminal, "OLD_FELL_BACK").await;
+    harness.detach(&mut connection).await;
     harness.shutdown().await;
 }
 
 #[tokio::test]
-async fn immediate_exit_interactive_create_pane_preserves_its_original_sibling() {
+async fn immediate_exit_interactive_split_pane_preserves_its_original_sibling() {
     let mut harness = Harness::start(
         "printf 'PANE_A_READY\\r\\n'; while IFS= read -r line; do printf 'PANE_A_%s\\r\\n' \"$line\"; done",
     )
@@ -5882,6 +5969,7 @@ async fn immediate_exit_interactive_create_pane_preserves_its_original_sibling()
     let workspace_id = before.sessions[0].workspaces[0].id;
     let tab_id = before.sessions[0].workspaces[0].tabs[0].id;
     let pane_id = before.sessions[0].workspaces[0].tabs[0].panes[0].id;
+    let gate = harness.root.path().join("immediate-split-exit-gate");
     let (mut connection, terminal_a, pid_a) = harness.interactive().await;
     snapshot_containing(&mut connection, terminal_a, "PANE_A_READY").await;
 
@@ -5890,111 +5978,63 @@ async fn immediate_exit_interactive_create_pane_preserves_its_original_sibling()
         &mut connection,
         Envelope {
             request_id: Some(request_id),
-            message: ClientMessage::CreatePane {
-                tab_id,
+            message: ClientMessage::SplitPane {
+                pane_id,
+                direction: fut::splits::SplitDirection::Right,
                 cwd: None,
                 program: Some("/bin/sh".into()),
-                argv: vec!["-c".into(), "printf 'PANE_B_FINAL\\r\\n'; exit 23".into()],
+                argv: vec![
+                    "-c".into(),
+                    format!(
+                        "printf 'PANE_B_READY\\r\\n'; while [ ! -e '{}' ]; do sleep 0.01; done; printf 'PANE_B_FINAL\\r\\n'; exit 23",
+                        gate.display()
+                    ),
+                ],
             },
         },
     )
     .await;
 
-    let response = time::timeout(DEADLINE, async {
-        loop {
-            let response = receive_envelope(&mut connection)
-                .await
-                .expect("connection ended before create-pane response");
-            if response.request_id == Some(request_id) {
-                break response.message;
-            }
-            match response.message {
-                ServerMessage::Snapshot { terminal_id, .. } => {
-                    assert_eq!(terminal_id, terminal_a);
-                }
-                ServerMessage::ResourcesChanged { .. } => {}
-                other => panic!("unexpected frame before CreatePane response: {other:?}"),
-            }
-        }
-    })
-    .await
-    .expect("immediate-exit CreatePane hung");
+    let selected = await_correlated_creation(
+        &mut connection,
+        request_id,
+        terminal_a,
+        CreationResponse::Pane,
+        "PANE_B_READY",
+        2,
+    )
+    .await;
+    assert_eq!(selected.tab_id, tab_id);
+    fs::write(&gate, "exit").unwrap();
 
-    match response {
-        ServerMessage::Error { code, .. } => {
-            assert_eq!(code, "terminal_exited");
-            send(
-                &mut connection,
-                ClientMessage::Input {
-                    bytes: b"BEFORE_REATTACH\n".to_vec(),
-                },
-            )
-            .await;
-            snapshot_containing(&mut connection, terminal_a, "PANE_A_BEFORE_REATTACH").await;
-            harness.detach(&mut connection).await;
-        }
-        ServerMessage::PaneCreated { selected } => {
-            assert_eq!(selected.tab_id, tab_id);
-            let mut saw_final_snapshot = false;
-            loop {
-                let message = time::timeout(DEADLINE, receive(&mut connection))
-                    .await
-                    .expect("committed immediate-exit pane hung")
-                    .expect("connection ended before TerminalExited");
-                match message {
-                    ServerMessage::Snapshot {
-                        terminal_id,
-                        screen,
-                    } => {
-                        assert!(
-                            terminal_id == selected.terminal_id || terminal_id == terminal_a,
-                            "snapshot came from an unrelated terminal"
-                        );
-                        if terminal_id == selected.terminal_id {
-                            saw_final_snapshot |= snapshot_text(&screen).contains("PANE_B_FINAL");
-                        }
-                    }
-                    ServerMessage::TerminalExited {
-                        terminal_id,
-                        exit_code,
-                    } => {
-                        assert_eq!(terminal_id, selected.terminal_id);
-                        assert_eq!(exit_code, Some(23));
-                        assert!(saw_final_snapshot, "TerminalExited preceded final snapshot");
-                        break;
-                    }
-                    ServerMessage::TargetSelected { selected: view } => {
-                        assert_eq!(view.focused, selected);
-                        assert_eq!(view.panes.len(), 2);
-                    }
-                    ServerMessage::ResourcesChanged { snapshot } => {
-                        assert!(snapshot.revision >= 2);
-                    }
-                    other => panic!("unexpected frame after PaneCreated: {other:?}"),
-                }
-            }
-            let transferred = receive_matching(&mut connection, |message| {
-                matches!(
-                    message,
-                    ServerMessage::TargetSelected { selected }
-                        if selected.focused.terminal_id == terminal_a
-                )
-            })
-            .await;
-            assert!(matches!(transferred, ServerMessage::TargetSelected { .. }));
-            send(
-                &mut connection,
-                ClientMessage::Input {
-                    bytes: b"TRANSFERRED\n".to_vec(),
-                },
-            )
-            .await;
-            snapshot_containing(&mut connection, terminal_a, "PANE_A_TRANSFERRED").await;
-            harness.detach(&mut connection).await;
-        }
-        other => panic!("expected terminal_exited or PaneCreated, got {other:?}"),
-    }
-    drop(connection);
+    let fallback = await_gated_exit(
+        &mut connection,
+        selected.terminal_id,
+        terminal_a,
+        "PANE_B_FINAL",
+        |snapshot| {
+            let tab = &snapshot.sessions[0].workspaces[0].tabs[0];
+            tab.id == tab_id
+                && tab.panes.len() == 1
+                && tab.panes[0].id == pane_id
+                && tab.layout.leaf_ids() == vec![pane_id]
+        },
+    )
+    .await;
+    assert_eq!(
+        fallback.panes.as_slice(),
+        std::slice::from_ref(&fallback.focused)
+    );
+
+    send(
+        &mut connection,
+        ClientMessage::Input {
+            bytes: b"TRANSFERRED\n".to_vec(),
+        },
+    )
+    .await;
+    snapshot_containing(&mut connection, terminal_a, "PANE_A_TRANSFERRED").await;
+    harness.detach(&mut connection).await;
 
     let after = resources_when(&harness, |snapshot| {
         snapshot.sessions[0].workspaces[0].tabs[0].panes.len() == 1
@@ -6009,19 +6049,81 @@ async fn immediate_exit_interactive_create_pane_preserves_its_original_sibling()
     assert!(process_alive(pid_a));
     assert!(harness.socket.exists());
     assert!(harness.daemon.try_wait().unwrap().is_none());
+    harness.shutdown().await;
+}
 
-    let (mut original, selected) =
-        attach_once(&harness, TargetSelector::Terminal(terminal_a)).await;
-    assert_eq!(selected.child_pid, pid_a);
-    send(
-        &mut original,
-        ClientMessage::Input {
-            bytes: b"AFTER_EXIT\n".to_vec(),
-        },
-    )
+#[tokio::test]
+async fn removed_terminal_context_rejects_tab_and_split_creation_without_mutation() {
+    let harness = Harness::start("while :; do sleep 1; done").await;
+    let before = harness.resources().await;
+    let session_id = before.sessions[0].id;
+    let workspace_id = before.sessions[0].workspaces[0].id;
+    let tab_id = before.sessions[0].workspaces[0].tabs[0].id;
+    let anchor = before.sessions[0].workspaces[0].tabs[0].panes[0].clone();
+    let stale_context = fut::protocol::TerminalContext {
+        session_id,
+        workspace_id,
+        tab_id,
+        pane_id: anchor.id,
+        terminal_id: anchor.terminal_id,
+    };
+    let ServerMessage::PaneCreated { selected: survivor } = harness
+        .control_command(ClientMessage::CreatePane {
+            tab_id,
+            cwd: None,
+            program: Some("/bin/sh".into()),
+            argv: vec!["-c".into(), "while :; do sleep 1; done".into()],
+        })
+        .await
+    else {
+        panic!("failed to create stale-context survivor")
+    };
+
+    assert_eq!(
+        harness
+            .control_command(ClientMessage::CloseTarget {
+                selector: TargetSelector::Pane(anchor.id),
+            })
+            .await,
+        ServerMessage::CommandCompleted {
+            command: fut::protocol::AcknowledgedCommand::CloseTarget,
+        }
+    );
+    let stable = resources_when(&harness, |snapshot| {
+        let tab = &snapshot.sessions[0].workspaces[0].tabs[0];
+        tab.panes.len() == 1 && tab.panes[0].terminal_id == survivor.terminal_id
+    })
     .await;
-    snapshot_containing(&mut original, terminal_a, "PANE_A_AFTER_EXIT").await;
-    harness.detach(&mut original).await;
+
+    for command in [
+        fut::protocol::ContextualCommand::CreateTab {
+            name: Some("must-not-exist".into()),
+            cwd: None,
+            program: None,
+            argv: Vec::new(),
+        },
+        fut::protocol::ContextualCommand::SplitPane {
+            direction: fut::splits::SplitDirection::Right,
+            cwd: None,
+            program: None,
+            argv: Vec::new(),
+        },
+    ] {
+        assert!(matches!(
+            harness
+                .control_command(ClientMessage::Contextual {
+                    context: stale_context,
+                    command,
+                })
+                .await,
+            ServerMessage::Error { code, .. } if code == "not_found"
+        ));
+        assert_eq!(
+            without_observations(harness.resources().await),
+            without_observations(stable.clone())
+        );
+    }
+
     harness.shutdown().await;
 }
 
