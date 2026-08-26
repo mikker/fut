@@ -1162,10 +1162,13 @@ async fn run_loop(
                             }
                             continue;
                         }
+                        let stale_split_drag = mouse_input
+                            .reconcile_ui_drag(view.focused().tab_id, &view.layout);
                         if old_terminal != view.focused().terminal_id {
                             mouse_input.clear();
-                        } else {
-                            mouse_input.reconcile_ui_drag(view.focused().tab_id, &view.layout);
+                        }
+                        if stale_split_drag {
+                            toasts.info("Layout changed in another client");
                         }
                         workspace_history.record_transition(&previous_target, view.focused());
                         if copy_mode.as_ref().is_some_and(|copy_mode| {
@@ -1301,13 +1304,18 @@ async fn run_loop(
                             copy_mode = None;
                         }
                         if terminal_id == view.focused().terminal_id {
+                            if mouse_input.cancel_split_drag() {
+                                toasts.info("Layout changed in another client");
+                            }
                             mouse_input.clear();
                             pending_focused_exit = Some(exit_code);
                             force_draw = true;
                             continue;
                         }
                         view.remove(terminal_id);
-                        mouse_input.reconcile_ui_drag(view.focused().tab_id, &view.layout);
+                        if mouse_input.reconcile_ui_drag(view.focused().tab_id, &view.layout) {
+                            toasts.info("Layout changed in another client");
+                        }
                         force_draw = true;
                     }
                     ServerMessage::Detached => break,
@@ -3365,7 +3373,16 @@ impl MouseInputState {
         }
     }
 
-    fn reconcile_ui_drag(&mut self, tab_id: crate::domain::TabId, layout: &SplitTree) {
+    fn cancel_split_drag(&mut self) -> bool {
+        if matches!(self.ui_drag, Some(UiDrag::Split { .. })) {
+            self.ui_drag = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn reconcile_ui_drag(&mut self, tab_id: crate::domain::TabId, layout: &SplitTree) -> bool {
         if matches!(
             self.ui_drag,
             Some(UiDrag::Split {
@@ -3375,6 +3392,9 @@ impl MouseInputState {
             }) if drag_tab != tab_id || layout.ratio(split_id).is_none()
         ) {
             self.ui_drag = None;
+            true
+        } else {
+            false
         }
     }
 
@@ -6515,6 +6535,28 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_selected_view_replaces_an_optimistic_split_ratio() {
+        let panes = targets(2);
+        let initial = selected_view(1, panes[0].clone(), panes.clone());
+        let split_id = match &initial.layout {
+            SplitTree::Branch { split_id, .. } => *split_id,
+            _ => panic!("two-pane view did not contain a split"),
+        };
+        let mut accepted = initial.clone();
+        accepted.resource_revision = 2;
+        let mut state = ViewState::new(initial).unwrap();
+        let optimistic = SplitRatio::from_cells(1, 3).unwrap();
+        let authoritative = SplitRatio::from_cells(2, 3).unwrap();
+
+        state.resize_split(panes[0].tab_id, split_id, optimistic);
+        assert_eq!(state.layout.ratio(split_id), Some(optimistic));
+
+        assert!(accepted.layout.resize(split_id, authoritative));
+        assert!(state.replace(accepted).unwrap());
+        assert_eq!(state.layout.ratio(split_id), Some(authoritative));
+    }
+
+    #[test]
     fn replaced_views_still_own_in_flight_resize_errors() {
         let mut panes = targets(2);
         panes[1].tab_id = TabId::new();
@@ -7269,6 +7311,38 @@ mod tests {
             }))
         );
         assert!(input.ui_drag.is_none());
+    }
+
+    #[test]
+    fn authoritative_topology_change_cancels_a_stale_split_drag() {
+        let panes = targets(2);
+        let state = ViewState::new(selected_view(1, panes[0].clone(), panes.clone())).unwrap();
+        let host = Rect::new(0, 0, 80, 23);
+        let dividers = state.pane_layouts(host, PaneLayoutPolicy::Splits).1;
+        let divider = dividers[0];
+        let mut input = MouseInputState::default();
+
+        assert_eq!(
+            input.route_ui(
+                HostMouseEvent {
+                    kind: HostMouseEventKind::Down(HostMouseButton::Left),
+                    column: divider.area.x,
+                    row: divider.area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                host,
+                &[],
+                panes[0].tab_id,
+                &dividers,
+            ),
+            UiMouseRoute::Owned(None)
+        );
+        assert!(!input.reconcile_ui_drag(panes[0].tab_id, &state.layout));
+
+        let collapsed = SplitTree::leaf(panes[0].pane_id);
+        assert!(input.reconcile_ui_drag(panes[0].tab_id, &collapsed));
+        assert!(input.ui_drag.is_none());
+        assert!(!input.reconcile_ui_drag(panes[0].tab_id, &collapsed));
     }
 
     #[test]

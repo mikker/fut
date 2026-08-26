@@ -126,8 +126,11 @@ submit an empty name to restore the automatic label.
 
 Pane splits and divider sizes are shared daemon state. Client focus, zoom,
 scrollback, dialogs, and configuration are local. Multiple clients may attach
-to the same session; they share terminal input and output, and shared PTYs use
-the smallest attached client's dimensions.
+to the same session. Concurrent divider drags use the last ratio accepted by
+the daemon, and every client reconciles to that shared ratio. If another client
+changes the pane topology during a drag, Fut cancels the stale drag and shows
+`Layout changed in another client`. Attached clients also share terminal input
+and output, and shared PTYs use the smallest attached client's dimensions.
 
 ## Terminal alerts
 
