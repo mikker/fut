@@ -474,16 +474,46 @@ fn alert_client_id(socket_path: &Path) -> anyhow::Result<crate::domain::ClientId
         .collect::<String>();
     let directory = socket_path.parent().unwrap_or_else(|| Path::new("."));
     let path = directory.join(format!("alert-client-{key}"));
-    if let Ok(value) = fs::read_to_string(&path) {
-        return value
-            .trim()
-            .parse()
-            .context("parse retained alert client ID");
+    retained_alert_client_id(&path)
+}
+
+fn retained_alert_client_id(path: &Path) -> anyhow::Result<crate::domain::ClientId> {
+    match fs::read_to_string(path) {
+        Ok(value) => {
+            return value
+                .trim()
+                .parse()
+                .context("parse retained alert client ID");
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("read retained alert identity at {}", path.display()));
+        }
     }
+
     let client_id = crate::domain::ClientId::new();
-    fs::write(&path, client_id.to_string())
-        .with_context(|| format!("retain alert client identity at {}", path.display()))?;
-    Ok(client_id)
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut staged = tempfile::Builder::new()
+        .prefix(".alert-client-")
+        .tempfile_in(directory)
+        .with_context(|| format!("stage alert client identity in {}", directory.display()))?;
+    staged
+        .write_all(client_id.to_string().as_bytes())
+        .context("write staged alert client identity")?;
+
+    match staged.persist_noclobber(path) {
+        Ok(_) => Ok(client_id),
+        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
+            fs::read_to_string(path)
+                .with_context(|| format!("read concurrent alert identity at {}", path.display()))?
+                .trim()
+                .parse()
+                .context("parse concurrent alert client ID")
+        }
+        Err(error) => Err(error.error)
+            .with_context(|| format!("retain alert client identity at {}", path.display())),
+    }
 }
 
 async fn connect_interactive(
@@ -6413,6 +6443,35 @@ fn restore_host_cursor(writer: &mut impl io::Write) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::domain::{Cell, Cursor, PaneId, Rgb, SessionId, TabId, WorkspaceId};
+
+    #[test]
+    fn concurrent_clients_share_one_complete_retained_alert_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("alert-client-shared");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let clients = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    retained_alert_client_id(&path).unwrap()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(clients.iter().all(|client| *client == clients[0]));
+        assert_eq!(
+            fs::read_to_string(path)
+                .unwrap()
+                .parse::<crate::domain::ClientId>()
+                .unwrap(),
+            clients[0]
+        );
+    }
 
     #[test]
     fn full_reload_retains_its_invocation_session_through_global_commit() {
