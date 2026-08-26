@@ -32,8 +32,8 @@ use crate::domain::{
     MAX_HYPERLINK_URI_BYTES, MAX_SCREEN_HYPERLINK_BYTES, MAX_SEARCH_CELL_CODEPOINTS,
     MAX_SEARCH_CELLS, MAX_SEARCH_QUERY_BYTES, MAX_SEARCH_TEXT_BYTES, MAX_TERMINAL_OUTPUT_BYTES,
     MAX_TERMINAL_OUTPUT_CELLS, MAX_TERMINAL_OUTPUT_ROWS, MouseButton, MouseEvent, MouseEventKind,
-    MouseModifiers, MouseWheelDirection, Rgb, ScreenSnapshot, SearchDirection, TerminalKeyCode,
-    TerminalKeyEvent, TerminalOutputSource, TerminalSize,
+    MouseModifiers, MouseWheelDirection, Rgb, ScreenSnapshot, SearchDirection, TerminalKeyAction,
+    TerminalKeyCode, TerminalKeyEvent, TerminalOutputSource, TerminalSize,
 };
 
 const SYNCHRONIZED_OUTPUT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -1245,41 +1245,46 @@ impl GhosttyTerminal {
                 MouseWheelDirection::Down => TerminalKeyCode::Down,
             },
             modifiers: Default::default(),
+            action: TerminalKeyAction::Press,
+            text: None,
         };
         let mut response = Vec::with_capacity(64);
         for _ in 0..MOUSE_WHEEL_LINES {
-            self.encode_key_input(event, &mut response)?;
+            self.encode_key_input(&event, &mut response)?;
         }
         self.write_encoded_input(&response, "alternate scroll")
     }
 
     pub(crate) fn key_input(&mut self, event: TerminalKeyEvent) -> Result<()> {
         let mut response = Vec::with_capacity(16);
-        self.encode_key_input(event, &mut response)?;
+        self.encode_key_input(&event, &mut response)?;
         self.write_encoded_input(&response, "key input")
     }
 
-    fn encode_key_input(&mut self, event: TerminalKeyEvent, response: &mut Vec<u8>) -> Result<()> {
-        // Keep Fut's legacy modifier contract while retaining the structured
-        // modifiers for later enhanced-keyboard negotiation: Alt prefixes the
-        // sequence, while Shift and Control do not alter arrow bytes yet.
-        if event.modifiers.alt {
-            response.push(0x1b);
-        }
+    fn encode_key_input(&mut self, event: &TerminalKeyEvent, response: &mut Vec<u8>) -> Result<()> {
+        let mods = key_modifiers(event.modifiers);
         self.key_event
-            .set_action(key::Action::Press)
-            .set_key(match event.code {
-                TerminalKeyCode::Up => key::Key::ArrowUp,
-                TerminalKeyCode::Down => key::Key::ArrowDown,
-                TerminalKeyCode::Right => key::Key::ArrowRight,
-                TerminalKeyCode::Left => key::Key::ArrowLeft,
+            .set_action(match event.action {
+                TerminalKeyAction::Press => key::Action::Press,
+                TerminalKeyAction::Repeat => key::Action::Repeat,
+                TerminalKeyAction::Release => key::Action::Release,
             })
-            .set_mods(key::Mods::empty())
-            .set_consumed_mods(key::Mods::empty())
+            .set_key(ghostty_key(event.code))
+            .set_mods(mods)
+            .set_consumed_mods(if matches!(event.code, TerminalKeyCode::Character(_)) {
+                mods & key::Mods::SHIFT
+            } else {
+                key::Mods::empty()
+            })
             .set_composing(false)
-            .set_utf8(None::<String>)
-            .set_unshifted_codepoint('\0');
-        self.key_encoder.set_options_from_terminal(&self.terminal);
+            .set_utf8(event.text.clone())
+            .set_unshifted_codepoint(unshifted_codepoint(event.code));
+        self.key_encoder
+            .set_options_from_terminal(&self.terminal)
+            // Crossterm has already resolved Option to Alt for us. Tell the
+            // encoder to preserve Fut's established Meta-key behavior.
+            .set_macos_option_as_alt(key::OptionAsAlt::True)
+            .set_alt_esc_prefix(true);
         self.key_encoder.encode_to_vec(&self.key_event, response)?;
         Ok(())
     }
@@ -1821,6 +1826,112 @@ fn mouse_modifiers(modifiers: MouseModifiers) -> key::Mods {
     result.set(key::Mods::CTRL, modifiers.control);
     result.set(key::Mods::ALT, modifiers.alt);
     result
+}
+
+fn key_modifiers(modifiers: crate::domain::TerminalKeyModifiers) -> key::Mods {
+    let mut result = key::Mods::empty();
+    result.set(key::Mods::SHIFT, modifiers.shift);
+    result.set(key::Mods::CTRL, modifiers.control);
+    result.set(key::Mods::ALT, modifiers.alt);
+    result.set(key::Mods::SUPER, modifiers.super_key);
+    result.set(key::Mods::CAPS_LOCK, modifiers.caps_lock);
+    result.set(key::Mods::NUM_LOCK, modifiers.num_lock);
+    result
+}
+
+fn ghostty_key(code: TerminalKeyCode) -> key::Key {
+    match code {
+        TerminalKeyCode::Character(character) => match character.to_ascii_lowercase() {
+            'a' => key::Key::A,
+            'b' => key::Key::B,
+            'c' => key::Key::C,
+            'd' => key::Key::D,
+            'e' => key::Key::E,
+            'f' => key::Key::F,
+            'g' => key::Key::G,
+            'h' => key::Key::H,
+            'i' => key::Key::I,
+            'j' => key::Key::J,
+            'k' => key::Key::K,
+            'l' => key::Key::L,
+            'm' => key::Key::M,
+            'n' => key::Key::N,
+            'o' => key::Key::O,
+            'p' => key::Key::P,
+            'q' => key::Key::Q,
+            'r' => key::Key::R,
+            's' => key::Key::S,
+            't' => key::Key::T,
+            'u' => key::Key::U,
+            'v' => key::Key::V,
+            'w' => key::Key::W,
+            'x' => key::Key::X,
+            'y' => key::Key::Y,
+            'z' => key::Key::Z,
+            '0' => key::Key::Digit0,
+            '1' => key::Key::Digit1,
+            '2' => key::Key::Digit2,
+            '3' => key::Key::Digit3,
+            '4' => key::Key::Digit4,
+            '5' => key::Key::Digit5,
+            '6' => key::Key::Digit6,
+            '7' => key::Key::Digit7,
+            '8' => key::Key::Digit8,
+            '9' => key::Key::Digit9,
+            ' ' => key::Key::Space,
+            '`' | '~' => key::Key::Backquote,
+            '\\' | '|' => key::Key::Backslash,
+            '[' | '{' => key::Key::BracketLeft,
+            ']' | '}' => key::Key::BracketRight,
+            ',' | '<' => key::Key::Comma,
+            '=' | '+' => key::Key::Equal,
+            '-' | '_' => key::Key::Minus,
+            '.' | '>' => key::Key::Period,
+            '\'' | '"' => key::Key::Quote,
+            ';' | ':' => key::Key::Semicolon,
+            '/' | '?' => key::Key::Slash,
+            _ => key::Key::Unidentified,
+        },
+        TerminalKeyCode::Enter => key::Key::Enter,
+        TerminalKeyCode::Tab => key::Key::Tab,
+        TerminalKeyCode::Backspace => key::Key::Backspace,
+        TerminalKeyCode::Escape => key::Key::Escape,
+        TerminalKeyCode::Up => key::Key::ArrowUp,
+        TerminalKeyCode::Down => key::Key::ArrowDown,
+        TerminalKeyCode::Right => key::Key::ArrowRight,
+        TerminalKeyCode::Left => key::Key::ArrowLeft,
+        TerminalKeyCode::Home => key::Key::Home,
+        TerminalKeyCode::End => key::Key::End,
+        TerminalKeyCode::Insert => key::Key::Insert,
+        TerminalKeyCode::Delete => key::Key::Delete,
+        TerminalKeyCode::PageUp => key::Key::PageUp,
+        TerminalKeyCode::PageDown => key::Key::PageDown,
+        TerminalKeyCode::Function(number) => match number {
+            1 => key::Key::F1,
+            2 => key::Key::F2,
+            3 => key::Key::F3,
+            4 => key::Key::F4,
+            5 => key::Key::F5,
+            6 => key::Key::F6,
+            7 => key::Key::F7,
+            8 => key::Key::F8,
+            9 => key::Key::F9,
+            10 => key::Key::F10,
+            11 => key::Key::F11,
+            12 => key::Key::F12,
+            _ => key::Key::Unidentified,
+        },
+    }
+}
+
+fn unshifted_codepoint(code: TerminalKeyCode) -> char {
+    match code {
+        TerminalKeyCode::Character(character) if character.is_ascii_alphabetic() => {
+            character.to_ascii_lowercase()
+        }
+        TerminalKeyCode::Character(character) => character,
+        _ => '\0',
+    }
 }
 
 fn mouse_button(button: MouseButton) -> mouse::Button {
@@ -2593,9 +2704,14 @@ mod tests {
     }
 
     #[test]
-    fn physical_arrows_use_current_cursor_mode_and_preserve_legacy_modifiers() {
+    fn physical_arrows_use_current_cursor_mode_and_encode_modifiers() {
         let (mut terminal, output) = recording_terminal(10, 4);
-        let arrow = |code, modifiers| TerminalKeyEvent { code, modifiers };
+        let arrow = |code, modifiers| TerminalKeyEvent {
+            code,
+            modifiers,
+            action: TerminalKeyAction::Press,
+            text: None,
+        };
 
         for code in [
             TerminalKeyCode::Up,
@@ -2626,10 +2742,226 @@ mod tests {
                     shift: true,
                     control: true,
                     alt: true,
+                    ..Default::default()
                 },
             ))
             .unwrap();
-        assert_eq!(take_output(&output), b"\x1b\x1bOA");
+        assert_eq!(take_output(&output), b"\x1b[1;8A");
+    }
+
+    #[test]
+    fn keyboard_modes_disambiguate_keys_and_forward_event_types() {
+        let (mut terminal, output) = recording_terminal(10, 4);
+        let event = |code, modifiers, action, text: Option<&str>| TerminalKeyEvent {
+            code,
+            modifiers,
+            action,
+            text: text.map(str::to_owned),
+        };
+        let ctrl = crate::domain::TerminalKeyModifiers {
+            control: true,
+            ..Default::default()
+        };
+
+        terminal.feed(b"\x1b[>4;2m").unwrap().unwrap();
+        take_output(&output);
+        terminal
+            .key_input(event(
+                TerminalKeyCode::Character('i'),
+                ctrl,
+                TerminalKeyAction::Press,
+                Some("i"),
+            ))
+            .unwrap();
+        terminal
+            .key_input(event(
+                TerminalKeyCode::Tab,
+                Default::default(),
+                TerminalKeyAction::Press,
+                None,
+            ))
+            .unwrap();
+        assert_eq!(take_output(&output), b"\x1b[27;5;105~\t");
+
+        terminal.feed(b"\x1b[>11u").unwrap().unwrap();
+        take_output(&output);
+        assert_eq!(
+            terminal.terminal.kitty_keyboard_flags().unwrap(),
+            key::KittyKeyFlags::DISAMBIGUATE
+                | key::KittyKeyFlags::REPORT_EVENTS
+                | key::KittyKeyFlags::REPORT_ALL
+        );
+        for key_event in [
+            event(
+                TerminalKeyCode::Character('i'),
+                ctrl,
+                TerminalKeyAction::Press,
+                Some("i"),
+            ),
+            event(
+                TerminalKeyCode::Tab,
+                Default::default(),
+                TerminalKeyAction::Press,
+                None,
+            ),
+            event(
+                TerminalKeyCode::Character('m'),
+                ctrl,
+                TerminalKeyAction::Press,
+                Some("m"),
+            ),
+            event(
+                TerminalKeyCode::Enter,
+                Default::default(),
+                TerminalKeyAction::Press,
+                None,
+            ),
+            event(
+                TerminalKeyCode::Character('a'),
+                Default::default(),
+                TerminalKeyAction::Repeat,
+                Some("a"),
+            ),
+            event(
+                TerminalKeyCode::Character('a'),
+                Default::default(),
+                TerminalKeyAction::Release,
+                Some("a"),
+            ),
+            event(
+                TerminalKeyCode::Left,
+                crate::domain::TerminalKeyModifiers {
+                    shift: true,
+                    control: true,
+                    ..Default::default()
+                },
+                TerminalKeyAction::Press,
+                None,
+            ),
+        ] {
+            terminal.key_input(key_event).unwrap();
+        }
+        assert_eq!(
+            take_output(&output),
+            b"\x1b[105;5u\x1b[9u\x1b[109;5u\x1b[13u\x1b[97;1:2u\x1b[97;1:3u\x1b[1;6:1D"
+        );
+    }
+
+    #[test]
+    fn structured_keyboard_events_retain_the_complete_legacy_fallback() {
+        let (mut terminal, output) = recording_terminal(10, 4);
+        let event = |code, modifiers, action, text: Option<&str>| TerminalKeyEvent {
+            code,
+            modifiers,
+            action,
+            text: text.map(str::to_owned),
+        };
+        let ctrl = crate::domain::TerminalKeyModifiers {
+            control: true,
+            ..Default::default()
+        };
+        let alt = crate::domain::TerminalKeyModifiers {
+            alt: true,
+            ..Default::default()
+        };
+        for key_event in [
+            event(
+                TerminalKeyCode::Character('é'),
+                Default::default(),
+                TerminalKeyAction::Press,
+                Some("é"),
+            ),
+            event(
+                TerminalKeyCode::Enter,
+                Default::default(),
+                TerminalKeyAction::Press,
+                None,
+            ),
+            event(
+                TerminalKeyCode::Tab,
+                Default::default(),
+                TerminalKeyAction::Press,
+                None,
+            ),
+            event(
+                TerminalKeyCode::Escape,
+                Default::default(),
+                TerminalKeyAction::Press,
+                None,
+            ),
+            event(
+                TerminalKeyCode::Backspace,
+                Default::default(),
+                TerminalKeyAction::Press,
+                None,
+            ),
+            event(
+                TerminalKeyCode::Left,
+                Default::default(),
+                TerminalKeyAction::Press,
+                None,
+            ),
+            event(
+                TerminalKeyCode::Home,
+                Default::default(),
+                TerminalKeyAction::Press,
+                None,
+            ),
+            event(
+                TerminalKeyCode::Delete,
+                Default::default(),
+                TerminalKeyAction::Press,
+                None,
+            ),
+            event(
+                TerminalKeyCode::PageDown,
+                Default::default(),
+                TerminalKeyAction::Press,
+                None,
+            ),
+            event(
+                TerminalKeyCode::Function(1),
+                Default::default(),
+                TerminalKeyAction::Press,
+                None,
+            ),
+            event(
+                TerminalKeyCode::Function(12),
+                Default::default(),
+                TerminalKeyAction::Press,
+                None,
+            ),
+            event(
+                TerminalKeyCode::Character('c'),
+                ctrl,
+                TerminalKeyAction::Press,
+                Some("c"),
+            ),
+            event(
+                TerminalKeyCode::Character('x'),
+                alt,
+                TerminalKeyAction::Press,
+                Some("x"),
+            ),
+            event(
+                TerminalKeyCode::Character('z'),
+                Default::default(),
+                TerminalKeyAction::Repeat,
+                Some("z"),
+            ),
+            event(
+                TerminalKeyCode::Character('z'),
+                Default::default(),
+                TerminalKeyAction::Release,
+                Some("z"),
+            ),
+        ] {
+            terminal.key_input(key_event).unwrap();
+        }
+        assert_eq!(
+            take_output(&output),
+            b"\xc3\xa9\r\t\x1b\x7f\x1b[D\x1b[H\x1b[3~\x1b[6~\x1bOP\x1b[24~\x03\x1bxz"
+        );
     }
 
     #[test]

@@ -102,9 +102,15 @@ pub enum AcknowledgedCommand {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TerminalInputOperation {
-    Text { text: String },
-    Keys { bytes: Vec<u8> },
-    Run { text: String },
+    Text {
+        text: String,
+    },
+    Keys {
+        events: Vec<crate::domain::TerminalKeyEvent>,
+    },
+    Run {
+        text: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -994,7 +1000,10 @@ mod tests {
                     shift: true,
                     control: false,
                     alt: true,
+                    ..Default::default()
                 },
+                action: crate::domain::TerminalKeyAction::Press,
+                text: None,
             },
         };
 
@@ -1012,7 +1021,12 @@ mod tests {
                 text: "literal λ\n".into(),
             },
             TerminalInputOperation::Keys {
-                bytes: b"\x03\x1b[A".to_vec(),
+                events: vec![crate::domain::TerminalKeyEvent {
+                    code: crate::domain::TerminalKeyCode::Left,
+                    modifiers: Default::default(),
+                    action: crate::domain::TerminalKeyAction::Press,
+                    text: None,
+                }],
             },
             TerminalInputOperation::Run {
                 text: "printf '雪'".into(),

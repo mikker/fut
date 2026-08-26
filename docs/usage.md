@@ -155,8 +155,16 @@ See [Configuration](../configuration/) for the opt-in outer-terminal BEL.
 
 Fut renders standard terminal mouse modes, indexed and RGB color, OSC 8
 hyperlinks, cursor shapes, bracketed paste, alternate screens, application
-cursor keys, and Kitty graphics used by terminals such as Ghostty, Kitty, and
-WezTerm.
+cursor keys, mode-aware modified keys, and Kitty graphics used by terminals
+such as Ghostty, Kitty, and WezTerm. When attached directly from Ghostty,
+Kitty, WezTerm, foot, or Alacritty, Fut negotiates the Kitty keyboard protocol
+with the outer terminal. This keeps keys such as `Ctrl-I` distinct from Tab,
+preserves modified navigation keys, and lets inner applications request
+modifyOtherKeys or Kitty press/repeat/release reporting. Other outer terminals,
+including terminal chains that do not advertise this capability, stay on the
+traditional input path: text, Unicode, Ctrl/Alt chords, navigation keys, and
+F1–F12 remain compatible, but ambiguities already present in legacy terminal
+input cannot be recovered.
 
 ## CLI and automation
 

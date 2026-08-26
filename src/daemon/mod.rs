@@ -6300,7 +6300,16 @@ async fn targeted_terminal_input(
 
     let result = match operation {
         TerminalInputOperation::Text { text } => terminal.paste(text).await,
-        TerminalInputOperation::Keys { bytes } => terminal.input(bytes).await,
+        TerminalInputOperation::Keys { events } => {
+            let mut result = Ok(());
+            for event in events {
+                if let Err(error) = terminal.key_input(event).await {
+                    result = Err(error);
+                    break;
+                }
+            }
+            result
+        }
         TerminalInputOperation::Run { text } => terminal.paste_and_input(text, vec![b'\r']).await,
     };
     result.map_err(|error| {

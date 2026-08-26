@@ -9643,6 +9643,53 @@ async fn public_arrow_keys_use_the_daemon_terminals_current_cursor_mode() {
 }
 
 #[tokio::test]
+async fn public_enhanced_keyboard_preserves_disambiguation_modifiers_and_event_types() {
+    let harness = Harness::start(
+        "stty raw -echo; printf '\\033[>11uENHANCED_KEYS_READY\\r\\n'; dd bs=1 count=51 of=enhanced-keys.capture 2>/dev/null; printf 'ENHANCED_KEYS_CAPTURED\\r\\n'; exec cat >/dev/null",
+    )
+    .await;
+    let pane = harness.resources().await.sessions[0].workspaces[0].tabs[0].panes[0].id;
+    let mut command = Command::new("/usr/bin/script");
+    command
+        .env_clear()
+        .env("HOME", harness.root.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", harness.root.path().join("runtime"))
+        .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+        .env("TERM", "xterm-kitty")
+        .args(script_command_args())
+        .arg(format!(
+            "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {pane}",
+            env!("CARGO_BIN_EXE_fut"),
+            harness.socket.display(),
+        ));
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("ENHANCED_KEYS_READY").await;
+    assert!(
+        client
+            .output
+            .lock()
+            .unwrap()
+            .bytes
+            .windows(b"\x1b[>15u".len())
+            .any(|window| window == b"\x1b[>15u"),
+        "capable host did not receive Fut's enhanced-keyboard negotiation"
+    );
+    let input = b"\x1b[105;5u\x1b[9u\x1b[109;5u\x1b[13u\x1b[97;1:2u\x1b[97;1:3u\x1b[1;6D";
+    let expected = b"\x1b[105;5u\x1b[9u\x1b[109;5u\x1b[13u\x1b[97;1:2u\x1b[97;1:3u\x1b[1;6:1D";
+    client.send(input);
+    client.wait_for("ENHANCED_KEYS_CAPTURED").await;
+
+    assert_eq!(
+        fs::read(harness.root.path().join("cwd/enhanced-keys.capture")).unwrap(),
+        expected
+    );
+    client.send(b"\x02d");
+    client.wait_success().await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn public_client_renders_simultaneous_panes_and_cycles_focus() {
     let harness = Harness::start(
         "printf 'SPLIT_A_READY\r\n'; while IFS= read -r line; do [ \"$line\" = a ] && printf 'SPLIT_A_INPUT\r\n'; done",

@@ -1,6 +1,6 @@
 ---
 id: fut-3qvz
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-08-21T09:02:08Z
@@ -33,3 +33,11 @@ Negotiate enhanced keyboard reporting with capable host terminals so Fut receive
 **2026-08-26T07:01:28Z**
 
 Implemented the focused B-10 application-cursor-mode correction: interactive and temporary-command arrow events now retain structured identity through the terminal runtime and use current DECCKM state, with unit and end-to-end coverage. This does not complete the remaining enhanced-keyboard acceptance criteria; keep this ticket open for modifier protocols, key disambiguation, and press/repeat/release support.
+
+**2026-08-26T09:45:13Z**
+
+Completed the remaining extended-keyboard slice: capable direct hosts negotiate Crossterm/Kitty enhancement flags; all supported interactive and send-keys input now crosses the client/daemon boundary as structured identity, text, modifiers, and action; daemon-owned libghostty-vt encoding honors legacy, DECCKM, modifyOtherKeys, and Kitty modes. Added legacy/mode unit coverage and a PTY E2E covering negotiation, Ctrl-I vs Tab, Ctrl-M vs Enter, modified navigation, repeat, and release. Updated docs/usage.md and CHANGELOG.md. Validation: cargo fmt -- --check; cargo test --lib (595 passed); focused E2E tests public_enhanced_keyboard_preserves_disambiguation_modifiers_and_event_types, public_arrow_keys_use_the_daemon_terminals_current_cursor_mode, public_terminal_input_is_literal_validated_bracket_aware_atomic_and_exit_typed, and public_wheel_uses_dec_alternate_scroll_and_terminal_cursor_key_mode (all passed); cargo build passed; git diff --check passed.
+
+**2026-08-26T10:21:45Z**
+
+Refactor pass removed the legacy Alt post-encoding repair and configured libghostty-vt's Option/Alt behavior directly, leaving one encoder path. Manual isolated-daemon validation passed for structured terminal send-keys in legacy mode, modifyOtherKeys mode 2, and Kitty flags 11; each probe matched exact expected bytes (including Unicode, Ctrl/Alt, navigation, F keys, Ctrl-I vs Tab, Ctrl-M vs Enter, and modified navigation). Final validation: cargo fmt -- --check; cargo test --lib (595 passed); four focused PTY E2E tests passed; cargo build; git diff --check.

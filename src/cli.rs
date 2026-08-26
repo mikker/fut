@@ -566,7 +566,7 @@ fn parse_output_lines(value: &str) -> Result<usize, String> {
 
 #[derive(Clone)]
 struct LogicalKey {
-    bytes: Vec<u8>,
+    event: crate::domain::TerminalKeyEvent,
 }
 
 impl FromStr for LogicalKey {
@@ -574,9 +574,9 @@ impl FromStr for LogicalKey {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let event = logical_key_event(value)?;
-        let bytes = client::input::encode_key(event)
+        let event = client::input::terminal_key_event(event)
             .ok_or_else(|| format!("unsupported logical key: {value}"))?;
-        Ok(Self { bytes })
+        Ok(Self { event })
     }
 }
 
@@ -621,28 +621,8 @@ fn logical_key_event(value: &str) -> Result<KeyEvent, String> {
             other => other,
         };
     }
-    if parsed_modifiers.contains(KeyModifiers::CONTROL)
-        && !matches!(code, Some(KeyCode::Char(character)) if control_character_supported(character))
-    {
-        return Err(format!("control modifier is unsupported for `{key}`"));
-    }
-    if parsed_modifiers.contains(KeyModifiers::SHIFT)
-        && !matches!(
-            code,
-            Some(KeyCode::Char(_) | KeyCode::Tab | KeyCode::BackTab)
-        )
-    {
-        return Err(format!("shift modifier is unsupported for `{key}`"));
-    }
     code.map(|code| KeyEvent::new(code, parsed_modifiers))
         .ok_or_else(|| format!("unknown logical key `{key}` in `{value}`"))
-}
-
-fn control_character_supported(character: char) -> bool {
-    matches!(
-        character.to_ascii_lowercase(),
-        '@' | ' ' | 'a'..='z' | '[' | '\\' | ']' | '^' | '_' | '?'
-    )
 }
 
 fn named_key_code(value: &str) -> Option<KeyCode> {
@@ -1561,15 +1541,12 @@ async fn execute(cli: Cli) -> Result<()> {
             command: TerminalCommand::SendKeys { terminal_id, keys },
         }) => {
             let key_count = keys.len();
-            let bytes = keys
-                .into_iter()
-                .flat_map(|key| key.bytes)
-                .collect::<Vec<_>>();
+            let events = keys.into_iter().map(|key| key.event).collect::<Vec<_>>();
             terminal_input(
                 &socket,
                 ClientMessage::TerminalInput {
                     terminal_id,
-                    operation: TerminalInputOperation::Keys { bytes },
+                    operation: TerminalInputOperation::Keys { events },
                 },
             )
             .await?;
@@ -4839,32 +4816,30 @@ mod tests {
     }
 
     #[test]
-    fn logical_keys_validate_and_match_live_keyboard_encoding() {
-        let encoded = ["é", "enter", "ctrl+c", "alt+left", "shift+tab", "f12"]
+    fn logical_keys_validate_as_structured_terminal_events() {
+        let events = ["é", "enter", "ctrl+c", "alt+left", "shift+tab", "f12"]
             .into_iter()
-            .map(|key| key.parse::<LogicalKey>().unwrap().bytes)
+            .map(|key| key.parse::<LogicalKey>().unwrap().event)
             .collect::<Vec<_>>();
         assert_eq!(
-            encoded,
-            [
-                "é".as_bytes().to_vec(),
-                vec![b'\r'],
-                vec![3],
-                b"\x1b\x1b[D".to_vec(),
-                b"\x1b[Z".to_vec(),
-                b"\x1b[24~".to_vec(),
-            ]
+            events[0].code,
+            crate::domain::TerminalKeyCode::Character('é')
         );
-        for invalid in [
-            "",
-            "no-such-key",
-            "ctrl+",
-            "hyper+c",
-            "f13",
-            "ctrl+left",
-            "ctrl+é",
-            "shift+up",
-        ] {
+        assert_eq!(events[0].text.as_deref(), Some("é"));
+        assert_eq!(events[1].code, crate::domain::TerminalKeyCode::Enter);
+        assert!(events[2].modifiers.control);
+        assert_eq!(events[3].code, crate::domain::TerminalKeyCode::Left);
+        assert!(events[3].modifiers.alt);
+        assert_eq!(events[4].code, crate::domain::TerminalKeyCode::Tab);
+        assert!(events[4].modifiers.shift);
+        assert_eq!(events[5].code, crate::domain::TerminalKeyCode::Function(12));
+        for accepted in ["ctrl+left", "ctrl+é", "shift+up"] {
+            assert!(
+                accepted.parse::<LogicalKey>().is_ok(),
+                "rejected {accepted:?}"
+            );
+        }
+        for invalid in ["", "no-such-key", "ctrl+", "hyper+c", "f13"] {
             assert!(
                 invalid.parse::<LogicalKey>().is_err(),
                 "accepted {invalid:?}"

@@ -1,29 +1,68 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
 #[cfg(test)]
 use super::actions::{FocusDirection, HistoryScope};
 use super::{actions::ClientAction, config::BindingsConfig};
-use crate::domain::{TerminalKeyCode, TerminalKeyEvent, TerminalKeyModifiers};
+use crate::domain::{TerminalKeyAction, TerminalKeyCode, TerminalKeyEvent, TerminalKeyModifiers};
+
+pub(crate) fn host_supports_keyboard_enhancement(term: &str, term_program: &str) -> bool {
+    let term = term.to_ascii_lowercase();
+    let program = term_program.to_ascii_lowercase();
+    if term.starts_with("screen") || term.starts_with("tmux") {
+        return false;
+    }
+    matches!(
+        program.as_str(),
+        "ghostty" | "kitty" | "wezterm" | "alacritty"
+    ) || term == "alacritty"
+        || term == "xterm-kitty"
+        || term.starts_with("foot")
+        || term.contains("ghostty")
+        || term.contains("wezterm")
+}
 
 pub(crate) fn terminal_key_event(key: KeyEvent) -> Option<TerminalKeyEvent> {
-    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-        return None;
-    }
-
-    let code = match key.code {
-        KeyCode::Up => TerminalKeyCode::Up,
-        KeyCode::Down => TerminalKeyCode::Down,
-        KeyCode::Right => TerminalKeyCode::Right,
-        KeyCode::Left => TerminalKeyCode::Left,
+    let (code, text) = match key.code {
+        KeyCode::Char(character) => (
+            TerminalKeyCode::Character(character),
+            (!character.is_control()).then(|| character.to_string()),
+        ),
+        KeyCode::Enter => (TerminalKeyCode::Enter, None),
+        KeyCode::Tab | KeyCode::BackTab => (TerminalKeyCode::Tab, None),
+        KeyCode::Backspace => (TerminalKeyCode::Backspace, None),
+        KeyCode::Esc => (TerminalKeyCode::Escape, None),
+        KeyCode::Up => (TerminalKeyCode::Up, None),
+        KeyCode::Down => (TerminalKeyCode::Down, None),
+        KeyCode::Right => (TerminalKeyCode::Right, None),
+        KeyCode::Left => (TerminalKeyCode::Left, None),
+        KeyCode::Home => (TerminalKeyCode::Home, None),
+        KeyCode::End => (TerminalKeyCode::End, None),
+        KeyCode::Insert => (TerminalKeyCode::Insert, None),
+        KeyCode::Delete => (TerminalKeyCode::Delete, None),
+        KeyCode::PageUp => (TerminalKeyCode::PageUp, None),
+        KeyCode::PageDown => (TerminalKeyCode::PageDown, None),
+        KeyCode::F(number @ 1..=12) => (TerminalKeyCode::Function(number), None),
         _ => return None,
     };
     Some(TerminalKeyEvent {
         code,
         modifiers: TerminalKeyModifiers {
-            shift: key.modifiers.contains(KeyModifiers::SHIFT),
+            shift: key.modifiers.contains(KeyModifiers::SHIFT)
+                || matches!(key.code, KeyCode::BackTab),
             control: key.modifiers.contains(KeyModifiers::CONTROL),
             alt: key.modifiers.contains(KeyModifiers::ALT),
+            super_key: key
+                .modifiers
+                .intersects(KeyModifiers::SUPER | KeyModifiers::HYPER),
+            caps_lock: key.state.contains(KeyEventState::CAPS_LOCK),
+            num_lock: key.state.contains(KeyEventState::NUM_LOCK),
         },
+        action: match key.kind {
+            KeyEventKind::Press => TerminalKeyAction::Press,
+            KeyEventKind::Repeat => TerminalKeyAction::Repeat,
+            KeyEventKind::Release => TerminalKeyAction::Release,
+        },
+        text,
     })
 }
 
@@ -210,13 +249,40 @@ mod tests {
                     shift: true,
                     control: true,
                     alt: true,
+                    ..Default::default()
                 },
+                action: TerminalKeyAction::Press,
+                text: None,
             })
         );
         assert_eq!(
-            terminal_key_event(key(KeyCode::Home, KeyModifiers::NONE)),
-            None
+            terminal_key_event(key(KeyCode::Home, KeyModifiers::NONE)).map(|event| event.code),
+            Some(TerminalKeyCode::Home)
         );
+        let mut release = key(KeyCode::Char('i'), KeyModifiers::CONTROL);
+        release.kind = KeyEventKind::Release;
+        assert_eq!(
+            terminal_key_event(release).map(|event| event.action),
+            Some(TerminalKeyAction::Release)
+        );
+    }
+
+    #[test]
+    fn enables_enhanced_input_only_for_known_capable_hosts() {
+        for (term, program) in [
+            ("xterm-kitty", ""),
+            ("foot-extra", ""),
+            ("xterm-256color", "Ghostty"),
+            ("xterm-256color", "WezTerm"),
+        ] {
+            assert!(host_supports_keyboard_enhancement(term, program));
+        }
+        assert!(!host_supports_keyboard_enhancement("xterm-256color", ""));
+        assert!(!host_supports_keyboard_enhancement("screen-256color", ""));
+        assert!(!host_supports_keyboard_enhancement(
+            "screen-256color",
+            "Ghostty"
+        ));
     }
 
     #[test]

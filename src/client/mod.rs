@@ -29,7 +29,7 @@ mod temporary_command;
 mod toast;
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     future::Future,
     io::{self, Write},
@@ -62,8 +62,10 @@ use crossterm::{
     cursor::{Hide, SetCursorStyle, Show},
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseButton as HostMouseButton,
-        MouseEvent as HostMouseEvent, MouseEventKind as HostMouseEventKind,
+        Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+        MouseButton as HostMouseButton, MouseEvent as HostMouseEvent,
+        MouseEventKind as HostMouseEventKind, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{
@@ -72,7 +74,9 @@ use crossterm::{
     },
 };
 use futures_util::{SinkExt, StreamExt};
-use input::{PrefixAction, PrefixState, encode_key, terminal_key_event};
+use input::{
+    PrefixAction, PrefixState, encode_key, host_supports_keyboard_enhancement, terminal_key_event,
+};
 use layout::{
     PaneLayout, SplitDivider, authored_layout, authored_navigation_layout, directional_neighbor,
     navigation_pane_layouts, pane_layouts,
@@ -404,6 +408,7 @@ pub async fn attach_navigator(
         catalog.generation,
         socket_path,
         config_location,
+        guard.enhanced_keyboard,
     )
     .await;
     drop(terminal);
@@ -446,6 +451,7 @@ pub(crate) async fn attach_with_ui(
         catalog.generation,
         socket_path,
         config_location,
+        guard.enhanced_keyboard,
     )
     .await;
     drop(terminal);
@@ -653,6 +659,7 @@ async fn run(
     catalog_generation: u64,
     socket_path: &Path,
     config_location: &config::ConfigLocation,
+    enhanced_keyboard: bool,
 ) -> anyhow::Result<()> {
     let mut client_hooks = crate::extensions::ClientHookRuntime::new(
         ui.extensions.clone(),
@@ -669,6 +676,7 @@ async fn run(
         socket_path,
         config_location,
         &mut client_hooks,
+        enhanced_keyboard,
     )
     .await;
     client_hooks.shutdown().await;
@@ -689,10 +697,12 @@ async fn run_loop(
     socket_path: &Path,
     config_location: &config::ConfigLocation,
     client_hooks: &mut crate::extensions::ClientHookRuntime,
+    enhanced_keyboard: bool,
 ) -> anyhow::Result<()> {
     let mut events = EventStream::new();
     let mut termination = TerminationSignals::subscribe()?;
     let mut prefix = PrefixState::new(ui.bindings.clone());
+    let mut prefix_keys_awaiting_release = HashSet::new();
     let mut mouse_input = MouseInputState::default();
     let mut view = ViewState::new(selected)?;
     let mut resources = ResourceState::default();
@@ -2762,8 +2772,18 @@ async fn run_loop(
                             UiMouseRoute::NotOwned => mouse_input.discard(mouse),
                             }
                         }
-                    Event::Key(key) if surface.is_none() && copy_mode.is_none() => if let Some(bytes) = encode_key(key) {
-                        let terminal_key = terminal_key_event(key);
+                    Event::Key(key) if surface.is_none() && copy_mode.is_none() => if let Some(terminal_key) = terminal_key_event(key) {
+                        if matches!(key.kind, KeyEventKind::Release) {
+                            if prefix_keys_awaiting_release.remove(&key.code) {
+                                continue;
+                            }
+                            send(framed, ClientMessage::KeyInput { event: terminal_key }).await?;
+                            continue;
+                        }
+                        let Some(bytes) = encode_key(key) else {
+                            send(framed, ClientMessage::KeyInput { event: terminal_key }).await?;
+                            continue;
+                        };
                         let prefix_was_waiting = prefix.waiting();
                         let focused_terminal_was_covered =
                             cheatsheet_visible || toasts.is_visible();
@@ -2777,6 +2797,9 @@ async fn run_loop(
                         }
                         match prefix.feed(bytes) {
                             PrefixAction::Wait => {
+                                if enhanced_keyboard {
+                                    prefix_keys_awaiting_release.insert(key.code);
+                                }
                                 cheatsheet_at = Some(time::Instant::now() + CHEATSHEET_DELAY);
                                 send(
                                     framed,
@@ -2786,6 +2809,9 @@ async fn run_loop(
                                 ).await?;
                             }
                             PrefixAction::Dispatch(action) => {
+                                if enhanced_keyboard {
+                                    prefix_keys_awaiting_release.insert(key.code);
+                                }
                                 release_captured_mouse_input(
                                     framed,
                                     &mut mouse_input,
@@ -2823,11 +2849,12 @@ async fn run_loop(
                             }
                             PrefixAction::Send(bytes) => {
                                 if prefix_was_waiting {
+                                    if enhanced_keyboard {
+                                        prefix_keys_awaiting_release.insert(key.code);
+                                    }
                                     send(framed, ClientMessage::Input { bytes }).await?;
-                                } else if let Some(event) = terminal_key {
-                                    send(framed, ClientMessage::KeyInput { event }).await?;
                                 } else {
-                                    send(framed, ClientMessage::Input { bytes }).await?;
+                                    send(framed, ClientMessage::KeyInput { event: terminal_key }).await?;
                                 }
                             }
                         }
@@ -6300,6 +6327,7 @@ struct TerminalGuard {
     raw: bool,
     alternate_screen: bool,
     bracketed_paste: bool,
+    enhanced_keyboard: bool,
     mouse_capture: bool,
     cursor_hidden: bool,
     line_wrap_disabled: bool,
@@ -6311,6 +6339,7 @@ impl TerminalGuard {
             raw: false,
             alternate_screen: false,
             bracketed_paste: false,
+            enhanced_keyboard: false,
             mouse_capture: false,
             cursor_hidden: false,
             line_wrap_disabled: false,
@@ -6321,6 +6350,22 @@ impl TerminalGuard {
         guard.alternate_screen = true;
         execute!(io::stdout(), EnableBracketedPaste)?;
         guard.bracketed_paste = true;
+        if host_supports_keyboard_enhancement(
+            &std::env::var("TERM").unwrap_or_default(),
+            &std::env::var("TERM_PROGRAM").unwrap_or_default(),
+        ) && execute!(
+            io::stdout(),
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+            )
+        )
+        .is_ok()
+        {
+            guard.enhanced_keyboard = true;
+        }
         // Mark capture before the multi-sequence command so a partial write or
         // flush failure still runs the disabling cleanup in Drop.
         guard.mouse_capture = true;
@@ -6347,6 +6392,9 @@ impl Drop for TerminalGuard {
         }
         if self.bracketed_paste {
             let _ = execute!(stdout, DisableBracketedPaste);
+        }
+        if self.enhanced_keyboard {
+            let _ = execute!(stdout, PopKeyboardEnhancementFlags);
         }
         if self.alternate_screen {
             let _ = execute!(stdout, LeaveAlternateScreen);
