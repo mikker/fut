@@ -487,7 +487,8 @@ struct Tab {
     /// A non-empty user title wins permanently until the user clears it.
     name: String,
     automatic_name: String,
-    focused_pane: PaneId,
+    /// The oldest surviving pane supplies an unnamed tab's shared title.
+    automatic_name_anchor: Option<PaneId>,
     tokens: MaterializedTokenMap,
     /// `None` only while removing the final pane, before empty-resource
     /// cascading removes the tab in the same mutation.
@@ -497,6 +498,7 @@ struct Tab {
 struct Pane {
     tab_id: TabId,
     terminal_id: TerminalId,
+    creation_order: u64,
     tokens: MaterializedTokenMap,
     activity: AgentActivity,
     cwd: Option<PathBuf>,
@@ -516,6 +518,7 @@ enum CloseIntent {
 #[derive(Clone, Debug, Default)]
 pub struct ResourceTree {
     revision: u64,
+    next_pane_creation_order: u64,
     session_order: Vec<SessionId>,
     sessions: BTreeMap<SessionId, Session>,
     workspaces: BTreeMap<WorkspaceId, Workspace>,
@@ -568,8 +571,8 @@ impl ResourceTree {
             .iter()
             .filter(|(id, tab)| tab.name.is_empty() && !self.tab_is_closing(**id))
             .filter_map(|(_, tab)| {
-                (!self.pane_is_closing(tab.focused_pane))
-                    .then_some(self.panes[&tab.focused_pane].terminal_id)
+                let pane_id = tab.automatic_name_anchor?;
+                (!self.pane_is_closing(pane_id)).then_some(self.panes[&pane_id].terminal_id)
             })
             .collect()
     }
@@ -1119,7 +1122,7 @@ impl ResourceTree {
 
     /// Record the readable foreground process for a pane. Automatic tab names
     /// belong to the resource tree, rather than being guessed independently by
-    /// each client, and only follow the tab's focused pane.
+    /// each client, and only follow the tab's oldest surviving pane.
     pub fn update_process_name(
         &mut self,
         terminal_id: TerminalId,
@@ -1131,7 +1134,9 @@ impl ResourceTree {
             .ok_or(ResourceError::NotFound("terminal"))?;
         let tab_id = self.panes[&pane_id].tab_id;
         let tab = self.tabs.get_mut(&tab_id).expect("pane tab exists");
-        if !tab.name.is_empty() || tab.focused_pane != pane_id || tab.automatic_name == process_name
+        if !tab.name.is_empty()
+            || tab.automatic_name_anchor != Some(pane_id)
+            || tab.automatic_name == process_name
         {
             return Ok(self.revision);
         }
@@ -1158,22 +1163,6 @@ impl ResourceTree {
         }
         pane.cwd = Some(cwd);
         pane.worktree = worktree;
-        self.revision += 1;
-        Ok(self.revision)
-    }
-
-    /// Select which pane supplies an unnamed tab's automatic title.
-    pub fn focus_pane(&mut self, pane_id: PaneId) -> Result<u64, ResourceError> {
-        let pane = self
-            .panes
-            .get(&pane_id)
-            .ok_or(ResourceError::NotFound("pane"))?;
-        let tab = self.tabs.get_mut(&pane.tab_id).expect("pane tab exists");
-        if tab.focused_pane == pane_id {
-            return Ok(self.revision);
-        }
-        tab.focused_pane = pane_id;
-        tab.automatic_name.clear();
         self.revision += 1;
         Ok(self.revision)
     }
@@ -1310,7 +1299,7 @@ impl ResourceTree {
                 workspace_id: path.workspace_id,
                 name: path.tab_name,
                 automatic_name: String::new(),
-                focused_pane: path.pane_id,
+                automatic_name_anchor: Some(path.pane_id),
                 tokens: BTreeMap::new(),
                 layout: Some(SplitTree::leaf(path.pane_id)),
             },
@@ -1533,7 +1522,7 @@ impl ResourceTree {
                 workspace_id: path.workspace_id,
                 name: path.tab_name,
                 automatic_name: String::new(),
-                focused_pane: path.pane_id,
+                automatic_name_anchor: Some(path.pane_id),
                 tokens: BTreeMap::new(),
                 layout: Some(SplitTree::leaf(path.pane_id)),
             },
@@ -1605,7 +1594,7 @@ impl ResourceTree {
                 workspace_id,
                 name: path.tab_name,
                 automatic_name: String::new(),
-                focused_pane: path.pane_id,
+                automatic_name_anchor: Some(path.pane_id),
                 tokens: BTreeMap::new(),
                 layout: Some(SplitTree::leaf(path.pane_id)),
             },
@@ -1811,15 +1800,6 @@ impl ResourceTree {
             .take()
             .expect("live source tab has a layout")
             .without(pane_id);
-        if source.focused_pane == pane_id
-            && let Some(replacement) = source
-                .layout
-                .as_ref()
-                .and_then(|layout| layout.leaf_ids().last().copied())
-        {
-            source.focused_pane = replacement;
-            source.automatic_name.clear();
-        }
         let destination_tab = self.tabs.get_mut(&destination).unwrap();
         let anchor = *destination_tab
             .layout
@@ -1836,6 +1816,8 @@ impl ResourceTree {
                 .split(anchor, SplitDirection::Right, pane_id)
         );
         self.panes.get_mut(&pane_id).unwrap().tab_id = destination;
+        self.refresh_automatic_name_anchor(pane.tab_id);
+        self.refresh_automatic_name_anchor(destination);
         let mut events = vec![ResourceEvent::PaneMoved {
             pane_id,
             terminal_id: pane.terminal_id,
@@ -2233,6 +2215,7 @@ impl ResourceTree {
                     if tab.workspace_id != *wid
                         || check_optional_name(&tab.name).is_err()
                         || !tab.layout.as_ref().is_some_and(SplitTree::validate)
+                        || tab.automatic_name_anchor != self.oldest_pane(*tid)
                         || (!tab.name.is_empty() && !tab_names.insert(&tab.name))
                         || !seen_tabs.insert(*tid)
                     {
@@ -2287,15 +2270,7 @@ impl ResourceTree {
             .take()
             .expect("pane tab has a layout")
             .without(pane_id);
-        if tab.focused_pane == pane_id
-            && let Some(replacement) = tab
-                .layout
-                .as_ref()
-                .and_then(|layout| layout.leaf_ids().last().copied())
-        {
-            tab.focused_pane = replacement;
-            tab.automatic_name.clear();
-        }
+        self.refresh_automatic_name_anchor(pane.tab_id);
         pane.tab_id
     }
 
@@ -2341,11 +2316,17 @@ impl ResourceTree {
     }
 
     fn insert_pane(&mut self, tab_id: TabId, pane_id: PaneId, terminal_id: TerminalId) {
+        let creation_order = self.next_pane_creation_order;
+        self.next_pane_creation_order = self
+            .next_pane_creation_order
+            .checked_add(1)
+            .expect("pane creation order exhausted");
         self.panes.insert(
             pane_id,
             Pane {
                 tab_id,
                 terminal_id,
+                creation_order,
                 tokens: BTreeMap::new(),
                 activity: AgentActivity::default(),
                 cwd: None,
@@ -2353,6 +2334,24 @@ impl ResourceTree {
             },
         );
         self.terminals.insert(terminal_id, pane_id);
+    }
+
+    fn refresh_automatic_name_anchor(&mut self, tab_id: TabId) {
+        let anchor = self.oldest_pane(tab_id);
+        let tab = self.tabs.get_mut(&tab_id).expect("pane tab exists");
+        if tab.automatic_name_anchor != anchor {
+            tab.automatic_name_anchor = anchor;
+            tab.automatic_name.clear();
+        }
+    }
+
+    fn oldest_pane(&self, tab_id: TabId) -> Option<PaneId> {
+        self.tab_panes(tab_id).into_iter().min_by_key(|pane_id| {
+            self.panes
+                .get(pane_id)
+                .map(|pane| pane.creation_order)
+                .unwrap_or(u64::MAX)
+        })
     }
     fn finish(
         &mut self,
@@ -3032,7 +3031,7 @@ mod tests {
     }
 
     #[test]
-    fn unnamed_tabs_follow_the_focused_process_but_explicit_titles_stay_stable() {
+    fn unnamed_tabs_follow_the_oldest_surviving_pane_and_explicit_titles_stay_stable() {
         let mut tree = ResourceTree::default();
         let path = initial("processes", "/processes");
         let tab_id = path.tab_id;
@@ -3070,12 +3069,32 @@ mod tests {
             tree.snapshot().sessions[0].workspaces[0].tabs[0].name,
             "zsh"
         );
-        tree.focus_pane(second_pane).unwrap();
+
+        let third_pane = PaneId::new();
+        let third_terminal = TerminalId::new();
+        tree.split_pane(
+            first_pane,
+            SplitDirection::Right,
+            third_pane,
+            third_terminal,
+        )
+        .unwrap();
+        tree.update_process_name(third_terminal, "less".into())
+            .unwrap();
+        assert_eq!(
+            tree.snapshot().sessions[0].workspaces[0].tabs[0].name,
+            "zsh",
+            "new panes never replace the stable title anchor"
+        );
+
+        tree.close_pane(first_pane).unwrap();
+        tree.terminal_exited(first_terminal).unwrap();
         tree.update_process_name(second_terminal, "vim".into())
             .unwrap();
         assert_eq!(
             tree.snapshot().sessions[0].workspaces[0].tabs[0].name,
-            "vim"
+            "vim",
+            "the next-oldest pane becomes the anchor even when it is not the first layout leaf"
         );
 
         tree.rename_tab(tab_id, "editor".into()).unwrap();
@@ -3088,7 +3107,7 @@ mod tests {
 
         tree.rename_tab(tab_id, String::new()).unwrap();
         tree.terminal_exited(second_terminal).unwrap();
-        tree.update_process_name(first_terminal, "fish".into())
+        tree.update_process_name(third_terminal, "fish".into())
             .unwrap();
         assert_eq!(
             tree.snapshot().sessions[0].workspaces[0].tabs[0].name,

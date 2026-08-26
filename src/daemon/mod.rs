@@ -4499,7 +4499,7 @@ async fn lease_view(
     client: ClientId,
     size: TerminalSize,
 ) -> Result<Attachment, DaemonError> {
-    let mut state = shared.lock().await;
+    let state = shared.lock().await;
     if !state.accepting {
         return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
     }
@@ -4555,8 +4555,6 @@ async fn lease_view(
         });
     }
     let layout = retain_observed_layout(layout, &panes)?;
-    let revision = state.resources.focus_pane(focused.pane_id)?;
-    state.publish_resource_change(revision);
     let resource_changes = state.resource_changes.subscribe();
     let presence_changes = state.presence.subscribe();
     let mut attachment = Attachment::new(
@@ -4656,7 +4654,7 @@ async fn focus_leased_attachment(
         .clear_active_copy_mode()
         .await
         .map_err(|error| DaemonError::new(command_error_code(&error), error.to_string()))?;
-    let mut state = shared.lock().await;
+    let state = shared.lock().await;
     if !state.accepting {
         return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
     }
@@ -4677,8 +4675,6 @@ async fn focus_leased_attachment(
     focused.selected = selected_target(path, &focused.terminal);
     let panes = observed_targets(&state, paths, focused.selected.terminal_id)?;
     let layout = retain_observed_layout(layout, &panes)?;
-    let revision = state.resources.focus_pane(path.pane_id)?;
-    state.publish_resource_change(revision);
     let selected = focused.selected.clone();
     attachment.focused = focused;
     attachment.reconcile(
@@ -7220,6 +7216,116 @@ mod tests {
             &focused,
             &TargetSelector::Session(crate::resources::SessionSelector::Id(SessionId::new())),
         ));
+    }
+
+    #[tokio::test]
+    async fn clients_can_focus_different_panes_without_renaming_the_shared_tab() {
+        let (mut state, path) = inconsistent_state();
+        let second_pane = PaneId::new();
+        let second_terminal_id = TerminalId::new();
+        state
+            .resources
+            .rename_tab(path.tab_id, String::new())
+            .unwrap();
+        state
+            .resources
+            .split_pane(
+                path.pane_id,
+                SplitDirection::Right,
+                second_pane,
+                second_terminal_id,
+            )
+            .unwrap();
+        state
+            .resources
+            .update_process_name(path.terminal_id, "anchor".into())
+            .unwrap();
+        state
+            .resources
+            .update_process_name(second_terminal_id, "other".into())
+            .unwrap();
+
+        let first_terminal = Arc::new(
+            spawn_terminal(SpawnSpec {
+                id: path.terminal_id,
+                program: "/bin/sh".into(),
+                argv: vec!["-c".into(), "while :; do sleep 1; done".into()],
+                cwd: "/".into(),
+                env: HashMap::new(),
+                size: TerminalSize {
+                    columns: 80,
+                    rows: 24,
+                },
+            })
+            .unwrap(),
+        );
+        let second_terminal = Arc::new(
+            spawn_terminal(SpawnSpec {
+                id: second_terminal_id,
+                program: "/bin/sh".into(),
+                argv: vec!["-c".into(), "while :; do sleep 1; done".into()],
+                cwd: "/".into(),
+                env: HashMap::new(),
+                size: TerminalSize {
+                    columns: 80,
+                    rows: 24,
+                },
+            })
+            .unwrap(),
+        );
+        state.runtimes.insert(
+            path.terminal_id,
+            RuntimeEntry {
+                handle: Arc::clone(&first_terminal),
+                lease: AttachmentLease::default(),
+            },
+        );
+        state.runtimes.insert(
+            second_terminal_id,
+            RuntimeEntry {
+                handle: Arc::clone(&second_terminal),
+                lease: AttachmentLease::default(),
+            },
+        );
+        let revision = state.resources.revision();
+        let shared = Arc::new(Mutex::new(state));
+        let size = TerminalSize {
+            columns: 80,
+            rows: 24,
+        };
+
+        let first_client = lease_view(
+            &shared,
+            Some(TargetSelector::Pane(path.pane_id)),
+            None,
+            ClientId::new(),
+            size,
+        )
+        .await
+        .unwrap();
+        let second_client = lease_view(
+            &shared,
+            Some(TargetSelector::Pane(second_pane)),
+            None,
+            ClientId::new(),
+            size,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(first_client.focused.selected.pane_id, path.pane_id);
+        assert_eq!(second_client.focused.selected.pane_id, second_pane);
+        let state = shared.lock().await;
+        assert_eq!(state.resources.revision(), revision);
+        assert_eq!(
+            state.resources.snapshot().sessions[0].workspaces[0].tabs[0].name,
+            "anchor"
+        );
+        drop(state);
+        drop(first_client);
+        drop(second_client);
+        first_terminal.close().await.unwrap();
+        second_terminal.close().await.unwrap();
     }
 
     fn inconsistent_state() -> (SharedState, InitialPath) {

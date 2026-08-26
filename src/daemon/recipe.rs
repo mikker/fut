@@ -718,7 +718,6 @@ fn plan_recipe_session(
             }
         }
     }
-    resources.focus_pane(selected.pane_id)?;
     resources.validate()?;
     Ok(RecipeCreationPlan {
         resources,

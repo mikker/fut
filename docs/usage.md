@@ -122,8 +122,9 @@ another attempt.
 Workspaces are organizational contexts, not Git objects. Fut uses their root as
 a working-directory fallback but does not create or manage worktrees. Unnamed
 workspaces show their live directory or Git work tree; unnamed tabs follow the
-focused pane's foreground process. Rename either to keep a fixed label, or
-submit an empty name to restore the automatic label.
+oldest surviving pane's foreground process. Focusing a pane does not change the
+shared tab label. Rename either to keep a fixed label, or submit an empty name
+to restore the automatic label.
 
 Pane splits and divider sizes are shared daemon state. Client focus, zoom,
 scrollback, dialogs, and configuration are local. Multiple clients may attach
