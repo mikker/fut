@@ -183,11 +183,11 @@ receive the client process environment plus these API v1 values:
 | `FUT_EXTENSION_ID` | Manifest `id`. |
 | `FUT_EXTENSION_COMMAND` | Unqualified command declaration name. |
 | `FUT_EXTENSION_ROOT` | Canonical package root. |
-| `FUT_SESSION_ID` | Focused session UUID. |
-| `FUT_WORKSPACE_ID` | Focused workspace UUID. |
-| `FUT_TAB_ID` | Focused tab UUID. |
-| `FUT_PANE_ID` | Focused pane UUID. |
-| `FUT_TERMINAL_ID` | Focused terminal UUID. |
+| `FUT_SESSION_ID` | Focused session compact ID. |
+| `FUT_WORKSPACE_ID` | Focused workspace compact ID. |
+| `FUT_TAB_ID` | Focused tab compact ID. |
+| `FUT_PANE_ID` | Focused pane compact ID. |
+| `FUT_TERMINAL_ID` | Focused terminal compact ID. |
 | `FUT_EXTENSION_CONFIG` | Resolved config object as compact JSON; at minimum `{}`. |
 | `FUT_EXTENSION_CONFIG_GLOBAL_PATH` | Present only when global config contributed values. |
 | `FUT_EXTENSION_CONFIG_WORKSPACE_PATH` | Present only when workspace config contributed values. |

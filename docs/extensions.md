@@ -296,11 +296,11 @@ Extension commands run from the focused workspace root and receive:
 | `FUT_EXTENSION_ID` | Manifest ID |
 | `FUT_EXTENSION_COMMAND` | Command declaration name |
 | `FUT_EXTENSION_ROOT` | Canonical extension directory |
-| `FUT_SESSION_ID` | Focused session UUID |
-| `FUT_WORKSPACE_ID` | Focused workspace UUID |
-| `FUT_TAB_ID` | Focused tab UUID |
-| `FUT_PANE_ID` | Focused pane UUID |
-| `FUT_TERMINAL_ID` | Focused terminal UUID |
+| `FUT_SESSION_ID` | Focused session compact ID |
+| `FUT_WORKSPACE_ID` | Focused workspace compact ID |
+| `FUT_TAB_ID` | Focused tab compact ID |
+| `FUT_PANE_ID` | Focused pane compact ID |
+| `FUT_TERMINAL_ID` | Focused terminal compact ID |
 | `FUT_EXTENSION_CONFIG` | Resolved `[extension.<id>]` table as compact JSON |
 | `FUT_EXTENSION_TRUSTED_CONFIG` | Global and trusted-project layers only, as compact JSON |
 | `FUT_EXTENSION_CONFIG_GLOBAL_PATH` | Global source path, when it contributed values |

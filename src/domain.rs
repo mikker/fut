@@ -3,11 +3,38 @@
 //! These types deliberately contain no PTY, terminal-emulator, transport, or
 //! presentation-library types.
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
+
+/// Length of Fut's complete, URL-safe representation of a 128-bit resource ID.
+pub const COMPACT_ID_LEN: usize = 23;
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[error("expected a UUID or {COMPACT_ID_LEN}-character compact Fut ID")]
+pub struct IdParseError;
+
+#[must_use]
+pub fn compact_id(id: Uuid) -> String {
+    format!("f{}", URL_SAFE_NO_PAD.encode(id.as_bytes()))
+}
+
+pub fn parse_id(value: &str) -> Result<Uuid, IdParseError> {
+    if let Ok(id) = Uuid::parse_str(value) {
+        return Ok(id);
+    }
+    if value.len() != COMPACT_ID_LEN {
+        return Err(IdParseError);
+    }
+    let encoded = value.strip_prefix('f').ok_or(IdParseError)?;
+    let bytes = URL_SAFE_NO_PAD.decode(encoded).map_err(|_| IdParseError)?;
+    let bytes: [u8; 16] = bytes.try_into().map_err(|_| IdParseError)?;
+    let id = Uuid::from_bytes(bytes);
+    (compact_id(id) == value).then_some(id).ok_or(IdParseError)
+}
 
 /// Upper bound for the number of cells in a terminal's visible grid.
 ///
@@ -72,6 +99,12 @@ macro_rules! id_type {
             pub fn new() -> Self {
                 Self(Uuid::new_v4())
             }
+
+            /// The canonical UUID retained on the wire and in structured output.
+            #[must_use]
+            pub fn uuid(self) -> Uuid {
+                self.0
+            }
         }
 
         impl Default for $name {
@@ -82,15 +115,15 @@ macro_rules! id_type {
 
         impl std::fmt::Display for $name {
             fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                self.0.fmt(formatter)
+                formatter.write_str(&compact_id(self.0))
             }
         }
 
         impl std::str::FromStr for $name {
-            type Err = uuid::Error;
+            type Err = IdParseError;
 
             fn from_str(value: &str) -> Result<Self, Self::Err> {
-                Uuid::parse_str(value).map(Self)
+                parse_id(value).map(Self)
             }
         }
     };
@@ -1346,14 +1379,23 @@ mod tests {
     }
 
     #[test]
-    fn ids_are_opaque_unique_and_serde_round_trip() {
+    fn ids_are_compact_unambiguous_and_serde_round_trip_as_uuid() {
         let first = TerminalId::new();
         let second = TerminalId::new();
         assert_ne!(first, second);
 
         let json = serde_json::to_string(&first).unwrap();
         assert_eq!(serde_json::from_str::<TerminalId>(&json).unwrap(), first);
-        assert_eq!(first.to_string().len(), 36);
+        assert_eq!(first.to_string().len(), COMPACT_ID_LEN);
+        assert_eq!(first.to_string().parse::<TerminalId>().unwrap(), first);
+        assert_eq!(
+            first.uuid().to_string().parse::<TerminalId>().unwrap(),
+            first
+        );
+        assert_eq!(json, format!("\"{}\"", first.uuid()));
+        for malformed in ["short", &format!("{}A", first), &format!("{}=", first)] {
+            assert!(malformed.parse::<TerminalId>().is_err());
+        }
     }
 
     #[test]

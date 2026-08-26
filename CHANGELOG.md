@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Resource IDs in human-facing output, shell completion, and Fut environments now use stable 23-character compact selectors; CLI arguments continue to accept canonical UUIDs.
 - Close confirmations now prevent pasted or pointer input from reaching terminals and controls behind the prompt.
 - Failed multi-terminal closes now report partial progress and remain visibly closing instead of implying that already-terminated panes were restored.
 - Agents dialogs and sidebars now exclude terminals known only through best-effort screen detection.

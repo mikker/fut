@@ -1681,7 +1681,10 @@ async fn agent_cli_composes_lifecycle_input_and_bounded_output_without_stale_idl
         .unwrap();
     let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
     assert_eq!(listed["result"]["agents"].as_array().unwrap().len(), 1);
-    assert_eq!(listed["result"]["agents"][0]["terminal_id"], terminal);
+    assert_eq!(
+        listed["result"]["agents"][0]["terminal_id"],
+        terminal_id.uuid().to_string()
+    );
     assert_eq!(listed["result"]["agents"][0]["available"], true);
     let got = harness
         .cli()
@@ -2027,9 +2030,18 @@ async fn public_cli_lists_creates_and_closes_resources() {
     )
     .unwrap();
     assert_eq!(panes["command"], "pane.list");
-    assert_eq!(panes["result"]["tab_id"], tab);
-    assert_eq!(panes["result"]["layout"]["pane_id"], tab_pane);
-    assert_eq!(panes["result"]["panes"][0]["id"], tab_pane);
+    assert_eq!(
+        panes["result"]["tab_id"],
+        tab.parse::<TabId>().unwrap().uuid().to_string()
+    );
+    assert_eq!(
+        panes["result"]["layout"]["pane_id"],
+        tab_pane.parse::<PaneId>().unwrap().uuid().to_string()
+    );
+    assert_eq!(
+        panes["result"]["panes"][0]["id"],
+        tab_pane.parse::<PaneId>().unwrap().uuid().to_string()
+    );
 
     let missing = harness
         .cli()
@@ -4279,21 +4291,21 @@ async fn public_pane_move_preserves_attachment_identity_order_and_cascades_empty
     assert_eq!(moved_json["command"], "pane.move");
     assert_eq!(
         moved_json["result"]["source_tab_id"],
-        source_tab.to_string()
+        source_tab.uuid().to_string()
     );
     assert_eq!(moved_json["result"]["moved"], true);
     assert_eq!(moved_json["result"]["source_tab_closed"], false);
     assert_eq!(
         moved_json["result"]["selected"]["tab_id"],
-        destination_tab.to_string()
+        destination_tab.uuid().to_string()
     );
     assert_eq!(
         moved_json["result"]["selected"]["pane_id"],
-        pane_a.to_string()
+        pane_a.uuid().to_string()
     );
     assert_eq!(
         moved_json["result"]["selected"]["terminal_id"],
-        terminal_a.to_string()
+        terminal_a.uuid().to_string()
     );
     assert_eq!(
         moved_json["result"]["selected"]["child_pid"],
@@ -4361,7 +4373,7 @@ async fn public_pane_move_preserves_attachment_identity_order_and_cascades_empty
     let retry_json: Value = serde_json::from_slice(&retry.stdout).unwrap();
     assert_eq!(
         retry_json["result"]["source_tab_id"],
-        destination_tab.to_string()
+        destination_tab.uuid().to_string()
     );
     assert_eq!(retry_json["result"]["moved"], false);
     assert_eq!(retry_json["result"]["source_tab_closed"], false);
@@ -4385,13 +4397,13 @@ async fn public_pane_move_preserves_attachment_identity_order_and_cascades_empty
     let final_json: Value = serde_json::from_slice(&final_move.stdout).unwrap();
     assert_eq!(
         final_json["result"]["source_tab_id"],
-        source_tab.to_string()
+        source_tab.uuid().to_string()
     );
     assert_eq!(final_json["result"]["moved"], true);
     assert_eq!(final_json["result"]["source_tab_closed"], true);
     assert_eq!(
         final_json["result"]["selected"]["terminal_id"],
-        terminal_c.to_string()
+        terminal_c.uuid().to_string()
     );
     let after = harness.resources().await;
     let original_session = after
@@ -6409,9 +6421,15 @@ async fn location_aware_layout_commands_follow_live_terminal_ancestry_and_guard_
         .success()
     );
     let tabs = success_json(run(&["--json", "tab", "list"], anchor.terminal_id));
-    assert_eq!(tabs["result"]["workspace_id"], workspace_id.to_string());
+    assert_eq!(
+        tabs["result"]["workspace_id"],
+        workspace_id.uuid().to_string()
+    );
     let panes = success_json(run(&["--json", "pane", "list"], anchor.terminal_id));
-    assert_eq!(panes["result"]["tab_id"], original_tab_id.to_string());
+    assert_eq!(
+        panes["result"]["tab_id"],
+        original_tab_id.uuid().to_string()
+    );
 
     let second_tab = success_json(run(
         &["--json", "tab", "new", "--name", "destination"],
@@ -6450,7 +6468,7 @@ async fn location_aware_layout_commands_follow_live_terminal_ancestry_and_guard_
     ));
     assert_eq!(
         moved["result"]["selected"]["pane_id"],
-        anchor.id.to_string()
+        anchor.id.uuid().to_string()
     );
     assert!(
         run(
@@ -6461,7 +6479,10 @@ async fn location_aware_layout_commands_follow_live_terminal_ancestry_and_guard_
         .success()
     );
     let moved_panes = success_json(run(&["--json", "pane", "list"], anchor.terminal_id));
-    assert_eq!(moved_panes["result"]["tab_id"], second_tab_id.to_string());
+    assert_eq!(
+        moved_panes["result"]["tab_id"],
+        second_tab_id.uuid().to_string()
+    );
 
     assert!(matches!(
         harness
@@ -6874,7 +6895,7 @@ async fn public_pane_split_preserves_target_direction_cwd_argv_focus_and_atomic_
     let split: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(split["version"], 1);
     assert_eq!(split["command"], "pane.split");
-    assert_eq!(split["result"]["anchor_pane_id"], anchor.to_string());
+    assert_eq!(split["result"]["anchor_pane_id"], anchor.uuid().to_string());
     assert_eq!(split["result"]["direction"], "right");
     let right_pane: PaneId = split["result"]["selected"]["pane_id"]
         .as_str()
@@ -7057,7 +7078,10 @@ async fn public_terminal_input_is_literal_validated_bracket_aware_atomic_and_exi
         let value: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(value["version"], 1);
         assert_eq!(value["command"], command);
-        assert_eq!(value["result"]["terminal_id"], terminal_id.to_string());
+        assert_eq!(
+            value["result"]["terminal_id"],
+            terminal_id.uuid().to_string()
+        );
     };
 
     json(
@@ -7337,15 +7361,18 @@ async fn public_json_control_mutations_use_dotted_commands_and_raw_ids() {
     };
 
     let initial = harness.resources().await;
-    let session_id = initial.sessions[0].id.to_string();
-    let workspace_id = initial.sessions[0].workspaces[0].id.to_string();
-    let tab_id = initial.sessions[0].workspaces[0].tabs[0].id.to_string();
+    let session = initial.sessions[0].id;
+    let workspace = initial.sessions[0].workspaces[0].id;
+    let tab = initial.sessions[0].workspaces[0].tabs[0].id;
+    let session_id = session.to_string();
+    let workspace_id = workspace.to_string();
+    let tab_id = tab.to_string();
     assert_eq!(
         json(
             &["session", "rename", &session_id, "json-session", "--json"],
             "session.rename"
         )["session_id"],
-        session_id
+        session.uuid().to_string()
     );
     assert_eq!(
         json(
@@ -7358,14 +7385,14 @@ async fn public_json_control_mutations_use_dotted_commands_and_raw_ids() {
             ],
             "workspace.rename"
         )["workspace_id"],
-        workspace_id
+        workspace.uuid().to_string()
     );
     assert_eq!(
         json(
             &["tab", "rename", &tab_id, "json-tab", "--json"],
             "tab.rename"
         )["tab_id"],
-        tab_id
+        tab.uuid().to_string()
     );
 
     let created = json(&["tab", "new", &workspace_id, "--json"], "tab.new");
@@ -7426,6 +7453,10 @@ async fn public_json_control_mutations_use_dotted_commands_and_raw_ids() {
             "workspace.close"
         )["workspace_id"],
         workspace_to_close
+            .parse::<WorkspaceId>()
+            .unwrap()
+            .uuid()
+            .to_string()
     );
     assert_eq!(
         json(
@@ -7433,6 +7464,10 @@ async fn public_json_control_mutations_use_dotted_commands_and_raw_ids() {
             "session.close"
         )["session_id"],
         session_to_close
+            .parse::<SessionId>()
+            .unwrap()
+            .uuid()
+            .to_string()
     );
 
     harness.shutdown().await;
@@ -14683,7 +14718,7 @@ fn zsh_dynamic(output: &std::process::Output) -> Vec<(String, String)> {
         .lines()
         .filter_map(|line| {
             let (value, help) = line.split_once(':')?;
-            Uuid::parse_str(value).ok()?;
+            value.parse::<TerminalId>().ok()?;
             Some((value.into(), help.into()))
         })
         .collect()
@@ -14900,11 +14935,11 @@ async fn context_resolves_fresh_ancestry_from_terminal_identity_and_get_resolves
     assert_eq!(context["command"], "context");
     assert_eq!(
         context["result"]["target"]["workspace"]["id"],
-        workspace.id.to_string()
+        workspace.id.uuid().to_string()
     );
     assert_eq!(
         context["result"]["target"]["terminal"]["id"],
-        pane.terminal_id.to_string()
+        pane.terminal_id.uuid().to_string()
     );
 
     let mismatched = harness
@@ -14921,7 +14956,7 @@ async fn context_resolves_fresh_ancestry_from_terminal_identity_and_get_resolves
     let mismatched: Value = serde_json::from_slice(&mismatched.stdout).unwrap();
     assert_eq!(
         mismatched["result"]["target"]["pane"]["id"],
-        pane.id.to_string()
+        pane.id.uuid().to_string()
     );
 
     harness.shutdown().await;

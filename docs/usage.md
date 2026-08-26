@@ -193,8 +193,11 @@ fut extension reload
 Commands after `--` are passed directly, without shell evaluation. Creation
 and mutation commands do not change another client's visual focus. Inside Fut,
 many resource IDs may be omitted and are resolved from the caller's live
-terminal ancestry. Automation should instead use `--json`, retain returned raw
-UUIDs, and pass explicit IDs to later commands.
+terminal ancestry. Human-facing output and shell completion use 23-character
+compact Fut IDs. They encode the complete 128-bit identity, so they are stable
+and do not depend on the current set of resources. Every ID argument also
+accepts the canonical UUID form. Automation should use `--json`, retain the
+returned canonical UUIDs, and pass explicit IDs to later commands.
 
 For terminal I/O, lifecycle-aware agent control, and event streaming, see
 [Agent activity](../agents/). Fut also bundles machine-readable operating

@@ -200,11 +200,11 @@ enum Command {
     },
     /// Resolve the current terminal ancestry from Fut's environment.
     Context,
-    /// Look up any Fut resource by its globally unique UUID.
+    /// Look up any Fut resource by its ID.
     Get {
-        /// Raw session, workspace, tab, pane, or terminal UUID.
+        /// Session, workspace, tab, pane, or terminal compact ID or UUID.
         #[arg(add = ArgValueCompleter::new(completion::get))]
-        id: Uuid,
+        id: String,
     },
     /// List resources from the existing daemon.
     #[command(alias = "ls")]
@@ -253,21 +253,21 @@ enum ProjectCommand {
 enum SessionCommand {
     /// Attach to a session that contains exactly one open terminal.
     Attach {
-        /// Session UUID or name; a UUID-shaped value is always treated as an ID.
+        /// Session compact ID, UUID, or name; an ID-shaped value is always treated as an ID.
         #[arg(add = ArgValueCompleter::new(completion::session_attach))]
         session: String,
     },
-    /// Rename a session by raw UUID, or infer the caller's session.
+    /// Rename a session by ID, or infer the caller's session.
     Rename {
-        /// New name, or a raw session UUID when followed by NAME.
+        /// New name, or a session ID when followed by NAME.
         #[arg(add = ArgValueCompleter::new(completion::session_rename))]
         session_or_name: String,
         /// New session name when SESSION_ID is provided.
         name: Option<String>,
     },
-    /// Close a session by raw UUID, or infer the caller's session.
+    /// Close a session by ID, or infer the caller's session.
     Close {
-        /// Raw session UUID.
+        /// Compact session ID or UUID.
         #[arg(add = ArgValueCompleter::new(completion::session_close))]
         session_id: Option<SessionId>,
     },
@@ -277,27 +277,27 @@ enum SessionCommand {
 enum WorkspaceCommand {
     /// Attach to a workspace on the existing daemon.
     Attach {
-        /// Raw workspace UUID; the workspace must contain exactly one open terminal.
+        /// Compact workspace ID or UUID; the workspace must contain exactly one open terminal.
         #[arg(add = ArgValueCompleter::new(completion::workspace_attach))]
         workspace_id: WorkspaceId,
     },
-    /// Rename a workspace by raw UUID, or infer the caller's workspace.
+    /// Rename a workspace by ID, or infer the caller's workspace.
     Rename {
-        /// New name, or a raw workspace UUID when followed by NAME.
+        /// New name, or a workspace ID when followed by NAME.
         #[arg(add = ArgValueCompleter::new(completion::workspace_rename))]
         workspace_or_name: String,
         /// New workspace name when WORKSPACE_ID is provided.
         name: Option<String>,
     },
-    /// Close a workspace by raw UUID, or infer the caller's workspace.
+    /// Close a workspace by ID, or infer the caller's workspace.
     Close {
-        /// Raw workspace UUID.
+        /// Compact workspace ID or UUID.
         #[arg(add = ArgValueCompleter::new(completion::workspace_close))]
         workspace_id: Option<WorkspaceId>,
     },
     /// Acknowledge this workspace's retirement before terminating its terminals.
     Retire {
-        /// Raw workspace UUID; defaults to the caller's workspace.
+        /// Compact workspace ID or UUID; defaults to the caller's workspace.
         #[arg(add = ArgValueCompleter::new(completion::workspace_close))]
         workspace_id: Option<WorkspaceId>,
     },
@@ -307,7 +307,7 @@ enum WorkspaceCommand {
 enum TabCommand {
     /// Create a tab through an existing daemon without attaching.
     New {
-        /// Raw owner workspace UUID; defaults to the caller's workspace.
+        /// Compact owner workspace ID or UUID; defaults to the caller's workspace.
         #[arg(add = ArgValueCompleter::new(completion::tab_new))]
         workspace_id: Option<WorkspaceId>,
         /// Name for the new tab; unnamed by default.
@@ -322,27 +322,27 @@ enum TabCommand {
     },
     /// List the tabs of a workspace, including each tab's split layout.
     List {
-        /// Raw owner workspace UUID; defaults to the caller's workspace.
+        /// Compact owner workspace ID or UUID; defaults to the caller's workspace.
         #[arg(add = ArgValueCompleter::new(completion::tab_new))]
         workspace_id: Option<WorkspaceId>,
     },
     /// Attach to a tab on the existing daemon.
     Attach {
-        /// Raw tab UUID; the tab must contain exactly one open terminal.
+        /// Compact tab ID or UUID; the tab must contain exactly one open terminal.
         #[arg(add = ArgValueCompleter::new(completion::tab_attach))]
         tab_id: TabId,
     },
-    /// Rename a tab by raw UUID, or infer the caller's tab.
+    /// Rename a tab by ID, or infer the caller's tab.
     Rename {
-        /// New name, or a raw tab UUID when followed by NAME.
+        /// New name, or a tab ID when followed by NAME.
         #[arg(add = ArgValueCompleter::new(completion::tab_rename))]
         tab_or_name: String,
         /// New tab name when TAB_ID is provided.
         name: Option<String>,
     },
-    /// Close a tab by raw UUID, or infer the caller's tab.
+    /// Close a tab by ID, or infer the caller's tab.
     Close {
-        /// Raw tab UUID.
+        /// Compact tab ID or UUID.
         #[arg(add = ArgValueCompleter::new(completion::tab_close))]
         tab_id: Option<TabId>,
     },
@@ -352,7 +352,7 @@ enum TabCommand {
 enum PaneCommand {
     /// Create a pane through an existing daemon without attaching.
     New {
-        /// Raw owner tab UUID; defaults to the caller's tab.
+        /// Compact owner tab ID or UUID; defaults to the caller's tab.
         #[arg(add = ArgValueCompleter::new(completion::pane_new))]
         tab_id: Option<TabId>,
         /// Working directory for the child; defaults to the workspace root.
@@ -364,7 +364,7 @@ enum PaneCommand {
     },
     /// Split a pane through an existing daemon without attaching.
     Split {
-        /// Direction, or a raw pane UUID when followed by DIRECTION.
+        /// Direction, or a pane ID when followed by DIRECTION.
         #[arg(add = ArgValueCompleter::new(completion::pane_split_anchor_or_direction))]
         pane_or_direction: String,
         /// Direction when PANE_ID is provided.
@@ -379,28 +379,28 @@ enum PaneCommand {
     },
     /// List the panes of a tab, including the tab's split layout.
     List {
-        /// Raw owner tab UUID; defaults to the caller's tab.
+        /// Compact owner tab ID or UUID; defaults to the caller's tab.
         #[arg(add = ArgValueCompleter::new(completion::pane_new))]
         tab_id: Option<TabId>,
     },
     /// Attach to a pane on the existing daemon.
     Attach {
-        /// Raw pane UUID identifying one terminal placement.
+        /// Compact pane ID or UUID identifying one terminal placement.
         #[arg(add = ArgValueCompleter::new(completion::pane_attach))]
         pane_id: PaneId,
     },
     /// Move a pane to another tab in the same workspace.
     Move {
-        /// Destination tab UUID, or source pane UUID when followed by DESTINATION_TAB_ID.
+        /// Destination tab ID, or source pane ID when followed by DESTINATION_TAB_ID.
         #[arg(add = ArgValueCompleter::new(completion::pane_move_source))]
         pane_or_destination_id: String,
-        /// Destination tab UUID when PANE_ID is provided.
+        /// Destination tab ID when PANE_ID is provided.
         #[arg(add = ArgValueCompleter::new(completion::pane_move_destination))]
         destination_tab_id: Option<TabId>,
     },
-    /// Close a pane by raw UUID, or infer the caller's pane.
+    /// Close a pane by ID, or infer the caller's pane.
     Close {
-        /// Raw pane UUID.
+        /// Compact pane ID or UUID.
         #[arg(add = ArgValueCompleter::new(completion::pane_close))]
         pane_id: Option<PaneId>,
     },
@@ -425,13 +425,13 @@ impl From<PaneSplitDirection> for SplitDirection {
 enum TerminalCommand {
     /// Attach to a terminal on the existing daemon.
     Attach {
-        /// Raw terminal UUID identifying one process-bearing terminal.
+        /// Compact terminal ID or UUID identifying one process-bearing terminal.
         #[arg(add = ArgValueCompleter::new(completion::terminal_attach))]
         terminal_id: TerminalId,
     },
     /// Send literal text without submitting it.
     SendText {
-        /// Raw UUID of the terminal that will receive the text.
+        /// Compact terminal ID or UUID of the terminal that will receive the text.
         #[arg(add = ArgValueCompleter::new(completion::terminal_attach))]
         terminal_id: TerminalId,
         /// Literal Unicode text, encoded using the terminal's current paste mode.
@@ -440,7 +440,7 @@ enum TerminalCommand {
     },
     /// Send validated logical keys or control chords.
     SendKeys {
-        /// Raw UUID of the terminal that will receive the keys.
+        /// Compact terminal ID or UUID of the terminal that will receive the keys.
         #[arg(add = ArgValueCompleter::new(completion::terminal_attach))]
         terminal_id: TerminalId,
         /// Named key, one character, or chord such as ctrl+c or alt+left.
@@ -449,7 +449,7 @@ enum TerminalCommand {
     },
     /// Send literal command text and Enter as one atomic operation.
     Run {
-        /// Raw UUID of the terminal that will receive the command.
+        /// Compact terminal ID or UUID of the terminal that will receive the command.
         #[arg(add = ArgValueCompleter::new(completion::terminal_attach))]
         terminal_id: TerminalId,
         /// Literal command text to submit.
@@ -458,7 +458,7 @@ enum TerminalCommand {
     },
     /// Read a bounded terminal output snapshot.
     Read {
-        /// Raw UUID of the terminal to inspect.
+        /// Compact terminal ID or UUID of the terminal to inspect.
         #[arg(add = ArgValueCompleter::new(completion::terminal_attach))]
         terminal_id: TerminalId,
         /// Visible viewport or a bounded recent physical-row window.
@@ -474,7 +474,7 @@ enum TerminalCommand {
     /// Wait for literal or regular-expression output without polling.
     #[command(group(ArgGroup::new("matcher").required(true).args(["literal", "regex"])))]
     WaitOutput {
-        /// Raw UUID of the terminal to observe.
+        /// Compact terminal ID or UUID of the terminal to observe.
         #[arg(add = ArgValueCompleter::new(completion::terminal_attach))]
         terminal_id: TerminalId,
         /// Literal Unicode text to match.
@@ -498,7 +498,7 @@ enum TerminalCommand {
         /// Agent state or completion event.
         #[arg(value_enum)]
         state: AgentReportArg,
-        /// Terminal UUID; defaults to FUT_TERMINAL_ID inside Fut.
+        /// Compact terminal ID or UUID; defaults to FUT_TERMINAL_ID inside Fut.
         #[arg(long)]
         terminal_id: Option<TerminalId>,
         /// Integration name, such as codex or claude-code.
@@ -682,13 +682,13 @@ enum AgentCommand {
     List,
     /// Inspect one integrated agent terminal.
     Get {
-        /// Raw UUID of the integrated terminal.
+        /// Compact ID or UUID of the integrated terminal.
         #[arg(add = ArgValueCompleter::new(completion::agent))]
         terminal_id: TerminalId,
     },
     /// Submit one prompt as literal text followed atomically by Enter.
     Prompt {
-        /// Raw UUID of the integrated terminal.
+        /// Compact ID or UUID of the integrated terminal.
         #[arg(add = ArgValueCompleter::new(completion::agent))]
         terminal_id: TerminalId,
         /// Literal Unicode prompt text.
@@ -706,7 +706,7 @@ enum AgentCommand {
     },
     /// Wait for a currently working agent to settle, or return current settled state.
     Wait {
-        /// Raw UUID of the integrated terminal.
+        /// Compact ID or UUID of the integrated terminal.
         #[arg(add = ArgValueCompleter::new(completion::agent))]
         terminal_id: TerminalId,
         /// Required deadline, such as 500ms, 30s, or 2m.
@@ -715,7 +715,7 @@ enum AgentCommand {
     },
     /// Read bounded output together with current agent availability.
     Read {
-        /// Raw UUID of the integrated terminal.
+        /// Compact ID or UUID of the integrated terminal.
         #[arg(add = ArgValueCompleter::new(completion::agent))]
         terminal_id: TerminalId,
         /// Visible viewport or a bounded recent physical-row window.
@@ -733,7 +733,7 @@ enum AgentCommand {
         /// Agent state or completion event.
         #[arg(value_enum)]
         state: AgentReportArg,
-        /// Terminal UUID; defaults to FUT_TERMINAL_ID inside Fut.
+        /// Compact terminal ID or UUID; defaults to FUT_TERMINAL_ID inside Fut.
         #[arg(long)]
         terminal_id: Option<TerminalId>,
         /// Integration name, such as codex or claude-code.
@@ -1812,12 +1812,7 @@ async fn execute(cli: Cli) -> Result<()> {
             let terminal_id = terminal_context_id()?;
             let snapshot = list_resources(&socket).await?;
             let context = context_for_terminal(&snapshot, terminal_id)?;
-            let terminal_uuid = context
-                .terminal_id
-                .to_string()
-                .parse()
-                .expect("typed Fut IDs contain UUIDs");
-            let target = discover_target(&snapshot, terminal_uuid)?;
+            let target = discover_target(&snapshot, context.terminal_id.uuid())?;
             output(
                 cli.json,
                 "context",
@@ -1827,6 +1822,12 @@ async fn execute(cli: Cli) -> Result<()> {
         }
         Some(Command::Get { id }) => {
             let snapshot = list_resources(&socket).await?;
+            let id = crate::domain::parse_id(&id).map_err(|_| {
+                CliError::new(
+                    "invalid_arguments",
+                    "resource ID must be a compact Fut ID or UUID",
+                )
+            })?;
             let target = discover_target(&snapshot, id)?;
             output(
                 cli.json,
@@ -3569,7 +3570,7 @@ fn terminal_context_id() -> Result<TerminalId> {
         Ok(value) => value.parse().map_err(|_| {
             CliError::new(
                 "invalid_context",
-                "FUT_TERMINAL_ID is not a valid terminal UUID",
+                "FUT_TERMINAL_ID is not a valid compact terminal ID or UUID",
             )
             .into()
         }),
@@ -3618,7 +3619,7 @@ where
     value.parse().map_err(|_| {
         CliError::new(
             "invalid_arguments",
-            format!("explicit {kind} target must be a raw UUID"),
+            format!("explicit {kind} target must be a compact Fut ID or UUID"),
         )
         .into()
     })
@@ -3634,11 +3635,9 @@ where
 {
     match name {
         Some(name) => Ok((Some(parse_id::<T>(&target_or_name, kind)?), name)),
-        None if Uuid::parse_str(&target_or_name).is_ok() => Err(CliError::new(
-            "invalid_arguments",
-            format!("missing NAME after {kind} UUID"),
-        )
-        .into()),
+        None if target_or_name.parse::<T>().is_ok() => {
+            Err(CliError::new("invalid_arguments", format!("missing NAME after {kind} ID")).into())
+        }
         None => Ok((None, target_or_name)),
     }
 }
@@ -3651,7 +3650,7 @@ fn discover_target(snapshot: &ResourceSnapshot, id: Uuid) -> Result<serde_json::
             "name": session.name,
             "closing": session.closing,
         });
-        if uuid_matches(session.id, id) {
+        if session.id.uuid() == id {
             matches.push(json!({ "kind": "session", "session": session_json }));
         }
         for workspace in &session.workspaces {
@@ -3661,7 +3660,7 @@ fn discover_target(snapshot: &ResourceSnapshot, id: Uuid) -> Result<serde_json::
                 "root": workspace.root,
                 "closing": workspace.closing,
             });
-            if uuid_matches(workspace.id, id) {
+            if workspace.id.uuid() == id {
                 matches.push(json!({
                     "kind": "workspace",
                     "session": session_json,
@@ -3674,7 +3673,7 @@ fn discover_target(snapshot: &ResourceSnapshot, id: Uuid) -> Result<serde_json::
                     "name": tab.name,
                     "closing": tab.closing,
                 });
-                if uuid_matches(tab.id, id) {
+                if tab.id.uuid() == id {
                     matches.push(json!({
                         "kind": "tab",
                         "session": session_json,
@@ -3689,7 +3688,7 @@ fn discover_target(snapshot: &ResourceSnapshot, id: Uuid) -> Result<serde_json::
                         "activity": pane.activity,
                     });
                     let terminal_json = json!({ "id": pane.terminal_id });
-                    if uuid_matches(pane.id, id) {
+                    if pane.id.uuid() == id {
                         matches.push(json!({
                             "kind": "pane",
                             "session": session_json,
@@ -3699,7 +3698,7 @@ fn discover_target(snapshot: &ResourceSnapshot, id: Uuid) -> Result<serde_json::
                             "terminal": terminal_json,
                         }));
                     }
-                    if uuid_matches(pane.terminal_id, id) {
+                    if pane.terminal_id.uuid() == id {
                         matches.push(json!({
                             "kind": "terminal",
                             "session": session_json,
@@ -3719,14 +3718,10 @@ fn discover_target(snapshot: &ResourceSnapshot, id: Uuid) -> Result<serde_json::
         1 => Ok(matches.pop().expect("one discovery match")),
         _ => Err(CliError::new(
             "ambiguous_target",
-            format!("UUID {id} identifies more than one resource"),
+            format!("ID {id} identifies more than one resource"),
         )
         .into()),
     }
-}
-
-fn uuid_matches(id: impl std::fmt::Display, expected: Uuid) -> bool {
-    id.to_string().parse::<Uuid>().ok() == Some(expected)
 }
 
 fn render_discovered_target(revision: u64, target: &serde_json::Value) -> String {
@@ -4676,7 +4671,7 @@ mod tests {
                 .unwrap_err();
             let error = error.downcast_ref::<CliError>().unwrap();
             assert_eq!(error.code, "invalid_arguments");
-            assert_eq!(error.message, format!("missing NAME after {kind} UUID"));
+            assert_eq!(error.message, format!("missing NAME after {kind} ID"));
         }
     }
 
@@ -4779,8 +4774,11 @@ mod tests {
         );
 
         let verbose = render_verbose_resources(&snapshot);
-        assert!(verbose.starts_with("revision=42\nsession 11111111-1111-1111-1111-111111111111"));
-        assert!(verbose.contains("terminal=55555555-5555-5555-5555-555555555555"));
+        assert!(verbose.starts_with(&format!("revision=42\nsession {}", snapshot.sessions[0].id)));
+        assert!(verbose.contains(&format!(
+            "terminal={}",
+            snapshot.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id
+        )));
         assert_eq!(
             render_resource_tree(&ResourceSnapshot {
                 revision: 43,

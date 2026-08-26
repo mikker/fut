@@ -12,7 +12,9 @@ description: Report semantic agent activity to Fut.
 > read` without changing client focus.
 
 Programs running inside Fut receive scoped `FUT_SESSION_ID`, `FUT_WORKSPACE_ID`,
-`FUT_TAB_ID`, `FUT_PANE_ID`, and `FUT_TERMINAL_ID` environment variables.
+`FUT_TAB_ID`, `FUT_PANE_ID`, and `FUT_TERMINAL_ID` environment variables. These
+use Fut's compact, reversible 23-character form; CLI ID arguments also accept
+canonical UUIDs from structured output.
 Resolve the terminal's current live ancestry, including the pane's current
 agent activity, with:
 
@@ -25,10 +27,10 @@ location and may be stale after a pane move; `context` resolves their current
 replacements from a fresh daemon snapshot.
 
 Look up any session, workspace, tab, pane, or terminal outside that inherited
-context by its UUID without changing visual focus:
+context by its compact ID or canonical UUID without changing visual focus:
 
 ```sh
-fut --json get UUID
+fut --json get ID
 ```
 
 Print Fut's bundled agent skill with:

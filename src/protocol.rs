@@ -855,7 +855,8 @@ mod tests {
         );
 
         let legacy = format!(
-            r#"{{"type":"report_agent","terminal_id":"{terminal_id}","report":"working"}}"#
+            r#"{{"type":"report_agent","terminal_id":"{}","report":"working"}}"#,
+            terminal_id.uuid()
         );
         assert_eq!(
             serde_json::from_str::<ClientMessage>(&legacy).unwrap(),

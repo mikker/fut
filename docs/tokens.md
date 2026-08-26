@@ -56,7 +56,7 @@ These may appear only under `ui.tab_bar.item.segments`.
 | `tab.marker` | Current icon for the active tab, otherwise its one-based index |
 | `tab.index` | One-based tab index |
 | `tab.name` | Tab name |
-| `tab.id` | Full stable tab UUID |
+| `tab.id` | Compact, reversible stable tab ID |
 | `tab.closing` | Closing icon while closing; otherwise empty |
 | `tab.pane_count` | Number of panes in the tab |
 | `tab.icon` | Tab icon from the selected preset |
@@ -72,7 +72,7 @@ These may appear in the `row.left`, `body`, `right`, or `detail` fields of a `co
 | --- | --- |
 | `workspace.index` | One-based workspace index |
 | `workspace.name` | Workspace name; unnamed workspaces present their live location, or `multiple` when panes disagree |
-| `workspace.id` | Full stable workspace UUID |
+| `workspace.id` | Compact, reversible stable workspace ID |
 | `workspace.root` | Live workspace location: the Git work tree (or directory) every open pane is inside, observed from pane working directories with the creation-time root as fallback; `multiple` when panes disagree |
 | `workspace.root_name` | Final component of the live workspace location; `multiple` when panes disagree |
 | `workspace.closing` | Closing icon while closing; otherwise empty |
