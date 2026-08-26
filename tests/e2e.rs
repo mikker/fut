@@ -8845,6 +8845,106 @@ async fn public_close_confirmation_consumes_paste_and_mouse_input() {
 }
 
 #[tokio::test]
+async fn public_ordinary_dialogs_own_paste_pointer_and_wheel_input() {
+    let expected = [
+        sgr_mouse(0, 8, 5, false),
+        sgr_mouse(0, 8, 5, true),
+        sgr_mouse(64, 8, 5, false),
+    ]
+    .concat();
+    let application_mouse_input = [
+        sgr_mouse(0, 8, 6, false),
+        sgr_mouse(0, 8, 6, true),
+        sgr_mouse(64, 8, 6, false),
+    ]
+    .concat();
+    let harness = Harness::start(&format!(
+        "stty raw -echo; printf '\\033[?1003h\\033[?1006hDIALOG_INPUT_READY\\r\\n'; dd bs=1 count={} of=dialog-input.tmp 2>/dev/null; mv dialog-input.tmp dialog-input.capture; printf 'DIALOG_INPUT_CAPTURED\\r\\n'; exec cat >/dev/null",
+        expected.len(),
+    ))
+    .await;
+    let pane = harness.resources().await.sessions[0].workspaces[0].tabs[0].panes[0].id;
+
+    let mut command = Command::new("/usr/bin/script");
+    command
+        .env_clear()
+        .env("HOME", harness.root.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", harness.root.path().join("runtime"))
+        .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+        .env("TERM", "xterm-256color")
+        .args(script_command_args())
+        .arg(format!(
+            "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {pane}",
+            env!("CARGO_BIN_EXE_fut"),
+            harness.socket.display(),
+        ));
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("DIALOG_INPUT_READY").await;
+
+    let blocked_mouse = [
+        sgr_mouse(0, 40, 10, false),
+        sgr_mouse(0, 40, 10, true),
+        sgr_mouse(0, 2, 22, false),
+        sgr_mouse(0, 2, 22, true),
+        sgr_mouse(64, 40, 10, false),
+        sgr_mouse(65, 40, 10, false),
+    ]
+    .concat();
+
+    for (open, title, paste, query, close) in [
+        (
+            b"\x02:".as_slice(),
+            "Search commands",
+            b"\x1b[200~dialogpalette\x1b[201~".as_slice(),
+            "dialogpalette",
+            b"\x03".as_slice(),
+        ),
+        (
+            b"\x02s".as_slice(),
+            " navigator",
+            b"\x1b[200~dialognavigator\x1b[201~".as_slice(),
+            "dialognavigator",
+            b"\x1b".as_slice(),
+        ),
+        (
+            b"\x02S".as_slice(),
+            "Project name or path",
+            b"\x1b[200~dialogopener\x1b[201~".as_slice(),
+            "dialogopener",
+            b"\x03".as_slice(),
+        ),
+    ] {
+        client.send(open);
+        client.wait_for(title).await;
+        client.send(paste);
+        client.wait_for(query).await;
+        client.send(&blocked_mouse);
+        client.send(close);
+        time::sleep(Duration::from_millis(100)).await;
+    }
+
+    assert!(
+        !harness
+            .root
+            .path()
+            .join("cwd/dialog-input.capture")
+            .exists()
+    );
+
+    client.send(&application_mouse_input);
+    client.wait_for("DIALOG_INPUT_CAPTURED").await;
+    assert_eq!(
+        fs::read(harness.root.path().join("cwd/dialog-input.capture")).unwrap(),
+        expected
+    );
+
+    client.send(b"\x02d");
+    client.wait_success().await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn public_held_mouse_releases_before_modal_focus_and_detach_transitions() {
     let modal_expected = b"\x1b[<0;8;5M\x1b[<0;8;5m";
     let copy_expected = b"\x1b[<0;8;6M\x1b[<0;8;6m";
