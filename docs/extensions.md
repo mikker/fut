@@ -282,6 +282,8 @@ size = { width = 120, height = 40 }
 Commands appear in `Ctrl-b :` as a stable qualified slug followed by their
 title, such as `review-status:open-review  Open review`. Both are searchable.
 Commands run in an interactive temporary PTY with the client environment.
+While that surface is open, attention from the covered managed terminal remains
+unread until the managed terminal is visible again.
 Extension commands run from the focused workspace root and receive:
 
 | Variable | Value |

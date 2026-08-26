@@ -158,9 +158,10 @@ mode = "background"
 The public command slug is `<extension-id>:<command-name>`. It appears in
 `Ctrl-b :` and can be bound under `[ui.bindings]`. The default `mode` is
 `interactive`: Fut creates a temporary PTY, connects normal terminal input and
-output, and restores the prior view when the process exits. `size` requests a
-popup width of at least 4 and height of at least 3; omitted dimensions fill the
-available terminal and Fut clamps the result.
+output, and restores the prior view when the process exits. Attention from the
+covered managed terminal remains unread until that terminal is visible again.
+`size` requests a popup width of at least 4 and height of at least 3; omitted
+dimensions fill the available terminal and Fut clamps the result.
 
 `activate_opened = true` asks Fut to focus the most recent target opened by a
 descendant `fut open` after a successful exit. It defaults to false.

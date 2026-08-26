@@ -2780,28 +2780,20 @@ async fn run_loop(
             }
             _ = redraw.tick(), if force_draw || view.needs_draw() => {
                 let focused_terminal_id = view.focused().terminal_id;
-                let rendered_attention = matches!(
+                let focused_terminal_rendered = focused_terminal_is_rendered(
+                    temporary_command.is_some(),
                     surface.as_ref(),
-                    None
-                        | Some(ClientSurface::Sidebar(_))
-                        | Some(ClientSurface::TabBar(_))
-                        | Some(ClientSurface::ContextMenu(_))
-                )
+                    rename.is_some(),
+                    toasts.is_visible(),
+                );
+                let rendered_attention = focused_terminal_rendered
                 .then(|| resources.attention_revision(focused_terminal_id))
-                .flatten()
-                .filter(|_| rename.is_none() && !toasts.is_visible());
-                let rendered_alert = matches!(
-                    surface.as_ref(),
-                    None
-                        | Some(ClientSurface::Sidebar(_))
-                        | Some(ClientSurface::TabBar(_))
-                        | Some(ClientSurface::ContextMenu(_))
-                )
+                .flatten();
+                let rendered_alert = focused_terminal_rendered
                 .then(|| resources.notifications().terminal_alert(focused_terminal_id))
                 .flatten()
                 .filter(|alert| alert.unseen())
-                .map(|alert| alert.state.cursor())
-                .filter(|_| rename.is_none() && !toasts.is_visible());
+                .map(|alert| alert.state.cursor());
                 let draw_started = std::time::Instant::now();
                 io::stdout().sync_update(|stdout| -> io::Result<()> {
                     let mut rendered_cursor = None;
@@ -3003,6 +2995,23 @@ async fn run_loop(
         }
     }
     Ok(())
+}
+
+fn focused_terminal_is_rendered(
+    temporary_command_open: bool,
+    surface: Option<&ClientSurface>,
+    rename_open: bool,
+    toast_visible: bool,
+) -> bool {
+    !temporary_command_open
+        && !rename_open
+        && !toast_visible
+        && matches!(
+            surface,
+            None | Some(ClientSurface::Sidebar(_))
+                | Some(ClientSurface::TabBar(_))
+                | Some(ClientSurface::ContextMenu(_))
+        )
 }
 
 fn failed_exit_code(exit: Option<Option<i32>>) -> Option<i32> {
@@ -7455,6 +7464,12 @@ mod tests {
     fn cheatsheet_obstructs_application_mouse_and_cursor_routing() {
         assert!(app_overlay_clear(true, true, true, false));
         assert!(!app_overlay_clear(true, true, true, true));
+    }
+
+    #[test]
+    fn temporary_command_keeps_covered_terminal_attention_unread() {
+        assert!(focused_terminal_is_rendered(false, None, false, false));
+        assert!(!focused_terminal_is_rendered(true, None, false, false));
     }
 
     #[test]

@@ -11135,6 +11135,91 @@ async fn extension_commands_launch_from_the_palette_with_focused_context() {
 }
 
 #[tokio::test]
+async fn extension_command_keeps_covered_agent_attention_unread() {
+    let harness = Harness::start_with("printf 'HOST_READY\\r\\n'; while :; do sleep 1; done", |root| {
+        let extension = root.join("extension");
+        fs::create_dir_all(extension.join("bin")).unwrap();
+        fs::write(
+            extension.join("fut-extension.toml"),
+            "api_version = 1\nversion = '1.0.0'\nfut = '>=0.8.0, <1.0.0'\ncapabilities = ['commands']\nid = 'attention-test'\n[commands.cover]\ntitle = 'Cover terminal'\nargv = ['./bin/cover']\n",
+        )
+        .unwrap();
+        let cover = extension.join("bin/cover");
+        fs::write(&cover, "#!/bin/sh\nprintf 'COMMAND_READY\\r\\n'\nread -r _\n").unwrap();
+        fs::set_permissions(&cover, fs::Permissions::from_mode(0o755)).unwrap();
+        let config = root.join("home/.config/fut/config.toml");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(
+            config,
+            format!("extensions = [{:?}]\n", extension.display().to_string()),
+        )
+        .unwrap();
+    })
+    .await;
+    let snapshot = harness.resources().await;
+    let pane = &snapshot.sessions[0].workspaces[0].tabs[0].panes[0];
+    let terminal_id = pane.terminal_id;
+
+    let mut command = Command::new("/usr/bin/script");
+    command
+        .env_clear()
+        .env("HOME", harness.root.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", harness.root.path().join("runtime"))
+        .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+        .env("TERM", "xterm-256color")
+        .args(script_command_args())
+        .arg(format!(
+            "stty rows 24 cols 80; exec '{}' --socket '{}' pane attach {}",
+            env!("CARGO_BIN_EXE_fut"),
+            harness.socket.display(),
+            pane.id,
+        ));
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("HOST_READY").await;
+    client.send(b"\x02:cover terminal\r");
+    client.wait_for("COMMAND_READY").await;
+
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::ReportAgent {
+                terminal_id,
+                report: AgentReport::Completed,
+                metadata: Default::default(),
+            })
+            .await,
+        ServerMessage::CommandCompleted { .. }
+    ));
+    time::sleep(Duration::from_millis(200)).await;
+    let agent_list = harness
+        .cli()
+        .args(["--json", "agent", "list"])
+        .output()
+        .unwrap();
+    assert!(agent_list.status.success());
+    let agent_list: Value = serde_json::from_slice(&agent_list.stdout).unwrap();
+    assert_eq!(agent_list["result"]["unread_count"], 1);
+    assert_eq!(agent_list["result"]["agents"][0]["unread"], true);
+
+    client.send(b"\r");
+    client.wait_for("HOST_READY").await;
+    wait_for(DEADLINE, || {
+        let output = harness
+            .cli()
+            .args(["--json", "agent", "list"])
+            .output()
+            .unwrap();
+        let agents: Value = serde_json::from_slice(&output.stdout).unwrap();
+        agents["result"]["unread_count"] == 0
+    })
+    .await;
+
+    client.send(b"\x02d");
+    client.wait_success().await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn compiled_rust_extension_conforms_through_public_fut_boundaries() {
     let mut harness = Harness::start_public_with(
         "printf 'RUST_CONFORMANCE_HOST_READY\\r\\n'; while :; do sleep 1; done",
