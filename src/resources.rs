@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 use crate::{
@@ -23,11 +23,112 @@ use crate::{
 /// A daemon-wide bound on materialized extension presentation values. Token
 /// declarations are bounded separately while loading extension manifests.
 pub const MAX_MATERIALIZED_TOKEN_VALUES: usize = 4096;
-/// Token values are presentation text, never style or executable content.
+/// Token text is plain presentation content; any attached action is a separate
+/// daemon-validated enum value.
 pub const MAX_MATERIALIZED_TOKEN_VALUE_BYTES: usize = 1024;
 
-pub type MaterializedTokenMap = BTreeMap<String, String>;
+pub type MaterializedTokenMap = BTreeMap<String, MaterializedTokenValue>;
 pub type ExtensionConfigTable = serde_json::Map<String, serde_json::Value>;
+
+/// A generic interaction attached to materialized extension presentation
+/// text. Clients decide how to present the interaction, while the daemon owns
+/// validation and publisher identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PresentationTokenAction {
+    Pane {
+        pane_id: PaneId,
+    },
+    ExtensionCommand {
+        extension_id: String,
+        command: String,
+    },
+}
+
+/// The complete value published for one presentation token.
+///
+/// Deserialization accepts the old string-only representation so persisted
+/// snapshots and fixtures from before token actions remain readable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedTokenValue {
+    pub text: String,
+    pub action: Option<PresentationTokenAction>,
+}
+
+impl MaterializedTokenValue {
+    #[must_use]
+    pub fn new(text: String, action: Option<PresentationTokenAction>) -> Self {
+        Self { text, action }
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+}
+
+impl From<String> for MaterializedTokenValue {
+    fn from(text: String) -> Self {
+        Self { text, action: None }
+    }
+}
+
+impl From<&str> for MaterializedTokenValue {
+    fn from(text: &str) -> Self {
+        text.to_owned().into()
+    }
+}
+
+impl Serialize for MaterializedTokenValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let Some(action) = &self.action else {
+            return serializer.serialize_str(&self.text);
+        };
+
+        #[derive(Serialize)]
+        struct ActionableValue<'a> {
+            text: &'a str,
+            action: &'a PresentationTokenAction,
+        }
+
+        ActionableValue {
+            text: &self.text,
+            action,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for MaterializedTokenValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum CompatibleValue {
+            Text(String),
+            Value {
+                text: String,
+                #[serde(default)]
+                action: Option<PresentationTokenAction>,
+            },
+        }
+
+        Ok(match CompatibleValue::deserialize(deserializer)? {
+            CompatibleValue::Text(text) => Self::new(text, None),
+            CompatibleValue::Value { text, action } => Self::new(text, action),
+        })
+    }
+}
 
 /// Extension configuration approved as part of the exact project recipe and
 /// captured for the lifetime of its live session.
@@ -823,7 +924,44 @@ impl ResourceTree {
         qualified_name: String,
         value: String,
     ) -> Result<TokenPublication, ResourceError> {
+        self.publish_presentation_token_value(target, qualified_name, value.into())
+    }
+
+    /// Materialize an extension presentation value and its optional action as
+    /// one atomic replacement.
+    pub fn publish_presentation_token_value(
+        &mut self,
+        target: PresentationTokenTarget,
+        qualified_name: String,
+        value: MaterializedTokenValue,
+    ) -> Result<TokenPublication, ResourceError> {
         self.replace_presentation_tokens(target, [(qualified_name, Some(value))])
+    }
+
+    /// Check that an action pane is currently live and owned by the resource
+    /// on which its token will be published.
+    pub fn presentation_action_pane_is_live_descendant(
+        &self,
+        target: PresentationTokenTarget,
+        pane_id: PaneId,
+    ) -> Result<bool, ResourceError> {
+        // Validate the target and all of its ancestors first.
+        self.presentation_tokens_for(target)?;
+        let pane = self
+            .panes
+            .get(&pane_id)
+            .ok_or(ResourceError::NotFound("pane"))?;
+        if self.pane_is_closing(pane_id) {
+            return Err(ResourceError::Closing("pane"));
+        }
+        let tab = &self.tabs[&pane.tab_id];
+        let workspace = &self.workspaces[&tab.workspace_id];
+        Ok(match target {
+            PresentationTokenTarget::Session(id) => workspace.session_id == id,
+            PresentationTokenTarget::Workspace(id) => tab.workspace_id == id,
+            PresentationTokenTarget::Tab(id) => pane.tab_id == id,
+            PresentationTokenTarget::Pane(id) => pane_id == id,
+        })
     }
 
     /// Remove materialized extension values whose qualified token names are no
@@ -874,9 +1012,18 @@ impl ResourceTree {
         self.replace_presentation_tokens(
             PresentationTokenTarget::Workspace(workspace_id),
             [
-                (WORKSPACE_GIT_BRANCH_TOKEN.to_owned(), branch),
-                (WORKSPACE_GIT_ADDED_TOKEN.to_owned(), added),
-                (WORKSPACE_GIT_DELETED_TOKEN.to_owned(), deleted),
+                (
+                    WORKSPACE_GIT_BRANCH_TOKEN.to_owned(),
+                    branch.map(MaterializedTokenValue::from),
+                ),
+                (
+                    WORKSPACE_GIT_ADDED_TOKEN.to_owned(),
+                    added.map(MaterializedTokenValue::from),
+                ),
+                (
+                    WORKSPACE_GIT_DELETED_TOKEN.to_owned(),
+                    deleted.map(MaterializedTokenValue::from),
+                ),
             ],
         )
     }
@@ -884,7 +1031,7 @@ impl ResourceTree {
     fn replace_presentation_tokens(
         &mut self,
         target: PresentationTokenTarget,
-        replacements: impl IntoIterator<Item = (String, Option<String>)>,
+        replacements: impl IntoIterator<Item = (String, Option<MaterializedTokenValue>)>,
     ) -> Result<TokenPublication, ResourceError> {
         let replacements = replacements.into_iter().collect::<BTreeMap<_, _>>();
         let tokens = self.presentation_tokens_for(target)?;
@@ -2767,6 +2914,190 @@ mod tests {
     }
 
     #[test]
+    fn materialized_token_values_replace_text_and_action_atomically() {
+        let mut tree = ResourceTree::default();
+        let path = initial("token-actions", "/token-actions");
+        let workspace_id = path.workspace_id;
+        let pane_id = path.pane_id;
+        tree.create_session(path).unwrap();
+        let name = "workspace.extension.status.state".to_owned();
+
+        let first = tree
+            .publish_presentation_token_value(
+                PresentationTokenTarget::Workspace(workspace_id),
+                name.clone(),
+                MaterializedTokenValue::new(
+                    "ready".into(),
+                    Some(PresentationTokenAction::Pane { pane_id }),
+                ),
+            )
+            .unwrap();
+        let unchanged = tree
+            .publish_presentation_token_value(
+                PresentationTokenTarget::Workspace(workspace_id),
+                name.clone(),
+                MaterializedTokenValue::new(
+                    "ready".into(),
+                    Some(PresentationTokenAction::Pane { pane_id }),
+                ),
+            )
+            .unwrap();
+        assert!(!unchanged.changed);
+        assert_eq!(unchanged.revision, first.revision);
+
+        let changed = tree
+            .publish_presentation_token_value(
+                PresentationTokenTarget::Workspace(workspace_id),
+                name.clone(),
+                MaterializedTokenValue::new("ready".into(), None),
+            )
+            .unwrap();
+        assert!(changed.changed);
+        assert_eq!(changed.revision, first.revision + 1);
+        assert_eq!(
+            tree.snapshot().sessions[0].workspaces[0].tokens[&name],
+            MaterializedTokenValue::from("ready")
+        );
+    }
+
+    #[test]
+    fn materialized_token_map_deserializes_legacy_strings_and_action_values() {
+        let pane_id = PaneId::new();
+        let values: MaterializedTokenMap = serde_json::from_value(serde_json::json!({
+            "workspace.extension.status.legacy": "ready",
+            "workspace.extension.status.actionable": {
+                "text": "open",
+                "action": { "type": "pane", "pane_id": pane_id }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            values["workspace.extension.status.legacy"],
+            MaterializedTokenValue::from("ready")
+        );
+        assert_eq!(
+            values["workspace.extension.status.actionable"],
+            MaterializedTokenValue::new(
+                "open".into(),
+                Some(PresentationTokenAction::Pane { pane_id })
+            )
+        );
+        let serialized = serde_json::to_value(values).unwrap();
+        assert_eq!(
+            serialized["workspace.extension.status.legacy"],
+            serde_json::json!("ready")
+        );
+        assert!(serialized["workspace.extension.status.actionable"].is_object());
+
+        let legacy = BTreeMap::from([(
+            "workspace.extension.status.legacy".to_owned(),
+            "ready".to_owned(),
+        )]);
+        let encoded = rmp_serde::to_vec_named(&legacy).unwrap();
+        let decoded: MaterializedTokenMap = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(
+            decoded["workspace.extension.status.legacy"],
+            MaterializedTokenValue::from("ready")
+        );
+    }
+
+    #[test]
+    fn presentation_action_panes_must_be_live_descendants_of_token_targets() {
+        let mut tree = ResourceTree::default();
+        let path = initial("action-panes", "/action-panes");
+        let (session_id, workspace_id, tab_id, pane_id) = (
+            path.session_id,
+            path.workspace_id,
+            path.tab_id,
+            path.pane_id,
+        );
+        tree.create_session(path).unwrap();
+        let sibling_pane = PaneId::new();
+        tree.add_pane(tab_id, sibling_pane, TerminalId::new())
+            .unwrap();
+        let peer = WorkspacePath {
+            workspace_id: WorkspaceId::new(),
+            workspace_name: "peer".into(),
+            root: "/action-panes/peer".into(),
+            tab_id: TabId::new(),
+            tab_name: "peer".into(),
+            pane_id: PaneId::new(),
+            terminal_id: TerminalId::new(),
+        };
+        let peer_pane = peer.pane_id;
+        tree.add_workspace(session_id, peer).unwrap();
+        let other = initial("other-action-session", "/other-action-session");
+        let other_pane = other.pane_id;
+        tree.create_session(other).unwrap();
+
+        for target in [
+            PresentationTokenTarget::Session(session_id),
+            PresentationTokenTarget::Workspace(workspace_id),
+            PresentationTokenTarget::Tab(tab_id),
+        ] {
+            assert!(
+                tree.presentation_action_pane_is_live_descendant(target, sibling_pane)
+                    .unwrap()
+            );
+        }
+        assert!(
+            tree.presentation_action_pane_is_live_descendant(
+                PresentationTokenTarget::Pane(pane_id),
+                pane_id
+            )
+            .unwrap()
+        );
+        assert!(
+            !tree
+                .presentation_action_pane_is_live_descendant(
+                    PresentationTokenTarget::Workspace(workspace_id),
+                    peer_pane,
+                )
+                .unwrap()
+        );
+        assert!(
+            !tree
+                .presentation_action_pane_is_live_descendant(
+                    PresentationTokenTarget::Session(session_id),
+                    other_pane,
+                )
+                .unwrap()
+        );
+        assert!(
+            !tree
+                .presentation_action_pane_is_live_descendant(
+                    PresentationTokenTarget::Tab(tab_id),
+                    peer_pane,
+                )
+                .unwrap()
+        );
+        assert!(
+            !tree
+                .presentation_action_pane_is_live_descendant(
+                    PresentationTokenTarget::Pane(pane_id),
+                    sibling_pane,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            tree.presentation_action_pane_is_live_descendant(
+                PresentationTokenTarget::Workspace(workspace_id),
+                PaneId::new(),
+            ),
+            Err(ResourceError::NotFound("pane"))
+        );
+        tree.close_pane(sibling_pane).unwrap();
+        assert_eq!(
+            tree.presentation_action_pane_is_live_descendant(
+                PresentationTokenTarget::Workspace(workspace_id),
+                sibling_pane,
+            ),
+            Err(ResourceError::Closing("pane"))
+        );
+    }
+
+    #[test]
     fn extension_token_pruning_covers_every_scope_in_one_revision() {
         let mut tree = ResourceTree::default();
         let path = initial("token-prune", "/token-prune");
@@ -2829,11 +3160,11 @@ mod tests {
             &pane.tokens,
         ] {
             assert!(tokens.keys().all(|name| !name.contains(".removed.")));
-            assert!(tokens.values().any(|value| value == "keep"));
+            assert!(tokens.values().any(|value| value.text == "keep"));
         }
         assert_eq!(
             workspace.tokens.get(WORKSPACE_GIT_BRANCH_TOKEN),
-            Some(&"main".to_owned())
+            Some(&MaterializedTokenValue::from("main"))
         );
 
         let unchanged = tree.prune_extension_presentation_tokens(&declared);
@@ -2862,9 +3193,18 @@ mod tests {
         assert_eq!(
             tree.snapshot().sessions[0].workspaces[0].tokens,
             BTreeMap::from([
-                (WORKSPACE_GIT_BRANCH_TOKEN.into(), "main".into()),
-                (WORKSPACE_GIT_ADDED_TOKEN.into(), "+3".into()),
-                (WORKSPACE_GIT_DELETED_TOKEN.into(), "-2".into()),
+                (
+                    WORKSPACE_GIT_BRANCH_TOKEN.into(),
+                    MaterializedTokenValue::from("main"),
+                ),
+                (
+                    WORKSPACE_GIT_ADDED_TOKEN.into(),
+                    MaterializedTokenValue::from("+3"),
+                ),
+                (
+                    WORKSPACE_GIT_DELETED_TOKEN.into(),
+                    MaterializedTokenValue::from("-2"),
+                ),
             ])
         );
 
@@ -4812,8 +5152,8 @@ mod tests {
             paths[0].pane,
             &snapshot.sessions[0].workspaces[0].tabs[0].panes[0]
         ));
-        assert_eq!(paths[0].session.tokens["session.test"], "borrowed");
-        assert_eq!(paths[0].pane.tokens["pane.test"], "borrowed");
+        assert_eq!(paths[0].session.tokens["session.test"].text, "borrowed");
+        assert_eq!(paths[0].pane.tokens["pane.test"].text, "borrowed");
     }
 
     #[test]

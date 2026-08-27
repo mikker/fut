@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Made extension status tokens clickable for pane navigation or resource-scoped extension commands, including the bundled run status linking to its owner pane or logs.
+
 ## 0.14
 
 - Added stable 23-character resource selectors to human-facing output, shell completion, and Fut environments while retaining canonical UUID support.

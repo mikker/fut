@@ -109,6 +109,7 @@ use tokio_util::codec::Framed;
 use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
+use presentation::PresentationTokenInvocation;
 use sidebar::{ComponentEffect, SidebarComponentKind, SidebarSide, SidebarState, render_sidebar};
 use tab_bar::{TabBarAction, TabBarState};
 use temporary_command::{
@@ -127,7 +128,9 @@ use crate::{
         ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, SelectedTarget, SelectedView,
         SelectionExpectation, ServerMessage, codec, decode_payload, encode_payload,
     },
-    resources::{ResourceSnapshot, TargetSelector},
+    resources::{
+        PresentationTokenAction, PresentationTokenTarget, ResourceSnapshot, TargetSelector,
+    },
     splits::{SplitRatio, SplitTree},
 };
 
@@ -1325,6 +1328,8 @@ async fn run_loop(
                         let sidebar_selected = matches!(focus_origin, Some(FocusOrigin::Sidebar { .. }));
                         let notification_selected =
                             matches!(focus_origin, Some(FocusOrigin::Notification));
+                        let token_action_selected =
+                            matches!(focus_origin, Some(FocusOrigin::TokenAction));
                         let observed_revision = resources.snapshot().map(|snapshot| snapshot.revision);
                         let create_selected =
                             create.selected(request_id, &target, observed_revision);
@@ -1334,6 +1339,7 @@ async fn run_loop(
                                 || workspace_selected
                                 || tab_selected
                                 || sidebar_selected
+                                || token_action_selected
                             {
                                 surface = None;
                                 view.invalidate_drawn();
@@ -1400,6 +1406,10 @@ async fn run_loop(
                             view.invalidate_drawn();
                         }
                         if sidebar_selected {
+                            surface = None;
+                            view.invalidate_drawn();
+                        }
+                        if token_action_selected {
                             surface = None;
                             view.invalidate_drawn();
                         }
@@ -1619,6 +1629,10 @@ async fn run_loop(
                                 }
                                 Some(FocusOrigin::Notification) => {
                                     toasts.error(format!("notification unavailable · {message}"));
+                                    force_draw = true;
+                                }
+                                Some(FocusOrigin::TokenAction) => {
+                                    toasts.error(format!("token action unavailable · {message}"));
                                     force_draw = true;
                                 }
                                 None => bail!("daemon error ({code}): {message}"),
@@ -2117,6 +2131,9 @@ async fn run_loop(
                             _ => unreachable!("surface guard ensures sidebar"),
                         };
                         match action {
+                            ComponentEffect::Token(_) => {
+                                unreachable!("keyboard sidebar actions do not contain token hits")
+                            }
                             ComponentEffect::Stay => force_draw = true,
                             ComponentEffect::CloseSidebar => {
                                 surface = None;
@@ -2220,6 +2237,9 @@ async fn run_loop(
                             _ => unreachable!("surface guard ensures tab bar"),
                         };
                         match action {
+                            TabBarAction::Token(_) => {
+                                unreachable!("keyboard tab-bar actions do not contain token hits")
+                            }
                             TabBarAction::Stay => force_draw = true,
                             TabBarAction::Close => {
                                 surface = None;
@@ -2561,6 +2581,25 @@ async fn run_loop(
                         if let Some(activation) = activation {
                             mouse_input.discard(mouse);
                             match activation {
+                                UiActivation::Sidebar(ComponentEffect::Token(invocation))
+                                | UiActivation::Tab(TabBarAction::Token(invocation)) => {
+                                    toasts.replace(
+                                        dispatch_presentation_token_action(
+                                            invocation,
+                                            framed,
+                                            &mut view,
+                                            &resources,
+                                            &mut surface,
+                                            &mut focus,
+                                            host,
+                                            &ui,
+                                            &mut temporary_command,
+                                            socket_path,
+                                            &background_results,
+                                        )
+                                        .await?,
+                                    );
+                                }
                                 UiActivation::Sidebar(ComponentEffect::Navigate(
                                     pane_id,
                                     scope,
@@ -4191,6 +4230,179 @@ async fn request_project_open(
     .await
 }
 
+fn presentation_token_context_path<'a>(
+    snapshot: &'a ResourceSnapshot,
+    target: PresentationTokenTarget,
+    focused: &SelectedTarget,
+) -> Option<crate::resources::PanePathRef<'a>> {
+    let live = |path: &crate::resources::PanePathRef<'_>| {
+        !path.session.closing && !path.workspace.closing && !path.tab.closing && !path.pane.closing
+    };
+    snapshot
+        .pane_paths()
+        .filter(|path| presentation_target_matches(target, path) && live(path))
+        .min_by_key(|path| path.pane.id != focused.pane_id)
+}
+
+fn presentation_target_matches(
+    target: PresentationTokenTarget,
+    path: &crate::resources::PanePathRef<'_>,
+) -> bool {
+    match target {
+        PresentationTokenTarget::Session(id) => path.session.id == id,
+        PresentationTokenTarget::Workspace(id) => path.workspace.id == id,
+        PresentationTokenTarget::Tab(id) => path.tab.id == id,
+        PresentationTokenTarget::Pane(id) => path.pane.id == id,
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "token actions share the interactive client's focus and command surface state"
+)]
+async fn dispatch_presentation_token_action(
+    invocation: PresentationTokenInvocation,
+    framed: &mut Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
+    view: &mut ViewState,
+    resources: &ResourceState,
+    surface: &mut Option<ClientSurface>,
+    focus: &mut FocusState,
+    host: Rect,
+    ui: &UiConfig,
+    temporary_command: &mut Option<TemporaryCommandSurface>,
+    socket_path: &Path,
+    background_results: &mpsc::UnboundedSender<BackgroundCommandResult>,
+) -> anyhow::Result<Option<Toast>> {
+    let Some(snapshot) = resources.snapshot() else {
+        return Ok(Some(Toast::error(
+            "token action unavailable · resources are not loaded",
+        )));
+    };
+    match invocation.action {
+        PresentationTokenAction::Pane { pane_id } => {
+            let Some(path) = presentation_token_context_path(
+                snapshot,
+                PresentationTokenTarget::Pane(pane_id),
+                view.focused(),
+            ) else {
+                return Ok(Some(Toast::error(
+                    "token action unavailable · pane is no longer available",
+                )));
+            };
+            if !presentation_target_matches(invocation.target, &path) {
+                return Ok(Some(Toast::error(
+                    "token action unavailable · pane moved outside its token context",
+                )));
+            }
+            let expected = Some(match invocation.target {
+                PresentationTokenTarget::Session(id) => SelectionExpectation::Session(id),
+                PresentationTokenTarget::Workspace(id) => SelectionExpectation::Workspace(id),
+                PresentationTokenTarget::Tab(id) => SelectionExpectation::Tab(id),
+                PresentationTokenTarget::Pane(_) => SelectionExpectation::Tab(path.tab.id),
+            });
+            if let Some(request) = focus.begin(FocusOrigin::TokenAction) {
+                send_request(
+                    framed,
+                    Some(request),
+                    ClientMessage::SelectTarget {
+                        selector: TargetSelector::Pane(pane_id),
+                        expected,
+                    },
+                )
+                .await?;
+            }
+            Ok(None)
+        }
+        PresentationTokenAction::ExtensionCommand {
+            extension_id,
+            command,
+        } => {
+            let Some(path) =
+                presentation_token_context_path(snapshot, invocation.target, view.focused())
+            else {
+                return Ok(Some(Toast::error(
+                    "token action unavailable · resource is no longer available",
+                )));
+            };
+            let Some(command) = ui
+                .bindings
+                .extension_command(&extension_id, &command)
+                .cloned()
+            else {
+                return Ok(Some(Toast::error(
+                    "token action unavailable · command is not loaded",
+                )));
+            };
+            let focused = SelectedTarget {
+                session_id: path.session.id,
+                workspace_id: path.workspace.id,
+                tab_id: path.tab.id,
+                pane_id: path.pane.id,
+                terminal_id: path.pane.terminal_id,
+                child_pid: view.focused().child_pid,
+            };
+            if command.mode() == crate::extensions::ExtensionCommandMode::Background {
+                dispatch_background_command(
+                    command,
+                    ui.clone(),
+                    focused,
+                    path.workspace.root.clone(),
+                    path.session.trusted_project_config.clone(),
+                    socket_path.to_owned(),
+                    background_results.clone(),
+                );
+                return Ok(None);
+            }
+            let context = match ExtensionCommandContext::resolve(
+                ui,
+                &command,
+                &focused,
+                &path.workspace.root,
+                path.session.trusted_project_config.as_ref(),
+            ) {
+                Ok(context) => context,
+                Err(error) => {
+                    return Ok(Some(Toast::error(format!(
+                        "token action failed · {}",
+                        one_line_error(&error)
+                    ))));
+                }
+            };
+            if !command.fields.is_empty() {
+                match CommandFormState::open(command, context) {
+                    Ok(form) => *surface = Some(ClientSurface::CommandForm(Box::new(form))),
+                    Err(error) => {
+                        return Ok(Some(Toast::error(format!(
+                            "token action failed · {}",
+                            one_line_error(&error)
+                        ))));
+                    }
+                }
+                return Ok(None);
+            }
+            match spawn_temporary_command(
+                &command,
+                focused.child_pid,
+                host,
+                socket_path,
+                Some(&context),
+                None,
+            )
+            .await
+            {
+                Ok(command) => *temporary_command = Some(command),
+                Err(error) => {
+                    return Ok(Some(Toast::error(format!(
+                        "token action failed · {}",
+                        one_line_error(&error)
+                    ))));
+                }
+            }
+            Ok(None)
+        }
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "the dispatcher explicitly borrows the small client states it coordinates"
@@ -5269,6 +5481,7 @@ enum FocusOrigin {
         component: SidebarComponentKind,
     },
     Notification,
+    TokenAction,
 }
 
 impl FocusOrigin {
@@ -6513,6 +6726,115 @@ mod tests {
         };
 
         assert_eq!(reload.session_id, invocation_session);
+    }
+
+    #[test]
+    fn presentation_token_context_uses_the_invocation_resource_and_rejects_stale_paths() {
+        let session_id = SessionId::new();
+        let focused_workspace_id = WorkspaceId::new();
+        let target_workspace_id = WorkspaceId::new();
+        let focused_tab_id = TabId::new();
+        let target_tab_id = TabId::new();
+        let focused_pane_id = PaneId::new();
+        let target_pane_id = PaneId::new();
+        let focused_terminal_id = TerminalId::new();
+        let target_terminal_id = TerminalId::new();
+        let mut snapshot = ResourceSnapshot {
+            revision: 1,
+            sessions: vec![crate::resources::SessionSnapshot {
+                id: session_id,
+                name: "project".into(),
+                project: crate::resources::Project {
+                    identity: crate::resources::ProjectIdentity::CanonicalDirectory(PathBuf::from(
+                        "/project",
+                    )),
+                },
+                trusted_project_config: None,
+                closing: false,
+                tokens: Default::default(),
+                workspaces: vec![
+                    crate::resources::WorkspaceSnapshot {
+                        id: focused_workspace_id,
+                        name: "focused".into(),
+                        root: PathBuf::from("/project/focused"),
+                        closing: false,
+                        tokens: Default::default(),
+                        tabs: vec![crate::resources::TabSnapshot {
+                            id: focused_tab_id,
+                            name: "shell".into(),
+                            closing: false,
+                            tokens: Default::default(),
+                            layout: SplitTree::leaf(focused_pane_id),
+                            panes: vec![crate::resources::PaneSnapshot {
+                                id: focused_pane_id,
+                                terminal_id: focused_terminal_id,
+                                closing: false,
+                                tokens: Default::default(),
+                                activity: Default::default(),
+                                cwd: None,
+                                worktree: None,
+                            }],
+                        }],
+                    },
+                    crate::resources::WorkspaceSnapshot {
+                        id: target_workspace_id,
+                        name: "token-target".into(),
+                        root: PathBuf::from("/project/token-target"),
+                        closing: false,
+                        tokens: Default::default(),
+                        tabs: vec![crate::resources::TabSnapshot {
+                            id: target_tab_id,
+                            name: "logs".into(),
+                            closing: false,
+                            tokens: Default::default(),
+                            layout: SplitTree::leaf(target_pane_id),
+                            panes: vec![crate::resources::PaneSnapshot {
+                                id: target_pane_id,
+                                terminal_id: target_terminal_id,
+                                closing: false,
+                                tokens: Default::default(),
+                                activity: Default::default(),
+                                cwd: None,
+                                worktree: None,
+                            }],
+                        }],
+                    },
+                ],
+            }],
+        };
+        let focused = SelectedTarget {
+            session_id,
+            workspace_id: focused_workspace_id,
+            tab_id: focused_tab_id,
+            pane_id: focused_pane_id,
+            terminal_id: focused_terminal_id,
+            child_pid: 1,
+        };
+
+        let path = presentation_token_context_path(
+            &snapshot,
+            PresentationTokenTarget::Workspace(target_workspace_id),
+            &focused,
+        )
+        .expect("token workspace should resolve independently of client focus");
+        assert_eq!(path.workspace.id, target_workspace_id);
+        assert_eq!(path.workspace.root, PathBuf::from("/project/token-target"));
+        assert_eq!(path.tab.id, target_tab_id);
+        assert_eq!(path.pane.id, target_pane_id);
+        assert!(!presentation_target_matches(
+            PresentationTokenTarget::Tab(focused_tab_id),
+            &path,
+        ));
+
+        snapshot.sessions[0].workspaces[1].closing = true;
+        assert!(
+            presentation_token_context_path(
+                &snapshot,
+                PresentationTokenTarget::Workspace(target_workspace_id),
+                &focused,
+            )
+            .is_none()
+        );
     }
 
     #[tokio::test]

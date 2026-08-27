@@ -3,10 +3,11 @@
 # a stub that records `token publish` argv lines, and FUT_RUN_STATE_DIR keeps
 # all state inside a temporary directory.
 #
-# Covers: config validation, readiness signals (including chunk boundaries and
-# restart reset), start/stop lifecycle, exit tokens, launch failure,
-# rapid-restart races, workspace isolation, stale-PID safety, graceful-stop
-# escalation, log rotation, created/closed hooks, and viewer plumbing.
+# Covers: config validation, owner/log token actions and stale-owner fallback,
+# readiness signals (including chunk boundaries and restart reset), start/stop
+# lifecycle, exit tokens, launch failure, rapid-restart races, workspace
+# isolation, stale-PID safety, graceful-stop escalation, log rotation,
+# created/closed hooks, and viewer plumbing.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")/.." && pwd)
@@ -31,6 +32,14 @@ STUB="$TMP/fut-stub"
 cat > "$STUB" <<'SH'
 #!/bin/sh
 out="${FUT_STUB_LOG:?}"
+reject=${FUT_STUB_REJECT_PANE-}
+previous=
+for argument in "$@"; do
+  if [ "$previous" = "--action-pane-id" ] && [ -n "$reject" ] && [ "$argument" = "$reject" ]; then
+    exit 2
+  fi
+  previous=$argument
+done
 { printf '%s\037' "$@"; printf '\n'; } >> "$out"
 SH
 chmod +x "$STUB"
@@ -61,6 +70,19 @@ status_is() { # <workspace-id> <glyph>
     END { exit value == glyph ? 0 : 1 }' "$TOKENS"
 }
 
+status_action() { # <workspace-id> -> "<flag> <value>" or empty
+  awk -v ws="$1" 'BEGIN { FS = "\037" }
+    $3 == "token" && $4 == "publish" && $6 == "status" && $9 == ws && $7 != "" {
+      action = $10 == "" ? "" : $10 " " $11
+    }
+    END { print action }' "$TOKENS"
+}
+
+empty_tokens_have_no_actions() {
+  awk 'BEGIN { FS = "\037" }
+    $3 == "token" && $4 == "publish" && $7 == "" && $10 != "" { exit 1 }' "$TOKENS"
+}
+
 state_dir() { find "$FUT_RUN_STATE_DIR" -type d -name "$1" 2>/dev/null | head -1; }
 
 state_get() { # <workspace-id> <python expression over `s`>
@@ -74,10 +96,10 @@ print($2)
 " "$(state_dir "$1")/state.json"
 }
 
-run() { # <workspace-id> <config-json> <subcommand>
-  local ws=$1 cfg=$2 cmd=$3
+run() { # <workspace-id> <config-json> <subcommand> [starter-pane-id]
+  local ws=$1 cfg=$2 cmd=$3 pane=${4-}
   mkdir -p "$TMP/roots/$ws"
-  env FUT_WORKSPACE_ID="$ws" FUT_WORKSPACE_ROOT="$TMP/roots/$ws" \
+  env FUT_WORKSPACE_ID="$ws" FUT_WORKSPACE_ROOT="$TMP/roots/$ws" FUT_PANE_ID="$pane" \
       FUT_EXTENSION_CONFIG="$cfg" "$RUNCTL" "$cmd"
 }
 
@@ -124,19 +146,41 @@ run w-cfg '{"command":["x"],"grace_seconds":true}' restart 2>"$TMP/err" && fail 
 run w-cfg '{"command":["x"],"signal":false}' restart 2>"$TMP/err" && fail "non-string signal accepted"
 run w-cfg '{"command":["x"],"signal":""}' restart 2>"$TMP/err" && fail "empty signal accepted"
 run w-cfg '{"command":["x"],"auto_start":"yes"}' restart 2>"$TMP/err" && fail "non-boolean auto_start accepted"
+run w-cfg '{"command":["x"],"click":"OWNER"}' restart 2>"$TMP/err" && fail "unknown click accepted"
+grep -q 'click must be "owner" or "logs"' "$TMP/err" || fail "invalid-click message"
+run w-cfg '{"command":["x"],"click":true}' restart 2>"$TMP/err" && fail "non-string click accepted"
 [ "$(token_count w-cfg)" = 0 ] || fail "config errors published tokens"
 ok "config validation rejects bad [extension.run] tables"
 
 # --- 2. start, running state, play token ----------------------------------------
 PIDS1="$TMP/pids-w1"; : > "$PIDS1"
-out=$(run w1 "$(sleeper_cfg "$PIDS1")" restart) || fail "restart failed"
+out=$(run w1 "$(sleeper_cfg "$PIDS1")" restart owner-pane-a) || fail "restart failed"
 [ -z "$out" ] || fail "restart was not silent: $out"
 phase_is w1 running || fail "w1 not running"
 wait_for 5 child_alive w1 || fail "w1 child not alive"
 token_is w1 play || fail "w1 token is '$(last_token w1)', wanted play"
 status_is w1 '▶' || fail "w1 general status did not show running"
+[ "$(state_get w1 "s.get('owner_pane_id')")" = owner-pane-a ] || fail "manual starter pane not recorded"
+[ "$(state_get w1 "s.get('click')")" = owner ] || fail "default click was not owner"
+[ "$(status_action w1)" = "--action-pane-id owner-pane-a" ] || fail "owner action is '$(status_action w1)'"
+empty_tokens_have_no_actions || fail "an empty token carried an action"
 grep -q "fut-run · start · generation 1" "$(state_dir w1)/run.log" || fail "missing start separator"
-ok "restart starts the runner, records state, publishes play"
+ok "restart records the owner and publishes actionable play tokens by default"
+
+# --- clickable status variants ------------------------------------------------
+run w-click-logs '{"command":["sh","-c","exit 0"],"click":"logs"}' restart ignored-pane || fail "logs-click restart failed"
+wait_for 5 phase_is w-click-logs exited || fail "logs-click runner never exited"
+[ "$(state_get w-click-logs "s.get('click')")" = logs ] || fail "logs click not recorded"
+[ "$(status_action w-click-logs)" = "--action-command logs" ] || fail "logs action is '$(status_action w-click-logs)'"
+
+export FUT_STUB_REJECT_PANE=closed-pane
+PIDS_STALE="$TMP/pids-w-stale"; : > "$PIDS_STALE"
+run w-stale-owner "$(sleeper_cfg "$PIDS_STALE")" restart closed-pane || fail "stale-owner restart failed"
+[ "$(status_action w-stale-owner)" = "" ] || fail "rejected stale owner did not fall back"
+run w-stale-owner '{}' stop || fail "stale-owner cleanup failed"
+unset FUT_STUB_REJECT_PANE
+empty_tokens_have_no_actions || fail "an empty token carried an action"
+ok "logs actions use run:logs and rejected stale owners fall back to plain tokens"
 
 # --- 3. readiness signal spans output chunks and resets on restart ---------------
 READY_CFG=$(printf '{"command":["sh","-c","printf STATUS:; sleep 1; printf READY >&2; sleep 300","%s"],"signal":"STATUS:READY"}' "$MARKER")
@@ -162,14 +206,16 @@ token_is w-early-fail cross || fail "early failing runner did not publish cross"
 ok "exit before readiness publishes stop for code 0 and cross for failure"
 
 # --- 5. rapid concurrent restarts leave exactly one runner ----------------------
-for _ in 1 2 3 4 5; do run w1 "$(sleeper_cfg "$PIDS1")" restart & done
+for i in 1 2 3 4 5; do run w1 "$(sleeper_cfg "$PIDS1")" restart "race-pane-$i" & done
 wait
 wait_for 5 lines_at_least "$PIDS1" 6 || fail "restarts did not all start"
 [ "$(alive_count "$PIDS1")" = 1 ] || fail "expected exactly 1 live child, got $(alive_count "$PIDS1")"
 [ "$(state_get w1 "s['generation']")" = 6 ] || fail "generation is $(state_get w1 "s['generation']"), wanted 6"
 phase_is w1 running || fail "w1 not running after races"
 token_is w1 play || fail "w1 token after races"
-ok "5 concurrent restarts: one survivor, generation 6, no orphans"
+RACE_OWNER=$(state_get w1 "s.get('owner_pane_id')")
+[ "$(status_action w1)" = "--action-pane-id $RACE_OWNER" ] || fail "latest generation does not own final action"
+ok "5 concurrent restarts: one survivor and latest generation owns the final action"
 
 # --- 6. isolation, stop, explicit-termination token ------------------------------
 PIDS2="$TMP/pids-w2"; : > "$PIDS2"
@@ -257,7 +303,7 @@ grep -q "fut-run · exit · generation 1 · code 0" "$D7/run.log" || fail "missi
 ok "log rotation copies then truncates; run.log inode stays stable and both files stay bounded"
 
 # --- 12. creation hooks: project auto-start or merged-config pause ------------------
-mkdir -p "$TMP/roots/w8" "$TMP/roots/w9" "$TMP/roots/w-auto" "$TMP/roots/w-new"
+mkdir -p "$TMP/roots/w8" "$TMP/roots/w9" "$TMP/roots/w-auto" "$TMP/roots/w-new" "$TMP/roots/w-logs-pause"
 HOOK_CFG=$(printf '{"command":["sh","-c","touch %s","fut-run-smoke-w8"],"auto_start":true}' "$TMP/w8-started")
 hook() { # <workspace-id> <event> <root> [resolved-config-json] [trusted-config-json]
   local cfg=${4-}
@@ -265,17 +311,24 @@ hook() { # <workspace-id> <event> <root> [resolved-config-json] [trusted-config-
   [ -n "$cfg" ] || cfg='{}'
   [ -n "$trusted" ] || trusted='{}'
   printf '{"version":1,"event":"%s","workspace":{"id":"%s","name":"x","root":"%s"}}\n' "$2" "$1" "$3" |
-    env FUT_WORKSPACE_ID="$1" FUT_WORKSPACE_ROOT="$3" FUT_EVENT="$2" \
+    env FUT_WORKSPACE_ID="$1" FUT_WORKSPACE_ROOT="$3" FUT_PANE_ID=hook-pane FUT_EVENT="$2" \
       FUT_EXTENSION_CONFIG="$cfg" FUT_EXTENSION_TRUSTED_CONFIG="$trusted" "$RUNCTL" hook
 }
 hook w8 workspace.created "$TMP/roots/w8" "$HOOK_CFG" || fail "created hook failed"
 hook w9 workspace.created "$TMP/roots/w9" || fail "created hook (unconfigured) failed"
 token_is w8 pause || fail "w8 created token is '$(last_token w8)'"
+[ "$(status_action w8)" = "" ] || fail "owner-mode pause without manual owner had an action"
 [ "$(token_count w9)" = 0 ] || fail "unconfigured workspace published tokens"
 [ ! -e "$TMP/roots/w8/.fut/config.toml" ] || fail "global-only smoke unexpectedly used local config"
 [ ! -e "$(dirname "$(state_dir w1)")/w8/state.json" ] || fail "created hook wrote state"
 [ ! -e "$TMP/w8-started" ] || fail "created hook auto-started the command"
 pgrep -f "fut-run-smoke-w8" >/dev/null && fail "created hook left a process behind"
+
+hook w-logs-pause workspace.created "$TMP/roots/w-logs-pause" \
+  '{"command":["unused"],"click":"logs"}' || fail "logs-click created hook failed"
+token_is w-logs-pause pause || fail "logs-click created hook did not publish pause"
+[ "$(status_action w-logs-pause)" = "--action-command logs" ] || \
+  fail "pause token did not carry logs action"
 
 AUTO_PIDS="$TMP/pids-w-auto"; : > "$AUTO_PIDS"
 AUTO_TRUSTED=$(printf '{"command":["sh","-c","echo $$ >> %s; sleep 300","%s"],"auto_start":true}' "$AUTO_PIDS" "$MARKER")
@@ -284,6 +337,9 @@ hook w-auto session.created "$TMP/roots/w-auto" \
   "$AUTO_TRUSTED" || fail "trusted auto-start hook failed"
 phase_is w-auto running || fail "trusted auto-start runner is not running"
 wait_for 5 child_alive w-auto || fail "trusted auto-start child is not alive"
+[ "$(state_get w-auto "s.get('owner_pane_id')")" = None ] || \
+  fail "automatic start captured the hook pane as owner"
+[ "$(status_action w-auto)" = "" ] || fail "automatic start had an owner action"
 [ "$(state_get w-auto "s.get('command') == ['sh', '-c', 'echo \$\$ >> $AUTO_PIDS; sleep 300', '$MARKER']")" = True ] || \
   fail "auto-start did not use trusted command"
 token_is w-auto play || fail "trusted auto-start did not publish play"

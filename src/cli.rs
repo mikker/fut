@@ -49,9 +49,9 @@ use crate::{
     protocol::{
         AcknowledgedCommand, AgentPromptMode, ClientMessage, ClientMode, ContextScope,
         ContextualCommand, Envelope, ExtensionCapabilityDeclaration, ExtensionCatalog,
-        ExtensionDeclaration, PROTOCOL_VERSION, PROTOCOL_VERSION_0_1, RenameSelector,
-        ServerMessage, TerminalContext, TerminalInputOperation, codec, decode_payload,
-        encode_payload,
+        ExtensionDeclaration, PROTOCOL_VERSION, PROTOCOL_VERSION_0_1,
+        PresentationTokenPublishAction, RenameSelector, ServerMessage, TerminalContext,
+        TerminalInputOperation, codec, decode_payload, encode_payload,
     },
     resources::{
         PanePathRef, PaneSnapshot, PresentationTokenTarget, ResourceSnapshot, SessionSelector,
@@ -876,6 +876,12 @@ struct TokenPublishArgs {
     /// Publish to this pane.
     #[arg(long)]
     pane_id: Option<PaneId>,
+    /// Make the token navigate to this live descendant pane when activated.
+    #[arg(long, conflicts_with = "action_command")]
+    action_pane_id: Option<PaneId>,
+    /// Make the token run this command from the publishing extension.
+    #[arg(long, conflicts_with = "action_pane_id")]
+    action_command: Option<String>,
 }
 
 pub fn complete() {
@@ -1709,6 +1715,15 @@ async fn execute(cli: Cli) -> Result<()> {
                 (None, None, None, Some(id)) => PresentationTokenTarget::Pane(id),
                 _ => unreachable!("clap requires exactly one token target"),
             };
+            let action = match (args.action_pane_id, args.action_command) {
+                (Some(pane_id), None) => Some(PresentationTokenPublishAction::Pane { pane_id }),
+                (None, Some(command)) => {
+                    Some(PresentationTokenPublishAction::ExtensionCommand { command })
+                }
+                (None, None) => None,
+                (Some(_), Some(_)) => unreachable!("clap requires at most one token action"),
+            };
+            let published_action = action.clone();
             match control(
                 &socket,
                 ClientMessage::PublishToken {
@@ -1716,6 +1731,7 @@ async fn execute(cli: Cli) -> Result<()> {
                     token: args.token.clone(),
                     value: args.value,
                     target,
+                    action,
                 },
             )
             .await?
@@ -1730,6 +1746,7 @@ async fn execute(cli: Cli) -> Result<()> {
                         "extension": args.extension,
                         "token": args.token,
                         "target": target,
+                        "action": published_action,
                         "revision": resource_revision,
                         "changed": changed,
                     }),
@@ -4096,6 +4113,62 @@ mod tests {
                 })
             }) if id == workspace_id
         ));
+    }
+
+    #[test]
+    fn token_publish_accepts_one_optional_action() {
+        let workspace_id = WorkspaceId::new();
+        let pane_id = PaneId::new();
+        let workspace_id_text = workspace_id.to_string();
+        let pane_id_text = pane_id.to_string();
+        let base = [
+            "fut",
+            "token",
+            "publish",
+            "status",
+            "state",
+            "ready",
+            "--workspace-id",
+            workspace_id_text.as_str(),
+        ];
+        let parsed = try_parse_cli_from(
+            base.into_iter()
+                .chain(["--action-pane-id", pane_id_text.as_str()]),
+        )
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Token {
+                command: TokenCommand::Publish(TokenPublishArgs {
+                    action_pane_id: Some(id),
+                    action_command: None,
+                    ..
+                })
+            }) if id == pane_id
+        ));
+
+        let parsed =
+            try_parse_cli_from(base.into_iter().chain(["--action-command", "logs"])).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Token {
+                command: TokenCommand::Publish(TokenPublishArgs {
+                    action_pane_id: None,
+                    action_command: Some(command),
+                    ..
+                })
+            }) if command == "logs"
+        ));
+
+        assert!(
+            try_parse_cli_from(base.into_iter().chain([
+                "--action-pane-id",
+                pane_id_text.as_str(),
+                "--action-command",
+                "logs",
+            ]))
+            .is_err()
+        );
     }
 
     #[test]

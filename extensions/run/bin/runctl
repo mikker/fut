@@ -16,7 +16,7 @@ $FUT_RUN_STATE_DIR or ${XDG_STATE_HOME:-~/.local/state}/fut-run:
     state.lock       guards state.json writes and token publishes
     supervisor.lock  held by the live supervisor for its whole life;
                      this lock, not any recorded PID, is the liveness truth
-    state.json       generation, phase, PIDs, exit details
+    state.json       generation, phase, PIDs, exit details, token click target
     run.log          stable combined stdout/stderr, bounded
     run.log.1        previous rotation
 
@@ -28,6 +28,8 @@ Ordering rules that keep races safe:
     still carries its own generation, so a superseded runner goes silent.
   - Token publishes happen under state.lock right after the generation
     check, so the last published state always matches the newest generation.
+    A manual restart stores its FUT_PANE_ID with that generation; automatic
+    starts deliberately have no owner.
 """
 
 import fcntl
@@ -42,6 +44,7 @@ import signal
 import subprocess
 import sys
 import time
+from typing import NamedTuple
 
 TOKENS = {
     "pause": "…",
@@ -50,7 +53,7 @@ TOKENS = {
     "stop": "■",
     "cross": "✗",
 }
-CONFIG_KEYS = {"auto_start", "command", "grace_seconds", "signal"}
+CONFIG_KEYS = {"auto_start", "click", "command", "grace_seconds", "signal"}
 TRUSTED_CONFIG_ENV = "FUT_EXTENSION_TRUSTED_CONFIG"
 DEFAULT_GRACE = 3.0
 CLOSE_GRACE = 0.5        # workspace.closed must fit Fut's 5s hook timeout
@@ -187,7 +190,36 @@ def write_state(wsdir, state):
     os.replace(tmp, path)
 
 
-def publish_tokens(active):
+def publish_token(base_argv, target_argv, name, value, action):
+    plain_argv = base_argv + [name, value] + target_argv
+    argv = plain_argv.copy()
+    action_attached = bool(value and action is not None)
+    if action_attached:
+        argv.extend(action)
+    try:
+        result = subprocess.run(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+        # An owner can disappear or a command can become unavailable after an
+        # extension reload. The status transition must still be visible when
+        # the daemon rejects its action.
+        if result.returncode and action_attached:
+            subprocess.run(
+                plain_argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def publish_tokens(active, click="owner", owner_pane_id=None):
     """Publish the general status and exactly one styled workspace token.
 
     The general status makes the state usable in a single workspace-row
@@ -201,31 +233,29 @@ def publish_tokens(active):
     workspace = os.environ.get("FUT_WORKSPACE_ID")
     if not (fut_bin and socket and workspace):
         return
+    base_argv = [
+        fut_bin,
+        "--socket",
+        socket,
+        "token",
+        "publish",
+        extension,
+    ]
+    target_argv = ["--workspace-id", workspace]
+    action = None
+    if click == "logs":
+        action = ["--action-command", "logs"]
+    elif click == "owner" and isinstance(owner_pane_id, str) and owner_pane_id:
+        action = ["--action-pane-id", owner_pane_id]
     status = "…" if active == "launching" else TOKENS[active]
     values = [("status", status), (active, TOKENS[active])]
     values.extend((name, "") for name in TOKENS if name != active)
     for name, value in values:
-        try:
-            subprocess.run(
-                [
-                    fut_bin,
-                    "--socket",
-                    socket,
-                    "token",
-                    "publish",
-                    extension,
-                    name,
-                    value,
-                    "--workspace-id",
-                    workspace,
-                ],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=5,
-            )
-        except (OSError, subprocess.SubprocessError):
-            pass
+        publish_token(base_argv, target_argv, name, value, action)
+
+
+def publish_state_tokens(active, state):
+    publish_tokens(active, state.get("click", "owner"), state.get("owner_pane_id"))
 
 
 # --- configuration -----------------------------------------------------------
@@ -233,6 +263,14 @@ def publish_tokens(active):
 
 class ConfigError(ValueError):
     pass
+
+
+class RunConfig(NamedTuple):
+    command: list
+    grace: float
+    readiness_signal: str
+    auto_start: bool
+    click: str
 
 
 def parse_config(require_command, environment="FUT_EXTENSION_CONFIG"):
@@ -252,7 +290,7 @@ def parse_config(require_command, environment="FUT_EXTENSION_CONFIG"):
     if unknown:
         raise ConfigError(
             "unknown %s key(s): %s "
-            "(expected: auto_start, command, grace_seconds, signal)"
+            "(expected: auto_start, click, command, grace_seconds, signal)"
             % (label, ", ".join(unknown))
         )
     command = data.get("command")
@@ -284,7 +322,10 @@ def parse_config(require_command, environment="FUT_EXTENSION_CONFIG"):
     auto_start = data.get("auto_start", False)
     if type(auto_start) is not bool:
         raise ConfigError("%s auto_start must be a boolean" % label)
-    return command, float(grace), readiness_signal, auto_start
+    click = data.get("click", "owner")
+    if click not in ("owner", "logs"):
+        raise ConfigError('%s click must be "owner" or "logs"' % label)
+    return RunConfig(command, float(grace), readiness_signal, auto_start, click)
 
 
 def load_config(require_command, environment="FUT_EXTENSION_CONFIG"):
@@ -297,8 +338,7 @@ def load_config(require_command, environment="FUT_EXTENSION_CONFIG"):
 def stop_grace():
     """Invalid config must never prevent an already-running process from stopping."""
     try:
-        _, grace, _, _ = parse_config(require_command=False)
-        return grace
+        return parse_config(require_command=False).grace
     except ConfigError:
         return DEFAULT_GRACE
 
@@ -432,7 +472,7 @@ def record_ready(wsdir, generation):
                 return True
             state.update(phase="running", ready_at=timestamp())
             write_state(wsdir, state)
-            publish_tokens("play")
+            publish_state_tokens("play", state)
             return True
     except RuntimeError:
         return False
@@ -480,24 +520,28 @@ def supervise(wsdir, generation, command, cwd, grace, readiness_signal, ack_fd):
 
     try:
         with state_lock(wsdir):
-            if int(read_state(wsdir).get("generation", 0)) != generation:
+            previous = read_state(wsdir)
+            if int(previous.get("generation", 0)) != generation:
                 raise RuntimeError("superseded by a newer restart")
-            write_state(
-                wsdir,
-                {
-                    "generation": generation,
-                    "phase": "launching" if readiness_signal is not None else "running",
-                    "command": command,
-                    "cwd": cwd,
-                    "signal": readiness_signal,
-                    "supervisor_pid": os.getpid(),
-                    "child_pid": child.pid,
-                    "child_pgid": child.pid,
-                    "started_at": timestamp(),
-                    "stop_requested": False,
-                },
+            state = {
+                "generation": generation,
+                "phase": "launching" if readiness_signal is not None else "running",
+                "command": command,
+                "cwd": cwd,
+                "signal": readiness_signal,
+                "supervisor_pid": os.getpid(),
+                "child_pid": child.pid,
+                "child_pgid": child.pid,
+                "started_at": timestamp(),
+                "stop_requested": False,
+                "click": previous.get("click", "owner"),
+            }
+            if previous.get("owner_pane_id"):
+                state["owner_pane_id"] = previous["owner_pane_id"]
+            write_state(wsdir, state)
+            publish_state_tokens(
+                "launching" if readiness_signal is not None else "play", state
             )
-            publish_tokens("launching" if readiness_signal is not None else "play")
             ack(ack_fd, "ok")
             os.close(ack_fd)
     except RuntimeError as error:
@@ -592,25 +636,26 @@ def record_exit(wsdir, generation, command, cwd, returncode, error, terminated):
                 return
             stop_requested = bool(state.get("stop_requested")) or terminated
             clean = returncode == 0 and not stop_requested
-            write_state(
-                wsdir,
-                {
-                    "generation": generation,
-                    "phase": "exited",
-                    "command": command,
-                    "cwd": cwd,
-                    "signal": state.get("signal"),
-                    "ready_at": state.get("ready_at"),
-                    "stop_requested": stop_requested,
-                    "exit": {
-                        "code": returncode if returncode is not None and returncode >= 0 else None,
-                        "signal": -returncode if returncode is not None and returncode < 0 else None,
-                        "error": error,
-                        "at": timestamp(),
-                    },
+            exited = {
+                "generation": generation,
+                "phase": "exited",
+                "command": command,
+                "cwd": cwd,
+                "signal": state.get("signal"),
+                "ready_at": state.get("ready_at"),
+                "stop_requested": stop_requested,
+                "click": state.get("click", "owner"),
+                "exit": {
+                    "code": returncode if returncode is not None and returncode >= 0 else None,
+                    "signal": -returncode if returncode is not None and returncode < 0 else None,
+                    "error": error,
+                    "at": timestamp(),
                 },
-            )
-            publish_tokens("stop" if clean else "cross")
+            }
+            if state.get("owner_pane_id"):
+                exited["owner_pane_id"] = state["owner_pane_id"]
+            write_state(wsdir, exited)
+            publish_state_tokens("stop" if clean else "cross", exited)
     except RuntimeError:
         pass
 
@@ -668,9 +713,12 @@ def with_control_lock(wsdir, timeout=CONTROL_TIMEOUT):
     return control
 
 
-def restart_runner(config):
+def restart_runner(config, owner_pane_id=None):
     workspace = require_env("FUT_WORKSPACE_ID")
-    command, grace, readiness_signal, _ = config
+    command = config.command
+    grace = config.grace
+    readiness_signal = config.readiness_signal
+    click = config.click
     cwd = os.environ.get("FUT_WORKSPACE_ROOT") or os.getcwd()
     wsdir = workspace_dir(workspace)
     with_control_lock(wsdir)
@@ -686,7 +734,12 @@ def restart_runner(config):
                 command=command,
                 cwd=cwd,
                 signal=readiness_signal,
+                click=click,
             )
+            if owner_pane_id:
+                state["owner_pane_id"] = owner_pane_id
+            else:
+                state.pop("owner_pane_id", None)
             state.pop("ready_at", None)
             write_state(wsdir, state)
         terminate_runner(wsdir, grace)
@@ -708,7 +761,9 @@ def restart_runner(config):
 
 
 def cmd_restart():
-    restart_runner(load_config(require_command=True))
+    restart_runner(
+        load_config(require_command=True), owner_pane_id=os.environ.get("FUT_PANE_ID")
+    )
 
 
 def repair_stopped_runner(wsdir):
@@ -724,7 +779,7 @@ def repair_stopped_runner(wsdir):
                 "at": timestamp(),
             }
             write_state(wsdir, state)
-            publish_tokens("cross")
+            publish_state_tokens("cross", state)
 
 
 def cmd_stop():
@@ -779,24 +834,23 @@ def cmd_hook():
         return
     if event == "session.created":
         trusted = load_config(require_command=False, environment=TRUSTED_CONFIG_ENV)
-        trusted_command, _, _, auto_start = trusted
-        if auto_start:
-            if trusted_command is None:
+        if trusted.auto_start:
+            if trusted.command is None:
                 fail("trusted [extension.run] auto_start requires command")
             restart_runner(trusted)
     elif event == "workspace.created":
-        _, _, _, auto_start = load_config(
+        trusted = load_config(
             require_command=False, environment=TRUSTED_CONFIG_ENV
         )
-        if auto_start:
+        if trusted.auto_start:
             return
-        command, _, _, _ = load_config(require_command=False)
-        if command is None:
+        config = load_config(require_command=False)
+        if config.command is None:
             return
         wsdir = workspace_dir(workspace)
         with state_lock(wsdir):
             if not supervisor_alive(wsdir) and read_state(wsdir).get("phase") != "running":
-                publish_tokens("pause")
+                publish_tokens("pause", click=config.click)
     elif event == "workspace.closed":
         wsdir = workspace_dir(workspace, create=False)
         if not os.path.isdir(wsdir):

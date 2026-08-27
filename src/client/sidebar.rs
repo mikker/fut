@@ -9,7 +9,10 @@ use ratatui::{
 use crate::{
     domain::{PaneId, SessionId, TerminalId, WorkspaceId},
     protocol::SelectedTarget,
-    resources::{MaterializedTokenMap, PanePathRef, ResourceSnapshot},
+    resources::{
+        MaterializedTokenMap, MaterializedTokenValue, PanePathRef, PresentationTokenTarget,
+        ResourceSnapshot,
+    },
 };
 
 use super::{
@@ -25,8 +28,8 @@ use super::{
     navigation::NavigationHistory,
     notifications::{ActivityIndicator, NotificationState},
     presentation::{
-        ItemState, TokenValue, apply_item_state, extension_token_value, render_token_segments,
-        truncate_line,
+        ItemState, PresentationTokenInvocation, RenderedTokenLine, TokenValue, apply_item_state,
+        materialized_extension_token_value, render_token_segments, truncate_line,
     },
 };
 
@@ -151,15 +154,23 @@ struct WorkspaceItem {
 }
 
 impl WorkspaceItem {
-    fn token_value(&self, token: &str) -> &str {
-        self.tokens.get(token).map_or("", String::as_str)
+    fn token_value(&self, token: &str) -> Option<&MaterializedTokenValue> {
+        self.tokens.get(token)
+    }
+
+    fn token_text(&self, token: &str) -> &str {
+        self.token_value(token)
+            .map_or("", |value| value.text.as_str())
     }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct WorkspaceModel {
+    session_id: Option<SessionId>,
     session_name: String,
     session_tokens: MaterializedTokenMap,
+    focused_tab_id: Option<crate::domain::TabId>,
+    focused_pane_id: Option<PaneId>,
     tab_tokens: MaterializedTokenMap,
     pane_tokens: MaterializedTokenMap,
     items: Vec<WorkspaceItem>,
@@ -188,8 +199,13 @@ impl WorkspaceModel {
         let focused_tab = focused_workspace
             .and_then(|workspace| workspace.tabs.iter().find(|tab| tab.id == focused.tab_id));
         Self {
+            session_id: Some(session.id),
             session_name: sanitize(&session.name),
             session_tokens: session.tokens.clone(),
+            focused_tab_id: focused_tab.map(|tab| tab.id),
+            focused_pane_id: focused_tab
+                .and_then(|tab| tab.panes.iter().find(|pane| pane.id == focused.pane_id))
+                .map(|pane| pane.id),
             tab_tokens: focused_tab
                 .map_or_else(MaterializedTokenMap::new, |tab| tab.tokens.clone()),
             pane_tokens: focused_tab
@@ -231,18 +247,38 @@ impl WorkspaceModel {
         }
     }
 
-    fn extension_value(&self, token: &str) -> &str {
+    fn extension_value(
+        &self,
+        token: &str,
+    ) -> Option<(&MaterializedTokenValue, PresentationTokenTarget)> {
         self.session_tokens
             .get(token)
+            .and_then(|value| {
+                self.session_id
+                    .map(|id| (value, PresentationTokenTarget::Session(id)))
+            })
             .or_else(|| {
                 self.items
                     .iter()
                     .find(|item| item.current)
-                    .and_then(|item| item.tokens.get(token))
+                    .and_then(|item| {
+                        item.tokens
+                            .get(token)
+                            .map(|value| (value, PresentationTokenTarget::Workspace(item.id)))
+                    })
             })
-            .or_else(|| self.tab_tokens.get(token))
-            .or_else(|| self.pane_tokens.get(token))
-            .map_or("", String::as_str)
+            .or_else(|| {
+                self.tab_tokens.get(token).and_then(|value| {
+                    self.focused_tab_id
+                        .map(|id| (value, PresentationTokenTarget::Tab(id)))
+                })
+            })
+            .or_else(|| {
+                self.pane_tokens.get(token).and_then(|value| {
+                    self.focused_pane_id
+                        .map(|id| (value, PresentationTokenTarget::Pane(id)))
+                })
+            })
     }
 }
 
@@ -302,6 +338,7 @@ pub(super) enum ComponentEffect {
     ToggleDisplay,
     RenameWorkspace(WorkspaceId, String),
     Navigate(PaneId, NavigationScope, SidebarComponentKind),
+    Token(PresentationTokenInvocation),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -464,6 +501,20 @@ impl WorkspacesComponent {
         if matches!(self.status, WorkspaceStatus::Switching) {
             return ComponentEffect::Stay;
         }
+        if !self.help
+            && let Some(invocation) = workspace_token_at(
+                &self.model,
+                self.selected,
+                Some(&self.status),
+                area,
+                position,
+                ui,
+                column,
+                row,
+            )
+        {
+            return ComponentEffect::Token(invocation);
+        }
         if let Some(hotkey) = workspace_hotkey_at(
             &self.model,
             &self.status,
@@ -512,6 +563,11 @@ impl WorkspacesComponent {
         column: u16,
         row: u16,
     ) -> ComponentEffect {
+        if let Some(invocation) =
+            workspace_token_at(&self.model, None, None, area, position, ui, column, row)
+        {
+            return ComponentEffect::Token(invocation);
+        }
         self.item_at(area, position, ui, column, row)
             .map(switch_to)
             .unwrap_or(ComponentEffect::Stay)
@@ -1388,10 +1444,11 @@ struct WorkspaceRowGeometry {
 
 struct WorkspaceGeometry {
     content: Rect,
-    header: Line<'static>,
+    header: RenderedTokenLine,
+    header_height: u16,
     rows: Rect,
     row_geometries: Vec<WorkspaceRowGeometry>,
-    footer: Vec<Line<'static>>,
+    footer: Vec<RenderedTokenLine>,
 }
 
 #[allow(
@@ -1483,6 +1540,7 @@ fn workspace_geometry(
     Some(WorkspaceGeometry {
         content,
         header,
+        header_height,
         rows,
         row_geometries,
         footer,
@@ -1521,6 +1579,90 @@ fn workspace_hotkey_at(
     lines
         .get(usize::from(row.checked_sub(footer_y)?))?
         .action_at(usize::from(column - geometry.content.x))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "token hit testing consumes the renderer's complete configurable geometry"
+)]
+fn workspace_token_at(
+    model: &WorkspaceModel,
+    selected: Option<WorkspaceId>,
+    status: Option<&WorkspaceStatus>,
+    area: Rect,
+    position: SidebarSide,
+    ui: &UiConfig,
+    column: u16,
+    row: u16,
+) -> Option<PresentationTokenInvocation> {
+    if sidebar_is_minimized(area, position, ui) {
+        return None;
+    }
+    let geometry = workspace_geometry(model, selected, status, false, 0, area, position, ui)?;
+    if geometry.header_height > 0 && row == geometry.content.y && column >= geometry.content.x {
+        let relative = usize::from(column - geometry.content.x);
+        if let Some(invocation) = geometry
+            .header
+            .truncated(usize::from(geometry.content.width))
+            .action_at(relative)
+        {
+            return Some(invocation.clone());
+        }
+    }
+
+    let footer_y = geometry
+        .content
+        .bottom()
+        .saturating_sub(u16::try_from(geometry.footer.len()).unwrap_or(u16::MAX));
+    if row >= footer_y
+        && column >= geometry.content.x
+        && let Some(line) = geometry.footer.get(usize::from(row - footer_y))
+        && let Some(invocation) = line
+            .truncated(usize::from(geometry.content.width))
+            .action_at(usize::from(column - geometry.content.x))
+    {
+        return Some(invocation.clone());
+    }
+
+    let row_geometry = geometry.row_geometries.into_iter().find(|geometry| {
+        matches!(geometry.row, VisibleRow::Item(_)) && rect_contains(geometry.area, column, row)
+    })?;
+    let VisibleRow::Item(index) = row_geometry.row else {
+        return None;
+    };
+    let item = model.items.get(index)?;
+    let lines = workspace_row_lines(item, selected == Some(item.id), 0, position, ui);
+    let relative_x = usize::from(column - row_geometry.area.x);
+    let width = usize::from(row_geometry.area.width);
+    if row == row_geometry.area.y {
+        let left_width = lines.left.width().min(width);
+        let right_width = lines.right.width().min(width.saturating_sub(left_width));
+        let body_width = width.saturating_sub(left_width + right_width);
+        if relative_x < left_width {
+            return lines
+                .left
+                .truncated(left_width)
+                .action_at(relative_x)
+                .cloned();
+        }
+        if relative_x < left_width + body_width {
+            return lines
+                .body
+                .truncated(body_width)
+                .action_at(relative_x - left_width)
+                .cloned();
+        }
+        return lines
+            .right
+            .truncated(right_width)
+            .action_at(relative_x.saturating_sub(width - right_width))
+            .cloned();
+    }
+    lines
+        .detail?
+        .truncated(width)
+        .action_at(relative_x)
+        .cloned()
 }
 
 #[allow(
@@ -1661,7 +1803,7 @@ fn render_minimized_model(
         position,
         ui,
     );
-    let header_height = render_sidebar_header(&header, content, 2, buffer);
+    let header_height = render_sidebar_header(&header.line, content, 2, buffer);
     let rows = Rect::new(
         content.x,
         content.y.saturating_add(header_height),
@@ -1800,7 +1942,7 @@ fn render_model(
         return;
     };
     render_sidebar_header(
-        &geometry.header,
+        &geometry.header.line,
         geometry.content,
         geometry.content.width,
         buffer,
@@ -1876,7 +2018,7 @@ fn render_model(
         buffer.set_line(
             geometry.content.x,
             footer_y.saturating_add(offset),
-            &truncate_line(footer, usize::from(geometry.content.width)),
+            &footer.truncated(usize::from(geometry.content.width)).line,
             geometry.content.width,
         );
     }
@@ -1889,14 +2031,17 @@ fn render_sidebar_footer(
     spinner_frame: usize,
     side: SidebarSide,
     ui: &UiConfig,
-) -> Vec<Line<'static>> {
+) -> Vec<RenderedTokenLine> {
     if help
         || matches!(status, Some(WorkspaceStatus::Ready))
             && workspace_config(ui, side).uses_default_footer
     {
         return workspace_hotkey_lines(help, side, ui)
             .into_iter()
-            .map(|hotkey| hotkey.line)
+            .map(|hotkey| RenderedTokenLine {
+                line: hotkey.line,
+                actions: Vec::new(),
+            })
             .collect();
     }
     let footer = render_sidebar_chrome(
@@ -2046,7 +2191,7 @@ fn render_sidebar_chrome(
     spinner_frame: usize,
     side: SidebarSide,
     ui: &UiConfig,
-) -> ratatui::text::Line<'static> {
+) -> RenderedTokenLine {
     let current = model.items.iter().find(|item| item.current);
     let icons = ui.icons.resolve();
     let display = side.config(ui).display.label();
@@ -2079,23 +2224,31 @@ fn render_sidebar_chrome(
                 ),
                 None => TokenValue::plain(format!(" {display} · {visibility}")),
             },
-            _ => extension_token_value(ui, token, model.extension_value(token), spinner_frame),
+            _ => materialized_extension_token_value(
+                ui,
+                token,
+                model.extension_value(token),
+                spinner_frame,
+            ),
         },
     )
 }
 
-fn render_workspace_row(
+struct WorkspaceRowLines {
+    style: Style,
+    left: RenderedTokenLine,
+    body: RenderedTokenLine,
+    right: RenderedTokenLine,
+    detail: Option<RenderedTokenLine>,
+}
+
+fn workspace_row_lines(
     item: &WorkspaceItem,
     selected: bool,
     spinner_frame: usize,
-    area: Rect,
     side: SidebarSide,
     ui: &UiConfig,
-    buffer: &mut Buffer,
-) {
-    if area.width == 0 {
-        return;
-    }
+) -> WorkspaceRowLines {
     let icons = ui.icons.resolve();
     let state = ItemState {
         // Keyboard selection and closing own the whole row. Current styling is
@@ -2107,7 +2260,6 @@ fn render_workspace_row(
     };
     let surface = ui.styles.apply(SemanticStyle::Normal, Style::default());
     let row_style = apply_item_state(&ui.styles, state, surface);
-    clear(area, row_style, buffer);
     let resolve = |token: &str| match token {
         "workspace.index" if item.current => {
             TokenValue::styled((item.index + 1).to_string(), SemanticStyle::Current)
@@ -2135,12 +2287,12 @@ fn render_workspace_row(
         }
         "workspace.tab_count" => TokenValue::plain(item.tab_count.to_string()),
         "workspace.icon" => TokenValue::plain(icons.workspace.clone()),
-        "workspace.git_branch" => TokenValue::plain(sanitize(item.token_value(token))),
-        "workspace.git_added" if !item.token_value(token).is_empty() => {
-            TokenValue::styled(item.token_value(token).to_owned(), SemanticStyle::Added)
+        "workspace.git_branch" => TokenValue::plain(sanitize(item.token_text(token))),
+        "workspace.git_added" if !item.token_text(token).is_empty() => {
+            TokenValue::styled(item.token_text(token).to_owned(), SemanticStyle::Added)
         }
-        "workspace.git_deleted" if !item.token_value(token).is_empty() => {
-            TokenValue::styled(item.token_value(token).to_owned(), SemanticStyle::Deleted)
+        "workspace.git_deleted" if !item.token_text(token).is_empty() => {
+            TokenValue::styled(item.token_text(token).to_owned(), SemanticStyle::Deleted)
         }
         "workspace.activity" => item.activity.map_or_else(
             || TokenValue::plain(""),
@@ -2154,7 +2306,13 @@ fn render_workspace_row(
                 TokenValue::styled(activity.marker(spinner_frame), style)
             },
         ),
-        _ => extension_token_value(ui, token, item.token_value(token), spinner_frame),
+        _ => materialized_extension_token_value(
+            ui,
+            token,
+            item.token_value(token)
+                .map(|value| (value, PresentationTokenTarget::Workspace(item.id))),
+            spinner_frame,
+        ),
     };
     let left = render_token_segments(
         &workspace_config(ui, side).row.left,
@@ -2180,41 +2338,71 @@ fn render_workspace_row(
         &icons,
         resolve,
     );
-    let title_width = usize::from(area.width);
-    let left_width = left.width().min(title_width);
-    let right_width = right.width().min(title_width.saturating_sub(left_width));
-    let body_width = title_width.saturating_sub(left_width + right_width);
-    buffer.set_line(
-        area.x,
-        area.y,
-        &truncate_line(&left, left_width),
-        left_width as u16,
-    );
-    buffer.set_line(
-        area.x.saturating_add(left_width as u16),
-        area.y,
-        &truncate_line(&body, body_width),
-        body_width as u16,
-    );
-    buffer.set_line(
-        area.x.saturating_add((title_width - right_width) as u16),
-        area.y,
-        &truncate_line(&right, right_width),
-        right_width as u16,
-    );
-    if area.height > 1 && !workspace_config(ui, side).row.detail.is_empty() {
-        let detail = render_token_segments(
+    let detail = (!workspace_config(ui, side).row.detail.is_empty()).then(|| {
+        render_token_segments(
             &workspace_config(ui, side).row.detail,
             None,
             state,
             &ui.styles,
             &icons,
             resolve,
-        );
+        )
+    });
+    WorkspaceRowLines {
+        style: row_style,
+        left,
+        body,
+        right,
+        detail,
+    }
+}
+
+fn render_workspace_row(
+    item: &WorkspaceItem,
+    selected: bool,
+    spinner_frame: usize,
+    area: Rect,
+    side: SidebarSide,
+    ui: &UiConfig,
+    buffer: &mut Buffer,
+) {
+    if area.width == 0 {
+        return;
+    }
+    let lines = workspace_row_lines(item, selected, spinner_frame, side, ui);
+    clear(area, lines.style, buffer);
+    let title_width = usize::from(area.width);
+    let left_width = lines.left.width().min(title_width);
+    let right_width = lines
+        .right
+        .width()
+        .min(title_width.saturating_sub(left_width));
+    let body_width = title_width.saturating_sub(left_width + right_width);
+    buffer.set_line(
+        area.x,
+        area.y,
+        &lines.left.truncated(left_width).line,
+        left_width as u16,
+    );
+    buffer.set_line(
+        area.x.saturating_add(left_width as u16),
+        area.y,
+        &lines.body.truncated(body_width).line,
+        body_width as u16,
+    );
+    buffer.set_line(
+        area.x.saturating_add((title_width - right_width) as u16),
+        area.y,
+        &lines.right.truncated(right_width).line,
+        right_width as u16,
+    );
+    if area.height > 1
+        && let Some(detail) = lines.detail
+    {
         buffer.set_line(
             area.x,
             area.y.saturating_add(1),
-            &truncate_line(&detail, usize::from(area.width)),
+            &detail.truncated(usize::from(area.width)).line,
             area.width,
         );
     }
@@ -2329,7 +2517,8 @@ mod tests {
         },
         extensions,
         resources::{
-            PaneSnapshot, Project, ProjectIdentity, SessionSnapshot, TabSnapshot, WorkspaceSnapshot,
+            MaterializedTokenValue, PaneSnapshot, PresentationTokenAction, Project,
+            ProjectIdentity, SessionSnapshot, TabSnapshot, WorkspaceSnapshot,
         },
     };
 
@@ -2438,21 +2627,35 @@ mod tests {
             &NotificationState::default(),
         );
         assert_eq!(
-            model.extension_value("session.extension.demo.value"),
-            "session"
+            model
+                .extension_value("session.extension.demo.value")
+                .map(|(value, _)| value.text.as_str()),
+            Some("session")
         );
         assert_eq!(
-            model.extension_value("workspace.extension.demo.value"),
+            model
+                .extension_value("workspace.extension.demo.value")
+                .map(|(value, _)| value.text.as_str()),
+            Some("workspace")
+        );
+        assert_eq!(
+            model
+                .extension_value("tab.extension.demo.value")
+                .map(|(value, _)| value.text.as_str()),
+            Some("tab")
+        );
+        assert_eq!(
+            model
+                .extension_value("pane.extension.demo.value")
+                .map(|(value, _)| value.text.as_str()),
+            Some("pane")
+        );
+        assert_eq!(
+            model.items[0].token_text("workspace.extension.demo.value"),
             "workspace"
         );
-        assert_eq!(model.extension_value("tab.extension.demo.value"), "tab");
-        assert_eq!(model.extension_value("pane.extension.demo.value"), "pane");
         assert_eq!(
-            model.items[0].token_value("workspace.extension.demo.value"),
-            "workspace"
-        );
-        assert_eq!(
-            model.items[1].token_value("workspace.extension.demo.value"),
+            model.items[1].token_text("workspace.extension.demo.value"),
             ""
         );
     }
@@ -2512,6 +2715,134 @@ mod tests {
         );
         assert_eq!(first[(0, 0)].symbol(), "⠋");
         assert_eq!(second[(0, 0)].symbol(), "⠙");
+    }
+
+    #[test]
+    fn expanded_workspace_token_hits_are_right_aligned_and_precede_row_navigation() {
+        let (mut snapshot, focused) = fixture(&["main", "peer"], 0);
+        let token = "workspace.extension.demo.action";
+        let peer = &mut snapshot.sessions[0].workspaces[1];
+        let peer_id = peer.id;
+        let peer_pane = peer.tabs[0].panes[0].id;
+        let owner_pane = focused.pane_id;
+        let action = PresentationTokenAction::Pane {
+            pane_id: owner_pane,
+        };
+        peer.tokens.insert(
+            token.into(),
+            MaterializedTokenValue::new("go".into(), Some(action.clone())),
+        );
+        let mut ui = UiConfig::default();
+        ui.icons.preset = IconPreset::NerdFont;
+        let SidebarComponentConfig::Workspaces {
+            header,
+            footer,
+            row,
+            ..
+        } = &mut ui.sidebar.left.components[0]
+        else {
+            panic!("default left sidebar should contain workspaces");
+        };
+        header.clear();
+        footer.clear();
+        row.left.clear();
+        row.body.clear();
+        row.right = vec![super::super::config::SegmentConfig::Token {
+            token: token.into(),
+            style: None,
+            prefix: "[".into(),
+            suffix: "]".into(),
+            max_width: None,
+            visual: super::super::config::TokenVisual::Pill,
+        }];
+        row.detail.clear();
+        let component = WorkspacesComponent::open(
+            &snapshot,
+            &focused,
+            &NavigationHistory::default(),
+            &NotificationState::default(),
+        );
+        let area = Rect::new(0, 0, 20, 4);
+        let invocation = PresentationTokenInvocation {
+            action,
+            target: PresentationTokenTarget::Workspace(peer_id),
+        };
+
+        // The content is 19 cells wide after the divider; the six-cell pill is
+        // aligned to its right edge and every visible cell, including caps and
+        // affixes, owns the token action.
+        for column in 13..19 {
+            assert_eq!(
+                component.passive_click(area, SidebarSide::Left, &ui, column, 1),
+                ComponentEffect::Token(invocation.clone())
+            );
+        }
+        assert_eq!(
+            component.passive_click(area, SidebarSide::Left, &ui, 0, 1),
+            ComponentEffect::Navigate(
+                peer_pane,
+                NavigationScope::Workspace,
+                SidebarComponentKind::Workspaces,
+            )
+        );
+
+        ui.sidebar.left.display = SidebarDisplay::Minimized;
+        assert!(!matches!(
+            component.passive_click(
+                Rect::new(0, 0, MINIMIZED_SIDEBAR_WIDTH, 4),
+                SidebarSide::Left,
+                &ui,
+                3,
+                1,
+            ),
+            ComponentEffect::Token(_)
+        ));
+    }
+
+    #[test]
+    fn unrendered_short_sidebar_header_token_is_not_clickable() {
+        let (mut snapshot, focused) = fixture(&["main"], 0);
+        let token = "workspace.extension.demo.action";
+        let workspace = &mut snapshot.sessions[0].workspaces[0];
+        let action = PresentationTokenAction::Pane {
+            pane_id: focused.pane_id,
+        };
+        workspace.tokens.insert(
+            token.into(),
+            MaterializedTokenValue::new("hidden".into(), Some(action)),
+        );
+        let mut ui = UiConfig::default();
+        let SidebarComponentConfig::Workspaces { header, footer, .. } =
+            &mut ui.sidebar.left.components[0]
+        else {
+            panic!("default left sidebar should contain workspaces");
+        };
+        *header = vec![super::super::config::SegmentConfig::Token {
+            token: token.into(),
+            style: None,
+            prefix: String::new(),
+            suffix: String::new(),
+            max_width: None,
+            visual: super::super::config::TokenVisual::Plain,
+        }];
+        footer.clear();
+        let component = WorkspacesComponent::open(
+            &snapshot,
+            &focused,
+            &NavigationHistory::default(),
+            &NotificationState::default(),
+        );
+
+        assert!(!matches!(
+            component.passive_click(
+                Rect::new(0, 0, 20, SIDEBAR_HEADER_HEIGHT),
+                SidebarSide::Left,
+                &ui,
+                0,
+                0,
+            ),
+            ComponentEffect::Token(_)
+        ));
     }
 
     #[test]

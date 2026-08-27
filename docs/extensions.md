@@ -502,7 +502,8 @@ the normal Fut control socket:
 ```sh
 "$FUT_BIN" --socket "$FUT_SOCKET" \
   token publish review-status state ready \
-  --workspace-id "$FUT_WORKSPACE_ID"
+  --workspace-id "$FUT_WORKSPACE_ID" \
+  --action-command open-review
 ```
 
 The target option must match the declaration scope. The UI token is qualified
@@ -523,11 +524,19 @@ affixes. Animation is entirely client-side—publication happens only when the
 extension's state changes, never once per frame—and does not give plain token
 values a control or styling channel.
 
-Values are plain text. They cannot inject styles, actions, or executable
-behavior. Unpublished values are empty; published values live in ordinary
+Values are plain text and cannot inject styles or markup. A non-empty
+publication may attach either `--action-pane-id PANE`, which navigates the
+clicking client, or `--action-command COMMAND`, which runs a command declared
+by the publishing extension. These flags are mutually
+exclusive. The daemon requires the pane to be a live descendant of the token
+target and the command to belong to the publisher; it rejects actions on empty
+values. Command actions use the clicked token resource's workspace context.
+
+Unpublished values are empty; published values and actions live in ordinary
 resource snapshots, are shared by every attached client, and disappear when
-their target closes. See [Presentation tokens](../tokens/) for compatible UI
-contexts.
+their target closes. A pane referenced by an action can close sooner, in which
+case the client reports the stale click safely. See [Presentation
+tokens](../tokens/) for compatible UI contexts and exact clickable regions.
 
 ## Limits and failure behavior
 

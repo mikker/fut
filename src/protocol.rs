@@ -495,6 +495,8 @@ pub enum ClientMessage {
         token: String,
         value: String,
         target: PresentationTokenTarget,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action: Option<PresentationTokenPublishAction>,
     },
     PrepareExtensionReload,
     CommitExtensionReload {
@@ -527,6 +529,16 @@ pub enum ClientMessage {
     },
     Ping,
     Shutdown,
+}
+
+/// An action requested by an extension token publisher. Extension command
+/// identity is deliberately completed by the daemon from `extension_id` so a
+/// publisher cannot impersonate another extension.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PresentationTokenPublishAction {
+    Pane { pane_id: PaneId },
+    ExtensionCommand { command: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1452,10 +1464,26 @@ mod tests {
             token: "state".into(),
             value: "ready".into(),
             target: PresentationTokenTarget::Workspace(WorkspaceId::new()),
+            action: Some(PresentationTokenPublishAction::ExtensionCommand {
+                command: "open".into(),
+            }),
         };
         assert_eq!(
             decode_payload::<ClientMessage>(&encode_payload(&publish).unwrap()).unwrap(),
             publish
+        );
+        let legacy_publish = ClientMessage::PublishToken {
+            extension_id: "review-status".into(),
+            token: "state".into(),
+            value: "ready".into(),
+            target: PresentationTokenTarget::Workspace(WorkspaceId::new()),
+            action: None,
+        };
+        let serialized = serde_json::to_value(&legacy_publish).unwrap();
+        assert!(serialized.get("action").is_none());
+        assert_eq!(
+            serde_json::from_value::<ClientMessage>(serialized).unwrap(),
+            legacy_publish
         );
         let published = ServerMessage::TokenPublished {
             resource_revision: 10,

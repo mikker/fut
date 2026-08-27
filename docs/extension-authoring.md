@@ -368,20 +368,33 @@ client. Publish state changes, not animation frames:
 ```sh
 "$FUT_BIN" --socket "$FUT_SOCKET" \
   token publish "$FUT_EXTENSION_ID" state ready \
-  --workspace-id "$FUT_WORKSPACE_ID"
+  --workspace-id "$FUT_WORKSPACE_ID" \
+  --action-pane-id "$FUT_PANE_ID"
 ```
 
 Use the one target option matching the declaration: `--session-id`,
 `--workspace-id`, `--tab-id`, or `--pane-id`. The visible UI token name is
 `<scope>.extension.<extension-id>.<token-name>`. An empty string suppresses its
 segment. Values are unstyled UTF-8 plain text without control or
-bidirectional-formatting characters; they cannot carry actions or markup.
+bidirectional-formatting characters; they cannot carry markup.
+
+A non-empty publication can carry at most one click action. Use
+`--action-pane-id PANE` to navigate the clicking client to a live pane beneath
+the token target, or `--action-command COMMAND` to run a command declared by
+the same extension. The flags are mutually exclusive.
+Command names are their unqualified manifest names, such as `logs` for
+`run:logs`. Command actions receive the clicked token resource's
+workspace and ancestry as their runtime context. Fut rejects actions on empty
+values, foreign or undeclared commands, and panes that are closing or outside
+the publication target.
 
 Publication goes through the documented CLI using the exact `FUT_BIN` and
-`FUT_SOCKET`. A wrong extension, undeclared name, wrong scope, invalid value,
-closed target, or exhausted daemon-wide materialization limit fails the CLI
-call. Treat disappearance as normal cleanup in close/detach races. Values live
-in shared resource snapshots, reach all clients, and disappear with the target.
+`FUT_SOCKET`. A wrong extension, undeclared name, wrong scope, invalid value or
+action, closed target, or exhausted daemon-wide materialization limit fails the
+CLI call. Treat disappearance as normal cleanup in close/detach races. Values
+and actions live in shared resource snapshots, reach all clients, and disappear
+with the target. A referenced pane can close later; clients handle that stale
+action safely when clicked.
 
 ## Public contract versus daemon internals
 

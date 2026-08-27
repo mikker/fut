@@ -53,12 +53,14 @@ use crate::{
     protocol::{
         AcknowledgedCommand, AgentPromptMode, ClientMessage, ClientMode, ClientPresenceSnapshot,
         ContextScope, ContextualCommand, Envelope, OpenDisposition, PROTOCOL_VERSION,
-        RenameSelector, SelectedTarget, SelectedView, SelectionExpectation, ServerMessage,
-        TerminalContext, TerminalInputOperation, codec, decode_payload, encode_payload,
+        PresentationTokenPublishAction, RenameSelector, SelectedTarget, SelectedView,
+        SelectionExpectation, ServerMessage, TerminalContext, TerminalInputOperation, codec,
+        decode_payload, encode_payload,
     },
     resources::{
-        CheckoutDestination, InitialPath, Mutation, PresentationTokenTarget, ResourceError,
-        ResourceTree, SessionSelector, TabPath, TargetSelector, TokenPublication, WorkspacePath,
+        CheckoutDestination, InitialPath, MaterializedTokenValue, Mutation,
+        PresentationTokenAction, PresentationTokenTarget, ResourceError, ResourceTree,
+        SessionSelector, TabPath, TargetSelector, TokenPublication, WorkspacePath,
     },
     splits::{SplitDirection, SplitRatio, SplitTree},
     terminal::{
@@ -300,6 +302,7 @@ impl SharedState {
         token_name: &str,
         value: String,
         target: PresentationTokenTarget,
+        action: Option<PresentationTokenPublishAction>,
     ) -> Result<TokenPublication, DaemonError> {
         if !self.accepting {
             return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
@@ -342,10 +345,46 @@ impl SharedState {
         }
         crate::extensions::validate_presentation_value(&value)
             .map_err(|error| DaemonError::new("invalid_token_value", error.to_string()))?;
-        let publication = self.resources.publish_presentation_token(
+        if value.is_empty() && action.is_some() {
+            return Err(DaemonError::new(
+                "invalid_token_action",
+                "an empty presentation token value cannot have an action",
+            ));
+        }
+        let action = match action {
+            Some(PresentationTokenPublishAction::Pane { pane_id }) => {
+                if !self
+                    .resources
+                    .presentation_action_pane_is_live_descendant(target, pane_id)?
+                {
+                    return Err(DaemonError::new(
+                        "invalid_token_action",
+                        "presentation token action pane is not a descendant of its target",
+                    ));
+                }
+                Some(PresentationTokenAction::Pane { pane_id })
+            }
+            Some(PresentationTokenPublishAction::ExtensionCommand { command }) => {
+                if !extension
+                    .commands()
+                    .any(|launcher| launcher.name() == command)
+                {
+                    return Err(DaemonError::new(
+                        "invalid_token_action",
+                        format!("extension {extension_id:?} does not declare command {command:?}"),
+                    ));
+                }
+                Some(PresentationTokenAction::ExtensionCommand {
+                    extension_id: extension_id.to_owned(),
+                    command,
+                })
+            }
+            None => None,
+        };
+        let publication = self.resources.publish_presentation_token_value(
             target,
             declaration.qualified_name().to_owned(),
-            value,
+            MaterializedTokenValue::new(value, action),
         )?;
         if publication.changed {
             self.publish_resource_change(publication.revision);
@@ -3915,11 +3954,12 @@ async fn control_loop(
                 token,
                 value,
                 target,
+                action,
             } => {
                 let result = shared
                     .lock()
                     .await
-                    .publish_token(&extension_id, &token, value, target);
+                    .publish_token(&extension_id, &token, value, target, action);
                 match result {
                     Ok(publication) => {
                         send(
@@ -7406,7 +7446,10 @@ mod tests {
 version = "1.0.0"
 fut = ">=0.7.0, <1.0.0"
 id = "reload-test"
-capabilities = ["presentation_tokens"]
+capabilities = ["commands", "presentation_tokens"]
+[commands.logs]
+title = "Open logs"
+argv = ["true"]
 [[presentation_tokens]]
 name = "state"
 scope = "workspace"
@@ -7425,6 +7468,110 @@ scope = "workspace"
             source: "test",
         };
         (config, location)
+    }
+
+    #[test]
+    fn token_actions_are_validated_and_materialize_publisher_identity() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (_, location) = reload_fixture(temporary.path());
+        let registry = Arc::new(load_reload_registry(&location, 1));
+        let (mut state, path) = inconsistent_state();
+        state.extension_registry = Arc::clone(&registry);
+        state.extension_catalog = watch::channel(registry.catalog().unwrap()).0;
+        let sibling_pane = PaneId::new();
+        state
+            .resources
+            .add_pane(path.tab_id, sibling_pane, TerminalId::new())
+            .unwrap();
+        let peer = WorkspacePath {
+            workspace_id: WorkspaceId::new(),
+            workspace_name: "peer".into(),
+            root: "/peer".into(),
+            tab_id: TabId::new(),
+            tab_name: "peer".into(),
+            pane_id: PaneId::new(),
+            terminal_id: TerminalId::new(),
+        };
+        let peer_pane = peer.pane_id;
+        state
+            .resources
+            .add_workspace(path.session_id, peer)
+            .unwrap();
+        let target = PresentationTokenTarget::Workspace(path.workspace_id);
+
+        let published = state
+            .publish_token(
+                "reload-test",
+                "state",
+                "ready".into(),
+                target,
+                Some(PresentationTokenPublishAction::ExtensionCommand {
+                    command: "logs".into(),
+                }),
+            )
+            .unwrap();
+        assert!(published.changed);
+        assert_eq!(
+            state.resources.snapshot().sessions[0].workspaces[0].tokens["workspace.extension.reload-test.state"],
+            MaterializedTokenValue::new(
+                "ready".into(),
+                Some(PresentationTokenAction::ExtensionCommand {
+                    extension_id: "reload-test".into(),
+                    command: "logs".into(),
+                })
+            )
+        );
+
+        for (value, action) in [
+            (
+                "",
+                PresentationTokenPublishAction::ExtensionCommand {
+                    command: "logs".into(),
+                },
+            ),
+            (
+                "ready",
+                PresentationTokenPublishAction::ExtensionCommand {
+                    command: "missing".into(),
+                },
+            ),
+            (
+                "ready",
+                PresentationTokenPublishAction::Pane { pane_id: peer_pane },
+            ),
+        ] {
+            let error = state
+                .publish_token("reload-test", "state", value.into(), target, Some(action))
+                .unwrap_err();
+            assert_eq!(error.code, "invalid_token_action");
+        }
+
+        let error = state
+            .publish_token(
+                "reload-test",
+                "state",
+                "ready".into(),
+                target,
+                Some(PresentationTokenPublishAction::Pane {
+                    pane_id: PaneId::new(),
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "not_found");
+
+        state.resources.close_pane(sibling_pane).unwrap();
+        let error = state
+            .publish_token(
+                "reload-test",
+                "state",
+                "ready".into(),
+                target,
+                Some(PresentationTokenPublishAction::Pane {
+                    pane_id: sibling_pane,
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "target_closing");
     }
 
     fn load_reload_registry(
@@ -7527,6 +7674,7 @@ scope = "workspace"
                 "state",
                 "ready".into(),
                 PresentationTokenTarget::Workspace(path.workspace_id),
+                None,
             )
             .unwrap();
         let before = state.resources.snapshot();

@@ -19,6 +19,7 @@ command = ["just", "run"]   # required argv array; never a shell string
 grace_seconds = 3           # optional, 0–120: SIGTERM→SIGKILL escalation delay
 signal = "STATUS:READY"      # optional literal marker in combined stdout/stderr
 auto_start = true            # optional; trusted global/project config only
+click = "owner"              # optional: "owner" (default) or "logs"
 ```
 
 Put `auto_start` in `.fut/project.toml` when the project should run the command
@@ -27,6 +28,15 @@ do not start it again. The trusted command and all settings used for that
 automatic start come from global configuration plus the exact approved project
 recipe. A `.fut/config.toml` may still override manual `run:restart`, but cannot
 affect automatic execution.
+
+Run status tokens are clickable in both the tab bar and expanded workspace
+sidebar. With the default `click = "owner"`, clicking a status returns that Fut
+client to the pane that manually started or restarted the latest generation.
+An automatically started run, or a manual start without a pane context, has no
+owner action. If that pane has since closed, the click safely does nothing and
+Fut may show a concise stale-target error. Set `click = "logs"` to make every
+nonempty status open the existing interactive `run:logs` command for the
+token's workspace instead.
 
 Load the extension and bind restart:
 
@@ -82,6 +92,11 @@ The additional `workspace.extension.run.status` token carries the same current
 glyph in one stable token, using a static `…` while launching. It is intended
 for a compact workspace row where per-state styling and animation are less
 important than configuring the status as one segment.
+
+Every visible status token is published with the configured click action.
+Empty tokens used to clear the other styles never carry actions. Owner pane and
+click behavior are stored with the generation, so a superseded runner cannot
+replace the latest generation's destination during a restart race.
 
 The example uses dark-gray pause/stop, yellow launching, green play, and red
 cross pills. A workspace without run configuration publishes nothing.
@@ -139,12 +154,15 @@ smoke test. macOS and Linux only (flock + process groups).
 ## Smoke test
 
 ```sh
+./test/unit
 ./test/smoke
 ```
 
-Runs against a stub `fut` binary and a temporary state root — no daemon
-needed. It covers config validation, chunk-spanning readiness and restart
-reset, lifecycle and token transitions, launch failure, five concurrent
+The focused unit suite covers config parsing, state compatibility, exact token
+publish arguments, and action-rejection fallback. The smoke test runs against a
+stub `fut` binary and a temporary state root — no daemon needed. It covers
+owner/log click actions and stale-owner fallback, chunk-spanning readiness and
+restart reset, lifecycle and token transitions, launch failure, five concurrent
 restarts, workspace isolation, stale-PID safety, SIGKILL escalation,
 inode-stable log rotation, bounded close cleanup, both hooks, and viewer
 plumbing.

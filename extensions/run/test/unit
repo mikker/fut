@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""Focused unit tests for run config, state, and token publication."""
+
+import importlib.util
+import json
+import os
+import pathlib
+import sys
+import tempfile
+import unittest
+from importlib.machinery import SourceFileLoader
+from unittest import mock
+
+
+RUNCTL = pathlib.Path(__file__).resolve().parents[1] / "bin" / "runctl"
+sys.dont_write_bytecode = True
+LOADER = SourceFileLoader("fut_runctl", str(RUNCTL))
+SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
+runctl = importlib.util.module_from_spec(SPEC)
+LOADER.exec_module(runctl)
+
+
+class Result:
+    def __init__(self, returncode=0):
+        self.returncode = returncode
+
+
+class ConfigTests(unittest.TestCase):
+    def parse(self, value):
+        with mock.patch.dict(
+            os.environ, {"FUT_EXTENSION_CONFIG": json.dumps(value)}, clear=False
+        ):
+            return runctl.parse_config(require_command=False)
+
+    def test_click_defaults_to_owner_and_accepts_logs(self):
+        self.assertEqual(self.parse({})[4], "owner")
+        self.assertEqual(self.parse({"click": "owner"})[4], "owner")
+        self.assertEqual(self.parse({"click": "logs"})[4], "logs")
+
+    def test_click_rejects_every_other_value(self):
+        for value in (None, True, 1, "OWNER", "", ["logs"]):
+            with self.subTest(value=value), self.assertRaises(runctl.ConfigError):
+                self.parse({"click": value})
+
+
+class StateTests(unittest.TestCase):
+    def test_new_action_fields_round_trip_and_old_state_remains_readable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = {
+                "generation": 3,
+                "phase": "running",
+                "click": "owner",
+                "owner_pane_id": "pane-3",
+            }
+            runctl.write_state(directory, state)
+            self.assertEqual(runctl.read_state(directory), state)
+
+            with open(
+                os.path.join(directory, "state.json"), "w", encoding="utf-8"
+            ) as handle:
+                json.dump({"generation": 2, "phase": "exited"}, handle)
+            old = runctl.read_state(directory)
+            self.assertEqual(old.get("generation"), 2)
+            self.assertEqual(old.get("click", "owner"), "owner")
+            self.assertIsNone(old.get("owner_pane_id"))
+
+
+class PublicationTests(unittest.TestCase):
+    ENVIRONMENT = {
+        "FUT_BIN": "/fut",
+        "FUT_SOCKET": "/fut.sock",
+        "FUT_EXTENSION_ID": "run",
+        "FUT_WORKSPACE_ID": "workspace-a",
+    }
+
+    def publish(self, active, click, owner=None, side_effect=None):
+        with mock.patch.dict(
+            os.environ, self.ENVIRONMENT, clear=False
+        ), mock.patch.object(
+            runctl.subprocess, "run", side_effect=side_effect, return_value=Result()
+        ) as invoke:
+            runctl.publish_tokens(active, click, owner)
+            return [call.args[0] for call in invoke.call_args_list]
+
+    def test_owner_action_is_only_attached_to_nonempty_values(self):
+        calls = self.publish("play", "owner", "pane-a")
+        nonempty = [argv for argv in calls if argv[7]]
+        empty = [argv for argv in calls if not argv[7]]
+        self.assertEqual(len(nonempty), 2)
+        self.assertTrue(
+            all(argv[-2:] == ["--action-pane-id", "pane-a"] for argv in nonempty)
+        )
+        self.assertTrue(all("--action-pane-id" not in argv for argv in empty))
+
+    def test_logs_action_names_the_manifest_command(self):
+        calls = self.publish("cross", "logs")
+        nonempty = [argv for argv in calls if argv[7]]
+        self.assertTrue(
+            all(argv[-2:] == ["--action-command", "logs"] for argv in nonempty)
+        )
+
+    def test_rejected_actions_retry_without_hiding_status(self):
+        def reject_actions(argv, **_kwargs):
+            return Result(2 if "--action-command" in argv else 0)
+
+        calls = self.publish("pause", "logs", side_effect=reject_actions)
+        status_calls = [argv for argv in calls if argv[6] == "status"]
+        pause_calls = [argv for argv in calls if argv[6] == "pause"]
+        self.assertEqual(len(status_calls), 2)
+        self.assertEqual(len(pause_calls), 2)
+        self.assertEqual(status_calls[-1][-2:], ["--workspace-id", "workspace-a"])
+        self.assertEqual(pause_calls[-1][-2:], ["--workspace-id", "workspace-a"])
+
+    def test_failed_empty_clears_are_not_retried_as_targetless_publications(self):
+        calls = self.publish("pause", "logs", side_effect=lambda *_args, **_kwargs: Result(2))
+        empty = [argv for argv in calls if not argv[7]]
+        self.assertEqual(len(empty), len(runctl.TOKENS) - 1)
+        self.assertTrue(
+            all(argv[-2:] == ["--workspace-id", "workspace-a"] for argv in empty)
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

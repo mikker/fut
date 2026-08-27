@@ -1,3 +1,5 @@
+use std::{fmt, ops::Deref};
+
 use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
@@ -9,11 +11,93 @@ use super::{
     config::{IconSet, SegmentConfig, SemanticStyle, StylesConfig, TokenVisual, UiConfig},
     notifications::spinner_marker,
 };
-use crate::extensions::TokenPresentation;
+use crate::{
+    extensions::TokenPresentation,
+    resources::{MaterializedTokenValue, PresentationTokenAction, PresentationTokenTarget},
+};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PresentationTokenInvocation {
+    pub action: PresentationTokenAction,
+    pub target: PresentationTokenTarget,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct TokenActionRegion {
+    pub start: usize,
+    pub width: usize,
+    pub invocation: PresentationTokenInvocation,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct RenderedTokenLine {
+    pub line: Line<'static>,
+    pub actions: Vec<TokenActionRegion>,
+}
+
+impl RenderedTokenLine {
+    pub fn action_at(&self, column: usize) -> Option<&PresentationTokenInvocation> {
+        self.actions
+            .iter()
+            .find(|region| column >= region.start && column < region.start + region.width)
+            .map(|region| &region.invocation)
+    }
+
+    pub fn truncated(&self, width: usize) -> Self {
+        let line = truncate_line(&self.line, width);
+        let visible_width = line.width();
+        let actions = self
+            .actions
+            .iter()
+            .filter_map(|region| {
+                let clipped_width = visible_width.saturating_sub(region.start).min(region.width);
+                (clipped_width > 0).then(|| TokenActionRegion {
+                    start: region.start,
+                    width: clipped_width,
+                    invocation: region.invocation.clone(),
+                })
+            })
+            .collect();
+        Self { line, actions }
+    }
+
+    pub fn append_to(&self, line: &mut Line<'static>, actions: &mut Vec<TokenActionRegion>) {
+        let offset = line.width();
+        line.spans.extend(self.line.spans.iter().cloned());
+        actions.extend(self.actions.iter().cloned().map(|mut region| {
+            region.start += offset;
+            region
+        }));
+    }
+}
+
+impl Deref for RenderedTokenLine {
+    type Target = Line<'static>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.line
+    }
+}
+
+impl fmt::Display for RenderedTokenLine {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.line.fmt(formatter)
+    }
+}
+
+impl From<Line<'static>> for RenderedTokenLine {
+    fn from(line: Line<'static>) -> Self {
+        Self {
+            line,
+            actions: Vec::new(),
+        }
+    }
+}
 
 pub(super) struct TokenValue {
     pub text: String,
     pub style: Option<SemanticStyle>,
+    pub invocation: Option<PresentationTokenInvocation>,
 }
 
 impl TokenValue {
@@ -21,6 +105,7 @@ impl TokenValue {
         Self {
             text: text.into(),
             style: None,
+            invocation: None,
         }
     }
 
@@ -28,7 +113,13 @@ impl TokenValue {
         Self {
             text: text.into(),
             style: Some(style),
+            invocation: None,
         }
+    }
+
+    fn with_invocation(mut self, invocation: Option<PresentationTokenInvocation>) -> Self {
+        self.invocation = invocation;
+        self
     }
 }
 
@@ -52,6 +143,23 @@ pub(super) fn extension_token_value(
         TokenPresentation::Plain => TokenValue::plain(value),
         TokenPresentation::Spinner => TokenValue::plain(spinner_marker(spinner_frame)),
     }
+}
+
+pub(super) fn materialized_extension_token_value(
+    ui: &UiConfig,
+    token: &str,
+    materialized: Option<(&MaterializedTokenValue, PresentationTokenTarget)>,
+    spinner_frame: usize,
+) -> TokenValue {
+    let Some((value, target)) = materialized else {
+        return TokenValue::plain("");
+    };
+    extension_token_value(ui, token, &value.text, spinner_frame).with_invocation(
+        value
+            .action
+            .clone()
+            .map(|action| PresentationTokenInvocation { action, target }),
+    )
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -97,11 +205,15 @@ pub(super) fn render_token_segments(
     styles: &StylesConfig,
     icons: &IconSet,
     mut resolve: impl FnMut(&str) -> TokenValue,
-) -> Line<'static> {
+) -> RenderedTokenLine {
     let mut spans = Vec::new();
+    let mut actions = Vec::new();
+    let mut rendered_width = 0;
     for segment in segments {
-        let (text, token_style, segment_style, visual) = match segment {
-            SegmentConfig::Text { text, style } => (text.clone(), None, *style, TokenVisual::Plain),
+        let (text, token_style, segment_style, visual, invocation) = match segment {
+            SegmentConfig::Text { text, style } => {
+                (text.clone(), None, *style, TokenVisual::Plain, None)
+            }
             SegmentConfig::Token {
                 token,
                 style,
@@ -122,6 +234,7 @@ pub(super) fn render_token_segments(
                     value.style,
                     *style,
                     *visual,
+                    value.invocation,
                 )
             }
             SegmentConfig::Tabs => continue,
@@ -149,14 +262,37 @@ pub(super) fn render_token_segments(
             && !icons.pill_right.is_empty()
         {
             let cap = pill_cap_style(style, surface);
+            let width = UnicodeWidthStr::width(icons.pill_left.as_str())
+                + UnicodeWidthStr::width(text.as_str())
+                + UnicodeWidthStr::width(icons.pill_right.as_str());
             spans.push(Span::styled(icons.pill_left.clone(), cap));
             spans.push(Span::styled(text, style));
             spans.push(Span::styled(icons.pill_right.clone(), cap));
+            if let Some(invocation) = invocation {
+                actions.push(TokenActionRegion {
+                    start: rendered_width,
+                    width,
+                    invocation,
+                });
+            }
+            rendered_width += width;
             continue;
         }
+        let width = UnicodeWidthStr::width(text.as_str());
         spans.push(Span::styled(text, style));
+        if let Some(invocation) = invocation {
+            actions.push(TokenActionRegion {
+                start: rendered_width,
+                width,
+                invocation,
+            });
+        }
+        rendered_width += width;
     }
-    Line::from(spans)
+    RenderedTokenLine {
+        line: Line::from(spans),
+        actions,
+    }
 }
 
 pub(super) fn truncate(value: &str, width: usize) -> String {
@@ -286,6 +422,91 @@ mod tests {
         );
         assert_eq!(value.to_string(), "\u{e0b6}[開…]\u{e0b4}");
         assert_eq!(value.width(), 7);
+    }
+
+    #[test]
+    fn actionable_token_region_includes_affixes_and_pill_caps_and_clips_to_visible_cells() {
+        let icons = icons(IconPreset::NerdFont);
+        let pane_id = crate::domain::PaneId::new();
+        let target = PresentationTokenTarget::Pane(pane_id);
+        let value = MaterializedTokenValue::new(
+            "go".into(),
+            Some(PresentationTokenAction::Pane { pane_id }),
+        );
+        let rendered = render_token_segments(
+            &[
+                SegmentConfig::Text {
+                    text: ".".into(),
+                    style: None,
+                },
+                SegmentConfig::Token {
+                    token: "pane.extension.demo.action".into(),
+                    style: None,
+                    prefix: "[".into(),
+                    suffix: "]".into(),
+                    max_width: None,
+                    visual: TokenVisual::Pill,
+                },
+                SegmentConfig::Text {
+                    text: "!".into(),
+                    style: None,
+                },
+            ],
+            None,
+            ItemState::default(),
+            &StylesConfig::default(),
+            &icons,
+            |token| {
+                materialized_extension_token_value(
+                    &UiConfig::default(),
+                    token,
+                    Some((&value, target)),
+                    0,
+                )
+            },
+        );
+        let invocation = PresentationTokenInvocation {
+            action: PresentationTokenAction::Pane { pane_id },
+            target,
+        };
+
+        assert_eq!(rendered.to_string(), ".\u{e0b6}[go]\u{e0b4}!");
+        assert_eq!(rendered.action_at(0), None);
+        for column in 1..7 {
+            assert_eq!(rendered.action_at(column), Some(&invocation));
+        }
+        assert_eq!(rendered.action_at(7), None);
+
+        let wide = MaterializedTokenValue::new(
+            "界x".into(),
+            Some(PresentationTokenAction::Pane { pane_id }),
+        );
+        let wide = render_token_segments(
+            &[SegmentConfig::Token {
+                token: "pane.extension.demo.action".into(),
+                style: None,
+                prefix: String::new(),
+                suffix: String::new(),
+                max_width: None,
+                visual: TokenVisual::Plain,
+            }],
+            None,
+            ItemState::default(),
+            &StylesConfig::default(),
+            &icons,
+            |token| {
+                materialized_extension_token_value(
+                    &UiConfig::default(),
+                    token,
+                    Some((&wide, target)),
+                    0,
+                )
+            },
+        )
+        .truncated(2);
+        assert_eq!(wide.to_string(), "…");
+        assert_eq!(wide.action_at(0), Some(&invocation));
+        assert_eq!(wide.action_at(1), None);
     }
 
     #[test]

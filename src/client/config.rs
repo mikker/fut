@@ -279,6 +279,19 @@ impl BindingsConfig {
         self.commands.get(index)
     }
 
+    pub(super) fn extension_command(
+        &self,
+        extension_id: &str,
+        command: &str,
+    ) -> Option<&PaletteCommand> {
+        self.commands.iter().find(|candidate| {
+            candidate
+                .extension
+                .as_ref()
+                .is_some_and(|identity| identity.id == extension_id && identity.command == command)
+        })
+    }
+
     pub(super) fn suffix(&self, action: ClientAction) -> Option<Vec<u8>> {
         match self.values.get(config_key(action)) {
             Some(value) => self.parse_suffix(value).map(|(bytes, _)| bytes),

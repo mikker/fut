@@ -12,6 +12,7 @@ use super::{
     chrome::{TabBarHit, TabBarHotkey, render_tab_bar, tab_bar_hit_at},
     navigation::NavigationHistory,
     notifications::NotificationState,
+    presentation::PresentationTokenInvocation,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -36,6 +37,7 @@ pub(super) enum TabBarAction {
     Create,
     Rename(TabId, String),
     Select(PaneId),
+    Token(PresentationTokenInvocation),
 }
 
 impl TabBarState {
@@ -175,6 +177,7 @@ impl TabBarState {
             return TabBarAction::Stay;
         };
         match hit {
+            TabBarHit::Token(invocation) => TabBarAction::Token(invocation),
             TabBarHit::Hotkey(hotkey) => match hotkey {
                 TabBarHotkey::Create => TabBarAction::Create,
                 TabBarHotkey::Rename => self
@@ -230,7 +233,7 @@ impl TabBarState {
             row,
         )? {
             TabBarHit::Item(id) => Some(id),
-            TabBarHit::Hotkey(_) => None,
+            TabBarHit::Token(_) | TabBarHit::Hotkey(_) => None,
         }
     }
 

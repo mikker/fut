@@ -101,11 +101,14 @@ that recipe.
 If a repository recipe is not yet trusted, Fut shows its exact contents for
 review and accepts or declines machine-local approval in the same dialog.
 
-The tab bar and workspace rows also support the mouse: left-click to switch,
-right-click for create, rename, close, and sidebar display actions. Drag pane
-or sidebar dividers to resize them. Fut preserves application mouse reporting;
-when an application does not claim the mouse, the wheel scrolls client-local
-history and dragging selects text. Hold Shift to force Fut selection.
+The tab bar and workspace rows also support the mouse: left-click to switch or
+activate a clickable extension token, and right-click for create, rename,
+close, and sidebar display actions. Token clicks include their visible affixes
+and pills and take precedence over switching the surrounding tab or expanded
+workspace row. Drag pane or sidebar dividers to resize them. Fut preserves
+application mouse reporting; when an application does not claim the mouse, the
+wheel scrolls client-local history and dragging selects text. Hold Shift to
+force Fut selection.
 
 ## Copy and scrollback
 

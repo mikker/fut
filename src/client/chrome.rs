@@ -8,9 +8,9 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    domain::TabId,
+    domain::{PaneId, SessionId, TabId, WorkspaceId},
     protocol::{ClientPresenceSnapshot, SelectedTarget},
-    resources::{MaterializedTokenMap, ResourceSnapshot},
+    resources::{MaterializedTokenMap, PresentationTokenTarget, ResourceSnapshot},
 };
 
 use super::{
@@ -21,8 +21,8 @@ use super::{
     hotkey::{HotkeyButton, HotkeyLine},
     notifications::{ActivityIndicator, NotificationState},
     presentation::{
-        ItemState, TokenValue, apply_item_state, extension_token_value, pill_cap_style,
-        render_token_segments, truncate_line,
+        ItemState, PresentationTokenInvocation, RenderedTokenLine, TokenValue, apply_item_state,
+        materialized_extension_token_value, pill_cap_style, render_token_segments,
     },
     sidebar::{SidebarSide, slot_relevant},
 };
@@ -253,7 +253,7 @@ impl ResourceState {
                 let populated = |values: &MaterializedTokenMap| {
                     values
                         .get(token.qualified_name())
-                        .is_some_and(|value| !value.is_empty())
+                        .is_some_and(|value| !value.text.is_empty())
                 };
                 match token.scope() {
                     crate::extensions::PresentationScope::Session => snapshot
@@ -301,10 +301,13 @@ struct TabItem {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TabBarModel {
+    session_id: SessionId,
     session_name: String,
     session_tokens: MaterializedTokenMap,
+    workspace_id: WorkspaceId,
     workspace_name: String,
     workspace_tokens: MaterializedTokenMap,
+    pane_id: PaneId,
     pane_tokens: MaterializedTokenMap,
     tabs: Vec<TabItem>,
     active: usize,
@@ -331,10 +334,13 @@ impl TabBarModel {
             .iter()
             .position(|tab| tab.id == focused.tab_id)?;
         Some(Self {
+            session_id: session.id,
             session_name: sanitize(&session.name),
             session_tokens: session.tokens.clone(),
+            workspace_id: workspace.id,
             workspace_name: sanitize(&workspace.name),
             workspace_tokens: workspace.tokens.clone(),
+            pane_id: focused.pane_id,
             pane_tokens: workspace.tabs[active]
                 .panes
                 .iter()
@@ -358,13 +364,34 @@ impl TabBarModel {
         })
     }
 
-    fn extension_value(&self, token: &str) -> &str {
+    fn extension_value(
+        &self,
+        token: &str,
+    ) -> Option<(
+        &crate::resources::MaterializedTokenValue,
+        PresentationTokenTarget,
+    )> {
         self.session_tokens
             .get(token)
-            .or_else(|| self.workspace_tokens.get(token))
-            .or_else(|| self.tabs[self.active].tokens.get(token))
-            .or_else(|| self.pane_tokens.get(token))
-            .map_or("", String::as_str)
+            .map(|value| (value, PresentationTokenTarget::Session(self.session_id)))
+            .or_else(|| {
+                self.workspace_tokens
+                    .get(token)
+                    .map(|value| (value, PresentationTokenTarget::Workspace(self.workspace_id)))
+            })
+            .or_else(|| {
+                self.tabs[self.active].tokens.get(token).map(|value| {
+                    (
+                        value,
+                        PresentationTokenTarget::Tab(self.tabs[self.active].id),
+                    )
+                })
+            })
+            .or_else(|| {
+                self.pane_tokens
+                    .get(token)
+                    .map(|value| (value, PresentationTokenTarget::Pane(self.pane_id)))
+            })
     }
 }
 
@@ -377,7 +404,7 @@ enum Lane {
 
 struct ResolvedGroup {
     lane: Lane,
-    line: Line<'static>,
+    line: RenderedTokenLine,
     tabs: bool,
     hotkeys: bool,
     style: Option<SemanticStyle>,
@@ -395,7 +422,7 @@ struct TabBarScene {
 struct PlacedTabBarGroup {
     x: usize,
     width: usize,
-    line: Line<'static>,
+    line: RenderedTokenLine,
     tabs: Vec<VisibleTab>,
     hotkeys: Option<PlacedHotkeys>,
 }
@@ -419,8 +446,9 @@ pub(super) enum TabBarHotkey {
     Close,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum TabBarHit {
+    Token(PresentationTokenInvocation),
     Item(TabId),
     Hotkey(TabBarHotkey),
 }
@@ -473,7 +501,7 @@ impl TabBarScene {
                     );
                     (visible.line, visible.tabs)
                 } else {
-                    (truncate_line(&group.line, group.allocation), Vec::new())
+                    (group.line.truncated(group.allocation), Vec::new())
                 };
                 let hotkeys = group
                     .hotkeys
@@ -506,6 +534,9 @@ impl TabBarScene {
             .iter()
             .find(|group| column >= group.x && column < group.x + group.width)?;
         let column = column - group.x;
+        if let Some(invocation) = group.line.action_at(column) {
+            return Some(TabBarHit::Token(invocation.clone()));
+        }
         if let Some(tab) = group
             .tabs
             .iter()
@@ -529,10 +560,13 @@ fn tab_bar_model(
     snapshot
         .and_then(|snapshot| TabBarModel::from_snapshot(snapshot, focused, notifications))
         .unwrap_or_else(|| TabBarModel {
+            session_id: focused.session_id,
             session_name: "session".into(),
             session_tokens: MaterializedTokenMap::new(),
+            workspace_id: focused.workspace_id,
             workspace_name: "workspace".into(),
             workspace_tokens: MaterializedTokenMap::new(),
+            pane_id: focused.pane_id,
             pane_tokens: MaterializedTokenMap::new(),
             tabs: vec![TabItem {
                 id: focused.tab_id,
@@ -585,7 +619,7 @@ pub(super) fn render_tab_bar(
             area.x
                 .saturating_add(u16::try_from(group.x).unwrap_or(u16::MAX)),
             area.y,
-            &group.line,
+            &group.line.line,
             u16::try_from(group.width).unwrap_or(u16::MAX),
         );
     }
@@ -680,7 +714,7 @@ fn render_bar_group(
     selected: Option<TabId>,
     spinner_frame: usize,
     ui: &UiConfig,
-) -> Line<'static> {
+) -> RenderedTokenLine {
     let icons = ui.icons.resolve();
     let active = &model.tabs[model.active];
     render_token_segments(
@@ -721,7 +755,12 @@ fn render_bar_group(
                 || TokenValue::plain(""),
                 |activity| activity_token(activity, spinner_frame),
             ),
-            _ => extension_token_value(ui, token, model.extension_value(token), spinner_frame),
+            _ => materialized_extension_token_value(
+                ui,
+                token,
+                model.extension_value(token),
+                spinner_frame,
+            ),
         },
     )
 }
@@ -791,7 +830,7 @@ fn allocate_groups(groups: &mut [ResolvedGroup], width: usize) {
 }
 
 struct VisibleTabs {
-    line: Line<'static>,
+    line: RenderedTokenLine,
     tabs: Vec<VisibleTab>,
 }
 
@@ -805,7 +844,7 @@ fn visible_tabs(
 ) -> VisibleTabs {
     if width == 0 {
         return VisibleTabs {
-            line: Line::default(),
+            line: RenderedTokenLine::default(),
             tabs: Vec::new(),
         };
     }
@@ -844,7 +883,10 @@ fn visible_tabs(
                 style = ui.styles.apply(SemanticStyle::Selected, style);
             }
             return VisibleTabs {
-                line: Line::styled(format!("{:^width$}", marker.text), style),
+                line: RenderedTokenLine {
+                    line: Line::styled(format!("{:^width$}", marker.text), style),
+                    actions: Vec::new(),
+                },
                 tabs: vec![VisibleTab {
                     id: tab.id,
                     x: 0,
@@ -853,7 +895,7 @@ fn visible_tabs(
             };
         }
         return VisibleTabs {
-            line: truncate_line(&fallback, width),
+            line: fallback.truncated(width),
             tabs: vec![VisibleTab {
                 id: model.tabs[anchor].id,
                 x: 0,
@@ -924,35 +966,35 @@ fn selected_line(
     component_style: Option<SemanticStyle>,
     spinner_frame: usize,
     ui: &UiConfig,
-) -> Line<'static> {
-    let mut spans = Vec::new();
+) -> RenderedTokenLine {
+    let mut line = Line::default();
+    let mut actions = Vec::new();
     let icons = ui.icons.resolve();
     if first > 0 {
         let mut style = ui.styles.apply(SemanticStyle::Normal, Style::default());
         if let Some(role) = component_style {
             style = ui.styles.apply(role, style);
         }
-        spans.push(Span::styled(
+        line.spans.push(Span::styled(
             format!(" {} ", icons.overflow),
             ui.styles.apply(SemanticStyle::Muted, style),
         ));
     }
     for index in first..=last {
-        spans.extend(
-            render_tab_item(model, index, selected, component_style, spinner_frame, ui).spans,
-        );
+        render_tab_item(model, index, selected, component_style, spinner_frame, ui)
+            .append_to(&mut line, &mut actions);
     }
     if last + 1 < model.tabs.len() {
         let mut style = ui.styles.apply(SemanticStyle::Normal, Style::default());
         if let Some(role) = component_style {
             style = ui.styles.apply(role, style);
         }
-        spans.push(Span::styled(
+        line.spans.push(Span::styled(
             format!(" {} ", icons.overflow),
             ui.styles.apply(SemanticStyle::Muted, style),
         ));
     }
-    Line::from(spans)
+    RenderedTokenLine { line, actions }
 }
 
 fn render_tab_item(
@@ -962,8 +1004,9 @@ fn render_tab_item(
     component_style: Option<SemanticStyle>,
     spinner_frame: usize,
     ui: &UiConfig,
-) -> Line<'static> {
-    let line = render_tab_item_content(model, index, selected, component_style, spinner_frame, ui);
+) -> RenderedTokenLine {
+    let mut line =
+        render_tab_item_content(model, index, selected, component_style, spinner_frame, ui);
     let icons = ui.icons.resolve();
     if icons.pill_left.is_empty() || icons.pill_right.is_empty() {
         return line;
@@ -974,17 +1017,27 @@ fn render_tab_item(
         bar = ui.styles.apply(role, bar);
     }
     let cap = pill_cap_style(style, bar);
-    let mut spans = Vec::with_capacity(line.spans.len() + 2);
-    spans.extend(line.spans);
-    if index == model.active {
-        spans.insert(0, Span::styled(icons.pill_left, cap));
-        spans.push(Span::styled(icons.pill_right, cap));
+    let left_cap = if index == model.active {
+        icons.pill_left
     } else {
         // Inactive tabs pad by the cap width so items keep a stable width.
-        spans.insert(0, Span::styled(" ", cap));
-        spans.push(Span::styled(" ", cap));
+        " ".into()
+    };
+    let right_cap = if index == model.active {
+        icons.pill_right
+    } else {
+        " ".into()
+    };
+    let cap_width = UnicodeWidthStr::width(left_cap.as_str());
+    for action in &mut line.actions {
+        action.start += cap_width;
     }
-    Line::from(spans)
+    let mut spans = Vec::with_capacity(line.spans.len() + 2);
+    spans.push(Span::styled(left_cap, cap));
+    spans.append(&mut line.line.spans);
+    spans.push(Span::styled(right_cap, cap));
+    line.line = Line::from(spans);
+    line
 }
 
 fn render_tab_item_content(
@@ -994,7 +1047,7 @@ fn render_tab_item_content(
     component_style: Option<SemanticStyle>,
     spinner_frame: usize,
     ui: &UiConfig,
-) -> Line<'static> {
+) -> RenderedTokenLine {
     let tab = &model.tabs[index];
     let icons = ui.icons.resolve();
     render_token_segments(
@@ -1066,10 +1119,12 @@ fn tab_token(
             || TokenValue::plain(""),
             |activity| activity_token(activity, spinner_frame),
         ),
-        _ => extension_token_value(
+        _ => materialized_extension_token_value(
             ui,
             token,
-            tab.tokens.get(token).map_or("", String::as_str),
+            tab.tokens
+                .get(token)
+                .map(|value| (value, PresentationTokenTarget::Tab(tab.id))),
             spinner_frame,
         ),
     }
@@ -1150,7 +1205,8 @@ mod tests {
         domain::{AgentIntegration, PaneId, SessionId, TabId, TerminalId, WorkspaceId},
         extensions,
         resources::{
-            PaneSnapshot, Project, ProjectIdentity, SessionSnapshot, TabSnapshot, WorkspaceSnapshot,
+            MaterializedTokenValue, PaneSnapshot, PresentationTokenAction, Project,
+            ProjectIdentity, SessionSnapshot, TabSnapshot, WorkspaceSnapshot,
         },
     };
     use ratatui::style::Modifier;
@@ -1258,9 +1314,10 @@ mod tests {
         assert!(resources.accept(snapshot.clone()));
         assert!(resources.has_animated_extension_token(&ui));
         snapshot.revision += 1;
-        snapshot.sessions[0].workspaces[0]
-            .tokens
-            .insert("workspace.extension.run.launching".into(), String::new());
+        snapshot.sessions[0].workspaces[0].tokens.insert(
+            "workspace.extension.run.launching".into(),
+            String::new().into(),
+        );
         snapshot.sessions[0].workspaces[0]
             .tokens
             .insert("workspace.extension.run.play".into(), "spinner".into());
@@ -1584,7 +1641,7 @@ mod tests {
             let mut groups = vec![
                 ResolvedGroup {
                     lane: Lane::Left,
-                    line: Line::raw("tabs preferred content"),
+                    line: Line::raw("tabs preferred content").into(),
                     tabs: true,
                     hotkeys: false,
                     style: None,
@@ -1593,7 +1650,7 @@ mod tests {
                 },
                 ResolvedGroup {
                     lane: Lane::Center,
-                    line: Line::raw("CENTER"),
+                    line: Line::raw("CENTER").into(),
                     tabs: false,
                     hotkeys: false,
                     style: None,
@@ -1602,7 +1659,7 @@ mod tests {
                 },
                 ResolvedGroup {
                     lane: Lane::Right,
-                    line: Line::raw("ZOOM"),
+                    line: Line::raw("ZOOM").into(),
                     tabs: false,
                     hotkeys: false,
                     style: None,
@@ -1796,7 +1853,86 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!rendered_tabs.is_empty());
         for (x, width, hit) in rendered_tabs {
-            assert!((x..x + width).all(|column| scene.hit_at(column) == Some(hit)));
+            assert!((x..x + width).all(|column| scene.hit_at(column) == Some(hit.clone())));
+        }
+    }
+
+    #[test]
+    fn actionable_tab_item_and_group_tokens_take_precedence_over_tab_navigation() {
+        let (mut snapshot, focused) = fixture(&["one"], 0);
+        let token = "tab.extension.demo.action";
+        let pane_id = snapshot.sessions[0].workspaces[0].tabs[0].panes[0].id;
+        let tab_id = snapshot.sessions[0].workspaces[0].tabs[0].id;
+        let action = PresentationTokenAction::Pane { pane_id };
+        snapshot.sessions[0].workspaces[0].tabs[0].tokens.insert(
+            token.into(),
+            MaterializedTokenValue::new("go".into(), Some(action.clone())),
+        );
+        let mut ui = UiConfig::default();
+        ui.icons.preset = super::super::config::IconPreset::NerdFont;
+        ui.tab_bar.item.segments = vec![SegmentConfig::Token {
+            token: token.into(),
+            style: None,
+            prefix: "[".into(),
+            suffix: "]".into(),
+            max_width: None,
+            visual: super::super::config::TokenVisual::Pill,
+        }];
+        ui.tab_bar.left = vec![GroupConfig {
+            segments: vec![SegmentConfig::Tabs],
+            style: None,
+            priority: 100,
+        }];
+        ui.tab_bar.center.clear();
+        ui.tab_bar.right.clear();
+        let model =
+            TabBarModel::from_snapshot(&snapshot, &focused, &NotificationState::default()).unwrap();
+        let scene = TabBarScene::build(&model, false, None, 0, &ui, 80);
+        let (group, region) = scene
+            .groups
+            .iter()
+            .find_map(|group| group.line.actions.first().map(|region| (group, region)))
+            .expect("tab token should publish an action region");
+        let invocation = PresentationTokenInvocation {
+            action: action.clone(),
+            target: PresentationTokenTarget::Tab(tab_id),
+        };
+        for column in group.x + region.start..group.x + region.start + region.width {
+            assert_eq!(
+                scene.hit_at(column),
+                Some(TabBarHit::Token(invocation.clone()))
+            );
+        }
+        let tab = group.tabs.iter().find(|tab| tab.id == tab_id).unwrap();
+        assert!(
+            tab.x < region.start,
+            "tab starts at {}, token starts at {}",
+            tab.x,
+            region.start,
+        );
+        assert_eq!(scene.hit_at(group.x + tab.x), Some(TabBarHit::Item(tab_id)));
+
+        ui.tab_bar.left = vec![GroupConfig {
+            segments: vec![SegmentConfig::Token {
+                token: token.into(),
+                style: None,
+                prefix: "<".into(),
+                suffix: ">".into(),
+                max_width: None,
+                visual: super::super::config::TokenVisual::Plain,
+            }],
+            style: None,
+            priority: 255,
+        }];
+        let scene = TabBarScene::build(&model, false, None, 0, &ui, 80);
+        let group = &scene.groups[0];
+        let region = &group.line.actions[0];
+        assert_eq!(region.width, 4);
+        for column in group.x + region.start..group.x + region.start + region.width {
+            assert_eq!(
+                scene.hit_at(column),
+                Some(TabBarHit::Token(invocation.clone()))
+            );
         }
     }
 

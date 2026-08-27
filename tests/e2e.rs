@@ -25,9 +25,12 @@ use fut::{
     },
     protocol::{
         ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, PROTOCOL_VERSION_0_1,
-        RenameSelector, SelectedTarget, ServerMessage, codec, decode_payload, encode_payload,
+        PresentationTokenPublishAction, RenameSelector, SelectedTarget, ServerMessage, codec,
+        decode_payload, encode_payload,
     },
-    resources::{PresentationTokenTarget, SessionSelector, TargetSelector},
+    resources::{
+        PresentationTokenAction, PresentationTokenTarget, SessionSelector, TargetSelector,
+    },
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
@@ -2229,7 +2232,7 @@ async fn checked_in_example_extension_smokes_hooks_cli_tokens_and_configuration(
         snapshot.sessions[0].workspaces[0]
             .tokens
             .get("workspace.extension.example-workspace-status.last_event")
-            .is_some_and(|value| value == "workspace.created")
+            .is_some_and(|value| value.text == "workspace.created")
     })
     .await;
     let workspace_id = created.sessions[0].workspaces[0].id;
@@ -2255,7 +2258,7 @@ async fn checked_in_example_extension_smokes_hooks_cli_tokens_and_configuration(
         snapshot.sessions[0].workspaces[0]
             .tokens
             .get("workspace.extension.example-workspace-status.last_event")
-            .is_some_and(|value| value == "workspace.renamed")
+            .is_some_and(|value| value.text == "workspace.renamed")
     })
     .await;
 
@@ -2433,8 +2436,11 @@ r#"
 api_version = 1
 version = "1.0.0"
 fut = ">=0.7.0, <1.0.0"
-capabilities = ["presentation_tokens"]
+capabilities = ["commands", "presentation_tokens"]
 id = "status"
+[commands.logs]
+title = "Open logs"
+argv = ["true"]
 [[presentation_tokens]]
 name = "state"
 scope = "workspace"
@@ -2447,12 +2453,29 @@ scope = "pane"
 "#,
         )
         .unwrap();
+        let foreign = root.join("foreign-extension");
+        fs::create_dir(&foreign).unwrap();
+        fs::write(
+            foreign.join("fut-extension.toml"),
+            r#"
+api_version = 1
+version = "1.0.0"
+fut = ">=0.7.0, <1.0.0"
+capabilities = ["commands"]
+id = "foreign"
+[commands.inspect]
+title = "Inspect"
+argv = ["true"]
+"#,
+        )
+        .unwrap();
         fs::create_dir_all(root.join("home/.config/fut")).unwrap();
         fs::write(
             root.join("home/.config/fut/config.toml"),
             format!(
-                "extensions = [{:?}]\n[ui.sidebar.left]\ncomponents = [{{ component = 'workspaces', row = {{ right = [{{ token = 'workspace.extension.status.state' }}] }} }}]\n",
-                extension.display().to_string()
+                "extensions = [{:?}, {:?}]\n[ui.sidebar.left]\ncomponents = [{{ component = 'workspaces', row = {{ right = [{{ token = 'workspace.extension.status.state' }}] }} }}]\n",
+                extension.display().to_string(),
+                foreign.display().to_string()
             ),
         )
         .unwrap();
@@ -2487,6 +2510,8 @@ scope = "pane"
             "ready",
             "--workspace-id",
             &workspace_id.to_string(),
+            "--action-command",
+            "logs",
             "--json",
         ])
         .output()
@@ -2499,6 +2524,10 @@ scope = "pane"
     let published: Value = serde_json::from_slice(&published.stdout).unwrap();
     assert_eq!(published["command"], "token.publish");
     assert_eq!(published["result"]["changed"], true);
+    assert_eq!(
+        published["result"]["action"],
+        serde_json::json!({"type": "extension_command", "command": "logs"})
+    );
     let published_revision = published["result"]["revision"].as_u64().unwrap();
     assert!(published_revision > initial.revision);
 
@@ -2509,7 +2538,14 @@ scope = "pane"
                 if snapshot.sessions[0].workspaces[0]
                     .tokens
                     .get("workspace.extension.status.state")
-                    .is_some_and(|value| value == "ready")
+                    .is_some_and(|value| {
+                        value.text == "ready"
+                            && value.action
+                                == Some(PresentationTokenAction::ExtensionCommand {
+                                    extension_id: "status".into(),
+                                    command: "logs".into(),
+                                })
+                    })
         )
     })
     .await;
@@ -2520,8 +2556,18 @@ scope = "pane"
         snapshot.sessions[0].workspaces[0]
             .tokens
             .get("workspace.extension.status.state")
-            .map(String::as_str),
+            .map(|value| value.text.as_str()),
         Some("ready")
+    );
+    assert_eq!(
+        snapshot.sessions[0].workspaces[0]
+            .tokens
+            .get("workspace.extension.status.state")
+            .and_then(|value| value.action.as_ref()),
+        Some(&PresentationTokenAction::ExtensionCommand {
+            extension_id: "status".into(),
+            command: "logs".into(),
+        })
     );
     assert!(snapshot.revision >= published_revision);
 
@@ -2536,6 +2582,8 @@ scope = "pane"
             "ready",
             "--workspace-id",
             &workspace_id.to_string(),
+            "--action-command",
+            "logs",
         ])
         .output()
         .unwrap();
@@ -2551,6 +2599,7 @@ scope = "pane"
                 token: "badge".into(),
                 value: "tab".into(),
                 target: PresentationTokenTarget::Workspace(workspace_id),
+                action: None,
             })
             .await,
         ServerMessage::Error { ref code, .. } if code == "invalid_token_scope"
@@ -2562,6 +2611,7 @@ scope = "pane"
                 token: "state".into(),
                 value: "value".into(),
                 target: PresentationTokenTarget::Workspace(workspace_id),
+                action: None,
             })
             .await,
         ServerMessage::Error { ref code, .. } if code == "unknown_extension"
@@ -2573,6 +2623,7 @@ scope = "pane"
                 token: "missing".into(),
                 value: "value".into(),
                 target: PresentationTokenTarget::Workspace(workspace_id),
+                action: None,
             })
             .await,
         ServerMessage::Error { ref code, .. } if code == "undeclared_token"
@@ -2584,10 +2635,73 @@ scope = "pane"
                 token: "state".into(),
                 value: "unsafe\nvalue".into(),
                 target: PresentationTokenTarget::Workspace(workspace_id),
+                action: None,
             })
             .await,
         ServerMessage::Error { ref code, .. } if code == "invalid_token_value"
     ));
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::PublishToken {
+                extension_id: "status".into(),
+                token: "state".into(),
+                value: String::new(),
+                target: PresentationTokenTarget::Workspace(workspace_id),
+                action: Some(PresentationTokenPublishAction::ExtensionCommand {
+                    command: "logs".into(),
+                }),
+            })
+            .await,
+        ServerMessage::Error { ref code, .. } if code == "invalid_token_action"
+    ));
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::PublishToken {
+                extension_id: "status".into(),
+                token: "state".into(),
+                value: "ready".into(),
+                target: PresentationTokenTarget::Workspace(workspace_id),
+                action: Some(PresentationTokenPublishAction::ExtensionCommand {
+                    command: "inspect".into(),
+                }),
+            })
+            .await,
+        ServerMessage::Error { ref code, .. } if code == "invalid_token_action"
+    ));
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::PublishToken {
+                extension_id: "status".into(),
+                token: "state".into(),
+                value: "ready".into(),
+                target: PresentationTokenTarget::Workspace(workspace_id),
+                action: Some(PresentationTokenPublishAction::Pane {
+                    pane_id: PaneId::new(),
+                }),
+            })
+            .await,
+        ServerMessage::Error { ref code, .. } if code == "not_found"
+    ));
+
+    assert!(matches!(
+        harness
+            .control_command(ClientMessage::PublishToken {
+                extension_id: "status".into(),
+                token: "state".into(),
+                value: "ready".into(),
+                target: PresentationTokenTarget::Workspace(workspace_id),
+                action: Some(PresentationTokenPublishAction::Pane { pane_id }),
+            })
+            .await,
+        ServerMessage::TokenPublished { changed: true, .. }
+    ));
+    assert_eq!(
+        harness.resources().await.sessions[0].workspaces[0]
+            .tokens
+            .get("workspace.extension.status.state")
+            .and_then(|value| value.action.as_ref()),
+        Some(&PresentationTokenAction::Pane { pane_id })
+    );
 
     assert!(matches!(
         harness
@@ -2596,6 +2710,7 @@ scope = "pane"
                 token: "badge".into(),
                 value: "tab".into(),
                 target: PresentationTokenTarget::Tab(tab_id),
+                action: None,
             })
             .await,
         ServerMessage::TokenPublished { changed: true, .. }
@@ -2607,6 +2722,7 @@ scope = "pane"
                 token: "mark".into(),
                 value: "pane".into(),
                 target: PresentationTokenTarget::Pane(pane_id),
+                action: None,
             })
             .await,
         ServerMessage::TokenPublished { changed: true, .. }
@@ -2616,14 +2732,14 @@ scope = "pane"
         snapshot.sessions[0].workspaces[0].tabs[0]
             .tokens
             .get("tab.extension.status.badge")
-            .map(String::as_str),
+            .map(|value| value.text.as_str()),
         Some("tab")
     );
     assert_eq!(
         snapshot.sessions[0].workspaces[0].tabs[0].panes[0]
             .tokens
             .get("pane.extension.status.mark")
-            .map(String::as_str),
+            .map(|value| value.text.as_str()),
         Some("pane")
     );
 
@@ -3365,6 +3481,7 @@ scope = "workspace"
                 token: "state".into(),
                 value: "ready".into(),
                 target: PresentationTokenTarget::Workspace(workspace_id),
+                action: None,
             })
             .await,
         ServerMessage::TokenPublished { changed: true, .. }
@@ -3444,6 +3561,7 @@ id = "reloadable"
                 token: "state".into(),
                 value: "again".into(),
                 target: PresentationTokenTarget::Workspace(workspace_id),
+                action: None,
             })
             .await,
         ServerMessage::Error { ref code, .. } if code == "undeclared_token"
@@ -14761,9 +14879,15 @@ async fn resources_when_with_timeout(
 fn workspace_git_tokens(snapshot: &fut::resources::ResourceSnapshot) -> [Option<&str>; 3] {
     let tokens = &snapshot.sessions[0].workspaces[0].tokens;
     [
-        tokens.get("workspace.git_branch").map(String::as_str),
-        tokens.get("workspace.git_added").map(String::as_str),
-        tokens.get("workspace.git_deleted").map(String::as_str),
+        tokens
+            .get("workspace.git_branch")
+            .map(|value| value.text.as_str()),
+        tokens
+            .get("workspace.git_added")
+            .map(|value| value.text.as_str()),
+        tokens
+            .get("workspace.git_deleted")
+            .map(|value| value.text.as_str()),
     ]
 }
 
