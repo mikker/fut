@@ -5,6 +5,7 @@ use ratatui::{
     style::Style,
     text::{Line, Span},
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     domain::{PaneId, SessionId, TerminalId, WorkspaceId},
@@ -29,7 +30,7 @@ use super::{
     notifications::{ActivityIndicator, NotificationState},
     presentation::{
         ItemState, PresentationTokenInvocation, RenderedTokenLine, TokenValue, apply_item_state,
-        materialized_extension_token_value, render_token_segments, truncate_line,
+        materialized_extension_token_value, pill_cap_style, render_token_segments, truncate_line,
     },
 };
 
@@ -2322,14 +2323,36 @@ fn workspace_row_lines(
         &icons,
         resolve,
     );
-    let body = render_token_segments(
+    let title_state = ItemState {
+        current: item.current,
+        ..state
+    };
+    let mut body = render_token_segments(
         &workspace_config(ui, side).row.body,
         None,
-        state,
+        title_state,
         &ui.styles,
         &icons,
         resolve,
     );
+    if item.current
+        && !body.spans.is_empty()
+        && !icons.pill_left.is_empty()
+        && !icons.pill_right.is_empty()
+    {
+        let title_style = apply_item_state(&ui.styles, title_state, surface);
+        let cap_style = pill_cap_style(title_style, row_style);
+        let left_width = UnicodeWidthStr::width(icons.pill_left.as_str());
+        for action in &mut body.actions {
+            action.start += left_width;
+        }
+        body.line
+            .spans
+            .insert(0, Span::styled(icons.pill_left.clone(), cap_style));
+        body.line
+            .spans
+            .push(Span::styled(icons.pill_right.clone(), cap_style));
+    }
     let right = render_token_segments(
         &workspace_config(ui, side).row.right,
         None,
@@ -3225,6 +3248,37 @@ mod tests {
         assert!(!buffer[(0, 3)].modifier.contains(Modifier::REVERSED));
         assert!((7..23).all(|column| !buffer[(column, 3)].modifier.contains(Modifier::REVERSED)));
         assert!((0..23).all(|column| !buffer[(column, 4)].modifier.contains(Modifier::REVERSED)));
+    }
+
+    #[test]
+    fn current_workspace_uses_configured_pill_caps_around_its_body() {
+        let (snapshot, focused) = fixture(&["main"], 0);
+        let mut model = WorkspaceModel::from_snapshot(
+            &snapshot,
+            &focused,
+            &NavigationHistory::default(),
+            &NotificationState::default(),
+        );
+        model.items[0].activity = Some(ActivityIndicator::Working);
+        let mut ui = UiConfig::default();
+        ui.icons.pill_left = Some("<".into());
+        ui.icons.pill_right = Some(">".into());
+
+        let lines = workspace_row_lines(&model.items[0], false, 0, SidebarSide::Left, &ui);
+
+        assert_eq!(lines.body.to_string(), "<1 main>");
+        assert!(lines.body.spans.iter().all(|span| {
+            span.style.add_modifier.contains(Modifier::REVERSED)
+                || span.content == "<"
+                || span.content == ">"
+        }));
+        let activity = lines
+            .right
+            .spans
+            .iter()
+            .find(|span| span.style.fg == Some(ratatui::style::Color::LightCyan))
+            .expect("workspace activity");
+        assert!(!activity.style.add_modifier.contains(Modifier::REVERSED));
     }
 
     #[test]
