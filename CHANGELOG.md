@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Made extension status tokens clickable for pane navigation or resource-scoped extension commands, including the bundled run status linking to its owner pane or logs.
+- Fixed snippet expanders and accessibility-generated typing producing repeated physical-key characters inside Fut.
 
 ## 0.14
 

@@ -9789,9 +9789,9 @@ async fn public_enhanced_keyboard_preserves_disambiguation_modifiers_and_event_t
             .lock()
             .unwrap()
             .bytes
-            .windows(b"\x1b[>15u".len())
-            .any(|window| window == b"\x1b[>15u"),
-        "capable host did not receive Fut's enhanced-keyboard negotiation"
+            .windows(b"\x1b[>7u".len())
+            .any(|window| window == b"\x1b[>7u"),
+        "capable host did not receive Fut's text-compatible enhanced-keyboard negotiation"
     );
     let input = b"\x1b[105;5u\x1b[9u\x1b[109;5u\x1b[13u\x1b[97;1:2u\x1b[97;1:3u\x1b[1;6D";
     let expected = b"\x1b[105;5u\x1b[9u\x1b[109;5u\x1b[13u\x1b[97;1:2u\x1b[97;1:3u\x1b[1;6:1D";

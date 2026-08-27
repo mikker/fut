@@ -6593,6 +6593,9 @@ impl TerminalGuard {
         guard.alternate_screen = true;
         execute!(io::stdout(), EnableBracketedPaste)?;
         guard.bracketed_paste = true;
+        // Keep plain text out of CSI-u: Crossterm cannot yet recover Kitty's
+        // associated text, which macOS synthetic input uses with a placeholder
+        // physical key code.
         if host_supports_keyboard_enhancement(
             &std::env::var("TERM").unwrap_or_default(),
             &std::env::var("TERM_PROGRAM").unwrap_or_default(),
@@ -6601,8 +6604,7 @@ impl TerminalGuard {
             PushKeyboardEnhancementFlags(
                 KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                     | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
-                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS,
             )
         )
         .is_ok()
