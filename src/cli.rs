@@ -1030,7 +1030,12 @@ async fn execute(cli: Cli) -> Result<()> {
     reject_nested_client(&cli)?;
     match cli.command {
         None => {
-            let cwd = std::env::current_dir().context("read current directory")?;
+            let current_dir = std::env::current_dir().context("read current directory")?;
+            let (cwd, configured_project) =
+                resolve_project_open(None, None, &current_dir, &config_location).await?;
+            if let Some((name, configured)) = configured_project.as_ref() {
+                confirm_project_recipe(name, configured, &config_location, cli.json)?;
+            }
             open_and_attach(&socket, cwd, &config_location).await
         }
         Some(Command::Attach) => client::attach_navigator(&socket, &config_location).await,
@@ -1043,8 +1048,9 @@ async fn execute(cli: Cli) -> Result<()> {
         }) => {
             let current_dir = std::env::current_dir()?;
             let (cwd, configured_project) =
-                resolve_project_open(path, project.as_deref(), &current_dir, &config_location)?;
-            if let Some((name, configured)) = project.as_deref().zip(configured_project.as_ref()) {
+                resolve_project_open(path, project.as_deref(), &current_dir, &config_location)
+                    .await?;
+            if let Some((name, configured)) = configured_project.as_ref() {
                 confirm_project_recipe(name, configured, &config_location, cli.json)?;
             }
             let (program, argv) = child_command(command);
@@ -2526,22 +2532,45 @@ fn joined_or_dash(values: impl IntoIterator<Item = impl AsRef<str>>) -> String {
     }
 }
 
-fn resolve_project_open(
+async fn resolve_project_open(
     path: Option<PathBuf>,
     project: Option<&str>,
     current_dir: &std::path::Path,
     config_location: &client::config::ConfigLocation,
-) -> Result<(PathBuf, Option<client::config::ProjectConfig>)> {
-    let Some(project_name) = project else {
-        return Ok((resolve_open_path(path, current_dir), None));
-    };
+) -> Result<(PathBuf, Option<(String, client::config::ProjectConfig)>)> {
     let catalog = client::config::load_projects_location(config_location)?;
-    let configured = catalog_project(&catalog, project_name)?.clone();
-    let cwd = path.map_or_else(
-        || configured.path().to_owned(),
-        |path| resolve_open_path(Some(path), current_dir),
-    );
-    Ok((cwd, Some(configured)))
+    if let Some(project_name) = project {
+        let configured = catalog_project(&catalog, project_name)?.clone();
+        let cwd = path.map_or_else(
+            || configured.path().to_owned(),
+            |path| resolve_open_path(Some(path), current_dir),
+        );
+        return Ok((cwd, Some((project_name.to_owned(), configured))));
+    }
+
+    let cwd = resolve_open_path(path, current_dir);
+    let resolver = crate::project::ProjectResolver::default();
+    let requested = resolver
+        .resolve(&cwd)
+        .await
+        .with_context(|| format!("resolve project path {}", cwd.display()))?;
+    let mut matched = None;
+    for (name, configured) in catalog.iter() {
+        let Ok(candidate) = resolver.resolve(configured.path()).await else {
+            continue;
+        };
+        if candidate.project != requested.project {
+            continue;
+        }
+        if matched.is_some() {
+            bail!(
+                "project identity for {} matches multiple configured projects, including {name:?}",
+                requested.cwd.display()
+            );
+        }
+        matched = Some((name.to_owned(), configured.clone()));
+    }
+    Ok((cwd, matched))
 }
 
 fn catalog_project<'a>(
@@ -2587,16 +2616,23 @@ fn confirm_project_recipe(
         "Project {name:?} contains an untrusted recipe:\n  {}\n  SHA-256 {digest}",
         path.display()
     );
-    eprint!("Trust this recipe and continue? [y/N] ");
-    std::io::stderr().flush().context("flush trust prompt")?;
-    let mut answer = String::new();
-    std::io::stdin()
-        .lock()
-        .read_line(&mut answer)
-        .context("read trust response")?;
-    let answer = answer.trim();
-    if !answer.eq_ignore_ascii_case("y") && !answer.eq_ignore_ascii_case("yes") {
-        bail!("project recipe was not trusted");
+    let mut stdin = std::io::stdin().lock();
+    loop {
+        eprint!("Trust this recipe and continue? [y/N/i] ");
+        std::io::stderr().flush().context("flush trust prompt")?;
+        let mut answer = String::new();
+        stdin
+            .read_line(&mut answer)
+            .context("read trust response")?;
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => break,
+            "i" | "inspect" => {
+                let source = std::fs::read_to_string(path)
+                    .with_context(|| format!("read project recipe {}", path.display()))?;
+                eprintln!("\n{source}");
+            }
+            _ => bail!("project recipe was not trusted"),
+        }
     }
 
     crate::project_definition::trust_digest(project, &loaded.extensions, digest)?;
@@ -5235,8 +5271,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn configured_project_supplies_its_root_and_preserves_an_explicit_path() {
+    #[tokio::test]
+    async fn configured_project_supplies_its_root_and_preserves_an_explicit_path() {
         let temporary = tempfile::tempdir().unwrap();
         let main = temporary.path().join("main");
         let linked = temporary.path().join("linked");
@@ -5251,6 +5287,7 @@ mod tests {
 
         assert_eq!(
             resolve_project_open(None, Some("fut"), temporary.path(), &config_location)
+                .await
                 .unwrap()
                 .0,
             main
@@ -5262,6 +5299,7 @@ mod tests {
                 temporary.path(),
                 &config_location,
             )
+            .await
             .unwrap()
             .0,
             linked

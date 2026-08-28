@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Prompt to inspect, approve, or reject untrusted project recipes before daemon startup instead of hiding the error in the daemon log.
 - Added a safe forced-shutdown escape hatch for protocol-incompatible daemons, with automatic delegation to the running daemon's own binary when available.
 - Collapsed the run extension indicator to one always-visible token whose glyph, pulse, and style follow its state, with dedicated glyphs under the Nerd Font preset.
 - Made extension status tokens clickable for pane navigation or resource-scoped extension commands, including the bundled run status linking to its owner pane or logs.

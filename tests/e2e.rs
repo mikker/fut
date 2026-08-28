@@ -8365,6 +8365,86 @@ async fn repository_recipe_trust_change_and_untrust_apply_without_daemon_restart
 }
 
 #[tokio::test]
+async fn implicit_catalog_recipe_is_prompted_before_daemon_autostart() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    let config_dir = root.path().join("home/.config/fut");
+    let state_dir = root.path().join("state");
+    let runtime = root.path().join("runtime");
+    let socket = runtime.join("fut.sock");
+    fs::create_dir_all(project.join(".fut")).unwrap();
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        project.join(".fut/project.toml"),
+        r#"workspaces = [{ tabs = [{ panes = [{ command = ["/bin/sh", "-c", "touch approved-marker; while :; do sleep 1; done"] }] }] }]
+"#,
+    )
+    .unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        format!("[projects.implicit]\npath = {:?}\n", project),
+    )
+    .unwrap();
+
+    let run_open = |answer: &'static [u8]| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_fut"))
+            .env_clear()
+            .env("HOME", root.path().join("home"))
+            .env("XDG_STATE_HOME", &state_dir)
+            .env("PATH", "/usr/bin:/bin")
+            .env("SHELL", "/bin/sh")
+            .current_dir(&project)
+            .args(["--socket", socket.to_str().unwrap(), "open", "--background"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(answer).unwrap();
+        child.wait_with_output().unwrap()
+    };
+
+    let rejected = run_open(b"n\n");
+    assert!(!rejected.status.success());
+    let rejected_error = String::from_utf8_lossy(&rejected.stderr);
+    assert!(rejected_error.contains("contains an untrusted recipe"));
+    assert!(rejected_error.contains("Trust this recipe and continue? [y/N/i]"));
+    assert!(rejected_error.contains("project recipe was not trusted"));
+    assert!(!socket.exists());
+    assert!(!runtime.join("fut-daemon.log").exists());
+    assert!(!project.join("approved-marker").exists());
+
+    let approved = run_open(b"i\ny\n");
+    assert!(
+        approved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&approved.stderr)
+    );
+    let approved_error = String::from_utf8_lossy(&approved.stderr);
+    assert!(approved_error.contains("contains an untrusted recipe"));
+    assert!(approved_error.contains("touch approved-marker"));
+    assert_eq!(
+        approved_error
+            .matches("Trust this recipe and continue? [y/N/i]")
+            .count(),
+        2
+    );
+    assert!(approved_error.contains("Trusted project recipe for \"implicit\"."));
+    wait_for(DEADLINE, || project.join("approved-marker").exists()).await;
+    assert!(
+        !fs::read_to_string(runtime.join("fut-daemon.log"))
+            .unwrap_or_default()
+            .contains("untrusted project recipe")
+    );
+
+    let shutdown = Command::new(env!("CARGO_BIN_EXE_fut"))
+        .args(["--socket", socket.to_str().unwrap(), "daemon", "shutdown"])
+        .output()
+        .unwrap();
+    assert!(shutdown.status.success());
+}
+
+#[tokio::test]
 async fn daemon_bootstrap_applies_the_matching_catalog_recipe_atomically() {
     let harness = Harness::start_with(
         "touch bootstrap-focus.marker; while :; do sleep 1; done",
