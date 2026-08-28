@@ -2335,23 +2335,25 @@ fn workspace_row_lines(
         &icons,
         resolve,
     );
-    if item.current
-        && !body.spans.is_empty()
-        && !icons.pill_left.is_empty()
-        && !icons.pill_right.is_empty()
-    {
-        let title_style = apply_item_state(&ui.styles, title_state, surface);
-        let cap_style = pill_cap_style(title_style, row_style);
+    if !body.spans.is_empty() && !icons.pill_left.is_empty() && !icons.pill_right.is_empty() {
         let left_width = UnicodeWidthStr::width(icons.pill_left.as_str());
         for action in &mut body.actions {
             action.start += left_width;
         }
-        body.line
-            .spans
-            .insert(0, Span::styled(icons.pill_left.clone(), cap_style));
-        body.line
-            .spans
-            .push(Span::styled(icons.pill_right.clone(), cap_style));
+        if item.current {
+            let title_style = apply_item_state(&ui.styles, title_state, surface);
+            let cap_style = pill_cap_style(title_style, row_style);
+            body.line
+                .spans
+                .insert(0, Span::styled(icons.pill_left.clone(), cap_style));
+            body.line
+                .spans
+                .push(Span::styled(icons.pill_right.clone(), cap_style));
+        } else {
+            body.line
+                .spans
+                .insert(0, Span::styled(" ".repeat(left_width), row_style));
+        }
     }
     let right = render_token_segments(
         &workspace_config(ui, side).row.right,
@@ -2903,6 +2905,36 @@ mod tests {
                 .fg,
             ratatui::style::Color::Red
         );
+    }
+
+    #[test]
+    fn workspace_numbers_align_when_the_current_title_has_pill_caps() {
+        let (snapshot, focused) = fixture(&["current", "other"], 0);
+        let model = WorkspaceModel::from_snapshot(
+            &snapshot,
+            &focused,
+            &NavigationHistory::default(),
+            &NotificationState::default(),
+        );
+        let mut ui = UiConfig::default();
+        ui.icons.preset = IconPreset::NerdFont;
+        let area = Rect::new(0, 0, 20, 2);
+        let mut buffer = Buffer::empty(area);
+
+        for (row, item) in model.items.iter().enumerate() {
+            render_workspace_row(
+                item,
+                false,
+                0,
+                Rect::new(0, u16::try_from(row).unwrap(), 20, 1),
+                SidebarSide::Left,
+                &ui,
+                &mut buffer,
+            );
+        }
+
+        assert_eq!(buffer[(2, 0)].symbol(), "1");
+        assert_eq!(buffer[(2, 1)].symbol(), "2");
     }
 
     fn rendered(
