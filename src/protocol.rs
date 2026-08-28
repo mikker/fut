@@ -19,8 +19,6 @@ use crate::{
     splits::{SplitDirection, SplitRatio, SplitTree},
 };
 
-/// Protocol version used by released Fut 0.1 builds.
-pub const PROTOCOL_VERSION_0_1: u16 = 0;
 /// Current clients and daemons require an exact protocol match. The protocol is
 /// the package version's minor component: Fut 0.12.x uses protocol 12.
 pub const PROTOCOL_VERSION: u16 = parse_protocol_version(env!("CARGO_PKG_VERSION_MINOR"));
@@ -1582,7 +1580,6 @@ mod tests {
             decode_payload::<ServerMessage>(&encode_payload(&switched).unwrap()).unwrap(),
             switched
         );
-        assert_eq!(PROTOCOL_VERSION_0_1, 0);
         assert_eq!(
             PROTOCOL_VERSION.to_string(),
             env!("CARGO_PKG_VERSION_MINOR")

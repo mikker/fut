@@ -1,7 +1,13 @@
 use std::{
     ffi::OsString,
-    io::{BufRead, Read, Write},
-    path::PathBuf,
+    fs,
+    io::{self, BufRead, Read, Write},
+    os::fd::AsRawFd,
+    os::unix::{
+        ffi::OsStringExt,
+        fs::{FileTypeExt, MetadataExt},
+    },
+    path::{Path, PathBuf},
     process::ExitCode,
     str::FromStr,
     time::Duration,
@@ -49,9 +55,9 @@ use crate::{
     protocol::{
         AcknowledgedCommand, AgentPromptMode, ClientMessage, ClientMode, ContextScope,
         ContextualCommand, Envelope, ExtensionCapabilityDeclaration, ExtensionCatalog,
-        ExtensionDeclaration, PROTOCOL_VERSION, PROTOCOL_VERSION_0_1,
-        PresentationTokenPublishAction, RenameSelector, ServerMessage, TerminalContext,
-        TerminalInputOperation, codec, decode_payload, encode_payload,
+        ExtensionDeclaration, PROTOCOL_VERSION, PresentationTokenPublishAction, RenameSelector,
+        ServerMessage, TerminalContext, TerminalInputOperation, codec, decode_payload,
+        encode_payload,
     },
     resources::{
         PanePathRef, PaneSnapshot, PresentationTokenTarget, ResourceSnapshot, SessionSelector,
@@ -776,7 +782,11 @@ enum DaemonCommand {
     /// Check whether the existing daemon is responsive.
     Ping,
     /// Ask the existing daemon to shut down.
-    Shutdown,
+    Shutdown {
+        /// Terminate the socket-owning daemon without using its protocol.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1992,12 +2002,13 @@ async fn execute(cli: Cli) -> Result<()> {
             Ok(())
         }
         Some(Command::Daemon {
-            command: DaemonCommand::Shutdown,
+            command: DaemonCommand::Shutdown { force },
         }) => {
-            response_ok(
-                shutdown_control(&socket).await?,
-                AcknowledgedCommand::Shutdown,
-            )?;
+            if force {
+                force_shutdown(&socket).await?;
+            } else {
+                shutdown_control(&socket).await?;
+            }
             output(
                 cli.json,
                 "daemon.shutdown",
@@ -3403,50 +3414,52 @@ async fn connected_control(
 ) -> Result<Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>> {
     match control_handshake(socket, PROTOCOL_VERSION).await? {
         ControlHandshake::Connected(framed) => Ok(framed),
-        ControlHandshake::Incompatible { server } => bail!(
+        ControlHandshake::Incompatible { server, .. } => bail!(
             "daemon at {} uses protocol {server}, but this Fut client requires protocol \
-             {PROTOCOL_VERSION}",
+             {PROTOCOL_VERSION}; run `fut --socket {} daemon shutdown --force` to terminate it",
+            socket.display(),
             socket.display()
         ),
     }
 }
 
-async fn shutdown_control(socket: &std::path::Path) -> Result<ServerMessage> {
+async fn shutdown_control(socket: &std::path::Path) -> Result<()> {
     match control_handshake(socket, PROTOCOL_VERSION).await? {
-        ControlHandshake::Connected(framed) => request(framed, ClientMessage::Shutdown).await,
-        ControlHandshake::Incompatible { server } => match shutdown_downgrade_version(server) {
-            Some(version) => match control_handshake(socket, version).await? {
-                ControlHandshake::Connected(framed) => {
-                    request(framed, ClientMessage::Shutdown).await
-                }
-                ControlHandshake::Incompatible { server: changed } => bail!(
-                    "daemon at {} changed protocol from {server} to {changed} during shutdown",
-                    socket.display()
-                ),
-            },
-            None => bail!(
-                "daemon at {} uses protocol {server}, but this Fut client can only shut down \
-                 current protocol {PROTOCOL_VERSION} or Fut 0.1 protocol \
-                 {PROTOCOL_VERSION_0_1}",
+        ControlHandshake::Connected(framed) => response_ok(
+            request(framed, ClientMessage::Shutdown).await?,
+            AcknowledgedCommand::Shutdown,
+        ),
+        ControlHandshake::Incompatible { server, peer } => {
+            if let Some(peer) = peer
+                && peer.uid == effective_user_id()
+                && std::env::var_os("FUT_SHUTDOWN_DELEGATED").is_none()
+                && shutdown_with_daemon_binary(socket, peer.pid).await.is_ok()
+            {
+                return Ok(());
+            }
+            bail!(
+                "daemon at {} uses incompatible protocol {server}; run `fut --socket {} \
+                 daemon shutdown --force` to terminate it",
+                socket.display(),
                 socket.display()
-            ),
-        },
+            )
+        }
     }
-}
-
-fn shutdown_downgrade_version(server: u16) -> Option<u16> {
-    (server == PROTOCOL_VERSION_0_1).then_some(server)
 }
 
 enum ControlHandshake {
     Connected(Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>),
-    Incompatible { server: u16 },
+    Incompatible {
+        server: u16,
+        peer: Option<PeerCredentials>,
+    },
 }
 
 async fn control_handshake(socket: &std::path::Path, version: u16) -> Result<ControlHandshake> {
     let stream = UnixStream::connect(socket)
         .await
         .with_context(|| format!("connect to {}", socket.display()))?;
+    let peer = peer_credentials(&stream).ok();
     let mut framed = Framed::new(stream, codec());
     let hello_request_id = send(
         &mut framed,
@@ -3469,10 +3482,286 @@ async fn control_handshake(socket: &std::path::Path, version: u16) -> Result<Con
             version: server, ..
         } if server == version => Ok(ControlHandshake::Connected(framed)),
         ServerMessage::IncompatibleProtocol { server, .. } => {
-            Ok(ControlHandshake::Incompatible { server })
+            Ok(ControlHandshake::Incompatible { server, peer })
         }
         other => unexpected(other),
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PeerCredentials {
+    pid: libc::pid_t,
+    uid: libc::uid_t,
+}
+
+fn effective_user_id() -> libc::uid_t {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(target_os = "linux")]
+fn peer_credentials(stream: &UnixStream) -> Result<PeerCredentials> {
+    let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: the kernel writes at most `length` bytes to the valid output buffer.
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            credentials.as_mut_ptr().cast(),
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error()).context("read daemon peer credentials");
+    }
+    if length as usize != std::mem::size_of::<libc::ucred>() {
+        bail!("daemon peer credentials had an unexpected size");
+    }
+    // SAFETY: getsockopt succeeded and filled the complete structure.
+    let credentials = unsafe { credentials.assume_init() };
+    Ok(PeerCredentials {
+        pid: credentials.pid,
+        uid: credentials.uid,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn peer_credentials(stream: &UnixStream) -> Result<PeerCredentials> {
+    let descriptor = stream.as_raw_fd();
+    let mut pid = 0;
+    let mut pid_length = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    // SAFETY: the kernel writes at most `pid_length` bytes to the valid PID pointer.
+    if unsafe {
+        libc::getsockopt(
+            descriptor,
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut pid_length,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error()).context("read daemon peer PID");
+    }
+    let mut uid = 0;
+    let mut gid = 0;
+    // SAFETY: getpeereid writes to both valid output pointers.
+    if unsafe { libc::getpeereid(descriptor, &mut uid, &mut gid) } != 0 {
+        return Err(io::Error::last_os_error()).context("read daemon peer identity");
+    }
+    Ok(PeerCredentials { pid, uid })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn peer_credentials(_stream: &UnixStream) -> Result<PeerCredentials> {
+    bail!("forced daemon shutdown is supported only on Linux and macOS")
+}
+
+async fn shutdown_with_daemon_binary(socket: &Path, pid: libc::pid_t) -> Result<()> {
+    let executable = daemon_executable(pid).await?;
+    let status = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new(&executable)
+            .arg("--socket")
+            .arg(socket)
+            .args(["daemon", "shutdown"])
+            .env("FUT_SHUTDOWN_DELEGATED", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status(),
+    )
+    .await
+    .with_context(|| format!("daemon binary {} timed out", executable.display()))??;
+    if !status.success() {
+        bail!(
+            "daemon binary {} could not shut itself down",
+            executable.display()
+        );
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SocketIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl SocketIdentity {
+    fn matches(self, metadata: &fs::Metadata) -> bool {
+        metadata.dev() == self.device && metadata.ino() == self.inode
+    }
+}
+
+async fn force_shutdown(socket: &Path) -> Result<()> {
+    let identity = owned_socket_identity(socket)?;
+    let stream = UnixStream::connect(socket)
+        .await
+        .with_context(|| format!("connect to {}", socket.display()))?;
+    let peer = peer_credentials(&stream)?;
+    drop(stream);
+    if peer.uid != effective_user_id() {
+        bail!(
+            "refusing to terminate daemon PID {} owned by user {}",
+            peer.pid,
+            peer.uid
+        );
+    }
+    if peer.pid <= 1 || peer.pid == std::process::id() as libc::pid_t {
+        bail!("refusing to terminate invalid daemon PID {}", peer.pid);
+    }
+    match peer_at_socket(socket, identity).await? {
+        Some(confirmed) if confirmed == peer => {}
+        Some(confirmed) => bail!(
+            "daemon socket {} changed owner from PID {} to PID {}",
+            socket.display(),
+            peer.pid,
+            confirmed.pid
+        ),
+        None => {
+            remove_original_stale_socket(socket, identity)?;
+            return Ok(());
+        }
+    }
+
+    signal_process(peer.pid, libc::SIGTERM)?;
+    if !wait_for_socket_peer_exit(socket, identity, peer, Duration::from_secs(2)).await? {
+        signal_process(peer.pid, libc::SIGKILL)?;
+        if !wait_for_socket_peer_exit(socket, identity, peer, Duration::from_secs(2)).await? {
+            bail!("daemon PID {} did not exit after SIGKILL", peer.pid);
+        }
+    }
+    remove_original_stale_socket(socket, identity)?;
+    Ok(())
+}
+
+fn owned_socket_identity(socket: &Path) -> Result<SocketIdentity> {
+    let metadata = fs::symlink_metadata(socket)
+        .with_context(|| format!("inspect daemon socket {}", socket.display()))?;
+    if !metadata.file_type().is_socket() {
+        bail!("refusing to use non-socket path {}", socket.display());
+    }
+    if metadata.uid() != effective_user_id() {
+        bail!(
+            "refusing to use daemon socket not owned by the current user: {}",
+            socket.display()
+        );
+    }
+    Ok(SocketIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+fn signal_process(pid: libc::pid_t, signal: libc::c_int) -> Result<()> {
+    // SAFETY: kill receives a validated positive PID and a standard signal number.
+    if unsafe { libc::kill(pid, signal) } == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(error).with_context(|| format!("signal daemon PID {pid}"))
+}
+
+async fn wait_for_socket_peer_exit(
+    socket: &Path,
+    identity: SocketIdentity,
+    expected: PeerCredentials,
+    duration: Duration,
+) -> Result<bool> {
+    let deadline = tokio::time::Instant::now() + duration;
+    while tokio::time::Instant::now() < deadline {
+        match peer_at_socket(socket, identity).await? {
+            None => return Ok(true),
+            Some(peer) if peer == expected => tokio::time::sleep(Duration::from_millis(25)).await,
+            Some(peer) => bail!(
+                "daemon socket {} changed owner from PID {} to PID {}",
+                socket.display(),
+                expected.pid,
+                peer.pid
+            ),
+        }
+    }
+    Ok(false)
+}
+
+async fn peer_at_socket(
+    socket: &Path,
+    identity: SocketIdentity,
+) -> Result<Option<PeerCredentials>> {
+    match fs::symlink_metadata(socket) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect daemon socket {}", socket.display()));
+        }
+        Ok(metadata) => {
+            if !identity.matches(&metadata) {
+                bail!("daemon socket {} was replaced", socket.display());
+            }
+        }
+    }
+    match UnixStream::connect(socket).await {
+        Ok(stream) => peer_credentials(&stream).map(Some),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error).with_context(|| format!("connect to {}", socket.display())),
+    }
+}
+
+fn remove_original_stale_socket(socket: &Path, identity: SocketIdentity) -> Result<()> {
+    let Ok(metadata) = fs::symlink_metadata(socket) else {
+        return Ok(());
+    };
+    if metadata.file_type().is_socket() && identity.matches(&metadata) {
+        fs::remove_file(socket)
+            .with_context(|| format!("remove stale daemon socket {}", socket.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn daemon_executable(pid: libc::pid_t) -> Result<PathBuf> {
+    let executable = PathBuf::from(format!("/proc/{pid}/exe"));
+    tokio::fs::metadata(&executable)
+        .await
+        .with_context(|| format!("resolve executable for daemon PID {pid}"))?;
+    Ok(executable)
+}
+
+#[cfg(target_os = "macos")]
+async fn daemon_executable(pid: libc::pid_t) -> Result<PathBuf> {
+    let mut buffer = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: proc_pidpath writes at most buffer.len() bytes into the valid buffer.
+    let length = unsafe {
+        libc::proc_pidpath(
+            pid,
+            buffer.as_mut_ptr().cast(),
+            u32::try_from(buffer.len()).expect("process path buffer length fits u32"),
+        )
+    };
+    if length <= 0 {
+        return Err(io::Error::last_os_error())
+            .with_context(|| format!("resolve executable for daemon PID {pid}"));
+    }
+    buffer.truncate(length as usize);
+    Ok(PathBuf::from(std::ffi::OsString::from_vec(buffer)))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+async fn daemon_executable(_pid: libc::pid_t) -> Result<PathBuf> {
+    bail!("daemon executable discovery is supported only on Linux and macOS")
 }
 
 async fn request(
@@ -4294,91 +4583,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_reconnects_with_fut_0_1_daemon_protocol() {
-        assert_shutdown_reconnects_with(PROTOCOL_VERSION_0_1).await;
+    async fn unix_socket_peer_credentials_identify_the_current_process() {
+        let temporary = tempfile::tempdir().unwrap();
+        let socket = temporary.path().join("peer.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let client = UnixStream::connect(&socket).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        let client_peer = peer_credentials(&client).unwrap();
+        let server_peer = peer_credentials(&server).unwrap();
+        let pid = std::process::id() as libc::pid_t;
+        let uid = effective_user_id();
+        assert_eq!(client_peer, PeerCredentials { pid, uid });
+        assert_eq!(server_peer, PeerCredentials { pid, uid });
+        assert!(owned_socket_identity(&socket).is_ok());
     }
 
-    async fn assert_shutdown_reconnects_with(compatible_version: u16) {
-        let temporary = tempfile::tempdir().unwrap();
-        let socket = temporary.path().join("fut.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut framed = Framed::new(stream, codec());
-            let first = framed.next().await.unwrap().unwrap();
-            let first: Envelope<ClientMessage> = decode_payload(&first).unwrap();
-            assert!(matches!(
-                first.message,
-                ClientMessage::Hello {
-                    version: PROTOCOL_VERSION,
-                    ..
-                }
-            ));
-            framed
-                .send(Bytes::from(
-                    encode_payload(&Envelope {
-                        request_id: first.request_id,
-                        message: ServerMessage::IncompatibleProtocol {
-                            client: PROTOCOL_VERSION,
-                            server: compatible_version,
-                        },
-                    })
-                    .unwrap(),
-                ))
-                .await
-                .unwrap();
-            drop(framed);
+    #[tokio::test]
+    async fn daemon_executable_resolves_the_current_process() {
+        let executable = daemon_executable(std::process::id() as libc::pid_t)
+            .await
+            .unwrap();
+        assert!(executable.is_absolute());
+        assert!(executable.exists());
+    }
 
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut framed = Framed::new(stream, codec());
-            let second = framed.next().await.unwrap().unwrap();
-            let second: Envelope<ClientMessage> = decode_payload(&second).unwrap();
-            assert!(matches!(
-                second.message,
-                ClientMessage::Hello {
-                    version,
-                    ..
-                } if version == compatible_version
-            ));
-            framed
-                .send(Bytes::from(
-                    encode_payload(&Envelope {
-                        request_id: second.request_id,
-                        message: ServerMessage::Welcome {
-                            version: compatible_version,
-                            server_version: "old".into(),
-                            selected: None,
-                            extension_catalog: empty_extension_catalog(),
-                        },
-                    })
-                    .unwrap(),
-                ))
-                .await
-                .unwrap();
-            let shutdown = framed.next().await.unwrap().unwrap();
-            let shutdown: Envelope<ClientMessage> = decode_payload(&shutdown).unwrap();
-            assert_eq!(shutdown.message, ClientMessage::Shutdown);
-            framed
-                .send(Bytes::from(
-                    encode_payload(&Envelope {
-                        request_id: shutdown.request_id,
-                        message: ServerMessage::CommandCompleted {
-                            command: AcknowledgedCommand::Shutdown,
-                        },
-                    })
-                    .unwrap(),
-                ))
-                .await
-                .unwrap();
-        });
-
-        assert_eq!(
-            shutdown_control(&socket).await.unwrap(),
-            ServerMessage::CommandCompleted {
-                command: AcknowledgedCommand::Shutdown,
-            }
-        );
-        server.await.unwrap();
+    #[test]
+    fn forced_shutdown_rejects_non_socket_paths() {
+        let temporary = tempfile::NamedTempFile::new().unwrap();
+        let error = owned_socket_identity(temporary.path()).unwrap_err();
+        assert!(error.to_string().contains("non-socket"));
     }
 
     #[test]
@@ -4387,7 +4621,7 @@ mod tests {
         let messages = [
             ServerMessage::IncompatibleProtocol {
                 client: PROTOCOL_VERSION,
-                server: PROTOCOL_VERSION_0_1,
+                server: PROTOCOL_VERSION + 1,
             },
             ServerMessage::Welcome {
                 version: PROTOCOL_VERSION,
@@ -4417,20 +4651,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn shutdown_downgrade_is_restricted_to_known_compatible_protocols() {
-        assert_eq!(
-            shutdown_downgrade_version(PROTOCOL_VERSION_0_1),
-            Some(PROTOCOL_VERSION_0_1)
-        );
-        assert_eq!(shutdown_downgrade_version(1), None);
-        assert_eq!(shutdown_downgrade_version(2), None);
-        assert_eq!(shutdown_downgrade_version(3), None);
-        assert_eq!(shutdown_downgrade_version(PROTOCOL_VERSION), None);
-        assert_eq!(shutdown_downgrade_version(PROTOCOL_VERSION + 1), None);
-        assert_eq!(shutdown_downgrade_version(u16::MAX), None);
     }
 
     #[test]
@@ -4588,6 +4808,7 @@ mod tests {
             vec!["fut", "daemon", "run"],
             vec!["fut", "daemon", "ping"],
             vec!["fut", "daemon", "shutdown"],
+            vec!["fut", "daemon", "shutdown", "--force"],
         ] {
             Cli::try_parse_from(args).unwrap();
         }

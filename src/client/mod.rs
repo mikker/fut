@@ -558,7 +558,10 @@ async fn connect_interactive(
             bail!("daemon welcomed client with unsupported protocol version {version}")
         }
         ServerMessage::IncompatibleProtocol { client, server } => {
-            bail!("incompatible protocol: client {client}, server {server}")
+            bail!(
+                "incompatible protocol: client {client}, server {server}; run `fut daemon \
+                 shutdown --force` to terminate the old daemon"
+            )
         }
         ServerMessage::Error { code, message } => bail!("daemon error ({code}): {message}"),
         message => bail!("expected welcome from daemon, received {message:?}"),
@@ -609,7 +612,10 @@ async fn connect_control_navigator(
             ..
         } if version == PROTOCOL_VERSION => extension_catalog,
         ServerMessage::IncompatibleProtocol { client, server } => {
-            bail!("incompatible protocol: client {client}, server {server}")
+            bail!(
+                "incompatible protocol: client {client}, server {server}; run `fut daemon \
+                 shutdown --force` to terminate the old daemon"
+            )
         }
         ServerMessage::Error { code, message } => bail!("daemon error ({code}): {message}"),
         message => bail!("expected control welcome from daemon, received {message:?}"),

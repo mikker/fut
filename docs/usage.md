@@ -24,6 +24,12 @@ you detach. Detached terminals keep consuming and parsing their output, but Fut
 defers screen rendering until a client observes them again. Runtime state is not
 restored after the daemon exits or the machine restarts.
 
+`fut daemon shutdown` gracefully closes every session. If an upgrade leaves an
+older, protocol-incompatible daemon running, Fut first asks that daemon's own
+executable to shut it down. As a final recovery path,
+`fut daemon shutdown --force` verifies the Unix socket belongs to your user and
+terminates its owning process without speaking the incompatible protocol.
+
 Run `fut` from another directory to open it in the existing daemon. Fut groups
 resources like this:
 
