@@ -36,7 +36,8 @@ use crate::{
     protocol::{
         ExtensionCapabilityDeclaration, ExtensionCatalog, ExtensionCommandDeclaration,
         ExtensionCommandExecutionDeclaration, ExtensionDeclaration, ExtensionPresentationScope,
-        ExtensionPresentationTokenDeclaration, ExtensionTokenPresentation, SelectedTarget,
+        ExtensionPresentationTokenDeclaration, ExtensionPresentationTokenVariantDeclaration,
+        ExtensionTokenPresentation, ExtensionTokenStyle, SelectedTarget,
     },
     resources::{MAX_MATERIALIZED_TOKEN_VALUE_BYTES, Mutation, ResourceEvent, ResourceSnapshot},
 };
@@ -461,10 +462,20 @@ fn extension_declaration(extension: &Extension) -> Result<ExtensionDeclaration> 
                 PresentationScope::Tab => ExtensionPresentationScope::Tab,
                 PresentationScope::Pane => ExtensionPresentationScope::Pane,
             },
-            presentation: match token.presentation {
-                TokenPresentation::Plain => ExtensionTokenPresentation::Plain,
-                TokenPresentation::Spinner => ExtensionTokenPresentation::Spinner,
-            },
+            presentation: token.presentation.into(),
+            variants: token
+                .variants
+                .iter()
+                .map(
+                    |(value, variant)| ExtensionPresentationTokenVariantDeclaration {
+                        value: value.clone(),
+                        text: variant.text.clone(),
+                        nerd_font_text: variant.nerd_font_text.clone(),
+                        presentation: variant.presentation.into(),
+                        style: variant.style,
+                    },
+                )
+                .collect(),
         })
         .collect();
     Ok(ExtensionDeclaration {
@@ -704,10 +715,31 @@ fn extension_from_declaration(declaration: ExtensionDeclaration) -> Result<Exten
             ExtensionPresentationScope::Tab => PresentationScope::Tab,
             ExtensionPresentationScope::Pane => PresentationScope::Pane,
         };
-        let presentation = match token.presentation {
-            ExtensionTokenPresentation::Plain => TokenPresentation::Plain,
-            ExtensionTokenPresentation::Spinner => TokenPresentation::Spinner,
-        };
+        let presentation = token.presentation.into();
+        if token.variants.len() > MAX_PRESENTATION_TOKENS {
+            bail!("extension catalog presentation token declares too many variants");
+        }
+        let mut variants = BTreeMap::new();
+        for variant in token.variants {
+            validate_identifier("presentation token variant", &variant.value)?;
+            validate_token_variant_text(&variant.text, variant.nerd_font_text.as_deref())
+                .context("validate extension catalog presentation token variant")?;
+            let value = variant.value;
+            if variants
+                .insert(
+                    value.clone(),
+                    TokenVariant {
+                        text: variant.text,
+                        nerd_font_text: variant.nerd_font_text,
+                        presentation: variant.presentation.into(),
+                        style: variant.style,
+                    },
+                )
+                .is_some()
+            {
+                bail!("extension catalog repeats presentation token variant {value:?}");
+            }
+        }
         presentation_tokens.push(PresentationToken {
             qualified_name: format!(
                 "{}.extension.{}.{}",
@@ -718,6 +750,7 @@ fn extension_from_declaration(declaration: ExtensionDeclaration) -> Result<Exten
             name: token.name,
             scope,
             presentation,
+            variants,
         });
     }
 
@@ -876,6 +909,14 @@ fn registry_fingerprint(extensions: &[Extension], config: &ExtensionConfigCatalo
             fingerprint.string(token.scope().as_str());
             fingerprint.string(token.presentation().as_str());
             fingerprint.string(token.qualified_name());
+            fingerprint.count(token.variants.len());
+            for (value, variant) in &token.variants {
+                fingerprint.string(value);
+                fingerprint.string(&variant.text);
+                fingerprint.string(variant.nerd_font_text.as_deref().unwrap_or(""));
+                fingerprint.string(variant.presentation.as_str());
+                fingerprint.string(&format!("{:?}", variant.style));
+            }
         }
     }
 
@@ -1602,6 +1643,7 @@ pub(crate) struct PresentationToken {
     name: String,
     scope: PresentationScope,
     presentation: TokenPresentation,
+    variants: BTreeMap<String, TokenVariant>,
     qualified_name: String,
 }
 
@@ -1612,6 +1654,29 @@ impl PresentationToken {
 
     pub(crate) const fn presentation(&self) -> TokenPresentation {
         self.presentation
+    }
+
+    pub(crate) fn variant(&self, value: &str) -> Option<&TokenVariant> {
+        self.variants.get(value)
+    }
+
+    pub(crate) fn presentation_for(&self, value: &str) -> TokenPresentation {
+        self.variant(value)
+            .map(|variant| variant.presentation)
+            .unwrap_or(self.presentation)
+    }
+
+    pub(crate) fn is_animated(&self, value: &str, nerd_font: bool) -> bool {
+        match self.presentation_for(value) {
+            TokenPresentation::Plain => false,
+            TokenPresentation::Pulse => true,
+            TokenPresentation::Spinner => {
+                !(nerd_font
+                    && self
+                        .variant(value)
+                        .is_some_and(|variant| variant.nerd_font_text.is_some()))
+            }
+        }
     }
 
     /// The collision-free name later publication and rendering work can expose.
@@ -1626,6 +1691,35 @@ pub(crate) enum TokenPresentation {
     #[default]
     Plain,
     Spinner,
+    Pulse,
+}
+
+impl From<ExtensionTokenPresentation> for TokenPresentation {
+    fn from(value: ExtensionTokenPresentation) -> Self {
+        match value {
+            ExtensionTokenPresentation::Plain => Self::Plain,
+            ExtensionTokenPresentation::Spinner => Self::Spinner,
+            ExtensionTokenPresentation::Pulse => Self::Pulse,
+        }
+    }
+}
+
+impl From<TokenPresentation> for ExtensionTokenPresentation {
+    fn from(value: TokenPresentation) -> Self {
+        match value {
+            TokenPresentation::Plain => Self::Plain,
+            TokenPresentation::Spinner => Self::Spinner,
+            TokenPresentation::Pulse => Self::Pulse,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TokenVariant {
+    pub(crate) text: String,
+    pub(crate) nerd_font_text: Option<String>,
+    pub(crate) presentation: TokenPresentation,
+    pub(crate) style: ExtensionTokenStyle,
 }
 
 impl TokenPresentation {
@@ -1633,6 +1727,7 @@ impl TokenPresentation {
         match self {
             Self::Plain => "plain",
             Self::Spinner => "spinner",
+            Self::Pulse => "pulse",
         }
     }
 }
@@ -1658,6 +1753,20 @@ pub(crate) fn validate_presentation_value(value: &str) -> Result<()> {
             )
     }) {
         bail!("presentation token value contains a control or bidirectional formatting character");
+    }
+    Ok(())
+}
+
+fn validate_token_variant_text(text: &str, nerd_font_text: Option<&str>) -> Result<()> {
+    validate_presentation_value(text)?;
+    if text.is_empty() {
+        bail!("presentation token variant has an empty glyph");
+    }
+    if let Some(text) = nerd_font_text {
+        validate_presentation_value(text)?;
+        if text.is_empty() {
+            bail!("presentation token variant has an empty Nerd Font glyph");
+        }
     }
     Ok(())
 }
@@ -1715,6 +1824,19 @@ struct TokenDeclaration {
     scope: PresentationScope,
     #[serde(default)]
     presentation: TokenPresentation,
+    #[serde(default)]
+    variants: BTreeMap<String, TokenVariantDeclaration>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TokenVariantDeclaration {
+    text: String,
+    #[serde(default)]
+    nerd_font_text: Option<String>,
+    #[serde(default)]
+    presentation: TokenPresentation,
+    style: ExtensionTokenStyle,
 }
 
 /// Load all configured roots or return an error without exposing a partial set.
@@ -1970,10 +2092,46 @@ fn load_one(root: &Path) -> Result<Extension> {
             manifest.id,
             declaration.name
         );
+        if declaration.variants.len() > MAX_PRESENTATION_TOKENS {
+            bail!(
+                "extension {:?} presentation token {:?} declares too many variants",
+                manifest.id,
+                declaration.name
+            );
+        }
+        let variants = declaration
+            .variants
+            .into_iter()
+            .map(|(value, variant)| {
+                validate_identifier("presentation token variant", &value).with_context(|| {
+                    format!(
+                        "validate extension {:?} presentation token variant {value:?}",
+                        manifest.id
+                    )
+                })?;
+                validate_token_variant_text(&variant.text, variant.nerd_font_text.as_deref())
+                    .with_context(|| {
+                        format!(
+                            "validate extension {:?} presentation token variant {value:?}",
+                            manifest.id
+                        )
+                    })?;
+                Ok((
+                    value,
+                    TokenVariant {
+                        text: variant.text,
+                        nerd_font_text: variant.nerd_font_text,
+                        presentation: variant.presentation,
+                        style: variant.style,
+                    },
+                ))
+            })
+            .collect::<Result<_>>()?;
         presentation_tokens.push(PresentationToken {
             name: declaration.name,
             scope: declaration.scope,
             presentation: declaration.presentation,
+            variants,
             qualified_name,
         });
     }
@@ -3307,11 +3465,14 @@ scope = "tab"
                 .iter()
                 .map(|token| token.name.as_str())
                 .collect::<Vec<_>>(),
-            ["pause", "launching", "play", "stop", "cross", "status"]
+            ["status"]
         );
         assert_eq!(
-            extension.presentation_tokens()[1].presentation(),
-            TokenPresentation::Spinner
+            extension.presentation_tokens()[0]
+                .variant("launching")
+                .unwrap()
+                .presentation,
+            TokenPresentation::Pulse
         );
 
         match std::process::Command::new("python3")

@@ -1,5 +1,5 @@
 api_version = 1
-version = "1.1.0"
+version = "1.2.0"
 fut = ">=0.14.0, <1.0.0"
 capabilities = ["commands", "hooks", "presentation_tokens"]
 id = "run"
@@ -28,26 +28,30 @@ argv = ["./bin/runctl", "edit-logs"]
 "workspace.closed" = ["./bin/runctl", "hook"]
 
 [[presentation_tokens]]
-name = "pause"
-scope = "workspace"
-
-[[presentation_tokens]]
-name = "launching"
-scope = "workspace"
-presentation = "spinner"
-
-[[presentation_tokens]]
-name = "play"
-scope = "workspace"
-
-[[presentation_tokens]]
-name = "stop"
-scope = "workspace"
-
-[[presentation_tokens]]
-name = "cross"
-scope = "workspace"
-
-[[presentation_tokens]]
 name = "status"
 scope = "workspace"
+
+[presentation_tokens.variants.pause]
+text = "⚬"
+nerd_font_text = "󰒓"
+style = "muted"
+
+[presentation_tokens.variants.launching]
+text = "⁕"
+nerd_font_text = "󱑠"
+style = "attention"
+presentation = "pulse"
+
+[presentation_tokens.variants.play]
+text = "‣"
+nerd_font_text = "󱤵"
+style = "added"
+
+[presentation_tokens.variants.stop]
+text = "☒"
+nerd_font_text = "󱤷"
+style = "divider"
+
+[presentation_tokens.variants.cross]
+text = "✗"
+style = "error"

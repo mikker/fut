@@ -171,11 +171,7 @@ center = [
   { segments = [{ component = "tabs" }], priority = 100 },
 ]
 right = [
-  { segments = [{ token = "workspace.extension.run.pause", style = "divider", inverted = true, pill = true }], priority = 220 },
-  { segments = [{ token = "workspace.extension.run.launching", style = "attention", inverted = true, pill = true }], priority = 220 },
-  { segments = [{ token = "workspace.extension.run.play", style = "added", inverted = true, pill = true }], priority = 220 },
-  { segments = [{ token = "workspace.extension.run.stop", style = "divider", inverted = true, pill = true }], priority = 220 },
-  { segments = [{ token = "workspace.extension.run.cross", style = "error", inverted = true, pill = true }], priority = 220 },
+  { segments = [{ token = "workspace.extension.run.status", inverted = true, pill = true }], priority = 220 },
   { segments = [{ token = "client.zoom", suffix = " " }], priority = 255 },
   { segments = [{ token = "client.help" }], style = "muted", priority = 0 },
 ]

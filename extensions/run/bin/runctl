@@ -46,13 +46,7 @@ import sys
 import time
 from typing import NamedTuple
 
-TOKENS = {
-    "pause": "…",
-    "launching": "1",
-    "play": "▶",
-    "stop": "■",
-    "cross": "✗",
-}
+STATES = {"pause", "launching", "play", "stop", "cross"}
 CONFIG_KEYS = {"auto_start", "click", "command", "grace_seconds", "signal"}
 TRUSTED_CONFIG_ENV = "FUT_EXTENSION_TRUSTED_CONFIG"
 DEFAULT_GRACE = 3.0
@@ -220,13 +214,9 @@ def publish_token(base_argv, target_argv, name, value, action):
 
 
 def publish_tokens(active, click="owner", owner_pane_id=None):
-    """Publish the general status and exactly one styled workspace token.
-
-    The general status makes the state usable in a single workspace-row
-    segment. It is published before the styled token changes so neither
-    representation blinks empty. Failures are ignored: the workspace may
-    already be gone.
-    """
+    """Publish one stable, manifest-styled status token."""
+    if active not in STATES:
+        raise ValueError("unknown run state %r" % active)
     fut_bin = os.environ.get("FUT_BIN")
     socket = os.environ.get("FUT_SOCKET")
     extension = os.environ.get("FUT_EXTENSION_ID", "run")
@@ -247,11 +237,7 @@ def publish_tokens(active, click="owner", owner_pane_id=None):
         action = ["--action-command", "logs"]
     elif click == "owner" and isinstance(owner_pane_id, str) and owner_pane_id:
         action = ["--action-pane-id", owner_pane_id]
-    status = "…" if active == "launching" else TOKENS[active]
-    values = [("status", status), (active, TOKENS[active])]
-    values.extend((name, "") for name in TOKENS if name != active)
-    for name, value in values:
-        publish_token(base_argv, target_argv, name, value, action)
+    publish_token(base_argv, target_argv, "status", active, action)
 
 
 def publish_state_tokens(active, state):

@@ -355,6 +355,20 @@ Declare every token before publishing it:
 name = "state"
 scope = "workspace"
 
+[presentation_tokens.variants.waiting]
+text = "…"
+style = "divider"
+
+[presentation_tokens.variants.running]
+text = "▶"
+nerd_font_text = "󰐊"
+style = "added"
+
+[presentation_tokens.variants.refreshing]
+text = "…"
+style = "attention"
+presentation = "pulse"
+
 [[presentation_tokens]]
 name = "refreshing"
 scope = "workspace"
@@ -362,8 +376,17 @@ presentation = "spinner"
 ```
 
 Scopes are `session`, `workspace`, `tab`, and `pane`. `presentation` is `plain`
-by default; `spinner` treats any non-empty value as presence and animates in the
-client. Publish state changes, not animation frames:
+by default. `spinner` treats any non-empty value as presence and replaces it
+with an animated spinner; `pulse` keeps the text and applies a two-second
+bright-to-dim pulse using the terminal's faint-text support. A token may instead
+declare named `variants`, each with a nonempty `text`, semantic `style`, and
+optional presentation. `nerd_font_text` supplies an alternate glyph when
+`[ui.icons] preset = "nerd_font"`; for spinners it replaces the animation, while
+plain and pulsing variants retain their presentation. Publishing the variant
+name displays its configured glyph and style. This keeps state-specific display
+choices in the extension manifest while UI layouts configure one stable token.
+Styles use the same semantic names as UI segments, such as `divider`,
+`attention`, `added`, and `error`. Publish state changes, not animation frames:
 
 ```sh
 "$FUT_BIN" --socket "$FUT_SOCKET" \

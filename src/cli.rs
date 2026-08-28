@@ -2449,6 +2449,7 @@ fn render_extension_show(
             let presentation = match token.presentation {
                 crate::protocol::ExtensionTokenPresentation::Plain => "plain",
                 crate::protocol::ExtensionTokenPresentation::Spinner => "spinner",
+                crate::protocol::ExtensionTokenPresentation::Pulse => "pulse",
             };
             format!("{} ({scope}, {presentation})", token.name)
         })

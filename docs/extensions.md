@@ -519,10 +519,12 @@ components = [
 Presentation defaults to `plain`: the client renders the validated published
 string exactly as token text. `presentation = "spinner"` instead treats any
 non-empty published value as presence and renders an animated spinner using
-the client's existing 100 ms clock. Empty still suppresses the segment and its
-affixes. Animation is entirely client-side—publication happens only when the
-extension's state changes, never once per frame—and does not give plain token
-values a control or styling channel.
+the client's existing 100 ms clock. `presentation = "pulse"` keeps the text and
+applies a two-second bright-to-dim pulse using the terminal's broadly supported
+faint-text modifier; terminal protocols do not provide alpha transparency.
+Empty still suppresses the segment and its affixes. Animation is entirely
+client-side—publication happens only when the extension's state changes, never
+once per frame—and does not give plain token values a control or styling channel.
 
 Values are plain text and cannot inject styles or markup. A non-empty
 publication may attach either `--action-pane-id PANE`, which navigates the

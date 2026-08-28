@@ -309,6 +309,18 @@ pub struct ExtensionPresentationTokenDeclaration {
     pub name: String,
     pub scope: ExtensionPresentationScope,
     pub presentation: ExtensionTokenPresentation,
+    #[serde(default)]
+    pub variants: Vec<ExtensionPresentationTokenVariantDeclaration>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExtensionPresentationTokenVariantDeclaration {
+    pub value: String,
+    pub text: String,
+    #[serde(default)]
+    pub nerd_font_text: Option<String>,
+    pub presentation: ExtensionTokenPresentation,
+    pub style: ExtensionTokenStyle,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -325,6 +337,27 @@ pub enum ExtensionPresentationScope {
 pub enum ExtensionTokenPresentation {
     Plain,
     Spinner,
+    Pulse,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionTokenStyle {
+    Normal,
+    Muted,
+    Session,
+    Workspace,
+    Tab,
+    Pane,
+    Current,
+    Selected,
+    Closing,
+    Activity,
+    Attention,
+    Error,
+    Divider,
+    Added,
+    Deleted,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -807,6 +840,7 @@ mod tests {
                     name: "state".into(),
                     scope: ExtensionPresentationScope::Workspace,
                     presentation: ExtensionTokenPresentation::Spinner,
+                    variants: Vec::new(),
                 }],
             }],
             config: ExtensionCatalogConfig {

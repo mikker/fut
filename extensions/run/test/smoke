@@ -52,9 +52,9 @@ export FUT_RUN_STATE_DIR="$TMP/state"
 export FUT_RUN_MAX_LOG_BYTES=4096
 
 # Recorded argv: --socket S token publish run <name> <value> --workspace-id <ws>
-last_token() { # <workspace-id> -> name of last non-empty publish
+last_token() { # <workspace-id> -> state of last non-empty status publish
   awk -v ws="$1" 'BEGIN { FS = "\037" }
-    $3 == "token" && $4 == "publish" && $8 == "--workspace-id" && $9 == ws && $7 != "" { last = $6 }
+    $3 == "token" && $4 == "publish" && $6 == "status" && $8 == "--workspace-id" && $9 == ws && $7 != "" { last = $7 }
     END { print last }' "$TOKENS"
 }
 
@@ -64,10 +64,10 @@ token_count() { # <workspace-id>
     END { print n }' "$TOKENS"
 }
 
-status_is() { # <workspace-id> <glyph>
-  awk -v ws="$1" -v glyph="$2" 'BEGIN { FS = "\037" }
+status_is() { # <workspace-id> <state>
+  awk -v ws="$1" -v state="$2" 'BEGIN { FS = "\037" }
     $3 == "token" && $4 == "publish" && $6 == "status" && $9 == ws { value = $7 }
-    END { exit value == glyph ? 0 : 1 }' "$TOKENS"
+    END { exit value == state ? 0 : 1 }' "$TOKENS"
 }
 
 status_action() { # <workspace-id> -> "<flag> <value>" or empty
@@ -159,7 +159,7 @@ out=$(run w1 "$(sleeper_cfg "$PIDS1")" restart owner-pane-a) || fail "restart fa
 phase_is w1 running || fail "w1 not running"
 wait_for 5 child_alive w1 || fail "w1 child not alive"
 token_is w1 play || fail "w1 token is '$(last_token w1)', wanted play"
-status_is w1 '▶' || fail "w1 general status did not show running"
+status_is w1 play || fail "w1 general status did not show running"
 [ "$(state_get w1 "s.get('owner_pane_id')")" = owner-pane-a ] || fail "manual starter pane not recorded"
 [ "$(state_get w1 "s.get('click')")" = owner ] || fail "default click was not owner"
 [ "$(status_action w1)" = "--action-pane-id owner-pane-a" ] || fail "owner action is '$(status_action w1)'"
@@ -226,7 +226,7 @@ pid_dead "$(tail -1 "$PIDS1")" || fail "w1 child survived stop"
 wait_for 5 child_alive w2 || fail "w2 child died with w1"
 token_is w2 play || fail "w2 token disturbed by w1 stop"
 token_is w1 cross || fail "w1 stop token is '$(last_token w1)', wanted cross"
-status_is w1 '✗' || fail "w1 general status did not show stopped"
+status_is w1 cross || fail "w1 general status did not show stopped"
 phase_is w1 exited || fail "w1 phase after stop"
 [ "$(state_get w1 "(s.get('exit') or {}).get('signal')")" = 15 ] || fail "w1 exit signal"
 run w1 '{}' stop || fail "second stop errored"

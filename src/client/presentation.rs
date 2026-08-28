@@ -8,11 +8,14 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::{
-    config::{IconSet, SegmentConfig, SemanticStyle, StylesConfig, TokenVisual, UiConfig},
+    config::{
+        IconPreset, IconSet, SegmentConfig, SemanticStyle, StylesConfig, TokenVisual, UiConfig,
+    },
     notifications::spinner_marker,
 };
 use crate::{
     extensions::TokenPresentation,
+    protocol::ExtensionTokenStyle,
     resources::{MaterializedTokenValue, PresentationTokenAction, PresentationTokenTarget},
 };
 
@@ -97,6 +100,7 @@ impl From<Line<'static>> for RenderedTokenLine {
 pub(super) struct TokenValue {
     pub text: String,
     pub style: Option<SemanticStyle>,
+    pub modifier: Modifier,
     pub invocation: Option<PresentationTokenInvocation>,
 }
 
@@ -105,6 +109,7 @@ impl TokenValue {
         Self {
             text: text.into(),
             style: None,
+            modifier: Modifier::empty(),
             invocation: None,
         }
     }
@@ -113,8 +118,14 @@ impl TokenValue {
         Self {
             text: text.into(),
             style: Some(style),
+            modifier: Modifier::empty(),
             invocation: None,
         }
+    }
+
+    fn with_modifier(mut self, modifier: Modifier) -> Self {
+        self.modifier = modifier;
+        self
     }
 
     fn with_invocation(mut self, invocation: Option<PresentationTokenInvocation>) -> Self {
@@ -132,16 +143,63 @@ pub(super) fn extension_token_value(
     if value.is_empty() {
         return TokenValue::plain("");
     }
-    let presentation = ui
+    let declaration = ui
         .extensions
         .iter()
         .flat_map(|extension| extension.presentation_tokens())
-        .find(|declaration| declaration.qualified_name() == token)
+        .find(|declaration| declaration.qualified_name() == token);
+    if let Some(variant) = declaration.and_then(|declaration| declaration.variant(value)) {
+        let nerd_font_text = (ui.icons.preset == IconPreset::NerdFont)
+            .then_some(variant.nerd_font_text.as_ref())
+            .flatten();
+        let text = match (nerd_font_text, variant.presentation) {
+            (Some(text), _) => text.clone(),
+            (None, TokenPresentation::Plain) => variant.text.clone(),
+            (None, TokenPresentation::Spinner) => spinner_marker(spinner_frame).into(),
+            (None, TokenPresentation::Pulse) => variant.text.clone(),
+        };
+        return TokenValue::styled(text, semantic_style(variant.style))
+            .with_modifier(pulse_modifier(variant.presentation, spinner_frame));
+    }
+    let presentation = declaration
         .map(|declaration| declaration.presentation())
         .unwrap_or_default();
     match presentation {
         TokenPresentation::Plain => TokenValue::plain(value),
         TokenPresentation::Spinner => TokenValue::plain(spinner_marker(spinner_frame)),
+        TokenPresentation::Pulse => {
+            TokenValue::plain(value).with_modifier(pulse_modifier(presentation, spinner_frame))
+        }
+    }
+}
+
+/// Approximate Tailwind's two-second opacity pulse with terminal faint text.
+/// Terminals do not expose alpha transparency, but SGR dim is broadly supported.
+fn pulse_modifier(presentation: TokenPresentation, frame: usize) -> Modifier {
+    if presentation == TokenPresentation::Pulse && matches!(frame % 20, 5..15) {
+        Modifier::DIM
+    } else {
+        Modifier::empty()
+    }
+}
+
+fn semantic_style(style: ExtensionTokenStyle) -> SemanticStyle {
+    match style {
+        ExtensionTokenStyle::Normal => SemanticStyle::Normal,
+        ExtensionTokenStyle::Muted => SemanticStyle::Muted,
+        ExtensionTokenStyle::Session => SemanticStyle::Session,
+        ExtensionTokenStyle::Workspace => SemanticStyle::Workspace,
+        ExtensionTokenStyle::Tab => SemanticStyle::Tab,
+        ExtensionTokenStyle::Pane => SemanticStyle::Pane,
+        ExtensionTokenStyle::Current => SemanticStyle::Current,
+        ExtensionTokenStyle::Selected => SemanticStyle::Selected,
+        ExtensionTokenStyle::Closing => SemanticStyle::Closing,
+        ExtensionTokenStyle::Activity => SemanticStyle::Activity,
+        ExtensionTokenStyle::Attention => SemanticStyle::Attention,
+        ExtensionTokenStyle::Error => SemanticStyle::Error,
+        ExtensionTokenStyle::Divider => SemanticStyle::Divider,
+        ExtensionTokenStyle::Added => SemanticStyle::Added,
+        ExtensionTokenStyle::Deleted => SemanticStyle::Deleted,
     }
 }
 
@@ -210,10 +268,15 @@ pub(super) fn render_token_segments(
     let mut actions = Vec::new();
     let mut rendered_width = 0;
     for segment in segments {
-        let (text, token_style, segment_style, visual, invocation) = match segment {
-            SegmentConfig::Text { text, style } => {
-                (text.clone(), None, *style, TokenVisual::Plain, None)
-            }
+        let (text, token_style, segment_style, modifier, visual, invocation) = match segment {
+            SegmentConfig::Text { text, style } => (
+                text.clone(),
+                None,
+                *style,
+                Modifier::empty(),
+                TokenVisual::Plain,
+                None,
+            ),
             SegmentConfig::Token {
                 token,
                 style,
@@ -233,6 +296,7 @@ pub(super) fn render_token_segments(
                     format!("{prefix}{value_text}{suffix}"),
                     value.style,
                     *style,
+                    value.modifier,
                     *visual,
                     value.invocation,
                 )
@@ -254,6 +318,7 @@ pub(super) fn render_token_segments(
             style = styles.apply(role, style);
         }
         style = apply_item_state(styles, state, style);
+        style = style.add_modifier(modifier);
         if visual != TokenVisual::Plain {
             style = style.add_modifier(Modifier::REVERSED);
         }
@@ -261,7 +326,7 @@ pub(super) fn render_token_segments(
             && !icons.pill_left.is_empty()
             && !icons.pill_right.is_empty()
         {
-            let cap = pill_cap_style(style, surface);
+            let cap = pill_cap_style(style, surface).add_modifier(modifier);
             let width = UnicodeWidthStr::width(icons.pill_left.as_str())
                 + UnicodeWidthStr::width(text.as_str())
                 + UnicodeWidthStr::width(icons.pill_right.as_str());
@@ -368,23 +433,55 @@ mod tests {
     }
 
     #[test]
-    fn only_manifest_animated_tokens_replace_populated_plain_text() {
-        let ui = run_extension_ui();
+    fn manifest_variants_supply_glyph_style_and_animation() {
+        let mut ui = run_extension_ui();
         assert_eq!(
-            extension_token_value(&ui, "workspace.extension.run.launching", "1", 0).text,
-            "⠋"
+            extension_token_value(&ui, "workspace.extension.run.status", "launching", 0).text,
+            "⁕"
+        );
+        assert!(
+            extension_token_value(&ui, "workspace.extension.run.status", "launching", 0)
+                .modifier
+                .is_empty()
+        );
+        assert!(
+            extension_token_value(&ui, "workspace.extension.run.status", "launching", 10)
+                .modifier
+                .contains(Modifier::DIM)
         );
         assert_eq!(
-            extension_token_value(&ui, "workspace.extension.run.launching", "1", 1).text,
-            "⠙"
+            extension_token_value(&ui, "workspace.extension.run.status", "play", 1).text,
+            "‣"
         );
         assert_eq!(
-            extension_token_value(&ui, "workspace.extension.run.launching", "", 1).text,
-            ""
+            extension_token_value(&ui, "workspace.extension.run.status", "play", 1).style,
+            Some(SemanticStyle::Added)
+        );
+        ui.icons.preset = IconPreset::NerdFont;
+        assert_eq!(
+            extension_token_value(&ui, "workspace.extension.run.status", "pause", 1).text,
+            "󰒓"
         );
         assert_eq!(
-            extension_token_value(&ui, "workspace.extension.run.play", "spinner", 1).text,
-            "spinner"
+            extension_token_value(&ui, "workspace.extension.run.status", "pause", 1).style,
+            Some(SemanticStyle::Muted)
+        );
+        assert_eq!(
+            extension_token_value(&ui, "workspace.extension.run.status", "launching", 1).text,
+            "󱑠"
+        );
+        assert!(
+            extension_token_value(&ui, "workspace.extension.run.status", "launching", 10)
+                .modifier
+                .contains(Modifier::DIM)
+        );
+        assert_eq!(
+            extension_token_value(&ui, "workspace.extension.run.status", "play", 1).text,
+            "󱤵"
+        );
+        assert_eq!(
+            extension_token_value(&ui, "workspace.extension.run.status", "stop", 1).text,
+            "󱤷"
         );
         assert_eq!(
             extension_token_value(&ui, "workspace.extension.unknown.state", "spinner", 1).text,

@@ -15,9 +15,9 @@ the extension validates the inner keys:
 
 ```toml
 [extension.run]
-command = ["just", "run"]   # required argv array; never a shell string
-grace_seconds = 3           # optional, 0–120: SIGTERM→SIGKILL escalation delay
-signal = "STATUS:READY"      # optional literal marker in combined stdout/stderr
+command = ["npm", "run", "dev"]   # required argv array; never a shell string
+grace_seconds = 3            # optional, 0–120: SIGTERM→SIGKILL escalation delay
+signal = "FUT:READY"         # optional literal marker in combined stdout/stderr
 auto_start = true            # optional; trusted global/project config only
 click = "owner"              # optional: "owner" (default) or "logs"
 ```
@@ -48,11 +48,7 @@ extensions = ["/absolute/path/to/fut/extensions/run"]
 
 [ui.tab_bar]
 right = [
-  { segments = [{ token = "workspace.extension.run.pause", style = "divider", inverted = true, pill = true }], priority = 220 },
-  { segments = [{ token = "workspace.extension.run.launching", style = "attention", inverted = true, pill = true }], priority = 220 },
-  { segments = [{ token = "workspace.extension.run.play", style = "added", inverted = true, pill = true }], priority = 220 },
-  { segments = [{ token = "workspace.extension.run.stop", style = "divider", inverted = true, pill = true }], priority = 220 },
-  { segments = [{ token = "workspace.extension.run.cross", style = "error", inverted = true, pill = true }], priority = 220 },
+  { segments = [{ token = "workspace.extension.run.status", inverted = true, pill = true }], priority = 220 },
 ]
 
 [ui.sidebar.left]
@@ -76,30 +72,32 @@ content inverted.
 
 ## Status tokens
 
-The manifest declares five style-specific workspace tokens; the extension
-keeps exactly one populated (publishing the new one before clearing the rest,
-so the indicator never blinks):
+The manifest declares one workspace status token with a display variant for
+each state. The extension always publishes a state name, and Fut turns it into
+the corresponding nonempty glyph, semantic style, or pulse:
 
-| Token | Glyph | Meaning |
-| --- | --- | --- |
-| `workspace.extension.run.pause` | … | configured, not started yet |
-| `workspace.extension.run.launching` | animated spinner | child started but has not emitted the configured `signal` |
-| `workspace.extension.run.play` | ▶ | running |
-| `workspace.extension.run.stop` | ■ | exited cleanly (code 0) |
-| `workspace.extension.run.cross` | ✗ | stopped, killed, signaled, or nonzero exit |
+| State | Default | Nerd Font | Meaning |
+| --- | --- | --- | --- |
+| `pause` | ⚬ | 󰒓 | configured, not started yet |
+| `launching` | pulsing ⁕ | pulsing 󱑠 | child started but has not emitted the configured `signal` |
+| `play` | ‣ | 󱤵 | running |
+| `stop` | ☒ | 󱤷 | exited cleanly (code 0) |
+| `cross` | ✗ | ✗ | stopped, killed, signaled, or nonzero exit |
 
-The additional `workspace.extension.run.status` token carries the same current
-glyph in one stable token, using a static `…` while launching. It is intended
-for a compact workspace row where per-state styling and animation are less
-important than configuring the status as one segment.
+`workspace.extension.run.status` is the only token to configure in either the
+tab bar or a workspace row. Its display variants live with the extension in
+`fut-extension.toml`, rather than spreading run-specific display configuration
+through the UI layout. Every status is published with the configured click
+action. Owner pane and click behavior are stored with the generation, so a
+superseded runner cannot replace the latest generation's destination during a
+restart race.
 
-Every visible status token is published with the configured click action.
-Empty tokens used to clear the other styles never carry actions. Owner pane and
-click behavior are stored with the generation, so a superseded runner cannot
-replace the latest generation's destination during a restart race.
+The glyphs contain no implicit padding. Add `prefix` or `suffix` to the token
+segment in your UI configuration when your terminal's Nerd Font width settings
+need extra space.
 
-The example uses dark-gray pause/stop, yellow launching, green play, and red
-cross pills. A workspace without run configuration publishes nothing.
+The example uses muted pause, dark-gray stop, yellow launching, green play, and
+red cross pills. A workspace without run configuration publishes nothing.
 
 When `signal` is configured, every restart begins in `launching`. The
 supervisor searches the combined stdout/stderr byte stream for the exact UTF-8
@@ -127,9 +125,10 @@ daemons never share process, state, token, or log ownership.
   bumps a **generation** in `state.json`. A superseded supervisor records and
   publishes nothing, which settles rapid-restart and natural-exit-versus-
   restart races: the newest generation always owns the final token.
-- The launching token is published once per state transition. Its manifest
-  declares `presentation = "spinner"`, so each client renders frames using
-  Fut's existing 100 ms clock; no extension or Fut subprocess runs per frame.
+- The launching state is published once per transition. Its manifest variant
+  declares `presentation = "pulse"`, so each client alternates bright and faint
+  terminal text using Fut's existing 100 ms clock; no extension or Fut
+  subprocess runs per frame.
 - The log is a stable `run.log` with start/stop/exit separators. At 2 MiB its
   content is copied to `run.log.1`, then the open `run.log` is truncated in
   place. This bounds disk use to two files while preserving the inode, so an

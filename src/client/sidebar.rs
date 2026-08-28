@@ -2684,12 +2684,11 @@ mod tests {
     }
 
     #[test]
-    fn workspace_row_renders_manifest_spinner_frames() {
+    fn workspace_row_renders_manifest_pulse_frames() {
         let (mut snapshot, focused) = fixture(&["main"], 0);
-        snapshot.sessions[0].workspaces[0].tokens.insert(
-            "workspace.extension.run.launching".into(),
-            "populated".into(),
-        );
+        snapshot.sessions[0].workspaces[0]
+            .tokens
+            .insert("workspace.extension.run.status".into(), "launching".into());
         let model = WorkspaceModel::from_snapshot(
             &snapshot,
             &focused,
@@ -2705,7 +2704,7 @@ mod tests {
         };
         row.left.clear();
         row.body = vec![super::super::config::SegmentConfig::Token {
-            token: "workspace.extension.run.launching".into(),
+            token: "workspace.extension.run.status".into(),
             style: None,
             prefix: String::new(),
             suffix: String::new(),
@@ -2730,14 +2729,16 @@ mod tests {
         render_workspace_row(
             &model.items[0],
             false,
-            1,
+            10,
             area,
             SidebarSide::Left,
             &ui,
             &mut second,
         );
-        assert_eq!(first[(0, 0)].symbol(), "⠋");
-        assert_eq!(second[(0, 0)].symbol(), "⠙");
+        assert_eq!(first[(0, 0)].symbol(), "⁕");
+        assert!(!first[(0, 0)].modifier.contains(Modifier::DIM));
+        assert_eq!(second[(0, 0)].symbol(), "⁕");
+        assert!(second[(0, 0)].modifier.contains(Modifier::DIM));
     }
 
     #[test]

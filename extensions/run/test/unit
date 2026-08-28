@@ -82,22 +82,15 @@ class PublicationTests(unittest.TestCase):
             runctl.publish_tokens(active, click, owner)
             return [call.args[0] for call in invoke.call_args_list]
 
-    def test_owner_action_is_only_attached_to_nonempty_values(self):
+    def test_owner_action_is_attached_to_status(self):
         calls = self.publish("play", "owner", "pane-a")
-        nonempty = [argv for argv in calls if argv[7]]
-        empty = [argv for argv in calls if not argv[7]]
-        self.assertEqual(len(nonempty), 2)
-        self.assertTrue(
-            all(argv[-2:] == ["--action-pane-id", "pane-a"] for argv in nonempty)
-        )
-        self.assertTrue(all("--action-pane-id" not in argv for argv in empty))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][6:8], ["status", "play"])
+        self.assertEqual(calls[0][-2:], ["--action-pane-id", "pane-a"])
 
     def test_logs_action_names_the_manifest_command(self):
         calls = self.publish("cross", "logs")
-        nonempty = [argv for argv in calls if argv[7]]
-        self.assertTrue(
-            all(argv[-2:] == ["--action-command", "logs"] for argv in nonempty)
-        )
+        self.assertEqual(calls[0][-2:], ["--action-command", "logs"])
 
     def test_rejected_actions_retry_without_hiding_status(self):
         def reject_actions(argv, **_kwargs):
@@ -105,19 +98,14 @@ class PublicationTests(unittest.TestCase):
 
         calls = self.publish("pause", "logs", side_effect=reject_actions)
         status_calls = [argv for argv in calls if argv[6] == "status"]
-        pause_calls = [argv for argv in calls if argv[6] == "pause"]
         self.assertEqual(len(status_calls), 2)
-        self.assertEqual(len(pause_calls), 2)
         self.assertEqual(status_calls[-1][-2:], ["--workspace-id", "workspace-a"])
-        self.assertEqual(pause_calls[-1][-2:], ["--workspace-id", "workspace-a"])
 
-    def test_failed_empty_clears_are_not_retried_as_targetless_publications(self):
-        calls = self.publish("pause", "logs", side_effect=lambda *_args, **_kwargs: Result(2))
-        empty = [argv for argv in calls if not argv[7]]
-        self.assertEqual(len(empty), len(runctl.TOKENS) - 1)
-        self.assertTrue(
-            all(argv[-2:] == ["--workspace-id", "workspace-a"] for argv in empty)
-        )
+    def test_every_state_publishes_a_nonempty_value(self):
+        for state in runctl.STATES:
+            with self.subTest(state=state):
+                calls = self.publish(state, "owner")
+                self.assertEqual(calls[0][6:8], ["status", state])
 
 
 if __name__ == "__main__":
