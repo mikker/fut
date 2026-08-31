@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Smoothed extension token pulses across complete pills, including their affixes and caps.
+
 ## 0.15
 
 - Prompt to inspect, approve, or reject untrusted project recipes before daemon startup instead of hiding the error in the daemon log.

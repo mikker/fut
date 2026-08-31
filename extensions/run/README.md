@@ -126,9 +126,9 @@ daemons never share process, state, token, or log ownership.
   publishes nothing, which settles rapid-restart and natural-exit-versus-
   restart races: the newest generation always owns the final token.
 - The launching state is published once per transition. Its manifest variant
-  declares `presentation = "pulse"`, so each client alternates bright and faint
-  terminal text using Fut's existing 100 ms clock; no extension or Fut
-  subprocess runs per frame.
+  declares `presentation = "pulse"`, so each client glides the complete segment
+  through bright, normal, and faint steps using Fut's existing 100 ms clock; no
+  extension or Fut subprocess runs per frame.
 - The log is a stable `run.log` with start/stop/exit separators. At 2 MiB its
   content is copied to `run.log.1`, then the open `run.log` is truncated in
   place. This bounds disk use to two files while preserving the inode, so an

@@ -97,10 +97,22 @@ impl From<Line<'static>> for RenderedTokenLine {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct PulseStyle {
+    add: Modifier,
+    remove: Modifier,
+}
+
+impl PulseStyle {
+    fn apply(self, style: Style) -> Style {
+        style.remove_modifier(self.remove).add_modifier(self.add)
+    }
+}
+
 pub(super) struct TokenValue {
     pub text: String,
     pub style: Option<SemanticStyle>,
-    pub modifier: Modifier,
+    pulse: PulseStyle,
     pub invocation: Option<PresentationTokenInvocation>,
 }
 
@@ -109,7 +121,7 @@ impl TokenValue {
         Self {
             text: text.into(),
             style: None,
-            modifier: Modifier::empty(),
+            pulse: PulseStyle::default(),
             invocation: None,
         }
     }
@@ -118,13 +130,13 @@ impl TokenValue {
         Self {
             text: text.into(),
             style: Some(style),
-            modifier: Modifier::empty(),
+            pulse: PulseStyle::default(),
             invocation: None,
         }
     }
 
-    fn with_modifier(mut self, modifier: Modifier) -> Self {
-        self.modifier = modifier;
+    fn with_pulse(mut self, pulse: PulseStyle) -> Self {
+        self.pulse = pulse;
         self
     }
 
@@ -159,7 +171,7 @@ pub(super) fn extension_token_value(
             (None, TokenPresentation::Pulse) => variant.text.clone(),
         };
         return TokenValue::styled(text, semantic_style(variant.style))
-            .with_modifier(pulse_modifier(variant.presentation, spinner_frame));
+            .with_pulse(pulse_style(variant.presentation, spinner_frame));
     }
     let presentation = declaration
         .map(|declaration| declaration.presentation())
@@ -168,18 +180,32 @@ pub(super) fn extension_token_value(
         TokenPresentation::Plain => TokenValue::plain(value),
         TokenPresentation::Spinner => TokenValue::plain(spinner_marker(spinner_frame)),
         TokenPresentation::Pulse => {
-            TokenValue::plain(value).with_modifier(pulse_modifier(presentation, spinner_frame))
+            TokenValue::plain(value).with_pulse(pulse_style(presentation, spinner_frame))
         }
     }
 }
 
-/// Approximate Tailwind's two-second opacity pulse with terminal faint text.
-/// Terminals do not expose alpha transparency, but SGR dim is broadly supported.
-fn pulse_modifier(presentation: TokenPresentation, frame: usize) -> Modifier {
-    if presentation == TokenPresentation::Pulse && matches!(frame % 20, 5..15) {
-        Modifier::DIM
-    } else {
-        Modifier::empty()
+/// Approximate a two-second opacity pulse with the three terminal intensity
+/// levels available to us: bold, normal, and faint. The mirrored steps avoid
+/// the abrupt bright/faint switch of a square wave.
+fn pulse_style(presentation: TokenPresentation, frame: usize) -> PulseStyle {
+    if presentation != TokenPresentation::Pulse {
+        return PulseStyle::default();
+    }
+    match frame % 20 {
+        0..=1 | 18..=19 => PulseStyle {
+            add: Modifier::BOLD,
+            remove: Modifier::DIM,
+        },
+        2..=5 | 14..=17 => PulseStyle {
+            add: Modifier::empty(),
+            remove: Modifier::BOLD | Modifier::DIM,
+        },
+        6..=13 => PulseStyle {
+            add: Modifier::DIM,
+            remove: Modifier::BOLD,
+        },
+        _ => unreachable!(),
     }
 }
 
@@ -268,12 +294,12 @@ pub(super) fn render_token_segments(
     let mut actions = Vec::new();
     let mut rendered_width = 0;
     for segment in segments {
-        let (text, token_style, segment_style, modifier, visual, invocation) = match segment {
+        let (text, token_style, segment_style, pulse, visual, invocation) = match segment {
             SegmentConfig::Text { text, style } => (
                 text.clone(),
                 None,
                 *style,
-                Modifier::empty(),
+                PulseStyle::default(),
                 TokenVisual::Plain,
                 None,
             ),
@@ -296,7 +322,7 @@ pub(super) fn render_token_segments(
                     format!("{prefix}{value_text}{suffix}"),
                     value.style,
                     *style,
-                    value.modifier,
+                    value.pulse,
                     *visual,
                     value.invocation,
                 )
@@ -318,7 +344,7 @@ pub(super) fn render_token_segments(
             style = styles.apply(role, style);
         }
         style = apply_item_state(styles, state, style);
-        style = style.add_modifier(modifier);
+        style = pulse.apply(style);
         if visual != TokenVisual::Plain {
             style = style.add_modifier(Modifier::REVERSED);
         }
@@ -326,7 +352,7 @@ pub(super) fn render_token_segments(
             && !icons.pill_left.is_empty()
             && !icons.pill_right.is_empty()
         {
-            let cap = pill_cap_style(style, surface).add_modifier(modifier);
+            let cap = pulse.apply(pill_cap_style(style, surface));
             let width = UnicodeWidthStr::width(icons.pill_left.as_str())
                 + UnicodeWidthStr::width(text.as_str())
                 + UnicodeWidthStr::width(icons.pill_right.as_str());
@@ -441,12 +467,23 @@ mod tests {
         );
         assert!(
             extension_token_value(&ui, "workspace.extension.run.status", "launching", 0)
-                .modifier
-                .is_empty()
+                .pulse
+                .add
+                .contains(Modifier::BOLD)
+        );
+        let transition =
+            extension_token_value(&ui, "workspace.extension.run.status", "launching", 4);
+        assert!(transition.pulse.add.is_empty());
+        assert!(
+            transition
+                .pulse
+                .remove
+                .contains(Modifier::BOLD | Modifier::DIM)
         );
         assert!(
             extension_token_value(&ui, "workspace.extension.run.status", "launching", 10)
-                .modifier
+                .pulse
+                .add
                 .contains(Modifier::DIM)
         );
         assert_eq!(
@@ -472,7 +509,8 @@ mod tests {
         );
         assert!(
             extension_token_value(&ui, "workspace.extension.run.status", "launching", 10)
-                .modifier
+                .pulse
+                .add
                 .contains(Modifier::DIM)
         );
         assert_eq!(
@@ -487,6 +525,51 @@ mod tests {
             extension_token_value(&ui, "workspace.extension.unknown.state", "spinner", 1).text,
             "spinner"
         );
+    }
+
+    #[test]
+    fn pulse_steps_apply_to_the_complete_pill() {
+        let mut ui = run_extension_ui();
+        ui.icons.preset = IconPreset::NerdFont;
+        let icons = ui.icons.resolve();
+        let render = |frame| {
+            render_token_segments(
+                &[SegmentConfig::Token {
+                    token: "workspace.extension.run.status".into(),
+                    style: None,
+                    prefix: "[".into(),
+                    suffix: "]".into(),
+                    max_width: None,
+                    visual: TokenVisual::Pill,
+                }],
+                None,
+                ItemState::default(),
+                &ui.styles,
+                &icons,
+                |token| extension_token_value(&ui, token, "launching", frame),
+            )
+        };
+
+        let bright = render(0);
+        let transition = render(4);
+        let faint = render(10);
+        assert_eq!(bright.to_string(), "\u{e0b6}[󱑠]\u{e0b4}");
+        assert!(
+            bright
+                .spans
+                .iter()
+                .all(|span| span.style.add_modifier.contains(Modifier::BOLD))
+        );
+        assert!(transition.spans.iter().all(|span| {
+            !span
+                .style
+                .add_modifier
+                .intersects(Modifier::BOLD | Modifier::DIM)
+        }));
+        assert!(faint.spans.iter().all(|span| {
+            span.style.add_modifier.contains(Modifier::DIM)
+                && !span.style.add_modifier.contains(Modifier::BOLD)
+        }));
     }
 
     #[test]

@@ -378,8 +378,8 @@ presentation = "spinner"
 Scopes are `session`, `workspace`, `tab`, and `pane`. `presentation` is `plain`
 by default. `spinner` treats any non-empty value as presence and replaces it
 with an animated spinner; `pulse` keeps the text and applies a two-second
-bright-to-dim pulse using the terminal's faint-text support. A token may instead
-declare named `variants`, each with a nonempty `text`, semantic `style`, and
+stepped bright-to-normal-to-faint pulse to the complete segment. A token may
+instead declare named `variants`, each with a nonempty `text`, semantic `style`, and
 optional presentation. `nerd_font_text` supplies an alternate glyph when
 `[ui.icons] preset = "nerd_font"`; for spinners it replaces the animation, while
 plain and pulsing variants retain their presentation. Publishing the variant
