@@ -1020,7 +1020,6 @@ dependencies = [
 [[package]]
 name = "libghostty-vt-sys"
 version = "0.2.1"
-source = "git+https://github.com/uzaaft/libghostty-rs?rev=72ac98f292879bf9f788fcbb11238c562a1eebe6#72ac98f292879bf9f788fcbb11238c562a1eebe6"
 
 [[package]]
 name = "libm"

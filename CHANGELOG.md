@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Smoothed extension token pulses across complete pills, including their affixes and caps.
+- Fixed Linux arm64 release binaries crashing with illegal instructions on CPUs without SVE.
 
 ## 0.15
 
