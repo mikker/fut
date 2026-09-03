@@ -10,7 +10,7 @@ use ratatui::{
 
 use super::{
     chrome::sanitize,
-    config::{AgentScope, SemanticStyle},
+    config::{AgentScope, SemanticStyle, SpinnerConfig},
     notifications::{ActivityIndicator, NotificationState},
 };
 
@@ -58,22 +58,23 @@ impl AgentItem {
         }
     }
 
-    pub(super) fn marker(&self, spinner_frame: usize) -> &'static str {
+    pub(super) fn marker<'a>(&self, elapsed_ms: usize, spinner: &'a SpinnerConfig) -> &'a str {
         self.indicator
             .map_or(if self.current { "•" } else { " " }, |indicator| {
-                indicator.marker(spinner_frame)
+                indicator.marker(elapsed_ms, spinner)
             })
     }
 
     pub(super) fn line(
         &self,
-        spinner_frame: usize,
+        elapsed_ms: usize,
+        spinner: &SpinnerConfig,
         path_separator: &str,
         title_style: Style,
         detail_style: Style,
         status_style: Style,
     ) -> Line<'static> {
-        let marker = self.marker(spinner_frame);
+        let marker = self.marker(elapsed_ms, spinner);
         Line::from(vec![
             Span::styled(format!(" {marker}"), status_style),
             Span::styled(format!(" {} ", self.source), title_style),

@@ -10,6 +10,7 @@ use crate::{
 };
 
 use super::chrome::truncate;
+use super::config::SpinnerConfig;
 use super::dialog::{
     dialog_area, fill_row, frame_inner, render_footer, render_frame, render_list_scrollbar,
     render_title, row_style,
@@ -18,10 +19,8 @@ use super::dialog::{
 const MAX_WIDTH: u16 = 80;
 const MAX_HEIGHT: u16 = 16;
 
-const BRAILLE_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-pub(super) fn spinner_marker(frame: usize) -> &'static str {
-    BRAILLE_SPINNER[frame % BRAILLE_SPINNER.len()]
+pub(super) fn spinner_marker(spinner: &SpinnerConfig, elapsed_ms: usize) -> &str {
+    spinner.frame(elapsed_ms)
 }
 
 fn open_panes(snapshot: &ResourceSnapshot) -> impl Iterator<Item = &PaneSnapshot> {
@@ -48,10 +47,10 @@ pub(super) enum ActivityIndicator {
 }
 
 impl ActivityIndicator {
-    pub(super) fn marker(self, frame: usize) -> &'static str {
+    pub(super) fn marker(self, elapsed_ms: usize, spinner: &SpinnerConfig) -> &str {
         match self {
             Self::Bell => "!",
-            Self::Working => spinner_marker(frame),
+            Self::Working => spinner_marker(spinner, elapsed_ms),
             Self::Blocked => "!",
             Self::Completed => "•",
         }
@@ -582,8 +581,9 @@ mod tests {
 
     #[test]
     fn spinner_uses_braille_frames() {
-        assert_eq!(ActivityIndicator::Working.marker(0), "⠋");
-        assert_eq!(ActivityIndicator::Working.marker(10), "⠋");
+        let spinner = SpinnerConfig::default();
+        assert_eq!(ActivityIndicator::Working.marker(0, &spinner), "⠋");
+        assert_eq!(ActivityIndicator::Working.marker(800, &spinner), "⠋");
     }
 
     #[test]

@@ -97,22 +97,19 @@ impl From<Line<'static>> for RenderedTokenLine {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct PulseStyle {
-    add: Modifier,
-    remove: Modifier,
-}
-
-impl PulseStyle {
-    fn apply(self, style: Style) -> Style {
-        style.remove_modifier(self.remove).add_modifier(self.add)
-    }
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum TokenEffect {
+    #[default]
+    Plain,
+    Pulse,
+    Wave,
 }
 
 pub(super) struct TokenValue {
     pub text: String,
     pub style: Option<SemanticStyle>,
-    pulse: PulseStyle,
+    effect: TokenEffect,
+    elapsed_ms: usize,
     pub invocation: Option<PresentationTokenInvocation>,
 }
 
@@ -121,7 +118,8 @@ impl TokenValue {
         Self {
             text: text.into(),
             style: None,
-            pulse: PulseStyle::default(),
+            effect: TokenEffect::Plain,
+            elapsed_ms: 0,
             invocation: None,
         }
     }
@@ -130,13 +128,15 @@ impl TokenValue {
         Self {
             text: text.into(),
             style: Some(style),
-            pulse: PulseStyle::default(),
+            effect: TokenEffect::Plain,
+            elapsed_ms: 0,
             invocation: None,
         }
     }
 
-    fn with_pulse(mut self, pulse: PulseStyle) -> Self {
-        self.pulse = pulse;
+    pub(super) fn with_effect(mut self, effect: TokenEffect, elapsed_ms: usize) -> Self {
+        self.effect = effect;
+        self.elapsed_ms = elapsed_ms;
         self
     }
 
@@ -150,7 +150,7 @@ pub(super) fn extension_token_value(
     ui: &UiConfig,
     token: &str,
     value: &str,
-    spinner_frame: usize,
+    elapsed_ms: usize,
 ) -> TokenValue {
     if value.is_empty() {
         return TokenValue::plain("");
@@ -167,45 +167,55 @@ pub(super) fn extension_token_value(
         let text = match (nerd_font_text, variant.presentation) {
             (Some(text), _) => text.clone(),
             (None, TokenPresentation::Plain) => variant.text.clone(),
-            (None, TokenPresentation::Spinner) => spinner_marker(spinner_frame).into(),
-            (None, TokenPresentation::Pulse) => variant.text.clone(),
+            (None, TokenPresentation::Spinner) => spinner_marker(&ui.spinner, elapsed_ms).into(),
+            (None, TokenPresentation::Pulse | TokenPresentation::Wave) => variant.text.clone(),
         };
         return TokenValue::styled(text, semantic_style(variant.style))
-            .with_pulse(pulse_style(variant.presentation, spinner_frame));
+            .with_effect(token_effect(variant.presentation), elapsed_ms);
     }
     let presentation = declaration
         .map(|declaration| declaration.presentation())
         .unwrap_or_default();
     match presentation {
         TokenPresentation::Plain => TokenValue::plain(value),
-        TokenPresentation::Spinner => TokenValue::plain(spinner_marker(spinner_frame)),
-        TokenPresentation::Pulse => {
-            TokenValue::plain(value).with_pulse(pulse_style(presentation, spinner_frame))
+        TokenPresentation::Spinner => TokenValue::plain(spinner_marker(&ui.spinner, elapsed_ms)),
+        TokenPresentation::Pulse | TokenPresentation::Wave => {
+            TokenValue::plain(value).with_effect(token_effect(presentation), elapsed_ms)
         }
     }
 }
 
-/// Approximate a two-second opacity pulse with the three terminal intensity
-/// levels available to us: bold, normal, and faint. The mirrored steps avoid
-/// the abrupt bright/faint switch of a square wave.
-fn pulse_style(presentation: TokenPresentation, frame: usize) -> PulseStyle {
-    if presentation != TokenPresentation::Pulse {
-        return PulseStyle::default();
+fn token_effect(presentation: TokenPresentation) -> TokenEffect {
+    match presentation {
+        TokenPresentation::Pulse => TokenEffect::Pulse,
+        TokenPresentation::Wave => TokenEffect::Wave,
+        TokenPresentation::Plain | TokenPresentation::Spinner => TokenEffect::Plain,
     }
-    match frame % 20 {
-        0..=1 | 18..=19 => PulseStyle {
-            add: Modifier::BOLD,
-            remove: Modifier::DIM,
-        },
-        2..=5 | 14..=17 => PulseStyle {
-            add: Modifier::empty(),
-            remove: Modifier::BOLD | Modifier::DIM,
-        },
-        6..=13 => PulseStyle {
-            add: Modifier::DIM,
-            remove: Modifier::BOLD,
-        },
-        _ => unreachable!(),
+}
+
+fn effect_style(
+    effect: TokenEffect,
+    style: Style,
+    index: usize,
+    count: usize,
+    elapsed_ms: usize,
+) -> Style {
+    let dim = match effect {
+        TokenEffect::Plain => false,
+        TokenEffect::Pulse => elapsed_ms % 2_000 >= 1_000,
+        TokenEffect::Wave => {
+            let padding = 3;
+            let travel = count + padding * 2;
+            let center = (elapsed_ms / 90) % travel;
+            let position = index + padding;
+            center.abs_diff(position) <= 1
+        }
+    };
+    let style = style.remove_modifier(Modifier::DIM);
+    if dim {
+        style.add_modifier(Modifier::DIM)
+    } else {
+        style
     }
 }
 
@@ -233,12 +243,12 @@ pub(super) fn materialized_extension_token_value(
     ui: &UiConfig,
     token: &str,
     materialized: Option<(&MaterializedTokenValue, PresentationTokenTarget)>,
-    spinner_frame: usize,
+    elapsed_ms: usize,
 ) -> TokenValue {
     let Some((value, target)) = materialized else {
         return TokenValue::plain("");
     };
-    extension_token_value(ui, token, &value.text, spinner_frame).with_invocation(
+    extension_token_value(ui, token, &value.text, elapsed_ms).with_invocation(
         value
             .action
             .clone()
@@ -294,41 +304,44 @@ pub(super) fn render_token_segments(
     let mut actions = Vec::new();
     let mut rendered_width = 0;
     for segment in segments {
-        let (text, token_style, segment_style, pulse, visual, invocation) = match segment {
-            SegmentConfig::Text { text, style } => (
-                text.clone(),
-                None,
-                *style,
-                PulseStyle::default(),
-                TokenVisual::Plain,
-                None,
-            ),
-            SegmentConfig::Token {
-                token,
-                style,
-                prefix,
-                suffix,
-                max_width,
-                visual,
-            } => {
-                let value = resolve(token);
-                if value.text.is_empty() {
-                    continue;
-                }
-                let value_text = max_width.map_or(value.text.clone(), |width| {
-                    truncate(&value.text, usize::from(width))
-                });
-                (
-                    format!("{prefix}{value_text}{suffix}"),
-                    value.style,
+        let (text, token_style, segment_style, effect, elapsed_ms, visual, invocation) =
+            match segment {
+                SegmentConfig::Text { text, style } => (
+                    text.clone(),
+                    None,
                     *style,
-                    value.pulse,
-                    *visual,
-                    value.invocation,
-                )
-            }
-            SegmentConfig::Tabs => continue,
-        };
+                    TokenEffect::Plain,
+                    0,
+                    TokenVisual::Plain,
+                    None,
+                ),
+                SegmentConfig::Token {
+                    token,
+                    style,
+                    prefix,
+                    suffix,
+                    max_width,
+                    visual,
+                } => {
+                    let value = resolve(token);
+                    if value.text.is_empty() {
+                        continue;
+                    }
+                    let value_text = max_width.map_or(value.text.clone(), |width| {
+                        truncate(&value.text, usize::from(width))
+                    });
+                    (
+                        format!("{prefix}{value_text}{suffix}"),
+                        value.style,
+                        *style,
+                        value.effect,
+                        value.elapsed_ms,
+                        *visual,
+                        value.invocation,
+                    )
+                }
+                SegmentConfig::Tabs => continue,
+            };
         if text.is_empty() {
             continue;
         }
@@ -344,7 +357,6 @@ pub(super) fn render_token_segments(
             style = styles.apply(role, style);
         }
         style = apply_item_state(styles, state, style);
-        style = pulse.apply(style);
         if visual != TokenVisual::Plain {
             style = style.add_modifier(Modifier::REVERSED);
         }
@@ -352,12 +364,13 @@ pub(super) fn render_token_segments(
             && !icons.pill_left.is_empty()
             && !icons.pill_right.is_empty()
         {
-            let cap = pulse.apply(pill_cap_style(style, surface));
+            let cap = pill_cap_style(style, surface);
             let width = UnicodeWidthStr::width(icons.pill_left.as_str())
                 + UnicodeWidthStr::width(text.as_str())
                 + UnicodeWidthStr::width(icons.pill_right.as_str());
+            let text_count = text.graphemes(true).count();
             spans.push(Span::styled(icons.pill_left.clone(), cap));
-            spans.push(Span::styled(text, style));
+            push_effect_spans(&mut spans, &text, style, effect, elapsed_ms, text_count);
             spans.push(Span::styled(icons.pill_right.clone(), cap));
             if let Some(invocation) = invocation {
                 actions.push(TokenActionRegion {
@@ -370,7 +383,8 @@ pub(super) fn render_token_segments(
             continue;
         }
         let width = UnicodeWidthStr::width(text.as_str());
-        spans.push(Span::styled(text, style));
+        let count = text.graphemes(true).count();
+        push_effect_spans(&mut spans, &text, style, effect, elapsed_ms, count);
         if let Some(invocation) = invocation {
             actions.push(TokenActionRegion {
                 start: rendered_width,
@@ -384,6 +398,36 @@ pub(super) fn render_token_segments(
         line: Line::from(spans),
         actions,
     }
+}
+
+fn push_effect_spans(
+    spans: &mut Vec<Span<'static>>,
+    text: &str,
+    style: Style,
+    effect: TokenEffect,
+    elapsed_ms: usize,
+    total: usize,
+) {
+    match effect {
+        TokenEffect::Plain => {
+            spans.push(Span::styled(text.to_owned(), style));
+            return;
+        }
+        TokenEffect::Pulse => {
+            spans.push(Span::styled(
+                text.to_owned(),
+                effect_style(effect, style, 0, total, elapsed_ms),
+            ));
+            return;
+        }
+        TokenEffect::Wave => {}
+    }
+    spans.extend(text.graphemes(true).enumerate().map(|(index, grapheme)| {
+        Span::styled(
+            grapheme.to_owned(),
+            effect_style(effect, style, index, total, elapsed_ms),
+        )
+    }));
 }
 
 pub(super) fn truncate(value: &str, width: usize) -> String {
@@ -465,26 +509,13 @@ mod tests {
             extension_token_value(&ui, "workspace.extension.run.status", "launching", 0).text,
             "⁕"
         );
-        assert!(
-            extension_token_value(&ui, "workspace.extension.run.status", "launching", 0)
-                .pulse
-                .add
-                .contains(Modifier::BOLD)
-        );
-        let transition =
-            extension_token_value(&ui, "workspace.extension.run.status", "launching", 4);
-        assert!(transition.pulse.add.is_empty());
-        assert!(
-            transition
-                .pulse
-                .remove
-                .contains(Modifier::BOLD | Modifier::DIM)
-        );
-        assert!(
-            extension_token_value(&ui, "workspace.extension.run.status", "launching", 10)
-                .pulse
-                .add
-                .contains(Modifier::DIM)
+        let normal = extension_token_value(&ui, "workspace.extension.run.status", "launching", 0);
+        assert_eq!(normal.effect, TokenEffect::Pulse);
+        assert_eq!(normal.elapsed_ms, 0);
+        assert_eq!(
+            extension_token_value(&ui, "workspace.extension.run.status", "launching", 1_300)
+                .elapsed_ms,
+            1_300
         );
         assert_eq!(
             extension_token_value(&ui, "workspace.extension.run.status", "play", 1).text,
@@ -507,11 +538,9 @@ mod tests {
             extension_token_value(&ui, "workspace.extension.run.status", "launching", 1).text,
             "󱑠"
         );
-        assert!(
-            extension_token_value(&ui, "workspace.extension.run.status", "launching", 10)
-                .pulse
-                .add
-                .contains(Modifier::DIM)
+        assert_eq!(
+            extension_token_value(&ui, "workspace.extension.run.status", "launching", 1_300).effect,
+            TokenEffect::Pulse
         );
         assert_eq!(
             extension_token_value(&ui, "workspace.extension.run.status", "play", 1).text,
@@ -528,7 +557,7 @@ mod tests {
     }
 
     #[test]
-    fn pulse_steps_apply_to_the_complete_pill() {
+    fn pulse_changes_the_complete_text_without_fading_pill_caps() {
         let mut ui = run_extension_ui();
         ui.icons.preset = IconPreset::NerdFont;
         let icons = ui.icons.resolve();
@@ -550,26 +579,85 @@ mod tests {
             )
         };
 
-        let bright = render(0);
-        let transition = render(4);
-        let faint = render(10);
-        assert_eq!(bright.to_string(), "\u{e0b6}[󱑠]\u{e0b4}");
+        let normal = render(0);
+        let faint = render(1_000);
+        assert_eq!(normal.to_string(), "\u{e0b6}[󱑠]\u{e0b4}");
         assert!(
-            bright
+            normal
                 .spans
                 .iter()
-                .all(|span| span.style.add_modifier.contains(Modifier::BOLD))
+                .all(|span| { !span.style.add_modifier.contains(Modifier::DIM) })
         );
-        assert!(transition.spans.iter().all(|span| {
-            !span
+        assert!(
+            !faint
+                .spans
+                .first()
+                .unwrap()
                 .style
                 .add_modifier
-                .intersects(Modifier::BOLD | Modifier::DIM)
-        }));
-        assert!(faint.spans.iter().all(|span| {
-            span.style.add_modifier.contains(Modifier::DIM)
-                && !span.style.add_modifier.contains(Modifier::BOLD)
-        }));
+                .contains(Modifier::DIM)
+        );
+        assert!(
+            !faint
+                .spans
+                .last()
+                .unwrap()
+                .style
+                .add_modifier
+                .contains(Modifier::DIM)
+        );
+        assert!(
+            faint.spans[1..faint.spans.len() - 1]
+                .iter()
+                .all(|span| span.style.add_modifier.contains(Modifier::DIM))
+        );
+    }
+
+    #[test]
+    fn wave_moves_a_faint_band_across_text_without_fading_pill_caps() {
+        let icons = icons(IconPreset::NerdFont);
+        let render = |elapsed_ms| {
+            render_token_segments(
+                &[SegmentConfig::Token {
+                    token: "status".into(),
+                    style: None,
+                    prefix: " ".into(),
+                    suffix: " ".into(),
+                    max_width: None,
+                    visual: TokenVisual::Pill,
+                }],
+                None,
+                ItemState::default(),
+                &StylesConfig::default(),
+                &icons,
+                |_| TokenValue::plain("go").with_effect(TokenEffect::Wave, elapsed_ms),
+            )
+        };
+
+        let first = render(270);
+        let next = render(360);
+        let dimmed = |line: &RenderedTokenLine| {
+            line.spans
+                .iter()
+                .map(|span| span.style.add_modifier.contains(Modifier::DIM))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(first.to_string(), "\u{e0b6} go \u{e0b4}");
+        assert_ne!(dimmed(&first), dimmed(&next));
+        assert!(!dimmed(&first)[0]);
+        assert!(!dimmed(&first)[first.spans.len() - 1]);
+        assert!(dimmed(&first).into_iter().any(|dim| dim));
+        assert!(dimmed(&next).into_iter().any(|dim| !dim));
+    }
+
+    #[test]
+    fn effects_preserve_configured_glyph_weight() {
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let pulse = effect_style(TokenEffect::Pulse, bold, 0, 1, 1_000);
+        let wave = effect_style(TokenEffect::Wave, bold, 0, 1, 270);
+
+        assert!(pulse.add_modifier.contains(Modifier::BOLD | Modifier::DIM));
+        assert!(wave.add_modifier.contains(Modifier::BOLD | Modifier::DIM));
     }
 
     #[test]

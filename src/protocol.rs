@@ -336,6 +336,7 @@ pub enum ExtensionTokenPresentation {
     Plain,
     Spinner,
     Pulse,
+    Wave,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -83,6 +83,9 @@ pub struct Cli {
     /// Emit versioned JSON for noninteractive commands only.
     #[arg(long, global = true)]
     json: bool,
+    /// Launch the standalone UI playground without starting or contacting a daemon.
+    #[arg(long)]
+    ui_playground: bool,
     /// Command to run; omit it to open the current directory and attach.
     #[command(subcommand)]
     command: Option<Command>,
@@ -915,7 +918,7 @@ async fn run_from(args: impl IntoIterator<Item = OsString>) -> ExitCode {
         }
     };
     let json_output = cli.json;
-    if matches!(cli.command, Some(Command::Doctor)) {
+    if matches!(cli.command, Some(Command::Doctor)) && !cli.ui_playground {
         let socket = match socket_path(cli.socket.as_deref()) {
             Ok(socket) => socket,
             Err(error) => {
@@ -970,6 +973,14 @@ async fn run_from(args: impl IntoIterator<Item = OsString>) -> ExitCode {
 }
 
 async fn execute(cli: Cli) -> Result<()> {
+    if cli.ui_playground {
+        if cli.command.is_some() {
+            bail!("--ui-playground cannot be combined with a command");
+        }
+        reject_interactive_json(&cli)?;
+        return client::launch_ui_playground(&cli.config_location()?).await;
+    }
+
     if matches!(
         &cli.command,
         Some(Command::Agent {
@@ -1021,9 +1032,9 @@ async fn execute(cli: Cli) -> Result<()> {
         }
     }
 
+    reject_interactive_json(&cli)?;
     let config_location = cli.config_location()?;
     let socket = socket_path(cli.socket.as_deref())?;
-    reject_interactive_json(&cli)?;
     reject_nested_client(&cli)?;
     match cli.command {
         None => {
@@ -2464,6 +2475,7 @@ fn render_extension_show(
                 crate::protocol::ExtensionTokenPresentation::Plain => "plain",
                 crate::protocol::ExtensionTokenPresentation::Spinner => "spinner",
                 crate::protocol::ExtensionTokenPresentation::Pulse => "pulse",
+                crate::protocol::ExtensionTokenPresentation::Wave => "wave",
             };
             format!("{} ({scope}, {presentation})", token.name)
         })
@@ -5228,6 +5240,17 @@ mod tests {
                 })
             ));
         }
+    }
+
+    #[test]
+    fn ui_playground_is_a_top_level_launch_flag() {
+        let playground = Cli::try_parse_from(["fut", "--ui-playground"]).unwrap();
+        assert!(playground.ui_playground);
+        assert!(playground.command.is_none());
+
+        let with_command = Cli::try_parse_from(["fut", "--ui-playground", "attach"]).unwrap();
+        assert!(with_command.ui_playground);
+        assert!(matches!(with_command.command, Some(Command::Attach)));
     }
 
     #[test]

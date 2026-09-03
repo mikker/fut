@@ -518,11 +518,11 @@ components = [
 
 Presentation defaults to `plain`: the client renders the validated published
 string exactly as token text. `presentation = "spinner"` instead treats any
-non-empty published value as presence and renders an animated spinner using
-the client's existing 100 ms clock. `presentation = "pulse"` keeps the text and
-applies a two-second stepped bright-to-normal-to-faint pulse to the complete
-segment, including affixes and pill caps; terminal protocols do not provide
-alpha transparency.
+non-empty published value as presence and renders the client's configured
+animated spinner. `presentation = "pulse"` keeps the text and breathes
+it over two seconds. `presentation = "wave"` moves a faint band across the text.
+Both text effects cover the complete text and affixes while pill caps remain stable;
+terminal protocols do not provide alpha transparency.
 Empty still suppresses the segment and its affixes. Animation is entirely
 client-side—publication happens only when the extension's state changes, never
 once per frame—and does not give plain token values a control or styling channel.

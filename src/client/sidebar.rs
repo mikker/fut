@@ -1383,7 +1383,14 @@ fn render_agent_row(
     buffer.set_line(
         area.x,
         area.y,
-        &item.line(spinner_frame, "/", title_style, detail_style, status_style),
+        &item.line(
+            spinner_frame,
+            &ui.spinner,
+            "/",
+            title_style,
+            detail_style,
+            status_style,
+        ),
         area.width,
     );
 }
@@ -1415,9 +1422,9 @@ fn render_minimized_agent_row(
         9 => "0".into(),
         _ => "…".into(),
     };
-    let activity = item
-        .indicator
-        .map_or(" ", |indicator| indicator.marker(spinner_frame));
+    let activity = item.indicator.map_or(" ", |indicator| {
+        indicator.marker(spinner_frame, &ui.spinner)
+    });
     let activity_style = ui.styles.apply(item.status_style(), base);
     buffer.set_line(
         area.x,
@@ -1885,7 +1892,7 @@ fn render_minimized_workspace_row(
             }
         };
         (
-            activity.marker(spinner_frame).into(),
+            activity.marker(spinner_frame, &ui.spinner).into(),
             ui.styles.apply(role, base),
         )
     } else {
@@ -2304,7 +2311,7 @@ fn workspace_row_lines(
                     | ActivityIndicator::Completed
                     | ActivityIndicator::Bell => SemanticStyle::Attention,
                 };
-                TokenValue::styled(activity.marker(spinner_frame), style)
+                TokenValue::styled(activity.marker(spinner_frame, &ui.spinner), style)
             },
         ),
         _ => materialized_extension_token_value(
@@ -2731,7 +2738,7 @@ mod tests {
         render_workspace_row(
             &model.items[0],
             false,
-            10,
+            1_300,
             area,
             SidebarSide::Left,
             &ui,

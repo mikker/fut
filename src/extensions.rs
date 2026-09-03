@@ -1669,7 +1669,7 @@ impl PresentationToken {
     pub(crate) fn is_animated(&self, value: &str, nerd_font: bool) -> bool {
         match self.presentation_for(value) {
             TokenPresentation::Plain => false,
-            TokenPresentation::Pulse => true,
+            TokenPresentation::Pulse | TokenPresentation::Wave => true,
             TokenPresentation::Spinner => {
                 !(nerd_font
                     && self
@@ -1692,6 +1692,7 @@ pub(crate) enum TokenPresentation {
     Plain,
     Spinner,
     Pulse,
+    Wave,
 }
 
 impl From<ExtensionTokenPresentation> for TokenPresentation {
@@ -1700,6 +1701,7 @@ impl From<ExtensionTokenPresentation> for TokenPresentation {
             ExtensionTokenPresentation::Plain => Self::Plain,
             ExtensionTokenPresentation::Spinner => Self::Spinner,
             ExtensionTokenPresentation::Pulse => Self::Pulse,
+            ExtensionTokenPresentation::Wave => Self::Wave,
         }
     }
 }
@@ -1710,6 +1712,7 @@ impl From<TokenPresentation> for ExtensionTokenPresentation {
             TokenPresentation::Plain => Self::Plain,
             TokenPresentation::Spinner => Self::Spinner,
             TokenPresentation::Pulse => Self::Pulse,
+            TokenPresentation::Wave => Self::Wave,
         }
     }
 }
@@ -1728,6 +1731,7 @@ impl TokenPresentation {
             Self::Plain => "plain",
             Self::Spinner => "spinner",
             Self::Pulse => "pulse",
+            Self::Wave => "wave",
         }
     }
 }

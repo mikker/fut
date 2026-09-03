@@ -124,6 +124,11 @@ preset = "nerd_font" # "ascii", "unicode", or "nerd_font"
 # pill_left = ""       # Focused tab/workspace pill caps; empty outside "nerd_font".
 # pill_right = ""
 
+[ui.spinner]
+style = "dots" # Browse the built-in styles with `fut --ui-playground`.
+# interval = 80 # Optional frame delay in milliseconds.
+# frames = ["-", "\\", "|", "/"] # Optional custom frames; overrides style.
+
 [ui.styles.current]
 foreground = "blue"
 add_modifiers = ["reversed"]
@@ -290,6 +295,35 @@ Tab-bar lanes contain groups. A group has `segments`, an optional semantic `styl
 Workspace rows have intrinsic `left` and `right` lanes; `body` receives the remaining cells and truncates safely. Expanded default rows show the workspace number and name, reserve leading and trailing padding, and use the same current style as the focused tab instead of a separate active marker. With Nerd Font pill caps, only that title line becomes a pill. The minimized rail keeps its compact active-workspace bullet. A nonempty `detail` format adds a second full-width line. Workspaces are unnamed unless explicitly named, presenting as their live location — the work tree (or directory) every open pane is inside, or `multiple` when panes disagree. The default detail aligns under the row name and shows the Git branch at that live location with its short working-tree diff (`+N` inserted, `-N` deleted). The daemon collects those values with bounded background `git` processes and publishes them atomically into the shared resource snapshot, so rendering never waits, attached clients agree, and non-Git locations simply stay empty. Set `detail = []` for compact one-line rows. Header and footer are optional single-line segment lists. At tiny heights Fut preserves resource rows over decorative header/footer content, while switching and error status remains visible.
 
 All widths are terminal display cells. Dynamic values are sanitized and truncated at grapheme boundaries. Bars never wrap.
+
+## Spinners and effects
+
+Run `fut --ui-playground` to browse the built-in non-emoji spinner styles at
+their intended speed and preview plain, pulse, wave, inverted, and pill token
+treatments—including effect combinations—with the active theme. The standalone
+playground reads the normal configuration but does not start or contact a
+daemon. Search by typing and move with the arrow keys or `Ctrl-j`/`Ctrl-k`.
+
+Choose a named style or provide a custom, equal-width frame list:
+
+```toml
+[ui.spinner]
+style = "circle_halves"
+# interval = 80 # Override the preset's frame delay.
+
+# Or define a custom spinner. `style` is ignored when frames are present.
+# frames = ["-", "\\", "|", "/"]
+# interval = 100
+```
+
+The interval must be 16–2000 milliseconds. Custom lists accept 1–256 safe,
+nonempty frames, each 1–32 display cells wide; every frame must have the same
+display width so surrounding UI does not jump. The selected spinner is shared
+by agent activity and extension tokens declared with `presentation = "spinner"`.
+
+Pulse alternates the complete text between normal and faint. Wave moves the
+faint treatment across its characters. Neither effect changes glyph weight;
+affixes participate while pill caps retain a stable fill.
 
 ## Styles
 

@@ -24,9 +24,11 @@ mod presentation;
 mod project_opener;
 mod rename;
 mod sidebar;
+mod spinners;
 mod tab_bar;
 mod temporary_command;
 mod toast;
+mod ui_catalog;
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -117,6 +119,7 @@ use temporary_command::{
     TemporaryCommandUpdate, dispatch_background_command,
 };
 use toast::{Toast, ToastState};
+use ui_catalog::{UiCatalog, UiCatalogAction};
 
 use crate::{
     domain::{
@@ -353,6 +356,47 @@ pub async fn attach(
         config_location,
     )
     .await
+}
+
+/// Launch the theme-aware UI playground without contacting or starting a daemon.
+pub async fn launch_ui_playground(config_location: &config::ConfigLocation) -> anyhow::Result<()> {
+    let ui = config::load_location(config_location)?.ui;
+    let _guard = TerminalGuard::enter()?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let mut catalog = UiCatalog::open(&ui);
+    let mut events = EventStream::new();
+    let mut termination = TerminationSignals::subscribe()?;
+    let started = time::Instant::now();
+    let mut animation = time::interval(Duration::from_millis(50));
+    animation.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    loop {
+        terminal.draw(|frame| {
+            let area = frame.area();
+            frame.render_widget(Clear, area);
+            catalog.render(
+                area,
+                started.elapsed().as_millis() as usize,
+                &ui,
+                frame.buffer_mut(),
+            );
+        })?;
+        tokio::select! {
+            name = termination.recv() => bail!("terminated by {name}"),
+            _ = animation.tick() => {}
+            event = events.next() => match event.transpose()? {
+                Some(Event::Key(key)) => {
+                    let visible = ui_catalog::dialog_body_rows(terminal.size()?.into());
+                    if catalog.key(key, visible) == UiCatalogAction::Close {
+                        return Ok(());
+                    }
+                }
+                Some(Event::Paste(text)) => catalog.paste(&text),
+                Some(Event::Resize(_, _)) | Some(Event::FocusGained | Event::FocusLost) => {}
+                Some(Event::Mouse(_)) => {}
+                None => bail!("terminal input closed"),
+            }
+        }
+    }
 }
 
 /// Open a lease-free global navigator on an existing daemon, then attach only
@@ -645,7 +689,7 @@ async fn initial_navigator(
         terminal.draw(|frame| {
             let area = frame.area();
             frame.render_widget(Clear, area);
-            navigator.render(area, 0, &ui.styles, frame.buffer_mut());
+            navigator.render(area, 0, &ui.spinner, &ui.styles, frame.buffer_mut());
         })?;
         tokio::select! {
             name = termination.recv() => bail!("terminated by {name}"),
@@ -769,8 +813,7 @@ async fn run_loop(
     let mut project_preparation: Option<ProjectPreparationTask> = None;
     let mut redraw = time::interval(Duration::from_millis(16));
     redraw.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-    let mut spinner = time::interval(Duration::from_millis(100));
-    spinner.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let animation_started = time::Instant::now();
     let (clipboard_results, mut clipboard_result) = mpsc::channel(1);
     let (background_results, mut background_result) = mpsc::unbounded_channel();
     let (project_preparation_results, mut project_preparation_result) =
@@ -3044,11 +3087,11 @@ async fn run_loop(
                 toasts.expire();
                 force_draw = true;
             }
-            _ = spinner.tick(), if resources.has_working() || resources.has_animated_extension_token(&ui) => {
-                spinner_frame = spinner_frame.wrapping_add(1);
-                force_draw = true;
-            }
-            _ = redraw.tick(), if force_draw || view.needs_draw() => {
+            _ = redraw.tick(), if force_draw
+                || view.needs_draw()
+                || resources.has_working()
+                || resources.has_animated_extension_token(&ui) => {
+                spinner_frame = animation_started.elapsed().as_millis() as usize;
                 let focused_terminal_id = view.focused().terminal_id;
                 let focused_terminal_rendered = focused_terminal_is_rendered(
                     temporary_command.is_some(),
@@ -3170,13 +3213,13 @@ async fn run_loop(
                         }
                         match surface.as_mut() {
                             Some(ClientSurface::Navigator(nav)) => {
-                                nav.render(area, spinner_frame, &ui.styles, frame.buffer_mut());
+                                nav.render(area, spinner_frame, &ui.spinner, &ui.styles, frame.buffer_mut());
                             }
                             Some(ClientSurface::ProjectOpener(opener)) => {
                                 opener.render(layout.terminal, frame.buffer_mut());
                             }
                             Some(ClientSurface::Agents(dialog)) => {
-                                dialog.render(area, spinner_frame, &ui.styles, frame.buffer_mut());
+                                dialog.render(area, spinner_frame, &ui.spinner, &ui.styles, frame.buffer_mut());
                             }
                             Some(ClientSurface::Notifications(dialog)) => {
                                 dialog.render(area, frame.buffer_mut());

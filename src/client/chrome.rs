@@ -754,7 +754,7 @@ fn render_bar_group(
             ),
             "tab.activity" => active.activity.map_or_else(
                 || TokenValue::plain(""),
-                |activity| activity_token(activity, spinner_frame),
+                |activity| activity_token(activity, spinner_frame, ui),
             ),
             _ => materialized_extension_token_value(
                 ui,
@@ -1118,7 +1118,7 @@ fn tab_token(
         "tab.icon" => TokenValue::plain(icons.tab.clone()),
         "tab.activity" => tab.activity.map_or_else(
             || TokenValue::plain(""),
-            |activity| activity_token(activity, spinner_frame),
+            |activity| activity_token(activity, spinner_frame, ui),
         ),
         _ => materialized_extension_token_value(
             ui,
@@ -1131,14 +1131,14 @@ fn tab_token(
     }
 }
 
-fn activity_token(activity: ActivityIndicator, frame: usize) -> TokenValue {
+fn activity_token(activity: ActivityIndicator, frame: usize, ui: &UiConfig) -> TokenValue {
     let style = match activity {
         ActivityIndicator::Working => SemanticStyle::Activity,
         ActivityIndicator::Blocked | ActivityIndicator::Completed | ActivityIndicator::Bell => {
             SemanticStyle::Attention
         }
     };
-    TokenValue::styled(activity.marker(frame), style)
+    TokenValue::styled(activity.marker(frame, &ui.spinner), style)
 }
 
 pub(super) fn truncate(value: &str, width: usize) -> String {
@@ -1309,7 +1309,7 @@ mod tests {
                 .iter()
                 .all(|span| !span.style.add_modifier.contains(Modifier::DIM))
         );
-        let dimmed = render_bar_group(&group, &model, false, None, 10, &ui);
+        let dimmed = render_bar_group(&group, &model, false, None, 1_300, &ui);
         assert_eq!(dimmed.to_string(), "⁕");
         assert!(
             dimmed
@@ -1323,14 +1323,25 @@ mod tests {
         assert!(resources.accept(snapshot.clone()));
         assert!(resources.has_animated_extension_token(&ui));
         ui.icons.preset = IconPreset::NerdFont;
-        let dimmed = render_bar_group(&group, &model, false, None, 10, &ui);
+        let dimmed = render_bar_group(&group, &model, false, None, 1_300, &ui);
         assert_eq!(dimmed.to_string(), "\u{e0b6}󱑠\u{e0b4}");
         assert!(
-            dimmed
-                .line
-                .spans
-                .iter()
-                .all(|span| span.style.add_modifier.contains(Modifier::DIM))
+            !dimmed.line.spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::DIM)
+        );
+        assert!(
+            dimmed.line.spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::DIM)
+        );
+        assert!(
+            !dimmed.line.spans[2]
+                .style
+                .add_modifier
+                .contains(Modifier::DIM)
         );
         assert!(resources.has_animated_extension_token(&ui));
         snapshot.revision += 1;

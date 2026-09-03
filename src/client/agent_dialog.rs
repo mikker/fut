@@ -6,7 +6,7 @@ use crate::{domain::PaneId, protocol::SelectedTarget, resources::ResourceSnapsho
 
 use super::{
     agents::{self, AgentItem},
-    config::{AgentScope, SemanticStyle, StylesConfig},
+    config::{AgentScope, SemanticStyle, SpinnerConfig, StylesConfig},
     dialog::{
         dialog_area, fill_row, frame_inner, render_footer, render_frame, render_list_scrollbar,
         render_title,
@@ -131,7 +131,8 @@ impl AgentsDialog {
     pub(super) fn render(
         &mut self,
         host: Rect,
-        spinner_frame: usize,
+        elapsed_ms: usize,
+        spinner: &SpinnerConfig,
         styles: &StylesConfig,
         buffer: &mut Buffer,
     ) {
@@ -203,7 +204,7 @@ impl AgentsDialog {
                 buffer.set_line(
                     body.x,
                     y,
-                    &row.line(spinner_frame, " › ", style, style, status_style),
+                    &row.line(elapsed_ms, spinner, " › ", style, style, status_style),
                     body.width,
                 );
             }
@@ -300,7 +301,13 @@ mod tests {
         let host = Rect::new(0, 0, 80, 10);
         let mut buffer = Buffer::empty(host);
 
-        dialog.render(host, 0, &StylesConfig::default(), &mut buffer);
+        dialog.render(
+            host,
+            0,
+            &SpinnerConfig::default(),
+            &StylesConfig::default(),
+            &mut buffer,
+        );
 
         let source = &buffer[(4, 2)];
         let status = &buffer[(10, 2)];

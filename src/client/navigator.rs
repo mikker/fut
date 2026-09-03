@@ -15,7 +15,7 @@ use crate::{
     resources::{ResourceSnapshot, TargetSelector},
 };
 
-use super::config::{SemanticStyle, StylesConfig};
+use super::config::{SemanticStyle, SpinnerConfig, StylesConfig};
 use super::dialog::{
     dialog_area, fill_row, frame_inner, render_footer, render_frame, render_list_scrollbar,
     render_title,
@@ -573,6 +573,7 @@ impl NavigatorState {
         &mut self,
         host: Rect,
         spinner_frame: usize,
+        spinner: &SpinnerConfig,
         styles: &StylesConfig,
         buffer: &mut Buffer,
     ) {
@@ -651,7 +652,7 @@ impl NavigatorState {
                         let marker = if row.closing {
                             "×"
                         } else if let Some(activity) = row.activity {
-                            activity.marker(spinner_frame)
+                            activity.marker(spinner_frame, spinner)
                         } else if row.current && matches!(row.key, ResourceKey::Pane(_)) {
                             "•"
                         } else {
@@ -1115,7 +1116,13 @@ mod tests {
     fn rendered(nav: &mut NavigatorState, width: u16, height: u16) -> (String, Buffer) {
         let area = Rect::new(0, 0, width, height);
         let mut buffer = Buffer::empty(area);
-        nav.render(area, 0, &StylesConfig::default(), &mut buffer);
+        nav.render(
+            area,
+            0,
+            &SpinnerConfig::default(),
+            &StylesConfig::default(),
+            &mut buffer,
+        );
         let text = (0..height)
             .map(|y| {
                 (0..width)
@@ -1806,7 +1813,13 @@ mod tests {
             nav.selected = nav.rows.len() - 1;
             let area = Rect::new(0, 0, width, height);
             let mut buffer = Buffer::empty(area);
-            nav.render(area, 0, &StylesConfig::default(), &mut buffer);
+            nav.render(
+                area,
+                0,
+                &SpinnerConfig::default(),
+                &StylesConfig::default(),
+                &mut buffer,
+            );
             assert!(nav.scroll <= nav.selected);
         }
     }

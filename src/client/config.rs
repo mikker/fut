@@ -15,6 +15,7 @@ use unicode_width::UnicodeWidthStr;
 use super::actions::{
     ALL_ACTIONS, ClientAction, config_key, default_suffix, parse_key, suffix_name,
 };
+use super::spinners::{SpinnerStyle, builtin_spinner};
 use crate::{
     command::PopupSize,
     extension_store,
@@ -31,6 +32,8 @@ const MAX_EXTENSION_CONFIG_ARRAY_VALUES: usize = 128;
 const MAX_EXTENSION_CONFIG_SERIALIZED_BYTES: usize = 16 * 1024;
 const MAX_SEGMENTS: usize = 64;
 const MAX_TEXT_BYTES: usize = 1024;
+const MAX_SPINNER_FRAMES: usize = 256;
+const MAX_SPINNER_WIDTH: usize = 32;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -793,6 +796,40 @@ impl IconsConfig {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(super) struct SpinnerConfig {
+    pub style: String,
+    pub frames: Option<Vec<String>>,
+    pub interval: Option<u64>,
+}
+
+impl Default for SpinnerConfig {
+    fn default() -> Self {
+        Self {
+            style: "dots".into(),
+            frames: None,
+            interval: None,
+        }
+    }
+}
+
+impl SpinnerConfig {
+    pub fn frame(&self, elapsed_ms: usize) -> &str {
+        if let Some(frames) = &self.frames {
+            let interval = self.interval.unwrap_or(80) as usize;
+            return &frames[(elapsed_ms / interval) % frames.len()];
+        }
+        let spinner = self.builtin().expect("validated spinner style");
+        let interval = self.interval.unwrap_or(spinner.interval_ms) as usize;
+        spinner.frames[(elapsed_ms / interval) % spinner.frames.len()]
+    }
+
+    pub fn builtin(&self) -> Option<SpinnerStyle> {
+        builtin_spinner(&self.style)
+    }
+}
+
 /// Raw TOML form for a presentation segment. This deliberately mirrors the
 /// user-facing syntax; [`SegmentConfig`] is the validated form the renderer
 /// receives.
@@ -1388,6 +1425,7 @@ pub(crate) struct UiConfig {
     prefix: String,
     pub(super) bindings: BindingsConfig,
     pub(super) icons: IconsConfig,
+    pub(super) spinner: SpinnerConfig,
     pub(super) styles: StylesConfig,
     pub(super) tab_bar: TabBarConfig,
     pub(super) sidebar: SidebarConfig,
@@ -1407,6 +1445,7 @@ impl Default for UiConfig {
             prefix: "ctrl-b".into(),
             bindings: BindingsConfig::default(),
             icons: IconsConfig::default(),
+            spinner: SpinnerConfig::default(),
             styles: StylesConfig::default(),
             tab_bar: TabBarConfig::default(),
             sidebar: SidebarConfig::default(),
@@ -2308,6 +2347,33 @@ fn merge_extension_tables(base: &mut ExtensionConfigTable, overrides: ExtensionC
 }
 
 fn validate(ui: &UiConfig, extensions: &[Extension]) -> Result<()> {
+    if ui.spinner.frames.is_none() && ui.spinner.builtin().is_none() {
+        bail!("unknown ui.spinner.style {:?}", ui.spinner.style);
+    }
+    if let Some(interval) = ui.spinner.interval
+        && !(16..=2_000).contains(&interval)
+    {
+        bail!("ui.spinner.interval must be between 16 and 2000 milliseconds");
+    }
+    if let Some(frames) = &ui.spinner.frames {
+        if frames.is_empty() || frames.len() > MAX_SPINNER_FRAMES {
+            bail!("ui.spinner.frames must contain between 1 and {MAX_SPINNER_FRAMES} frames");
+        }
+        let mut width = None;
+        for frame in frames {
+            validate_text("ui.spinner.frames", frame)?;
+            let frame_width = UnicodeWidthStr::width(frame.as_str());
+            if frame_width == 0 || frame_width > MAX_SPINNER_WIDTH {
+                bail!("ui.spinner frames must be between 1 and {MAX_SPINNER_WIDTH} cells wide");
+            }
+            if width
+                .replace(frame_width)
+                .is_some_and(|width| width != frame_width)
+            {
+                bail!("ui.spinner frames must all have the same display width");
+            }
+        }
+    }
     let valid_binding_keys = ALL_ACTIONS
         .into_iter()
         .map(config_key)
@@ -2703,6 +2769,31 @@ recipe_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde
         let empty = temporary.path().join("empty.toml");
         fs::write(&empty, "").unwrap();
         assert_eq!(load_path(&empty, true).unwrap(), UiConfig::default());
+    }
+
+    #[test]
+    fn spinner_presets_and_custom_frames_are_strict_and_time_based() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("config.toml");
+        fs::write(&path, "[ui.spinner]\nstyle = 'line'\n").unwrap();
+        let preset = load_path(&path, true).unwrap();
+        assert_eq!(preset.spinner.frame(0), "-");
+        assert_eq!(preset.spinner.frame(130), "\\");
+
+        fs::write(&path, "[ui.spinner]\nframes = ['a', 'b']\ninterval = 40\n").unwrap();
+        let custom = load_path(&path, true).unwrap();
+        assert_eq!(custom.spinner.frame(39), "a");
+        assert_eq!(custom.spinner.frame(40), "b");
+
+        for invalid in [
+            "[ui.spinner]\nstyle = 'missing'\n",
+            "[ui.spinner]\nframes = []\n",
+            "[ui.spinner]\nframes = ['a', 'wide']\n",
+            "[ui.spinner]\nframes = ['a']\ninterval = 5\n",
+        ] {
+            fs::write(&path, invalid).unwrap();
+            assert!(load_path(&path, true).is_err(), "accepted {invalid:?}");
+        }
     }
 
     #[test]

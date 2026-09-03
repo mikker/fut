@@ -377,12 +377,13 @@ presentation = "spinner"
 
 Scopes are `session`, `workspace`, `tab`, and `pane`. `presentation` is `plain`
 by default. `spinner` treats any non-empty value as presence and replaces it
-with an animated spinner; `pulse` keeps the text and applies a two-second
-stepped bright-to-normal-to-faint pulse to the complete segment. A token may
+with an animated spinner; `pulse` breathes the complete text over two seconds,
+while `wave` moves a faint band across its characters. Both apply to the
+complete segment. A token may
 instead declare named `variants`, each with a nonempty `text`, semantic `style`, and
 optional presentation. `nerd_font_text` supplies an alternate glyph when
 `[ui.icons] preset = "nerd_font"`; for spinners it replaces the animation, while
-plain and pulsing variants retain their presentation. Publishing the variant
+plain, pulsing, and wave variants retain their presentation. Publishing the variant
 name displays its configured glyph and style. This keeps state-specific display
 choices in the extension manifest while UI layouts configure one stable token.
 Styles use the same semantic names as UI segments, such as `divider`,
