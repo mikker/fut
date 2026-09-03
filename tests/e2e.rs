@@ -12096,6 +12096,7 @@ async fn extension_command_can_activate_the_target_opened_by_its_child() {
     harness.shutdown().await;
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
 async fn keyboard_copy_search_uses_client_clipboard_and_surfaces_success_and_failure() {
     let root = tempfile::Builder::new()
@@ -12113,7 +12114,11 @@ async fn keyboard_copy_search_uses_client_clipboard_and_surfaces_success_and_fai
 
     let bin = root.path().join("bin");
     fs::create_dir(&bin).unwrap();
-    let clipboard = bin.join("wl-copy");
+    let clipboard = bin.join(if cfg!(target_os = "macos") {
+        "pbcopy"
+    } else {
+        "wl-copy"
+    });
     fs::write(
         &clipboard,
         "#!/bin/sh\nif [ \"$CLIPBOARD_FAIL\" = 1 ] && [ ! -e \"$CLIPBOARD_FAILED_ONCE\" ]; then touch \"$CLIPBOARD_FAILED_ONCE\"; cat >/dev/null; exit 23; fi\ncount=0\n[ ! -f \"$CLIPBOARD_COUNT\" ] || read -r count < \"$CLIPBOARD_COUNT\"\ncount=$((count + 1))\ncat > \"$CLIPBOARD_CAPTURE.$count\"\nprintf '%s\\n' \"$count\" > \"$CLIPBOARD_COUNT\"\n",
