@@ -12097,7 +12097,7 @@ async fn extension_command_can_activate_the_target_opened_by_its_child() {
 }
 
 #[tokio::test]
-async fn keyboard_copy_search_uses_client_pbcopy_and_surfaces_success_and_failure() {
+async fn keyboard_copy_search_uses_client_clipboard_and_surfaces_success_and_failure() {
     let root = tempfile::Builder::new()
         .prefix("fut-copy-mode-e2e-")
         .tempdir()
@@ -12113,13 +12113,13 @@ async fn keyboard_copy_search_uses_client_pbcopy_and_surfaces_success_and_failur
 
     let bin = root.path().join("bin");
     fs::create_dir(&bin).unwrap();
-    let pbcopy = bin.join("pbcopy");
+    let clipboard = bin.join("wl-copy");
     fs::write(
-        &pbcopy,
-        "#!/bin/sh\nif [ \"$PBCOPY_FAIL\" = 1 ] && [ ! -e \"$PBCOPY_FAILED_ONCE\" ]; then touch \"$PBCOPY_FAILED_ONCE\"; cat >/dev/null; exit 23; fi\ncount=0\n[ ! -f \"$PBCOPY_COUNT\" ] || read -r count < \"$PBCOPY_COUNT\"\ncount=$((count + 1))\ncat > \"$PBCOPY_CAPTURE.$count\"\nprintf '%s\\n' \"$count\" > \"$PBCOPY_COUNT\"\n",
+        &clipboard,
+        "#!/bin/sh\nif [ \"$CLIPBOARD_FAIL\" = 1 ] && [ ! -e \"$CLIPBOARD_FAILED_ONCE\" ]; then touch \"$CLIPBOARD_FAILED_ONCE\"; cat >/dev/null; exit 23; fi\ncount=0\n[ ! -f \"$CLIPBOARD_COUNT\" ] || read -r count < \"$CLIPBOARD_COUNT\"\ncount=$((count + 1))\ncat > \"$CLIPBOARD_CAPTURE.$count\"\nprintf '%s\\n' \"$count\" > \"$CLIPBOARD_COUNT\"\n",
     )
     .unwrap();
-    fs::set_permissions(&pbcopy, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&clipboard, fs::Permissions::from_mode(0o755)).unwrap();
     let capture = root.path().join("clipboard");
     let copy_count = root.path().join("clipboard-count");
 
@@ -12129,10 +12129,14 @@ async fn keyboard_copy_search_uses_client_pbcopy_and_surfaces_success_and_failur
             .env_clear()
             .env("HOME", harness.root.path().join("home"))
             .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-            .env("PBCOPY_CAPTURE", &capture)
-            .env("PBCOPY_COUNT", &copy_count)
-            .env("PBCOPY_FAILED_ONCE", root.path().join("pbcopy-failed-once"))
-            .env("PBCOPY_FAIL", if fail { "1" } else { "0" })
+            .env("CLIPBOARD_CAPTURE", &capture)
+            .env("CLIPBOARD_COUNT", &copy_count)
+            .env(
+                "CLIPBOARD_FAILED_ONCE",
+                root.path().join("clipboard-failed-once"),
+            )
+            .env("CLIPBOARD_FAIL", if fail { "1" } else { "0" })
+            .env("WAYLAND_DISPLAY", "wayland-test")
             .env("TMPDIR", harness.root.path().join("runtime"))
             .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
             .env("TERM", "xterm-256color")

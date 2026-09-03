@@ -337,8 +337,8 @@ enum ClipboardResult {
 /// Hesitation after the prefix before the which-key cheatsheet appears.
 const CHEATSHEET_DELAY: Duration = Duration::from_millis(700);
 
-const PBCOPY_TIMEOUT: Duration = Duration::from_secs(2);
-const PBCOPY_REAP_TIMEOUT: Duration = Duration::from_secs(1);
+const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(2);
+const CLIPBOARD_REAP_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Attach an interactive full-screen client to an already-running daemon.
 pub async fn attach(
@@ -1029,7 +1029,7 @@ async fn run_loop(
                                 .then_some(request_id)
                         });
                         if let Some(request_id) = accepted {
-                            spawn_pbcopy(
+                            spawn_clipboard_copy(
                                 request_id,
                                 text,
                                 clipboard_results.clone(),
@@ -1723,7 +1723,11 @@ async fn run_loop(
                         let content = temporary_command_content(command.size().area(host));
                         match command.mouse(mouse, content).await {
                             Ok(Some(copy)) => {
-                                spawn_pbcopy(copy.request_id, copy.text, clipboard_results.clone());
+                                spawn_clipboard_copy(
+                                    copy.request_id,
+                                    copy.text,
+                                    clipboard_results.clone(),
+                                );
                             }
                             Ok(None) => {}
                             Err(error) => {
@@ -5060,9 +5064,9 @@ async fn pump_copy_mode(
     .await
 }
 
-fn spawn_pbcopy(request_id: Uuid, text: String, results: mpsc::Sender<ClipboardResult>) {
+fn spawn_clipboard_copy(request_id: Uuid, text: String, results: mpsc::Sender<ClipboardResult>) {
     tokio::spawn(async move {
-        let result = pbcopy(text).await;
+        let result = copy_to_system_clipboard(text).await;
         let _ = results
             .send(match result {
                 Ok(bytes) => ClipboardResult::Copied { request_id, bytes },
@@ -5075,17 +5079,96 @@ fn spawn_pbcopy(request_id: Uuid, text: String, results: mpsc::Sender<ClipboardR
     });
 }
 
-async fn pbcopy(text: String) -> anyhow::Result<usize> {
-    copy_to_clipboard(Path::new("pbcopy"), text, PBCOPY_TIMEOUT).await
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClipboardCommand {
+    program: &'static str,
+    args: &'static [&'static str],
+}
+
+#[cfg(target_os = "macos")]
+fn clipboard_commands(wayland: bool, x11: bool) -> Vec<ClipboardCommand> {
+    let _ = (wayland, x11);
+    vec![ClipboardCommand {
+        program: "pbcopy",
+        args: &[],
+    }]
+}
+
+#[cfg(target_os = "linux")]
+fn clipboard_commands(wayland: bool, x11: bool) -> Vec<ClipboardCommand> {
+    let mut commands = Vec::new();
+    if wayland {
+        commands.push(ClipboardCommand {
+            program: "wl-copy",
+            args: &[],
+        });
+    }
+    if x11 {
+        commands.extend([
+            ClipboardCommand {
+                program: "xclip",
+                args: &["-selection", "clipboard"],
+            },
+            ClipboardCommand {
+                program: "xsel",
+                args: &["--clipboard", "--input"],
+            },
+        ]);
+    }
+    commands
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn clipboard_commands(wayland: bool, x11: bool) -> Vec<ClipboardCommand> {
+    let _ = (wayland, x11);
+    Vec::new()
+}
+
+async fn copy_to_system_clipboard(text: String) -> anyhow::Result<usize> {
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    let x11 = std::env::var_os("DISPLAY").is_some();
+    let commands = clipboard_commands(wayland, x11);
+    if commands.is_empty() {
+        bail!("clipboard unavailable: no graphical session (SSH/headless session?)");
+    }
+
+    for command in &commands {
+        match copy_to_clipboard(
+            Path::new(command.program),
+            command.args,
+            &text,
+            CLIPBOARD_TIMEOUT,
+        )
+        .await
+        {
+            Ok(bytes) => return Ok(bytes),
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<io::Error>()
+                        .is_some_and(|error| error.kind() == io::ErrorKind::NotFound)
+                }) => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    let attempted = commands
+        .iter()
+        .map(|command| command.program)
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!("clipboard unavailable: no supported command found (tried {attempted})")
 }
 
 async fn copy_to_clipboard(
     program: &Path,
-    text: String,
+    args: &[&str],
+    text: &str,
     deadline: Duration,
 ) -> anyhow::Result<usize> {
     let bytes = text.len();
     let mut child = tokio::process::Command::new(program)
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -5131,7 +5214,7 @@ async fn copy_to_clipboard(
 
 async fn kill_and_reap(child: &mut tokio::process::Child) {
     let _ = child.start_kill();
-    let _ = time::timeout(PBCOPY_REAP_TIMEOUT, child.wait()).await;
+    let _ = time::timeout(CLIPBOARD_REAP_TIMEOUT, child.wait()).await;
 }
 
 async fn send(
@@ -8745,7 +8828,7 @@ mod tests {
         let capture = capture_dir.path().join("copied");
         let (_success_dir, success) = clipboard_script(&format!("cat > '{}'", capture.display()));
         assert_eq!(
-            copy_to_clipboard(&success, "selected λ雪".into(), Duration::from_secs(1))
+            copy_to_clipboard(&success, &[], "selected λ雪", Duration::from_secs(1))
                 .await
                 .unwrap(),
             "selected λ雪".len()
@@ -8754,7 +8837,7 @@ mod tests {
 
         let (_failure_dir, failure) = clipboard_script("cat >/dev/null; exit 23");
         assert!(
-            copy_to_clipboard(&failure, "retry me".into(), Duration::from_secs(1))
+            copy_to_clipboard(&failure, &[], "retry me", Duration::from_secs(1))
                 .await
                 .unwrap_err()
                 .to_string()
@@ -8770,13 +8853,9 @@ mod tests {
         // The deadline must comfortably outlast shell startup: macOS can
         // spend over 100ms scanning a freshly written script on first exec,
         // and the pid file must exist by the time the timeout fires.
-        let error = copy_to_clipboard(
-            &timeout_script,
-            "blocked".into(),
-            Duration::from_millis(1000),
-        )
-        .await
-        .unwrap_err();
+        let error = copy_to_clipboard(&timeout_script, &[], "blocked", Duration::from_millis(1000))
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("timed out"));
         let pid = std::fs::read_to_string(pid_file).unwrap();
         let status = std::process::Command::new("/bin/kill")
@@ -8789,7 +8868,8 @@ mod tests {
         assert!(
             copy_to_clipboard(
                 Path::new("/definitely/missing/fut-pbcopy"),
-                "text".into(),
+                &[],
+                "text",
                 Duration::from_secs(1),
             )
             .await
@@ -8797,5 +8877,32 @@ mod tests {
             .to_string()
             .contains("start")
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn clipboard_commands_follow_linux_session_type() {
+        assert_eq!(clipboard_commands(false, false), []);
+        assert_eq!(
+            clipboard_commands(true, false),
+            [ClipboardCommand {
+                program: "wl-copy",
+                args: &[],
+            }]
+        );
+        assert_eq!(
+            clipboard_commands(false, true),
+            [
+                ClipboardCommand {
+                    program: "xclip",
+                    args: &["-selection", "clipboard"],
+                },
+                ClipboardCommand {
+                    program: "xsel",
+                    args: &["--clipboard", "--input"],
+                },
+            ]
+        );
+        assert_eq!(clipboard_commands(true, true).len(), 3);
     }
 }

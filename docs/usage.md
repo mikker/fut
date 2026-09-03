@@ -122,10 +122,12 @@ Press `Ctrl-b [` for copy mode. Move with arrows, `hjkl`, Home/End, or page
 keys. Space starts or clears a selection; `y` or Enter copies it; Escape or `q`
 cancels. `/` searches literal text and `n`/`N` repeats the search.
 
-Clipboard writes use a local `pbcopy` executable. It is available by default
-on macOS. On Linux, put a `pbcopy` wrapper around a clipboard tool such as
-`wl-copy` or `xclip` on `PATH`. A failed copy keeps the selection active for
-another attempt.
+Clipboard writes use `pbcopy` on macOS. On Linux, Fut automatically uses
+`wl-copy` in Wayland sessions or `xclip`/`xsel` in X11 sessions. Install
+`wl-clipboard`, `xclip`, or `xsel` if your desktop does not provide one. In an
+SSH or headless session without access to a graphical clipboard, Fut reports
+that the clipboard is unavailable. A failed copy keeps the selection active
+for another attempt.
 
 ## Workspaces, tabs, and panes
 

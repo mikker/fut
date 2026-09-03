@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added automatic Wayland and X11 clipboard support on Linux, with clear failures in headless sessions.
 - Smoothed extension token pulses across complete pills, including their affixes and caps.
 - Fixed Linux arm64 release binaries crashing with illegal instructions on CPUs without SVE.
 - Clear the terminal canvas before rendering Fut's first interactive frame.
