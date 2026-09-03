@@ -3787,6 +3787,8 @@ async fn daemon_executable(pid: libc::pid_t) -> Result<PathBuf> {
 
 #[cfg(target_os = "macos")]
 async fn daemon_executable(pid: libc::pid_t) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+
     let mut buffer = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     // SAFETY: proc_pidpath writes at most buffer.len() bytes into the valid buffer.
     let length = unsafe {
@@ -3801,7 +3803,7 @@ async fn daemon_executable(pid: libc::pid_t) -> Result<PathBuf> {
             .with_context(|| format!("resolve executable for daemon PID {pid}"));
     }
     buffer.truncate(length as usize);
-    Ok(PathBuf::from(std::ffi::OsString::from_vec(buffer)))
+    Ok(PathBuf::from(OsString::from_vec(buffer)))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
