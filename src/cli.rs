@@ -3,10 +3,7 @@ use std::{
     fs,
     io::{self, BufRead, Read, Write},
     os::fd::AsRawFd,
-    os::unix::{
-        ffi::OsStringExt,
-        fs::{FileTypeExt, MetadataExt},
-    },
+    os::unix::fs::{FileTypeExt, MetadataExt},
     path::{Path, PathBuf},
     process::ExitCode,
     str::FromStr,
