@@ -59,7 +59,7 @@ use copy_mode::{
 };
 use crossterm::{
     SynchronizedUpdate,
-    cursor::{Hide, SetCursorStyle, Show},
+    cursor::{Hide, MoveTo, SetCursorStyle, Show},
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
         Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
@@ -69,8 +69,8 @@ use crossterm::{
     },
     execute,
     terminal::{
-        DisableLineWrap, EnableLineWrap, EnterAlternateScreen, LeaveAlternateScreen,
-        disable_raw_mode, enable_raw_mode,
+        Clear as TerminalClear, ClearType, DisableLineWrap, EnableLineWrap, EnterAlternateScreen,
+        LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
     },
 };
 use futures_util::{SinkExt, StreamExt};
@@ -6597,6 +6597,7 @@ impl TerminalGuard {
         guard.raw = true;
         execute!(io::stdout(), EnterAlternateScreen)?;
         guard.alternate_screen = true;
+        clear_host_screen(&mut io::stdout())?;
         execute!(io::stdout(), EnableBracketedPaste)?;
         guard.bracketed_paste = true;
         // Keep plain text out of CSI-u: Crossterm cannot yet recover Kitty's
@@ -6658,6 +6659,10 @@ impl Drop for TerminalGuard {
 
 fn restore_host_cursor(writer: &mut impl io::Write) -> io::Result<()> {
     execute!(writer, SetCursorStyle::DefaultUserShape, Show)
+}
+
+fn clear_host_screen(writer: &mut impl io::Write) -> io::Result<()> {
+    execute!(writer, TerminalClear(ClearType::All), MoveTo(0, 0))
 }
 
 #[cfg(test)]
@@ -8539,6 +8544,15 @@ mod tests {
         let mut cleanup = Vec::new();
         restore_host_cursor(&mut cleanup).unwrap();
         assert_eq!(cleanup, b"\x1b[0 q\x1b[?25h");
+    }
+
+    #[test]
+    fn host_screen_is_cleared_and_homed_before_the_first_frame() {
+        let mut output = Vec::new();
+
+        clear_host_screen(&mut output).unwrap();
+
+        assert_eq!(output, b"\x1b[2J\x1b[1;1H");
     }
 
     #[test]
