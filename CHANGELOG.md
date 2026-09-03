@@ -4,6 +4,7 @@
 
 - Added automatic Wayland and X11 clipboard support on Linux, with clear failures in headless sessions.
 - Smoothed extension token pulses across complete pills, including their affixes and caps.
+- Navigator parent results now reopen the most recently used available workspace, tab, and pane in their hierarchy.
 - Added a searchable `fut --ui-playground`, configurable text spinners, restrained pulse and wave effects, and previews combining effects with inverted tokens and pills.
 - Fixed Linux arm64 release binaries crashing with illegal instructions on CPUs without SVE.
 - Clear the terminal canvas before rendering Fut's first interactive frame.

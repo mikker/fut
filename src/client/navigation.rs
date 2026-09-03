@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::hash::Hash;
 
 use crate::{
     domain::{PaneId, SessionId, TabId, WorkspaceId},
@@ -8,9 +9,9 @@ use crate::{
 
 #[derive(Default)]
 pub(super) struct NavigationHistory {
-    tab_destinations: HashMap<TabId, PaneId>,
-    workspace_destinations: HashMap<WorkspaceId, PaneId>,
-    session_destinations: HashMap<SessionId, PaneId>,
+    panes_by_tab: RecentChildren<TabId, PaneId>,
+    tabs_by_workspace: RecentChildren<WorkspaceId, TabId>,
+    workspaces_by_session: RecentChildren<SessionId, WorkspaceId>,
     last_panes: HashMap<TabId, PaneId>,
     last_tabs: HashMap<WorkspaceId, TabId>,
     last_workspaces: HashMap<SessionId, WorkspaceId>,
@@ -19,11 +20,11 @@ pub(super) struct NavigationHistory {
 
 impl NavigationHistory {
     pub fn record(&mut self, target: &SelectedTarget) {
-        self.tab_destinations.insert(target.tab_id, target.pane_id);
-        self.workspace_destinations
-            .insert(target.workspace_id, target.pane_id);
-        self.session_destinations
-            .insert(target.session_id, target.pane_id);
+        self.panes_by_tab.record(target.tab_id, target.pane_id);
+        self.tabs_by_workspace
+            .record(target.workspace_id, target.tab_id);
+        self.workspaces_by_session
+            .record(target.session_id, target.workspace_id);
     }
 
     pub fn record_transition(&mut self, previous: &SelectedTarget, target: &SelectedTarget) {
@@ -65,8 +66,7 @@ impl NavigationHistory {
             };
             let tab = &path.workspace.tabs[index];
             if !tab.closing
-                && let Some(pane_id) =
-                    tab_destination(tab, self.tab_destinations.get(&tab.id).copied())
+                && let Some(pane_id) = self.tab_destination(tab)
             {
                 return Some(pane_id);
             }
@@ -86,7 +86,7 @@ impl NavigationHistory {
             .tabs
             .get(usize::from(number.checked_sub(1)?))?;
         (!tab.closing && tab.id != path.tab.id)
-            .then(|| tab_destination(tab, self.tab_destinations.get(&tab.id).copied()))
+            .then(|| self.tab_destination(tab))
             .flatten()
     }
 
@@ -127,7 +127,7 @@ impl NavigationHistory {
     ) -> Option<PaneId> {
         let path = focused_path(snapshot, focused.pane_id)?;
         let pane_id = *self.last_panes.get(&path.tab.id)?;
-        (pane_id != path.pane_id && open_pane(path.tab, pane_id).is_some()).then_some(pane_id)
+        (pane_id != path.pane_id && pane_is_open(path.tab, pane_id)).then_some(pane_id)
     }
 
     pub fn last_tab(
@@ -142,7 +142,7 @@ impl NavigationHistory {
             .tabs
             .iter()
             .find(|tab| !tab.closing && tab.id == tab_id && tab.id != path.tab.id)?;
-        tab_destination(tab, self.tab_destinations.get(&tab.id).copied())
+        self.tab_destination(tab)
     }
 
     pub fn last_workspace(
@@ -172,32 +172,42 @@ impl NavigationHistory {
     }
 
     pub fn workspace_destination(&self, workspace: &WorkspaceSnapshot) -> Option<PaneId> {
-        self.workspace_destinations
-            .get(&workspace.id)
-            .copied()
-            .filter(|pane_id| workspace_has_open_pane(workspace, *pane_id))
+        self.tabs_by_workspace
+            .recent(&workspace.id)
+            .find_map(|tab_id| {
+                workspace
+                    .tabs
+                    .iter()
+                    .find(|tab| !tab.closing && tab.id == *tab_id)
+                    .and_then(|tab| self.tab_destination(tab))
+            })
             .or_else(|| {
                 workspace
                     .tabs
                     .iter()
                     .filter(|tab| !tab.closing)
-                    .find_map(|tab| tab_destination(tab, None))
+                    .find_map(|tab| self.tab_destination(tab))
             })
     }
 
     pub fn tab_destination(&self, tab: &TabSnapshot) -> Option<PaneId> {
-        self.tab_destinations
-            .get(&tab.id)
+        self.panes_by_tab
+            .recent(&tab.id)
             .copied()
-            .filter(|pane_id| open_pane(tab, *pane_id).is_some())
-            .or_else(|| tab_destination(tab, None))
+            .find(|pane_id| pane_is_open(tab, *pane_id))
+            .or_else(|| first_open_pane(tab))
     }
 
     pub fn session_destination(&self, session: &SessionSnapshot) -> Option<PaneId> {
-        self.session_destinations
-            .get(&session.id)
-            .copied()
-            .filter(|pane_id| session_has_open_pane(session, *pane_id))
+        self.workspaces_by_session
+            .recent(&session.id)
+            .find_map(|workspace_id| {
+                session
+                    .workspaces
+                    .iter()
+                    .find(|workspace| !workspace.closing && workspace.id == *workspace_id)
+                    .and_then(|workspace| self.workspace_destination(workspace))
+            })
             .or_else(|| {
                 session
                     .workspaces
@@ -205,6 +215,33 @@ impl NavigationHistory {
                     .filter(|workspace| !workspace.closing)
                     .find_map(|workspace| self.workspace_destination(workspace))
             })
+    }
+}
+
+struct RecentChildren<K, V> {
+    by_parent: HashMap<K, Vec<V>>,
+}
+
+impl<K, V> Default for RecentChildren<K, V> {
+    fn default() -> Self {
+        Self {
+            by_parent: HashMap::new(),
+        }
+    }
+}
+
+impl<K: Eq + Hash, V: Eq> RecentChildren<K, V> {
+    fn record(&mut self, parent: K, child: V) {
+        let children = self.by_parent.entry(parent).or_default();
+        children.retain(|candidate| *candidate != child);
+        children.push(child);
+    }
+
+    fn recent<'a>(&'a self, parent: &K) -> impl Iterator<Item = &'a V> {
+        self.by_parent
+            .get(parent)
+            .into_iter()
+            .flat_map(|children| children.iter().rev())
     }
 }
 
@@ -231,7 +268,7 @@ fn focused_path(snapshot: &ResourceSnapshot, pane_id: PaneId) -> Option<FocusedP
                         .iter()
                         .filter(|tab| !tab.closing)
                         .find_map(|tab| {
-                            open_pane(tab, pane_id).map(|_| FocusedPath {
+                            pane_is_open(tab, pane_id).then_some(FocusedPath {
                                 session,
                                 workspace,
                                 tab,
@@ -242,38 +279,17 @@ fn focused_path(snapshot: &ResourceSnapshot, pane_id: PaneId) -> Option<FocusedP
         })
 }
 
-fn tab_destination(tab: &TabSnapshot, preferred: Option<PaneId>) -> Option<PaneId> {
-    preferred
-        .filter(|pane_id| open_pane(tab, *pane_id).is_some())
-        .or_else(|| {
-            tab.panes
-                .iter()
-                .find(|pane| !pane.closing)
-                .map(|pane| pane.id)
-        })
+fn first_open_pane(tab: &TabSnapshot) -> Option<PaneId> {
+    tab.panes
+        .iter()
+        .find(|pane| !pane.closing)
+        .map(|pane| pane.id)
 }
 
-fn open_pane(tab: &TabSnapshot, pane_id: PaneId) -> Option<()> {
+fn pane_is_open(tab: &TabSnapshot, pane_id: PaneId) -> bool {
     tab.panes
         .iter()
         .any(|pane| !pane.closing && pane.id == pane_id)
-        .then_some(())
-}
-
-fn workspace_has_open_pane(workspace: &WorkspaceSnapshot, pane_id: PaneId) -> bool {
-    workspace
-        .tabs
-        .iter()
-        .filter(|tab| !tab.closing)
-        .any(|tab| open_pane(tab, pane_id).is_some())
-}
-
-fn session_has_open_pane(session: &SessionSnapshot, pane_id: PaneId) -> bool {
-    session
-        .workspaces
-        .iter()
-        .filter(|workspace| !workspace.closing)
-        .any(|workspace| workspace_has_open_pane(workspace, pane_id))
 }
 
 #[cfg(test)]
@@ -447,6 +463,53 @@ mod tests {
             history.last_tab(&snapshot, &b),
             Some(snapshot.sessions[0].workspaces[0].tabs[0].panes[1].id),
             "a valid remembered tab falls back to its first open pane"
+        );
+    }
+
+    #[test]
+    fn parent_destinations_follow_recent_open_children_at_each_level() {
+        let mut snapshot = fixture();
+        let session = &snapshot.sessions[0];
+        let main = &session.workspaces[0];
+        let tab_a = &main.tabs[0];
+        let a1 = target(session, main, tab_a, tab_a.panes[0].clone());
+        let a2 = target(session, main, tab_a, tab_a.panes[1].clone());
+        let tab_b = &main.tabs[1];
+        let b = target(session, main, tab_b, tab_b.panes[0].clone());
+
+        let mut history = NavigationHistory::default();
+        history.record(&a1);
+        history.record(&a2);
+        history.record(&b);
+
+        snapshot.sessions[0].workspaces[0].tabs[1].closing = true;
+        snapshot.sessions[0].workspaces[0].tabs[0].panes[1].closing = true;
+
+        assert_eq!(
+            history.session_destination(&snapshot.sessions[0]),
+            Some(a1.pane_id),
+            "the session descends through the most recent open workspace, tab, and pane"
+        );
+    }
+
+    #[test]
+    fn moving_a_remembered_pane_does_not_change_its_remembered_tab() {
+        let mut snapshot = fixture();
+        let session = &snapshot.sessions[0];
+        let main = &session.workspaces[0];
+        let tab = &main.tabs[0];
+        let remembered = target(session, main, tab, tab.panes[1].clone());
+        let expected = tab.panes[0].id;
+        let mut history = NavigationHistory::default();
+        history.record(&remembered);
+
+        let moved = snapshot.sessions[0].workspaces[0].tabs[0].panes.remove(1);
+        snapshot.sessions[0].workspaces[0].tabs[1].panes.push(moved);
+
+        assert_eq!(
+            history.session_destination(&snapshot.sessions[0]),
+            Some(expected),
+            "parent history descends through the remembered tab rather than following the moved pane"
         );
     }
 
