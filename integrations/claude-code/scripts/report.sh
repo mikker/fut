@@ -10,7 +10,7 @@ case "$state" in
 esac
 
 # Claude Code can also load this plugin in IDE, desktop, and web environments.
-# Only a local Claude process running inside Fut has both scoped identifiers.
+# Fut validates inherited identifiers against the reporting process ancestry.
 if [ -z "${FUT_SOCKET-}" ] || [ -z "${FUT_TERMINAL_ID-}" ]; then
   exit 0
 fi
@@ -36,13 +36,11 @@ esac
 
 if [ -n "$agent_session_id" ]; then
   fut agent report "$state" \
-    --terminal-id "$FUT_TERMINAL_ID" \
     --source claude-code \
     --agent-session-id "$agent_session_id" \
     >/dev/null 2>&1 || :
 else
   fut agent report "$state" \
-    --terminal-id "$FUT_TERMINAL_ID" \
     --source claude-code \
     >/dev/null 2>&1 || :
 fi

@@ -73,7 +73,9 @@ FUT_LIVE_BIN="$PWD/target/debug/fut" \
 | `notify: agent-turn-complete` | `completed` | `thread-id`, `turn-id` |
 
 The hook adapter and notification command are inert unless both
-`FUT_TERMINAL_ID` and `FUT_SOCKET` are set. Malformed events, missing `fut`,
+`FUT_TERMINAL_ID` and `FUT_SOCKET` are set. The daemon also verifies that the
+reporting process belongs to that terminal's process tree. Desktop apps or
+unrelated terminals that inherit Fut's environment cannot claim its activity. Malformed events, missing `fut`,
 timeouts, and failed reports are ignored so a feedback failure cannot break
 Codex.
 
@@ -94,3 +96,8 @@ reports `blocked`. These are native decision-point states, not post-decision
 claims. Codex does not currently publish a post-hook-decision event that would
 let a passive plugin distinguish those cases; the next tool or completion event
 repairs the reported state.
+
+Automatic integrations omit `--terminal-id` so the daemon validates inherited
+context. External controllers can still use `fut agent report --terminal-id …`
+to report explicitly for another terminal. Detached, reparented agents must use
+that explicit interface because they no longer belong to the terminal process tree.

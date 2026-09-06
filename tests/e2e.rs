@@ -744,7 +744,7 @@ impl Drop for Harness {
 }
 
 #[tokio::test]
-async fn agent_reports_flow_from_scoped_cli_into_authoritative_snapshots() {
+async fn agent_reports_validate_inherited_context_and_allow_explicit_external_targets() {
     let harness = Harness::start("env > fut-env; while IFS= read -r line; do :; done").await;
     let initial = harness.resources().await;
     let session = &initial.sessions[0];
@@ -769,10 +769,31 @@ async fn agent_reports_flow_from_scoped_cli_into_authoritative_snapshots() {
         assert!(child_env.lines().any(|line| line == expected), "{expected}");
     }
 
-    let working = harness
+    let inherited = harness
         .cli()
         .env("FUT_TERMINAL_ID", terminal_id.to_string())
         .args(["terminal", "report", "working"])
+        .output()
+        .unwrap();
+    assert!(!inherited.status.success());
+    assert!(
+        String::from_utf8_lossy(&inherited.stderr)
+            .contains("must originate in the target terminal")
+    );
+    assert_eq!(
+        harness.resources().await.sessions[0].workspaces[0].tabs[0].panes[0].activity,
+        pane.activity
+    );
+
+    let working = harness
+        .cli()
+        .args([
+            "terminal",
+            "report",
+            "working",
+            "--terminal-id",
+            &terminal_id.to_string(),
+        ])
         .output()
         .unwrap();
     assert!(
@@ -790,8 +811,13 @@ async fn agent_reports_flow_from_scoped_cli_into_authoritative_snapshots() {
 
     let completed = harness
         .cli()
-        .env("FUT_TERMINAL_ID", terminal_id.to_string())
-        .args(["terminal", "report", "completed"])
+        .args([
+            "terminal",
+            "report",
+            "completed",
+            "--terminal-id",
+            &terminal_id.to_string(),
+        ])
         .output()
         .unwrap();
     assert!(completed.status.success());

@@ -4,6 +4,7 @@ mod git;
 mod lease;
 pub mod path;
 mod presence;
+mod process;
 mod recipe;
 
 pub mod autostart;
@@ -496,6 +497,13 @@ impl SharedState {
             activity,
         });
         Ok(())
+    }
+
+    fn reporter_belongs_to_terminal(&self, terminal_id: TerminalId, peer_pid: Option<u32>) -> bool {
+        self.runtimes
+            .get(&terminal_id)
+            .zip(peer_pid)
+            .is_some_and(|(runtime, pid)| process::is_descendant(pid, runtime.handle.child_pid()))
     }
 
     fn acknowledge_agent(
@@ -2281,6 +2289,7 @@ impl Drop for OwnedSocket {
 /// pending snapshots coalesce so only the newest screen per terminal is
 /// kept. All other messages are delivered verbatim in order.
 struct ClientConnection {
+    peer_pid: Option<u32>,
     reader: SplitStream<Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>>,
     outbound: Arc<OutboundQueue>,
 }
@@ -2319,13 +2328,21 @@ struct OutboundQueue {
 
 impl ClientConnection {
     fn new(stream: UnixStream, writers: &WriterTasks) -> Self {
+        let peer_pid = stream
+            .peer_cred()
+            .ok()
+            .and_then(|credentials| credentials.pid().and_then(|pid| u32::try_from(pid).ok()));
         let (sink, reader) = Framed::new(stream, codec()).split();
         let outbound = Arc::new(OutboundQueue::default());
         writers
             .lock()
             .expect("writer registry lock poisoned")
             .spawn(write_outbound(sink, Arc::clone(&outbound)));
-        Self { reader, outbound }
+        Self {
+            reader,
+            outbound,
+            peer_pid,
+        }
     }
 
     async fn next(&mut self) -> Option<std::io::Result<bytes::BytesMut>> {
@@ -3434,7 +3451,7 @@ async fn handle_connection(
                             ).await?,
                         }
                     }
-                    ClientMessage::MovePane { .. } | ClientMessage::Contextual { .. } | ClientMessage::RetireWorkspace { .. } | ClientMessage::PublishToken { .. } | ClientMessage::ReloadExtensions | ClientMessage::ReportAgent { .. } | ClientMessage::TerminalInput { .. } | ClientMessage::ReadTerminalOutput { .. } | ClientMessage::WaitTerminalOutput { .. } | ClientMessage::PromptAgent { .. } | ClientMessage::WaitAgent { .. } | ClientMessage::GetExtensionCatalog | ClientMessage::WatchResources | ClientMessage::Shutdown => send_error(&mut connection, envelope.request_id, "control_only", "command requires a control connection").await?,
+                    ClientMessage::MovePane { .. } | ClientMessage::Contextual { .. } | ClientMessage::RetireWorkspace { .. } | ClientMessage::PublishToken { .. } | ClientMessage::ReloadExtensions | ClientMessage::ReportAgent { .. } | ClientMessage::ReportTerminalAgent { .. } | ClientMessage::TerminalInput { .. } | ClientMessage::ReadTerminalOutput { .. } | ClientMessage::WaitTerminalOutput { .. } | ClientMessage::PromptAgent { .. } | ClientMessage::WaitAgent { .. } | ClientMessage::GetExtensionCatalog | ClientMessage::WatchResources | ClientMessage::Shutdown => send_error(&mut connection, envelope.request_id, "control_only", "command requires a control connection").await?,
                     ClientMessage::Hello { .. } => send_error(&mut connection, envelope.request_id, "already_hello", "hello was already received").await?,
                 }
             },
@@ -3654,6 +3671,16 @@ async fn control_loop(
         if let Some(operation) = fire_and_forget_operation(&envelope.message)
             && reject_fire_and_forget_request_id(connection, envelope.request_id, operation).await?
         {
+            continue;
+        }
+        if let ClientMessage::ReportTerminalAgent { terminal_id, .. } = &envelope.message
+            && !shared
+                .lock()
+                .await
+                .reporter_belongs_to_terminal(*terminal_id, connection.peer_pid)
+        {
+            send_error(connection, envelope.request_id, "invalid_agent_context",
+                "automatic agent reports must originate in the target terminal; external controllers must pass --terminal-id explicitly").await?;
             continue;
         }
         match envelope.message {
@@ -4067,6 +4094,10 @@ async fn control_loop(
                 }
             }
             ClientMessage::ReportAgent {
+                terminal_id,
+                report,
+                metadata,
+            } | ClientMessage::ReportTerminalAgent {
                 terminal_id,
                 report,
                 metadata,

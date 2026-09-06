@@ -31,9 +31,13 @@ as they are for a process spawned inside Fut. The `fut` binary must be on
 `PATH`, and the installed Fut must provide:
 
 ```sh
-fut agent report STATE --terminal-id ID --source SOURCE \
+fut agent report STATE --source SOURCE \
   [--agent-session-id ID] [--turn-id ID]
 ```
+
+The daemon validates the inherited terminal ID against the reporting process
+tree. Integrations omit `--terminal-id`; that option is reserved for external
+controllers intentionally reporting for another terminal.
 
 Every handler has a two-second Claude Code timeout, suppresses Fut output, and
 returns success when Fut is absent or rejects a report. Reporting cannot block

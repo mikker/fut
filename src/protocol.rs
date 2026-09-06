@@ -546,6 +546,14 @@ pub enum ClientMessage {
         #[serde(default, skip_serializing_if = "AgentReportMetadata::is_empty")]
         metadata: AgentReportMetadata,
     },
+    /// Automatic report using inherited terminal context. The daemon verifies
+    /// that the socket peer belongs to the target terminal's process tree.
+    ReportTerminalAgent {
+        terminal_id: TerminalId,
+        report: AgentReport,
+        #[serde(default, skip_serializing_if = "AgentReportMetadata::is_empty")]
+        metadata: AgentReportMetadata,
+    },
     AcknowledgeAgent {
         terminal_id: TerminalId,
         event_revision: u64,

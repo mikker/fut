@@ -85,8 +85,6 @@ class AdapterTests(unittest.TestCase):
                         "agent",
                         "report",
                         state,
-                        "--terminal-id",
-                        "00000000-0000-4000-8000-000000000001",
                         "--source",
                         "codex",
                         "--agent-session-id",

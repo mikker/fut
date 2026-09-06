@@ -13,8 +13,6 @@ export default function fut(pi: ExtensionAPI) {
       "agent",
       "report",
       state,
-      "--terminal-id",
-      terminalId,
       "--source",
       "pi",
       "--agent-session-id",

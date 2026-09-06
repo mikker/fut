@@ -504,7 +504,7 @@ enum TerminalCommand {
         /// Agent state or completion event.
         #[arg(value_enum)]
         state: AgentReportArg,
-        /// Compact terminal ID or UUID; defaults to FUT_TERMINAL_ID inside Fut.
+        /// Explicit target for external controllers; otherwise validates FUT_TERMINAL_ID against the reporting process.
         #[arg(long)]
         terminal_id: Option<TerminalId>,
         /// Integration name, such as codex or claude-code.
@@ -719,7 +719,7 @@ enum AgentCommand {
         /// Agent state or completion event.
         #[arg(value_enum)]
         state: AgentReportArg,
-        /// Compact terminal ID or UUID; defaults to FUT_TERMINAL_ID inside Fut.
+        /// Explicit target for external controllers; otherwise validates FUT_TERMINAL_ID against the reporting process.
         #[arg(long)]
         terminal_id: Option<TerminalId>,
         /// Integration name, such as codex or claude-code.
@@ -2742,6 +2742,7 @@ async fn report_agent_command(
     terminal_id: Option<TerminalId>,
     metadata: AgentReportMetadata,
 ) -> Result<()> {
+    let explicit_target = terminal_id.is_some();
     let terminal_id = match terminal_id {
         Some(terminal_id) => terminal_id,
         None => std::env::var("FUT_TERMINAL_ID")
@@ -2749,16 +2750,21 @@ async fn report_agent_command(
             .parse()
             .context("FUT_TERMINAL_ID is invalid")?,
     };
+    let message = if explicit_target {
+        ClientMessage::ReportAgent {
+            terminal_id,
+            report: state.into(),
+            metadata: metadata.clone(),
+        }
+    } else {
+        ClientMessage::ReportTerminalAgent {
+            terminal_id,
+            report: state.into(),
+            metadata: metadata.clone(),
+        }
+    };
     response_ok(
-        control(
-            socket,
-            ClientMessage::ReportAgent {
-                terminal_id,
-                report: state.into(),
-                metadata: metadata.clone(),
-            },
-        )
-        .await?,
+        control(socket, message).await?,
         AcknowledgedCommand::ReportAgent,
     )?;
     output(
@@ -2805,7 +2811,7 @@ async fn receive_agent_notification(
         Duration::from_secs(2),
         control(
             &socket,
-            ClientMessage::ReportAgent {
+            ClientMessage::ReportTerminalAgent {
                 terminal_id,
                 report: AgentReport::Completed,
                 metadata,

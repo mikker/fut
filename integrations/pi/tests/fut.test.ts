@@ -85,8 +85,6 @@ test("reports the complete lifecycle in native event order", async () => {
     assert.equal(call.command, "fut");
     assert.deepEqual(call.args.slice(0, 2), ["agent", "report"]);
     assert.deepEqual(call.args.slice(3), [
-      "--terminal-id",
-      "terminal-42",
       "--source",
       "pi",
       "--agent-session-id",

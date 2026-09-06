@@ -56,8 +56,6 @@ def report(state: str, session_id: str | None, turn_id: str | None) -> None:
         "agent",
         "report",
         state,
-        "--terminal-id",
-        terminal_id,
         "--source",
         "codex",
     ]

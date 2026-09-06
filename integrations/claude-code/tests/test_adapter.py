@@ -111,8 +111,6 @@ def test_reporter_is_scoped_bounded_and_non_disruptive():
             "agent",
             "report",
             "blocked",
-            "--terminal-id",
-            inside["FUT_TERMINAL_ID"],
             "--source",
             "claude-code",
             "--agent-session-id",
@@ -131,8 +129,6 @@ def test_reporter_is_scoped_bounded_and_non_disruptive():
             "agent",
             "report",
             "working",
-            "--terminal-id",
-            inside["FUT_TERMINAL_ID"],
             "--source",
             "claude-code",
         ]

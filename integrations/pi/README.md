@@ -35,9 +35,13 @@ as they are for Pi started inside Fut. The `fut` binary must be on `PATH` and
 provide:
 
 ```sh
-fut agent report STATE --terminal-id ID --source SOURCE \
+fut agent report STATE --source SOURCE \
   [--agent-session-id ID] [--turn-id ID]
 ```
+
+The daemon validates the inherited terminal ID against the reporting process
+tree. Integrations omit `--terminal-id`; that option is reserved for external
+controllers intentionally reporting for another terminal.
 
 Reports are serialized in event order. Each CLI call has a two-second timeout,
 and command failures are swallowed so lifecycle reporting cannot fail a Pi

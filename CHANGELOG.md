@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fixed desktop agents inheriting Fut context and leaving unrelated terminals with stuck activity indicators.
+
 ## 0.16
 
 - Added automatic Wayland and X11 clipboard support on Linux, with clear failures in headless sessions.
