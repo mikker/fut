@@ -10,7 +10,7 @@ use std::{
         ffi::OsStrExt,
         fs::{OpenOptionsExt, PermissionsExt},
     },
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Stdio,
     time::Duration,
 };
@@ -63,13 +63,22 @@ pub(crate) struct ManagedExtension {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ExtensionProvenance {
-    Git { remote_url: String, commit: String },
+    Git {
+        remote_url: String,
+        commit: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<PathBuf>,
+    },
 }
 
 impl ExtensionProvenance {
-    fn git(&self) -> (&str, &str) {
+    fn git(&self) -> (&str, &str, Option<&Path>) {
         match self {
-            Self::Git { remote_url, commit } => (remote_url, commit),
+            Self::Git {
+                remote_url,
+                commit,
+                path,
+            } => (remote_url, commit, path.as_deref()),
         }
     }
 }
@@ -438,17 +447,19 @@ fn install_prepared_at(
 pub(crate) async fn install_git(
     remote_url: &str,
     revision: &str,
+    package_path: Option<&Path>,
     expected_digest: Option<&str>,
 ) -> Result<StoreChange> {
     validate_remote_url(remote_url)?;
     let commit = normalize_commit(revision)?;
+    let package_path = normalize_git_package_path(package_path)?;
     if let Some(digest) = expected_digest {
         validate_digest(digest).context("invalid expected extension content SHA-256")?;
     }
     let configured_store = default_store_root()?
         .context("cannot resolve managed extension store; set absolute XDG_DATA_HOME or HOME")?;
-    let checkout = acquire_git_checkout(remote_url, &commit).await?;
-    let source = prepare_source(checkout.path())?;
+    let checkout = acquire_git_checkout(remote_url, &commit, package_path.as_deref()).await?;
+    let source = prepare_git_source(checkout.path(), package_path.as_deref())?;
     install_prepared_at(
         &source,
         &configured_store,
@@ -457,6 +468,7 @@ pub(crate) async fn install_git(
             provenance: Some(ExtensionProvenance::Git {
                 remote_url: remote_url.to_owned(),
                 commit,
+                path: package_path,
             }),
         },
         expected_digest,
@@ -489,7 +501,7 @@ pub(crate) async fn update_git(
             .find(|extension| extension.id == id)
             .with_context(|| format!("managed extension {id:?} is not installed"))?
     };
-    let (remote_url, previous_commit) = existing
+    let (remote_url, previous_commit, package_path) = existing
         .provenance
         .as_ref()
         .map(ExtensionProvenance::git)
@@ -504,14 +516,19 @@ pub(crate) async fn update_git(
         );
     }
     let remote_url = remote_url.to_owned();
-    let checkout = acquire_git_checkout(&remote_url, &commit).await?;
-    let source = prepare_source(checkout.path())?;
+    let package_path = package_path.map(Path::to_owned);
+    let checkout = acquire_git_checkout(&remote_url, &commit, package_path.as_deref()).await?;
+    let source = prepare_git_source(checkout.path(), package_path.as_deref())?;
     let current = install_prepared_at(
         &source,
         &configured_store,
         InstallOrigin {
             source: None,
-            provenance: Some(ExtensionProvenance::Git { remote_url, commit }),
+            provenance: Some(ExtensionProvenance::Git {
+                remote_url,
+                commit,
+                path: package_path,
+            }),
         },
         expected_digest,
         Some(&existing),
@@ -522,7 +539,11 @@ pub(crate) async fn update_git(
     })
 }
 
-async fn acquire_git_checkout(remote_url: &str, commit: &str) -> Result<tempfile::TempDir> {
+async fn acquire_git_checkout(
+    remote_url: &str,
+    commit: &str,
+    package_path: Option<&Path>,
+) -> Result<tempfile::TempDir> {
     let checkout = tempfile::Builder::new()
         .prefix("fut-extension-git-")
         .tempdir()
@@ -567,6 +588,22 @@ async fn acquire_git_checkout(remote_url: &str, commit: &str) -> Result<tempfile
         );
     }
 
+    let treeish = package_path.map_or_else(
+        || commit.to_owned(),
+        |path| format!("{commit}:{}", path.display()),
+    );
+    if let Some(package_path) = package_path {
+        let kind = git_success(
+            run_git(checkout.path(), &["cat-file", "-t", &treeish]).await?,
+            "inspect Git extension package path",
+        )?;
+        if required_git_line(&kind.stdout, "package object type")? != b"tree" {
+            bail!(
+                "Git extension package path {} is not a directory",
+                package_path.display()
+            );
+        }
+    }
     let tree = git_success(
         run_git(
             checkout.path(),
@@ -575,7 +612,7 @@ async fn acquire_git_checkout(remote_url: &str, commit: &str) -> Result<tempfile
                 "-r",
                 "-t",
                 "--format=%(objectmode) %(objectsize)",
-                commit,
+                &treeish,
             ],
         )
         .await?,
@@ -583,25 +620,78 @@ async fn acquire_git_checkout(remote_url: &str, commit: &str) -> Result<tempfile
     )?;
     inspect_git_tree(&tree.stdout, commit)?;
 
-    git_success(
-        run_git(
-            checkout.path(),
-            &[
+    let checkout_arguments = package_path.map_or_else(
+        || {
+            vec![
                 "checkout",
                 "--quiet",
                 "--detach",
                 "--force",
                 "--no-recurse-submodules",
                 commit,
-            ],
-        )
-        .await?,
+            ]
+        },
+        |path| {
+            vec![
+                "--literal-pathspecs",
+                "checkout",
+                "--quiet",
+                "--force",
+                commit,
+                "--",
+                path.to_str().expect("validated Git package path"),
+            ]
+        },
+    );
+    git_success(
+        run_git(checkout.path(), &checkout_arguments).await?,
         "check out pinned extension commit",
     )?;
     remove_tree(&checkout.path().join(".git"))
         .context("remove temporary Git metadata before package installation")?;
     normalize_checkout_permissions(checkout.path())?;
     Ok(checkout)
+}
+
+fn normalize_git_package_path(path: Option<&Path>) -> Result<Option<PathBuf>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    validate_path("Git package path", path)?;
+    if path.is_absolute() || path.as_os_str().is_empty() {
+        bail!("Git package path must be a non-empty relative path");
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(component) => normalized.push(component),
+            Component::CurDir => {}
+            _ => bail!("Git package path must not escape the repository"),
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        bail!("Git package path must name a directory within the repository");
+    }
+    Ok(Some(normalized))
+}
+
+fn prepare_git_source(checkout: &Path, package_path: Option<&Path>) -> Result<PathBuf> {
+    let source = package_path.map_or_else(|| checkout.to_owned(), |path| checkout.join(path));
+    let metadata = fs::symlink_metadata(&source)
+        .with_context(|| format!("inspect Git extension package path {}", source.display()))?;
+    if !metadata.is_dir() {
+        bail!(
+            "Git extension package path {} is not a directory",
+            package_path.unwrap_or_else(|| Path::new(".")).display()
+        );
+    }
+    let source = prepare_source(&source)?;
+    let checkout = fs::canonicalize(checkout).context("resolve temporary Git checkout")?;
+    if !source.starts_with(&checkout) {
+        bail!("Git extension package path escapes the repository");
+    }
+    Ok(source)
 }
 
 fn inspect_git_tree(output: &[u8], commit: &str) -> Result<()> {
@@ -977,7 +1067,7 @@ fn validate_index(root: &Path, index: &StoreIndex) -> Result<()> {
             }
         }
         if let Some(provenance) = &extension.provenance {
-            let (remote_url, commit) = provenance.git();
+            let (remote_url, commit, package_path) = provenance.git();
             validate_remote_url(remote_url).with_context(|| {
                 format!(
                     "managed extension {:?} has invalid Git remote URL",
@@ -987,6 +1077,12 @@ fn validate_index(root: &Path, index: &StoreIndex) -> Result<()> {
             validate_commit(commit).with_context(|| {
                 format!(
                     "managed extension {:?} has invalid Git commit",
+                    extension.id
+                )
+            })?;
+            normalize_git_package_path(package_path).with_context(|| {
+                format!(
+                    "managed extension {:?} has invalid Git package path",
                     extension.id
                 )
             })?;
@@ -1915,11 +2011,37 @@ mod tests {
         ] {
             assert!(validate_remote_url(url).is_err(), "accepted {url:?}");
         }
+        assert_eq!(
+            normalize_git_package_path(Some(Path::new("extensions/wt"))).unwrap(),
+            Some(PathBuf::from("extensions/wt"))
+        );
+        for path in ["", ".", "../wt", "/extensions/wt"] {
+            assert!(
+                normalize_git_package_path(Some(Path::new(path))).is_err(),
+                "accepted {path:?}"
+            );
+        }
 
         let error = inspect_git_tree(b"040000 12\n160000 0\n", &"a".repeat(40))
             .unwrap_err()
             .to_string();
         assert!(error.contains("submodule"), "{error}");
+    }
+
+    #[test]
+    fn git_package_path_cannot_escape_through_a_symlink() {
+        let temporary = tempfile::tempdir().unwrap();
+        let checkout = temporary.path().join("checkout");
+        let outside = temporary.path().join("outside/package");
+        fs::create_dir(&checkout).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(temporary.path().join("outside"), checkout.join("link")).unwrap();
+
+        let error = prepare_git_source(&checkout, Some(Path::new("link/package"))).unwrap_err();
+        assert!(
+            error.to_string().contains("escapes the repository"),
+            "{error:#}"
+        );
     }
 
     #[tokio::test]

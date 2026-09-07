@@ -65,8 +65,8 @@ Omit any field to keep its default value.
 
 ```toml
 extensions = [
-  "/Users/me/.config/fut/extensions/review-status",
-  "/Users/me/.config/fut/extensions/run",
+  "extensions/review-status",
+  "extensions/run",
 ]
 
 [alerts]
@@ -212,11 +212,13 @@ An explicitly empty array hides that lane or format.
 
 ## Local extensions
 
-`extensions` is an explicit list of trusted absolute directory paths, loaded in
-order. Fut appends packages enabled through its Fut-owned local managed store;
-it never rewrites this array or any other part of `config.toml`. The complete
-merged set is accepted or rejected atomically, and references to extension
-tokens are validated with it. Fut does not discover or download extensions.
+`extensions` is an explicit list of trusted directory paths, loaded in order.
+Relative paths are resolved from the directory containing `config.toml`;
+absolute paths continue to work unchanged. Fut appends packages enabled through
+its Fut-owned local managed store; it never rewrites this array or any other
+part of `config.toml`. The complete merged set is accepted or rejected
+atomically, and references to extension tokens are validated with it. Fut does
+not discover or download extensions.
 See [Extensions](extensions.md) for managed install commands, trust boundaries,
 hooks, tokens, limits, payloads, and examples. Third-party authors should use
 the [Extension authoring guide](extension-authoring.md) as the API contract.

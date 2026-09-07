@@ -1791,7 +1791,7 @@ pub(crate) fn load_extensions_location(location: &ConfigLocation) -> Result<Load
         },
         None => (ExtensionConfig::default(), None),
     };
-    let roots = merged_extension_roots(&config.extensions)?;
+    let roots = merged_extension_roots(&config.extensions, source_path)?;
     let loaded_extensions = extensions::load(&roots).with_context(|| {
         source_path.map_or_else(
             || "load managed extensions".to_owned(),
@@ -1829,7 +1829,7 @@ fn load_path_outcome(path: &std::path::Path, explicit: bool) -> Result<LoadedCon
                 .with_context(|| format!("parse Fut config {}", path.display()))
         },
     )?;
-    let roots = merged_extension_roots(&config.extensions)?;
+    let roots = merged_extension_roots(&config.extensions, Some(path))?;
     let loaded_extensions = extensions::load(&roots)
         .with_context(|| format!("load extensions from Fut config {}", path.display()))?;
     validate_extension_config_catalog(&config.extension, &loaded_extensions, path)?;
@@ -1851,7 +1851,7 @@ fn load_path_outcome(path: &std::path::Path, explicit: bool) -> Result<LoadedCon
 }
 
 fn load_default_outcome() -> Result<LoadedConfig> {
-    let roots = merged_extension_roots(&[])?;
+    let roots = merged_extension_roots(&[], None)?;
     let loaded_extensions = extensions::load(&roots).context("load managed extensions")?;
     let ui = materialize_config(
         Config::default(),
@@ -1866,10 +1866,22 @@ fn load_default_outcome() -> Result<LoadedConfig> {
     })
 }
 
-fn merged_extension_roots(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
+fn merged_extension_roots(
+    explicit: &[PathBuf],
+    config_path: Option<&Path>,
+) -> Result<Vec<PathBuf>> {
     let managed = extension_store::enabled_roots().context("load managed extension store")?;
     let mut roots = Vec::with_capacity(explicit.len() + managed.len());
-    roots.extend_from_slice(explicit);
+    for root in explicit {
+        if root.is_absolute() {
+            roots.push(root.clone());
+            continue;
+        }
+        let config_dir = config_path
+            .and_then(Path::parent)
+            .context("relative extension path requires a Fut config file")?;
+        roots.push(config_dir.join(root));
+    }
     roots.extend(managed);
     Ok(roots)
 }
@@ -3358,6 +3370,38 @@ components = [
         let error = format!("{:#}", load_path_outcome(&path, true).unwrap_err());
         assert!(error.contains("INVALID"), "{error}");
         assert!(error.contains(&path.display().to_string()), "{error}");
+    }
+
+    #[test]
+    fn relative_extension_roots_resolve_from_the_config_directory() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config_dir = temporary.path().join("config");
+        let extension_root = config_dir.join("extensions/configured");
+        fs::create_dir_all(&extension_root).unwrap();
+        fs::write(
+            extension_root.join(extensions::MANIFEST_FILE_NAME),
+            "api_version = 1\nversion = '1.0.0'\nfut = '>=0.7.0, <1.0.0'\ncapabilities = []\nid = 'configured'\n",
+        )
+        .unwrap();
+        let path = config_dir.join("config.toml");
+        fs::write(&path, "extensions = ['extensions/configured']\n").unwrap();
+        let location = ConfigLocation {
+            path: Some(path.clone()),
+            explicit: true,
+            source: "test",
+        };
+
+        let loaded = load_path_outcome(&path, true).unwrap();
+        assert_eq!(
+            loaded.extensions[0].root(),
+            extension_root.canonicalize().unwrap()
+        );
+
+        let loaded = load_extensions_location(&location).unwrap();
+        assert_eq!(
+            loaded.extensions[0].root(),
+            extension_root.canonicalize().unwrap()
+        );
     }
 
     #[test]

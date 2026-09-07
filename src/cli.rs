@@ -819,6 +819,9 @@ enum ExtensionCommand {
         /// Exact full commit SHA; branches, tags, and HEAD are rejected.
         #[arg(long, value_name = "COMMIT")]
         rev: String,
+        /// Relative extension package directory within the repository.
+        #[arg(long, value_name = "PATH", value_hint = ValueHint::DirPath)]
+        path: Option<PathBuf>,
         /// Expected SHA-256 of Fut's normalized installed package content.
         #[arg(long, value_name = "DIGEST")]
         sha256: Option<String>,
@@ -1013,8 +1016,20 @@ async fn execute(cli: Cli) -> Result<()> {
             ExtensionCommand::Install { path } => {
                 return install_extension_package(path, cli.json);
             }
-            ExtensionCommand::InstallGit { url, rev, sha256 } => {
-                return install_git_extension_package(url, rev, sha256.as_deref(), cli.json).await;
+            ExtensionCommand::InstallGit {
+                url,
+                rev,
+                path,
+                sha256,
+            } => {
+                return install_git_extension_package(
+                    url,
+                    rev,
+                    path.as_deref(),
+                    sha256.as_deref(),
+                    cli.json,
+                )
+                .await;
             }
             ExtensionCommand::Update { id, rev, sha256 } => {
                 return update_git_extension_package(id, rev, sha256.as_deref(), cli.json).await;
@@ -2245,10 +2260,11 @@ fn install_extension_package(path: &std::path::Path, json_output: bool) -> Resul
 async fn install_git_extension_package(
     url: &str,
     revision: &str,
+    package_path: Option<&Path>,
     expected_digest: Option<&str>,
     json_output: bool,
 ) -> Result<()> {
-    let change = crate::extension_store::install_git(url, revision, expected_digest)
+    let change = crate::extension_store::install_git(url, revision, package_path, expected_digest)
         .await
         .map_err(|error| {
             CliError::new(
@@ -2257,7 +2273,7 @@ async fn install_git_extension_package(
             )
         })?;
     let extension = &change.extension;
-    let (remote_url, commit) = git_extension_provenance(extension)
+    let (remote_url, commit, package_path) = git_extension_provenance(extension)
         .expect("a successful Git install records Git provenance");
     output(
         json_output,
@@ -2270,12 +2286,13 @@ async fn install_git_extension_package(
             "reload_required": extension.enabled,
         }),
         format!(
-            "installed Git extension {} version={} enabled={} changed={} sha256={} remote={remote_url:?} commit={commit} path={:?}\nNo hooks, submodules, LFS filters, package scripts, or build scripts were executed. Installed extensions are trusted local code; review this package before enabling it.",
+            "installed Git extension {} version={} enabled={} changed={} sha256={} remote={remote_url:?} commit={commit} package_path={:?} install_path={:?}\nNo hooks, submodules, LFS filters, package scripts, or build scripts were executed. Installed extensions are trusted local code; review this package before enabling it.",
             extension.id,
             extension.version,
             extension.enabled,
             change.changed,
             extension.content_sha256,
+            package_path.unwrap_or_else(|| Path::new(".")),
             extension.install_path,
         ),
     )
@@ -2297,9 +2314,9 @@ async fn update_git_extension_package(
         })?;
     let previous = &update.previous;
     let extension = &update.current.extension;
-    let (remote_url, previous_commit) =
+    let (remote_url, previous_commit, package_path) =
         git_extension_provenance(previous).expect("Git updates start from Git provenance");
-    let (_, commit) =
+    let (_, commit, _) =
         git_extension_provenance(extension).expect("Git updates retain Git provenance");
     output(
         json_output,
@@ -2313,7 +2330,7 @@ async fn update_git_extension_package(
             "reload_required": extension.enabled,
         }),
         format!(
-            "updated Git extension {} version={}->{} enabled={} changed={} sha256={}->{} remote={remote_url:?} commit={previous_commit}->{commit}\nNo hooks, submodules, LFS filters, package scripts, or build scripts were executed.{}",
+            "updated Git extension {} version={}->{} enabled={} changed={} sha256={}->{} remote={remote_url:?} commit={previous_commit}->{commit} package_path={:?}\nNo hooks, submodules, LFS filters, package scripts, or build scripts were executed.{}",
             extension.id,
             previous.version,
             extension.version,
@@ -2321,6 +2338,7 @@ async fn update_git_extension_package(
             update.current.changed,
             previous.content_sha256,
             extension.content_sha256,
+            package_path.unwrap_or_else(|| Path::new(".")),
             if extension.enabled {
                 " Run `fut extension reload` to activate the updated package in a running daemon."
             } else {
@@ -2332,11 +2350,13 @@ async fn update_git_extension_package(
 
 fn git_extension_provenance(
     extension: &crate::extension_store::ManagedExtension,
-) -> Option<(&str, &str)> {
+) -> Option<(&str, &str, Option<&Path>)> {
     match extension.provenance.as_ref()? {
-        crate::extension_store::ExtensionProvenance::Git { remote_url, commit } => {
-            Some((remote_url, commit))
-        }
+        crate::extension_store::ExtensionProvenance::Git {
+            remote_url,
+            commit,
+            path,
+        } => Some((remote_url, commit, path.as_deref())),
     }
 }
 
@@ -5499,7 +5519,7 @@ mod tests {
                 .map(clap::Arg::get_id)
                 .map(ToString::to_string)
                 .collect::<Vec<_>>(),
-            ["url", "rev", "sha256"]
+            ["url", "rev", "path", "sha256"]
         );
         let update = extension.find_subcommand("update").unwrap();
         assert_eq!(

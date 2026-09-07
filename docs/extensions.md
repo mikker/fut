@@ -9,7 +9,8 @@ permalink: /extensions/
 
 > **TL;DR:** Install a reviewed local package with `fut extension install
 > PATH`, or one exact Git commit with `fut extension install-git URL --rev
-> COMMIT`; enable its ID, then run `fut extension reload`. Extensions are
+> COMMIT`; add `--path PATH` when the package is inside a larger repository.
+> Enable its ID, then run `fut extension reload`. Extensions are
 > trusted code that may execute programs with your user permissions.
 
 Building a third-party package? Use the complete, language-neutral
@@ -26,11 +27,12 @@ usually, a few executables.
 
 Fut never discovers extensions or checks for updates. You can copy a local
 package into Fut's managed store, fetch one explicitly named immutable Git
-commit, or choose a directory explicitly by absolute path:
+commit, or choose a directory explicitly. Relative paths start from the
+directory containing `config.toml`; absolute paths also work:
 
 ```toml
 extensions = [
-  "/Users/me/.config/fut/extensions/review-status",
+  "extensions/review-status",
 ]
 ```
 
@@ -114,6 +116,17 @@ fut extension enable review-status
 fut extension reload
 ```
 
+When an extension is one directory within a repository, select it explicitly:
+
+```sh
+fut extension install-git https://github.com/mikker/fut.git \
+  --rev 0123456789abcdef0123456789abcdef01234567 \
+  --path extensions/wt
+```
+
+The path must remain within the repository. Fut normalizes it and retains it
+for future `fut extension update` commands.
+
 `--rev` is required and accepts only a full 40- or 64-character hexadecimal
 commit SHA. Branches, tags, abbreviated SHAs, and `HEAD` are rejected. The
 fetched object must itself be that commit, so a tag object cannot stand in for
@@ -122,13 +135,13 @@ background update check.
 
 Git acquisition happens in a private temporary directory with a per-command
 timeout and output limit. Fut fetches only the named commit, without tags or
-submodules, checks it out detached, and removes Git metadata before handing the
-tree to the normal package installer. Git and package hooks, credential
-helpers, submodules, LFS smudge filters, installer scripts, and build scripts
-are not run. Only HTTPS and absolute local-file remotes are accepted. The tree
-is rejected before installation if it exceeds the package entry or byte limits,
-contains a submodule, symbolic link, or special file, or has an invalid
-manifest.
+submodules, checks out the selected package tree, and removes Git metadata
+before handing it to the normal package installer. Git and package hooks,
+credential helpers, submodules, LFS smudge filters, installer scripts, and
+build scripts are not run. Only HTTPS and absolute local-file remotes are
+accepted. The selected tree is rejected before installation if it exceeds the
+package entry or byte limits, contains a submodule, symbolic link, or special
+file, or has an invalid manifest.
 
 Git checkout permissions are normalized from Git's executable bit before Fut
 computes its usual package SHA-256. To require bytes published by a package
@@ -141,10 +154,10 @@ fut extension install-git https://example.com/review-status.git \
 ```
 
 A mismatch leaves any installed package with that ID selected and unchanged.
-The strict store index records the remote URL, canonical commit, normalized
-content digest, immutable install path, version, and enabled state. Local
-entries from `fut extension install PATH` retain their existing `source`
-record.
+The strict store index records the remote URL, canonical commit, optional
+package path, normalized content digest, immutable install path, version, and
+enabled state. Local entries from `fut extension install PATH` retain their
+existing `source` record.
 
 Updates are equally explicit. `update` is available only for a package already
 installed from Git, reuses its recorded remote URL, requires a different full

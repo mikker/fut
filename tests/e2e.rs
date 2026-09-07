@@ -3081,8 +3081,21 @@ fn pinned_git_extension_install_update_and_rollback_are_daemonless() {
     fs::create_dir(&source).unwrap();
     fs::create_dir(&temporary).unwrap();
     git(&source, &["init", "-b", "main"]);
+    let package = source.join("extensions/remote-test");
+    fs::create_dir_all(&package).unwrap();
     fs::write(
         source.join("fut-extension.toml"),
+        r#"
+api_version = 1
+version = "1.0.0"
+fut = ">=0.7.0, <1.0.0"
+capabilities = []
+id = "root-test"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        package.join("fut-extension.toml"),
         r#"
 api_version = 1
 version = "1.0.0"
@@ -3092,7 +3105,8 @@ id = "remote-test"
 "#,
     )
     .unwrap();
-    fs::write(source.join("content.txt"), "first\n").unwrap();
+    fs::write(package.join("content.txt"), "first\n").unwrap();
+    fs::write(source.join("README.md"), "repository root\n").unwrap();
     git(&source, &["add", "."]);
     git(&source, &["commit", "-m", "first"]);
     let first_commit = git_stdout(&source, &["rev-parse", "HEAD"]);
@@ -3138,6 +3152,28 @@ id = "remote-test"
     );
     assert!(!data.join("fut/extensions/index.json").exists());
 
+    let root_installed = cli(&[
+        "--json",
+        "extension",
+        "install-git",
+        &remote_url,
+        "--rev",
+        &first_commit,
+    ]);
+    assert!(
+        root_installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&root_installed.stderr)
+    );
+    let root_installed: Value = serde_json::from_slice(&root_installed.stdout).unwrap();
+    assert_eq!(root_installed["result"]["extension"]["id"], "root-test");
+    assert!(
+        root_installed["result"]["extension"]["provenance"]
+            .get("path")
+            .is_none()
+    );
+    assert!(cli(&["extension", "remove", "root-test"]).status.success());
+
     let installed = cli(&[
         "--json",
         "extension",
@@ -3145,6 +3181,8 @@ id = "remote-test"
         &remote_url,
         "--rev",
         &first_commit,
+        "--path",
+        "extensions/remote-test",
     ]);
     assert!(
         installed.status.success(),
@@ -3166,6 +3204,10 @@ id = "remote-test"
         installed["result"]["extension"]["provenance"]["commit"],
         first_commit
     );
+    assert_eq!(
+        installed["result"]["extension"]["provenance"]["path"],
+        "extensions/remote-test"
+    );
     assert!(installed["result"]["extension"].get("source").is_none());
     assert_eq!(installed["result"]["scripts_executed"], false);
     let first_path = PathBuf::from(
@@ -3180,7 +3222,7 @@ id = "remote-test"
     assert!(first_path.is_dir());
 
     fs::write(
-        source.join("fut-extension.toml"),
+        package.join("fut-extension.toml"),
         r#"
 api_version = 1
 version = "2.0.0"
@@ -3190,7 +3232,7 @@ id = "remote-test"
 "#,
     )
     .unwrap();
-    fs::write(source.join("content.txt"), "second\n").unwrap();
+    fs::write(package.join("content.txt"), "second\n").unwrap();
     git(&source, &["add", "."]);
     git(&source, &["commit", "-m", "second"]);
     let second_commit = git_stdout(&source, &["rev-parse", "HEAD"]);
@@ -3244,6 +3286,10 @@ id = "remote-test"
     assert_eq!(
         updated["result"]["extension"]["provenance"]["commit"],
         second_commit
+    );
+    assert_eq!(
+        updated["result"]["extension"]["provenance"]["path"],
+        "extensions/remote-test"
     );
     assert_ne!(
         updated["result"]["extension"]["content_sha256"],
