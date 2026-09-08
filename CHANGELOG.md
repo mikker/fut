@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.18
+
 - Extension paths in `config.toml` now support `~/` home-directory expansion.
 
 ## 0.17
