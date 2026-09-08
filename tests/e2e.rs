@@ -252,6 +252,17 @@ impl PtyChild {
         .unwrap_or_else(|_| panic!("PTY output never contained {needle:?}: {:?}", self.text()));
     }
 
+    async fn send_until(&mut self, input: &[u8], needle: &str) {
+        time::timeout(DEADLINE, async {
+            while !self.sees(needle) {
+                self.send(input);
+                time::sleep(POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("PTY output never contained {needle:?}: {:?}", self.text()));
+    }
+
     async fn wait_for_count(&mut self, needle: &str, count: usize) {
         time::timeout(DEADLINE, async {
             loop {
@@ -12071,14 +12082,9 @@ async fn compiled_rust_extension_conforms_through_public_fut_boundaries() {
     // a fast command can exit without its frame ever being drawn. Probe until
     // the managed terminal responds instead of inferring input ownership from
     // either event.
-    time::timeout(DEADLINE, async {
-        while !client.sees("RUST_CONFORMANCE_DETACH_READY") {
-            client.send(b"detach-ready\n");
-            time::sleep(POLL_INTERVAL).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("managed terminal never regained input: {:?}", client.text()));
+    client
+        .send_until(b"detach-ready\n", "RUST_CONFORMANCE_DETACH_READY")
+        .await;
     client.send(b"\x02d");
     client.wait_success().await;
 
@@ -13191,7 +13197,7 @@ async fn public_client_transfers_focus_when_the_focused_pane_exits() {
             program: Some("/bin/sh".into()),
             argv: vec![
                 "-c".into(),
-                "trap 'printf SURVIVOR_FOCUSED\\r\\n' WINCH; printf 'SURVIVOR_PANE_READY\r\n'; while :; do IFS= read -r line || continue; [ \"$line\" = b ] && printf 'EXIT_B_INPUT\r\n'; done".into(),
+                "printf 'SURVIVOR_PANE_READY\r\n'; while :; do IFS= read -r line || continue; [ \"$line\" = b ] && printf 'EXIT_B_INPUT\r\n'; done".into(),
             ],
         })
         .await
@@ -13218,9 +13224,7 @@ async fn public_client_transfers_focus_when_the_focused_pane_exits() {
     client.wait_for("PRIMARY_EXIT_TARGET").await;
     client.wait_for("SURVIVOR_PANE_READY").await;
     client.send(b"exit\n");
-    client.wait_for("SURVIVOR_FOCUSED").await;
-    client.send(b"b\n");
-    client.wait_for("EXIT_B_INPUT").await;
+    client.send_until(b"b\n", "EXIT_B_INPUT").await;
     client.send(b"\x02d");
     client.wait_success().await;
 
