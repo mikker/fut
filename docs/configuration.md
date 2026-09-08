@@ -107,7 +107,7 @@ open_command_bar = "space"
 [trusted_commands.git_diff]
 title = "Repository diff"
 binding = "g"
-program = "/Users/me/.dotfiles/tmux/tmux.symlink/git_diff_popup.sh"
+program = "~/.dotfiles/tmux/tmux.symlink/git_diff_popup.sh"
 # args = ["--optional-argument"]
 size = { width = 120, height = 40 }
 
@@ -269,7 +269,7 @@ passes no arguments, and unknown qualified command slugs are rejected.
 
 ## Trusted commands
 
-Each `[trusted_commands.NAME]` table requires `title` and an executable `program`, plus optional `binding`, string array `args`, `size`, and `activate_opened` values. `size` and `activate_opened` have the same semantics as an extension command; omitting size preserves the full-terminal surface, while activation defaults to false. Running a command opens a dashed frame containing a temporary PTY, inherits the focused pane process's live working directory, and sends normal terminal input to the command. The frame names the command and identifies the temporary surface; when the process exits, Fut restores the previous panes, focus, and geometry. A bound trusted command may take a built-in's default key, which unbinds that built-in unless it is explicitly rebound under `ui.bindings`. Explicit binding collisions and duplicate command keys are rejected. Commands appear in the command palette; bound commands also appear in delayed which-key help. Configuration reload replaces them atomically.
+Each `[trusted_commands.NAME]` table requires `title` and an executable `program`, plus optional `binding`, string array `args`, `size`, and `activate_opened` values. `program` supports `~` and `~/` home-directory expansion. `size` and `activate_opened` have the same semantics as an extension command; omitting size preserves the full-terminal surface, while activation defaults to false. Running a command opens a dashed frame containing a temporary PTY, inherits the focused pane process's live working directory, and sends normal terminal input to the command. The frame names the command and identifies the temporary surface; when the process exits, Fut restores the previous panes, focus, and geometry. A bound trusted command may take a built-in's default key, which unbinds that built-in unless it is explicitly rebound under `ui.bindings`. Explicit binding collisions and duplicate command keys are rejected. Commands appear in the command palette; bound commands also appear in delayed which-key help. Configuration reload replaces them atomically.
 
 ## Sidebars
 

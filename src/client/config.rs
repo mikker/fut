@@ -1912,6 +1912,11 @@ fn materialize_config(
         .map(|(bytes, _)| bytes)
         .context("ui.prefix must be one character or a named key such as ctrl-a")?;
     config.ui.bindings.set_prefix(prefix);
+    let home = env::var_os("HOME").map(PathBuf::from);
+    for command in config.trusted_commands.values_mut() {
+        command.program =
+            expand_home_path(&command.program, home.as_deref(), "trusted command program")?;
+    }
     config.ui.bindings.commands = config.trusted_commands.into_values().collect();
     for extension in &extensions {
         for launcher in extension.commands() {
@@ -3767,7 +3772,7 @@ components = [
 [trusted_commands.git_diff]
 title = "Repository diff"
 binding = "s"
-program = "/bin/sh"
+program = "~/.local/bin/git-diff"
 args = ["-c", "git diff"]
 size = { width = 120, height = 40 }
 "#,
@@ -3781,6 +3786,10 @@ size = { width = 120, height = 40 }
         assert_eq!(
             config.bindings.label(ClientAction::OpenNavigator),
             "Unbound"
+        );
+        assert_eq!(
+            config.bindings.command(0).unwrap().program,
+            PathBuf::from(env::var_os("HOME").unwrap()).join(".local/bin/git-diff")
         );
         assert_eq!(config.bindings.command(0).unwrap().args, ["-c", "git diff"]);
         assert!(matches!(
