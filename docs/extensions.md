@@ -27,8 +27,9 @@ usually, a few executables.
 
 Fut never discovers extensions or checks for updates. You can copy a local
 package into Fut's managed store, fetch one explicitly named immutable Git
-commit, or choose a directory explicitly. Relative paths start from the
-directory containing `config.toml`; absolute paths also work:
+commit, or choose a directory explicitly. Paths beginning with `~/` start from
+your home directory, relative paths start from the directory containing
+`config.toml`, and absolute paths also work:
 
 ```toml
 extensions = [

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Extension paths in `config.toml` now support `~/` home-directory expansion.
+
 ## 0.17
 
 - Added portable extension paths: Git installs can select and retain a package within a repository using `--path`, and configured extension directories can be relative to `config.toml`.

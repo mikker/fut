@@ -1872,9 +1872,25 @@ fn merged_extension_roots(
 ) -> Result<Vec<PathBuf>> {
     let managed = extension_store::enabled_roots().context("load managed extension store")?;
     let mut roots = Vec::with_capacity(explicit.len() + managed.len());
+    roots.extend(resolve_explicit_extension_roots(
+        explicit,
+        config_path,
+        env::var_os("HOME").as_deref().map(Path::new),
+    )?);
+    roots.extend(managed);
+    Ok(roots)
+}
+
+fn resolve_explicit_extension_roots(
+    explicit: &[PathBuf],
+    config_path: Option<&Path>,
+    home: Option<&Path>,
+) -> Result<Vec<PathBuf>> {
+    let mut roots = Vec::with_capacity(explicit.len());
     for root in explicit {
+        let root = expand_home_path(root, home, "extension path")?;
         if root.is_absolute() {
-            roots.push(root.clone());
+            roots.push(root);
             continue;
         }
         let config_dir = config_path
@@ -1882,7 +1898,6 @@ fn merged_extension_roots(
             .context("relative extension path requires a Fut config file")?;
         roots.push(config_dir.join(root));
     }
-    roots.extend(managed);
     Ok(roots)
 }
 
@@ -1960,7 +1975,7 @@ fn validate_projects(projects: &mut BTreeMap<String, ProjectConfig>, source: &Pa
                 source.display()
             );
         }
-        project.path = expand_project_path(&project.path, home.as_deref())?;
+        project.path = expand_home_path(&project.path, home.as_deref(), "project path")?;
         if !project.path.is_absolute() {
             bail!(
                 "project {name:?} path in {} must be absolute or start with ~/",
@@ -1974,7 +1989,7 @@ fn validate_projects(projects: &mut BTreeMap<String, ProjectConfig>, source: &Pa
             );
         }
         if let Some(recipe) = &mut project.recipe {
-            *recipe = expand_project_path(recipe, home.as_deref())?;
+            *recipe = expand_home_path(recipe, home.as_deref(), "project path")?;
             if !recipe.is_absolute() {
                 bail!(
                     "project {name:?} recipe in {} must be absolute or start with ~/",
@@ -1986,22 +2001,22 @@ fn validate_projects(projects: &mut BTreeMap<String, ProjectConfig>, source: &Pa
     Ok(())
 }
 
-fn expand_project_path(path: &Path, home: Option<&Path>) -> Result<PathBuf> {
+fn expand_home_path(path: &Path, home: Option<&Path>, kind: &str) -> Result<PathBuf> {
     let value = path.as_os_str().to_string_lossy();
     if value == "~" {
         return home
             .filter(|home| home.is_absolute())
             .map(Path::to_path_buf)
-            .context("HOME must be absolute to expand a project path beginning with ~");
+            .with_context(|| format!("HOME must be absolute to expand a {kind} beginning with ~"));
     }
     if let Some(relative) = value.strip_prefix("~/") {
-        let home = home
-            .filter(|home| home.is_absolute())
-            .context("HOME must be absolute to expand a project path beginning with ~/")?;
+        let home = home.filter(|home| home.is_absolute()).with_context(|| {
+            format!("HOME must be absolute to expand a {kind} beginning with ~/")
+        })?;
         return Ok(home.join(relative));
     }
     if value.starts_with('~') {
-        bail!("project paths support only ~ or ~/ expansion");
+        bail!("{kind}s support only ~ or ~/ expansion");
     }
     Ok(path.to_owned())
 }
@@ -2718,7 +2733,12 @@ unknown_future_option = true
             temporary.path().join("dev/fut")
         );
         assert_eq!(
-            expand_project_path(Path::new("~/dev/fut"), Some(temporary.path())).unwrap(),
+            expand_home_path(
+                Path::new("~/dev/fut"),
+                Some(temporary.path()),
+                "project path"
+            )
+            .unwrap(),
             temporary.path().join("dev/fut")
         );
     }
@@ -3401,6 +3421,29 @@ components = [
         assert_eq!(
             loaded.extensions[0].root(),
             extension_root.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn extension_roots_expand_home_before_resolving_relative_paths() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config = temporary.path().join("config/config.toml");
+        let roots = resolve_explicit_extension_roots(
+            &[
+                PathBuf::from("~/dev/fut/extensions/wt"),
+                PathBuf::from("extensions/run"),
+            ],
+            Some(&config),
+            Some(temporary.path()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            roots,
+            [
+                temporary.path().join("dev/fut/extensions/wt"),
+                temporary.path().join("config/extensions/run"),
+            ]
         );
     }
 
