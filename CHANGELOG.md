@@ -5,6 +5,7 @@
 ## 0.18
 
 - Extension paths in `config.toml` now support `~/` home-directory expansion.
+- Fixed queued input being discarded while navigation waited for updated resources.
 
 ## 0.17
 

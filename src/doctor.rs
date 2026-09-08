@@ -551,25 +551,28 @@ mod tests {
         let socket = temporary.path().join("fut.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut framed = Framed::new(stream, codec());
-            let request = framed.next().await.unwrap().unwrap();
-            let hello: Envelope<ClientMessage> = decode_payload(&request).unwrap();
-            framed
-                .send(Bytes::from(
-                    encode_payload(&Envelope {
-                        request_id: hello.request_id,
-                        message: ServerMessage::Welcome {
-                            version: PROTOCOL_VERSION,
-                            server_version: "0.2.0".into(),
-                            selected: None,
-                            extension_catalog: empty_extension_catalog(),
-                        },
-                    })
-                    .unwrap(),
-                ))
-                .await
-                .unwrap();
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut framed = Framed::new(stream, codec());
+                let Some(Ok(request)) = framed.next().await else {
+                    continue;
+                };
+                let hello: Envelope<ClientMessage> = decode_payload(&request).unwrap();
+                let _ = framed
+                    .send(Bytes::from(
+                        encode_payload(&Envelope {
+                            request_id: hello.request_id,
+                            message: ServerMessage::Welcome {
+                                version: PROTOCOL_VERSION,
+                                server_version: "0.2.0".into(),
+                                selected: None,
+                                extension_catalog: empty_extension_catalog(),
+                            },
+                        })
+                        .unwrap(),
+                    ))
+                    .await;
+            }
         });
 
         let checks = probe_daemon(&socket).await;
@@ -587,7 +590,7 @@ mod tests {
         assert_eq!(extensions.status, CheckStatus::Ok);
         assert_eq!(extensions.details["generation"], 1);
         assert_eq!(extensions.details["count"], 0);
-        server.await.unwrap();
+        server.abort();
     }
 
     #[test]

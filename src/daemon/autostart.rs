@@ -172,30 +172,33 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let incompatible_version = PROTOCOL_VERSION - 1;
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut framed = Framed::new(stream, codec());
-            let request = framed.next().await.unwrap().unwrap();
-            let hello: Envelope<ClientMessage> = decode_payload(&request).unwrap();
-            assert!(matches!(
-                hello.message,
-                ClientMessage::Hello {
-                    version: PROTOCOL_VERSION,
-                    ..
-                }
-            ));
-            framed
-                .send(Bytes::from(
-                    encode_payload(&Envelope {
-                        request_id: hello.request_id,
-                        message: ServerMessage::IncompatibleProtocol {
-                            client: PROTOCOL_VERSION,
-                            server: incompatible_version,
-                        },
-                    })
-                    .unwrap(),
-                ))
-                .await
-                .unwrap();
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut framed = Framed::new(stream, codec());
+                let Some(Ok(request)) = framed.next().await else {
+                    continue;
+                };
+                let hello: Envelope<ClientMessage> = decode_payload(&request).unwrap();
+                assert!(matches!(
+                    hello.message,
+                    ClientMessage::Hello {
+                        version: PROTOCOL_VERSION,
+                        ..
+                    }
+                ));
+                let _ = framed
+                    .send(Bytes::from(
+                        encode_payload(&Envelope {
+                            request_id: hello.request_id,
+                            message: ServerMessage::IncompatibleProtocol {
+                                client: PROTOCOL_VERSION,
+                                server: incompatible_version,
+                            },
+                        })
+                        .unwrap(),
+                    ))
+                    .await;
+            }
         });
 
         let config_location = crate::client::config::resolve_location(None).unwrap();
@@ -214,6 +217,6 @@ mod tests {
                 .contains(&format!("requires protocol {PROTOCOL_VERSION}"))
         );
         assert!(!temporary.path().join("fut-daemon.log").exists());
-        server.await.unwrap();
+        server.abort();
     }
 }

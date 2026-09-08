@@ -291,6 +291,30 @@ impl PtyChild {
         });
     }
 
+    async fn wait_for_json_line(&mut self, mut predicate: impl FnMut(&Value) -> bool) -> Value {
+        time::timeout(DEADLINE, async {
+            loop {
+                let text = self.text();
+                if let Some(value) = text
+                    .split_inclusive('\n')
+                    .filter(|line| line.ends_with('\n'))
+                    .filter_map(|line| serde_json::from_str::<Value>(line.trim_end()).ok())
+                    .find(|value| predicate(value))
+                {
+                    return value;
+                }
+                time::sleep(POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "PTY output never contained matching JSON: {:?}",
+                self.text()
+            )
+        })
+    }
+
     async fn wait_success(&mut self) {
         // `script(1)` implementations differ in how eagerly their stdin
         // forwarding process exits after the child command is done. Closing
@@ -848,7 +872,7 @@ async fn codex_node_wrapper_screen_detection_tracks_working_then_idle() {
 mkfifo codex
 ( exec > codex
   printf '› Build it\r\n\r\n◦ Working (3s • esc to interrupt)\r\n'
-  sleep 2
+  while [ ! -e codex-complete ]; do sleep 0.02; done
   printf '\r\n• Implemented the change.\r\n\r\n› \r\n'
   sleep 5
 ) &
@@ -889,6 +913,8 @@ exec ./node ./codex
     })
     .await
     .unwrap_or_else(|_| panic!("fake Codex was not detected working: {}", harness.logs()));
+
+    fs::write(harness.root.path().join("cwd/codex-complete"), b"").unwrap();
 
     time::timeout(DEADLINE, async {
         loop {
@@ -7564,8 +7590,9 @@ async fn public_events_stream_emits_versioned_json_snapshots_on_change() {
         command.arg("events");
         command
     });
-    events.wait_for("\"command\":\"events\"").await;
-    let first: Value = serde_json::from_str(events.text().lines().next().unwrap()).unwrap();
+    let first = events
+        .wait_for_json_line(|value| value["command"] == "events")
+        .await;
     assert_eq!(first["version"], 1);
     assert_eq!(first["command"], "events");
     let first_revision = first["result"]["revision"].as_u64().unwrap();
@@ -7583,8 +7610,9 @@ async fn public_events_stream_emits_versioned_json_snapshots_on_change() {
             command: fut::protocol::AcknowledgedCommand::RenameTarget,
         }
     );
-    events.wait_for("watched λ").await;
-    let last: Value = serde_json::from_str(events.text().lines().last().unwrap()).unwrap();
+    let last = events
+        .wait_for_json_line(|value| value["result"]["sessions"][0]["name"] == "watched λ")
+        .await;
     assert_eq!(last["version"], 1);
     assert_eq!(last["command"], "events");
     assert!(last["result"]["revision"].as_u64().unwrap() > first_revision);
@@ -7606,8 +7634,13 @@ async fn public_events_stream_emits_versioned_json_snapshots_on_change() {
             command: fut::protocol::AcknowledgedCommand::ReportAgent,
         }
     );
-    events.wait_for("\"state\":\"blocked\"").await;
-    let last: Value = serde_json::from_str(events.text().lines().last().unwrap()).unwrap();
+    let last = events
+        .wait_for_json_line(|value| {
+            value["result"]["sessions"][0]["workspaces"][0]["tabs"][0]["panes"][0]
+                ["activity"]["state"]
+                == "blocked"
+        })
+        .await;
     assert_eq!(
         last["result"]["sessions"][0]["workspaces"][0]["tabs"][0]["panes"][0]["activity"]["state"],
         "blocked"
@@ -9116,7 +9149,7 @@ async fn public_agent_activity_spins_lists_waiting_terminals_and_navigates_unrea
     client.wait_for("waiting-b").await;
     client.send(b"\r");
     client.wait_for("WAITING").await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for(DEADLINE, || agent_list()["result"]["unread_count"] == 0).await;
     let read = agent_list();
     assert_eq!(read["result"]["unread_count"], 0);
     assert_eq!(read["result"]["agents"][1]["unread"], false);
@@ -10549,14 +10582,8 @@ async fn public_tab_navigation_and_right_down_splits_share_the_command_catalog()
         ));
     let mut client = PtyChild::spawn(command);
     client.wait_for("ACTION_A_READY").await;
-    time::timeout(DEADLINE, async {
-        while !client.text().contains("TAB_B_READY") {
-            client.send(b"\x02n");
-            time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("tab navigation never reconciled: {:?}", client.text()));
+    client.send(b"\x02n");
+    client.wait_for("ACTION_TAB_B_READY").await;
     client.send(b"\x02\x14");
     client.send(b"back\n");
     wait_for(DEADLINE, || {
@@ -10585,19 +10612,11 @@ async fn public_tab_navigation_and_right_down_splits_share_the_command_catalog()
         snapshot.sessions[0].workspaces[0].tabs.len() == 2
     })
     .await;
-    time::timeout(DEADLINE, async {
-        while !fs::metadata(&back_marker).is_ok_and(|metadata| metadata.len() >= 2) {
-            client.send(b"\x021back\n");
-            time::sleep(Duration::from_millis(100)).await;
-        }
+    client.send(b"\x021back\n");
+    wait_for(DEADLINE, || {
+        fs::metadata(&back_marker).is_ok_and(|metadata| metadata.len() >= 2)
     })
-    .await
-    .unwrap_or_else(|_| {
-        panic!(
-            "numbered tab navigation never reconciled: {:?}",
-            client.text()
-        )
-    });
+    .await;
 
     client.send(b"\x02|");
     client.send(b": > right-split-marker\n");
@@ -11788,7 +11807,7 @@ async fn public_command_bar_filters_labels_actions_and_matches_direct_dispatch()
 
 #[tokio::test]
 async fn extension_commands_launch_from_the_palette_with_focused_context() {
-    let harness = Harness::start_with("printf 'HOST_READY\\r\\n'; while :; do sleep 1; done", |root| {
+    let harness = Harness::start_with("printf 'HOST_READY\\r\\n'; while IFS= read -r line; do [ \"$line\" = host-ready ] && printf 'HOST_INPUT_READY\\r\\n'; done", |root| {
         let extension = root.join("extension");
         let bin = extension.join("bin");
         fs::create_dir_all(&bin).unwrap();
@@ -11870,7 +11889,7 @@ async fn extension_commands_launch_from_the_palette_with_focused_context() {
         "{context:?}"
     );
     client.send(b"\r");
-    time::sleep(Duration::from_millis(100)).await;
+    client.send_until(b"host-ready\n", "HOST_INPUT_READY").await;
     client.send(b"\x02d");
     client.wait_success().await;
     harness.shutdown().await;
@@ -12517,7 +12536,7 @@ async fn public_client_exits_copy_mode_on_unsolicited_cursor_loss() {
 #[tokio::test]
 async fn copy_mode_attachments_cleanup_independently_across_output_focus_and_exit() {
     let mut harness = Harness::start(
-        "printf 'COPY_A_READY\\r\\n'; (sleep 1; printf 'COPY_A_DURING\\r\\n') & while :; do sleep 1; done",
+        "printf 'COPY_A_READY\\r\\n'; (while [ ! -e copy-a-during ]; do sleep 0.02; done; printf 'COPY_A_DURING\\r\\n') & while :; do sleep 1; done",
     )
     .await;
     let resources = harness.resources().await;
@@ -12563,6 +12582,8 @@ async fn copy_mode_attachments_cleanup_independently_across_output_focus_and_exi
         CopyModeAction::ToggleSelection,
     )
     .await;
+
+    fs::write(harness.root.path().join("cwd/copy-a-during"), b"").unwrap();
 
     let during = receive_matching(&mut client_a, |message| {
         matches!(message, ServerMessage::Snapshot { terminal_id, screen }

@@ -1702,7 +1702,15 @@ async fn run_loop(
                     }
                 }
             }
-            event = events.next(), if accepts_client_input(&focus, &create, &close_target, &pending_focused_exit) => {
+            event = events.next(), if accepts_client_input(
+                &focus,
+                &create,
+                &close_target,
+                &pending_focused_exit,
+                resources
+                    .snapshot()
+                    .is_some_and(|snapshot| view.resources_are_current(snapshot)),
+            ) => {
                 let Some(event) = event else {
                     release_captured_mouse_input(
                         framed,
@@ -3523,8 +3531,10 @@ fn accepts_client_input(
     create: &CreateCoordinator,
     close_target: &CloseTargetState,
     pending_focused_exit: &Option<Option<i32>>,
+    resources_current: bool,
 ) -> bool {
-    focus.request_id.is_none()
+    resources_current
+        && focus.request_id.is_none()
         && !create.blocks_input()
         && !close_target.blocks_input()
         && pending_focused_exit.is_none()
@@ -7075,14 +7085,18 @@ mod tests {
         let request = state.begin(CreateKind::Tab).expect("first request starts");
         assert!(state.begin(CreateKind::Workspace).is_none());
         assert!(state.blocks_input());
-        assert!(!accepts_client_input(&focus, &state, &close, &no_exit));
+        assert!(!accepts_client_input(
+            &focus, &state, &close, &no_exit, true
+        ));
         let target = targets(1).remove(0);
         assert!(!state.created(None, CreateKind::Tab, target.terminal_id));
         assert!(!state.created(Some(Uuid::new_v4()), CreateKind::Tab, target.terminal_id));
         assert!(!state.created(Some(request), CreateKind::Workspace, target.terminal_id));
         assert!(state.created(Some(request), CreateKind::Tab, target.terminal_id));
         assert!(state.blocks_input());
-        assert!(!accepts_client_input(&focus, &state, &close, &no_exit));
+        assert!(!accepts_client_input(
+            &focus, &state, &close, &no_exit, true
+        ));
         let selected = selected_view(2, target.clone(), vec![target]);
         assert_eq!(
             state.selected(Some(Uuid::new_v4()), &selected, Some(1)),
@@ -7097,7 +7111,10 @@ mod tests {
         assert!(!state.accept_resources(1));
         assert!(state.accept_resources(2));
         assert!(!state.blocks_input());
-        assert!(accepts_client_input(&focus, &state, &close, &no_exit));
+        assert!(accepts_client_input(&focus, &state, &close, &no_exit, true));
+        assert!(!accepts_client_input(
+            &focus, &state, &close, &no_exit, false
+        ));
         assert!(state.begin(CreateKind::Workspace).is_some());
 
         let mut failed = CreateCoordinator::default();
@@ -7105,7 +7122,9 @@ mod tests {
         assert_eq!(failed.fail(Some(Uuid::new_v4())), None);
         assert_eq!(failed.fail(Some(request)), Some(CreateKind::SplitPane));
         assert!(!failed.blocks_input());
-        assert!(accepts_client_input(&focus, &failed, &close, &no_exit));
+        assert!(accepts_client_input(
+            &focus, &failed, &close, &no_exit, true
+        ));
     }
 
     #[test]
