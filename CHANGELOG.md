@@ -2,8 +2,9 @@
 
 ## Unreleased
 
-- Git extension installs can select a package within a repository using `--path` and retain it for updates.
-- Extension directories in `config.toml` may now use paths relative to the configuration file.
+## 0.17
+
+- Added portable extension paths: Git installs can select and retain a package within a repository using `--path`, and configured extension directories can be relative to `config.toml`.
 - Fixed desktop agents inheriting Fut context and leaving unrelated terminals with stuck activity indicators.
 
 ## 0.16
