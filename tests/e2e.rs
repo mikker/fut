@@ -12062,21 +12062,23 @@ async fn compiled_rust_extension_conforms_through_public_fut_boundaries() {
     let mut client = PtyChild::spawn(command);
     client.wait_for("RUST_CONFORMANCE_HOST_READY").await;
     client.send(b"\x02R");
-    client.wait_for("Probe Rust extension").await;
     wait_for(DEADLINE, || {
         fs::read_to_string(&log)
             .is_ok_and(|contents| contents.contains("command=probe label=workspace"))
     })
     .await;
-    // The command records its side effect before its temporary PTY exits.
-    // Wait for Fut to remove the command frame and return input ownership to
-    // the managed terminal before sending more input.
-    wait_for(DEADLINE, || {
-        !client.screen_text().contains("Probe Rust extension")
+    // The command records its side effect before its temporary PTY exits, and
+    // a fast command can exit without its frame ever being drawn. Probe until
+    // the managed terminal responds instead of inferring input ownership from
+    // either event.
+    time::timeout(DEADLINE, async {
+        while !client.sees("RUST_CONFORMANCE_DETACH_READY") {
+            client.send(b"detach-ready\n");
+            time::sleep(POLL_INTERVAL).await;
+        }
     })
-    .await;
-    client.send(b"detach-ready\n");
-    client.wait_for("RUST_CONFORMANCE_DETACH_READY").await;
+    .await
+    .unwrap_or_else(|_| panic!("managed terminal never regained input: {:?}", client.text()));
     client.send(b"\x02d");
     client.wait_success().await;
 
