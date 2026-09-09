@@ -1,8 +1,7 @@
 [tools]
-rust = "1.95.0"
-ruby = "3.3"
+rust = "1.98.1"
 zig = "0.16.0"
-node = "22.23.2"
+node = "26.8.1"
 python = "3.14.7"
 
 [tasks.check]
@@ -133,12 +132,12 @@ run = "bash scripts/perf/external"
 
 [tasks."docs:setup"]
 description = "Install local documentation dependencies"
-run = "cd docs && BUNDLE_PATH=../.bundle bundle install"
+run = "mise x ruby@4 -- bash -c 'cd docs && BUNDLE_PATH=../.bundle bundle install'"
 
 [tasks."docs:serve"]
 description = "Preview the documentation at http://127.0.0.1:4000"
 depends = ["docs:setup"]
-run = "cd docs && BUNDLE_PATH=../.bundle bundle exec jekyll serve --destination ../target/docs --baseurl '' --livereload"
+run = "mise x ruby@4 -- bash -c 'cd docs && BUNDLE_PATH=../.bundle bundle exec jekyll serve --destination ../target/docs --baseurl \"\" --livereload'"
 
 [tasks.release]
 description = "Test and publish the next 0.x release"

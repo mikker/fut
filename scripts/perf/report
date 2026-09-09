@@ -1,5 +1,4 @@
-#!/usr/bin/env ruby
-# frozen_string_literal: true
+#!/usr/bin/env python3
 
 # Summarizes a FUT_PERF_LOG CSV produced by the real client
 # (src/client/perf.rs). Usage:
@@ -7,39 +6,50 @@
 #   FUT_PERF_LOG=/tmp/fut-frames.csv fut attach ...   # exercise the UI
 #   scripts/perf/report /tmp/fut-frames.csv
 
-path = ARGV[0] or abort "Usage: scripts/perf/report FRAME_LOG.csv"
+import csv
+import math
+import sys
+from collections import defaultdict
 
-events = Hash.new { |hash, key| hash[key] = [] }
-bytes = Hash.new(0)
+
+def percentile(values, fraction):
+    return values[max(math.ceil(len(values) * fraction) - 1, 0)]
+
+
+if len(sys.argv) != 2:
+    raise SystemExit("Usage: scripts/perf/report FRAME_LOG.csv")
+
+path = sys.argv[1]
+events = defaultdict(list)
+byte_counts = defaultdict(int)
 timestamps = []
 
-File.foreach(path).drop(1).each do |line|
-  ts, event, dur, size = line.strip.split(",")
-  next unless dur
-  events[event] << Integer(dur)
-  bytes[event] += Integer(size)
-  timestamps << Integer(ts)
-end
+with open(path, newline="") as rows:
+    next(rows, None)
+    for row in csv.reader(rows):
+        if len(row) < 3:
+            continue
+        timestamp, event, duration = row[:3]
+        size = row[3] if len(row) > 3 else "0"
+        events[event].append(int(duration))
+        byte_counts[event] += int(size)
+        timestamps.append(int(timestamp))
 
-abort "No events in #{path}" if timestamps.empty?
+if not timestamps:
+    raise SystemExit(f"No events in {path}")
 
-def percentile(sorted, fraction)
-  sorted[[(sorted.size * fraction).ceil - 1, 0].max]
-end
+wall_s = (timestamps[-1] - timestamps[0]) / 1_000_000
+print(f"window: {wall_s:.1f} s")
 
-wall_s = (timestamps.last - timestamps.first) / 1_000_000.0
-puts format("window: %.1f s", wall_s)
-
-events.sort.each do |event, durations|
-  sorted = durations.sort
-  total_ms = durations.sum / 1000.0
-  row = format(
-    "%-8s n=%-6d rate=%6.1f/s  avg=%6.0fus  p95=%6.0fus  max=%6.0fus  busy=%4.1f%%",
-    event, durations.size, durations.size / wall_s,
-    durations.sum.to_f / durations.size,
-    percentile(sorted, 0.95), sorted.last,
-    100.0 * total_ms / (wall_s * 1000.0)
-  )
-  row += format("  wire=%.1fMiB", bytes[event] / 1024.0 / 1024.0) if bytes[event].positive?
-  puts row
-end
+for event, durations in sorted(events.items()):
+    ordered = sorted(durations)
+    total_ms = sum(durations) / 1000
+    row = (
+        f"{event:<8} n={len(durations):<6d} rate={len(durations) / wall_s:6.1f}/s  "
+        f"avg={sum(durations) / len(durations):6.0f}us  "
+        f"p95={percentile(ordered, 0.95):6.0f}us  max={ordered[-1]:6.0f}us  "
+        f"busy={100 * total_ms / (wall_s * 1000):4.1f}%"
+    )
+    if byte_counts[event] > 0:
+        row += f"  wire={byte_counts[event] / 1024 / 1024:.1f}MiB"
+    print(row)
