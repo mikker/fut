@@ -1,6 +1,7 @@
 {
   "name": "fut-pi",
   "private": true,
+  "type": "module",
   "keywords": ["pi-package"],
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"

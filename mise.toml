@@ -2,24 +2,32 @@
 rust = "1.95.0"
 ruby = "3.3"
 zig = "0.16.0"
+node = "22.23.2"
+python = "3.14.7"
 
 [tasks.check]
-depends = ["fmt", "clippy", "test"]
+run = '''
+mise run fmt
+mise run clippy
+mise run test
+mise run test:aux
+mise run test:run-smoke
+'''
 
 [tasks.build]
-run = "cargo build"
+run = "cargo build --locked"
 
 [tasks."build:all"]
 run = '''
-cargo build --all-targets --all-features
-cargo build --release --all-targets --all-features
+cargo build --locked --all-targets --all-features
+cargo build --locked --release --all-targets --all-features
 '''
 
 [tasks.fmt]
 run = "cargo fmt --check"
 
 [tasks.clippy]
-run = "cargo clippy --all-targets --all-features -- -D warnings"
+run = "cargo clippy --locked --all-targets --all-features -- -D warnings"
 
 [tasks.fresh]
 description = "Restart the debug daemon and attach without rebuilding"
@@ -44,29 +52,52 @@ exec target/debug/fut --socket "$socket" --config-dir "$config_dir"
 '''
 
 [tasks.test]
-run = "cargo test --all-targets --all-features"
+run = "cargo test --locked --lib --bins --tests --all-features"
 
 [tasks."test:unit"]
-run = "cargo test --lib --all-features"
+run = "cargo test --locked --lib --all-features"
 
 [tasks."test:e2e"]
-run = "cargo test --test e2e --all-features"
+run = "cargo test --locked --test e2e --all-features"
 
 [tasks."test:extension-conformance"]
 description = "Build and exercise the compiled extension reference through public Fut boundaries"
 run = "scripts/extension-conformance"
 
+[tasks."test:aux"]
+description = "Run fast adapter and extension checks without building Rust"
+depends = ["test:pi", "test:claude", "test:codex", "test:run", "test:wt"]
+
+[tasks."test:pi"]
+run = "node --test integrations/pi/tests/fut.test.ts"
+
+[tasks."test:claude"]
+run = "python3 integrations/claude-code/tests/test_adapter.py"
+
+[tasks."test:codex"]
+run = "python3 integrations/codex/tests/test_adapter.py"
+
+[tasks."test:run"]
+run = "python3 extensions/run/test/unit"
+
+[tasks."test:run-smoke"]
+description = "Exercise the run extension process lifecycle"
+run = "bash extensions/run/test/smoke"
+
+[tasks."test:wt"]
+run = "bash extensions/wt/test/smoke"
+
 [tasks.journey]
 description = "Run the isolated keyboard-driven daily-driver journey"
-run = "cargo test --test e2e --all-features isolated_daily_driver_journey -- --nocapture --test-threads=1"
+run = "cargo test --locked --test e2e --all-features isolated_daily_driver_journey -- --nocapture --test-threads=1"
 
 [tasks."journey:chaos"]
 description = "Run a reproducible isolated keyboard chaos journey"
-run = "cargo test --test e2e --all-features isolated_keyboard_chaos_journey -- --nocapture --test-threads=1"
+run = "cargo test --locked --test e2e --all-features isolated_keyboard_chaos_journey -- --nocapture --test-threads=1"
 
 [tasks."journey:overload"]
 description = "Run the isolated Hollywood-style terminal overload journey"
-run = "cargo test --test e2e --all-features isolated_hollywood_overload_journey -- --nocapture --test-threads=1"
+run = "cargo test --locked --test e2e --all-features isolated_hollywood_overload_journey -- --nocapture --test-threads=1"
 
 [tasks.demo]
 description = "Build and attach to a disposable multi-workspace Fut demo"
@@ -86,7 +117,7 @@ run = "bash scripts/demo clean"
 
 [tasks."perf:bench"]
 description = "Run render-pipeline microbenchmarks (feed/encode/decode/clone)"
-run = "cargo bench --bench render"
+run = "cargo bench --locked --bench render"
 
 [tasks."perf:e2e"]
 description = "Measure end-to-end snapshot throughput and input latency against a disposable daemon"
@@ -94,7 +125,7 @@ run = "bash scripts/perf/run"
 
 [tasks."perf:pager"]
 description = "Capture and compare less forward/backward paging output and Fut VT costs"
-run = "cargo run --release --example pager_measure"
+run = "cargo run --locked --release --example pager_measure"
 
 [tasks."perf:external"]
 description = "Measure the release daemon and client on the 300x65 four-pane animation workload"

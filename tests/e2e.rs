@@ -1307,7 +1307,32 @@ async fn isolated_hollywood_overload_journey_stays_controllable_and_closes_clean
         );
     }
 
-    time::sleep(Duration::from_millis(150)).await;
+    for (terminal, marker) in
+        overload_terminals
+            .iter()
+            .zip(["MATRIX GRID", "NEURAL SCAN", "ACCESS"])
+    {
+        let ready = harness
+            .cli()
+            .args([
+                "terminal",
+                "wait-output",
+                terminal,
+                "--source",
+                "visible",
+                "--literal",
+                marker,
+                "--timeout",
+                "2s",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            ready.status.success(),
+            "overload producer {marker} did not start: {}",
+            String::from_utf8_lossy(&ready.stderr)
+        );
+    }
     let ping_started = Instant::now();
     assert!(matches!(
         harness.control_command(ClientMessage::Ping).await,
@@ -3960,21 +3985,34 @@ argv = ["./final"]
 }
 
 #[tokio::test]
-async fn daemon_git_tokens_publish_atomic_shared_snapshots_and_clear_when_git_disappears() {
-    let harness = Harness::start_with("while :; do sleep 1; done", |root| {
-        let cwd = root.join("cwd");
-        git(&cwd, &["init", "--initial-branch=main"]);
-        fs::write(cwd.join("tracked"), "one\ntwo\n").unwrap();
-        git(&cwd, &["add", "tracked"]);
-        git(&cwd, &["commit", "-m", "fixture"]);
-    })
+async fn daemon_git_tokens_publish_atomic_shared_snapshots_on_live_directory_changes() {
+    let mut harness = Harness::start_with(
+        "while IFS= read -r directory; do cd \"$directory\" || exit 1; done",
+        |root| {
+            let cwd = root.join("cwd");
+            git(&cwd, &["init", "--initial-branch=main"]);
+            fs::write(cwd.join("tracked"), "one\ntwo\n").unwrap();
+            git(&cwd, &["add", "tracked"]);
+            git(&cwd, &["commit", "-m", "fixture"]);
+            let dirty = root.join("dirty");
+            fs::create_dir(&dirty).unwrap();
+            git(&dirty, &["init", "--initial-branch=feature"]);
+            fs::write(dirty.join("tracked"), "one\ntwo\n").unwrap();
+            git(&dirty, &["add", "tracked"]);
+            git(&dirty, &["commit", "-m", "fixture"]);
+            fs::write(dirty.join("tracked"), "one\nthree\nfour\n").unwrap();
+            fs::create_dir(root.join("plain")).unwrap();
+        },
+    )
     .await;
 
-    let initial = resources_when_with_timeout(&harness, Duration::from_secs(20), |snapshot| {
+    let initial = resources_when(&harness, |snapshot| {
         workspace_git_tokens(snapshot) == [Some("main"), None, None]
     })
     .await;
+    let (mut attached, _, _) = harness.interactive().await;
     let mut watchers = Vec::new();
+    let mut watched_revision = initial.revision;
     for _ in 0..2 {
         let mut watcher = harness.connect().await.unwrap();
         assert!(matches!(
@@ -3988,17 +4026,19 @@ async fn daemon_git_tokens_publish_atomic_shared_snapshots_and_clear_when_git_di
             panic!("expected initial resources")
         };
         assert_eq!(workspace_git_tokens(&snapshot), [Some("main"), None, None]);
+        watched_revision = watched_revision.max(snapshot.revision);
         watchers.push(watcher);
     }
 
-    fs::write(
-        harness.root.path().join("cwd/tracked"),
-        "one\nthree\nfour\n",
+    // A live directory change causes an immediate refresh. Exercise real Git,
+    // process discovery and shared delivery without waiting for the production
+    // timer to notice an edit in the same root.
+    send(
+        &mut attached,
+        ClientMessage::Input {
+            bytes: b"../dirty\n".to_vec(),
+        },
     )
-    .unwrap();
-    resources_when_with_timeout(&harness, Duration::from_secs(20), |snapshot| {
-        workspace_git_tokens(snapshot) == [Some("main"), Some("+2"), Some("-1")]
-    })
     .await;
     let mut changed_revisions = Vec::new();
     for watcher in &mut watchers {
@@ -4009,10 +4049,10 @@ async fn daemon_git_tokens_publish_atomic_shared_snapshots_and_clear_when_git_di
             let tokens = workspace_git_tokens(snapshot);
             assert!(
                 tokens == [Some("main"), None, None]
-                    || tokens == [Some("main"), Some("+2"), Some("-1")],
+                    || tokens == [Some("feature"), Some("+2"), Some("-1")],
                 "Git values must never be published as a partial snapshot: {tokens:?}"
             );
-            tokens == [Some("main"), Some("+2"), Some("-1")]
+            tokens == [Some("feature"), Some("+2"), Some("-1")]
         })
         .await;
         let ServerMessage::ResourcesChanged { snapshot } = message else {
@@ -4021,34 +4061,42 @@ async fn daemon_git_tokens_publish_atomic_shared_snapshots_and_clear_when_git_di
         changed_revisions.push(snapshot.revision);
     }
     assert_eq!(changed_revisions[0], changed_revisions[1]);
-    assert!(changed_revisions[0] > initial.revision);
+    assert!(changed_revisions[0] > watched_revision);
 
-    fs::rename(
-        harness.root.path().join("cwd/.git"),
-        harness.root.path().join("cwd/git-hidden"),
+    send(
+        &mut attached,
+        ClientMessage::Input {
+            bytes: b"../plain\n".to_vec(),
+        },
     )
-    .unwrap();
-    resources_when_with_timeout(&harness, Duration::from_secs(20), |snapshot| {
-        workspace_git_tokens(snapshot) == [None, None, None]
-    })
     .await;
-    let cleared = receive_matching(&mut watchers[0], |message| {
-        let ServerMessage::ResourcesChanged { snapshot } = message else {
-            return false;
+    let mut cleared_revisions = Vec::new();
+    for watcher in &mut watchers {
+        let cleared = receive_matching(watcher, |message| {
+            let ServerMessage::ResourcesChanged { snapshot } = message else {
+                return false;
+            };
+            let tokens = workspace_git_tokens(snapshot);
+            assert!(
+                tokens == [Some("feature"), Some("+2"), Some("-1")] || tokens == [None, None, None],
+                "Git values must clear together: {tokens:?}"
+            );
+            tokens == [None, None, None]
+        })
+        .await;
+        let ServerMessage::ResourcesChanged { snapshot } = cleared else {
+            unreachable!()
         };
-        let tokens = workspace_git_tokens(snapshot);
-        assert!(
-            tokens == [Some("main"), Some("+2"), Some("-1")] || tokens == [None, None, None],
-            "Git values must clear together: {tokens:?}"
-        );
-        tokens == [None, None, None]
-    })
-    .await;
-    let ServerMessage::ResourcesChanged { snapshot } = cleared else {
-        unreachable!()
-    };
-    assert_eq!(workspace_git_tokens(&snapshot), [None, None, None]);
+        cleared_revisions.push(snapshot.revision);
+    }
+    assert_eq!(cleared_revisions[0], cleared_revisions[1]);
+    assert!(cleared_revisions[0] > changed_revisions[0]);
+    assert_eq!(
+        workspace_git_tokens(&harness.resources().await),
+        [None, None, None]
+    );
 
+    harness.detach(&mut attached).await;
     harness.shutdown().await;
 }
 
@@ -13528,9 +13576,11 @@ async fn same_target_list_and_failed_switches_preserve_the_attachment() {
         if response.request_id == Some(request) {
             break response;
         }
+        assert_eq!(response.request_id, None);
         match response.message {
             ServerMessage::Snapshot { terminal_id, .. } => assert_eq!(terminal_id, a_id),
-            other => panic!("unexpected frame before Resources: {other:?}"),
+            ServerMessage::ResourcesChanged { .. } => {}
+            other => panic!("unexpected unsolicited frame before Resources: {other:?}"),
         }
     };
     assert!(matches!(response.message, ServerMessage::Resources { .. }));
@@ -14864,14 +14914,14 @@ async fn chaos_identify_pane(
     let marker = root.join("cwd").join(format!("a{step}"));
     let command = format!("echo $$>'{}'\n", marker.display());
     let paste = format!("\x1b[200~{command}\x1b[201~");
-    time::sleep(Duration::from_millis(100)).await;
+    // Send once: a retry can hide dropped input or overwrite a wrong-pane result.
+    client.send(paste.as_bytes());
     time::timeout(DEADLINE, async {
         loop {
             if file_has_contents(&marker) {
                 break;
             }
-            client.send(paste.as_bytes());
-            time::sleep(Duration::from_millis(100)).await;
+            time::sleep(POLL_INTERVAL).await;
         }
     })
     .await
@@ -14889,14 +14939,13 @@ async fn chaos_probe_pane(
     let marker = root.join("cwd").join(format!("p{step}"));
     let command = format!("echo $$>'{}'\n", marker.display());
     let paste = format!("\x1b[200~{command}\x1b[201~");
-    time::sleep(Duration::from_millis(100)).await;
+    client.send(paste.as_bytes());
     time::timeout(DEADLINE, async {
         loop {
             if file_has_contents(&marker) {
                 break;
             }
-            client.send(paste.as_bytes());
-            time::sleep(Duration::from_millis(100)).await;
+            time::sleep(POLL_INTERVAL).await;
         }
     })
     .await
@@ -15327,10 +15376,10 @@ fn context_without_terminal_identity_is_a_typed_error_before_daemon_connection()
 
 #[tokio::test]
 async fn process_completion_covers_live_resource_operations_and_refresh() {
-    let harness = Harness::start("while IFS= read -r line; do :; done").await;
+    let harness = Harness::start("exec /usr/bin/tail -f /dev/null").await;
     let env = CompletionEnv::new();
     let snapshot = resources_when(&harness, |snapshot| {
-        !snapshot.sessions[0].workspaces[0].tabs[0].name.is_empty()
+        snapshot.sessions[0].workspaces[0].tabs[0].name == "tail"
     })
     .await;
     let session = &snapshot.sessions[0];

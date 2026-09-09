@@ -2,6 +2,6 @@
 set -eu
 
 cd "$(dirname "$0")/.."
-exec cargo test --test e2e --all-features \
+exec cargo test --locked --test e2e --all-features \
   compiled_rust_extension_conforms_through_public_fut_boundaries \
   -- --exact --nocapture

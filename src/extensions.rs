@@ -1336,12 +1336,23 @@ async fn run_client_event(
                 active_extensions: &active_extensions,
                 payload: &payload,
             },
+            HOOK_TIMEOUT,
         )
         .await;
     }
 }
 
 async fn run_event(registry: &ExtensionRegistry, fut_bin: &Path, socket: &Path, event: &HookEvent) {
+    run_event_with_timeout(registry, fut_bin, socket, event, HOOK_TIMEOUT).await;
+}
+
+async fn run_event_with_timeout(
+    registry: &ExtensionRegistry,
+    fut_bin: &Path,
+    socket: &Path,
+    event: &HookEvent,
+    hook_timeout: Duration,
+) {
     let payload = match event.payload() {
         Ok(payload) => payload,
         Err(error) => {
@@ -1384,6 +1395,7 @@ async fn run_event(registry: &ExtensionRegistry, fut_bin: &Path, socket: &Path, 
                 active_extensions: &active_extensions,
                 payload: &payload,
             },
+            hook_timeout,
         )
         .await;
     }
@@ -1406,6 +1418,7 @@ async fn run_command(
     fut_bin: &Path,
     socket: &Path,
     invocation: HookInvocation<'_>,
+    hook_timeout: Duration,
 ) {
     let event = invocation.event;
     let mut command = Command::new(&hook.argv[0]);
@@ -1482,7 +1495,7 @@ async fn run_command(
         child.stderr.take().expect("hook stderr was piped"),
     ));
 
-    let status = match timeout(HOOK_TIMEOUT, child.wait()).await {
+    let status = match timeout(hook_timeout, child.wait()).await {
         Ok(status) => status,
         Err(_) => {
             terminate_hook_group(&mut child, child_pid).await;
@@ -1492,7 +1505,7 @@ async fn run_command(
             tracing::warn!(
                 extension = extension.id,
                 event,
-                timeout_ms = HOOK_TIMEOUT.as_millis(),
+                timeout_ms = hook_timeout.as_millis(),
                 stdout = %stdout,
                 stderr = %stderr,
                 "extension hook timed out"
@@ -3438,7 +3451,7 @@ scope = "tab"
     }
 
     #[test]
-    fn bundled_run_extension_manifest_and_smoke_are_valid() {
+    fn bundled_run_extension_manifest_is_valid() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("extensions/run");
         let extension = load(std::slice::from_ref(&root)).unwrap().remove(0);
 
@@ -3477,27 +3490,6 @@ scope = "tab"
                 .unwrap()
                 .presentation,
             TokenPresentation::Pulse
-        );
-
-        match std::process::Command::new("python3")
-            .arg("--version")
-            .output()
-        {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-            Err(error) => panic!("check python3 availability: {error}"),
-            Ok(output) if !output.status.success() => return,
-            Ok(_) => {}
-        }
-
-        let output = std::process::Command::new(root.join("test/smoke"))
-            .current_dir(&root)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "run extension smoke failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
         );
     }
 
@@ -3548,14 +3540,25 @@ scope = "tab"
 
     #[tokio::test]
     async fn timed_out_hook_is_killed_and_does_not_stop_later_extensions() {
+        let hook_timeout = Duration::from_millis(250);
         let output = tempfile::NamedTempFile::new().unwrap();
         let output_path = output.path().display().to_string();
+        let temporary = tempfile::tempdir().unwrap();
+        let pipe_path = temporary.path().join("descendant");
+        let pipe_name = std::ffi::CString::new(pipe_path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: pipe_name is a valid NUL-terminated path in our temporary directory.
+        assert_eq!(unsafe { libc::mkfifo(pipe_name.as_ptr(), 0o600) }, 0);
+        let mut pipe = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&pipe_path)
+            .unwrap();
         let slow = executable_hook(
             &format!(
-                "id = 'slow'\ncapabilities = ['hooks']\n[hooks]\n'workspace.created' = ['./hook', {:?}]\n",
-                output_path
+                "id = 'slow'\ncapabilities = ['hooks']\n[hooks]\n'workspace.created' = ['./hook', {:?}, {:?}]\n",
+                output_path, pipe_path
             ),
-            "#!/bin/sh\nprintf 'slow\\n' >> \"$1\"\n(trap '' TERM; sleep 6; printf 'orphan\\n' >> \"$1\") &\nsleep 30\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" > hook.pid\nprintf 'slow\\n' >> \"$1\"\n(trap '' TERM; exec 3>\"$2\"; printf 'ready\\n' >&3; sleep 30) &\nwait\n",
         );
         let later = executable_hook(
             &format!(
@@ -3577,16 +3580,48 @@ scope = "tab"
         };
         let started = tokio::time::Instant::now();
 
-        run_event(
+        run_event_with_timeout(
             &registry,
             Path::new("/opt/fut/bin/fut"),
             Path::new("/tmp/fut.sock"),
             &event,
+            hook_timeout,
         )
         .await;
 
-        assert!(started.elapsed() >= HOOK_TIMEOUT);
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(started.elapsed() >= hook_timeout);
+        let pid: libc::pid_t = fs::read_to_string(slow.path().join("hook.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: signal zero only checks whether the recorded hook process exists.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+
+        // The TERM-ignoring descendant and its sleep hold the writer open until
+        // killed. Readiness followed by EOF proves cleanup without waiting for
+        // an orphan's delayed side effect or for init to reap orphan zombies.
+        let mut observed = Vec::new();
+        timeout(Duration::from_secs(1), async {
+            let mut buffer = [0; 64];
+            loop {
+                match pipe.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => observed.extend_from_slice(&buffer[..count]),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    Err(error) => panic!("read descendant lifecycle pipe: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("hook descendants still hold the pipe open after timeout cleanup");
+        assert_eq!(observed, b"ready\n");
         assert_eq!(fs::read_to_string(output.path()).unwrap(), "slow\nlater\n");
     }
 

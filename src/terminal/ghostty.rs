@@ -163,6 +163,7 @@ pub(super) struct GhosttyTerminal {
     revision: u64,
     synchronized_output_started: Option<Instant>,
     copy_modes: HashMap<ClientId, ClientCopyState>,
+    max_copy_cells: usize,
 }
 
 impl GhosttyTerminal {
@@ -170,11 +171,21 @@ impl GhosttyTerminal {
         size: TerminalSize,
         writer: Arc<Mutex<Box<dyn Write + Send>>>,
     ) -> Result<Self> {
+        Self::new_with_limits(size, writer, 10_000, MAX_COPY_CELLS)
+    }
+
+    // Keep unit fixtures small while exercising the same pruning and copy checks.
+    fn new_with_limits(
+        size: TerminalSize,
+        writer: Arc<Mutex<Box<dyn Write + Send>>>,
+        max_scrollback: usize,
+        max_copy_cells: usize,
+    ) -> Result<Self> {
         validate_size(size)?;
         let mut terminal = Terminal::new(TerminalOptions {
             cols: size.columns,
             rows: size.rows,
-            max_scrollback: 10_000,
+            max_scrollback,
         })?;
         graphics::set_png_decoder(Some(Box::new(graphics::RustPngDecoder::default())))?;
         terminal.set_kitty_image_storage_limit(KITTY_IMAGE_STORAGE_BYTES)?;
@@ -215,6 +226,7 @@ impl GhosttyTerminal {
             revision: 0,
             synchronized_output_started: None,
             copy_modes: HashMap::new(),
+            max_copy_cells,
         })
     }
 
@@ -913,7 +925,7 @@ impl GhosttyTerminal {
             .copy_modes
             .get(&owner)
             .ok_or(CopyModeError::NotActive)?;
-        validate_copy_cells(self.copy_selection_cell_span(state)?)?;
+        validate_copy_cells(self.copy_selection_cell_span(state)?, self.max_copy_cells)?;
         let cursor = state
             .cursor
             .snapshot(&self.terminal)?
@@ -943,7 +955,7 @@ impl GhosttyTerminal {
             .cursor
             .point(PointSpace::Screen)?
             .ok_or(CopyModeError::CursorLost)?;
-        selection_cell_span(start, end, self.size.columns)
+        selection_cell_span(start, end, self.size.columns, self.max_copy_cells)
     }
 
     fn format_copy_selection(
@@ -971,7 +983,7 @@ impl GhosttyTerminal {
             .with_trim(true)
             .with_selection(&selection);
         let mut output = vec![0; MAX_COPY_BYTES];
-        validate_copy_cells(self.copy_selection_cell_span(state)?)?;
+        validate_copy_cells(self.copy_selection_cell_span(state)?, self.max_copy_cells)?;
         let written = match self.terminal.format_selection_buf(options, &mut output) {
             Ok(Some(written)) => {
                 validate_copy_size(written)?;
@@ -1684,12 +1696,9 @@ fn validate_copy_size(actual: usize) -> std::result::Result<(), CopyModeError> {
     }
 }
 
-fn validate_copy_cells(actual: usize) -> std::result::Result<(), CopyModeError> {
-    if actual > MAX_COPY_CELLS {
-        Err(CopyModeError::CopySpanTooLarge {
-            actual,
-            maximum: MAX_COPY_CELLS,
-        })
+fn validate_copy_cells(actual: usize, maximum: usize) -> std::result::Result<(), CopyModeError> {
+    if actual > maximum {
+        Err(CopyModeError::CopySpanTooLarge { actual, maximum })
     } else {
         Ok(())
     }
@@ -1699,6 +1708,7 @@ fn selection_cell_span(
     left: PointCoordinate,
     right: PointCoordinate,
     columns: u16,
+    maximum: usize,
 ) -> std::result::Result<usize, CopyModeFailure> {
     let (start, end) = if point_before(right, left) {
         (right, left)
@@ -1715,14 +1725,14 @@ fn selection_cell_span(
     let Some(start) = index(start) else {
         return Err(CopyModeError::CopySpanTooLarge {
             actual: usize::MAX,
-            maximum: MAX_COPY_CELLS,
+            maximum,
         }
         .into());
     };
     let Some(end) = index(end) else {
         return Err(CopyModeError::CopySpanTooLarge {
             actual: usize::MAX,
-            maximum: MAX_COPY_CELLS,
+            maximum,
         }
         .into());
     };
@@ -1731,7 +1741,7 @@ fn selection_cell_span(
         .ok_or_else(|| {
             CopyModeError::CopySpanTooLarge {
                 actual: usize::MAX,
-                maximum: MAX_COPY_CELLS,
+                maximum,
             }
             .into()
         })
@@ -3304,17 +3314,19 @@ mod tests {
 
     #[test]
     fn copy_revalidates_a_selection_expanded_by_reflow() {
-        const HARD_LINES: usize = 1_005;
+        const COPY_CELLS: usize = 9;
 
-        let mut terminal = terminal(249, 2);
-        let mut contents = String::with_capacity(HARD_LINES * 3);
-        for line in 0..HARD_LINES {
-            if line > 0 {
-                contents.push_str("\r\n");
-            }
-            contents.push('x');
-        }
-        terminal.feed(contents.as_bytes()).unwrap().unwrap();
+        let mut terminal = GhosttyTerminal::new_with_limits(
+            TerminalSize {
+                columns: 4,
+                rows: 2,
+            },
+            Arc::new(Mutex::new(Box::new(io::sink()))),
+            16,
+            COPY_CELLS,
+        )
+        .unwrap();
+        terminal.feed(b"x\r\nx\r\nx").unwrap().unwrap();
 
         let owner = ClientId::new();
         copy_action(&mut terminal, owner, CopyModeAction::Begin);
@@ -3342,26 +3354,24 @@ mod tests {
         let before = terminal
             .copy_selection_cell_span(&terminal.copy_modes[&owner])
             .unwrap();
-        assert!(before <= MAX_COPY_CELLS);
+        assert_eq!(before, COPY_CELLS);
+        assert_eq!(terminal.format_copy_selection(owner).unwrap(), "x\nx\nx");
 
         terminal
             .resize(TerminalSize {
-                columns: 1_100,
+                columns: 5,
                 rows: 2,
             })
             .unwrap();
         let expanded = terminal
             .copy_selection_cell_span(&terminal.copy_modes[&owner])
             .unwrap();
-        assert!(
-            expanded > MAX_COPY_CELLS,
-            "selection span changed from {before} to {expanded} cells"
-        );
+        assert_eq!(expanded, 11);
         assert!(matches!(
             terminal.copy_mode(owner, CopyModeAction::Copy, None),
             Err(CopyModeFailure::Semantic(CopyModeError::CopySpanTooLarge {
                 actual,
-                maximum: MAX_COPY_CELLS,
+                maximum: COPY_CELLS,
             })) if actual == expanded
         ));
     }
@@ -3519,7 +3529,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_and_scrollback_pruning_invalidate_tracked_copy_refs() {
+    fn reset_invalidates_tracked_copy_refs() {
         let owner = ClientId::new();
         let mut reset = terminal(8, 2);
         reset.feed(b"reset me").unwrap().unwrap();
@@ -3536,17 +3546,35 @@ mod tests {
             Err(CopyModeFailure::CursorLost { .. })
         ));
         assert!(!reset.copy_modes.contains_key(&owner));
+    }
 
+    #[test]
+    fn scrollback_pruning_invalidates_tracked_copy_refs() {
         let owner = ClientId::new();
-        let mut pruned = terminal(4, 2);
+        let mut pruned = GhosttyTerminal::new_with_limits(
+            TerminalSize {
+                columns: 256,
+                rows: 2,
+            },
+            Arc::new(Mutex::new(Box::new(io::sink()))),
+            1,
+            MAX_COPY_CELLS,
+        )
+        .unwrap();
         pruned.feed(b"old").unwrap().unwrap();
         copy_action(&mut pruned, owner, CopyModeAction::Begin);
-        let mut output = String::new();
-        for index in 0..10_050 {
-            use std::fmt::Write as _;
-            writeln!(&mut output, "{index:04}").unwrap();
-        }
-        pruned.feed(output.as_bytes()).unwrap().unwrap();
+        pruned.feed(b"\r\none\r\ntwo").unwrap().unwrap();
+        assert!(pruned.terminal.scrollback_rows().unwrap() > 0);
+        assert!(pruned.copy_modes[&owner].cursor.has_value());
+        pruned.copy_mode_snapshot(owner, None).unwrap();
+
+        // Nonzero scrollback retains at least two Ghostty pages. Wider rows
+        // fill those pages with hundreds of lines instead of thousands.
+        pruned
+            .feed("\r\nx".repeat(512).as_bytes())
+            .unwrap()
+            .unwrap();
+        assert!(!pruned.copy_modes[&owner].cursor.has_value());
         assert!(matches!(
             pruned.copy_mode(
                 owner,
@@ -3780,9 +3808,9 @@ mod tests {
 
     #[test]
     fn copy_payload_limit_is_explicit_and_never_truncates() {
-        assert_eq!(validate_copy_cells(MAX_COPY_CELLS), Ok(()));
+        assert_eq!(validate_copy_cells(MAX_COPY_CELLS, MAX_COPY_CELLS), Ok(()));
         assert_eq!(
-            validate_copy_cells(MAX_COPY_CELLS + 1),
+            validate_copy_cells(MAX_COPY_CELLS + 1, MAX_COPY_CELLS),
             Err(CopyModeError::CopySpanTooLarge {
                 actual: MAX_COPY_CELLS + 1,
                 maximum: MAX_COPY_CELLS,

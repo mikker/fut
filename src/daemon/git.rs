@@ -346,6 +346,19 @@ mod tests {
         assert!(state.complete(&current));
     }
 
+    #[test]
+    fn unchanged_workspaces_refresh_only_after_the_interval() {
+        let mut state = RefreshState::default();
+        let workspace_id = WorkspaceId::new();
+        let roots = BTreeMap::from([(workspace_id, PathBuf::from("/repository"))]);
+        let initial = state.reconcile(&roots).remove(0);
+        assert!(state.complete(&initial));
+        assert!(state.reconcile(&roots).is_empty());
+
+        state.entries.get_mut(&workspace_id).unwrap().requested = Instant::now() - REFRESH_INTERVAL;
+        assert_eq!(state.reconcile(&roots).len(), 1);
+    }
+
     #[tokio::test]
     async fn status_reads_a_repository_and_non_git_is_empty() {
         let repository = TempDir::new().expect("temporary repository");
@@ -367,5 +380,8 @@ mod tests {
             })
         );
         assert_eq!(status(&root.join("missing")).await, None);
+
+        fs::rename(root.join(".git"), root.join("git-hidden")).expect("hide Git metadata");
+        assert_eq!(status(root).await, None);
     }
 }
