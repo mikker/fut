@@ -131,6 +131,7 @@ struct RuntimeEntry {
 struct SharedState {
     resources: ResourceTree,
     runtimes: HashMap<TerminalId, RuntimeEntry>,
+    automatic_agent_owners: HashMap<TerminalId, u32>,
     presence: ClientPresence,
     expected_finalizations: HashSet<TerminalId>,
     exited_terminals: VecDeque<(TerminalId, Option<i32>)>,
@@ -499,11 +500,38 @@ impl SharedState {
         Ok(())
     }
 
-    fn reporter_belongs_to_terminal(&self, terminal_id: TerminalId, peer_pid: Option<u32>) -> bool {
+    fn report_automatic_agent(
+        &mut self,
+        terminal_id: TerminalId,
+        report: AgentReport,
+        metadata: crate::domain::AgentReportMetadata,
+        agent_pid: u32,
+    ) -> Result<(), DaemonError> {
+        self.report_agent(terminal_id, report, metadata)?;
+        if report == AgentReport::Exited {
+            self.automatic_agent_owners.remove(&terminal_id);
+        } else {
+            self.automatic_agent_owners.insert(terminal_id, agent_pid);
+        }
+        Ok(())
+    }
+
+    fn report_external_agent(
+        &mut self,
+        terminal_id: TerminalId,
+        report: AgentReport,
+        metadata: crate::domain::AgentReportMetadata,
+    ) -> Result<(), DaemonError> {
+        self.report_agent(terminal_id, report, metadata)?;
+        self.automatic_agent_owners.remove(&terminal_id);
+        Ok(())
+    }
+
+    fn automatic_agent_owner(&self, terminal_id: TerminalId, peer_pid: Option<u32>) -> Option<u32> {
         self.runtimes
             .get(&terminal_id)
             .zip(peer_pid)
-            .is_some_and(|(runtime, pid)| process::is_descendant(pid, runtime.handle.child_pid()))
+            .and_then(|(runtime, pid)| process::descendant_root(pid, runtime.handle.child_pid()))
     }
 
     fn acknowledge_agent(
@@ -683,6 +711,7 @@ impl SharedState {
         };
         let mutation = self.resources.terminal_exited(terminal_id)?;
         self.runtimes.remove(&terminal_id);
+        self.automatic_agent_owners.remove(&terminal_id);
         self.alerts.remove_terminal(terminal_id);
         self.publish_alert_change();
         self.exited_terminals.push_back((terminal_id, exit_code));
@@ -1701,6 +1730,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     let mut state = SharedState {
         resources: ResourceTree::default(),
         runtimes: HashMap::new(),
+        automatic_agent_owners: HashMap::new(),
         presence: ClientPresence::default(),
         expected_finalizations: HashSet::new(),
         exited_terminals: VecDeque::new(),
@@ -1946,6 +1976,24 @@ async fn refresh_process_names(
         .map(|observation| observation.terminal_id)
         .collect::<HashSet<_>>();
     codex.retain(|terminal_id, _| live.contains(terminal_id));
+    let exited_automatic_agents = state
+        .automatic_agent_owners
+        .iter()
+        .filter_map(|(terminal_id, owner_pid)| {
+            let owner_is_live = state.runtimes.get(terminal_id).is_some_and(|runtime| {
+                process::is_descendant(*owner_pid, runtime.handle.child_pid())
+            });
+            (!owner_is_live).then_some(*terminal_id)
+        })
+        .collect::<Vec<_>>();
+    for terminal_id in exited_automatic_agents {
+        state.automatic_agent_owners.remove(&terminal_id);
+        let _ = state.report_agent(
+            terminal_id,
+            AgentReport::Exited,
+            crate::domain::AgentReportMetadata::default(),
+        );
+    }
     for observation in observations {
         let ProcessObservation {
             terminal_id,
@@ -3673,16 +3721,6 @@ async fn control_loop(
         {
             continue;
         }
-        if let ClientMessage::ReportTerminalAgent { terminal_id, .. } = &envelope.message
-            && !shared
-                .lock()
-                .await
-                .reporter_belongs_to_terminal(*terminal_id, connection.peer_pid)
-        {
-            send_error(connection, envelope.request_id, "invalid_agent_context",
-                "automatic agent reports must originate in the target terminal; external controllers must pass --terminal-id explicitly").await?;
-            continue;
-        }
         match envelope.message {
             ClientMessage::Ping => {
                 send(
@@ -4097,30 +4135,33 @@ async fn control_loop(
                 terminal_id,
                 report,
                 metadata,
-            } | ClientMessage::ReportTerminalAgent {
+            } => {
+                let result = shared.lock().await.report_external_agent(
+                    terminal_id,
+                    report,
+                    metadata,
+                );
+                send_agent_report_result(connection, envelope.request_id, result).await?;
+            }
+            ClientMessage::ReportTerminalAgent {
                 terminal_id,
                 report,
                 metadata,
             } => {
+                let agent_pid = shared
+                    .lock()
+                    .await
+                    .automatic_agent_owner(terminal_id, connection.peer_pid);
+                let Some(agent_pid) = agent_pid else {
+                    send_error(connection, envelope.request_id, "invalid_agent_context",
+                        "automatic agent reports must originate in the target terminal; external controllers must pass --terminal-id explicitly").await?;
+                    continue;
+                };
                 let result = shared
                     .lock()
                     .await
-                    .report_agent(terminal_id, report, metadata);
-                match result {
-                    Ok(()) => {
-                        send(
-                            connection,
-                            envelope.request_id,
-                            ServerMessage::CommandCompleted {
-                                command: AcknowledgedCommand::ReportAgent,
-                            },
-                        )
-                        .await?
-                    }
-                    Err(error) => {
-                        send_error(connection, envelope.request_id, error.code, &error.message).await?
-                    }
-                }
+                    .report_automatic_agent(terminal_id, report, metadata, agent_pid);
+                send_agent_report_result(connection, envelope.request_id, result).await?;
             }
             ClientMessage::AcknowledgeAgent {
                 terminal_id,
@@ -6516,6 +6557,26 @@ async fn reject_fire_and_forget_request_id(
     Ok(true)
 }
 
+async fn send_agent_report_result(
+    connection: &mut ClientConnection,
+    request_id: Option<Uuid>,
+    result: Result<(), DaemonError>,
+) -> Result<()> {
+    match result {
+        Ok(()) => {
+            send(
+                connection,
+                request_id,
+                ServerMessage::CommandCompleted {
+                    command: AcknowledgedCommand::ReportAgent,
+                },
+            )
+            .await
+        }
+        Err(error) => send_error(connection, request_id, error.code, &error.message).await,
+    }
+}
+
 fn fire_and_forget_operation(message: &ClientMessage) -> Option<&'static str> {
     match message {
         ClientMessage::MouseInput { .. } => Some("mouse input"),
@@ -7445,6 +7506,7 @@ mod tests {
             SharedState {
                 resources,
                 runtimes: HashMap::new(),
+                automatic_agent_owners: HashMap::new(),
                 presence: ClientPresence::default(),
                 expected_finalizations: HashSet::new(),
                 exited_terminals: VecDeque::new(),
@@ -8239,6 +8301,7 @@ scope = "workspace"
         let mut state = SharedState {
             resources: ResourceTree::default(),
             runtimes: HashMap::new(),
+            automatic_agent_owners: HashMap::new(),
             presence: ClientPresence::default(),
             expected_finalizations: HashSet::new(),
             exited_terminals: VecDeque::new(),

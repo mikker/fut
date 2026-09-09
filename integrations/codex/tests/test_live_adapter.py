@@ -245,6 +245,33 @@ class LiveAdapterTests(unittest.TestCase):
         )
         self.assertEqual(self.agent()["activity"], original)
 
+    def test_agent_integration_exits_with_its_reporting_codex_process(self) -> None:
+        codex = Path(self.temporary.name) / "codex"
+        source = codex.with_suffix(".c")
+        ready = Path(self.temporary.name) / "codex-ready"
+        source.write_text(
+            '#include <stdlib.h>\nint main(int argc, char **argv) { return system(argv[1]); }\n'
+        )
+        subprocess.run(["cc", str(source), "-o", str(codex)], check=True)
+        script = shlex.join([FUT, "agent", "report", "working", "--source", "codex"])
+        script += f" && touch {shlex.quote(str(ready))} && sleep 2"
+        self.cli("terminal", "run", self.terminal_id, shlex.join([str(codex), script]))
+
+        deadline = time.monotonic() + 3
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(ready.exists(), "fake Codex process did not report")
+        self.assertEqual(self.agent()["activity"]["state"], "working")
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            agents = self.cli("agent", "list")["result"]["agents"]
+            if all(agent["terminal_id"] != self.terminal_id for agent in agents):
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("exited Codex process remained an active agent")
+
     def test_real_report_get_and_wait_surface_observes_native_transitions(self) -> None:
         self.hook("SessionStart", turn_id=None)
         agent = self.agent()

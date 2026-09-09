@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Trusted command programs in `config.toml` now support `~/` home-directory expansion.
+- Agent activity now clears when an integrated agent exits and another process takes over its terminal.
 
 ## 0.18
 

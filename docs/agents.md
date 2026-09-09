@@ -197,7 +197,9 @@ fut agent report exited
 
 The terminal defaults to `FUT_TERMINAL_ID`; outside that environment pass
 `--terminal-id`. `fut terminal report` remains a compatibility alias and
-accepts the same metadata.
+accepts the same metadata. Reports using inherited terminal context are owned
+by the reporting command's live process branch, so the integration exits when
+that agent process ends even if it cannot send a final `exited` report.
 
 Completion and blocked reports create daemon-wide unread attention. Use `Ctrl-b u`
 to list waiting terminals and `Ctrl-b Ctrl-b` to jump to the next one. Rendering a

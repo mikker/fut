@@ -5029,8 +5029,14 @@ async fn interactive_tab_view_streams_all_panes_with_per_client_focus() {
             .collect::<Vec<_>>(),
         [terminal_a, pane_b.terminal_id]
     );
-    snapshot_containing(&mut first, terminal_a, "VIEW_A_READY").await;
-    snapshot_containing(&mut first, pane_b.terminal_id, "VIEW_B_READY").await;
+    snapshots_containing_all(
+        &mut first,
+        &[
+            (terminal_a, "VIEW_A_READY"),
+            (pane_b.terminal_id, "VIEW_B_READY"),
+        ],
+    )
+    .await;
 
     let ServerMessage::PaneCreated { selected: pane_c } = harness
         .control_command(ClientMessage::CreatePane {
@@ -14745,6 +14751,32 @@ async fn snapshot_containing(
         ServerMessage::Snapshot { screen, .. } => screen,
         _ => unreachable!(),
     }
+}
+
+async fn snapshots_containing_all(connection: &mut Connection, expected: &[(TerminalId, &str)]) {
+    let mut remaining = expected.iter().copied().collect::<HashMap<_, _>>();
+    time::timeout(DEADLINE, async {
+        while !remaining.is_empty() {
+            let message = receive(connection)
+                .await
+                .expect("daemon disconnected while waiting for snapshots");
+            let ServerMessage::Snapshot {
+                terminal_id,
+                screen,
+            } = message
+            else {
+                continue;
+            };
+            if remaining
+                .get(&terminal_id)
+                .is_some_and(|needle| snapshot_text(&screen).contains(needle))
+            {
+                remaining.remove(&terminal_id);
+            }
+        }
+    })
+    .await
+    .expect("matching protocol snapshots timed out");
 }
 
 async fn snapshot_with_size(
