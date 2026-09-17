@@ -16,6 +16,9 @@ Or [install with Homebrew](https://github.com/mikker/homebrew-tap):
 brew install mikker/tap/fut
 ```
 
+Or add the flake to a NixOS, nix-darwin, or home-manager config; see the
+[Nix install section](https://fut.sh#nix) for details.
+
 [Documentation](https://fut.sh)
 
 ## Quick start

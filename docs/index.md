@@ -37,6 +37,42 @@ Or install on macOS with Homebrew:
 brew install mikker/tap/fut
 ```
 
+### Nix
+
+Or add the flake (`inputs.fut.url = "github:mikker/fut";`) to a NixOS,
+nix-darwin, or home-manager config:
+
+```nix
+# NixOS
+nixpkgs.lib.nixosSystem {
+  modules = [
+    fut.nixosModules.default
+    { programs.fut.enable = true; }
+  ];
+};
+```
+
+```nix
+# nix-darwin
+darwin.lib.darwinSystem {
+  modules = [
+    fut.darwinModules.default
+    { programs.fut.enable = true; }
+  ];
+};
+```
+
+```nix
+# home-manager
+{
+  imports = [ fut.homeManagerModules.default ];
+  programs.fut.enable = true;
+  programs.fut.settings.alerts.signal_outer_terminal = true;
+}
+```
+
+`nix build github:mikker/fut` or `nix profile install github:mikker/fut` also work directly.
+
 ## Docs
 
 - [Using Fut](usage.md)
