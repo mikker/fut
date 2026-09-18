@@ -44,6 +44,7 @@ before changing configuration or closing anything.
 
 ## Agent integrations
 
-Fut can show native lifecycle activity from Claude Code, Codex, and Pi. See the
-dedicated setup guides for [Claude Code](https://fut.sh/agents/claude-code/),
-[Codex](https://fut.sh/agents/codex/), and [Pi](https://fut.sh/agents/pi/).
+Fut can show native lifecycle activity from Antigravity, Claude Code, Codex,
+and Pi. See the dedicated setup guides for [Antigravity](https://fut.sh/agents/agy/),
+[Claude Code](https://fut.sh/agents/claude-code/), [Codex](https://fut.sh/agents/codex/),
+and [Pi](https://fut.sh/agents/pi/).

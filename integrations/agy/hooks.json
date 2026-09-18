@@ -1,0 +1,42 @@
+{
+  "fut-lifecycle": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "./scripts/report.sh working",
+        "timeout": 2
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "ask_question",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/report.sh blocked",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "ask_question",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/report.sh working",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "./scripts/report.sh completed",
+        "timeout": 2
+      }
+    ]
+  }
+}

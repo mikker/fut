@@ -46,15 +46,16 @@ installed Fut release.
 
 Fut ships first-party lifecycle adapters for:
 
+- [Antigravity](agents/agy.md)
 - [Claude Code](agents/claude-code.md)
 - [Codex](agents/codex.md)
 - [Pi](agents/pi.md)
 
-Claude Code and Codex require their Fut plugin; Codex also requires the
-documented `notify` command setting for authoritative turn completion. Follow
-the linked installation guides, restart the agent, and launch it inside Fut. A
-screen-based Codex fallback exists, but explicit lifecycle reports are more
-reliable and take precedence.
+Antigravity, Claude Code, and Codex require their Fut plugin; Codex also
+requires the documented `notify` command setting for authoritative turn
+completion. Follow the linked installation guides, restart the agent, and launch
+it inside Fut. A screen-based Codex fallback exists, but explicit lifecycle
+reports are more reliable and take precedence.
 
 ## Control integrated agents
 

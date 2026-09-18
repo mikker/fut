@@ -41,6 +41,7 @@ brew install mikker/tap/fut
 
 - [Using Fut](usage.md)
 - [Agent activity](agents.md)
+  - [Antigravity](agents/agy.md)
   - [Claude Code](agents/claude-code.md)
   - [Codex](agents/codex.md)
   - [Pi](agents/pi.md)

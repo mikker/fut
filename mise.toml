@@ -69,7 +69,7 @@ run = "scripts/extension-conformance"
 
 [tasks."test:aux"]
 description = "Run fast adapter and extension checks without building Rust"
-depends = ["test:pi", "test:claude", "test:codex", "test:run", "test:wt"]
+depends = ["test:pi", "test:claude", "test:codex", "test:agy", "test:run", "test:wt"]
 
 [tasks."test:pi"]
 run = "node --test integrations/pi/tests/fut.test.ts"
@@ -79,6 +79,9 @@ run = "python3 integrations/claude-code/tests/test_adapter.py"
 
 [tasks."test:codex"]
 run = "python3 integrations/codex/tests/test_adapter.py"
+
+[tasks."test:agy"]
+run = "python3 integrations/agy/tests/test_adapter.py"
 
 [tasks."test:run"]
 run = "python3 extensions/run/test/unit"

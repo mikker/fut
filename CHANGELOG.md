@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added a lifecycle-only Google Antigravity (AGY) plugin for reporting agent activity to Fut.
+
 ## 0.24
 
 - Fixed shell redraws, including zsh autosuggestions, by advertising a portable terminal type inside Fut.
