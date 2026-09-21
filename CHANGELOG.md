@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fut now records daemon lifecycle and failures in a bounded rotating log whose path is shown by `fut doctor`.
+
 ## 0.24
 
 - Fixed shell redraws, including zsh autosuggestions, by advertising a portable terminal type inside Fut.

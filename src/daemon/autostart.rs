@@ -1,8 +1,10 @@
 use std::{
-    fs::OpenOptions,
-    os::unix::process::CommandExt,
-    path::Path,
+    fs::{self, File, OpenOptions},
+    io::{self, Write},
+    os::unix::{fs::OpenOptionsExt, process::CommandExt},
+    path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -21,6 +23,85 @@ use super::path::{prepare_runtime_dir, runtime_dir};
 
 const START_DEADLINE: Duration = Duration::from_secs(5);
 const PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+pub const DAEMON_LOG_ROTATE_BYTES: u64 = 1024 * 1024;
+
+#[derive(Clone)]
+pub struct RotatingDaemonLog {
+    state: Arc<RotatingDaemonLogState>,
+}
+
+struct RotatingDaemonLogState {
+    path: PathBuf,
+    writes: Mutex<()>,
+}
+
+impl RotatingDaemonLog {
+    pub fn at(path: PathBuf) -> Self {
+        Self {
+            state: Arc::new(RotatingDaemonLogState {
+                path,
+                writes: Mutex::new(()),
+            }),
+        }
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RotatingDaemonLog {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl Write for RotatingDaemonLog {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let _guard = self
+            .state
+            .writes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let written = buffer.len();
+        let buffer = &buffer[buffer
+            .len()
+            .saturating_sub(DAEMON_LOG_ROTATE_BYTES as usize)..];
+        let mut file = open_daemon_log(&self.state.path, buffer.len() as u64)?;
+        file.write_all(buffer)?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+pub fn daemon_log_path(socket: &Path) -> Result<PathBuf> {
+    Ok(runtime_dir(socket)?.join("fut-daemon.log"))
+}
+
+pub fn rotated_daemon_log_path(log: &Path) -> PathBuf {
+    log.with_file_name("fut-daemon.log.1")
+}
+
+fn open_daemon_log(path: &Path, incoming_bytes: u64) -> io::Result<File> {
+    if fs::metadata(path).is_ok_and(|metadata| {
+        metadata.len() >= DAEMON_LOG_ROTATE_BYTES
+            || metadata.len().saturating_add(incoming_bytes) > DAEMON_LOG_ROTATE_BYTES
+    }) {
+        let rotated = rotated_daemon_log_path(path);
+        match fs::remove_file(&rotated) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        fs::rename(path, rotated)?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProtocolProbe {
@@ -48,13 +129,10 @@ pub async fn ensure_daemon(
         ProtocolProbe::Occupied => false,
         ProtocolProbe::Unavailable => true,
     };
-    let log_path = runtime_dir(socket)?.join("fut-daemon.log");
+    let log_path = daemon_log_path(socket)?;
     if should_start {
         prepare_runtime_dir(socket)?;
-        let stdout = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
+        let stdout = open_daemon_log(&log_path, 0)
             .with_context(|| format!("open daemon log {}", log_path.display()))?;
         let stderr = stdout.try_clone()?;
         let mut command = Command::new(std::env::current_exe().context("locate fut executable")?);
@@ -71,6 +149,7 @@ pub async fn ensure_daemon(
             .arg("run")
             .arg("--cwd")
             .arg(cwd)
+            .arg("--log-file")
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
@@ -218,5 +297,22 @@ mod tests {
         );
         assert!(!temporary.path().join("fut-daemon.log").exists());
         server.abort();
+    }
+
+    #[test]
+    fn daemon_log_keeps_one_bounded_rotated_generation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("fut-daemon.log");
+        let mut log = RotatingDaemonLog::at(path.clone());
+        let full = vec![b'x'; DAEMON_LOG_ROTATE_BYTES as usize];
+
+        log.write_all(&full).unwrap();
+        log.write_all(b"next\n").unwrap();
+
+        assert_eq!(
+            fs::metadata(rotated_daemon_log_path(&path)).unwrap().len(),
+            DAEMON_LOG_ROTATE_BYTES
+        );
+        assert_eq!(fs::read(path).unwrap(), b"next\n");
     }
 }

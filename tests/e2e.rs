@@ -833,6 +833,24 @@ async fn terminal_uses_portable_term_when_daemon_has_no_term() {
 }
 
 #[tokio::test]
+async fn daemon_logs_termination_signal_and_shuts_down_cleanly() {
+    let mut harness = Harness::start("while IFS= read -r line; do :; done").await;
+
+    // SAFETY: this PID belongs to the daemon child owned by the harness.
+    assert_eq!(
+        unsafe { libc::kill(harness.daemon.id() as _, libc::SIGTERM) },
+        0
+    );
+    harness.wait_until_exited().await;
+
+    let logs = harness.logs();
+    assert!(logs.contains("daemon starting"), "{logs}");
+    assert!(logs.contains("daemon shutting down"), "{logs}");
+    assert!(logs.contains("SIGTERM"), "{logs}");
+    assert!(logs.contains("daemon stopped"), "{logs}");
+}
+
+#[tokio::test]
 async fn agent_reports_validate_inherited_context_and_allow_explicit_external_targets() {
     let harness = Harness::start("env > fut-env; while IFS= read -r line; do :; done").await;
     let initial = harness.resources().await;
@@ -13201,6 +13219,7 @@ fn public_doctor_is_read_only_and_json_reports_configuration_errors() {
     );
     let human = String::from_utf8(healthy.stdout).unwrap();
     assert!(human.contains("Fut doctor"));
+    assert!(human.contains(&runtime.join("fut-daemon.log").display().to_string()));
     assert!(human.contains("active font cannot be detected") || human.contains("visually verify"));
     assert!(!runtime.exists(), "doctor created the runtime directory");
 

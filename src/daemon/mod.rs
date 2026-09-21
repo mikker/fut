@@ -32,6 +32,7 @@ use futures_util::{
 use regex::Regex;
 use tokio::{
     net::{UnixListener, UnixStream},
+    signal::unix::{Signal, SignalKind, signal},
     sync::{Mutex, Notify, broadcast, mpsc, watch},
     task::{JoinHandle, JoinSet},
     time::{Duration, timeout},
@@ -1690,6 +1691,7 @@ fn watch_attachment(
 
 /// Bind Fut's sole socket and run while at least one session is alive.
 pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
+    let mut termination = DaemonTerminationSignals::subscribe()?;
     let config_location = config.config_location;
     let loaded_extensions = global_config::load_extensions_location(&config_location)?;
     let projects = global_config::load_projects_location(&config_location)?;
@@ -1796,17 +1798,20 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     let mut connections = JoinSet::new();
     let writers = WriterTasks::default();
 
-    loop {
+    let shutdown_reason = loop {
         tokio::select! {
             biased;
+            signal = termination.recv() => {
+                break signal;
+            }
             Some(terminal_id) = exited_rx.recv() => {
                 if finalize_terminal(&shared, terminal_id).await {
-                    break;
+                    break "last terminal exited";
                 }
             }
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
-                    break;
+                    break "shutdown requested";
                 }
             }
             accepted = socket.listener.accept() => {
@@ -1828,7 +1833,8 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
                 }
             }
         }
-    }
+    };
+    tracing::info!(reason = shutdown_reason, "daemon shutting down");
     shutdown_tx.send_replace(true);
     let _ = process_names.await;
     let _ = git_metadata.await;
@@ -1867,6 +1873,33 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
         hooks.abort();
     }
     Ok(())
+}
+
+struct DaemonTerminationSignals {
+    interrupt: Signal,
+    terminate: Signal,
+    hangup: Signal,
+    quit: Signal,
+}
+
+impl DaemonTerminationSignals {
+    fn subscribe() -> io::Result<Self> {
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+            hangup: signal(SignalKind::hangup())?,
+            quit: signal(SignalKind::quit())?,
+        })
+    }
+
+    async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.interrupt.recv() => "SIGINT",
+            _ = self.terminate.recv() => "SIGTERM",
+            _ = self.hangup.recv() => "SIGHUP",
+            _ = self.quit.recv() => "SIGQUIT",
+        }
+    }
 }
 
 fn watch_process_names(shared: Shared, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {

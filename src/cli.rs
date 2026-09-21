@@ -40,7 +40,7 @@ use crate::{
     client,
     daemon::{
         DaemonConfig,
-        autostart::{ensure_daemon, protocol_ready},
+        autostart::{RotatingDaemonLog, daemon_log_path, ensure_daemon, protocol_ready},
         path::socket_path,
         run_daemon,
     },
@@ -808,6 +808,9 @@ enum DaemonCommand {
         /// Initial child working directory; defaults to the current directory.
         #[arg(long, value_hint = ValueHint::DirPath)]
         cwd: Option<PathBuf>,
+        /// Write daemon diagnostics to the bounded runtime log.
+        #[arg(long, hide = true)]
+        log_file: bool,
         /// Initial child program and its direct argv, following `--`; defaults to the shell.
         #[arg(last = true, value_hint = ValueHint::CommandWithArguments)]
         command: Vec<String>,
@@ -2163,7 +2166,12 @@ async fn execute(cli: Cli) -> Result<()> {
             )
         }
         Some(Command::Daemon {
-            command: DaemonCommand::Run { cwd, command },
+            command:
+                DaemonCommand::Run {
+                    cwd,
+                    log_file,
+                    command,
+                },
         }) => {
             let cwd = cwd.unwrap_or(std::env::current_dir()?);
             let mut config = DaemonConfig::shell(socket, cwd, config_location);
@@ -2172,7 +2180,34 @@ async fn execute(cli: Cli) -> Result<()> {
                 config.spawn.argv = command[1..].to_vec();
                 config.recipe_command_override = true;
             }
-            run_daemon(config).await
+            let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+            if log_file {
+                let writer = RotatingDaemonLog::at(daemon_log_path(&config.socket_path)?);
+                let _ = tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_ansi(false)
+                    .with_writer(writer)
+                    .try_init();
+            } else {
+                let _ = tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_ansi(false)
+                    .try_init();
+            }
+            tracing::info!(
+                version = BUILD_VERSION,
+                pid = std::process::id(),
+                socket = %config.socket_path.display(),
+                cwd = %config.spawn.cwd.display(),
+                "daemon starting"
+            );
+            let result = run_daemon(config).await;
+            match &result {
+                Ok(()) => tracing::info!("daemon stopped"),
+                Err(error) => tracing::error!(%error, "daemon failed"),
+            }
+            result
         }
         Some(Command::Daemon {
             command: DaemonCommand::Ping,

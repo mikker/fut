@@ -245,6 +245,21 @@ pub async fn run(socket: &Path, location: &config::ConfigLocation) -> DoctorRepo
         },
     }
 
+    if runtime.is_some()
+        && let Ok(log) = crate::daemon::autostart::daemon_log_path(socket)
+    {
+        checks.push(check(
+            "daemon_log",
+            CheckStatus::Info,
+            format!("daemon log: {}", path_text(&log)),
+            json!({
+                "path": path_text(&log),
+                "rotated_path": path_text(&crate::daemon::autostart::rotated_daemon_log_path(&log)),
+                "rotate_bytes": crate::daemon::autostart::DAEMON_LOG_ROTATE_BYTES,
+            }),
+        ));
+    }
+
     match std::fs::symlink_metadata(socket) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => checks.push(check(
             "socket",
