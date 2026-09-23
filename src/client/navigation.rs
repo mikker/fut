@@ -97,7 +97,7 @@ impl NavigationHistory {
         forward: bool,
     ) -> Option<PaneId> {
         let path = focused_path(snapshot, focused.pane_id)?;
-        let workspaces = &path.session.workspaces;
+        let workspaces = path.session.workspaces_depth_first();
         if workspaces.len() < 2 {
             return None;
         }
@@ -110,7 +110,7 @@ impl NavigationHistory {
             } else {
                 (current + workspaces.len() - offset) % workspaces.len()
             };
-            let workspace = &workspaces[index];
+            let workspace = workspaces[index];
             if !workspace.closing
                 && let Some(pane_id) = self.workspace_destination(workspace)
             {
@@ -369,6 +369,7 @@ mod tests {
                     WorkspaceSnapshot {
                         tokens: Default::default(),
                         id: WorkspaceId::new(),
+                        parent_workspace_id: None,
                         name: "main".into(),
                         root: PathBuf::from("/one/main"),
                         closing: false,
@@ -377,6 +378,7 @@ mod tests {
                     WorkspaceSnapshot {
                         tokens: Default::default(),
                         id: WorkspaceId::new(),
+                        parent_workspace_id: None,
                         name: "feature".into(),
                         root: PathBuf::from("/one/feature"),
                         closing: false,
@@ -396,6 +398,7 @@ mod tests {
                 workspaces: vec![WorkspaceSnapshot {
                     tokens: Default::default(),
                     id: WorkspaceId::new(),
+                    parent_workspace_id: None,
                     name: "main".into(),
                     root: PathBuf::from("/two/main"),
                     closing: false,
@@ -547,6 +550,22 @@ mod tests {
     #[test]
     fn adjacent_workspaces_wrap_within_the_focused_session() {
         let mut snapshot = fixture();
+        let main_id = snapshot.sessions[0].workspaces[0].id;
+        snapshot.sessions[0].workspaces[1].parent_workspace_id = Some(main_id);
+        let feature_id = snapshot.sessions[0].workspaces[1].id;
+        let mut sibling = snapshot.sessions[0].workspaces[1].clone();
+        sibling.id = WorkspaceId::new();
+        sibling.parent_workspace_id = None;
+        sibling.tabs = vec![tab("sibling", vec![pane()])];
+        let sibling_pane = sibling.tabs[0].panes[0].id;
+        let mut grandchild = snapshot.sessions[0].workspaces[1].clone();
+        grandchild.id = WorkspaceId::new();
+        grandchild.parent_workspace_id = Some(feature_id);
+        grandchild.tabs = vec![tab("grandchild", vec![pane()])];
+        let grandchild_pane = grandchild.tabs[0].panes[0].id;
+        snapshot.sessions[0]
+            .workspaces
+            .extend([sibling, grandchild]);
         let session = &snapshot.sessions[0];
         let workspace = &session.workspaces[0];
         let focused = target(
@@ -564,10 +583,26 @@ mod tests {
         );
         assert_eq!(
             history.adjacent_workspace(&snapshot, &focused, false),
-            Some(feature)
+            Some(sibling_pane)
+        );
+
+        let feature_workspace = &snapshot.sessions[0].workspaces[1];
+        let feature_focused = target(
+            &snapshot.sessions[0],
+            feature_workspace,
+            &feature_workspace.tabs[0],
+            feature_workspace.tabs[0].panes[0].clone(),
+        );
+        assert_eq!(
+            history.adjacent_workspace(&snapshot, &feature_focused, true),
+            Some(grandchild_pane),
+            "adjacent traversal follows displayed depth-first order"
         );
 
         snapshot.sessions[0].workspaces[1].closing = true;
-        assert_eq!(history.adjacent_workspace(&snapshot, &focused, true), None);
+        assert_eq!(
+            history.adjacent_workspace(&snapshot, &focused, true),
+            Some(grandchild_pane)
+        );
     }
 }

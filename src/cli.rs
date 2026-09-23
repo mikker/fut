@@ -157,6 +157,13 @@ enum Command {
         /// Name for the new session or workspace created for this location.
         #[arg(long)]
         name: Option<String>,
+        /// Nest a newly created workspace beneath this workspace in the same session.
+        #[arg(
+            long,
+            value_name = "ID",
+            add = ArgValueCompleter::new(completion::workspace_parent)
+        )]
+        parent_workspace: Option<WorkspaceId>,
         /// Open in the background without attaching.
         #[arg(short = 'b', long)]
         background: bool,
@@ -1227,6 +1234,7 @@ async fn execute(cli: Cli) -> Result<()> {
             path,
             project,
             name,
+            parent_workspace,
             background,
             command,
         }) => {
@@ -1251,6 +1259,7 @@ async fn execute(cli: Cli) -> Result<()> {
                 ClientMessage::OpenLocation {
                     project,
                     name,
+                    parent_workspace_id: parent_workspace,
                     cwd: cwd.clone(),
                     program,
                     argv,
@@ -3808,6 +3817,7 @@ async fn open_current_location_with_config(
         ClientMessage::OpenLocation {
             project: None,
             name: None,
+            parent_workspace_id: None,
             cwd: cwd.to_owned(),
             program: None,
             argv: vec![],
@@ -4411,6 +4421,7 @@ fn discover_target(snapshot: &ResourceSnapshot, id: Uuid) -> Result<serde_json::
         for workspace in &session.workspaces {
             let workspace_json = json!({
                 "id": workspace.id,
+                "parent_workspace_id": workspace.parent_workspace_id,
                 "name": workspace.name,
                 "root": workspace.root,
                 "closing": workspace.closing,
@@ -4558,11 +4569,17 @@ fn render_resource_tree(snapshot: &ResourceSnapshot) -> String {
                 .flat_map(|workspace| &workspace.tabs)
                 .flat_map(|tab| &tab.panes),
         ));
-        for workspace in &session.workspaces {
+        for workspace in session.workspaces_depth_first() {
+            let workspace_nesting = session.workspace_depth(workspace.id);
+            let workspace_depth = workspace_nesting + 1;
             let workspace_closing = session.closing || workspace.closing;
             lines.push(resource_line(
                 1,
-                &workspace.name,
+                &format!(
+                    "{}{}",
+                    session.workspace_tree_prefix(workspace.id),
+                    workspace.name
+                ),
                 workspace_closing,
                 workspace.tabs.iter().flat_map(|tab| &tab.panes),
             ));
@@ -4584,11 +4601,16 @@ fn render_resource_tree(snapshot: &ResourceSnapshot) -> String {
                 let tab_closing = workspace_closing
                     || tab.closing
                     || single_pane.is_some_and(|pane| pane.closing);
-                lines.push(resource_line(2, &label, tab_closing, &tab.panes));
+                lines.push(resource_line(
+                    workspace_depth + 1,
+                    &label,
+                    tab_closing,
+                    &tab.panes,
+                ));
                 if single_pane.is_none() {
                     for (pane_index, pane) in tab.panes.iter().enumerate() {
                         lines.push(resource_line(
-                            3,
+                            workspace_depth + 2,
                             &format!("pane {}", pane_index + 1),
                             tab_closing || pane.closing,
                             std::iter::once(pane),
@@ -4649,12 +4671,16 @@ fn render_verbose_resources(snapshot: &ResourceSnapshot) -> String {
             session.name,
             if session.closing { " closing" } else { "" }
         ));
-        for workspace in &session.workspaces {
+        for workspace in session.workspaces_depth_first() {
             lines.push(format!(
-                "  workspace {} {:?} {}",
+                "  {}workspace {} {:?} {}{}",
+                session.workspace_tree_prefix(workspace.id),
                 workspace.id,
                 workspace.name,
-                workspace.root.display()
+                workspace.root.display(),
+                workspace
+                    .parent_workspace_id
+                    .map_or_else(String::new, |parent| format!(" parent={parent}"))
             ));
             for tab in &workspace.tabs {
                 lines.push(format!(
@@ -4810,6 +4836,7 @@ mod tests {
                 tokens: Default::default(),
                 workspaces: vec![WorkspaceSnapshot {
                     id: workspace_id,
+                    parent_workspace_id: None,
                     name: "workspace".into(),
                     root: "/project".into(),
                     closing: false,
@@ -5568,6 +5595,46 @@ mod tests {
     }
 
     #[test]
+    fn resource_listing_renders_nested_workspaces_depth_first_with_parent_metadata() {
+        let mut snapshot = agent_fixture();
+        let root_id = snapshot.sessions[0].workspaces[0].id;
+        let mut sibling = snapshot.sessions[0].workspaces[0].clone();
+        sibling.id = WorkspaceId::new();
+        sibling.name = "sibling".into();
+        sibling.parent_workspace_id = Some(root_id);
+        let mut child = sibling.clone();
+        child.id = WorkspaceId::new();
+        child.name = "child".into();
+        child.parent_workspace_id = Some(root_id);
+        let mut grandchild = sibling.clone();
+        grandchild.id = WorkspaceId::new();
+        grandchild.name = "grandchild".into();
+        grandchild.parent_workspace_id = Some(child.id);
+        snapshot.sessions[0].workspaces.extend([
+            child.clone(),
+            sibling.clone(),
+            grandchild.clone(),
+        ]);
+
+        let rendered = render_resource_tree(&snapshot);
+        let root = rendered.find("! workspace").unwrap();
+        let child_position = rendered.find("! ├─ child").unwrap();
+        let grandchild_position = rendered.find("! │  └─ grandchild").unwrap();
+        let sibling_position = rendered.find("! └─ sibling").unwrap();
+        assert!(root < child_position);
+        assert!(child_position < grandchild_position);
+        assert!(grandchild_position < sibling_position);
+        assert!(rendered.contains("  ! ├─ child"));
+        assert!(rendered.contains("  ! │  └─ grandchild"));
+
+        let verbose = render_verbose_resources(&snapshot);
+        assert!(verbose.contains(&format!("parent={root_id}")));
+        assert!(verbose.contains(&format!("parent={}", child.id)));
+        assert!(verbose.contains(&format!("  ├─ workspace {}", child.id)));
+        assert!(verbose.contains(&format!("  │  └─ workspace {}", grandchild.id)));
+    }
+
+    #[test]
     fn resource_listing_accepts_verbose_after_list_or_ls() {
         for command in ["list", "ls"] {
             let cli = try_parse_cli_from(["fut", command, "-v"]).unwrap();
@@ -5597,6 +5664,15 @@ mod tests {
             matches!(cli.command, Some(Command::Open { command, .. }) if command == ["echo", "--flag"])
         );
         let workspace = WorkspaceId::new().to_string();
+        let cli =
+            Cli::try_parse_from(["fut", "open", "--parent-workspace", &workspace, "."]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Open {
+                parent_workspace: Some(parent),
+                ..
+            }) if parent.to_string() == workspace
+        ));
         assert!(Cli::try_parse_from(["fut", "tab", "new", &workspace, "echo"]).is_err());
         let tab = TabId::new().to_string();
         assert!(Cli::try_parse_from(["fut", "pane", "new", &tab, "echo"]).is_err());

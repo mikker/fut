@@ -1975,6 +1975,7 @@ async fn agent_cli_composes_lifecycle_input_and_bounded_output_without_stale_idl
         .control_command(ClientMessage::OpenLocation {
             project: None,
             name: Some("exiting-agent".into()),
+            parent_workspace_id: None,
             cwd: exit_cwd,
             program: Some("/bin/sh".into()),
             argv: vec!["-c".into(), "IFS= read -r line; exit 7".into()],
@@ -8001,6 +8002,7 @@ done
     let created = harness.control_command(ClientMessage::OpenLocation {
         project: None,
         name: Some("project-b".into()),
+        parent_workspace_id: None,
         cwd: cwd_b.clone(),
         program: Some("/bin/sh".into()),
         argv: vec!["-c".into(), "printf 'B_READY\\r\\n'; while IFS= read -r line; do case \"$line\" in b) printf 'B_INPUT\\r\\n' ;; esac; done".into()],
@@ -8101,6 +8103,7 @@ async fn public_last_session_navigation_toggles_after_global_selection() {
         .control_command(ClientMessage::OpenLocation {
             project: None,
             name: Some("second-project".into()),
+            parent_workspace_id: None,
             cwd: second_root,
             program: Some("/bin/sh".into()),
             argv: vec![
@@ -8180,6 +8183,7 @@ async fn linked_git_worktree_is_a_peer_workspace_and_reopens_idempotently() {
     let opened = harness.control_command(ClientMessage::OpenLocation {
         project: None,
         name: Some("linked".into()),
+        parent_workspace_id: None,
         cwd: linked.join("nested"),
         program: Some("/bin/sh".into()),
         argv: vec!["-c".into(), "printf 'LINKED_READY\r\n'; while IFS= read -r line; do case \"$line\" in linked) printf 'LINKED_INPUT\r\n';; esac; done".into()],
@@ -8228,6 +8232,7 @@ async fn linked_git_worktree_is_a_peer_workspace_and_reopens_idempotently() {
         .control_command(ClientMessage::OpenLocation {
             project: None,
             name: Some("ignored".into()),
+            parent_workspace_id: None,
             cwd: linked.clone(),
             program: Some("/bin/sh".into()),
             argv: vec!["-c".into(), format!("touch {}", marker.display())],
@@ -8385,6 +8390,7 @@ panes = [
         .control_command(ClientMessage::OpenLocation {
             project: Some("fut".into()),
             name: Some("recipe-project".into()),
+            parent_workspace_id: None,
             cwd: linked.clone(),
             program: None,
             argv: Vec::new(),
@@ -8457,6 +8463,7 @@ panes = [
         .control_command(ClientMessage::OpenLocation {
             project: None,
             name: Some("main".into()),
+            parent_workspace_id: None,
             cwd: main.clone(),
             program: Some("/bin/sh".into()),
             argv: vec![
@@ -8499,6 +8506,7 @@ panes = [
         .control_command(ClientMessage::OpenLocation {
             project: Some("fut".into()),
             name: Some("ignored".into()),
+            parent_workspace_id: None,
             cwd: linked,
             program: Some("/bin/sh".into()),
             argv: vec!["-c".into(), "touch must-not-run".into()],
@@ -8544,6 +8552,7 @@ async fn repository_recipe_trust_change_and_untrust_apply_without_daemon_restart
         .control_command(ClientMessage::OpenLocation {
             project: Some("unsafe".into()),
             name: None,
+            parent_workspace_id: None,
             cwd: project.clone(),
             program: None,
             argv: Vec::new(),
@@ -8588,6 +8597,7 @@ async fn repository_recipe_trust_change_and_untrust_apply_without_daemon_restart
         .control_command(ClientMessage::OpenLocation {
             project: Some("unsafe".into()),
             name: None,
+            parent_workspace_id: None,
             cwd: project.clone(),
             program: None,
             argv: Vec::new(),
@@ -8615,6 +8625,7 @@ async fn repository_recipe_trust_change_and_untrust_apply_without_daemon_restart
         .control_command(ClientMessage::OpenLocation {
             project: Some("unsafe".into()),
             name: None,
+            parent_workspace_id: None,
             cwd: project.clone(),
             program: None,
             argv: Vec::new(),
@@ -8632,6 +8643,7 @@ async fn repository_recipe_trust_change_and_untrust_apply_without_daemon_restart
         .control_command(ClientMessage::OpenLocation {
             project: Some("unsafe".into()),
             name: None,
+            parent_workspace_id: None,
             cwd: project.clone(),
             program: None,
             argv: Vec::new(),
@@ -8657,6 +8669,7 @@ async fn repository_recipe_trust_change_and_untrust_apply_without_daemon_restart
         .control_command(ClientMessage::OpenLocation {
             project: Some("unsafe".into()),
             name: None,
+            parent_workspace_id: None,
             cwd: project.clone(),
             program: None,
             argv: Vec::new(),
@@ -8843,6 +8856,7 @@ async fn workspace_retirement_waits_for_its_acknowledgement_connection() {
         .control_command(ClientMessage::OpenLocation {
             project: None,
             name: Some("linked".into()),
+            parent_workspace_id: None,
             cwd: linked,
             program: Some("/bin/sh".into()),
             argv: vec!["-c".into(), "while :; do sleep 1; done".into()],
@@ -8894,6 +8908,95 @@ async fn workspace_retirement_waits_for_its_acknowledgement_connection() {
     let session_id = harness.resources().await.sessions[0].id;
     harness.close_session(SessionSelector::Id(session_id)).await;
     harness.wait_until_exited().await;
+}
+
+#[tokio::test]
+async fn nested_workspace_open_and_parent_removal_preserve_descendants() {
+    let harness = Harness::start_with("while :; do sleep 1; done", |root| {
+        let main = root.join("cwd");
+        git(&main, &["init", "-b", "main"]);
+        fs::write(main.join("tracked"), "x").unwrap();
+        git(&main, &["add", "tracked"]);
+        git(&main, &["commit", "-m", "initial"]);
+        for name in ["child", "grandchild"] {
+            let path = root.join(name);
+            git(
+                &main,
+                &["worktree", "add", "-b", name, path.to_str().unwrap()],
+            );
+        }
+    })
+    .await;
+    let initial = harness.resources().await;
+    let root_id = initial.sessions[0].workspaces[0].id;
+
+    let ServerMessage::LocationOpened {
+        selected: child, ..
+    } = harness
+        .control_command(ClientMessage::OpenLocation {
+            project: None,
+            name: Some("child".into()),
+            parent_workspace_id: Some(root_id),
+            cwd: harness.root.path().join("child"),
+            program: Some("/bin/sh".into()),
+            argv: vec!["-c".into(), "while :; do sleep 1; done".into()],
+        })
+        .await
+    else {
+        panic!("child workspace was not created")
+    };
+    let ServerMessage::LocationOpened {
+        selected: grandchild,
+        ..
+    } = harness
+        .control_command(ClientMessage::OpenLocation {
+            project: None,
+            name: Some("grandchild".into()),
+            parent_workspace_id: Some(child.workspace_id),
+            cwd: harness.root.path().join("grandchild"),
+            program: Some("/bin/sh".into()),
+            argv: vec!["-c".into(), "while :; do sleep 1; done".into()],
+        })
+        .await
+    else {
+        panic!("grandchild workspace was not created")
+    };
+
+    let nested = harness.resources().await;
+    assert_eq!(
+        nested.sessions[0]
+            .workspaces
+            .iter()
+            .map(|workspace| (workspace.id, workspace.parent_workspace_id))
+            .collect::<Vec<_>>(),
+        [
+            (root_id, None),
+            (child.workspace_id, Some(root_id)),
+            (grandchild.workspace_id, Some(child.workspace_id)),
+        ]
+    );
+
+    assert_eq!(
+        harness
+            .control_command(ClientMessage::CloseTarget {
+                selector: TargetSelector::Workspace(child.workspace_id),
+            })
+            .await,
+        ServerMessage::CommandCompleted {
+            command: fut::protocol::AcknowledgedCommand::CloseTarget,
+        }
+    );
+    let promoted = harness.resources().await;
+    let grandchild_workspace = promoted.sessions[0]
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == grandchild.workspace_id)
+        .unwrap();
+    assert_eq!(grandchild_workspace.parent_workspace_id, Some(root_id));
+    assert!(!grandchild_workspace.closing);
+    assert!(process_alive(grandchild.child_pid));
+
+    harness.shutdown().await;
 }
 
 #[tokio::test]
@@ -8981,6 +9084,7 @@ async fn existing_reopen_is_idempotent_and_invalid_name_never_spawns() {
         .control_command(ClientMessage::OpenLocation {
             project: None,
             name: Some("cwd".into()),
+            parent_workspace_id: None,
             cwd: harness.root.path().join("cwd"),
             program: Some("/bin/sh".into()),
             argv: vec![
@@ -9004,6 +9108,7 @@ async fn existing_reopen_is_idempotent_and_invalid_name_never_spawns() {
         .control_command(ClientMessage::OpenLocation {
             project: None,
             name: Some("different-name".into()),
+            parent_workspace_id: None,
             cwd: harness.root.path().join("cwd"),
             program: Some("/bin/sh".into()),
             argv: vec![
@@ -9038,6 +9143,7 @@ async fn existing_reopen_is_idempotent_and_invalid_name_never_spawns() {
         .control_command(ClientMessage::OpenLocation {
             project: None,
             name: Some(" \t ".into()),
+            parent_workspace_id: None,
             cwd: blank_cwd,
             program: Some("/bin/sh".into()),
             argv: vec!["-c".into(), format!("touch {}", blank_marker.display())],
@@ -9183,6 +9289,7 @@ async fn public_client_navigator_switches_live_pty_and_preserves_terminal_isolat
         .control_command(ClientMessage::OpenLocation {
             project: None,
             name: Some("public-b".into()),
+            parent_workspace_id: None,
             cwd: cwd_b,
             program: Some("/bin/sh".into()),
             argv: vec![
@@ -9259,6 +9366,7 @@ async fn public_agent_activity_spins_lists_waiting_terminals_and_navigates_unrea
         .control_command(ClientMessage::OpenLocation {
             project: None,
             name: Some("waiting-b".into()),
+            parent_workspace_id: None,
             cwd: cwd_b,
             program: Some("/bin/sh".into()),
             argv: vec![
@@ -11541,6 +11649,7 @@ done
         .control_command(ClientMessage::OpenLocation {
             project: None,
             name: Some("feature".into()),
+            parent_workspace_id: None,
             cwd: linked,
             program: Some("/bin/sh".into()),
             argv: vec![
@@ -13583,6 +13692,7 @@ async fn switching_is_atomic_reversible_and_keeps_protocol_routing_isolated() {
         .control_command(ClientMessage::OpenLocation {
             project: None,
             name: Some("switch-b".into()),
+            parent_workspace_id: None,
             cwd: cwd_b,
             program: Some("/bin/sh".into()),
             argv: vec![
@@ -13671,6 +13781,7 @@ async fn interactive_open_location_reuses_the_connection_and_focuses_the_opened_
             message: ClientMessage::OpenLocation {
                 project: None,
                 name: None,
+                parent_workspace_id: None,
                 cwd,
                 program: Some("/bin/sh".into()),
                 argv: vec![
@@ -13727,7 +13838,7 @@ async fn same_target_list_and_failed_switches_preserve_the_attachment() {
     fs::create_dir(&cwd_b).unwrap();
     let ServerMessage::LocationOpened { selected: b, .. } = harness.control_command(ClientMessage::OpenLocation {
         project: None,
-        name: Some("held-b".into()), cwd: cwd_b, program: Some("/bin/sh".into()),
+        name: Some("held-b".into()), parent_workspace_id: None, cwd: cwd_b, program: Some("/bin/sh".into()),
         argv: vec!["-c".into(), "printf 'B_READY\\r\\n'; while IFS= read -r line; do printf 'B_%s\\r\\n' \"$line\"; done".into()],
     }).await else { panic!("expected B") };
     let resources = harness.resources().await;
@@ -13807,6 +13918,7 @@ async fn missing_destination_and_post_switch_disconnects_preserve_exact_leases()
         .control_command(ClientMessage::OpenLocation {
             project: None,
             name: Some("closing-b".into()),
+            parent_workspace_id: None,
             cwd: cwd_b,
             program: Some("/bin/sh".into()),
             argv: vec!["-c".into(), "while IFS= read -r line; do :; done".into()],
@@ -13860,6 +13972,7 @@ async fn missing_destination_and_post_switch_disconnects_preserve_exact_leases()
         .control_command(ClientMessage::OpenLocation {
             project: None,
             name: Some("disconnect-c".into()),
+            parent_workspace_id: None,
             cwd: cwd_c,
             program: Some("/bin/sh".into()),
             argv: vec!["-c".into(), "while IFS= read -r line; do :; done".into()],
@@ -14246,6 +14359,7 @@ async fn interactive_session_actions_apply_only_to_the_attached_session() {
         .control_command(ClientMessage::OpenLocation {
             project: None,
             name: Some("session-actions-peer".into()),
+            parent_workspace_id: None,
             cwd: second_cwd,
             program: Some("/bin/sh".into()),
             argv: vec!["-c".into(), "while IFS= read -r line; do :; done".into()],
@@ -14339,6 +14453,7 @@ async fn last_terminal_exit_detaches_instead_of_crossing_sessions() {
         .control_command(ClientMessage::OpenLocation {
             project: None,
             name: Some("other".into()),
+            parent_workspace_id: None,
             cwd: second_cwd,
             program: Some("/bin/sh".into()),
             argv: vec![
@@ -14414,6 +14529,7 @@ async fn public_rename_preserves_a_live_process_and_rejects_invalid_changes_atom
         .control_command(ClientMessage::OpenLocation {
             project: None,
             name: Some("rename-sibling".into()),
+            parent_workspace_id: None,
             cwd: sibling_cwd,
             program: Some("/bin/sh".into()),
             argv: vec!["-c".into(), "while IFS= read -r line; do :; done".into()],

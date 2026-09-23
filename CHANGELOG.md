@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added explicit nested workspaces with depth-first navigation and tree rendering in the navigator and `fut list`.
 - Fut now records daemon lifecycle and failures in a bounded rotating log whose path is shown by `fut doctor`.
 
 ## 0.24

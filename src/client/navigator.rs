@@ -51,18 +51,44 @@ impl ResourceKey {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ResourceFilter {
-    depth: u16,
+    kind: ResourceKind,
     scope: Option<ResourceKey>,
 }
 
 impl ResourceFilter {
     fn label(self) -> &'static str {
-        match self.depth {
-            0 => "sessions",
-            1 => "workspaces",
-            2 => "tabs",
-            _ => "panes",
+        match self.kind {
+            ResourceKind::Session => "sessions",
+            ResourceKind::Workspace => "workspaces",
+            ResourceKind::Tab => "tabs",
+            ResourceKind::Pane => "panes",
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResourceKind {
+    Session,
+    Workspace,
+    Tab,
+    Pane,
+}
+
+fn resource_kind(key: ResourceKey) -> ResourceKind {
+    match key {
+        ResourceKey::Session(_) => ResourceKind::Session,
+        ResourceKey::Workspace(_) => ResourceKind::Workspace,
+        ResourceKey::Tab(_) => ResourceKind::Tab,
+        ResourceKey::Pane(_) => ResourceKind::Pane,
+    }
+}
+
+fn resource_kind_rank(kind: ResourceKind) -> u8 {
+    match kind {
+        ResourceKind::Session => 0,
+        ResourceKind::Workspace => 1,
+        ResourceKind::Tab => 2,
+        ResourceKind::Pane => 3,
     }
 }
 
@@ -75,6 +101,7 @@ pub(super) struct NavigatorRow {
     pub machine_header: bool,
     pub selectable: bool,
     pub depth: u16,
+    pub tree_prefix: String,
     pub label: String,
     pub inline_pane: Option<PaneId>,
     pub search_path: String,
@@ -239,6 +266,7 @@ impl NavigatorState {
                 machine_header: true,
                 selectable: destination.is_some(),
                 depth: 0,
+                tree_prefix: String::new(),
                 label: format!("{label} · {status}"),
                 inline_pane: None,
                 search_path: format!("{label} › {status}"),
@@ -367,12 +395,12 @@ impl NavigatorState {
             (KeyCode::Up, modifiers)
                 if navigating_tree && modifiers.contains(KeyModifiers::SHIFT) =>
             {
-                self.jump_back(1)
+                self.jump_back(ResourceKind::Workspace)
             }
             (KeyCode::Down, modifiers)
                 if navigating_tree && modifiers.contains(KeyModifiers::SHIFT) =>
             {
-                self.jump_forward(1)
+                self.jump_forward(ResourceKind::Workspace)
             }
             (KeyCode::Up | KeyCode::Down, modifiers)
                 if !navigating_tree && modifiers.contains(KeyModifiers::SHIFT) => {}
@@ -398,16 +426,16 @@ impl NavigatorState {
                 self.show_all()
             }
             (KeyCode::Char('s'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.filter_depth(0)
+                self.filter_kind(ResourceKind::Session)
             }
             (KeyCode::Char('w'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.filter_depth(1)
+                self.filter_kind(ResourceKind::Workspace)
             }
             (KeyCode::Char('t'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.filter_depth(2)
+                self.filter_kind(ResourceKind::Tab)
             }
             (KeyCode::Char('p'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.filter_depth(3)
+                self.filter_kind(ResourceKind::Pane)
             }
             (KeyCode::Left, _) if navigating_tree => self.select_parent(),
             (KeyCode::Right, _) if navigating_tree => self.select_first_child(),
@@ -494,8 +522,9 @@ impl NavigatorState {
             let range = scope.map_or(0..self.rows.len(), |start| {
                 start + 1..self.subtree_end(start)
             });
-            self.filtered
-                .retain(|index| self.rows[*index].depth == filter.depth && range.contains(index));
+            self.filtered.retain(|index| {
+                resource_kind(self.rows[*index].key) == filter.kind && range.contains(index)
+            });
         }
         self.scroll = 0;
     }
@@ -571,23 +600,29 @@ impl NavigatorState {
 
     /// Limit rows to one resource kind inside the selected row's enclosing
     /// scope. Repeating the active filter restores the complete tree.
-    fn filter_depth(&mut self, depth: u16) {
+    fn filter_kind(&mut self, kind: ResourceKind) {
         let Some(current) = self.rows.get(self.selected) else {
             return;
         };
-        let target = if current.depth < depth {
+        let target = if resource_kind_rank(resource_kind(current.key)) < resource_kind_rank(kind) {
             let end = self.subtree_end(self.selected);
-            (self.selected + 1..end).find(|&index| self.rows[index].depth == depth)
+            (self.selected + 1..end).find(|&index| resource_kind(self.rows[index].key) == kind)
         } else {
             (0..=self.selected)
                 .rev()
-                .find(|&index| self.rows[index].depth == depth)
+                .find(|&index| resource_kind(self.rows[index].key) == kind)
         };
         let Some(target) = target else { return };
-        let scope = if depth > 0 {
+        let parent_kind = match kind {
+            ResourceKind::Session => None,
+            ResourceKind::Workspace => Some(ResourceKind::Session),
+            ResourceKind::Tab => Some(ResourceKind::Workspace),
+            ResourceKind::Pane => Some(ResourceKind::Tab),
+        };
+        let scope = if let Some(parent_kind) = parent_kind {
             let Some(index) = (0..=target)
                 .rev()
-                .find(|&index| self.rows[index].depth == depth - 1)
+                .find(|&index| resource_kind(self.rows[index].key) == parent_kind)
             else {
                 return;
             };
@@ -595,27 +630,27 @@ impl NavigatorState {
         } else {
             None
         };
-        let filter = ResourceFilter { depth, scope };
+        let filter = ResourceFilter { kind, scope };
         self.filter = (self.filter != Some(filter)).then_some(filter);
         self.refilter();
-        if self.filter.is_some() && self.rows[target].depth == depth {
+        if self.filter.is_some() && resource_kind(self.rows[target].key) == kind {
             self.selected = target;
         }
         self.ensure_selected_match();
     }
 
-    fn jump_forward(&mut self, depth: u16) {
-        if let Some(index) =
-            (self.selected + 1..self.rows.len()).find(|&index| self.rows[index].depth == depth)
+    fn jump_forward(&mut self, kind: ResourceKind) {
+        if let Some(index) = (self.selected + 1..self.rows.len())
+            .find(|&index| resource_kind(self.rows[index].key) == kind)
         {
             self.selected = index;
         }
     }
 
-    fn jump_back(&mut self, depth: u16) {
+    fn jump_back(&mut self, kind: ResourceKind) {
         if let Some(index) = (0..self.selected)
             .rev()
-            .find(|&index| self.rows[index].depth == depth)
+            .find(|&index| resource_kind(self.rows[index].key) == kind)
         {
             self.selected = index;
         }
@@ -803,10 +838,12 @@ impl NavigatorState {
                         let y = body_y + line as u16;
                         fill_row(Rect::new(area.x, y, area.width, 1), style, buffer);
                         if self.query.is_empty() {
+                            let tree_depth = row.tree_prefix.chars().count() / 3;
                             let text = format!(
-                                "{}{} {}",
-                                "  ".repeat(usize::from(row.depth)),
+                                "{}{} {}{}",
+                                "  ".repeat(usize::from(row.depth).saturating_sub(tree_depth)),
                                 marker,
+                                row.tree_prefix,
                                 row.label
                             );
                             let mut spans = vec![Span::styled(text, style)];
@@ -1088,6 +1125,7 @@ fn flatten_optional(
             machine_header: false,
             selectable: !session.closing,
             depth: 0,
+            tree_prefix: String::new(),
             label: session.name.clone(),
             inline_pane: None,
             search_path: session_path.clone(),
@@ -1107,8 +1145,15 @@ fn flatten_optional(
             ),
             open_elsewhere: false,
         });
-        for workspace in &session.workspaces {
-            let workspace_path = format!("{session_path} › {}", workspace.name);
+        let mut workspace_ancestry = Vec::<String>::new();
+        for workspace in session.workspaces_depth_first() {
+            let workspace_nesting = session.workspace_depth(workspace.id);
+            workspace_ancestry.truncate(workspace_nesting);
+            workspace_ancestry.push(workspace.name.clone());
+            let workspace_path = format!("{session_path} › {}", workspace_ancestry.join(" › "));
+            let workspace_depth = u16::try_from(workspace_nesting)
+                .unwrap_or(u16::MAX)
+                .saturating_add(1);
             let closing = session.closing || workspace.closing;
             let workspace_current = session_current && Some(workspace.id) == current_workspace_id;
             rows.push(NavigatorRow {
@@ -1118,7 +1163,8 @@ fn flatten_optional(
                 generation: Generation::default(),
                 machine_header: false,
                 selectable: !closing,
-                depth: 1,
+                depth: workspace_depth,
+                tree_prefix: session.workspace_tree_prefix(workspace.id),
                 label: workspace.name.clone(),
                 inline_pane: None,
                 search_path: workspace_path.clone(),
@@ -1158,7 +1204,8 @@ fn flatten_optional(
                     generation: Generation::default(),
                     machine_header: false,
                     selectable: !tab_row_closing,
-                    depth: 2,
+                    depth: workspace_depth.saturating_add(1),
+                    tree_prefix: String::new(),
                     label: tab_label,
                     inline_pane: single_pane.map(|pane| pane.id),
                     search_path: single_pane
@@ -1183,7 +1230,8 @@ fn flatten_optional(
                         generation: Generation::default(),
                         machine_header: false,
                         selectable: !pane_closing,
-                        depth: 3,
+                        depth: workspace_depth.saturating_add(2),
+                        tree_prefix: String::new(),
                         label: format!("pane {}", index + 1),
                         inline_pane: None,
                         search_path: format!("{tab_path} › pane {}", index + 1),
@@ -1311,6 +1359,7 @@ mod tests {
                     workspaces: vec![WorkspaceSnapshot {
                         tokens: Default::default(),
                         id: workspace_id,
+                        parent_workspace_id: None,
                         name: "workspace".into(),
                         root: PathBuf::from("/tmp"),
                         closing: false,
@@ -1444,6 +1493,32 @@ mod tests {
                 .iter()
                 .all(|row| row.destination == Some(remembered_pane_id))
         );
+    }
+
+    #[test]
+    fn flatten_indents_nested_workspaces_and_includes_ancestry_in_search_paths() {
+        let (mut snapshot, current, _) = fixture();
+        let parent_id = snapshot.sessions[0].workspaces[0].id;
+        let mut child = snapshot.sessions[0].workspaces[0].clone();
+        child.id = WorkspaceId::new();
+        child.parent_workspace_id = Some(parent_id);
+        child.name = "child".into();
+        let child_id = child.id;
+        snapshot.sessions[0].workspaces.push(child);
+
+        let rows = flatten(&snapshot, &current);
+        let child_row = rows
+            .iter()
+            .find(|row| row.key == ResourceKey::Workspace(child_id))
+            .unwrap();
+        assert_eq!(child_row.depth, 2);
+        assert_eq!(child_row.tree_prefix, "└─ ");
+        assert_eq!(child_row.search_path, "sessión 🛰 › workspace › child");
+        let child_index = rows
+            .iter()
+            .position(|row| row.key == ResourceKey::Workspace(child_id))
+            .unwrap();
+        assert_eq!(rows[child_index + 1].depth, 3);
     }
 
     #[test]
@@ -1838,13 +1913,19 @@ mod tests {
     /// Two sessions: S1(W1(T1(P1 P2) T2(P3)) W2(T3(P4))) S2(W3(T4(P5))).
     fn tree() -> NavigatorState {
         let row = |depth: u16| NavigatorRow {
-            key: ResourceKey::Pane(PaneId::new()),
+            key: match depth {
+                0 => ResourceKey::Session(SessionId::new()),
+                1 => ResourceKey::Workspace(WorkspaceId::new()),
+                2 => ResourceKey::Tab(TabId::new()),
+                _ => ResourceKey::Pane(PaneId::new()),
+            },
             session_id: SessionId::new(),
             machine: MachineId::Local,
             generation: Generation::default(),
             machine_header: false,
             selectable: true,
             depth,
+            tree_prefix: String::new(),
             label: String::new(),
             inline_pane: None,
             search_path: String::new(),

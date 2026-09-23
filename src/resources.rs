@@ -255,6 +255,7 @@ pub struct InitialPath {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkspacePath {
     pub workspace_id: WorkspaceId,
+    pub parent_workspace_id: Option<WorkspaceId>,
     pub workspace_name: String,
     pub root: PathBuf,
     pub tab_id: TabId,
@@ -302,6 +303,9 @@ pub struct SessionSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceSnapshot {
     pub id: WorkspaceId,
+    /// Display/provenance parent. Ownership and lifecycle remain session-scoped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_workspace_id: Option<WorkspaceId>,
     pub name: String,
     pub root: PathBuf,
     pub closing: bool,
@@ -421,6 +425,129 @@ impl ResourceSnapshot {
             });
         }
         found.ok_or(ResourceError::NotFound("terminal"))
+    }
+
+    /// Preserve the frozen remote metadata.v1 payload for peers that did not
+    /// negotiate nested workspace metadata.
+    pub(crate) fn clear_workspace_parents(&mut self) {
+        for session in &mut self.sessions {
+            for workspace in &mut session.workspaces {
+                workspace.parent_workspace_id = None;
+            }
+        }
+    }
+}
+
+impl SessionSnapshot {
+    /// Workspaces in display order: each parent's complete subtree precedes
+    /// the next sibling, while siblings retain creation order.
+    #[must_use]
+    pub fn workspaces_depth_first(&self) -> Vec<&WorkspaceSnapshot> {
+        fn append<'a>(
+            session: &'a SessionSnapshot,
+            parent: Option<WorkspaceId>,
+            ordered: &mut Vec<&'a WorkspaceSnapshot>,
+            visited: &mut BTreeSet<WorkspaceId>,
+        ) {
+            for workspace in &session.workspaces {
+                if workspace.parent_workspace_id == parent && visited.insert(workspace.id) {
+                    ordered.push(workspace);
+                    append(session, Some(workspace.id), ordered, visited);
+                }
+            }
+        }
+
+        let mut ordered = Vec::with_capacity(self.workspaces.len());
+        let mut visited = BTreeSet::new();
+        append(self, None, &mut ordered, &mut visited);
+        // A federated snapshot may come from a buggy or newer peer. Keep
+        // orphaned/cyclic workspaces visible as top-level fallbacks rather
+        // than dropping them or looping while rendering.
+        for workspace in &self.workspaces {
+            if visited.insert(workspace.id) {
+                ordered.push(workspace);
+                append(self, Some(workspace.id), &mut ordered, &mut visited);
+            }
+        }
+        ordered
+    }
+
+    /// Nesting depth in the validated, session-local workspace display tree.
+    #[must_use]
+    pub fn workspace_depth(&self, workspace_id: WorkspaceId) -> usize {
+        let mut depth = 0;
+        let mut visited = BTreeSet::new();
+        let mut current = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .and_then(|workspace| workspace.parent_workspace_id);
+        while let Some(parent_id) = current {
+            if !visited.insert(parent_id) {
+                return 0;
+            }
+            let Some(parent) = self
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == parent_id)
+            else {
+                break;
+            };
+            depth += 1;
+            current = parent.parent_workspace_id;
+        }
+        depth
+    }
+
+    /// Box-drawing prefix for a workspace in the depth-first display tree.
+    #[must_use]
+    pub fn workspace_tree_prefix(&self, workspace_id: WorkspaceId) -> String {
+        let mut lineage = Vec::new();
+        let mut visited = BTreeSet::new();
+        let mut current_id = workspace_id;
+
+        loop {
+            if !visited.insert(current_id) {
+                return String::new();
+            }
+            let Some(workspace) = self
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == current_id)
+            else {
+                return String::new();
+            };
+            let Some(parent_id) = workspace.parent_workspace_id else {
+                break;
+            };
+            if !self
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.id == parent_id)
+            {
+                return String::new();
+            }
+            lineage.push((parent_id, current_id));
+            current_id = parent_id;
+        }
+
+        lineage.reverse();
+        let lineage_len = lineage.len();
+        let mut prefix = String::new();
+        for (index, (parent_id, child_id)) in lineage.into_iter().enumerate() {
+            let is_last = self
+                .workspaces
+                .iter()
+                .rev()
+                .find(|workspace| workspace.parent_workspace_id == Some(parent_id))
+                .is_some_and(|workspace| workspace.id == child_id);
+            if index + 1 == lineage_len {
+                prefix.push_str(if is_last { "└─ " } else { "├─ " });
+            } else {
+                prefix.push_str(if is_last { "   " } else { "│  " });
+            }
+        }
+        prefix
     }
 }
 
@@ -550,6 +677,8 @@ pub enum ResourceError {
     EmptyName,
     #[error("panes may only move between tabs in the same workspace")]
     DifferentWorkspace,
+    #[error("invalid workspace parent: {0}")]
+    InvalidWorkspaceParent(&'static str),
     #[error("resource is closing: {0}")]
     Closing(&'static str),
     #[error("a session target must be selected")]
@@ -577,6 +706,7 @@ struct Session {
 #[derive(Clone, Debug)]
 struct Workspace {
     session_id: SessionId,
+    parent_workspace_id: Option<WorkspaceId>,
     name: String,
     root: PathBuf,
     tokens: MaterializedTokenMap,
@@ -1434,6 +1564,7 @@ impl ResourceTree {
             path.workspace_id,
             Workspace {
                 session_id: path.session_id,
+                parent_workspace_id: None,
                 name: path.workspace_name,
                 root: path.root,
                 tokens: BTreeMap::new(),
@@ -1625,6 +1756,7 @@ impl ResourceTree {
         if self.session_is_closing(session_id) {
             return Err(ResourceError::Closing("session"));
         }
+        self.validate_workspace_parent(session_id, path.workspace_id, path.parent_workspace_id)?;
         if !path.workspace_name.is_empty()
             && session
                 .workspaces
@@ -1657,6 +1789,7 @@ impl ResourceTree {
             path.workspace_id,
             Workspace {
                 session_id,
+                parent_workspace_id: path.parent_workspace_id,
                 name: path.workspace_name,
                 root: path.root,
                 tokens: BTreeMap::new(),
@@ -1700,6 +1833,45 @@ impl ResourceTree {
             ],
             vec![],
         ))
+    }
+
+    fn validate_workspace_parent(
+        &self,
+        session_id: SessionId,
+        workspace_id: WorkspaceId,
+        parent_workspace_id: Option<WorkspaceId>,
+    ) -> Result<(), ResourceError> {
+        let Some(mut parent_id) = parent_workspace_id else {
+            return Ok(());
+        };
+        let mut visited = BTreeSet::new();
+        loop {
+            if parent_id == workspace_id || !visited.insert(parent_id) {
+                return Err(ResourceError::InvalidWorkspaceParent(
+                    "cycle or self-parenting",
+                ));
+            }
+            let parent =
+                self.workspaces
+                    .get(&parent_id)
+                    .ok_or(ResourceError::InvalidWorkspaceParent(
+                        "workspace does not exist",
+                    ))?;
+            if parent.session_id != session_id {
+                return Err(ResourceError::InvalidWorkspaceParent(
+                    "workspace belongs to another session",
+                ));
+            }
+            if self.workspace_is_closing(parent_id) {
+                return Err(ResourceError::InvalidWorkspaceParent(
+                    "workspace is closing",
+                ));
+            }
+            let Some(next) = parent.parent_workspace_id else {
+                return Ok(());
+            };
+            parent_id = next;
+        }
     }
 
     pub fn add_tab(
@@ -2354,6 +2526,20 @@ impl ResourceTree {
                 {
                     return self.invalid("workspace fields or parent");
                 }
+                let mut ancestry = BTreeSet::new();
+                let mut parent = workspace.parent_workspace_id;
+                while let Some(parent_id) = parent {
+                    if !ancestry.insert(parent_id) || parent_id == *wid {
+                        return self.invalid("workspace parent cycle");
+                    }
+                    let Some(parent_workspace) = self.workspaces.get(&parent_id) else {
+                        return self.invalid("missing workspace parent");
+                    };
+                    if parent_workspace.session_id != *sid {
+                        return self.invalid("workspace parent belongs to another session");
+                    }
+                    parent = parent_workspace.parent_workspace_id;
+                }
                 let mut tab_names = BTreeSet::new();
                 for tid in &workspace.tabs {
                     let Some(tab) = self.tabs.get(tid) else {
@@ -2435,6 +2621,12 @@ impl ResourceTree {
         events.push(ResourceEvent::TabClosed { tab_id });
         if !self.workspaces[&workspace_id].tabs.is_empty() {
             return;
+        }
+        let parent_workspace_id = self.workspaces[&workspace_id].parent_workspace_id;
+        for child in self.workspaces.values_mut() {
+            if child.parent_workspace_id == Some(workspace_id) {
+                child.parent_workspace_id = parent_workspace_id;
+            }
         }
         let workspace = self.workspaces.remove(&workspace_id).unwrap();
         self.close_intents
@@ -2546,6 +2738,7 @@ impl ResourceTree {
             .collect::<Vec<_>>();
         WorkspaceSnapshot {
             id,
+            parent_workspace_id: w.parent_workspace_id,
             // Unnamed workspaces present as the place they are: the final
             // component of the location every open pane shares, or "multiple".
             name: if w.name.is_empty() {
@@ -2806,6 +2999,151 @@ mod tests {
         }
     }
 
+    fn workspace(name: &str, parent_workspace_id: Option<WorkspaceId>) -> WorkspacePath {
+        WorkspacePath {
+            workspace_id: WorkspaceId::new(),
+            parent_workspace_id,
+            workspace_name: name.into(),
+            root: format!("/project/{name}").into(),
+            tab_id: TabId::new(),
+            tab_name: "shell".into(),
+            pane_id: PaneId::new(),
+            terminal_id: TerminalId::new(),
+        }
+    }
+
+    #[test]
+    fn nested_workspaces_are_session_local_acyclic_and_snapshotted_depth_first() {
+        let mut tree = ResourceTree::default();
+        let root_path = initial("project", "/project");
+        let session_id = root_path.session_id;
+        let root_id = root_path.workspace_id;
+        tree.create_session(root_path).unwrap();
+
+        let child = workspace("child", Some(root_id));
+        let child_id = child.workspace_id;
+        tree.add_workspace(session_id, child).unwrap();
+        let sibling = workspace("sibling", None);
+        let sibling_id = sibling.workspace_id;
+        tree.add_workspace(session_id, sibling).unwrap();
+        let grandchild = workspace("grandchild", Some(child_id));
+        let grandchild_id = grandchild.workspace_id;
+        tree.add_workspace(session_id, grandchild).unwrap();
+
+        let snapshot = tree.snapshot();
+        let session = &snapshot.sessions[0];
+        assert_eq!(
+            session
+                .workspaces_depth_first()
+                .into_iter()
+                .map(|workspace| workspace.id)
+                .collect::<Vec<_>>(),
+            [root_id, child_id, grandchild_id, sibling_id]
+        );
+        assert_eq!(session.workspace_depth(root_id), 0);
+        assert_eq!(session.workspace_depth(child_id), 1);
+        assert_eq!(session.workspace_depth(grandchild_id), 2);
+        assert_eq!(session.workspace_tree_prefix(root_id), "");
+        assert_eq!(session.workspace_tree_prefix(child_id), "└─ ");
+        assert_eq!(session.workspace_tree_prefix(grandchild_id), "   └─ ");
+        assert_eq!(session.workspace_tree_prefix(sibling_id), "");
+        let mut orphaned = session.clone();
+        orphaned
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == child_id)
+            .unwrap()
+            .parent_workspace_id = Some(WorkspaceId::new());
+        assert_eq!(orphaned.workspace_depth(child_id), 0);
+        assert_eq!(
+            orphaned.workspaces_depth_first().len(),
+            orphaned.workspaces.len()
+        );
+
+        let missing = workspace("missing-parent", Some(WorkspaceId::new()));
+        assert_eq!(
+            tree.add_workspace(session_id, missing),
+            Err(ResourceError::InvalidWorkspaceParent(
+                "workspace does not exist"
+            ))
+        );
+        let self_parent_id = WorkspaceId::new();
+        let mut self_parent = workspace("self-parent", Some(self_parent_id));
+        self_parent.workspace_id = self_parent_id;
+        assert_eq!(
+            tree.add_workspace(session_id, self_parent),
+            Err(ResourceError::InvalidWorkspaceParent(
+                "cycle or self-parenting"
+            ))
+        );
+
+        let other = initial("other", "/other");
+        let other_session_id = other.session_id;
+        tree.create_session(other).unwrap();
+        assert_eq!(
+            tree.add_workspace(other_session_id, workspace("cross-session", Some(root_id))),
+            Err(ResourceError::InvalidWorkspaceParent(
+                "workspace belongs to another session"
+            ))
+        );
+
+        tree.workspaces
+            .get_mut(&child_id)
+            .unwrap()
+            .parent_workspace_id = Some(grandchild_id);
+        assert!(
+            matches!(tree.validate(), Err(ResourceError::Invariant(message)) if message.contains("cycle"))
+        );
+    }
+
+    #[test]
+    fn removing_parent_reparents_direct_children_without_closing_descendants() {
+        let mut tree = ResourceTree::default();
+        let root_path = initial("project", "/project");
+        let session_id = root_path.session_id;
+        let root_id = root_path.workspace_id;
+        tree.create_session(root_path).unwrap();
+        let parent = workspace("parent", Some(root_id));
+        let parent_id = parent.workspace_id;
+        let parent_terminal = parent.terminal_id;
+        tree.add_workspace(session_id, parent).unwrap();
+        let child = workspace("child", Some(parent_id));
+        let child_id = child.workspace_id;
+        let child_terminal = child.terminal_id;
+        tree.add_workspace(session_id, child).unwrap();
+        let grandchild = workspace("grandchild", Some(child_id));
+        let grandchild_id = grandchild.workspace_id;
+        let grandchild_terminal = grandchild.terminal_id;
+        tree.add_workspace(session_id, grandchild).unwrap();
+
+        let closing = tree.close_workspace(parent_id).unwrap();
+        assert_eq!(closing.terminals_to_close, [parent_terminal]);
+        assert!(
+            tree.resolve_terminal_target(Some(TargetSelector::Terminal(child_terminal)))
+                .is_ok()
+        );
+        assert!(
+            tree.resolve_terminal_target(Some(TargetSelector::Terminal(grandchild_terminal)))
+                .is_ok()
+        );
+
+        tree.terminal_exited(parent_terminal).unwrap();
+        let snapshot = tree.snapshot();
+        let child = snapshot.sessions[0]
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == child_id)
+            .unwrap();
+        let grandchild = snapshot.sessions[0]
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == grandchild_id)
+            .unwrap();
+        assert_eq!(child.parent_workspace_id, Some(root_id));
+        assert_eq!(grandchild.parent_workspace_id, Some(child_id));
+        tree.validate().unwrap();
+    }
+
     #[test]
     fn project_config_reload_is_revisioned_and_exact_no_ops_are_silent() {
         let mut tree = ResourceTree::default();
@@ -3018,6 +3356,7 @@ mod tests {
             .unwrap();
         let peer = WorkspacePath {
             workspace_id: WorkspaceId::new(),
+            parent_workspace_id: None,
             workspace_name: "peer".into(),
             root: "/action-panes/peer".into(),
             tab_id: TabId::new(),
@@ -3358,6 +3697,7 @@ mod tests {
 
         let sibling = WorkspacePath {
             workspace_id: WorkspaceId::new(),
+            parent_workspace_id: None,
             workspace_name: String::new(),
             root: "/places/other".into(),
             tab_id: TabId::new(),
@@ -3914,6 +4254,7 @@ mod tests {
             session_id,
             WorkspacePath {
                 workspace_id: WorkspaceId::new(),
+                parent_workspace_id: None,
                 workspace_name: "peer".into(),
                 root: "/first/peer".into(),
                 tab_id: TabId::new(),
@@ -4057,6 +4398,7 @@ mod tests {
         tree.create_session(p).unwrap();
         let peer = WorkspacePath {
             workspace_id: WorkspaceId::new(),
+            parent_workspace_id: None,
             workspace_name: "peer".into(),
             root: "/project/peer".into(),
             tab_id: TabId::new(),
@@ -4076,6 +4418,7 @@ mod tests {
         );
         let duplicate = WorkspacePath {
             workspace_id: WorkspaceId::new(),
+            parent_workspace_id: None,
             workspace_name: "bad".into(),
             root: "/project/peer".into(),
             tab_id: TabId::new(),
@@ -4320,6 +4663,7 @@ mod tests {
         tree.create_session(path).unwrap();
         let peer = WorkspacePath {
             workspace_id: WorkspaceId::new(),
+            parent_workspace_id: None,
             workspace_name: "peer".into(),
             root: "/a/peer".into(),
             tab_id: TabId::new(),
@@ -4411,6 +4755,7 @@ mod tests {
         let sid = ids.0;
         let bad_workspace = WorkspacePath {
             workspace_id: ids.1,
+            parent_workspace_id: None,
             workspace_name: "w".into(),
             root: "/unique".into(),
             tab_id: TabId::new(),
@@ -4520,6 +4865,7 @@ mod tests {
 
         let peer = WorkspacePath {
             workspace_id: WorkspaceId::new(),
+            parent_workspace_id: None,
             workspace_name: "peer".into(),
             root: "/p/peer".into(),
             tab_id: TabId::new(),

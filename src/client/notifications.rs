@@ -640,6 +640,7 @@ mod tests {
                 workspaces: vec![WorkspaceSnapshot {
                     tokens: Default::default(),
                     id: WorkspaceId::new(),
+                    parent_workspace_id: None,
                     name: "main".into(),
                     root: PathBuf::from("/project"),
                     closing: false,
@@ -814,6 +815,7 @@ mod tests {
         let workspace = |name: &str, closing: bool, tabs: Vec<TabSnapshot>| WorkspaceSnapshot {
             tokens: Default::default(),
             id: WorkspaceId::new(),
+            parent_workspace_id: None,
             name: name.into(),
             root: PathBuf::from("/project"),
             closing,

@@ -61,6 +61,7 @@ pub enum EndpointError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Capability {
     Metadata,
+    NestedWorkspaces,
     Interactive,
     Health,
     Alerts,
@@ -69,8 +70,9 @@ pub enum Capability {
 }
 
 impl Capability {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Metadata,
+        Self::NestedWorkspaces,
         Self::Interactive,
         Self::Health,
         Self::Alerts,
@@ -81,6 +83,7 @@ impl Capability {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Metadata => "metadata.v1",
+            Self::NestedWorkspaces => "nested-workspaces.v1",
             Self::Interactive => "interactive.v1",
             Self::Health => "health.v1",
             Self::Alerts => "alerts.v1",
@@ -221,6 +224,7 @@ impl RemoteHello {
                 Capability::Health.name().into(),
                 alerts.name().into(),
                 Capability::ExtensionCatalog.name().into(),
+                Capability::NestedWorkspaces.name().into(),
             ],
             mode,
         }

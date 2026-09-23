@@ -221,6 +221,7 @@ impl From<ResourceError> for DaemonError {
             ResourceError::Duplicate(_) => "duplicate",
             ResourceError::Closing(_) => "target_closing",
             ResourceError::DifferentWorkspace => "different_workspace",
+            ResourceError::InvalidWorkspaceParent(_) => "invalid_workspace_parent",
             ResourceError::TargetRequired | ResourceError::AmbiguousTarget => "target_required",
             ResourceError::EmptyName => "invalid_name",
             ResourceError::InvalidAgentReport(_) => "invalid_agent_report",
@@ -3225,12 +3226,22 @@ async fn handle_connection(
                     ClientMessage::OpenLocation {
                         project,
                         name,
+                        parent_workspace_id,
                         cwd,
                         program,
                         argv,
                     } => {
                         let (selected, disposition) = match recipe::open_location(
-                            &shared, &exited, project, name, cwd, program, argv,
+                            &shared,
+                            &exited,
+                            recipe::OpenLocationRequest {
+                                project,
+                                name,
+                                parent_workspace_id,
+                                cwd,
+                                program,
+                                argv,
+                            },
                         ).await {
                             Ok(opened) => opened,
                             Err(error) => {
@@ -3970,11 +3981,21 @@ async fn control_loop(
             ClientMessage::OpenLocation {
                 project,
                 name,
+                parent_workspace_id,
                 cwd,
                 program,
                 argv,
             } => match recipe::open_location(
-                &shared, &exited, project, name, cwd, program, argv,
+                &shared,
+                &exited,
+                recipe::OpenLocationRequest {
+                    project,
+                    name,
+                    parent_workspace_id,
+                    cwd,
+                    program,
+                    argv,
+                },
             )
             .await
             {
@@ -5227,6 +5248,7 @@ async fn open_location_without_recipe(
     shared: &Shared,
     exited: &mpsc::UnboundedSender<TerminalId>,
     name: Option<String>,
+    parent_workspace_id: Option<WorkspaceId>,
     resolved: ResolvedLocation,
     program: Option<PathBuf>,
     argv: Vec<String>,
@@ -5247,6 +5269,12 @@ async fn open_location_without_recipe(
         let mut replacing = None;
         let mut planned_resources = None;
         if let CheckoutDestination::Existing(workspace_id) = destination {
+            if parent_workspace_id.is_some() {
+                return Err(DaemonError::new(
+                    "parent_workspace_requires_creation",
+                    "--parent-workspace can only be used when creating a new workspace",
+                ));
+            }
             let path = state
                 .resources
                 .initial_terminal_for_workspace(workspace_id)?;
@@ -5308,6 +5336,7 @@ async fn open_location_without_recipe(
         let proposed_session = initial_path(&resolved, session_name, TerminalId::new());
         let proposed_workspace = WorkspacePath {
             workspace_id: WorkspaceId::new(),
+            parent_workspace_id,
             workspace_name,
             root: resolved.workspace_root.clone(),
             tab_id: TabId::new(),
@@ -5538,6 +5567,7 @@ async fn create_workspace(
         let workspace_name = name.unwrap_or_default();
         let proposed = WorkspacePath {
             workspace_id: WorkspaceId::new(),
+            parent_workspace_id: None,
             workspace_name,
             root,
             tab_id: TabId::new(),
@@ -6849,6 +6879,16 @@ async fn send(
 ) -> Result<()> {
     if connection
         .remote
+        .is_some_and(|caps| !caps.contains(Capability::NestedWorkspaces))
+    {
+        match &mut message {
+            ServerMessage::Resources { snapshot, .. }
+            | ServerMessage::ResourcesChanged { snapshot } => snapshot.clear_workspace_parents(),
+            _ => {}
+        }
+    }
+    if connection
+        .remote
         .is_some_and(|caps| !caps.allows_server(&message))
         && !matches!(message, ServerMessage::RemoteWelcome(_))
     {
@@ -7462,6 +7502,7 @@ mod tests {
         let (mut state, path) = inconsistent_state();
         let peer = WorkspacePath {
             workspace_id: WorkspaceId::new(),
+            parent_workspace_id: None,
             workspace_name: "peer".into(),
             root: "/peer".into(),
             tab_id: TabId::new(),
@@ -7532,6 +7573,7 @@ mod tests {
             .unwrap();
         let peer = WorkspacePath {
             workspace_id: WorkspaceId::new(),
+            parent_workspace_id: None,
             workspace_name: "peer".into(),
             root: "/peer".into(),
             tab_id: TabId::new(),
@@ -7806,6 +7848,7 @@ scope = "workspace"
             .unwrap();
         let peer = WorkspacePath {
             workspace_id: WorkspaceId::new(),
+            parent_workspace_id: None,
             workspace_name: "peer".into(),
             root: "/peer".into(),
             tab_id: TabId::new(),
@@ -8425,11 +8468,14 @@ scope = "workspace"
         let error = recipe::open_location(
             &shared,
             &exited,
-            None,
-            None,
-            root,
-            Some("/definitely/missing/fut-shell".into()),
-            Vec::new(),
+            recipe::OpenLocationRequest {
+                project: None,
+                name: None,
+                parent_workspace_id: None,
+                cwd: root,
+                program: Some("/definitely/missing/fut-shell".into()),
+                argv: Vec::new(),
+            },
         )
         .await
         .unwrap_err();

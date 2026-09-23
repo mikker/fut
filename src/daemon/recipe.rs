@@ -92,6 +92,15 @@ enum RecipeDestination {
     },
 }
 
+pub(super) struct OpenLocationRequest {
+    pub(super) project: Option<String>,
+    pub(super) name: Option<String>,
+    pub(super) parent_workspace_id: Option<WorkspaceId>,
+    pub(super) cwd: PathBuf,
+    pub(super) program: Option<PathBuf>,
+    pub(super) argv: Vec<String>,
+}
+
 pub(super) async fn prepare_initial(
     catalog: &global_config::ProjectCatalog,
     extensions: &[crate::extensions::Extension],
@@ -137,12 +146,16 @@ pub(super) async fn create_initial(
 pub(super) async fn open_location(
     shared: &Shared,
     exited: &mpsc::UnboundedSender<TerminalId>,
-    project: Option<String>,
-    name: Option<String>,
-    cwd: PathBuf,
-    program: Option<PathBuf>,
-    argv: Vec<String>,
+    request: OpenLocationRequest,
 ) -> Result<(SelectedTarget, OpenDisposition), DaemonError> {
+    let OpenLocationRequest {
+        project,
+        name,
+        parent_workspace_id,
+        cwd,
+        program,
+        argv,
+    } = request;
     let resolved = ProjectResolver::default().resolve(&cwd).await?;
     let config_location = {
         let state = shared.lock().await;
@@ -168,6 +181,12 @@ pub(super) async fn open_location(
         }
         match recipe_destination(&mut state, &resolved)? {
             RecipeDestination::Existing(selected) => {
+                if parent_workspace_id.is_some() {
+                    return Err(DaemonError::new(
+                        "parent_workspace_requires_creation",
+                        "--parent-workspace can only be used when creating a new workspace",
+                    ));
+                }
                 return Ok((selected, OpenDisposition::Existing));
             }
             RecipeDestination::Create {
@@ -177,7 +196,15 @@ pub(super) async fn open_location(
             RecipeDestination::Create {
                 destination: CheckoutDestination::CreateSession,
                 ..
-            } => false,
+            } => {
+                if parent_workspace_id.is_some() {
+                    return Err(DaemonError::new(
+                        "invalid_workspace_parent",
+                        "parent workspace is not in the session selected for this location",
+                    ));
+                }
+                false
+            }
             RecipeDestination::Create {
                 destination: CheckoutDestination::Existing(_),
                 ..
@@ -185,7 +212,16 @@ pub(super) async fn open_location(
         }
     };
     if add_workspace_without_recipe {
-        return open_location_without_recipe(shared, exited, name, resolved, program, argv).await;
+        return open_location_without_recipe(
+            shared,
+            exited,
+            name,
+            parent_workspace_id,
+            resolved,
+            program,
+            argv,
+        )
+        .await;
     }
 
     let loaded = match load_project_recipe(&recipe_project, extension_registry.extensions()) {
@@ -202,7 +238,16 @@ pub(super) async fn open_location(
         }
     };
     let Some(loaded) = loaded else {
-        return open_location_without_recipe(shared, exited, name, resolved, program, argv).await;
+        return open_location_without_recipe(
+            shared,
+            exited,
+            name,
+            parent_workspace_id,
+            resolved,
+            program,
+            argv,
+        )
+        .await;
     };
     let command_override = program.clone().map(|program| (program, argv.clone()));
     let recipe = match prepare_recipe(loaded, &resolved.workspace_root, command_override).await {
@@ -238,8 +283,16 @@ pub(super) async fn open_location(
             ..
         } => {
             drop(state);
-            return open_location_without_recipe(shared, exited, name, resolved, program, argv)
-                .await;
+            return open_location_without_recipe(
+                shared,
+                exited,
+                name,
+                parent_workspace_id,
+                resolved,
+                program,
+                argv,
+            )
+            .await;
         }
         RecipeDestination::Create {
             destination: CheckoutDestination::Existing(_),
@@ -649,6 +702,7 @@ fn plan_recipe_session(
                 session_id,
                 WorkspacePath {
                     workspace_id: path.workspace_id,
+                    parent_workspace_id: None,
                     workspace_name: workspace.title.clone(),
                     root: resolved.workspace_root.clone(),
                     tab_id: path.tab_id,

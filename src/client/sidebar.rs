@@ -139,10 +139,26 @@ fn workspace_config(ui: &UiConfig, side: SidebarSide) -> WorkspaceComponentConfi
         .expect("workspace component renderer requires workspace configuration")
 }
 
+fn workspace_tree_continuation(prefix: &str) -> String {
+    if prefix.is_empty() {
+        return String::new();
+    }
+    let mut continuation = prefix.chars().collect::<Vec<_>>();
+    continuation.truncate(continuation.len().saturating_sub(3));
+    continuation.extend(if prefix.ends_with("├─ ") {
+        ['│', ' ', ' ']
+    } else {
+        [' ', ' ', ' ']
+    });
+    continuation.into_iter().collect()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct WorkspaceItem {
     id: WorkspaceId,
     name: String,
+    tree_prefix: String,
+    tree_continuation: String,
     /// The live location every open pane shares; `None` when panes disagree.
     location: Option<std::path::PathBuf>,
     index: usize,
@@ -213,14 +229,17 @@ impl WorkspaceModel {
                 .and_then(|tab| tab.panes.iter().find(|pane| pane.id == focused.pane_id))
                 .map_or_else(MaterializedTokenMap::new, |pane| pane.tokens.clone()),
             items: session
-                .workspaces
-                .iter()
+                .workspaces_depth_first()
+                .into_iter()
                 .enumerate()
                 .map(|(index, workspace)| {
                     let closing = session.closing || workspace.closing;
+                    let tree_prefix = session.workspace_tree_prefix(workspace.id);
                     WorkspaceItem {
                         id: workspace.id,
                         name: workspace.name.clone(),
+                        tree_continuation: workspace_tree_continuation(&tree_prefix),
+                        tree_prefix,
                         location: crate::resources::shared_live_location(
                             &workspace.root,
                             &workspace.tabs,
@@ -1962,6 +1981,8 @@ fn render_model(
             id: WorkspaceId::new(),
             tokens: Default::default(),
             name: "workspace".into(),
+            tree_prefix: String::new(),
+            tree_continuation: String::new(),
             location: Some(std::path::PathBuf::new()),
             index: 0,
             tab_count: 0,
@@ -2268,15 +2289,17 @@ fn workspace_row_lines(
     };
     let surface = ui.styles.apply(SemanticStyle::Normal, Style::default());
     let row_style = apply_item_state(&ui.styles, state, surface);
+    let displayed_name = format!("{}{}", item.tree_prefix, sanitize(&item.name));
     let resolve = |token: &str| match token {
         "workspace.index" if item.current => {
             TokenValue::styled((item.index + 1).to_string(), SemanticStyle::Current)
         }
         "workspace.index" => TokenValue::plain((item.index + 1).to_string()),
         "workspace.name" if item.current => {
-            TokenValue::styled(sanitize(&item.name), SemanticStyle::Current)
+            TokenValue::styled(displayed_name.clone(), SemanticStyle::Current)
         }
-        "workspace.name" => TokenValue::plain(sanitize(&item.name)),
+        "workspace.name" => TokenValue::plain(displayed_name.clone()),
+        "workspace.tree_detail" => TokenValue::plain(format!("   {}", item.tree_continuation)),
         "workspace.id" => TokenValue::plain(item.id.to_string()),
         "workspace.root" => match item.location.as_ref() {
             Some(location) => TokenValue::plain(sanitize(&location.to_string_lossy())),
@@ -2554,6 +2577,15 @@ mod tests {
         },
     };
 
+    #[test]
+    fn workspace_tree_details_continue_ancestor_lines_between_rows() {
+        assert_eq!(workspace_tree_continuation(""), "");
+        assert_eq!(workspace_tree_continuation("├─ "), "│  ");
+        assert_eq!(workspace_tree_continuation("└─ "), "   ");
+        assert_eq!(workspace_tree_continuation("│  └─ "), "│     ");
+        assert_eq!(workspace_tree_continuation("│     └─ "), "│        ");
+    }
+
     fn fixture(names: &[&str], current: usize) -> (ResourceSnapshot, SelectedTarget) {
         let session_id = SessionId::new();
         let workspaces = names
@@ -2564,6 +2596,7 @@ mod tests {
                 WorkspaceSnapshot {
                     tokens: Default::default(),
                     id: WorkspaceId::new(),
+                    parent_workspace_id: None,
                     name: (*name).into(),
                     root: PathBuf::from(format!("/project/{index}")),
                     closing: false,

@@ -1262,6 +1262,7 @@ mod tests {
                     workspaces: vec![WorkspaceSnapshot {
                         tokens: Default::default(),
                         id: workspace_id,
+                        parent_workspace_id: None,
                         name: "main".into(),
                         root: PathBuf::from("/project"),
                         closing: false,

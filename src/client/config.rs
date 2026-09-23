@@ -1215,7 +1215,7 @@ impl Default for SidebarRowConfig {
                 SegmentConfig::text(" "),
             ],
             detail: vec![
-                SegmentConfig::text("    "),
+                SegmentConfig::token("workspace.tree_detail"),
                 SegmentConfig::token_with(
                     "workspace.git_branch",
                     Some(SemanticStyle::Muted),
@@ -2878,6 +2878,7 @@ fn token_allowed(scope: TokenScope, token: &str, extensions: &[Extension]) -> bo
             token,
             "workspace.index"
                 | "workspace.name"
+                | "workspace.tree_detail"
                 | "workspace.id"
                 | "workspace.root"
                 | "workspace.root_name"

@@ -5139,6 +5139,7 @@ async fn request_project_open(
         ClientMessage::OpenLocation {
             project,
             name: None,
+            parent_workspace_id: None,
             cwd,
             program: None,
             argv: Vec::new(),
@@ -7856,6 +7857,7 @@ mod tests {
                 workspaces: vec![
                     crate::resources::WorkspaceSnapshot {
                         id: focused_workspace_id,
+                        parent_workspace_id: None,
                         name: "focused".into(),
                         root: PathBuf::from("/project/focused"),
                         closing: false,
@@ -7879,6 +7881,7 @@ mod tests {
                     },
                     crate::resources::WorkspaceSnapshot {
                         id: target_workspace_id,
+                        parent_workspace_id: None,
                         name: "token-target".into(),
                         root: PathBuf::from("/project/token-target"),
                         closing: false,

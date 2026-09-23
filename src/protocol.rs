@@ -446,6 +446,8 @@ pub enum ClientMessage {
         project: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_workspace_id: Option<WorkspaceId>,
         cwd: PathBuf,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         program: Option<PathBuf>,
@@ -1472,6 +1474,7 @@ mod tests {
         let message = ClientMessage::OpenLocation {
             project: Some("fut".into()),
             name: Some("project λ".into()),
+            parent_workspace_id: Some(WorkspaceId::new()),
             cwd: PathBuf::from("/tmp/project"),
             program: Some(PathBuf::from("/bin/sh")),
             argv: vec!["-c".into(), "echo ok".into()],

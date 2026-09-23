@@ -96,6 +96,7 @@ fields = [{ name = 'value', label = 'Value' }]
             tokens: Default::default(),
             workspaces: vec![WorkspaceSnapshot {
                 id: target.workspace_id,
+                parent_workspace_id: None,
                 name: "remote".into(),
                 root: root.path().to_owned(),
                 closing: false,

@@ -28,6 +28,7 @@ completer!(session_attach, SessionAttach);
 completer!(session_rename, SessionRename);
 completer!(session_close, SessionClose);
 completer!(workspace_attach, WorkspaceAttach);
+completer!(workspace_parent, WorkspaceParent);
 completer!(workspace_rename, WorkspaceRename);
 completer!(workspace_close, WorkspaceClose);
 completer!(tab_new, TabNew);
@@ -120,6 +121,7 @@ enum Operation {
     SessionRename,
     SessionClose,
     WorkspaceAttach,
+    WorkspaceParent,
     WorkspaceRename,
     WorkspaceClose,
     TabNew,
@@ -393,8 +395,10 @@ fn candidates(snapshot: &ResourceSnapshot, operation: Operation) -> Vec<Candidat
             }
 
             if matches!(operation, Operation::WorkspaceAttach) && workspace_attachable
-                || matches!(operation, Operation::WorkspaceRename | Operation::TabNew)
-                    && workspace_live
+                || matches!(
+                    operation,
+                    Operation::WorkspaceParent | Operation::WorkspaceRename | Operation::TabNew
+                ) && workspace_live
                 || matches!(operation, Operation::WorkspaceClose) && workspace_closable
             {
                 push(
@@ -533,6 +537,7 @@ mod tests {
     fn workspace(name: &str, root: &str) -> WorkspacePath {
         WorkspacePath {
             workspace_id: WorkspaceId::new(),
+            parent_workspace_id: None,
             workspace_name: name.into(),
             root: root.into(),
             tab_id: TabId::new(),
@@ -577,6 +582,7 @@ mod tests {
                 workspaces: vec![WorkspaceSnapshot {
                     tokens: Default::default(),
                     id: WorkspaceId::new(),
+                    parent_workspace_id: None,
                     name: "W\tork".into(),
                     root: "/root\nwork".into(),
                     closing: false,

@@ -257,6 +257,16 @@ oldest surviving pane's foreground process. Focusing a pane does not change the
 shared tab label. Rename either to keep a fixed label, or submit an empty name
 to restore the automatic label.
 
+`fut open --parent-workspace WORKSPACE_ID PATH` explicitly nests a newly
+created workspace beneath another workspace in the same session. Nesting is
+display and provenance metadata: the navigator, workspace sidebar, `fut list`,
+and next/previous workspace traversal use depth-first tree order, while JSON
+snapshots expose `parent_workspace_id`. Closing a parent never closes its
+children; when it disappears, its direct children inherit its parent and keep
+their own descendants. Children become top-level only when their removed parent
+was top-level. Reopening an existing location with this creation-only option is
+rejected rather than silently changing its parent.
+
 Pane splits and divider sizes are shared daemon state. Client focus, zoom,
 scrollback, dialogs, and configuration are local. Multiple clients may attach
 to the same session. Concurrent divider drags use the last ratio accepted by
