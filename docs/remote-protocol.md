@@ -2,11 +2,16 @@
 
 Remote compatibility is independent of `CARGO_PKG_VERSION` and the local
 `PROTOCOL_VERSION` (package minor). Local `hello` / `welcome`, exact protocol
-checks, autostart policy, and the explicit local mismatch escape hatch keep
-their existing behavior. A remote client never sends a local hello or invokes
-daemon lifecycle operations on failure. SSH and `fut __stdio-bridge` forward
-bytes without parsing or negotiating anything. The daemon dispatches the first
-message on its existing Unix socket; no network listener is added.
+checks and the explicit local mismatch escape hatch keep their existing behavior.
+Standalone `fut --remote` asks the remote bridge to start a missing daemon by
+default, using the remote host's local autostart policy. Local
+`[remote] autostart = false` or `--attach-only` makes the bridge attach-only.
+Existing sockets are connected without a local-version probe. Background SSH
+and doctor never request startup. A remote client never sends a local hello or
+invokes daemon lifecycle operations on handshake failure. SSH and
+`fut __stdio-bridge` forward bytes without parsing or negotiating anything.
+The daemon dispatches the first message on its existing Unix socket; no network
+listener is added.
 
 ## Framing and handshake
 

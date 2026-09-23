@@ -16,14 +16,20 @@ if [ -n "$SSH_FAILURE" ]; then
     printf '%s\n' "$SSH_FAILURE" >&2
     exit 255
 fi
+cd "$HOME" || exit 1
 socket="$REMOTE_SOCKET"
 for argument in "$@"; do
     case "$argument" in
         alpha) socket="$REMOTE_SOCKET_ALPHA" ;;
         beta) socket="$REMOTE_SOCKET_BETA" ;;
     esac
+    remote_command="$argument"
 done
-exec "$FUT_BIN" --socket "$socket" __stdio-bridge
+case "$remote_command" in
+    'fut __stdio-bridge --start-if-missing')
+        exec "$FUT_BIN" --no-config --socket "$socket" __stdio-bridge --start-if-missing ;;
+    *) exec "$FUT_BIN" --socket "$socket" __stdio-bridge ;;
+esac
 "#,
     )
     .unwrap();
@@ -122,7 +128,10 @@ argv = ["./run"]
         assert!(!root.path().join("must-not-be-created").exists());
     }
     let argv = fs::read_to_string(root.path().join("ssh-args")).unwrap();
-    assert_eq!(argv, "-T\n--\nclonk\nfut __stdio-bridge\n".repeat(4));
+    assert_eq!(
+        argv,
+        "-T\n--\nclonk\nfut __stdio-bridge --start-if-missing\n".repeat(4)
+    );
     assert!(matches!(
         harness.control_command(ClientMessage::Ping).await,
         ServerMessage::Pong { .. }
@@ -268,6 +277,7 @@ async fn remote_cli_navigates_and_attaches_across_versions_without_optional_capa
     client.wait_for("navigator").await;
     client.send(b"\r");
     client.wait_for("OPTIONAL_READY").await;
+    client.wait_for("bash").await;
     client.send(b"ping\r");
     client.wait_for("OPTIONAL:ping").await;
     client.send(b"\x02S");
@@ -291,23 +301,83 @@ async fn remote_failures_leave_terminal_untouched_and_reap_ssh() {
         "Host key verification failed.",
         "fut: command not found",
     ] {
-        assert_remote_failure(Some(failure)).await;
+        assert_remote_failure(failure).await;
     }
 }
 
 #[tokio::test]
-async fn remote_missing_daemon_fails_concisely_without_terminal_setup_and_reaps_ssh() {
-    assert_remote_failure(None).await;
+async fn remote_missing_daemon_starts_on_remote_and_survives_detach() {
+    let root = tempfile::tempdir().unwrap();
+    let bin = fake_ssh(root.path());
+    let socket = root.path().join("runtime/fut.sock");
+    let mut command = Command::new("/usr/bin/script");
+    remote_env(&mut command, root.path(), &bin, &socket);
+    command
+        .args(script_command_args())
+        .arg("stty cols 80 rows 24; exec \"$FUT_BIN\" --no-config --remote clonk");
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("navigator").await;
+    client.send(b"\x1b");
+    client.wait_success().await;
+    assert_ssh_reaped(root.path()).await;
+    assert!(
+        socket.exists(),
+        "remote daemon must outlive the SSH connection"
+    );
+    let status = tokio::process::Command::new(env!("CARGO_BIN_EXE_fut"))
+        .args(["--no-config", "--socket"])
+        .arg(&socket)
+        .args(["daemon", "shutdown"])
+        .status()
+        .await
+        .unwrap();
+    assert!(status.success());
+    assert!(!root.path().join("must-not-be-created").exists());
 }
 
-async fn assert_remote_failure(failure: Option<&str>) {
+#[tokio::test]
+async fn remote_attach_only_flag_and_local_config_never_start_a_missing_daemon() {
+    let root = tempfile::tempdir().unwrap();
+    let bin = fake_ssh(root.path());
+    let socket = root.path().join("runtime/fut.sock");
+    let config = root.path().join("config");
+    fs::create_dir(&config).unwrap();
+    fs::write(config.join("config.toml"), "[remote]\nautostart = false\n").unwrap();
+
+    for arguments in [
+        "--no-config --attach-only".to_owned(),
+        format!("--config-dir {}", config.display()),
+    ] {
+        let mut command = Command::new("/usr/bin/script");
+        remote_env(&mut command, root.path(), &bin, &socket);
+        command.args(script_command_args()).arg(format!(
+            "before=$(stty -g); \"$FUT_BIN\" {arguments} --remote clonk attach; code=$?; after=$(stty -g); [ \"$before\" = \"$after\" ] && printf 'TERM_UNCHANGED\\n'; printf 'REMOTE_EXIT:%s\\n' \"$code\""
+        ));
+        let mut client = PtyChild::spawn(command);
+        client.wait_success().await;
+        wait_for(DEADLINE, || client.text().contains("REMOTE_EXIT:1")).await;
+        let output = client.text();
+        assert!(output.contains("TERM_UNCHANGED"), "{output}");
+        assert!(output.contains("connect bridge to"), "{output}");
+        assert!(!output.contains('\x1b'), "{output}");
+        assert!(!socket.exists());
+    }
+    assert_eq!(
+        fs::read_to_string(root.path().join("ssh-args")).unwrap(),
+        "-T\n--\nclonk\nfut __stdio-bridge\n".repeat(2)
+    );
+    assert_ssh_reaped(root.path()).await;
+    assert!(!root.path().join("must-not-be-created").exists());
+}
+
+async fn assert_remote_failure(failure: &str) {
     let root = tempfile::tempdir().unwrap();
     let bin = fake_ssh(root.path());
     let socket = root.path().join("missing.sock");
     let mut command = Command::new("/usr/bin/script");
     remote_env(&mut command, root.path(), &bin, &socket);
     command
-        .env("SSH_FAILURE", failure.unwrap_or_default())
+        .env("SSH_FAILURE", failure)
         .args(script_command_args())
         .arg(
             r#"
@@ -334,19 +404,7 @@ printf 'REMOTE_EXIT:%s\n' "$code"
     );
     let output = client.text();
     assert!(output.contains("remote attachment failed"), "{output}");
-    if let Some(failure) = failure {
-        assert!(output.contains(failure), "{output}");
-    } else {
-        assert!(output.contains("connect bridge to"), "{output}");
-        assert!(output.contains("missing.sock"), "{output}");
-        assert!(output.contains("No such file or directory"), "{output}");
-        assert!(
-            output.lines().count() <= 6,
-            "failure was not concise: {output}"
-        );
-        assert!(!output.contains("panicked"), "{output}");
-        assert!(!output.contains("shutdown"), "{output}");
-    }
+    assert!(output.contains(failure), "{output}");
     assert!(!socket.exists());
     assert!(!root.path().join("must-not-be-created").exists());
     assert_ssh_reaped(root.path()).await;
@@ -614,6 +672,7 @@ printf 'MACHINE_EXIT:%s\n' "$code"
             &root.path().join("no-ssh-here"),
             &harness.socket,
         );
+        command.env("PATH", root.path().join("no-ssh-here"));
         command.arg("--json").arg("machine").args(arguments);
         command.output().unwrap()
     };

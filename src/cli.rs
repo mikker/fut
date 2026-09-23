@@ -71,13 +71,16 @@ use crate::{
     after_help = "Enable shell completion with, for example: source <(COMPLETE=zsh fut)"
 )]
 pub struct Cli {
-    /// Attach to an existing remote daemon via an SSH config host (opens navigator).
+    /// Attach to a remote daemon via an SSH config host (opens navigator).
     ///
-    /// Supports only bare attachment or `attach`, with an exact protocol match.
-    /// Never starts, stops, or replaces the remote daemon. UI configuration is local.
+    /// Supports only bare attachment or `attach`. Starts a missing remote daemon,
+    /// but never stops or replaces one. UI configuration is local.
     /// Commands, project opening, config reload, and client hooks are unavailable remotely.
     #[arg(long, global = true, value_name = "HOST", conflicts_with_all = ["socket", "json"])]
     remote: Option<String>,
+    /// Attach to an existing remote daemon without starting one.
+    #[arg(long, global = true, requires = "remote")]
+    attach_only: bool,
     /// Override the Unix socket used to contact the daemon.
     #[arg(long, global = true, value_hint = ValueHint::FilePath)]
     socket: Option<PathBuf>,
@@ -132,7 +135,11 @@ where
 enum Command {
     /// Forward the selected daemon socket over stdio for an SSH attachment.
     #[command(name = "__stdio-bridge", hide = true)]
-    StdioBridge,
+    StdioBridge {
+        /// Only standalone remote attachment may bootstrap a missing daemon.
+        #[arg(long, hide = true)]
+        start_if_missing: bool,
+    },
     /// Attach to an existing daemon with the global navigator open.
     #[command(alias = "a")]
     Attach {
@@ -1099,7 +1106,7 @@ fn validate_remote_cli(cli: &Cli) -> Result<()> {
                 ignore_protocol_mismatch: true,
             }) => {
                 bail!(
-                    "--remote requires an exact protocol match; --ignore-protocol-mismatch is unavailable"
+                    "--remote does not support --ignore-protocol-mismatch; remote compatibility is negotiated separately"
                 );
             }
             _ => bail!(
@@ -1113,7 +1120,7 @@ fn validate_remote_cli(cli: &Cli) -> Result<()> {
 async fn execute(cli: Cli) -> Result<()> {
     if let Some(host) = &cli.remote {
         reject_nested_client(&cli)?;
-        return client::attach_remote(host, &cli.config_location()?).await;
+        return client::attach_remote(host, &cli.config_location()?, cli.attach_only).await;
     }
 
     if cli.ui_playground {
@@ -1124,9 +1131,29 @@ async fn execute(cli: Cli) -> Result<()> {
         return client::launch_ui_playground(&cli.config_location()?).await;
     }
 
-    if matches!(cli.command, Some(Command::StdioBridge)) {
+    if let Some(Command::StdioBridge { start_if_missing }) = &cli.command {
         let socket = socket_path(cli.socket.as_deref())?;
-        return tokio::task::spawn_blocking(move || crate::ssh_bridge::run_stdio(&socket))
+        let stream = match std::os::unix::net::UnixStream::connect(&socket) {
+            Ok(stream) => stream,
+            Err(error)
+                if *start_if_missing
+                    && matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                    ) =>
+            {
+                let location = cli.config_location()?;
+                let cwd = std::env::current_dir().context("read remote working directory")?;
+                ensure_daemon(&socket, &cwd, &location).await?;
+                std::os::unix::net::UnixStream::connect(&socket)
+                    .with_context(|| format!("connect bridge to {}", socket.display()))?
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("connect bridge to {}", socket.display()));
+            }
+        };
+        return tokio::task::spawn_blocking(move || crate::ssh_bridge::run_stdio(stream))
             .await
             .context("join stdio bridge")?;
     }
@@ -1214,7 +1241,9 @@ async fn execute(cli: Cli) -> Result<()> {
     let socket = socket_path(cli.socket.as_deref())?;
     reject_nested_client(&cli)?;
     match cli.command {
-        Some(Command::StdioBridge) => unreachable!("stdio bridge is handled before config loading"),
+        Some(Command::StdioBridge { .. }) => {
+            unreachable!("stdio bridge is handled before config loading")
+        }
         None => {
             let current_dir = std::env::current_dir().context("read current directory")?;
             let (cwd, project_name, recipe_project) =
@@ -4772,9 +4801,11 @@ mod tests {
             vec!["fut", "--remote", "clonk"],
             vec!["fut", "--remote", "clonk", "attach"],
             vec!["fut", "a", "--remote", "clonk", "--no-config"],
+            vec!["fut", "--remote", "clonk", "--attach-only"],
         ] {
             validate_remote_cli(&try_parse_cli_from(args).unwrap()).unwrap();
         }
+        assert!(try_parse_cli_from(["fut", "--attach-only"]).is_err());
         for tail in [
             vec!["attach", "--ignore-protocol-mismatch"],
             vec!["open", "/tmp"],

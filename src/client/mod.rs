@@ -480,13 +480,14 @@ pub async fn attach_navigator(
     result
 }
 
-/// Phase 1 is attach-only: SSH forwards an already-running daemon's protocol.
+/// The remote bridge starts a missing daemon on the SSH host before forwarding.
 /// No local socket, cwd, or daemon lifecycle operation is involved.
 pub async fn attach_remote(
     host: &str,
     config_location: &config::ConfigLocation,
+    attach_only: bool,
 ) -> anyhow::Result<()> {
-    attach_remote_inner(host, config_location)
+    attach_remote_inner(host, config_location, attach_only)
         .await
         .map_err(remote::report_error)
 }
@@ -494,9 +495,11 @@ pub async fn attach_remote(
 async fn attach_remote_inner(
     host: &str,
     config_location: &config::ConfigLocation,
+    attach_only: bool,
 ) -> anyhow::Result<()> {
     let staged = &stage_ui_config(config_location)?;
-    let selector = over_ssh(host, |stream| async move {
+    let start_if_missing = staged.remote_autostart() && !attach_only;
+    let selector = over_ssh(host, start_if_missing, |stream| async move {
         let (mut connection, ui, snapshot, presence, capabilities) = prepare_remote(async {
             let remote = remote::navigator(stream, Duration::from_secs(60))
                 .await
@@ -527,7 +530,7 @@ async fn attach_remote_inner(
 
     // Selection opens a new SSH connection after the navigator's terminal and
     // connection have been dropped, so authentication happens in cooked mode.
-    over_ssh(host, |stream| async move {
+    over_ssh(host, start_if_missing, |stream| async move {
         let (columns, rows) = crossterm::terminal::size().context("read terminal size")?;
         let remote = prepare_remote(remote::interactive(
             stream,
@@ -573,7 +576,7 @@ const REMOTE_HANDSHAKE_FAILED: &str = "remote attachment failed (SSH or daemon h
 /// version. This never touches the terminal, and failure or cancellation still
 /// terminates and reaps SSH. Nothing is started, stopped, or saved here.
 pub async fn probe_remote(host: &str) -> anyhow::Result<String> {
-    over_ssh(host, |stream| {
+    over_ssh(host, false, |stream| {
         prepare_remote(async {
             let mut remote = remote::negotiate(
                 stream,
@@ -627,11 +630,15 @@ pub(crate) async fn diagnose_remote(host: &str) -> anyhow::Result<String> {
 
 /// Runs `work` over one fresh SSH bridge, then terminates and reaps SSH
 /// whether or not `work` succeeded.
-async fn over_ssh<T, F>(host: &str, work: impl FnOnce(UnixStream) -> F) -> anyhow::Result<T>
+async fn over_ssh<T, F>(
+    host: &str,
+    start_if_missing: bool,
+    work: impl FnOnce(UnixStream) -> F,
+) -> anyhow::Result<T>
 where
     F: Future<Output = anyhow::Result<T>>,
 {
-    let (stream, bridge) = crate::ssh_bridge::SshBridge::connect(host)?;
+    let (stream, bridge) = crate::ssh_bridge::SshBridge::connect(host, start_if_missing)?;
     let result = work(stream).await;
     let cleanup = bridge.shutdown().await;
     result.and_then(|value| cleanup.map(|()| value))

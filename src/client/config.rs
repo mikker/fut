@@ -1558,6 +1558,7 @@ impl UiConfig {
 struct Config {
     terminal: crate::terminal::TerminalConfig,
     ui: UiConfig,
+    remote: RemoteConfig,
     alerts: AlertsConfig,
     trusted_commands: BTreeMap<String, PaletteCommand>,
     extension_commands: BTreeMap<String, ExtensionCommandConfig>,
@@ -1566,6 +1567,18 @@ struct Config {
     projects: BTreeMap<String, ProjectConfig>,
     #[serde(deserialize_with = "deserialize_extension_config_catalog")]
     extension: BTreeMap<String, ExtensionConfigTable>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RemoteConfig {
+    autostart: bool,
+}
+
+impl Default for RemoteConfig {
+    fn default() -> Self {
+        Self { autostart: true }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
@@ -1727,6 +1740,10 @@ pub(crate) struct StagedUiConfig {
 }
 
 impl StagedUiConfig {
+    pub(crate) fn remote_autostart(&self) -> bool {
+        self.config.remote.autostart
+    }
+
     /// Missing remote catalog support disables extension declarations and their
     /// local overrides; it must not make the rest of the interface unusable.
     pub(crate) fn materialize_remote(
@@ -2941,6 +2958,31 @@ fn validate_text(path: &str, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_autostart_defaults_on_and_can_be_disabled_locally() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("config.toml");
+        let location = ConfigLocation {
+            path: Some(path.clone()),
+            explicit: false,
+            source: "test",
+        };
+        assert!(stage_location(&location).unwrap().remote_autostart());
+        fs::write(&path, "[remote]\nautostart = false\n").unwrap();
+        assert!(!stage_location(&location).unwrap().remote_autostart());
+        fs::write(&path, "[remote]\nautostart = true\n").unwrap();
+        assert!(stage_location(&location).unwrap().remote_autostart());
+        fs::write(&path, "[remote]\nautostart = 'false'\n").unwrap();
+        assert!(stage_location(&location).is_err());
+        fs::write(&path, "[remote]\nunknown = false\n").unwrap();
+        assert!(stage_location(&location).is_err());
+        assert!(
+            stage_location(&ConfigLocation::disabled())
+                .unwrap()
+                .remote_autostart()
+        );
+    }
 
     #[test]
     fn terminal_scrollback_settings_load_for_client_and_daemon() {

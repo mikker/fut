@@ -74,26 +74,34 @@ The local process renders the interface and uses the local theme, keybindings,
 and clipboard; SSH carries the Fut protocol to the remote daemon without
 exposing a network listener.
 
-Fut must already be installed on the remote host and its daemon must already be
-running. The client and daemon may use different Fut versions when they support
-the same remote protocol generation, codec, and required capabilities. Older
-releases without the remote handshake need upgrading before remote attachment
-can work. For example, connect normally once, start Fut, and
-detach before using the local client:
+To attach without starting a missing daemon, run
+`fut --remote workbox --attach-only`. To make that your default, set
+`autostart = false` in the **local** `config.toml`:
 
-```sh
-ssh workbox
-fut
-# Ctrl-b d, then exit SSH
-fut --remote workbox
+```toml
+[remote]
+autostart = false
 ```
 
-Remote attachment is initially attach-only: it never starts, stops, upgrades,
-or replaces the remote daemon. Project opening, configuration reload, configured
-commands, extension command actions, and client lifecycle hooks are unavailable
-because they currently assume the client and daemon share a filesystem. Remote
-terminal links are limited to HTTP and HTTPS. Ordinary terminal input,
-navigation, layout actions, copy mode, and pane links continue to work.
+`--attach-only` applies to this invocation even if autostart is enabled in
+config. It does not change the remote host's configuration.
+
+Fut must already be installed on the remote host. If its daemon is not running,
+`fut --remote workbox` starts it there by default, using that host's normal
+socket, configuration and working directory. The client and daemon may use
+different Fut versions when they support the same remote protocol generation,
+codec, and required capabilities. Older releases without the remote handshake
+(or the remote bridge startup option) need upgrading before remote attachment
+can work.
+
+Remote attachment never stops, upgrades, or replaces an existing daemon, even if
+it is incompatible. Saved-machine background monitoring and `fut doctor` remain
+attach-only and never start remote daemons. Project opening, configuration reload,
+configured commands, extension command actions, and client lifecycle hooks are
+unavailable because they currently assume the client and daemon share a
+filesystem. Remote terminal links are limited to HTTP and HTTPS. Ordinary
+terminal input, navigation, layout actions, copy mode, and pane links continue
+to work.
 
 The navigator requires metadata support, and attachment additionally requires
 interactive terminal support. Bell alerts, extension catalogs, and health checks

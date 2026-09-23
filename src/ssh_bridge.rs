@@ -1,11 +1,11 @@
-//! Private, protocol-blind SSH transport. Neither end starts or stops a daemon.
+//! Private, protocol-blind SSH transport. Standalone attachment may bootstrap
+//! a missing daemon on the remote host; background probes remain attach-only.
 
 use std::{
     fs::File,
     io::{self, Read, Write},
     os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd},
     os::unix::net::UnixStream as StdUnixStream,
-    path::Path,
     process::Stdio,
     sync::{Arc, Mutex},
 };
@@ -20,10 +20,8 @@ use tokio::{
 /// This runs on a blocking worker, using poll rather than Tokio's stdin helper:
 /// a blocked stdin helper can keep the runtime alive after the daemon disconnects.
 /// EOF on either input ends the attachment once that direction's buffer drains.
-/// There is deliberately no frame parsing, handshake, or daemon autostart here.
-pub(crate) fn run_stdio(path: &Path) -> Result<()> {
-    let socket = StdUnixStream::connect(path)
-        .with_context(|| format!("connect bridge to {}", path.display()))?;
+/// There is deliberately no frame parsing or handshake here.
+pub(crate) fn run_stdio(socket: StdUnixStream) -> Result<()> {
     let stdin = duplicate(libc::STDIN_FILENO)?;
     let stdout = duplicate(libc::STDOUT_FILENO)?;
     let _stdin_flags = Nonblocking::new(stdin.as_raw_fd())?;
@@ -161,8 +159,8 @@ pub(crate) struct SshBridge {
 }
 
 impl SshBridge {
-    pub(crate) fn connect(destination: &str) -> Result<(UnixStream, Self)> {
-        let mut command = ssh_command(destination)?;
+    pub(crate) fn connect(destination: &str, start_if_missing: bool) -> Result<(UnixStream, Self)> {
+        let mut command = ssh_command(destination, start_if_missing)?;
         Self::spawn(&mut command)
     }
 
@@ -303,13 +301,22 @@ pub(crate) fn validate_destination(destination: &str) -> Result<()> {
     Ok(())
 }
 
-fn ssh_command(destination: &str) -> Result<Command> {
+fn ssh_command(destination: &str, start_if_missing: bool) -> Result<Command> {
     validate_destination(destination)?;
     let mut command = Command::new("ssh");
     // Let OpenSSH resolve aliases, identities, ProxyJump, and other user config.
     // Only this fixed string reaches the remote shell; no destination/path is
     // interpolated into it. Remote socket selection uses the normal environment.
-    command.args(["-T", "--", destination, "fut __stdio-bridge"]);
+    command.args([
+        "-T",
+        "--",
+        destination,
+        if start_if_missing {
+            "fut __stdio-bridge --start-if-missing"
+        } else {
+            "fut __stdio-bridge"
+        },
+    ]);
     Ok(command)
 }
 
@@ -357,10 +364,18 @@ mod tests {
     #[test]
     fn ssh_uses_direct_argv_and_a_fixed_remote_command() {
         for host in ["work", "user@host", "user@[::1]", "host;echo"] {
-            let command = ssh_command(host).unwrap();
+            let command = ssh_command(host, true).unwrap();
             assert_eq!(command.as_std().get_program(), "ssh");
             assert_eq!(
                 command.as_std().get_args().collect::<Vec<_>>(),
+                ["-T", "--", host, "fut __stdio-bridge --start-if-missing"]
+            );
+            assert_eq!(
+                ssh_command(host, false)
+                    .unwrap()
+                    .as_std()
+                    .get_args()
+                    .collect::<Vec<_>>(),
                 ["-T", "--", host, "fut __stdio-bridge"]
             );
             let background = background_ssh_command(host).unwrap();
@@ -389,9 +404,9 @@ mod tests {
             "user:password@host",
             &"h".repeat(MAX_DESTINATION_BYTES + 1),
         ] {
-            assert!(ssh_command(invalid).is_err(), "{invalid:?}");
+            assert!(ssh_command(invalid, true).is_err(), "{invalid:?}");
         }
-        assert!(ssh_command("hôte").is_ok());
+        assert!(ssh_command("hôte", true).is_ok());
     }
 
     #[tokio::test]
