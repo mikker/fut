@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Open named projects with `fut project NAME` or `fut p NAME`, while `fut open -p NAME` still works.
 - Project run commands now load the user's shell profile before starting, so aliases and PATH changes are available.
 
 ## 0.25

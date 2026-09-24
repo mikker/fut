@@ -178,11 +178,15 @@ enum Command {
         #[arg(last = true, value_hint = ValueHint::CommandWithArguments)]
         command: Vec<String>,
     },
-    /// Initialize or list projects.
+    /// Open a named project, or initialize or list projects.
+    #[command(alias = "p", args_conflicts_with_subcommands = true)]
     Project {
+        /// Project name from the configured catalog or projects_dir.
+        #[arg(value_name = "NAME", add = ArgValueCompleter::new(completion::project))]
+        name: Option<String>,
         /// Project operation to perform.
         #[command(subcommand)]
-        command: ProjectCommand,
+        command: Option<ProjectCommand>,
     },
     /// Approve the exact current local project recipe after validating it.
     Trust {
@@ -1118,6 +1122,22 @@ fn validate_remote_cli(cli: &Cli) -> Result<()> {
 }
 
 async fn execute(cli: Cli) -> Result<()> {
+    let mut cli = cli;
+    cli.command = cli.command.map(|command| match command {
+        Command::Project {
+            name: Some(project),
+            command: None,
+        } => Command::Open {
+            path: None,
+            project: Some(project),
+            name: None,
+            parent_workspace: None,
+            background: false,
+            command: Vec::new(),
+        },
+        command => command,
+    });
+
     if let Some(host) = &cli.remote {
         reject_nested_client(&cli)?;
         return client::attach_remote(host, &cli.config_location()?, cli.attach_only).await;
@@ -1324,9 +1344,11 @@ async fn execute(cli: Cli) -> Result<()> {
                 ),
             }
         }
-        Some(Command::Project { command }) => {
-            run_project_command(&config_location, cli.json, command)
-        }
+        Some(Command::Project {
+            command: Some(command),
+            ..
+        }) => run_project_command(&config_location, cli.json, command),
+        Some(Command::Project { .. }) => bail!("project requires a NAME or a subcommand"),
         Some(Command::Session {
             command: SessionCommand::Attach { session },
         }) => {
@@ -3457,6 +3479,7 @@ fn reject_interactive_json(cli: &Cli) -> Result<()> {
 fn attaches_client(command: &Option<Command>) -> bool {
     command.is_none()
         || matches!(command, Some(Command::Attach { .. }))
+        || matches!(command, Some(Command::Project { name: Some(_), .. }))
         || matches!(
             command,
             Some(Command::Open {
@@ -5785,6 +5808,23 @@ mod tests {
     }
 
     #[test]
+    fn project_name_opens_in_the_foreground_with_the_short_alias() {
+        for subcommand in ["project", "p"] {
+            let cli = try_parse_cli_from(["fut", subcommand, "fut"]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Some(Command::Project { ref name, command: None }) if name.as_deref() == Some("fut")
+            ));
+            assert!(attaches_client(&cli.command));
+            assert!(Cli::try_parse_from(["fut", subcommand, "fut", "other"]).is_err());
+            assert!(Cli::try_parse_from(["fut", subcommand, "fut", "list"]).is_err());
+
+            let cli = try_parse_cli_from(["fut", "--json", subcommand, "fut"]).unwrap();
+            assert!(reject_interactive_json(&cli).is_err());
+        }
+    }
+
+    #[test]
     fn open_attaches_by_default_and_accepts_a_background_flag() {
         let foreground = Cli::try_parse_from(["fut", "open"]).unwrap();
         assert!(attaches_client(&foreground.command));
@@ -5840,22 +5880,26 @@ mod tests {
 
     #[test]
     fn project_and_trust_commands_parse_with_global_json() {
-        let init = Cli::try_parse_from(["fut", "project", "init"]).unwrap();
-        assert!(matches!(
-            init.command,
-            Some(Command::Project {
-                command: ProjectCommand::Init
-            })
-        ));
-
-        for command in ["list", "ls"] {
-            let cli = Cli::try_parse_from(["fut", "project", command]).unwrap();
+        for group in ["project", "p"] {
+            let init = Cli::try_parse_from(["fut", group, "init"]).unwrap();
             assert!(matches!(
-                cli.command,
+                init.command,
                 Some(Command::Project {
-                    command: ProjectCommand::List
+                    name: None,
+                    command: Some(ProjectCommand::Init)
                 })
             ));
+
+            for command in ["list", "ls"] {
+                let cli = Cli::try_parse_from(["fut", group, command]).unwrap();
+                assert!(matches!(
+                    cli.command,
+                    Some(Command::Project {
+                        name: None,
+                        command: Some(ProjectCommand::List)
+                    })
+                ));
+            }
         }
 
         let cli = Cli::try_parse_from(["fut", "--json", "trust", "."]).unwrap();
@@ -6081,6 +6125,7 @@ mod tests {
         let help = String::from_utf8(help).unwrap();
         assert!(help.contains("versioned JSON for noninteractive commands only"));
         assert!(help.contains("Open a location and attach to it"));
+        assert!(help.contains("Open a named project, or initialize or list projects"));
 
         let command = cli_command();
         let project = command.find_subcommand("project").unwrap();

@@ -27,10 +27,12 @@ recipe = "~/.config/fut/recipes/website.toml"
 
 Project names use ASCII letters, numbers, `-`, or `_` and must be unique. Paths
 must be absolute or begin with `~/`; Fut performs no filesystem scanning or
-shell interpolation. Open and attach to a catalog entry with
-`fut open -p fut` (or `--project fut`), or add `-b` to open it in the background.
+shell interpolation. Open and attach to a catalog entry with `fut project fut`
+(or its short alias, `fut p fut`).
+`fut open -p fut` (or `--project fut`) still works; add `-b` to that form to
+open it in the background.
 When `projects_dir` is set, a project name not in the explicit catalog falls
-back to a directory with that name below it, so `fut open -p website` opens
+back to a directory with that name below it, so `fut project website` opens
 `~/dev/website` in this example. Explicit catalog entries take precedence.
 An optional path may select a linked checkout, for example
 `fut open ../fut-feature --project fut`; Fut verifies that the path has the same
