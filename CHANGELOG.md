@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.25
+
 - `fut --remote` now starts a missing daemon on the SSH host automatically, with local config and `--attach-only` opt-outs; it never replaces an existing one.
 - Added explicit nested workspaces with depth-first navigation and tree rendering in the navigator and `fut list`.
 - Fut now records daemon lifecycle and failures in a bounded rotating log whose path is shown by `fut doctor`.
