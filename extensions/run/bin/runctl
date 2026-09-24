@@ -490,8 +490,12 @@ def supervise(wsdir, generation, command, cwd, grace, readiness_signal, ack_fd):
         % (generation, timestamp(), shlex.join(command))
     )
     try:
+        # The interactive login shell loads both login and interactive startup
+        # files. Pass shell source rather than positional arguments so aliases
+        # defined there can expand, while quoting each configured argument.
+        shell = os.environ.get("SHELL") or "/bin/sh"
         child = subprocess.Popen(
-            command,
+            [shell, "-lic", shlex.join(command)],
             cwd=cwd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -501,7 +505,7 @@ def supervise(wsdir, generation, command, cwd, grace, readiness_signal, ack_fd):
     except OSError as error:
         log.write_line("===== fut-run · start failed · %s =====" % error)
         record_exit(wsdir, generation, command, cwd, None, str(error), terminated=False)
-        ack(ack_fd, "failed to start %s: %s" % (command[0], error))
+        ack(ack_fd, "failed to start %s: %s" % (shell, error))
         os._exit(1)
 
     try:

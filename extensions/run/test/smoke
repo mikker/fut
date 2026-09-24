@@ -167,6 +167,22 @@ empty_tokens_have_no_actions || fail "an empty token carried an action"
 grep -q "fut-run · start · generation 1" "$(state_dir w1)/run.log" || fail "missing start separator"
 ok "restart records the owner and publishes actionable play tokens by default"
 
+# A profile must run before resolving the command, including aliases and PATH.
+mkdir -p "$TMP/profile/bin"
+cat > "$TMP/profile/bin/profile-tool" <<'SH'
+#!/bin/sh
+printf 'arg1=<%s> arg2=<%s>\n' "$1" "$2"
+SH
+chmod +x "$TMP/profile/bin/profile-tool"
+printf 'export PATH="%s:$PATH"\nsource ~/.bashrc\n' "$TMP/profile/bin" > "$TMP/profile/.bash_profile"
+echo "alias profile-alias=profile-tool" > "$TMP/profile/.bashrc"
+SHELL=$(command -v bash) HOME="$TMP/profile" \
+  run w-profile '{"command":["profile-alias","arg with spaces","semi;colon"]}' restart || fail "profile restart failed"
+wait_for 5 phase_is w-profile exited || fail "profile command did not exit"
+exit_code_is w-profile 0 || fail "profile command failed: $(cat "$(state_dir w-profile)/run.log")"
+grep -q 'arg1=<arg with spaces> arg2=<semi;colon>' "$(state_dir w-profile)/run.log" || fail "profile alias or arguments were not resolved"
+ok "run commands resolve profile aliases and PATH without splitting arguments"
+
 # --- clickable status variants ------------------------------------------------
 run w-click-logs '{"command":["sh","-c","exit 0"],"click":"logs"}' restart ignored-pane || fail "logs-click restart failed"
 wait_for 5 phase_is w-click-logs exited || fail "logs-click runner never exited"
@@ -242,8 +258,8 @@ wait_for 5 exit_code_is w3 7 || fail "w3 nonzero exit not recorded"
 wait_for 5 token_is w3 cross || fail "w3 nonzero token is '$(last_token w3)'"
 ok "clean exit publishes stop; nonzero exit publishes cross"
 
-# --- 8. launch failure surfaces an error and cross --------------------------------
-run w4 '{"command":["/definitely/not/here-xyz"]}' restart 2>"$TMP/err" && fail "launch failure exited 0"
+# --- 8. shell launch failure surfaces an error and cross --------------------------
+SHELL=/definitely/not/here-xyz run w4 '{"command":["echo","hi"]}' restart 2>"$TMP/err" && fail "launch failure exited 0"
 grep -q "failed to start /definitely/not/here-xyz" "$TMP/err" || fail "launch failure message: $(cat "$TMP/err")"
 token_is w4 cross || fail "w4 launch-failure token"
 phase_is w4 exited || fail "w4 launch-failure phase is not exited"
@@ -347,6 +363,7 @@ hook w-new workspace.created "$TMP/roots/w-new" "$AUTO_TRUSTED" "$AUTO_TRUSTED" 
   fail "new workspace hook failed"
 [ ! -e "$(dirname "$(state_dir w1)")/w-new/state.json" ] || \
   fail "new workspace repeated project auto-start"
+wait_for 5 lines_at_least "$AUTO_PIDS" 1 || fail "trusted command did not start"
 [ "$(wc -l < "$AUTO_PIDS" | tr -d ' ')" = 1 ] || fail "project command started more than once"
 D_AUTO=$(state_dir w-auto)
 ok "creation hooks pause manual commands and auto-start once per project session"

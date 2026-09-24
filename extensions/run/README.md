@@ -15,7 +15,7 @@ the extension validates the inner keys:
 
 ```toml
 [extension.run]
-command = ["npm", "run", "dev"]   # required argv array; never a shell string
+command = ["npm", "run", "dev"]   # required argv array
 grace_seconds = 3            # optional, 0–120: SIGTERM→SIGKILL escalation delay
 signal = "FUT:READY"         # optional literal marker in combined stdout/stderr
 auto_start = true            # optional; trusted global/project config only
@@ -28,6 +28,12 @@ do not start it again. The trusted command and all settings used for that
 automatic start come from global configuration plus the exact approved project
 recipe. A `.fut/config.toml` may still override manual `run:restart`, but cannot
 affect automatic execution.
+
+Run commands start in the user's interactive login shell (`$SHELL`, or
+`/bin/sh` if unset). Its startup files load before the command, so aliases and
+PATH changes from the shell profile work. Each command argument is shell-quoted;
+the array is not treated as a free-form script. Shell startup output is logged
+alongside the command's output.
 
 Run status tokens are clickable in both the tab bar and expanded workspace
 sidebar. With the default `click = "owner"`, clicking a status returns that Fut

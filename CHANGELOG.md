@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Project run commands now load the user's shell profile before starting, so aliases and PATH changes are available.
+
 ## 0.25
 
 - `fut --remote` now starts a missing daemon on the SSH host automatically, with local config and `--attach-only` opt-outs; it never replaces an existing one.
