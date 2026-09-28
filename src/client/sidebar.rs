@@ -2365,10 +2365,15 @@ fn workspace_row_lines(
         &icons,
         resolve,
     );
-    if !body.spans.is_empty() && !icons.pill_left.is_empty() && !icons.pill_right.is_empty() {
-        let left_width = UnicodeWidthStr::width(icons.pill_left.as_str());
+    let pill_width =
+        if !body.spans.is_empty() && !icons.pill_left.is_empty() && !icons.pill_right.is_empty() {
+            UnicodeWidthStr::width(icons.pill_left.as_str())
+        } else {
+            0
+        };
+    if pill_width > 0 {
         for action in &mut body.actions {
-            action.start += left_width;
+            action.start += pill_width;
         }
         if item.current {
             let title_style = apply_item_state(&ui.styles, title_state, surface);
@@ -2382,7 +2387,7 @@ fn workspace_row_lines(
         } else {
             body.line
                 .spans
-                .insert(0, Span::styled(" ".repeat(left_width), row_style));
+                .insert(0, Span::styled(" ".repeat(pill_width), row_style));
         }
     }
     let right = render_token_segments(
@@ -2394,14 +2399,23 @@ fn workspace_row_lines(
         resolve,
     );
     let detail = (!workspace_config(ui, side).row.detail.is_empty()).then(|| {
-        render_token_segments(
+        let mut detail = render_token_segments(
             &workspace_config(ui, side).row.detail,
             None,
             state,
             &ui.styles,
             &icons,
             resolve,
-        )
+        );
+        if pill_width > 0 {
+            // The title line reserves a cap column even when unfocused;
+            // detail connectors must begin beneath the same tree column.
+            detail
+                .line
+                .spans
+                .insert(0, Span::raw(" ".repeat(pill_width)));
+        }
+        detail
     });
     WorkspaceRowLines {
         style: row_style,
@@ -2584,6 +2598,43 @@ mod tests {
         assert_eq!(workspace_tree_continuation("└─ "), "   ");
         assert_eq!(workspace_tree_continuation("│  └─ "), "│     ");
         assert_eq!(workspace_tree_continuation("│     └─ "), "│        ");
+    }
+
+    #[test]
+    fn workspace_tree_detail_aligns_with_pill_padded_branch() {
+        let (mut snapshot, focused) = fixture(&["root", "child", "sibling"], 1);
+        let root_id = snapshot.sessions[0].workspaces[0].id;
+        for workspace in &mut snapshot.sessions[0].workspaces[1..] {
+            workspace.parent_workspace_id = Some(root_id);
+        }
+        let model = WorkspaceModel::from_snapshot(
+            &snapshot,
+            &focused,
+            &NavigationHistory::default(),
+            &NotificationState::default(),
+        );
+        for caps in [false, true] {
+            let mut ui = UiConfig::default();
+            if caps {
+                ui.icons.pill_left = Some("<".into());
+                ui.icons.pill_right = Some(">".into());
+            }
+            let area = Rect::new(0, 0, 40, 2);
+            let mut buffer = Buffer::empty(area);
+            render_workspace_row(
+                &model.items[1],
+                false,
+                0,
+                area,
+                SidebarSide::Left,
+                &ui,
+                &mut buffer,
+            );
+            let branch = (0..area.width).find(|&x| buffer[(x, 0)].symbol() == "├");
+            let continuation = (0..area.width).find(|&x| buffer[(x, 1)].symbol() == "│");
+            assert_eq!(branch, continuation, "pill caps: {caps}");
+            assert_eq!(branch, Some(if caps { 4 } else { 3 }));
+        }
     }
 
     fn fixture(names: &[&str], current: usize) -> (ResourceSnapshot, SelectedTarget) {
