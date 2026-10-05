@@ -255,6 +255,29 @@ impl PtyChild {
         .unwrap_or_else(|_| panic!("PTY output never contained {needle:?}: {:?}", self.text()));
     }
 
+    async fn wait_for_screen(&mut self, needle: &str) {
+        time::timeout(DEADLINE, async {
+            loop {
+                assert!(
+                    self.child.try_wait().unwrap().is_none(),
+                    "PTY child exited before screen contained {needle:?}; output={:?}",
+                    self.text()
+                );
+                if self.screen_text().contains(needle) {
+                    return;
+                }
+                time::sleep(POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "PTY screen never contained {needle:?}: {:?}",
+                self.screen_text()
+            )
+        });
+    }
+
     async fn wait_for_screen_without(&mut self, needle: &str) {
         time::timeout(DEADLINE, async {
             loop {
@@ -287,6 +310,16 @@ impl PtyChild {
         })
         .await
         .unwrap_or_else(|_| panic!("PTY output never contained {needle:?}: {:?}", self.text()));
+    }
+
+    /// Query the shell until its PTY has applied an asynchronous layout change.
+    /// A unique marker prevents retained scrollback from satisfying a later check
+    /// for the same geometry. Only the read-only probe is retried, not UI input.
+    async fn wait_for_terminal_size(&mut self, rows: u16, columns: u16) {
+        let request = Uuid::new_v4().simple().to_string();
+        let input = format!("size-{request}\n");
+        let expected = format!("SIZE_{request}_{rows}_{columns}");
+        self.send_until(input.as_bytes(), &expected).await;
     }
 
     async fn wait_for_count(&mut self, needle: &str, count: usize) {
@@ -11664,14 +11697,48 @@ segments = [{ text = "{" }, { token = "tab.marker" }, { text = ":" }, { token = 
 }
 
 #[tokio::test]
+async fn terminal_size_probe_retries_and_requires_a_fresh_response() {
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        r#"
+previous=
+requests=0
+while IFS= read -r line; do
+  case "$line" in
+    exit) exit 0 ;;
+    size-*)
+      if [ "$line" = "$previous" ]; then
+        columns=96
+        printf 'PROBE_REQUEST_%s_SETTLED\r\n' "$requests"
+      else
+        columns=95
+        requests=$((requests + 1))
+      fi
+      previous=$line
+      printf 'SIZE_%s_23_%s\r\n' "${line#size-}" "$columns"
+      ;;
+  esac
+done
+"#,
+    ]);
+    let mut client = PtyChild::spawn(command);
+    client.wait_for_terminal_size(23, 96).await;
+    // Request the same geometry again: old output must not satisfy this check.
+    client.wait_for_terminal_size(23, 96).await;
+    client.wait_for("PROBE_REQUEST_2_SETTLED").await;
+    client.send(b"exit\n");
+    client.wait_success().await;
+}
+
+#[tokio::test]
 async fn public_component_sidebar_docks_navigates_and_collapses_responsively() {
     let main_script = r#"
 printf 'ALPHA_READY\r\n'
 while IFS= read -r line; do
   case "$line" in
     main) printf 'BRAVO_ACK\r\n' ;;
-    size-main) set -- $(stty size); printf 'ALPHA_SIZE_%s_%s\r\n' "$1" "$2" ;;
-    size-narrow) set -- $(stty size); printf 'NARROW_SIZE_%s_%s\r\n' "$1" "$2" ;;
+    size-*) set -- $(stty size); printf 'SIZE_%s_%s_%s\r\n' "${line#size-}" "$1" "$2" ;;
   esac
 done
 "#;
@@ -11701,7 +11768,7 @@ done
             program: Some("/bin/sh".into()),
             argv: vec![
                 "-c".into(),
-                "printf 'ZETA_READY\\r\\n'; while IFS= read -r line; do case \"$line\" in linked) printf 'ZETA_INPUT\\r\\n';; after-close) printf 'OMEGA_ACK\\r\\n';; size-linked) set -- $(stty size); printf 'ZETA_SIZE_%s_%s\\r\\n' \"$1\" \"$2\";; esac; done".into(),
+                "printf 'ZETA_READY\\r\\n'; while IFS= read -r line; do case \"$line\" in linked) printf 'ZETA_INPUT\\r\\n';; after-close) printf 'OMEGA_ACK\\r\\n';; size-*) set -- $(stty size); printf 'SIZE_%s_%s_%s\\r\\n' \"${line#size-}\" \"$1\" \"$2\";; esac; done".into(),
             ],
         })
         .await
@@ -11733,15 +11800,14 @@ done
     let mut left = spawn_client(124, main_pane);
     left.wait_for("ALPHA_READY").await;
     left.wait_for("feature").await;
-    left.send(b"size-main\n");
-    left.wait_for("ALPHA_SIZE_23_96").await;
+    left.wait_for_terminal_size(23, 96).await;
     left.send(b"\x02w");
     left.wait_for("hotkeys").await;
     left.send(b"j\r");
     left.wait_for("ZETA_READY").await;
-    left.send(b"linked\nsize-linked\n");
+    left.send(b"linked\n");
     left.wait_for("ZETA_INPUT").await;
-    left.wait_for("ZETA_SIZE_23_96").await;
+    left.wait_for_terminal_size(23, 96).await;
     left.send(b"\x02\x17");
     left.send(b"main\n");
     left.wait_for("BRAVO_ACK").await;
@@ -11757,15 +11823,13 @@ done
         ]
         .concat(),
     );
-    left.send(b"size-main\n");
-    left.wait_for("ALPHA_SIZE_23_104").await;
+    left.wait_for_terminal_size(23, 104).await;
     left.send(b"\x02d");
     left.wait_success().await;
 
     let mut left_reset = spawn_client(124, main_pane);
     left_reset.wait_for("ALPHA_READY").await;
-    left_reset.send(b"size-main\n");
-    left_reset.wait_for("ALPHA_SIZE_23_96").await;
+    left_reset.wait_for_terminal_size(23, 96).await;
     left_reset.send(b"\x02d");
     left_reset.wait_success().await;
 
@@ -11800,8 +11864,7 @@ components = [
     ));
     configured.wait_for("λ").await;
     configured.send(b"\x02]q");
-    configured.send(b"size-linked\n");
-    configured.wait_for("ZETA_SIZE_23_96").await;
+    configured.wait_for_terminal_size(23, 96).await;
     configured.send(
         &[
             sgr_mouse(0, 97, 6, false),
@@ -11810,15 +11873,13 @@ components = [
         ]
         .concat(),
     );
-    configured.send(b"size-linked\n");
-    configured.wait_for("ZETA_SIZE_23_104").await;
+    configured.wait_for_terminal_size(23, 104).await;
     configured.send(b"\x02d");
     configured.wait_success().await;
 
     let mut configured_reset = spawn_client(124, linked_target.pane_id);
     configured_reset.wait_for("ZETA_READY").await;
-    configured_reset.send(b"size-linked\n");
-    configured_reset.wait_for("ZETA_SIZE_23_96").await;
+    configured_reset.wait_for_terminal_size(23, 96).await;
     configured_reset.send(b"\x02d");
     configured_reset.wait_success().await;
 
@@ -11835,8 +11896,7 @@ components = [
 
     let mut narrow = spawn_client(123, main_pane);
     narrow.wait_for("ALPHA_READY").await;
-    narrow.send(b"size-narrow\n");
-    narrow.wait_for("NARROW_SIZE_23_95").await;
+    narrow.wait_for_terminal_size(23, 95).await;
     narrow.send(b"\x02w");
     narrow.wait_for("feature").await;
     narrow.wait_for("λ").await;
@@ -11849,15 +11909,13 @@ components = [
         .concat(),
     );
     narrow.send(b"q");
-    narrow.send(b"size-narrow\n");
-    narrow.wait_for("NARROW_SIZE_23_103").await;
+    narrow.wait_for_terminal_size(23, 103).await;
     narrow.send(b"\x02d");
     narrow.wait_success().await;
 
     let mut narrow_reset = spawn_client(123, main_pane);
     narrow_reset.wait_for("ALPHA_READY").await;
-    narrow_reset.send(b"size-narrow\n");
-    narrow_reset.wait_for("NARROW_SIZE_23_95").await;
+    narrow_reset.wait_for_terminal_size(23, 95).await;
     narrow_reset.send(b"\x02d");
     narrow_reset.wait_success().await;
 
@@ -11885,24 +11943,19 @@ components = [
             && snapshot.sessions[0].workspaces[0].name == "feature done"
     })
     .await;
-    live_close.send(b"size-linked\n");
-    live_close.wait_for("ZETA_SIZE_23_124").await;
+    live_close.wait_for_terminal_size(23, 124).await;
     live_close.send(b"\x02w");
     live_close.wait_for("done").await;
-    live_close.wait_for("MODE:automatic").await;
-    live_close.clear_output();
+    live_close.wait_for_screen("MODE:automatic").await;
     live_close.send(b"h");
-    // A concurrent resource redraw may preserve the unchanged `MODE:`
-    // prefix and emit only the changed suffix through the terminal diff.
-    live_close.wait_for("den").await;
-    live_close.clear_output();
+    live_close.wait_for_screen("MODE:hidden").await;
     live_close.send(b"h");
-    live_close.send(b"qsize-linked\n");
-    live_close.wait_for("ZETA_SIZE_23_96").await;
-    live_close.send(b"\x02wmqsize-linked\n");
-    live_close.wait_for("ZETA_SIZE_23_118").await;
-    live_close.send(b"\x02whqsize-linked\n");
-    live_close.wait_for("ZETA_SIZE_23_124").await;
+    live_close.send(b"q");
+    live_close.wait_for_terminal_size(23, 96).await;
+    live_close.send(b"\x02wmq");
+    live_close.wait_for_terminal_size(23, 118).await;
+    live_close.send(b"\x02whq");
+    live_close.wait_for_terminal_size(23, 124).await;
     live_close.send(b"\x02w");
     live_close.send(b"k\r");
     live_close.send(b"after-close\n");
