@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-## 0.28
+## 0.29
 
 - Keep SSH connections alive and automatically reattach after network interruptions; `fut doctor` reports effective keepalive settings.
 - Attach by saved machine name or SSH host with `--machine` (`--remote` remains an alias), and open remote catalog projects with `fut p NAME --machine HOST`.
