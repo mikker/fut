@@ -64,13 +64,13 @@ fields = [{ name = 'value', label = 'Value' }]
         .materialize(&catalog)
         .unwrap();
     assert!(
-        Attachment::Remote(crate::protocol::remote::Capabilities::ALL)
+        Attachment::remote(crate::protocol::remote::Capabilities::ALL, "clonk")
             .client_hooks(&ui)
             .unwrap()
             .is_none()
     );
     assert!(
-        Attachment::Remote(crate::protocol::remote::Capabilities::ALL)
+        Attachment::remote(crate::protocol::remote::Capabilities::ALL, "clonk")
             .local_socket()
             .is_err()
     );
@@ -160,7 +160,7 @@ fields = [{ name = 'value', label = 'Value' }]
             Rect::new(0, 0, 80, 24),
             &mut ui,
             &mut temporary,
-            &Attachment::Remote(crate::protocol::remote::Capabilities::ALL),
+            &Attachment::remote(crate::protocol::remote::Capabilities::ALL, "clonk"),
             None,
             federation::MachineId::Local,
             &background,
@@ -198,7 +198,7 @@ fields = [{ name = 'value', label = 'Value' }]
             Rect::new(0, 0, 80, 24),
             &ui,
             &mut temporary,
-            &Attachment::Remote(crate::protocol::remote::Capabilities::ALL),
+            &Attachment::remote(crate::protocol::remote::Capabilities::ALL, "clonk"),
             &background,
         )
         .await
@@ -233,7 +233,7 @@ fields = [{ name = 'value', label = 'Value' }]
             Rect::new(0, 0, 80, 24),
             &ui,
             &mut temporary,
-            &Attachment::Remote(crate::protocol::remote::Capabilities::ALL),
+            &Attachment::remote(crate::protocol::remote::Capabilities::ALL, "clonk"),
             &background,
         )
         .await
@@ -408,7 +408,7 @@ async fn remote_handshakes_accept_unequal_versions_and_omit_optional_behavior() 
             .unwrap();
         assert!(ui.extensions.is_empty());
         assert!(
-            Attachment::Remote(connection.capabilities)
+            Attachment::remote(connection.capabilities, "clonk")
                 .local_socket()
                 .is_err()
         );

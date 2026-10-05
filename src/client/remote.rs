@@ -3,6 +3,13 @@ use crate::protocol::remote::{
     Capabilities, Capability, EndpointError, RemoteHello, RemoteWelcome, decode_handshake,
 };
 
+#[derive(Debug, thiserror::Error)]
+#[error("remote daemon error ({code}): {message}")]
+pub(super) struct OperationError {
+    code: String,
+    message: String,
+}
+
 pub(super) struct RemoteConnection {
     pub framed: Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>,
     pub welcome: RemoteWelcome,
@@ -37,11 +44,11 @@ pub(super) async fn negotiate(
         ServerMessage::RemoteWelcome(welcome) => welcome,
         ServerMessage::EndpointError { error } => return Err(error.into()),
         ServerMessage::Error { code, message } => {
-            bail!(
-                "remote daemon error ({}): {}",
-                sanitize(&code),
-                sanitize(&message)
-            );
+            return Err(OperationError {
+                code: sanitize(&code),
+                message: sanitize(&message),
+            }
+            .into());
         }
         _ => return Err(EndpointError::InvalidHandshake.into()),
     };
@@ -167,5 +174,61 @@ pub(super) async fn open_project(
         ),
         ServerMessage::EndpointError { error } => Err(error.into()),
         _ => bail!("unexpected response to remote project open"),
+    }
+}
+
+/// Both handoffs and reconnection run in raw mode: use noninteractive SSH and
+/// retain its owner until the prepared attachment is committed or discarded.
+pub(super) async fn prepare_attachment(
+    target: &str,
+    selector: TargetSelector,
+    size: TerminalSize,
+    staged: &StagedUiConfig,
+) -> anyhow::Result<PreparedMachineAttachment> {
+    let (stream, mut bridge) = crate::ssh_bridge::SshBridge::connect_background(target)?;
+    let result = async {
+        let remote = interactive(stream, selector, size, Duration::from_secs(15))
+            .await
+            .context(REMOTE_HANDSHAKE_FAILED)?;
+        let ui = materialize_ui(staged, remote.welcome.extension_catalog.as_ref())?;
+        let catalog_generation = remote
+            .welcome
+            .extension_catalog
+            .as_ref()
+            .map_or(0, |catalog| catalog.generation);
+        Ok::<_, anyhow::Error>(PreparedMachineAttachment {
+            framed: remote.framed,
+            selected: remote
+                .welcome
+                .selected
+                .expect("validated interactive welcome"),
+            alerts: Default::default(),
+            ui,
+            catalog_generation,
+            attachment: Attachment::remote(remote.capabilities, target),
+            bridge: None,
+        })
+    }
+    .await;
+    match result {
+        Ok(mut prepared) => {
+            prepared.bridge = Some(bridge);
+            Ok(prepared)
+        }
+        Err(error) => {
+            bridge.finish_diagnostics(Duration::from_millis(250)).await;
+            let failure = federation_transport::classify_ssh_failure(
+                federation::Failure {
+                    kind: federation::FailureKind::Transient,
+                    message: one_line_error(&error),
+                },
+                &bridge.diagnostic(),
+            );
+            let _ = bridge.shutdown().await;
+            if failure.kind != federation::FailureKind::Transient {
+                return Err(connection::Attention(failure.message).into());
+            }
+            Err(error)
+        }
     }
 }

@@ -482,7 +482,7 @@ fn message_failure(message: MetadataMessage) -> Failure {
 
 /// Only explicit, actionable SSH diagnostics inhibit automatic retries. A
 /// refused/missing daemon socket, DNS failure, reset or timeout is transient.
-fn classify_ssh_failure(original: Failure, diagnostic: &str) -> Failure {
+pub(super) fn classify_ssh_failure(original: Failure, diagnostic: &str) -> Failure {
     if original.kind != FailureKind::Transient {
         return original;
     }

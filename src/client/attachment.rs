@@ -13,14 +13,24 @@ pub(super) enum Locality {
 #[derive(Clone, Debug)]
 pub(super) enum Attachment {
     Local(PathBuf),
-    Remote(Capabilities),
+    Remote {
+        capabilities: Capabilities,
+        target: String,
+    },
 }
 
 impl Attachment {
+    pub(super) fn remote(capabilities: Capabilities, target: impl Into<String>) -> Self {
+        Self::Remote {
+            capabilities,
+            target: target.into(),
+        }
+    }
+
     pub(super) fn supports_terminal_colors(&self) -> bool {
         match self {
             Self::Local(_) => true,
-            Self::Remote(capabilities) => {
+            Self::Remote { capabilities, .. } => {
                 capabilities.contains(crate::protocol::remote::Capability::TerminalColors)
             }
         }
@@ -29,14 +39,16 @@ impl Attachment {
     pub(super) fn locality(&self) -> Locality {
         match self {
             Self::Local(_) => Locality::Local,
-            Self::Remote(_) => Locality::Remote,
+            Self::Remote { .. } => Locality::Remote,
         }
     }
 
     pub(super) fn local_socket(&self) -> anyhow::Result<&Path> {
         match self {
             Self::Local(path) => Ok(path.as_path()),
-            Self::Remote(_) => anyhow::bail!("local commands unavailable during remote attachment"),
+            Self::Remote { .. } => {
+                anyhow::bail!("local commands unavailable during remote attachment")
+            }
         }
     }
 }
@@ -79,7 +91,7 @@ impl Attachment {
         ui: &UiConfig,
     ) -> anyhow::Result<Option<crate::extensions::ClientHookRuntime>> {
         match self {
-            Self::Remote(_) => Ok(None),
+            Self::Remote { .. } => Ok(None),
             Self::Local(socket) => Ok(Some(crate::extensions::ClientHookRuntime::new(
                 ui.extensions.clone(),
                 std::env::current_exe()?,

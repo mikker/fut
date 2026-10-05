@@ -113,6 +113,25 @@ filesystem. Remote terminal links are limited to HTTP and HTTPS. Ordinary
 terminal input, navigation, layout actions, copy mode, and pane links continue
 to work.
 
+Fut supplies SSH keepalive defaults of `ServerAliveInterval 30` and
+`ServerAliveCountMax 6` through a private temporary config file. Your user and
+system SSH settings take precedence, including an explicit interval of zero.
+`fut doctor` checks the effective settings for enabled saved machines and
+suggests settings when keepalives are disabled.
+
+An interrupted active remote attachment automatically reconnects to the same
+terminal, without reopening its project or replaying commands. The reconnect
+screen pauses input; press Esc or Ctrl+C to detach. Retries back off from one
+second to two minutes and reset after a minute of stable connectivity. A fresh
+screen and resource list are required before input resumes. Quiet connections
+are probed after 30 seconds, with a 15-second response deadline. Older peers
+without health support use resource queries instead.
+
+Reconnect attempts never start a daemon or prompt for credentials. If SSH needs
+attention, verify access with `ssh HOST` in another terminal (or use `ssh-add`),
+then attach again. Incompatible peers or a terminal that no longer exists fail
+instead of reopening it. Remote panes keep running when the SSH connection drops.
+
 The navigator requires metadata support, and attachment additionally requires
 interactive terminal support. Bell alerts, extension catalogs, and health checks
 are optional: a peer without one of these disables only that feature. A missing

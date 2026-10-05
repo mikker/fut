@@ -9,9 +9,15 @@ fn fake_ssh(root: &std::path::Path) -> PathBuf {
     fs::write(
         &ssh,
         r#"#!/bin/sh
+if [ "$1" = "-F" ]; then
+    [ -f "$2" ] || exit 99
+    cat "$2" >> "$SSH_ARGS.configs"
+    shift 2
+fi
 printf '%s\n' "$@" >> "$SSH_ARGS"
 printf '%s\n' "$$" >> "$SSH_PIDS"
 if [ -n "$SSH_STALL" ]; then exec /bin/sleep 60; fi
+while [ -n "$SSH_RECONNECT_GATE" ] && [ -e "$SSH_RECONNECT_GATE" ]; do /bin/sleep 0.02; done
 if [ -n "$SSH_FAILURE" ]; then
     printf '%s\n' "$SSH_FAILURE" >&2
     exit 255
@@ -179,6 +185,14 @@ async fn local_client_switches_atomically_between_two_saved_remote_endpoints() {
     client.wait_for("ALPHA_READY").await;
     client.send(b"one\r");
     client.wait_for("ALPHA:one").await;
+
+    let pids = fs::read_to_string(root.path().join("ssh-pids")).unwrap();
+    let active_pid = pids.lines().last().unwrap().parse::<i32>().unwrap();
+    assert_eq!(unsafe { libc::kill(active_pid, libc::SIGTERM) }, 0);
+    client.wait_for("Reconnecting to alpha").await;
+    client.wait_for("machine reconnected").await;
+    client.send(b"after-reconnect\r");
+    client.wait_for("ALPHA:after-reconnect").await;
 
     client.send(b"\x02s");
     client.wait_for("beta · Online").await;
@@ -1032,5 +1046,91 @@ async fn remote_cli_opens_named_project_from_remote_catalog_and_attaches_directl
             .iter()
             .any(|session| session.name == "remote-project")
     );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn active_remote_connection_recovers_without_replaying_input_or_opening_project_again() {
+    let harness = Harness::start_with("while :; do sleep 1; done", |root| {
+        let project = root.join("remote-project");
+        fs::create_dir(&project).unwrap();
+        let config = root.join("home/.config/fut");
+        fs::create_dir_all(&config).unwrap();
+        fs::write(
+            config.join("config.toml"),
+            format!("[projects.10er]\npath = {:?}\n", project),
+        )
+        .unwrap();
+    })
+    .await;
+    let root = tempfile::tempdir().unwrap();
+    let bin = fake_ssh(root.path());
+    let gate = root.path().join("pause-reconnect");
+    let mut command = Command::new("/usr/bin/script");
+    remote_env(&mut command, root.path(), &bin, &harness.socket);
+    command.env("SSH_RECONNECT_GATE", &gate);
+    command
+        .args(script_command_args())
+        .arg(r#"stty cols 80 rows 24; exec "$FUT_BIN" p 10er --machine clonk --no-config"#);
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("FUT_TEST_SHELL_READY>").await;
+    let before = without_observations(harness.resources().await);
+    let pids = fs::read_to_string(root.path().join("ssh-pids")).unwrap();
+    let pid = pids.lines().last().unwrap().parse::<i32>().unwrap();
+    fs::write(&gate, "").unwrap();
+    // Kill only the SSH bridge. The daemon and shell must survive.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    client.wait_for("Reconnecting to clonk").await;
+    client.send(b"touch SHOULD_NOT_REPLAY\r");
+    time::sleep(Duration::from_millis(100)).await;
+    fs::remove_file(&gate).unwrap();
+    client.wait_for("machine reconnected").await;
+    client.send(b"printf 'RECOVERED_%s\\n' SHELL\r");
+    client.wait_for("RECOVERED_SHELL").await;
+    assert!(
+        !harness
+            .root
+            .path()
+            .join("remote-project/SHOULD_NOT_REPLAY")
+            .exists()
+    );
+    assert_eq!(without_observations(harness.resources().await), before);
+    client.send(b"\x02d");
+    wait_for(DEADLINE, || client.text().contains("\x1b[?1049l")).await;
+    client.wait_success().await;
+    assert_ssh_reaped(root.path()).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn remote_reconnection_can_be_cancelled_while_ssh_is_stalled() {
+    let harness =
+        Harness::start("printf 'REMOTE_CANCEL_READY\r\n'; while :; do sleep 1; done").await;
+    let root = tempfile::tempdir().unwrap();
+    let bin = fake_ssh(root.path());
+    let gate = root.path().join("pause-reconnect");
+    let mut command = Command::new("/usr/bin/script");
+    remote_env(&mut command, root.path(), &bin, &harness.socket);
+    command.env("SSH_RECONNECT_GATE", &gate);
+    command
+        .args(script_command_args())
+        .arg(r#"stty cols 80 rows 24; exec "$FUT_BIN" --machine clonk --no-config"#);
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("navigator").await;
+    client.send(b"\r");
+    client.wait_for("REMOTE_CANCEL_READY").await;
+    fs::write(&gate, "").unwrap();
+    let pids = fs::read_to_string(root.path().join("ssh-pids")).unwrap();
+    let pid = pids.lines().last().unwrap().parse::<i32>().unwrap();
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    client.wait_for("Reconnecting to clonk").await;
+    time::sleep(Duration::from_millis(1200)).await;
+    client.send(b"\x1b");
+    client.wait_success().await;
+    assert_ssh_reaped(root.path()).await;
+    assert!(matches!(
+        harness.control_command(ClientMessage::Ping).await,
+        ServerMessage::Pong { .. }
+    ));
     harness.shutdown().await;
 }

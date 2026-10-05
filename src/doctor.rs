@@ -72,6 +72,19 @@ impl DoctorReport {
                 CheckStatus::Error => "error",
             };
             output.push_str(&format!("[{label:<5}] {}: {}\n", check.id, check.summary));
+            if check.id == "remote_endpoints"
+                && let Some(profiles) = check.details["profiles"].as_array()
+            {
+                for profile in profiles {
+                    if let (Some(machine), Some(interval), Some(count)) = (
+                        profile["label"].as_str(),
+                        profile["ssh"]["server_alive_interval"].as_u64(),
+                        profile["ssh"]["server_alive_count_max"].as_u64(),
+                    ) {
+                        output.push_str(&format!("        {machine}: SSH keepalive interval {interval}s, {count} missed replies allowed\n"));
+                    }
+                }
+            }
         }
         output.push_str(&format!(
             "\nResult: {}\n",
@@ -698,21 +711,24 @@ async fn remote_endpoints_check() -> DoctorCheck {
     }
     let total = enabled.len();
     let results = futures_util::stream::iter(enabled.into_iter().map(|machine| async move {
-        if let Err(error) = probe_ssh_config(&machine.target).await {
-            return json!({
-                "id": machine.id,
-                "label": safe_text(&machine.label),
-                "target": safe_text(&machine.target),
-                "status": "ssh_config_error",
-                "error": error,
-            });
-        }
+        let ssh = match probe_ssh_config(&machine.target).await {
+            Ok(settings) => settings,
+            Err(error) => {
+                return json!({
+                    "id": machine.id,
+                    "label": safe_text(&machine.label),
+                    "target": safe_text(&machine.target),
+                    "status": "ssh_config_error",
+                    "error": error,
+                });
+            }
+        };
         let result = time::timeout(
             Duration::from_secs(6),
             crate::client::diagnose_remote(&machine.target),
         )
         .await;
-        match result {
+        let mut profile = match result {
             Ok(Ok(server_version)) => json!({
                 "id": machine.id,
                 "label": safe_text(&machine.label),
@@ -734,7 +750,10 @@ async fn remote_endpoints_check() -> DoctorCheck {
                 "status": "timeout",
                 "error": "bounded compatibility probe timed out",
             }),
-        }
+        };
+        profile["ssh"] = json!(ssh);
+        profile["keepalive_warning"] = json!(ssh.interval == 0 || ssh.count == 0);
+        profile
     }))
     .buffer_unordered(4)
     .collect::<Vec<_>>()
@@ -743,37 +762,84 @@ async fn remote_endpoints_check() -> DoctorCheck {
         .iter()
         .filter(|result| result["status"] == "compatible")
         .count();
+    let keepalive_warnings = results
+        .iter()
+        .filter(|result| result["keepalive_warning"] == true)
+        .count();
     check(
         "remote_endpoints",
-        if compatible == total {
+        if compatible == total && keepalive_warnings > 0 {
+            CheckStatus::Warning
+        } else if compatible == total {
             CheckStatus::Ok
         } else {
             CheckStatus::Error
         },
-        format!("{compatible} of {total} enabled saved machines are compatible"),
+        if keepalive_warnings > 0 {
+            format!(
+                "{compatible} of {total} enabled saved machines are compatible; {keepalive_warnings} disable SSH keepalives or allow no missed replies. Consider ServerAliveInterval 30 and ServerAliveCountMax 6 in ~/.ssh/config"
+            )
+        } else {
+            format!(
+                "{compatible} of {total} enabled saved machines are compatible; effective SSH keepalives checked (Fut defaults: 30s, 6 missed replies)"
+            )
+        },
         json!({ "contacted": total, "compatible": compatible, "concurrency": 4, "profiles": results }),
     )
 }
 
-async fn probe_ssh_config(target: &str) -> Result<(), String> {
-    let mut command = Command::new("ssh");
+#[derive(Serialize)]
+struct SshKeepalives {
+    #[serde(rename = "server_alive_interval")]
+    interval: u32,
+    #[serde(rename = "server_alive_count_max")]
+    count: u32,
+}
+
+fn parse_ssh_keepalives(output: &[u8]) -> Result<SshKeepalives, String> {
+    let text = String::from_utf8_lossy(output);
+    let setting = |name: &str| {
+        text.lines()
+            .find_map(|line| {
+                let mut fields = line.split_whitespace();
+                (fields.next()? == name)
+                    .then(|| fields.next()?.parse::<u32>().ok())
+                    .flatten()
+            })
+            .ok_or_else(|| format!("ssh -G did not report a valid {name}"))
+    };
+    Ok(SshKeepalives {
+        interval: setting("serveraliveinterval")?,
+        count: setting("serveralivecountmax")?,
+    })
+}
+
+async fn probe_ssh_config(target: &str) -> Result<SshKeepalives, String> {
+    let (mut command, _config) = crate::ssh_bridge::configuration_command(target)
+        .map_err(|error| bounded_safe_text(&error.to_string(), MAX_DIAGNOSTIC_TEXT_BYTES))?;
     command
-        .args(["-G", "--", target])
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     let mut child = command
         .spawn()
         .map_err(|error| bounded_safe_text(&error.to_string(), MAX_DIAGNOSTIC_TEXT_BYTES))?;
     let stderr = child.stderr.take().expect("piped SSH config stderr");
+    let stdout = child.stdout.take().expect("piped SSH config stdout");
     let result = time::timeout(Duration::from_millis(500), async {
-        tokio::join!(child.wait(), read_bounded(stderr, MAX_OPENSSH_OUTPUT_BYTES))
+        tokio::join!(
+            child.wait(),
+            read_bounded(stderr, MAX_OPENSSH_OUTPUT_BYTES),
+            read_bounded(stdout, MAX_OPENSSH_OUTPUT_BYTES)
+        )
     })
     .await;
     match result {
-        Ok((Ok(status), Ok(_))) if status.success() => Ok(()),
-        Ok((status, stderr)) => {
+        Ok((Ok(status), Ok(_), Ok(stdout))) if status.success() => {
+            parse_ssh_keepalives(&stdout.bytes)
+        }
+        Ok((status, stderr, _)) => {
             let message = match (status, stderr) {
                 (Ok(status), Ok(stderr)) => format!(
                     "ssh -G exited with status {}: {}",
@@ -1099,5 +1165,19 @@ enabled = true
             "Fut doctor\n\n[error] config: invalid\n\nResult: errors\n"
         );
         assert_eq!(safe_text("bad\n\u{1b}[31m\u{202e}"), "bad��[31m�");
+    }
+}
+
+#[cfg(test)]
+mod keepalive_tests {
+    use super::*;
+    #[test]
+    fn doctor_reports_only_keepalive_settings_from_ssh_output() {
+        let settings = parse_ssh_keepalives(b"hostname sensitive-host\nserveraliveinterval 0\nserveralivecountmax 6\nidentityfile /private/key\n").unwrap();
+        assert_eq!(
+            serde_json::to_value(settings).unwrap(),
+            json!({"server_alive_interval": 0, "server_alive_count_max": 6})
+        );
+        assert!(parse_ssh_keepalives(b"serveraliveinterval broken\n").is_err());
     }
 }

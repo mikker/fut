@@ -10,6 +10,7 @@ mod colors;
 mod command_bar;
 mod command_form;
 pub mod config;
+mod connection;
 mod context_menu;
 mod copy_mode;
 mod dialog;
@@ -577,7 +578,7 @@ async fn attach_remote_inner(
             crate::alerts::ClientAlertSnapshot::default(),
             ui,
             generation,
-            Attachment::Remote(remote.capabilities),
+            Attachment::remote(remote.capabilities, host),
             None,
             config_location,
             guard.enhanced_keyboard,
@@ -930,45 +931,7 @@ async fn prepare_machine_attachment(
             })
         }
         federation::EndpointSpec::Ssh(machine) => {
-            // This runs in raw mode, so handoffs use non-interactive SSH and
-            // never let host-key or authentication prompts consume UI input.
-            let (stream, bridge) =
-                crate::ssh_bridge::SshBridge::connect_background(&machine.target)?;
-            let result = async {
-                let remote = remote::interactive(stream, selector, size, Duration::from_secs(15))
-                    .await
-                    .context(REMOTE_HANDSHAKE_FAILED)?;
-                let ui =
-                    remote::materialize_ui(&staged, remote.welcome.extension_catalog.as_ref())?;
-                let catalog_generation = remote
-                    .welcome
-                    .extension_catalog
-                    .as_ref()
-                    .map_or(0, |catalog| catalog.generation);
-                Ok::<_, anyhow::Error>((remote, ui, catalog_generation))
-            }
-            .await;
-            match result {
-                Ok((remote, ui, catalog_generation)) => Ok(PreparedMachineAttachment {
-                    framed: remote.framed,
-                    selected: remote
-                        .welcome
-                        .selected
-                        .expect("validated interactive welcome"),
-                    alerts: crate::alerts::ClientAlertSnapshot::default(),
-                    ui,
-                    catalog_generation,
-                    attachment: Attachment::Remote(remote.capabilities),
-                    bridge: Some(bridge),
-                }),
-                Err(error) => {
-                    bridge
-                        .shutdown()
-                        .await
-                        .context("clean up failed SSH handoff")?;
-                    Err(error)
-                }
-            }
+            remote::prepare_attachment(&machine.target, selector, size, &staged).await
         }
     }
 }
@@ -993,7 +956,7 @@ async fn stage_machine_view(
                 anyhow::anyhow!("target disconnected before its view was ready")
             })??;
             let envelope: Envelope<ServerMessage> = decode_payload(&frame)?;
-            if let Attachment::Remote(capabilities) = &prepared.attachment
+            if let Attachment::Remote { capabilities, .. } = &prepared.attachment
                 && !capabilities.allows_server(&envelope.message)
             {
                 return Err(crate::protocol::remote::EndpointError::MethodNotNegotiated.into());
@@ -1353,6 +1316,10 @@ async fn run_loop(
     let (background_results, mut background_result) = mpsc::unbounded_channel();
     let (project_preparation_results, mut project_preparation_result) =
         mpsc::unbounded_channel::<ProjectPreparationCompletion>();
+    let mut backoff = connection::Backoff::default();
+    'attachment: loop {
+        let mut health = connection::Health::default();
+        let result: anyhow::Result<()> = async {
     send_request(framed, Some(Uuid::new_v4()), ClientMessage::ListResources).await?;
     resize_view(framed, terminal.size()?.into(), &mut view, &resources, &ui).await?;
 
@@ -1369,6 +1336,11 @@ async fn run_loop(
                 },
             )
             .await?;
+        }
+        if let Attachment::Remote { capabilities, .. } = &attachment
+            && let Some((id, message)) = health.check(time::Instant::now(), *capabilities)?
+        {
+            send_request(framed, Some(id), message).await?;
         }
         tokio::select! {
             changed = async {
@@ -1558,19 +1530,23 @@ async fn run_loop(
                     if let Some(code) = failed_exit_code(pending_focused_exit) {
                         bail!("terminal exited with status {code}");
                     }
+                    if pending_focused_exit.is_none() && attachment.locality() == Locality::Remote {
+                        return Err(connection::Lost::closed().into());
+                    }
                     break;
                 };
-                let frame = frame?;
+                let frame = frame.map_err(connection::Lost::from)?;
                 let decode_started = std::time::Instant::now();
                 let envelope: Envelope<ServerMessage> = decode_payload(&frame)?;
                 if let Some(perf) = perf.as_mut() {
                     perf.record("decode", decode_started.elapsed(), frame.len());
                 }
-                if let Attachment::Remote(capabilities) = &attachment
+                if let Attachment::Remote { capabilities, .. } = &attachment
                     && !capabilities.allows_server(&envelope.message)
                 {
                     return Err(crate::protocol::remote::EndpointError::MethodNotNegotiated.into());
                 }
+                health.receive(envelope.request_id, &envelope.message);
                 let request_id = envelope.request_id;
                 match envelope.message {
                     ServerMessage::Snapshot { terminal_id, screen } => {
@@ -2932,6 +2908,8 @@ async fn run_loop(
                                     let old_bridge = active_bridge.take();
                                     active_bridge = prepared.bridge.take();
                                     attachment = prepared.attachment;
+                                    health = connection::Health::default();
+                                    backoff = connection::Backoff::default();
                                     active_machine = selection.machine;
                                     host_colors.reattach();
                                     view = next_view;
@@ -4203,8 +4181,62 @@ async fn run_loop(
             }
         }
     }
-    if let Some(bridge) = active_bridge {
-        bridge.shutdown().await?;
+        Ok(())
+        }.await;
+        match result {
+            Err(error)
+                if attachment.locality() == Locality::Remote
+                    && connection::Lost::retryable(&error) =>
+            {
+                if let Some(bridge) = active_bridge.take() {
+                    let _ = bridge.shutdown().await;
+                }
+                // Close the dead attachment before creating its replacement.
+                let _ = framed.get_mut().shutdown().await;
+                let Attachment::Remote { target, .. } = &attachment else {
+                    unreachable!()
+                };
+                let recovered = connection::recover(
+                    terminal,
+                    &mut events,
+                    target,
+                    TargetSelector::Terminal(view.focused().terminal_id),
+                    config_location,
+                    &mut backoff,
+                )
+                .await?;
+                let Some((mut prepared, next_view, next_resources)) = recovered else {
+                    break 'attachment;
+                };
+                *framed = prepared.framed;
+                active_bridge = prepared.bridge.take();
+                attachment = prepared.attachment;
+                ui = prepared.ui;
+                extension_generation = prepared.catalog_generation;
+                view = next_view;
+                resources = next_resources;
+                // Pending operations may already have run. Discard them instead of resending.
+                surface = None;
+                copy_mode = None;
+                rename = None;
+                create = CreateCoordinator::default();
+                close_target = CloseTargetState::default();
+                focus = FocusState::default();
+                mouse_input = MouseInputState::default();
+                prefix = PrefixState::new(ui.bindings.clone());
+                prefix_keys_awaiting_release.clear();
+                host_colors.reattach();
+                pending_focused_exit = None;
+                toasts.info("machine reconnected");
+                force_draw = true;
+            }
+            result => {
+                if let Some(bridge) = active_bridge.take() {
+                    let _ = bridge.shutdown().await;
+                }
+                return result;
+            }
+        }
     }
     Ok(())
 }
@@ -6233,12 +6265,19 @@ async fn send_request(
     request_id: Option<Uuid>,
     message: ClientMessage,
 ) -> anyhow::Result<()> {
-    framed
+    let detaching = matches!(message, ClientMessage::Detach);
+    let result = framed
         .send(Bytes::from(encode_payload(&Envelope {
             request_id,
             message,
         })?))
-        .await?;
+        .await;
+    if let Err(error) = result {
+        if detaching {
+            return Err(error.into());
+        }
+        return Err(connection::Lost::from(error).into());
+    }
     Ok(())
 }
 

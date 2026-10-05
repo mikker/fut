@@ -151,6 +151,7 @@ impl<R: Read + AsFd, W: Write + AsFd> Pump<R, W> {
 
 pub(crate) struct SshBridge {
     child: Child,
+    ssh_config: Option<tempfile::NamedTempFile>,
     // A duplicate lets the owner close the attachment even if a client still
     // holds its UnixStream. An unnamed socket has no path to leak or unlink.
     socket: StdUnixStream,
@@ -160,16 +161,22 @@ pub(crate) struct SshBridge {
 
 impl SshBridge {
     pub(crate) fn connect(destination: &str, start_if_missing: bool) -> Result<(UnixStream, Self)> {
-        let mut command = ssh_command(destination, start_if_missing)?;
-        Self::spawn(&mut command)
+        Self::connect_command(ssh_command(destination, start_if_missing)?, true)
     }
 
     /// Background supervision must never prompt through the user's terminal.
     pub(crate) fn connect_background(destination: &str) -> Result<(UnixStream, Self)> {
-        let mut command = background_ssh_command(destination)?;
-        Self::spawn_with_diagnostics(&mut command, false)
+        Self::connect_command(background_ssh_command(destination)?, false)
     }
 
+    fn connect_command(base: Command, echo_diagnostics: bool) -> Result<(UnixStream, Self)> {
+        let (mut command, config) = managed_command(base)?;
+        let (stream, mut bridge) = Self::spawn_with_diagnostics(&mut command, echo_diagnostics)?;
+        bridge.ssh_config = Some(config);
+        Ok((stream, bridge))
+    }
+
+    #[cfg(test)]
     fn spawn(command: &mut Command) -> Result<(UnixStream, Self)> {
         Self::spawn_with_diagnostics(command, true)
     }
@@ -216,6 +223,7 @@ impl SshBridge {
             stream,
             Self {
                 child,
+                ssh_config: None,
                 socket: local,
                 diagnostics,
                 diagnostic_text,
@@ -299,6 +307,62 @@ pub(crate) fn validate_destination(destination: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub(crate) const KEEPALIVE_INTERVAL: u32 = 30;
+pub(crate) const KEEPALIVE_COUNT: u32 = 6;
+
+/// OpenSSH uses the first value it sees. Include both normal config files before
+/// our fallbacks; command-line and explicit user settings retain precedence.
+fn managed_command(base: Command) -> Result<(Command, tempfile::NamedTempFile)> {
+    let user_config = std::env::var_os("HOME")
+        .map(|home| std::path::PathBuf::from(home).join(".ssh/config"))
+        .context("HOME must be set for SSH configuration")?;
+    managed_command_with_configs(
+        base,
+        &user_config,
+        std::path::Path::new("/etc/ssh/ssh_config"),
+    )
+}
+
+fn managed_command_with_configs(
+    base: Command,
+    user_config: &std::path::Path,
+    system_config: &std::path::Path,
+) -> Result<(Command, tempfile::NamedTempFile)> {
+    let mut config = tempfile::Builder::new()
+        .prefix("fut-ssh-")
+        .tempfile()
+        .context("create private SSH configuration")?;
+    let quote = |path: &std::path::Path| -> Result<String> {
+        let text = path.to_str().context("SSH config path must be UTF-8")?;
+        anyhow::ensure!(
+            !text.chars().any(char::is_control),
+            "invalid SSH config path"
+        );
+        Ok(text.replace('\\', "\\\\").replace('"', "\\\""))
+    };
+    let user = quote(user_config)?;
+    let system = quote(system_config)?;
+    write!(
+        config,
+        "Include \"{user}\" \"{system}\"\nHost *\n    ServerAliveInterval {KEEPALIVE_INTERVAL}\n    ServerAliveCountMax {KEEPALIVE_COUNT}\n"
+    )?;
+    let mut command = Command::new("ssh");
+    command
+        .arg("-F")
+        .arg(config.path())
+        .args(base.as_std().get_args());
+    Ok((command, config))
+}
+
+pub(crate) fn configuration_command(
+    destination: &str,
+) -> Result<(Command, tempfile::NamedTempFile)> {
+    validate_destination(destination)?;
+    let mut command = Command::new("ssh");
+    command.args(["-G", "--", destination]);
+    managed_command(command)
 }
 
 fn ssh_command(destination: &str, start_if_missing: bool) -> Result<Command> {
@@ -407,6 +471,56 @@ mod tests {
             assert!(ssh_command(invalid, true).is_err(), "{invalid:?}");
         }
         assert!(ssh_command("hôte", true).is_ok());
+    }
+
+    #[test]
+    fn keepalive_fallbacks_preserve_user_settings_and_config_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let user = root.path().join("user config");
+        let system = root.path().join("system config");
+        std::fs::write(&system, "# isolated system config\n").unwrap();
+        for explicit in [false, true] {
+            std::fs::write(
+                &user,
+                if explicit {
+                    "Host fut-test-host\n    ServerAliveInterval 0\n    ServerAliveCountMax 12\n"
+                } else {
+                    "Host fut-test-host\n    HostName example.com\n"
+                },
+            )
+            .unwrap();
+            let mut base = Command::new("ssh");
+            base.args(["-G", "--", "fut-test-host"]);
+            let (command, config) = managed_command_with_configs(base, &user, &system).unwrap();
+            let path = config.path().to_owned();
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            let output = std::process::Command::new(command.as_std().get_program())
+                .args(command.as_std().get_args())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let settings = String::from_utf8(output.stdout).unwrap();
+            assert!(settings.contains(if explicit {
+                "serveraliveinterval 0\n"
+            } else {
+                "serveraliveinterval 30\n"
+            }));
+            assert!(settings.contains(if explicit {
+                "serveralivecountmax 12\n"
+            } else {
+                "serveralivecountmax 6\n"
+            }));
+            drop(config);
+            assert!(!path.exists());
+        }
     }
 
     #[tokio::test]
