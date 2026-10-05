@@ -62,3 +62,6 @@ debug = true
 [[bench]]
 name = "render"
 harness = false
+
+[patch.crates-io]
+crossterm = { path = "vendor/crossterm" }

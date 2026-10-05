@@ -67,10 +67,11 @@ pub enum Capability {
     Alerts,
     ControlAlerts,
     ExtensionCatalog,
+    TerminalColors,
 }
 
 impl Capability {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Metadata,
         Self::NestedWorkspaces,
         Self::Interactive,
@@ -78,6 +79,7 @@ impl Capability {
         Self::Alerts,
         Self::ControlAlerts,
         Self::ExtensionCatalog,
+        Self::TerminalColors,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -89,12 +91,13 @@ impl Capability {
             Self::Alerts => "alerts.v1",
             Self::ControlAlerts => "control-alerts.v1",
             Self::ExtensionCatalog => "extension-catalog.v1",
+            Self::TerminalColors => "terminal-colors.v1",
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct Capabilities(u8);
+pub struct Capabilities(u16);
 
 impl Capabilities {
     pub const ALL: Self = Self((1 << Capability::ALL.len()) - 1);
@@ -129,6 +132,7 @@ impl Capabilities {
             ListResources | WatchResources => Capability::Metadata,
             Ping => Capability::Health,
             GetExtensionCatalog => Capability::ExtensionCatalog,
+            TerminalColors { .. } => Capability::TerminalColors,
             WatchAlerts { .. } | AcknowledgeAlerts { .. } => {
                 return self.contains(Capability::Alerts)
                     || self.contains(Capability::ControlAlerts);
@@ -215,17 +219,21 @@ impl RemoteHello {
         } else {
             Capability::Alerts
         };
+        let mut optional = vec![
+            Capability::Health.name().into(),
+            alerts.name().into(),
+            Capability::ExtensionCatalog.name().into(),
+            Capability::NestedWorkspaces.name().into(),
+        ];
+        if matches!(mode, ClientMode::Interactive { .. }) {
+            optional.push(Capability::TerminalColors.name().into());
+        }
         Self {
             generation: GENERATION,
             codec: CODEC.into(),
             client_version: client_version.into(),
             required,
-            optional: vec![
-                Capability::Health.name().into(),
-                alerts.name().into(),
-                Capability::ExtensionCatalog.name().into(),
-                Capability::NestedWorkspaces.name().into(),
-            ],
+            optional,
             mode,
         }
     }
@@ -588,6 +596,39 @@ mod tests {
         let mut bytes =
             bytes::BytesMut::from(((MAX_FRAME_LEN + 1) as u32).to_be_bytes().as_slice());
         assert!(codec().decode(&mut bytes).is_err());
+    }
+
+    #[test]
+    fn terminal_colors_require_their_own_optional_capability() {
+        let mode = ClientMode::Interactive {
+            size: crate::domain::TerminalSize {
+                columns: 80,
+                rows: 24,
+            },
+            selector: None,
+        };
+        let offer = RemoteHello::new(mode, "0.26.0");
+        let message = ClientMessage::TerminalColors {
+            terminal_id: crate::domain::TerminalId::new(),
+            colors: Default::default(),
+        };
+        assert!(
+            offer
+                .optional
+                .iter()
+                .any(|name| name == "terminal-colors.v1")
+        );
+        assert!(
+            offer
+                .negotiate(Capabilities::ALL)
+                .unwrap()
+                .allows_client(&message)
+        );
+        let mut old = offer;
+        old.optional.clear();
+        let selected = old.negotiate(Capabilities::ALL).unwrap();
+        assert!(!selected.allows_client(&message));
+        assert!(selected.contains(Capability::Interactive));
     }
 
     #[test]

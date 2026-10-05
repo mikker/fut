@@ -17,6 +17,15 @@ pub(super) enum Attachment {
 }
 
 impl Attachment {
+    pub(super) fn supports_terminal_colors(&self) -> bool {
+        match self {
+            Self::Local(_) => true,
+            Self::Remote(capabilities) => {
+                capabilities.contains(crate::protocol::remote::Capability::TerminalColors)
+            }
+        }
+    }
+
     pub(super) fn locality(&self) -> Locality {
         match self {
             Self::Local(_) => Locality::Local,

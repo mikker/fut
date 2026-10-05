@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Preserve terminal theme detection inside Fut, restoring Pi’s shaded message and tool panels.
+
 ## 0.26
 
 - Aligned nested workspace tree connectors in the sidebar when workspace names use pill caps.

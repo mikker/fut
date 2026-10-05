@@ -818,6 +818,53 @@ impl Drop for Harness {
 }
 
 #[tokio::test]
+async fn interactive_client_reports_host_colors_to_the_child_without_forwarding_replies_as_keys() {
+    let expected = b"\x1b]10;rgb:1111/2222/3333\x07\x1b]11;rgb:eeee/eeee/eeee\x07\x1b]4;2;rgb:4444/5555/6666\x07";
+    let script = format!(
+        "printf COLOR_READY; IFS= read -r line; printf '%s' \"$line\" > keyboard-input; stty raw -echo; printf '\\033]10;?\\007\\033]11;?\\007\\033]4;2;?\\007'; dd bs=1 count={} of=color-replies 2>/dev/null; printf COLOR_DONE; sleep 60",
+        expected.len()
+    );
+    let harness = Harness::start(&script).await;
+    let snapshot = harness.resources().await;
+    let terminal_id = snapshot.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id;
+    let mut command = Command::new("/usr/bin/script");
+    command
+        .env_clear()
+        .env("HOME", harness.root.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", harness.root.path().join("runtime"))
+        .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+        .env("TERM", "xterm-256color")
+        .args(script_command_args())
+        .arg(format!(
+            "stty rows 24 cols 80; exec '{}' --socket '{}' terminal attach '{}'",
+            env!("CARGO_BIN_EXE_fut"),
+            harness.socket.display(),
+            terminal_id
+        ));
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("\x1b]11;?\x1b\\").await;
+    client.send(b"\x1b]10;rgb:11/22/33\x07\x1b]11;rgb:");
+    time::sleep(Duration::from_millis(10)).await;
+    client.send(b"eeee/eeee/eeee\x1b\\\x1b]4;2;rgb:44/55/66\x07");
+    // Let the client batch the palette replies before starting the child probe.
+    time::sleep(Duration::from_millis(100)).await;
+    client.send(b"probe\r");
+    client.wait_for("COLOR_DONE").await;
+    assert_eq!(
+        fs::read(harness.root.path().join("cwd/color-replies")).unwrap(),
+        expected
+    );
+    assert_eq!(
+        fs::read(harness.root.path().join("cwd/keyboard-input")).unwrap(),
+        b"probe"
+    );
+    client.send(b"\x02d");
+    client.wait_success().await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn terminal_uses_portable_term_when_daemon_has_no_term() {
     let harness = Harness::start(
         "printf '%s\\n' \"$TERM\" > terminal-type; while IFS= read -r line; do :; done",

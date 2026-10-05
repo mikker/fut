@@ -197,6 +197,10 @@ impl GhosttyTerminal {
             u32::from(DEFAULT_CELL_PIXEL_WIDTH),
             u32::from(DEFAULT_CELL_PIXEL_HEIGHT),
         )?;
+        terminal.on_color_scheme(|terminal| {
+            let background = terminal.bg_color().ok()??;
+            Some(color_scheme(background))
+        })?;
         let callback_writer = Arc::clone(&writer);
         terminal.on_pty_write(move |_, bytes| {
             if let Ok(mut writer) = callback_writer.lock() {
@@ -229,6 +233,44 @@ impl GhosttyTerminal {
             copy_modes: HashMap::new(),
             max_copy_cells,
         })
+    }
+
+    pub(super) fn size(&self) -> TerminalSize {
+        self.size
+    }
+
+    pub(super) fn set_colors(&mut self, colors: crate::domain::TerminalColors) -> Result<()> {
+        let convert = |color: crate::domain::Rgb| libghostty_vt::style::RgbColor {
+            r: color.red,
+            g: color.green,
+            b: color.blue,
+        };
+        let foreground = colors.foreground.map(convert);
+        let background = colors.background.map(convert);
+        let mut changed = self.terminal.default_fg_color()? != foreground
+            || self.terminal.default_bg_color()? != background;
+        self.terminal.set_default_fg_color(foreground)?;
+        self.terminal.set_default_bg_color(background)?;
+        let mut palette = self.terminal.default_color_palette()?;
+        for (index, color) in colors.palette.iter().enumerate() {
+            if let Some(color) = color {
+                let color = convert(*color);
+                changed |= palette.0[index] != color;
+                palette.0[index] = color;
+            }
+        }
+        self.terminal.set_default_color_palette(Some(palette))?;
+        if changed
+            && self
+                .terminal
+                .mode(libghostty_vt::terminal::Mode::COLOR_SCHEME_REPORT)?
+            && let Some(background) = self.terminal.bg_color()?
+        {
+            let mut response = [0; 32];
+            let length = color_scheme(background).encode_report(&mut response)?;
+            self.write_encoded_input(&response[..length], "color scheme report")?;
+        }
+        Ok(())
     }
 
     pub(super) fn feed(&mut self, bytes: &[u8]) -> Result<Option<ScreenSnapshot>> {
@@ -2007,6 +2049,24 @@ fn encode_kitty_png(
     Ok(encoded)
 }
 
+fn color_scheme(color: libghostty_vt::style::RgbColor) -> libghostty_vt::terminal::ColorScheme {
+    // Relative luminance, matching the usual light/dark background threshold.
+    let linear = |value: u8| {
+        let value = f64::from(value) / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let luminance = 0.2126 * linear(color.r) + 0.7152 * linear(color.g) + 0.0722 * linear(color.b);
+    if luminance > 0.179 {
+        libghostty_vt::terminal::ColorScheme::Light
+    } else {
+        libghostty_vt::terminal::ColorScheme::Dark
+    }
+}
+
 fn rgb(color: libghostty_vt::style::RgbColor) -> Rgb {
     Rgb {
         red: color.r,
@@ -2054,6 +2114,73 @@ mod tests {
         )
         .unwrap();
         (terminal, output)
+    }
+
+    #[test]
+    fn reports_host_colors_and_notifies_only_subscribed_applications() {
+        let (mut terminal, output) = recording_terminal(10, 4);
+        let foreground = Rgb {
+            red: 17,
+            green: 34,
+            blue: 51,
+        };
+        let background = Rgb {
+            red: 238,
+            green: 238,
+            blue: 238,
+        };
+        let mut colors = crate::domain::TerminalColors {
+            foreground: Some(foreground),
+            background: Some(background),
+            ..Default::default()
+        };
+        colors.palette[2] = Some(foreground);
+        terminal.set_colors(colors).unwrap();
+        assert!(
+            output.lock().unwrap().is_empty(),
+            "shells must not receive unsolicited replies"
+        );
+        terminal
+            .feed(b"\x1b]10;?\x07\x1b]11;?\x07\x1b]4;2;?\x07\x1b[?996n")
+            .unwrap();
+        let response = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(response.contains("10;rgb:1111/2222/3333"), "{response:?}");
+        assert!(response.contains("11;rgb:eeee/eeee/eeee"), "{response:?}");
+        assert!(response.contains("4;2;rgb:1111/2222/3333"), "{response:?}");
+        assert!(response.contains("\x1b[?997;2n"), "{response:?}");
+        output.lock().unwrap().clear();
+        terminal.feed(b"\x1b[?2031h").unwrap();
+        colors.background = Some(Rgb {
+            red: 0,
+            green: 0,
+            blue: 0,
+        });
+        terminal.set_colors(colors).unwrap();
+        assert_eq!(*output.lock().unwrap(), b"\x1b[?997;1n");
+        output.lock().unwrap().clear();
+        terminal.set_colors(colors).unwrap();
+        assert!(
+            output.lock().unwrap().is_empty(),
+            "unchanged colors must not trigger query loops"
+        );
+        // Application-set OSC colors retain precedence over host defaults.
+        terminal.feed(b"\x1b]11;rgb:ff/ff/ff\x07").unwrap();
+        colors.background = Some(background);
+        terminal.set_colors(colors).unwrap();
+        output.lock().unwrap().clear();
+        terminal.feed(b"\x1b]11;?\x07").unwrap();
+        assert!(
+            String::from_utf8(output.lock().unwrap().clone())
+                .unwrap()
+                .contains("11;rgb:ffff/ffff/ffff")
+        );
+    }
+
+    #[test]
+    fn unconfigured_terminal_cannot_report_default_colors() {
+        let (mut terminal, output) = recording_terminal(10, 4);
+        terminal.feed(b"\x1b]10;?\x07\x1b]11;?\x07").unwrap();
+        assert!(output.lock().unwrap().is_empty());
     }
 
     #[test]

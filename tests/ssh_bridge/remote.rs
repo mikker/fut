@@ -259,7 +259,7 @@ async fn remote_cli_navigates_and_attaches_across_versions_without_optional_capa
                     frame = client.next() => {
                         let Some(Ok(frame)) = frame else { break };
                         let message: Envelope<ClientMessage> = decode_payload(&frame).unwrap();
-                        assert!(!matches!(message.message, ClientMessage::WatchAlerts { .. } | ClientMessage::GetExtensionCatalog | ClientMessage::Ping));
+                        assert!(!matches!(message.message, ClientMessage::WatchAlerts { .. } | ClientMessage::GetExtensionCatalog | ClientMessage::Ping | ClientMessage::TerminalColors { .. }));
                         daemon.send(frame.freeze()).await.unwrap();
                     }
                     frame = daemon.next() => {
@@ -278,6 +278,8 @@ async fn remote_cli_navigates_and_attaches_across_versions_without_optional_capa
     let mut client = PtyChild::spawn(command);
     client.wait_for("navigator").await;
     client.send(b"\r");
+    client.wait_for("\x1b]11;?\x1b\\").await;
+    client.send(b"\x1b]10;rgb:11/22/33\x07\x1b]11;rgb:ee/ee/ee\x07");
     client.wait_for("OPTIONAL_READY").await;
     client.wait_for("bash").await;
     client.send(b"ping\r");

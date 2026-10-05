@@ -57,7 +57,8 @@ pub struct SpawnSpec {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct AttachmentGeometry {
+pub(crate) struct AttachmentConfiguration {
+    pub colors: Option<crate::domain::TerminalColors>,
     pub revision: u64,
     pub size: TerminalSize,
 }
@@ -188,22 +189,26 @@ impl TerminalHandle {
         self.send(RuntimeMessage::Resize(size))
     }
 
-    pub(crate) async fn resize_for_attachment(
+    pub(crate) async fn configure_attachment(
         &self,
-        geometry: AttachmentGeometry,
+        configuration: AttachmentConfiguration,
     ) -> Result<(), CommandError> {
-        self.send(RuntimeMessage::AttachmentResize(geometry))
+        // Attachment state is authoritative: wait for queue capacity rather
+        // than permanently dropping a theme or geometry update under load.
+        self.commands
+            .send(RuntimeMessage::ConfigureAttachment(configuration))
+            .await
     }
 
-    /// Applies geometry selected while an attachment is being dropped. Drop
+    /// Applies configuration selected while an attachment is being dropped. Drop
     /// cannot await the bounded runtime queue, so finish the update in the
     /// current Tokio runtime rather than leaving the surviving attachment at
     /// the departed client's size.
-    pub(crate) fn resize_on_attachment_change(&self, geometry: AttachmentGeometry) {
+    pub(crate) fn configure_on_attachment_change(&self, configuration: AttachmentConfiguration) {
         let terminal = self.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                let _ = terminal.resize_for_attachment(geometry).await;
+                let _ = terminal.configure_attachment(configuration).await;
             });
         }
     }
@@ -497,7 +502,7 @@ enum RuntimeMessage {
         completion: oneshot::Sender<Result<(), CommandError>>,
     },
     Resize(TerminalSize),
-    AttachmentResize(AttachmentGeometry),
+    ConfigureAttachment(AttachmentConfiguration),
     ForegroundProcessId {
         completion: oneshot::Sender<Result<u32, CommandError>>,
     },
@@ -820,21 +825,29 @@ fn run(
                         );
                     }
                 }
-                RuntimeMessage::AttachmentResize(geometry) => {
-                    if geometry.revision < attachment_revision {
+                RuntimeMessage::ConfigureAttachment(configuration) => {
+                    if configuration.revision < attachment_revision {
                         continue;
                     }
-                    attachment_revision = geometry.revision;
-                    if let Err(error) = geometry
+                    attachment_revision = configuration.revision;
+                    if let Some(colors) = configuration.colors
+                        && let Err(error) = terminal.set_colors(colors)
+                    {
+                        send_error(publishers.events, error);
+                    }
+                    if configuration.size == terminal.size() {
+                        continue;
+                    }
+                    if let Err(error) = configuration
                         .size
                         .validate()
                         .map_err(Into::into)
-                        .and_then(|()| master.resize(pty_size(geometry.size)))
+                        .and_then(|()| master.resize(pty_size(configuration.size)))
                     {
                         send_error(publishers.events, error);
                     } else {
                         publish(
-                            terminal.resize(geometry.size),
+                            terminal.resize(configuration.size),
                             publishers.snapshots,
                             publishers.events,
                         );
@@ -1210,7 +1223,7 @@ fn serve_exited(
             RuntimeMessage::Input(_)
             | RuntimeMessage::KeyInput(_)
             | RuntimeMessage::Resize(_)
-            | RuntimeMessage::AttachmentResize(_) => {}
+            | RuntimeMessage::ConfigureAttachment(_) => {}
         }
     }
 }
@@ -2252,6 +2265,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn child_color_query_uses_latest_attachment_colors_even_after_detach() {
+        let temporary = tempfile::tempdir().unwrap();
+        let capture = temporary.path().join("colors.bin");
+        let expected = b"\x1b]11;rgb:eeee/eeee/eeee\x07";
+        let script = format!(
+            "printf READY; IFS= read -r go; stty raw -echo; printf '\\033]11;?\\007'; dd bs=1 count={} of=\"$FUT_COLOR_CAPTURE\" 2>/dev/null; printf DONE; sleep 60",
+            expected.len()
+        );
+        let mut env = HashMap::new();
+        env.insert("FUT_COLOR_CAPTURE".into(), capture.clone().into_os_string());
+        let handle = spawn_terminal(shell(&script, env)).unwrap();
+        let mut snapshots = handle.subscribe_snapshots();
+        wait_for_text(&mut snapshots, "READY").await;
+        let size = snapshots.borrow().size;
+        let light = crate::domain::TerminalColors {
+            background: Some(crate::domain::Rgb {
+                red: 238,
+                green: 238,
+                blue: 238,
+            }),
+            ..Default::default()
+        };
+        let dark = crate::domain::TerminalColors {
+            background: Some(crate::domain::Rgb {
+                red: 0,
+                green: 0,
+                blue: 0,
+            }),
+            ..Default::default()
+        };
+        for (revision, colors) in [(2, Some(light)), (1, Some(dark)), (3, None)] {
+            handle
+                .configure_attachment(AttachmentConfiguration {
+                    revision,
+                    size,
+                    colors,
+                })
+                .await
+                .unwrap();
+        }
+        handle.input(b"probe\n".to_vec()).await.unwrap();
+        wait_for_text(&mut snapshots, "DONE").await;
+        assert_eq!(std::fs::read(&capture).unwrap(), expected);
+        handle.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn stale_attachment_geometry_cannot_override_a_newer_resize() {
         let handle = spawn_terminal(shell("sleep 2", HashMap::new())).unwrap();
         let mut snapshots = handle.subscribe_snapshots();
@@ -2260,7 +2320,8 @@ mod tests {
             rows: 11,
         };
         handle
-            .resize_for_attachment(AttachmentGeometry {
+            .configure_attachment(AttachmentConfiguration {
+                colors: None,
                 revision: 2,
                 size: newest,
             })
@@ -2275,7 +2336,8 @@ mod tests {
         .unwrap();
 
         handle
-            .resize_for_attachment(AttachmentGeometry {
+            .configure_attachment(AttachmentConfiguration {
+                colors: None,
                 revision: 1,
                 size: TerminalSize {
                     columns: 90,

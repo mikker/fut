@@ -424,6 +424,11 @@ pub enum ClientMessage {
         terminal_id: TerminalId,
         action: CopyModeAction,
     },
+    /// Fire-and-forget host appearance update for the focused terminal.
+    TerminalColors {
+        terminal_id: TerminalId,
+        colors: crate::domain::TerminalColors,
+    },
     Resize {
         terminal_id: TerminalId,
         size: TerminalSize,

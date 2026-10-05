@@ -75,6 +75,7 @@ are common to every negotiated connection.
 | `metadata.v1` | `list_resources`, `watch_resources`; resource snapshots/changes and client presence | Required for the navigator and attachment |
 | `nested-workspaces.v1` | Optional `parent_workspace_id` fields in workspace snapshots | Workspaces remain flat and generation-1 metadata payloads are unchanged |
 | `interactive.v1` | Input/key/paste/mouse, viewport reset/refresh, copy mode, terminal/split resize, target selection, workspace/tab/pane creation and split, rename/close, agent acknowledgement; their replies, full/delta screens and terminal exit | Required for attachment |
+| `terminal-colors.v1` | Interactive `terminal_colors` updates with host foreground, background, and 16 ANSI palette colors | Child applications retain the emulator’s last known colors; host color updates are not sent |
 | `health.v1` | `ping` / `pong` | Machine verification probes health when available and otherwise uses the successful handshake |
 | `alerts.v1` | Interactive `watch_alerts`, `acknowledge_alerts`, alert snapshots and acknowledgement | No attached-terminal bell subscription or acknowledgement |
 | `control-alerts.v1` | Lease-free control `watch_alerts`, `acknowledge_alerts`, alert snapshots and acknowledgement | Background metadata retains no bell summary; agent summaries remain in resources |

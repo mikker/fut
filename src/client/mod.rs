@@ -6,6 +6,7 @@ mod agents;
 mod attachment;
 mod cheatsheet;
 mod chrome;
+mod colors;
 mod command_bar;
 mod command_form;
 pub mod config;
@@ -402,7 +403,7 @@ pub async fn launch_ui_playground(config_location: &config::ConfigLocation) -> a
                     }
                 }
                 Some(Event::Paste(text)) => catalog.paste(&text),
-                Some(Event::Resize(_, _)) | Some(Event::FocusGained | Event::FocusLost) => {}
+                Some(Event::Resize(_, _)) | Some(Event::FocusGained | Event::FocusLost) | Some(Event::TerminalResponse(_)) => {}
                 Some(Event::Mouse(_)) => {}
                 None => bail!("terminal input closed"),
             }
@@ -1304,6 +1305,8 @@ async fn run_loop(
     let mut prefix_keys_awaiting_release = HashSet::new();
     let mut mouse_input = MouseInputState::default();
     let mut view = ViewState::new(attachment.locality(), selected)?;
+    let mut host_colors = colors::HostColors::default();
+    colors::HostColors::start(&mut io::stdout())?;
     let mut resources = ResourceState::default();
     resources.accept_alerts(alerts);
     let mut surface: Option<ClientSurface> = None;
@@ -1338,6 +1341,19 @@ async fn run_loop(
     resize_view(framed, terminal.size()?.into(), &mut view, &resources, &ui).await?;
 
     loop {
+        if attachment.supports_terminal_colors()
+            && let Some(colors) = host_colors.update(view.focused().terminal_id)
+        {
+            send_request(
+                framed,
+                None,
+                ClientMessage::TerminalColors {
+                    terminal_id: view.focused().terminal_id,
+                    colors,
+                },
+            )
+            .await?;
+        }
         tokio::select! {
             changed = async {
                 federation_updates
@@ -2299,6 +2315,10 @@ async fn run_loop(
                     break
                 };
                 let event = event?;
+                if let Event::TerminalResponse(response) = &event {
+                    host_colors.receive(response, &mut io::stdout())?;
+                    continue;
+                }
                 if !matches!(&event, Event::Mouse(_)) {
                     mouse_input.cancel_local_drags();
                 }
@@ -2897,6 +2917,7 @@ async fn run_loop(
                                     active_bridge = prepared.bridge.take();
                                     attachment = prepared.attachment;
                                     active_machine = selection.machine;
+                                    host_colors.reattach();
                                     view = next_view;
                                     resources = next_resources;
                                     ui = prepared.ui;
@@ -7680,6 +7701,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut stdout = io::stdout();
+        let _ = execute!(stdout, crossterm::style::Print("\x1b[?2031l"));
         if self.line_wrap_disabled {
             let _ = execute!(stdout, EnableLineWrap);
         }

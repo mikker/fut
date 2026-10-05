@@ -703,6 +703,15 @@ pub struct Rgb {
     pub blue: u8,
 }
 
+/// Host terminal colors, as reported by OSC 10/11 and OSC 4.
+/// Missing values remain unknown rather than inventing a terminal theme.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TerminalColors {
+    pub foreground: Option<Rgb>,
+    pub background: Option<Rgb>,
+    pub palette: [Option<Rgb>; 16],
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CellColor {

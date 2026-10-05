@@ -1006,16 +1006,16 @@ struct LeasedTarget {
     selected: SelectedTarget,
     terminal: Arc<TerminalHandle>,
     lease: lease::LeaseGuard,
-    pending_geometry: Option<crate::terminal::AttachmentGeometry>,
+    pending_configuration: Option<crate::terminal::AttachmentConfiguration>,
 }
 
 impl LeasedTarget {
-    async fn apply_acquisition_geometry(&mut self) -> Result<(), DaemonError> {
-        let Some(geometry) = self.pending_geometry.take() else {
+    async fn apply_acquisition_configuration(&mut self) -> Result<(), DaemonError> {
+        let Some(configuration) = self.pending_configuration.take() else {
             return Ok(());
         };
         self.terminal
-            .resize_for_attachment(geometry)
+            .configure_attachment(configuration)
             .await
             .map_err(|error| DaemonError::new(command_error_code(&error), error.to_string()))
     }
@@ -1132,7 +1132,7 @@ impl Attachment {
 
     async fn resize_focused(&mut self, size: TerminalSize) -> Result<TerminalSize, CommandError> {
         self.size = size;
-        let geometry = self
+        let configuration = self
             .focused
             .lease
             .resize(size)
@@ -1141,9 +1141,24 @@ impl Attachment {
             .remove(&self.focused.selected.terminal_id);
         self.focused
             .terminal
-            .resize_for_attachment(geometry)
+            .configure_attachment(configuration)
             .await?;
-        Ok(geometry.size)
+        Ok(configuration.size)
+    }
+
+    async fn set_focused_colors(
+        &self,
+        colors: crate::domain::TerminalColors,
+    ) -> Result<(), CommandError> {
+        let configuration = self
+            .focused
+            .lease
+            .set_colors(colors)
+            .ok_or(CommandError::Stopped)?;
+        self.focused
+            .terminal
+            .configure_attachment(configuration)
+            .await
     }
 
     fn size(&self) -> TerminalSize {
@@ -3101,6 +3116,20 @@ async fn handle_connection(
                             }
                         }
                     }
+                    ClientMessage::TerminalColors { terminal_id, colors } => {
+                        if terminal_id != attachment.focused.selected.terminal_id {
+                            continue;
+                        }
+                        if let Err(error) = attachment.set_focused_colors(colors).await {
+                            respond_to_ui_event_error(
+                                &mut connection,
+                                envelope.request_id,
+                                "terminal colors",
+                                error,
+                                UiEventPolicy::Disposable,
+                            ).await?;
+                        }
+                    }
                     ClientMessage::Resize { terminal_id, size } => {
                         if let Err(error) = size.validate() {
                             send_error(&mut connection, envelope.request_id, "invalid_size", &error.to_string()).await?;
@@ -4552,7 +4581,8 @@ async fn control_loop(
             ClientMessage::MouseInput { .. }
             | ClientMessage::ResetViewport { .. }
             | ClientMessage::RefreshTerminal { .. }
-            | ClientMessage::ResizeSplit { .. } => {}
+            | ClientMessage::ResizeSplit { .. }
+            | ClientMessage::TerminalColors { .. } => {}
             ClientMessage::CreateWorkspace { .. }
             | ClientMessage::Input { .. }
             | ClientMessage::KeyInput { .. }
@@ -4886,7 +4916,7 @@ async fn lease_view(
         selected: selected_target(focused, &focused_runtime.handle),
         terminal: Arc::clone(&focused_runtime.handle),
         lease: acquisition.guard,
-        pending_geometry: Some(acquisition.geometry),
+        pending_configuration: Some(acquisition.configuration),
     };
     let mut panes = Vec::with_capacity(paths.len());
     for path in paths {
@@ -4924,7 +4954,7 @@ async fn lease_view(
         presence_changes,
     );
     drop(state);
-    attachment.focused.apply_acquisition_geometry().await?;
+    attachment.focused.apply_acquisition_configuration().await?;
     Ok(attachment)
 }
 
@@ -5002,7 +5032,7 @@ async fn focus_leased_attachment(
     attachment: &mut Attachment,
     mut focused: LeasedTarget,
 ) -> Result<(), DaemonError> {
-    focused.apply_acquisition_geometry().await?;
+    focused.apply_acquisition_configuration().await?;
     attachment
         .clear_active_copy_mode()
         .await
@@ -5617,7 +5647,7 @@ async fn create_workspace(
                         selected,
                         terminal: Arc::clone(&terminal),
                         lease: acquisition.guard,
-                        pending_geometry: Some(acquisition.geometry),
+                        pending_configuration: Some(acquisition.configuration),
                     })
                 }
             }),
@@ -5739,7 +5769,7 @@ async fn create_tab(
                         selected,
                         terminal: Arc::clone(&terminal),
                         lease: acquisition.guard,
-                        pending_geometry: Some(acquisition.geometry),
+                        pending_configuration: Some(acquisition.configuration),
                     };
                     CreatedTerminal::Attached(target)
                 }
@@ -5914,7 +5944,7 @@ async fn create_pane(
                         selected,
                         terminal: Arc::clone(&terminal),
                         lease: acquisition.guard,
-                        pending_geometry: Some(acquisition.geometry),
+                        pending_configuration: Some(acquisition.configuration),
                     })
                 }
             }),
@@ -7469,7 +7499,7 @@ mod tests {
                     selected,
                     terminal: Arc::clone(&terminal),
                     lease: acquisition.guard,
-                    pending_geometry: Some(acquisition.geometry),
+                    pending_configuration: Some(acquisition.configuration),
                 },
                 layout: SplitTree::leaf(pane_id),
                 fallback_terminal_ids: Vec::new(),
