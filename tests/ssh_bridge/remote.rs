@@ -211,7 +211,9 @@ async fn local_client_switches_atomically_between_two_saved_remote_endpoints() {
 
 #[tokio::test]
 async fn remote_cli_navigates_and_attaches_across_versions_without_optional_capabilities() {
-    let harness = Harness::start("printf 'OPTIONAL_READY\\r\\n'; while IFS= read -r line; do printf 'OPTIONAL:%s\\r\\n' \"$line\"; done").await;
+    // This test waits for the discovered process name to replace the initial
+    // "sh" tab label. Launch Bash explicitly: /bin/sh is Dash on Linux.
+    let harness = Harness::start("exec /bin/bash -c 'printf \"OPTIONAL_READY\\r\\n\"; while IFS= read -r line; do printf \"OPTIONAL:%s\\r\\n\" \"$line\"; done'").await;
     let root = tempfile::tempdir().unwrap();
     let bin = fake_ssh(root.path());
     let socket = root.path().join("compatible-peer.sock");
