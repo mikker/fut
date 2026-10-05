@@ -2,9 +2,10 @@
 
 ## Unreleased
 
+## 0.27
+
 - Keep SSH connections alive and automatically reattach after network interruptions; `fut doctor` reports effective keepalive settings.
-- Use `--machine` to attach by saved machine name or SSH host; `--remote` remains an alias.
-- Open and attach to remote catalog projects with `fut p NAME --machine HOST`.
+- Attach by saved machine name or SSH host with `--machine` (`--remote` remains an alias), and open remote catalog projects with `fut p NAME --machine HOST`.
 - Preserve terminal theme detection inside Fut, restoring Pi’s shaded message and tool panels.
 
 ## 0.26
