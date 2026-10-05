@@ -86,6 +86,18 @@ impl Catalog {
         Ok(file.machines)
     }
 
+    /// Explicit attachment accepts saved profiles (even disabled ones), or a raw SSH host.
+    pub(crate) fn attachment_target(&self, selector: &str) -> Result<String> {
+        match self.find(selector) {
+            Ok(machine) => Ok(machine.target),
+            Err(Error::NotFound(_)) => {
+                crate::ssh_bridge::validate_destination(selector)?;
+                Ok(selector.to_owned())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub(crate) fn find(&self, selector: &str) -> Result<Machine, Error> {
         find(&self.list()?, selector).cloned()
     }
@@ -352,6 +364,24 @@ mod tests {
         assert!(text.contains("[[machines]]"), "{text}");
         assert!(path.with_extension("lock").is_file());
         assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn attachment_resolves_profiles_and_falls_back_to_ssh_hosts() {
+        let (_temporary, catalog) = catalog();
+        assert_eq!(catalog.attachment_target("clonk").unwrap(), "clonk");
+        let machine = catalog.add("work", "user@clonk").unwrap();
+        assert_eq!(catalog.attachment_target("work").unwrap(), "user@clonk");
+        assert_eq!(
+            catalog.attachment_target(&machine.id.to_string()).unwrap(),
+            "user@clonk"
+        );
+        catalog.set_enabled("work", false).unwrap();
+        assert_eq!(catalog.attachment_target("work").unwrap(), "user@clonk");
+        assert_eq!(catalog.attachment_target("other").unwrap(), "other");
+        assert!(catalog.attachment_target("-oProxyCommand=evil").is_err());
+        fs::write(catalog.path(), "invalid catalog").unwrap();
+        assert!(catalog.attachment_target("other").is_err());
     }
 
     #[test]

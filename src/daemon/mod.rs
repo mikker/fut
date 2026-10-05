@@ -3636,7 +3636,7 @@ async fn handle_connection(
                             ).await?,
                         }
                     }
-                    ClientMessage::MovePane { .. } | ClientMessage::Contextual { .. } | ClientMessage::RetireWorkspace { .. } | ClientMessage::PublishToken { .. } | ClientMessage::ReloadExtensions | ClientMessage::ReportAgent { .. } | ClientMessage::ReportTerminalAgent { .. } | ClientMessage::TerminalInput { .. } | ClientMessage::ReadTerminalOutput { .. } | ClientMessage::WaitTerminalOutput { .. } | ClientMessage::PromptAgent { .. } | ClientMessage::WaitAgent { .. } | ClientMessage::GetExtensionCatalog | ClientMessage::WatchResources | ClientMessage::Shutdown => send_error(&mut connection, envelope.request_id, "control_only", "command requires a control connection").await?,
+                    ClientMessage::OpenProject { .. } | ClientMessage::MovePane { .. } | ClientMessage::Contextual { .. } | ClientMessage::RetireWorkspace { .. } | ClientMessage::PublishToken { .. } | ClientMessage::ReloadExtensions | ClientMessage::ReportAgent { .. } | ClientMessage::ReportTerminalAgent { .. } | ClientMessage::TerminalInput { .. } | ClientMessage::ReadTerminalOutput { .. } | ClientMessage::WaitTerminalOutput { .. } | ClientMessage::PromptAgent { .. } | ClientMessage::WaitAgent { .. } | ClientMessage::GetExtensionCatalog | ClientMessage::WatchResources | ClientMessage::Shutdown => send_error(&mut connection, envelope.request_id, "control_only", "command requires a control connection").await?,
                     ClientMessage::Hello { .. } | ClientMessage::RemoteHello(_) => send_error(&mut connection, envelope.request_id, "already_hello", "hello was already received").await?,
                 }
             },
@@ -4007,6 +4007,13 @@ async fn control_loop(
                     send_error(connection, envelope.request_id, error.code, &error.message).await?
                 }
             },
+            ClientMessage::OpenProject { project } => {
+                match recipe::open_project(&shared, &exited, project).await {
+                    Ok((selected, disposition)) => send(connection, envelope.request_id,
+                        ServerMessage::LocationOpened { selected, disposition }).await?,
+                    Err(error) => send_error(connection, envelope.request_id, error.code, &error.message).await?,
+                }
+            }
             ClientMessage::OpenLocation {
                 project,
                 name,

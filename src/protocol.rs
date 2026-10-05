@@ -446,6 +446,10 @@ pub enum ClientMessage {
         expected: Option<SelectionExpectation>,
     },
     Detach,
+    /// Open a catalog project using the daemon host's configuration.
+    OpenProject {
+        project: String,
+    },
     OpenLocation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         project: Option<String>,

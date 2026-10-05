@@ -127,3 +127,45 @@ pub(super) fn report_error(error: anyhow::Error) -> anyhow::Error {
         anyhow::anyhow!(one_line_error(&error))
     }
 }
+
+pub(super) async fn open_project(
+    stream: UnixStream,
+    project: &str,
+    deadline: Duration,
+) -> anyhow::Result<TargetSelector> {
+    let mut connection = negotiate(
+        stream,
+        ClientMode::Control,
+        env!("CARGO_PKG_VERSION"),
+        deadline,
+    )
+    .await?;
+    if !connection.capabilities.contains(Capability::ProjectOpen) {
+        bail!(
+            "remote daemon does not support opening named projects; update Fut on the remote host"
+        );
+    }
+    send_request(
+        &mut connection.framed,
+        Some(Uuid::new_v4()),
+        ClientMessage::OpenProject {
+            project: project.to_owned(),
+        },
+    )
+    .await?;
+    match time::timeout(deadline, receive(&mut connection.framed))
+        .await
+        .context("remote project open timed out")??
+    {
+        ServerMessage::LocationOpened { selected, .. } => {
+            Ok(TargetSelector::Terminal(selected.terminal_id))
+        }
+        ServerMessage::Error { code, message } => bail!(
+            "remote project open failed ({}): {}",
+            sanitize(&code),
+            sanitize(&message)
+        ),
+        ServerMessage::EndpointError { error } => Err(error.into()),
+        _ => bail!("unexpected response to remote project open"),
+    }
+}

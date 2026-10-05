@@ -71,15 +71,15 @@ use crate::{
     after_help = "Enable shell completion with, for example: source <(COMPLETE=zsh fut)"
 )]
 pub struct Cli {
-    /// Attach to a remote daemon via an SSH config host (opens navigator).
+    /// Attach to a saved machine or an SSH host.
     ///
-    /// Supports only bare attachment or `attach`. Starts a missing remote daemon,
-    /// but never stops or replaces one. UI configuration is local.
-    /// Commands, project opening, config reload, and client hooks are unavailable remotely.
-    #[arg(long, global = true, value_name = "HOST", conflicts_with_all = ["socket", "json"])]
-    remote: Option<String>,
+    /// Supports bare attachment, `attach`, or `project NAME`. Starts a missing remote daemon,
+    /// but never stops or replaces one.
+    /// Projects use the remote catalog. UI configuration is local.
+    #[arg(long = "machine", visible_alias = "remote", global = true, value_name = "NAME", conflicts_with_all = ["socket", "json"])]
+    remote_machine: Option<String>,
     /// Attach to an existing remote daemon without starting one.
-    #[arg(long, global = true, requires = "remote")]
+    #[arg(long, global = true, requires = "remote_machine")]
     attach_only: bool,
     /// Override the Unix socket used to contact the daemon.
     #[arg(long, global = true, value_hint = ValueHint::FilePath)]
@@ -94,7 +94,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     json: bool,
     /// Launch the standalone UI playground without starting or contacting a daemon.
-    #[arg(long, conflicts_with = "remote")]
+    #[arg(long, conflicts_with = "remote_machine")]
     ui_playground: bool,
     /// Command to run; omit it to open the current directory and attach.
     #[command(subcommand)]
@@ -1099,23 +1099,24 @@ async fn run_from(args: impl IntoIterator<Item = OsString>) -> ExitCode {
 }
 
 fn validate_remote_cli(cli: &Cli) -> Result<()> {
-    if let Some(host) = &cli.remote {
-        crate::ssh_bridge::validate_destination(host)?;
+    if cli.remote_machine.is_some() {
         match cli.command {
             None
             | Some(Command::Attach {
                 ignore_protocol_mismatch: false,
+            })
+            | Some(Command::Project {
+                name: Some(_),
+                command: None,
             }) => {}
             Some(Command::Attach {
                 ignore_protocol_mismatch: true,
             }) => {
                 bail!(
-                    "--remote does not support --ignore-protocol-mismatch; remote compatibility is negotiated separately"
+                    "--machine does not support --ignore-protocol-mismatch; remote compatibility is negotiated separately"
                 );
             }
-            _ => bail!(
-                "--remote supports only bare attachment or `attach`; remote open/start and other commands are unavailable"
-            ),
+            _ => bail!("--machine supports only bare attachment, `attach`, or `project NAME`"),
         }
     }
     Ok(())
@@ -1123,6 +1124,21 @@ fn validate_remote_cli(cli: &Cli) -> Result<()> {
 
 async fn execute(cli: Cli) -> Result<()> {
     let mut cli = cli;
+
+    if let Some(machine) = &cli.remote_machine {
+        reject_nested_client(&cli)?;
+        let host = crate::machines::Catalog::resolve()?.attachment_target(machine)?;
+        let project = match &cli.command {
+            Some(Command::Project {
+                name: Some(project),
+                command: None,
+            }) => Some(project.as_str()),
+            _ => None,
+        };
+        return client::attach_remote(&host, &cli.config_location()?, cli.attach_only, project)
+            .await;
+    }
+
     cli.command = cli.command.map(|command| match command {
         Command::Project {
             name: Some(project),
@@ -1137,11 +1153,6 @@ async fn execute(cli: Cli) -> Result<()> {
         },
         command => command,
     });
-
-    if let Some(host) = &cli.remote {
-        reject_nested_client(&cli)?;
-        return client::attach_remote(host, &cli.config_location()?, cli.attach_only).await;
-    }
 
     if cli.ui_playground {
         if cli.command.is_some() {
@@ -4819,12 +4830,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn remote_cli_accepts_only_standalone_navigator_attachment() {
+    fn machine_flag_is_primary_with_remote_alias() {
+        for flag in ["--machine", "--remote"] {
+            let cli = try_parse_cli_from(["fut", "p", "10er", flag, "work"]).unwrap();
+            assert_eq!(cli.remote_machine.as_deref(), Some("work"));
+        }
+        let help = cli_command().render_long_help().to_string();
+        assert!(help.contains("--machine <NAME>"));
+        assert!(help.contains("[alias: --remote]"));
+    }
+
+    #[test]
+    fn remote_cli_accepts_attachment_and_named_projects() {
         for args in [
             vec!["fut", "--remote", "clonk"],
             vec!["fut", "--remote", "clonk", "attach"],
             vec!["fut", "a", "--remote", "clonk", "--no-config"],
             vec!["fut", "--remote", "clonk", "--attach-only"],
+            vec!["fut", "p", "10er", "--remote", "clonk"],
+            vec!["fut", "p", "10er", "--machine", "clonk"],
+            vec!["fut", "--machine", "clonk"],
+            vec!["fut", "--machine", "clonk", "attach"],
+            vec!["fut", "--machine", "clonk", "--attach-only"],
+            vec![
+                "fut",
+                "project",
+                "10er",
+                "--remote",
+                "clonk",
+                "--attach-only",
+            ],
         ] {
             validate_remote_cli(&try_parse_cli_from(args).unwrap()).unwrap();
         }
@@ -4832,6 +4867,9 @@ mod tests {
         for tail in [
             vec!["attach", "--ignore-protocol-mismatch"],
             vec!["open", "/tmp"],
+            vec!["p", "list"],
+            vec!["p", "init"],
+            vec!["p"],
             vec!["daemon", "run"],
             vec!["daemon", "shutdown", "--force"],
             vec!["list"],
@@ -4848,10 +4886,12 @@ mod tests {
             vec!["--json"],
             vec!["--ui-playground"],
         ] {
-            let mut args = vec!["fut", "--remote", "clonk"];
-            args.extend(tail);
-            if let Ok(cli) = try_parse_cli_from(args.clone()) {
-                assert!(validate_remote_cli(&cli).is_err(), "{args:?}");
+            for flag in ["--machine", "--remote"] {
+                let mut args = vec!["fut", flag, "clonk"];
+                args.extend(tail.clone());
+                if let Ok(cli) = try_parse_cli_from(args.clone()) {
+                    assert!(validate_remote_cli(&cli).is_err(), "{args:?}");
+                }
             }
         }
     }

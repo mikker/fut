@@ -143,6 +143,32 @@ pub(super) async fn create_initial(
     Ok(terminals)
 }
 
+pub(super) async fn open_project(
+    shared: &Shared,
+    exited: &mpsc::UnboundedSender<TerminalId>,
+    project: String,
+) -> Result<(SelectedTarget, OpenDisposition), DaemonError> {
+    let location = shared.lock().await.config_location.clone();
+    let catalog = load_project_catalog(&location)?;
+    let configured = catalog.resolve(&project).ok_or_else(|| {
+        DaemonError::new("unknown_project", format!("unknown project {project:?}"))
+    })?;
+    let cwd = configured.path().to_owned();
+    open_location(
+        shared,
+        exited,
+        OpenLocationRequest {
+            project: Some(project),
+            name: None,
+            parent_workspace_id: None,
+            cwd,
+            program: None,
+            argv: Vec::new(),
+        },
+    )
+    .await
+}
+
 pub(super) async fn open_location(
     shared: &Shared,
     exited: &mpsc::UnboundedSender<TerminalId>,

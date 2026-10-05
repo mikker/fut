@@ -533,3 +533,36 @@ async fn remote_handshakes_reject_malformed_or_incompatible_peers_with_typed_err
         }
     }
 }
+
+#[tokio::test]
+async fn remote_project_open_requires_capability_before_sending_request() {
+    use crate::protocol::remote::{self as wire, RemoteWelcome};
+    let (stream, peer) = UnixStream::pair().unwrap();
+    let server = tokio::spawn(async move {
+        let mut peer = Framed::new(peer, codec());
+        let hello: Envelope<ClientMessage> =
+            wire::decode_handshake(&peer.next().await.unwrap().unwrap()).unwrap();
+        peer.send(Bytes::from(
+            encode_payload(&Envelope {
+                request_id: hello.request_id,
+                message: ServerMessage::RemoteWelcome(RemoteWelcome {
+                    generation: wire::GENERATION,
+                    codec: wire::CODEC.into(),
+                    server_version: "0.1.0".into(),
+                    capabilities: vec!["metadata.v1".into()],
+                    selected: None,
+                    extension_catalog: None,
+                }),
+            })
+            .unwrap(),
+        ))
+        .await
+        .unwrap();
+        assert!(peer.next().await.is_none());
+    });
+    let error = remote::open_project(stream, "10er", Duration::from_secs(1))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("update Fut on the remote host"));
+    server.await.unwrap();
+}

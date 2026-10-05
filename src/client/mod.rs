@@ -487,8 +487,9 @@ pub async fn attach_remote(
     host: &str,
     config_location: &config::ConfigLocation,
     attach_only: bool,
+    project: Option<&str>,
 ) -> anyhow::Result<()> {
-    attach_remote_inner(host, config_location, attach_only)
+    attach_remote_inner(host, config_location, attach_only, project)
         .await
         .map_err(remote::report_error)
 }
@@ -497,34 +498,49 @@ async fn attach_remote_inner(
     host: &str,
     config_location: &config::ConfigLocation,
     attach_only: bool,
+    project: Option<&str>,
 ) -> anyhow::Result<()> {
     let staged = &stage_ui_config(config_location)?;
     let start_if_missing = staged.remote_autostart() && !attach_only;
-    let selector = over_ssh(host, start_if_missing, |stream| async move {
-        let (mut connection, ui, snapshot, presence, capabilities) = prepare_remote(async {
-            let remote = remote::navigator(stream, Duration::from_secs(60))
+    let selector = if let Some(project) = project {
+        Some(
+            over_ssh(host, start_if_missing, |stream| async move {
+                prepare_remote(remote::open_project(
+                    stream,
+                    project,
+                    Duration::from_secs(60),
+                ))
                 .await
-                .context(REMOTE_HANDSHAKE_FAILED)?;
-            let ui = remote::materialize_ui(staged, remote.welcome.extension_catalog.as_ref())?;
-            let mut connection = remote.framed;
-            let (snapshot, presence) =
-                receive_initial_resources(&mut connection, "remote daemon").await?;
-            Ok((connection, ui, snapshot, presence, remote.capabilities))
-        })
-        .await?;
-        let _guard = TerminalGuard::enter()?;
-        let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-        initial_navigator(
-            &mut terminal,
-            &mut connection,
-            snapshot,
-            presence,
-            &ui,
-            Some(capabilities),
+            })
+            .await?,
         )
-        .await
-    })
-    .await?;
+    } else {
+        over_ssh(host, start_if_missing, |stream| async move {
+            let (mut connection, ui, snapshot, presence, capabilities) = prepare_remote(async {
+                let remote = remote::navigator(stream, Duration::from_secs(60))
+                    .await
+                    .context(REMOTE_HANDSHAKE_FAILED)?;
+                let ui = remote::materialize_ui(staged, remote.welcome.extension_catalog.as_ref())?;
+                let mut connection = remote.framed;
+                let (snapshot, presence) =
+                    receive_initial_resources(&mut connection, "remote daemon").await?;
+                Ok((connection, ui, snapshot, presence, remote.capabilities))
+            })
+            .await?;
+            let _guard = TerminalGuard::enter()?;
+            let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+            initial_navigator(
+                &mut terminal,
+                &mut connection,
+                snapshot,
+                presence,
+                &ui,
+                Some(capabilities),
+            )
+            .await
+        })
+        .await?
+    };
     let Some(selector) = selector else {
         return Ok(());
     };

@@ -57,25 +57,34 @@ There are two distinct SSH workflows:
 
 - `ssh -t workbox fut` runs both Fut's client and daemon on `workbox`; the SSH
   session owns terminal integration and clipboard availability.
-- `fut --remote workbox` runs the interface, theme, input handling, and
+- `fut --machine workbox` runs the interface, theme, input handling, and
   clipboard locally while the daemon and PTYs remain on `workbox`.
 
 Run Fut's interface locally while its daemon and terminals remain on an SSH
 host:
 
 ```sh
-fut --remote workbox
+fut --machine workbox
 ```
 
-`workbox` is a host or alias accepted by OpenSSH. Fut uses the normal SSH
-configuration, authentication, host keys, and jump hosts, then opens the global
-navigator for the remote daemon. `fut --remote workbox attach` is equivalent.
+`workbox` can be a saved machine label or ID, or a host or alias accepted by
+OpenSSH. Saved machines use their configured SSH target; explicit attachment
+also works for disabled profiles. `--remote` remains an alias for `--machine`.
+Fut uses the normal SSH configuration, authentication, host keys, and jump
+hosts, then opens the global
+navigator for the remote daemon. `fut --machine workbox attach` is equivalent.
 The local process renders the interface and uses the local theme, keybindings,
 and clipboard; SSH carries the Fut protocol to the remote daemon without
 exposing a network listener.
 
+Open and attach directly to a project from the remote machine’s catalog:
+
+```sh
+fut p 10er --machine workbox
+```
+
 To attach without starting a missing daemon, run
-`fut --remote workbox --attach-only`. To make that your default, set
+`fut --machine workbox --attach-only`. To make that your default, set
 `autostart = false` in the **local** `config.toml`:
 
 ```toml
@@ -87,7 +96,7 @@ autostart = false
 config. It does not change the remote host's configuration.
 
 Fut must already be installed on the remote host. If its daemon is not running,
-`fut --remote workbox` starts it there by default, using that host's normal
+`fut --machine workbox` starts it there by default, using that host's normal
 socket, configuration and working directory. The client and daemon may use
 different Fut versions when they support the same remote protocol generation,
 codec, and required capabilities. Older releases without the remote handshake
@@ -96,7 +105,8 @@ can work.
 
 Remote attachment never stops, upgrades, or replaces an existing daemon, even if
 it is incompatible. Saved-machine background monitoring and `fut doctor` remain
-attach-only and never start remote daemons. Project opening, configuration reload,
+attach-only and never start remote daemons. The interactive project picker,
+configuration reload,
 configured commands, extension command actions, and client lifecycle hooks are
 unavailable because they currently assume the client and daemon share a
 filesystem. Remote terminal links are limited to HTTP and HTTPS. Ordinary

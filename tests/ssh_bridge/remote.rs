@@ -504,7 +504,7 @@ fn remote_cli_restrictions_precede_all_local_special_cases() {
             .unwrap();
         assert!(!output.status.success());
         assert!(output.stdout.is_empty());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("--remote"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("--machine"));
     }
     assert!(!root.path().join("ssh-pids").exists());
     assert!(!root.path().join("must-not-be-created").exists());
@@ -987,5 +987,50 @@ async fn machine_add_saves_nothing_after_failed_or_cancelled_verification() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("machine setup terminated"));
     assert!(!catalog.exists());
     drop(lock);
+    harness.shutdown().await;
+}
+#[tokio::test]
+async fn remote_cli_opens_named_project_from_remote_catalog_and_attaches_directly() {
+    let harness = Harness::start_with("while :; do sleep 1; done", |root| {
+        let project = root.join("remote-project");
+        fs::create_dir(&project).unwrap();
+        let config_dir = root.join("home/.config/fut");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.toml"),
+            format!("[projects.10er]\npath = {:?}\n", project),
+        )
+        .unwrap();
+    })
+    .await;
+    let root = tempfile::tempdir().unwrap();
+    let bin = fake_ssh(root.path());
+    let state = root.path().join(".local/state/fut");
+    fs::create_dir_all(&state).unwrap();
+    let catalog = state.join("machines.toml");
+    fs::write(&catalog, format!(
+        "version = 1\n[[machines]]\nid = {:?}\nlabel = \"work\"\ntarget = \"clonk\"\nenabled = false\n",
+        Uuid::new_v4().to_string()
+    )).unwrap();
+    fs::set_permissions(&catalog, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut command = Command::new("/usr/bin/script");
+    remote_env(&mut command, root.path(), &bin, &harness.socket);
+    command
+        .args(script_command_args())
+        .arg(r#"stty cols 80 rows 24; exec "$FUT_BIN" p 10er --machine work --no-config"#);
+    let mut client = PtyChild::spawn(command);
+    client.wait_for("FUT_TEST_SHELL_READY>").await;
+    client.send(b"printf 'REMOTE_PROJECT_%s\\n' ATTACHED\r");
+    client.wait_for("REMOTE_PROJECT_ATTACHED").await;
+    client.send(b"\x02d");
+    client.wait_success().await;
+    assert_ssh_reaped(root.path()).await;
+    let resources = harness.resources().await;
+    assert!(
+        resources
+            .sessions
+            .iter()
+            .any(|session| session.name == "remote-project")
+    );
     harness.shutdown().await;
 }

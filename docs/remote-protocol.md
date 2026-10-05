@@ -3,7 +3,7 @@
 Remote compatibility is independent of `CARGO_PKG_VERSION` and the local
 `PROTOCOL_VERSION` (package minor). Local `hello` / `welcome`, exact protocol
 checks and the explicit local mismatch escape hatch keep their existing behavior.
-Standalone `fut --remote` asks the remote bridge to start a missing daemon by
+Standalone `fut --machine` asks the remote bridge to start a missing daemon by
 default, using the remote host's local autostart policy. Local
 `[remote] autostart = false` or `--attach-only` makes the bridge attach-only.
 Existing sockets are connected without a local-version probe. Background SSH
@@ -12,6 +12,11 @@ invokes daemon lifecycle operations on handshake failure. SSH and
 `fut __stdio-bridge` forward bytes without parsing or negotiating anything.
 The daemon dispatches the first message on its existing Unix socket; no network
 listener is added.
+
+`fut p NAME --machine HOST` resolves and opens a project from the daemon host's
+catalog over a control connection, then attaches directly to its terminal.
+It requires `project-open.v1`; older daemons report an unsupported operation.
+Recipe validation and trust remain on the daemon host.
 
 ## Framing and handshake
 
@@ -72,6 +77,7 @@ are common to every negotiated connection.
 
 | Capability | Generation-1 methods and messages | When omitted |
 | --- | --- | --- |
+| `project-open.v1` | `open_project` with a catalog name; `location_opened` | Named project opening is unavailable |
 | `metadata.v1` | `list_resources`, `watch_resources`; resource snapshots/changes and client presence | Required for the navigator and attachment |
 | `nested-workspaces.v1` | Optional `parent_workspace_id` fields in workspace snapshots | Workspaces remain flat and generation-1 metadata payloads are unchanged |
 | `interactive.v1` | Input/key/paste/mouse, viewport reset/refresh, copy mode, terminal/split resize, target selection, workspace/tab/pane creation and split, rename/close, agent acknowledgement; their replies, full/delta screens and terminal exit | Required for attachment |
@@ -110,7 +116,7 @@ the fallback when `health.v1` is absent.
 Use `fut doctor` to validate OpenSSH, the private saved-profile catalog, and a
 bounded non-interactive compatibility handshake for enabled profiles. Doctor
 does not repair hosts or mutate either endpoint. Operational setup and the
-difference between `ssh -t host fut` and `fut --remote host` are documented in
+difference between `ssh -t host fut` and `fut --machine host` are documented in
 [Using Fut](usage.md#attach-to-a-remote-machine).
 
 ## Frozen semantics and evolution

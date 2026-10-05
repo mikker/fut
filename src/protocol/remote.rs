@@ -68,10 +68,11 @@ pub enum Capability {
     ControlAlerts,
     ExtensionCatalog,
     TerminalColors,
+    ProjectOpen,
 }
 
 impl Capability {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Metadata,
         Self::NestedWorkspaces,
         Self::Interactive,
@@ -80,6 +81,7 @@ impl Capability {
         Self::ControlAlerts,
         Self::ExtensionCatalog,
         Self::TerminalColors,
+        Self::ProjectOpen,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -92,6 +94,7 @@ impl Capability {
             Self::ControlAlerts => "control-alerts.v1",
             Self::ExtensionCatalog => "extension-catalog.v1",
             Self::TerminalColors => "terminal-colors.v1",
+            Self::ProjectOpen => "project-open.v1",
         }
     }
 }
@@ -130,6 +133,7 @@ impl Capabilities {
         let capability = match message {
             Detach => return true,
             ListResources | WatchResources => Capability::Metadata,
+            OpenProject { .. } => Capability::ProjectOpen,
             Ping => Capability::Health,
             GetExtensionCatalog => Capability::ExtensionCatalog,
             TerminalColors { .. } => Capability::TerminalColors,
@@ -166,6 +170,7 @@ impl Capabilities {
             Resources { .. } | ResourcesChanged { .. } | PresenceChanged { .. } => {
                 Capability::Metadata
             }
+            LocationOpened { .. } => Capability::ProjectOpen,
             Pong { .. } => Capability::Health,
             ExtensionCatalog { .. } | ExtensionCatalogChanged { .. } => {
                 Capability::ExtensionCatalog
@@ -224,6 +229,7 @@ impl RemoteHello {
             alerts.name().into(),
             Capability::ExtensionCatalog.name().into(),
             Capability::NestedWorkspaces.name().into(),
+            Capability::ProjectOpen.name().into(),
         ];
         if matches!(mode, ClientMode::Interactive { .. }) {
             optional.push(Capability::TerminalColors.name().into());

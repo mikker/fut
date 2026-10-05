@@ -34,6 +34,9 @@ async fn remote_generation_one_supports_unequal_versions_and_optional_omission_o
         ServerMessage::Resources { .. }
     ));
     for request in [
+        ClientMessage::OpenProject {
+            project: "10er".into(),
+        },
         ClientMessage::Ping,
         ClientMessage::GetExtensionCatalog,
         ClientMessage::Shutdown,
