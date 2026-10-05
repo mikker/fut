@@ -11735,6 +11735,13 @@ done
 async fn public_component_sidebar_docks_navigates_and_collapses_responsively() {
     let main_script = r#"
 printf 'ALPHA_READY\r\n'
+# Deliberately scroll the startup marker off-screen. Reattachments must prove
+# readiness with a fresh response, not output retained from process startup.
+i=0
+while [ "$i" -lt 80 ]; do
+  printf 'startup output %s\r\n' "$i"
+  i=$((i + 1))
+done
 while IFS= read -r line; do
   case "$line" in
     main) printf 'BRAVO_ACK\r\n' ;;
@@ -11756,6 +11763,21 @@ done
     })
     .await;
     let linked = harness.root.path().join("linked");
+    let linked_script = r#"
+printf 'ZETA_READY\r\n'
+i=0
+while [ "$i" -lt 80 ]; do
+  printf 'startup output %s\r\n' "$i"
+  i=$((i + 1))
+done
+while IFS= read -r line; do
+  case "$line" in
+    linked) printf 'ZETA_INPUT\r\n' ;;
+    after-close) printf 'OMEGA_ACK\r\n' ;;
+    size-*) set -- $(stty size); printf 'SIZE_%s_%s_%s\r\n' "${line#size-}" "$1" "$2" ;;
+  esac
+done
+"#;
     let ServerMessage::LocationOpened {
         selected: linked_target,
         disposition: fut::protocol::OpenDisposition::WorkspaceCreated,
@@ -11766,10 +11788,7 @@ done
             parent_workspace_id: None,
             cwd: linked,
             program: Some("/bin/sh".into()),
-            argv: vec![
-                "-c".into(),
-                "printf 'ZETA_READY\\r\\n'; while IFS= read -r line; do case \"$line\" in linked) printf 'ZETA_INPUT\\r\\n';; after-close) printf 'OMEGA_ACK\\r\\n';; size-*) set -- $(stty size); printf 'SIZE_%s_%s_%s\\r\\n' \"${line#size-}\" \"$1\" \"$2\";; esac; done".into(),
-            ],
+            argv: vec!["-c".into(), linked_script.into()],
         })
         .await
     else {
@@ -11798,16 +11817,14 @@ done
     };
 
     let mut left = spawn_client(124, main_pane);
-    left.wait_for("ALPHA_READY").await;
     left.wait_for("feature").await;
     left.wait_for_terminal_size(23, 96).await;
     left.send(b"\x02w");
     left.wait_for("hotkeys").await;
     left.send(b"j\r");
-    left.wait_for("ZETA_READY").await;
+    left.wait_for_terminal_size(23, 96).await;
     left.send(b"linked\n");
     left.wait_for("ZETA_INPUT").await;
-    left.wait_for_terminal_size(23, 96).await;
     left.send(b"\x02\x17");
     left.send(b"main\n");
     left.wait_for("BRAVO_ACK").await;
@@ -11828,7 +11845,6 @@ done
     left.wait_success().await;
 
     let mut left_reset = spawn_client(124, main_pane);
-    left_reset.wait_for("ALPHA_READY").await;
     left_reset.wait_for_terminal_size(23, 96).await;
     left_reset.send(b"\x02d");
     left_reset.wait_success().await;
@@ -11878,7 +11894,6 @@ components = [
     configured.wait_success().await;
 
     let mut configured_reset = spawn_client(124, linked_target.pane_id);
-    configured_reset.wait_for("ZETA_READY").await;
     configured_reset.wait_for_terminal_size(23, 96).await;
     configured_reset.send(b"\x02d");
     configured_reset.wait_success().await;
@@ -11895,7 +11910,6 @@ components = [
     .unwrap();
 
     let mut narrow = spawn_client(123, main_pane);
-    narrow.wait_for("ALPHA_READY").await;
     narrow.wait_for_terminal_size(23, 95).await;
     narrow.send(b"\x02w");
     narrow.wait_for("feature").await;
@@ -11914,7 +11928,6 @@ components = [
     narrow.wait_success().await;
 
     let mut narrow_reset = spawn_client(123, main_pane);
-    narrow_reset.wait_for("ALPHA_READY").await;
     narrow_reset.wait_for_terminal_size(23, 95).await;
     narrow_reset.send(b"\x02d");
     narrow_reset.wait_success().await;
