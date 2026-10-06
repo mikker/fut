@@ -68,6 +68,8 @@ The manifest capabilities describe cooperation surfaces, not permissions.
 
 The checked-in workloads show where a sandbox would and would not help:
 
+<div class="wide-table" markdown="1">
+
 | Extension | What it actually needs | Sandbox fit |
 | --- | --- | --- |
 | `wt` | interactive input, `wt`, Git/worktree files, `fut open`, and an optional arbitrary post-open process | Poor. Granting process execution and workspace write access would collapse the tier into trusted code. |
@@ -75,6 +77,8 @@ The checked-in workloads show where a sandbox would and would not help:
 | `ghostty-title` | inherited terminal identity and writes to `/dev/tty` | Poor. Device/TTY access is intentionally ambient and client-local. |
 | `example-workspace-status` | lifecycle event to one declared token update | Good technically, but it is an example rather than evidence of user demand. |
 | `rust-status` | event/config parsing, optional arbitrary log-file append, and token update | The pure status path fits; arbitrary `log_path` does not. It is a conformance fixture. |
+
+</div>
 
 The useful initial sandbox is consequently narrower than manifest API v1: it
 is a pure, non-interactive lifecycle transformer. Existing process extensions
@@ -344,11 +348,15 @@ As of 2026-08-19, crates.io/docs.rs published Wasmtime 47.0.3 and
 `wasmtime-wasi` 47.0.3 (released 2026-07-31), both with MSRV 1.94. Fut uses Rust
 1.95, so the current toolchain is compatible.
 
+<div class="wide-table" markdown="1">
+
 | Published item | Wasmtime 47.0.3 | `wasmtime-wasi` 47.0.3 |
 | --- | ---: | ---: |
 | Unpacked crate source reported by docs.rs | 4.54 MB | 1.09 MB |
 | Downloaded `.crate` archive in this evaluation | 1,036,332 bytes | 224,100 bytes |
 | docs.rs average successful build duration for this release | 1m 51s | 58s |
+
+</div>
 
 The docs.rs durations are service measurements of each crate, not additive Fut
 CI predictions. The archives exclude transitive dependencies. In the isolated
@@ -380,12 +388,16 @@ host additionally used `wasmtime-wasi` with defaults disabled and `p2` enabled.
 Both configured fuel, epochs, and `StoreLimits`, compiled a 139-byte component
 exporting an empty `run`, instantiated it, and called it.
 
+<div class="wide-table" markdown="1">
+
 | arm64 macOS artifact | Unstripped bytes | `tar -czf` bytes |
 | --- | ---: | ---: |
 | Empty Rust control binary | 428,064 | not recorded |
 | Minimal custom Component host | 12,825,152 | 4,248,245 |
 | Minimal Component + WASI p2 host | 16,819,872 | 5,491,366 |
 | Current Fut release binary, for scale | 15,774,576 | 5,821,477 |
+
+</div>
 
 The standalone custom host is 12,397,088 bytes larger than its empty control;
 WASI p2 adds 3,994,720 bytes to that standalone host. These are reproducible
@@ -399,10 +411,14 @@ After one warm-up, 30 fresh host processes were sampled. Timers started inside
 `main`, so they exclude OS process-launch time and represent warm filesystem/OS
 caches:
 
+<div class="wide-table" markdown="1">
+
 | Host | Engine median (min–max) | Compile median (min–max) | Instantiate + empty call median (min–max) |
 | --- | ---: | ---: | ---: |
 | Custom Component | 0.053 ms (0.051–0.066) | 0.784 ms (0.752–0.949) | 0.029 ms (0.026–0.048) |
 | Component + WASI p2 | 0.055 ms (0.053–0.066) | 0.775 ms (0.757–0.919) | 0.133 ms (0.123–0.156) |
+
+</div>
 
 One warm `/usr/bin/time -l` sample reported 8,060,928 bytes maximum RSS for the
 custom host and 8,781,824 bytes for the WASI host. The guest does no useful

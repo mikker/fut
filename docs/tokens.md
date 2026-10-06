@@ -31,6 +31,8 @@ rendered.
 
 These may appear in groups under `ui.tab_bar.left`, `center`, or `right`.
 
+<div class="wide-table" markdown="1">
+
 | Token | Value |
 | --- | --- |
 | `fut` | `fut ` when the tab bar is passive; empty while it is keyboard-active |
@@ -45,11 +47,15 @@ These may appear in groups under `ui.tab_bar.left`, `center`, or `right`.
 | `client.waiting` | Configured `ui.icons.notification` and this client's count of unread agent notifications and terminal bells across Fut; empty when zero |
 | `session.waiting` | Configured `ui.icons.notification` and this client's count of unread agent notifications and terminal bells in the current session; empty when zero |
 
+</div>
+
 The special `{ component = "tabs" }` segment renders the focus-aware repeated tab collection. At most one may occur in a tab bar.
 
 ## Tab-item tokens
 
 These may appear only under `ui.tab_bar.item.segments`.
+
+<div class="wide-table" markdown="1">
 
 | Token | Value |
 | --- | --- |
@@ -62,11 +68,15 @@ These may appear only under `ui.tab_bar.item.segments`.
 | `tab.icon` | Tab icon from the selected preset |
 | `tab.activity` | Rolled-up agent/terminal attention: spinner for working, `!` for blocked or BEL, or `•` for completion; empty when inactive |
 
+</div>
+
 Current, closing, and keyboard-selected styles are composed over every item segment.
 
 ## Workspace-row tokens
 
 These may appear in the `row.left`, `body`, `right`, or `detail` fields of a `component = "workspaces"` entry under either `ui.sidebar.left.components` or `ui.sidebar.right.components`.
+
+<div class="wide-table" markdown="1">
 
 | Token | Value |
 | --- | --- |
@@ -83,6 +93,8 @@ These may appear in the `row.left`, `body`, `right`, or `detail` fields of a `co
 | `workspace.git_added` | `+N` inserted lines against `HEAD`, styled `added`; empty when none |
 | `workspace.git_deleted` | `-N` deleted lines against `HEAD`, styled `deleted`; empty when none |
 
+</div>
+
 Current, closing, and keyboard-selected styles compose over each workspace row.
 
 The daemon resolves Git tokens with bounded background `git` processes and refreshes each workspace at most every five seconds. Each Git command has a two-second timeout. Branch, insertion, and deletion values enter the authoritative resource snapshot together in at most one revision and only when changed, so every attached client sees the same status. They never block rendering and all three stay empty for non-Git roots, errors, timeouts, or a repository that disappears.
@@ -90,6 +102,8 @@ The daemon resolves Git tokens with bounded background `git` processes and refre
 ## Sidebar header and footer tokens
 
 These may appear in the `header` and `footer` fields of a `component = "workspaces"` entry under either sidebar side:
+
+<div class="wide-table" markdown="1">
 
 | Token | Value |
 | --- | --- |
@@ -100,6 +114,8 @@ These may appear in the `header` and `footer` fields of a `component = "workspac
 | `sidebar.display` | Current display label: `expanded` or `minimized` |
 | `sidebar.visibility` | Current compact visibility label: `visible`, `automatic`, or `hidden` |
 | `sidebar.status` | Current display and visibility plus contextual controls, switching progress, or a retryable error |
+
+</div>
 
 ## Extension tokens
 

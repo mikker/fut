@@ -211,6 +211,8 @@ These default bindings follow the `Ctrl-b` prefix, configurable as `ui.prefix`.
 The configuration name is the key to override under `[ui.bindings]`, or to
 assign directly without a prefix under `[ui.hotkeys]`.
 
+<div class="wide-table" markdown="1">
+
 | Key | Action | Configuration name |
 | --- | --- | --- |
 | `:` | Search every command and configured extension action | `open_command_bar` |
@@ -244,6 +246,8 @@ assign directly without a prefix under `[ui.hotkeys]`.
 | `z` | Toggle pane zoom | `toggle_pane_zoom` |
 | `x` | Close the focused pane | `close_pane` |
 | `d` | Detach | `detach` |
+
+</div>
 
 Pause for 700 ms after `Ctrl-b` to see the complete, current binding list.
 Bindings can be changed in [Configuration](../configuration/).

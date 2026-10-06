@@ -77,6 +77,8 @@ selection permits methods; existing control/interactive mode and resource-scope
 checks still apply. `detach`, `detached`, operational errors and endpoint errors
 are common to every negotiated connection.
 
+<div class="wide-table" markdown="1">
+
 | Capability | Generation-1 methods and messages | When omitted |
 | --- | --- | --- |
 | `project-open.v1` | `open_project` with a catalog name; `location_opened` | Named project opening is unavailable |
@@ -88,6 +90,8 @@ are common to every negotiated connection.
 | `alerts.v1` | Interactive `watch_alerts`, `acknowledge_alerts`, alert snapshots and acknowledgement | No attached-terminal bell subscription or acknowledgement |
 | `control-alerts.v1` | Lease-free control `watch_alerts`, `acknowledge_alerts`, alert snapshots and acknowledgement | Background metadata retains no bell summary; agent summaries remain in resources |
 | `extension-catalog.v1` | Catalog in the welcome; control `get_extension_catalog` and interactive catalog-change notifications | No extension declarations, styles or command listings; related local overrides are ignored |
+
+</div>
 
 Interactive resource operations execute **on the daemon's machine**. Paths,
 programs and argv in these methods are endpoint-local. Remote resource roots,

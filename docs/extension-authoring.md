@@ -77,6 +77,8 @@ scope = "workspace"
 
 All five metadata keys are required:
 
+<div class="wide-table" markdown="1">
+
 | Key | Contract |
 | --- | --- |
 | `api_version` | Integer selecting the manifest and process contract. Fut currently accepts exactly `1`. |
@@ -84,6 +86,8 @@ All five metadata keys are required:
 | `fut` | A SemVer requirement matched against the running Fut package version before activation. |
 | `capabilities` | The exact set of cooperation surfaces used below. |
 | `id` | Stable package namespace used in command slugs, config, environment, and tokens. |
+
+</div>
 
 The three versions answer different questions. `api_version` says how to
 interpret this file and processes. `version` identifies your release. `fut`
@@ -104,11 +108,15 @@ separators. Unknown manifest fields are errors.
 
 API v1 has exactly three capabilities:
 
+<div class="wide-table" markdown="1">
+
 | Capability | Required when |
 | --- | --- |
 | `commands` | `[commands]` contains at least one command. |
 | `hooks` | `[hooks]` contains at least one hook. |
 | `presentation_tokens` | At least one `[[presentation_tokens]]` exists. |
+
+</div>
 
 Missing, unknown, duplicate, and declared-but-unused capabilities reject the
 manifest. They describe which Fut surfaces a package uses; they are not OS
@@ -175,6 +183,8 @@ exits or its surface is closed, and a background command lives until it exits.
 Both modes run with the focused workspace root as their working directory and
 receive the client process environment plus these API v1 values:
 
+<div class="wide-table" markdown="1">
+
 | Variable | Value |
 | --- | --- |
 | `FUT_BIN` | Exact running Fut executable; do not replace it with a `PATH` lookup. |
@@ -192,6 +202,8 @@ receive the client process environment plus these API v1 values:
 | `FUT_EXTENSION_CONFIG_GLOBAL_PATH` | Present only when global config contributed values. |
 | `FUT_EXTENSION_CONFIG_WORKSPACE_PATH` | Present only when workspace config contributed values. |
 | `FUT_EXTENSION_FORM` | Present only for a command with fields; a compact JSON object mapping every field name to its submitted string. |
+
+</div>
 
 Inherited variables that are not listed here are host environment, not Fut
 API. Do not give them semantic meaning. Future compatible releases may add new
@@ -439,6 +451,8 @@ versions may change independently of manifest API v1.
 
 ## Limits and failure model
 
+<div class="wide-table" markdown="1">
+
 | Resource | API v1 limit |
 | --- | ---: |
 | Active/configured extensions | 32 |
@@ -465,6 +479,8 @@ versions may change independently of manifest API v1.
 | One managed file / total managed content | 16 MiB / 64 MiB |
 | Git remote URL | 4,096 bytes |
 | Each Git command / retained output stream | 30 seconds / 256 KiB |
+
+</div>
 
 Manifest, compatibility, duplicate-root/ID, config, and catalog errors reject
 the complete candidate generation. Reload is atomic: failure preserves the

@@ -302,6 +302,8 @@ While that surface is open, attention from the covered managed terminal remains
 unread until the managed terminal is visible again.
 Extension commands run from the focused workspace root and receive:
 
+<div class="wide-table" markdown="1">
+
 | Variable | Value |
 | --- | --- |
 | `FUT_BIN` | Exact running Fut executable |
@@ -321,6 +323,8 @@ Extension commands run from the focused workspace root and receive:
 | `FUT_EXTENSION_CONFIG_PROJECT_PATH` | Trusted project recipe path, when it contributed values |
 | `FUT_EXTENSION_CONFIG_WORKSPACE_PATH` | Workspace source path, when it contributed values |
 | `FUT_EXTENSION_FORM` | Submitted command fields as compact JSON, when declared |
+
+</div>
 
 Interactive commands may declare `[[commands.NAME.fields]]` entries with a
 required `name` and `label`, plus optional `prefix`, `placeholder`, `default`,
@@ -557,6 +561,8 @@ tokens](../tokens/) for compatible UI contexts and exact clickable regions.
 
 ## Limits and failure behavior
 
+<div class="wide-table" markdown="1">
+
 | Resource | Limit |
 | --- | ---: |
 | Configured extensions | 32 |
@@ -577,6 +583,8 @@ tokens](../tokens/) for compatible UI contexts and exact clickable regions.
 | Extension config nesting depth | 8 |
 | Values in one extension config array | 128 |
 | Resolved extension config JSON | 16 KiB |
+
+</div>
 
 The hook queue holds 128 events and never blocks resource mutations. Fut
 retains at most 16 KiB each of hook stdout and stderr for diagnostics. A new
