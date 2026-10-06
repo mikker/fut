@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Upgrade standalone installations with `fut upgrade`, or check for updates with `fut upgrade --check`.
+- Show the running remote daemon's version when it cannot open named projects.
+
 ## 0.29
 
 - Keep SSH connections alive and automatically reattach after network interruptions; `fut doctor` reports effective keepalive settings.

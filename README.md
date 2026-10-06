@@ -16,6 +16,12 @@ Or [install with Homebrew](https://github.com/mikker/homebrew-tap):
 brew install mikker/tap/fut
 ```
 
+For standalone installations, run `fut upgrade` to update the current binary,
+`fut upgrade --check` to check for updates, or `fut upgrade --yes` to skip the
+confirmation. Downloads are checksum-verified. Homebrew installations should
+use `brew upgrade fut` instead. Upgrading does not restart a running daemon;
+restart it when safe, since doing so may interrupt its terminals.
+
 [Documentation](https://fut.sh)
 
 ## Quick start

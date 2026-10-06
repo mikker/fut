@@ -564,5 +564,7 @@ async fn remote_project_open_requires_capability_before_sending_request() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("update Fut on the remote host"));
+    assert!(error.to_string().contains("Fut 0.1.0"));
+    assert!(error.to_string().contains("restart its daemon safely"));
     server.await.unwrap();
 }

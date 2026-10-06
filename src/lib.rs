@@ -19,3 +19,4 @@ pub mod splits;
 pub(crate) mod ssh_bridge;
 pub(crate) mod state_file;
 pub mod terminal;
+pub(crate) mod upgrade;

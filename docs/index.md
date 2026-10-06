@@ -28,14 +28,23 @@ Installs the latest macOS or Linux release to `~/.local/bin`. Set
 and x86_64. The installer needs `curl`, `tar`, and either `sha256sum` or
 `shasum`; it prints a PATH reminder when needed.
 
-Re-run the installer to upgrade, set `FUT_VERSION` to install a specific tag,
-or remove the installed `fut` binary to uninstall.
+Run `fut upgrade` to upgrade the current standalone installation to the latest
+stable release. Use `fut upgrade --check` to check without changing anything,
+or `fut upgrade --yes` to skip confirmation. The upgrade requires `curl` and
+`tar`, verifies the release checksum, and replaces the current binary atomically.
+It never restarts a running daemon; restart it when safe, since doing so may
+interrupt its terminals.
+
+For older versions without `fut upgrade`, re-run the installer. Set `FUT_VERSION`
+to install a specific tag, or remove the installed `fut` binary to uninstall.
 
 Or install on macOS with Homebrew:
 
 ```sh
 brew install mikker/tap/fut
 ```
+
+Homebrew-managed installations use `brew upgrade fut` instead of `fut upgrade`.
 
 ## Docs
 

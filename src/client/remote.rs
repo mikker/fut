@@ -149,7 +149,8 @@ pub(super) async fn open_project(
     .await?;
     if !connection.capabilities.contains(Capability::ProjectOpen) {
         bail!(
-            "remote daemon does not support opening named projects; update Fut on the remote host"
+            "remote daemon (Fut {}) does not support opening named projects; update Fut on the remote host and restart its daemon safely",
+            connection.welcome.server_version
         );
     }
     send_request(

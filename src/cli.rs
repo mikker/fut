@@ -133,6 +133,15 @@ where
 
 #[derive(Subcommand)]
 enum Command {
+    /// Upgrade this installation to the latest stable GitHub release.
+    Upgrade {
+        /// Show the latest version without changing this installation.
+        #[arg(long)]
+        check: bool,
+        /// Upgrade without asking for confirmation.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
     /// Forward the selected daemon socket over stdio for an SSH attachment.
     #[command(name = "__stdio-bridge", hide = true)]
     StdioBridge {
@@ -1162,6 +1171,17 @@ async fn execute(cli: Cli) -> Result<()> {
         return client::launch_ui_playground(&cli.config_location()?).await;
     }
 
+    if let Some(Command::Upgrade { check, yes }) = &cli.command {
+        if cli.json {
+            return Err(CliError::new(
+                "invalid_arguments",
+                "--json is not supported for `fut upgrade`",
+            )
+            .into());
+        }
+        return crate::upgrade::run(*check, *yes).await;
+    }
+
     if let Some(Command::StdioBridge { start_if_missing }) = &cli.command {
         let socket = socket_path(cli.socket.as_deref())?;
         let stream = match std::os::unix::net::UnixStream::connect(&socket) {
@@ -1272,6 +1292,9 @@ async fn execute(cli: Cli) -> Result<()> {
     let socket = socket_path(cli.socket.as_deref())?;
     reject_nested_client(&cli)?;
     match cli.command {
+        Some(Command::Upgrade { .. }) => {
+            unreachable!("upgrade is handled before config loading")
+        }
         Some(Command::StdioBridge { .. }) => {
             unreachable!("stdio bridge is handled before config loading")
         }
@@ -5322,6 +5345,25 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn upgrade_rejects_json_before_loading_config_or_contacting_daemon() {
+        let cli = try_parse_cli_from([
+            "fut",
+            "--json",
+            "--config-dir",
+            "/nonexistent/fut-upgrade-config",
+            "upgrade",
+            "--check",
+        ])
+        .unwrap();
+        let error = execute(cli).await.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<CliError>().unwrap().code,
+            "invalid_arguments"
+        );
+        assert!(error.to_string().contains("fut upgrade"));
+    }
+
     #[test]
     fn parses_entire_command_tree() {
         let session = SessionId::new().to_string();
@@ -5330,6 +5372,9 @@ mod tests {
         let pane = PaneId::new().to_string();
         let terminal = TerminalId::new().to_string();
         for args in [
+            vec!["fut", "upgrade"],
+            vec!["fut", "upgrade", "--check"],
+            vec!["fut", "upgrade", "--yes"],
             vec!["fut", "attach"],
             vec!["fut", "a"],
             vec!["fut", "open"],
@@ -6137,6 +6182,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "upgrade",
                 "attach",
                 "open",
                 "project",
