@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.31
+
 - Upgrade standalone installations with `fut upgrade`, or check for updates with `fut upgrade --check`.
 - Show the running remote daemon's version when it cannot open named projects.
 
