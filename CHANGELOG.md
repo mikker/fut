@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Show activity reported by any program through the OSC 7501 program status protocol, including over SSH.
+
 ## 0.32
 
 - Find remote Fut installations even when SSH's noninteractive PATH omits common install directories.

@@ -74,9 +74,13 @@ pub enum TerminalLifecycle {
     Exited { exit_code: Option<i32> },
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TerminalActivity {
     pub bell_count: u64,
+    /// Number of OSC 7501 root-record reports seen, including resets.
+    pub program_status_count: u64,
+    /// The most recent of those reports, oldest first.
+    pub program_statuses: Vec<super::ProgramStatus>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1493,11 +1497,18 @@ fn process_output_message(
 
 fn publish_activity(terminal: &GhosttyTerminal, publisher: &watch::Sender<TerminalActivity>) {
     let bell_count = terminal.bell_count();
+    let (program_status_count, program_statuses) = terminal.program_statuses();
     publisher.send_if_modified(|activity| {
-        if activity.bell_count == bell_count {
+        if activity.bell_count == bell_count
+            && activity.program_status_count == program_status_count
+        {
             return false;
         }
         activity.bell_count = bell_count;
+        if activity.program_status_count != program_status_count {
+            activity.program_status_count = program_status_count;
+            activity.program_statuses = program_statuses.iter().cloned().collect();
+        }
         true
     });
 }
@@ -2678,7 +2689,7 @@ mod tests {
             .map(|cell| cell.contents.as_str())
             .collect::<String>();
         assert!(contents.contains("FUT_FINAL_MARKER"), "{contents:?}");
-        let activity = *handle.subscribe_activity().borrow();
+        let activity = handle.subscribe_activity().borrow().clone();
         assert_eq!(
             activity.bell_count, 1,
             "final BEL must precede lifecycle exit"

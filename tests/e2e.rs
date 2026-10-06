@@ -1093,6 +1093,70 @@ exec ./node ./codex
 }
 
 #[tokio::test]
+async fn program_status_reports_drive_activity_and_end_with_their_program() {
+    // Job control gives each subshell its own foreground process group, as an
+    // interactive shell would.
+    let script = r#"
+set -m
+st() { printf '\033]7501;state=%s:app=deploy\033\134' "$1"; }
+wait_for() { while [ ! -e "$1" ]; do sleep 0.02; done; }
+( st working; wait_for step1; st blocked; wait_for step2; st done )
+wait_for step3
+( st working; wait_for step4 )
+exec sleep 30
+"#;
+    let harness = Harness::start(script).await;
+
+    fn activity(snapshot: &fut::resources::ResourceSnapshot) -> &fut::domain::AgentActivity {
+        &snapshot.sessions[0].workspaces[0].tabs[0].panes[0].activity
+    }
+    async fn await_report(harness: &Harness, report: AgentReport, revision: u64) -> u64 {
+        time::timeout(DEADLINE, async {
+            loop {
+                let snapshot = harness.resources().await;
+                let activity = activity(&snapshot);
+                if let Some(event) = &activity.last_event
+                    && event.kind == report
+                    && event.revision > revision
+                {
+                    if report != AgentReport::Exited {
+                        let integration = activity.integration.as_ref().unwrap();
+                        assert_eq!(integration.source.as_deref(), Some("deploy"));
+                    }
+                    return event.revision;
+                }
+                time::sleep(POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("no {report:?} report: {}", harness.logs()))
+    }
+
+    let cwd = harness.root.path().join("cwd");
+    let revision = await_report(&harness, AgentReport::Working, 0).await;
+    fs::write(cwd.join("step1"), b"").unwrap();
+    let revision = await_report(&harness, AgentReport::Blocked, revision).await;
+    fs::write(cwd.join("step2"), b"").unwrap();
+    let revision = await_report(&harness, AgentReport::Completed, revision).await;
+    // The completed program exits, but its result remains to be seen.
+    time::sleep(Duration::from_millis(1200)).await;
+    let snapshot = harness.resources().await;
+    assert_eq!(
+        activity(&snapshot).last_event.as_ref().unwrap().kind,
+        AgentReport::Completed
+    );
+    fs::write(cwd.join("step3"), b"").unwrap();
+    let revision = await_report(&harness, AgentReport::Working, revision).await;
+    fs::write(cwd.join("step4"), b"").unwrap();
+    // A program that exits while working must not leave the pane working.
+    await_report(&harness, AgentReport::Exited, revision).await;
+    let snapshot = harness.resources().await;
+    assert_eq!(activity(&snapshot).state, AgentState::Idle);
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn terminal_survives_detach_and_preserves_output_continuity() {
     let script = r#"
 printf 'READY\r\n'

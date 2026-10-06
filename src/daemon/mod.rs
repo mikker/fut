@@ -68,7 +68,8 @@ use crate::{
     splits::{SplitDirection, SplitRatio, SplitTree},
     terminal::{
         CommandError, CopyModeOutcome, MouseInputOutcome, OutputCapture, OutputCaptureError,
-        SpawnSpec, TerminalEvent, TerminalHandle, TerminalLifecycle, spawn_terminal,
+        ProgramState, ProgramStatus, SpawnSpec, TerminalActivity, TerminalEvent, TerminalHandle,
+        TerminalLifecycle, spawn_terminal,
     },
 };
 
@@ -135,6 +136,8 @@ struct SharedState {
     resources: ResourceTree,
     runtimes: HashMap<TerminalId, RuntimeEntry>,
     automatic_agent_owners: HashMap<TerminalId, u32>,
+    /// Terminals whose current activity came from an OSC 7501 report.
+    program_status_terminals: HashSet<TerminalId>,
     presence: ClientPresence,
     expected_finalizations: HashSet<TerminalId>,
     exited_terminals: VecDeque<(TerminalId, Option<i32>)>,
@@ -495,6 +498,7 @@ impl SharedState {
         let revision =
             self.resources
                 .report_agent_with_metadata(terminal_id, report, metadata, now_ms)?;
+        self.program_status_terminals.remove(&terminal_id);
         let activity = self.resources.agent_activity(terminal_id)?.clone();
         self.publish_resource_change(revision);
         let _ = self.agent_events.send(AgentLifecycleUpdate {
@@ -528,6 +532,65 @@ impl SharedState {
     ) -> Result<(), DaemonError> {
         self.report_agent(terminal_id, report, metadata)?;
         self.automatic_agent_owners.remove(&terminal_id);
+        Ok(())
+    }
+
+    /// Apply an OSC 7501 root-record report. Working, blocked and idle
+    /// records belong to the foreground program and end when it exits; done
+    /// and error survive exit so the result stays visible.
+    fn report_program_status(
+        &mut self,
+        terminal_id: TerminalId,
+        status: &ProgramStatus,
+        foreground_pid: Option<u32>,
+    ) -> Result<(), DaemonError> {
+        let owned = self.program_status_terminals.contains(&terminal_id);
+        let report = match status.state {
+            ProgramState::Idle => AgentReport::Idle,
+            ProgramState::Working => AgentReport::Working,
+            ProgramState::Blocked => AgentReport::Blocked,
+            ProgramState::Done | ProgramState::Error => AgentReport::Completed,
+            ProgramState::Clear if owned => AgentReport::Exited,
+            // Never let a reset end activity some other integration reported.
+            ProgramState::Clear => return Ok(()),
+        };
+        // Progress updates repeat the same state; only transitions matter.
+        if owned
+            && self
+                .resources
+                .agent_activity(terminal_id)?
+                .last_event
+                .as_ref()
+                .is_some_and(|event| event.kind == report)
+        {
+            return Ok(());
+        }
+        let metadata = crate::domain::AgentReportMetadata {
+            source: status.app.clone(),
+            ..Default::default()
+        };
+        // The foreground process group leader is the job the shell started.
+        // When it is the terminal's own process, its exit ends the terminal.
+        let owner = foreground_pid
+            .zip(self.runtimes.get(&terminal_id))
+            .and_then(|(pid, runtime)| {
+                let root = runtime.handle.child_pid();
+                (pid != root && process::is_descendant(pid, root)).then_some(pid)
+            });
+        match owner {
+            Some(owner)
+                if matches!(
+                    report,
+                    AgentReport::Idle | AgentReport::Working | AgentReport::Blocked
+                ) =>
+            {
+                self.report_automatic_agent(terminal_id, report, metadata, owner)?;
+            }
+            _ => self.report_external_agent(terminal_id, report, metadata)?,
+        }
+        if report != AgentReport::Exited {
+            self.program_status_terminals.insert(terminal_id);
+        }
         Ok(())
     }
 
@@ -716,6 +779,7 @@ impl SharedState {
         let mutation = self.resources.terminal_exited(terminal_id)?;
         self.runtimes.remove(&terminal_id);
         self.automatic_agent_owners.remove(&terminal_id);
+        self.program_status_terminals.remove(&terminal_id);
         self.alerts.remove_terminal(terminal_id);
         self.publish_alert_change();
         self.exited_terminals.push_back((terminal_id, exit_code));
@@ -1753,6 +1817,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
         resources: ResourceTree::default(),
         runtimes: HashMap::new(),
         automatic_agent_owners: HashMap::new(),
+        program_status_terminals: HashSet::new(),
         presence: ClientPresence::default(),
         expected_finalizations: HashSet::new(),
         exited_terminals: VecDeque::new(),
@@ -2221,10 +2286,12 @@ fn watch_terminal(
     tokio::spawn(async move {
         let mut lifecycle = terminal.subscribe_lifecycle();
         let mut activity = terminal.subscribe_activity();
-        let initial = *activity.borrow_and_update();
+        let initial = activity.borrow_and_update().clone();
         if initial.bell_count > 0 {
             record_terminal_bells(&shared, terminal.id(), initial.bell_count).await;
         }
+        let mut program_status_count = 0;
+        record_program_status(&terminal, &shared, &mut program_status_count, initial).await;
         loop {
             tokio::select! {
                 biased;
@@ -2232,8 +2299,9 @@ fn watch_terminal(
                     if changed.is_err() {
                         return;
                     }
-                    let update = *activity.borrow_and_update();
+                    let update = activity.borrow_and_update().clone();
                     record_terminal_bells(&shared, terminal.id(), update.bell_count).await;
+                    record_program_status(&terminal, &shared, &mut program_status_count, update).await;
                 }
                 changed = lifecycle.changed() => {
                     if changed.is_err() {
@@ -2241,7 +2309,7 @@ fn watch_terminal(
                     }
                     if matches!(*lifecycle.borrow(), TerminalLifecycle::Exited { .. }) {
                         if activity.has_changed().unwrap_or(false) {
-                            let update = *activity.borrow_and_update();
+                            let update = activity.borrow_and_update().clone();
                             record_terminal_bells(&shared, terminal.id(), update.bell_count).await;
                         }
                         break;
@@ -2251,6 +2319,29 @@ fn watch_terminal(
         }
         let _ = exited.send(terminal.id());
     });
+}
+
+async fn record_program_status(
+    terminal: &TerminalHandle,
+    shared: &Shared,
+    seen_count: &mut u64,
+    activity: TerminalActivity,
+) {
+    let unseen = usize::try_from(activity.program_status_count - *seen_count)
+        .unwrap_or(usize::MAX)
+        .min(activity.program_statuses.len());
+    *seen_count = activity.program_status_count;
+    if unseen == 0 {
+        return;
+    }
+    let unseen = &activity.program_statuses[activity.program_statuses.len() - unseen..];
+    let foreground_pid = terminal.foreground_process_id().await.ok();
+    let mut state = shared.lock().await;
+    for status in unseen {
+        if let Err(error) = state.report_program_status(terminal.id(), status, foreground_pid) {
+            tracing::debug!(message = %error.message, terminal_id = %terminal.id(), "apply program status");
+        }
+    }
 }
 
 async fn record_terminal_bells(shared: &Shared, terminal_id: TerminalId, bell_count: u64) {
@@ -7814,6 +7905,7 @@ mod tests {
                 resources,
                 runtimes: HashMap::new(),
                 automatic_agent_owners: HashMap::new(),
+                program_status_terminals: HashSet::new(),
                 presence: ClientPresence::default(),
                 expected_finalizations: HashSet::new(),
                 exited_terminals: VecDeque::new(),
@@ -8617,6 +8709,7 @@ scope = "workspace"
             resources: ResourceTree::default(),
             runtimes: HashMap::new(),
             automatic_agent_owners: HashMap::new(),
+            program_status_terminals: HashSet::new(),
             presence: ClientPresence::default(),
             expected_finalizations: HashSet::new(),
             exited_terminals: VecDeque::new(),

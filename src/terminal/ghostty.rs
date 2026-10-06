@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io::Write,
     sync::{
         Arc, Mutex,
@@ -25,7 +25,10 @@ use libghostty_vt::{
 };
 use uuid::Uuid;
 
-use super::{DEFAULT_CELL_PIXEL_HEIGHT, DEFAULT_CELL_PIXEL_WIDTH};
+use super::{
+    DEFAULT_CELL_PIXEL_HEIGHT, DEFAULT_CELL_PIXEL_WIDTH,
+    program_status::{self, ProgramState, ProgramStatus},
+};
 use crate::domain::{
     Cell, CellColor, CellStyle, ClientId, CopyModeAction, CopyModeError, CopyModeMovement, Cursor,
     CursorShape, KittyGraphics, KittyImage, KittyPlacement, MAX_COPY_BYTES, MAX_COPY_CELLS,
@@ -145,6 +148,9 @@ enum SearchBoundary {
     Before(PointCoordinate),
 }
 
+/// Root-record reports retained between activity publications.
+pub(super) const RECENT_PROGRAM_STATUSES: usize = 16;
+
 /// The complete libghostty boundary. This value must never leave its runtime thread.
 pub(super) struct GhosttyTerminal {
     terminal: Terminal<'static, 'static>,
@@ -159,6 +165,10 @@ pub(super) struct GhosttyTerminal {
     kitty_png_cache: HashMap<u64, Vec<u8>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     bell_count: Arc<AtomicU64>,
+    program_status_scanner: program_status::Scanner,
+    /// Counts root-record reports so repeated identical reports stay visible.
+    program_status_count: u64,
+    recent_program_statuses: VecDeque<ProgramStatus>,
     size: TerminalSize,
     revision: u64,
     synchronized_output_started: Option<Instant>,
@@ -227,6 +237,9 @@ impl GhosttyTerminal {
             kitty_png_cache: HashMap::new(),
             writer,
             bell_count,
+            program_status_scanner: program_status::Scanner::default(),
+            program_status_count: 0,
+            recent_program_statuses: VecDeque::new(),
             size,
             revision: 0,
             synchronized_output_started: None,
@@ -281,11 +294,53 @@ impl GhosttyTerminal {
     /// Parse-only half of `feed`, so a caller can push several PTY chunks
     /// through the parser and pay for one snapshot at the end of the batch.
     pub(super) fn vt_write(&mut self, bytes: &[u8]) {
-        self.terminal.vt_write(bytes);
+        let mut written = 0;
+        for (end, observation) in self.program_status_scanner.scan(bytes) {
+            match observation {
+                program_status::Observation::Report(status) => self.record_program_status(status),
+                program_status::Observation::FullReset => {
+                    self.record_program_status(ProgramStatus {
+                        state: ProgramState::Clear,
+                        app: None,
+                    });
+                }
+                program_status::Observation::Query { bel } => {
+                    // Reply before parsing what follows, so a program probing
+                    // with a trailing primary device attributes request sees
+                    // this answer first.
+                    self.terminal.vt_write(&bytes[written..end]);
+                    written = end;
+                    let reply: &[u8] = if bel {
+                        b"\x1b]7501;?\x07"
+                    } else {
+                        b"\x1b]7501;?\x1b\\"
+                    };
+                    if let Ok(mut writer) = self.writer.lock() {
+                        let _ = writer.write_all(reply);
+                        let _ = writer.flush();
+                    }
+                }
+            }
+        }
+        self.terminal.vt_write(&bytes[written..]);
+    }
+
+    fn record_program_status(&mut self, status: ProgramStatus) {
+        self.program_status_count += 1;
+        if self.recent_program_statuses.len() == RECENT_PROGRAM_STATUSES {
+            self.recent_program_statuses.pop_front();
+        }
+        self.recent_program_statuses.push_back(status);
     }
 
     pub(super) fn bell_count(&self) -> u64 {
         self.bell_count.load(Ordering::Relaxed)
+    }
+
+    /// The total root-record report count and the most recent reports, so a
+    /// reader that falls behind one parse batch still sees each transition.
+    pub(super) fn program_statuses(&self) -> (u64, &VecDeque<ProgramStatus>) {
+        (self.program_status_count, &self.recent_program_statuses)
     }
 
     /// Snapshot half of `feed`. Respects synchronized-output suppression the
@@ -2320,6 +2375,43 @@ mod tests {
             snapshot.cells[4..]
                 .iter()
                 .all(|cell| cell.hyperlink.is_none())
+        );
+    }
+
+    #[test]
+    fn answers_program_status_queries_before_later_device_attributes() {
+        let (mut terminal, output) = recording_terminal(10, 4);
+        terminal.vt_write(b"\x1b]7501;?\x1b\\\x1b[c");
+        let output = take_output(&output);
+        assert!(output.starts_with(b"\x1b]7501;?\x1b\\\x1b[?"), "{output:?}");
+    }
+
+    #[test]
+    fn records_program_status_without_rendering_it() {
+        let mut terminal = terminal(10, 1);
+        let snapshot = terminal
+            .feed(b"a\x1b]7501;state=working:app=cargo\x07b")
+            .unwrap()
+            .unwrap();
+        assert_eq!(&text(&snapshot)[..2], "ab");
+        let (count, statuses) = terminal.program_statuses();
+        assert_eq!(count, 1);
+        assert_eq!(
+            statuses.back(),
+            Some(&ProgramStatus {
+                state: ProgramState::Working,
+                app: Some("cargo".into()),
+            })
+        );
+        terminal.vt_write(b"\x1bc");
+        assert_eq!(terminal.program_statuses().0, 2);
+        assert_eq!(
+            terminal
+                .program_statuses()
+                .1
+                .back()
+                .map(|status| status.state),
+            Some(ProgramState::Clear)
         );
     }
 

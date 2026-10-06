@@ -1,6 +1,7 @@
 //! PTY process ownership and the isolated Ghostty virtual-terminal adapter.
 
 mod ghostty;
+mod program_status;
 mod runtime;
 
 /// Scrollback storage budget per terminal, in bytes (allocated as history grows).
@@ -26,6 +27,7 @@ const DEFAULT_CELL_PIXEL_HEIGHT: u16 = 18;
 pub(crate) use ghostty::{
     CopyModeOutcome, MouseInputOutcome, OutputCapture, OutputCaptureError, ViewportSnapshot,
 };
+pub use program_status::{ProgramState, ProgramStatus};
 pub(crate) use runtime::AttachmentConfiguration;
 pub use runtime::{
     CommandError, SpawnSpec, TerminalActivity, TerminalEvent, TerminalHandle, TerminalLifecycle,

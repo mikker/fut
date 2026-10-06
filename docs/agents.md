@@ -206,6 +206,29 @@ to list waiting terminals and `Ctrl-b Ctrl-b` to jump to the next one. Rendering
 terminal marks its current attention as read for every attached client and later CLI
 calls.
 
+## Program status (OSC 7501)
+
+Any program can report its own state by writing the
+[Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status)
+escape sequence to its terminal. No Fut CLI or socket is needed, so it also
+works over SSH and inside containers:
+
+```sh
+status() {
+  printf '\033]7501;state=%s:app=%s\033\\' "$1" "$2"
+}
+status working rsync
+rsync -a ~/Photos backup:/photos && status done rsync || status error rsync
+```
+
+Fut answers the `OSC 7501 ; ?` support query and applies root-record reports
+like lifecycle reports: `working`, `blocked`, and `idle` map directly, `done`
+and `error` become completion attention, and `clear` ends the reported
+activity. `app` becomes the integration `source`. Working, blocked, and idle
+reports belong to the foreground job and end when it exits; `done` and `error`
+remain until seen. Child records (reports with an `id`), `progress`, `kind`,
+and `msg` are accepted but not yet shown.
+
 ## Event stream
 
 Outside tools can subscribe to Fut's state changes instead of polling:
