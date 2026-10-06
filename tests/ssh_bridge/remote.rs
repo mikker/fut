@@ -32,7 +32,7 @@ for argument in "$@"; do
     remote_command="$argument"
 done
 case "$remote_command" in
-    'fut __stdio-bridge --start-if-missing')
+    *' --start-if-missing')
         exec "$FUT_BIN" --no-config --socket "$socket" __stdio-bridge --start-if-missing ;;
     *) exec "$FUT_BIN" --socket "$socket" __stdio-bridge ;;
 esac
@@ -41,6 +41,31 @@ esac
     .unwrap();
     fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
     bin
+}
+
+fn assert_ssh_arguments(root: &std::path::Path, host: &str, count: usize, start_if_missing: bool) {
+    let argv = fs::read_to_string(root.join("ssh-args")).unwrap();
+    let prefix = format!("-T\n--\n{host}\n");
+    let commands = argv
+        .strip_prefix(&prefix)
+        .unwrap_or_else(|| panic!("unexpected SSH arguments: {argv:?}"))
+        .split(&prefix)
+        .collect::<Vec<_>>();
+    assert_eq!(commands.len(), count, "{argv:?}");
+    for command in commands {
+        let command = command.trim_end_matches('\n');
+        assert!(command.starts_with("sh -c '"), "{command:?}");
+        assert!(command.contains("command -v fut"), "{command:?}");
+        assert!(command.contains("$HOME/.local/bin/fut"), "{command:?}");
+        assert!(command.contains("/usr/local/bin/fut"), "{command:?}");
+        assert!(command.contains("__stdio-bridge \"$@\""), "{command:?}");
+        if start_if_missing {
+            assert!(command.ends_with("' sh --start-if-missing"), "{command:?}");
+        } else {
+            assert!(command.ends_with("' sh"), "{command:?}");
+            assert!(!command.contains("--start-if-missing"), "{command:?}");
+        }
+    }
 }
 
 fn remote_env(
@@ -133,11 +158,7 @@ argv = ["./run"]
         );
         assert!(!root.path().join("must-not-be-created").exists());
     }
-    let argv = fs::read_to_string(root.path().join("ssh-args")).unwrap();
-    assert_eq!(
-        argv,
-        "-T\n--\nclonk\nfut __stdio-bridge --start-if-missing\n".repeat(4)
-    );
+    assert_ssh_arguments(root.path(), "clonk", 4, true);
     assert!(matches!(
         harness.control_command(ClientMessage::Ping).await,
         ServerMessage::Pong { .. }
@@ -380,10 +401,7 @@ async fn remote_attach_only_flag_and_local_config_never_start_a_missing_daemon()
         assert!(!output.contains('\x1b'), "{output}");
         assert!(!socket.exists());
     }
-    assert_eq!(
-        fs::read_to_string(root.path().join("ssh-args")).unwrap(),
-        "-T\n--\nclonk\nfut __stdio-bridge\n".repeat(2)
-    );
+    assert_ssh_arguments(root.path(), "clonk", 2, false);
     assert_ssh_reaped(root.path()).await;
     assert!(!root.path().join("must-not-be-created").exists());
 }
@@ -666,10 +684,7 @@ printf 'MACHINE_EXIT:%s\n' "$code"
         "{text}"
     );
     assert_ssh_reaped(root.path()).await;
-    assert_eq!(
-        fs::read_to_string(root.path().join("ssh-args")).unwrap(),
-        "-T\n--\nclonk\nfut __stdio-bridge\n"
-    );
+    assert_ssh_arguments(root.path(), "clonk", 1, false);
     let catalog = machine_catalog(root.path());
     assert_eq!(
         fs::metadata(&catalog).unwrap().permissions().mode() & 0o777,

@@ -365,6 +365,38 @@ pub(crate) fn configuration_command(
     managed_command(command)
 }
 
+/// SSH does not normally load interactive shell PATH configuration. Resolve the
+/// executable without sourcing noisy startup files into the protocol stream.
+/// Only fixed shell input is used; bridge flags are positional arguments to sh.
+fn remote_bridge_command(start_if_missing: bool) -> String {
+    let script = r#"fut=$(command -v fut 2>/dev/null)
+if [ -n "$fut" ]; then
+    exec "$fut" __stdio-bridge "$@"
+fi
+for candidate in \
+    "$HOME/.local/bin/fut" \
+    /opt/homebrew/bin/fut \
+    /usr/local/bin/fut \
+    /home/linuxbrew/.linuxbrew/bin/fut \
+    "$HOME/.nix-profile/bin/fut" \
+    "/etc/profiles/per-user/$USER/bin/fut" \
+    /nix/var/nix/profiles/default/bin/fut \
+    /run/current-system/sw/bin/fut; do
+    if [ -f "$candidate" ] && [ -x "$candidate" ]; then
+        exec "$candidate" __stdio-bridge "$@"
+    fi
+done
+printf "%s\n" "fut: remote executable not found on PATH or in common installation locations; install Fut on the remote host or add it to the noninteractive SSH PATH" >&2
+exit 127"#;
+    debug_assert!(!script.contains('\''));
+    let flag = if start_if_missing {
+        " --start-if-missing"
+    } else {
+        ""
+    };
+    format!("sh -c '{script}' sh{flag}")
+}
+
 fn ssh_command(destination: &str, start_if_missing: bool) -> Result<Command> {
     validate_destination(destination)?;
     let mut command = Command::new("ssh");
@@ -375,11 +407,7 @@ fn ssh_command(destination: &str, start_if_missing: bool) -> Result<Command> {
         "-T",
         "--",
         destination,
-        if start_if_missing {
-            "fut __stdio-bridge --start-if-missing"
-        } else {
-            "fut __stdio-bridge"
-        },
+        &remote_bridge_command(start_if_missing),
     ]);
     Ok(command)
 }
@@ -395,7 +423,7 @@ fn background_ssh_command(destination: &str) -> Result<Command> {
         "StrictHostKeyChecking=yes",
         "--",
         destination,
-        "fut __stdio-bridge",
+        &remote_bridge_command(false),
     ]);
     command.kill_on_drop(true);
     Ok(command)
@@ -427,12 +455,14 @@ mod tests {
 
     #[test]
     fn ssh_uses_direct_argv_and_a_fixed_remote_command() {
+        let start_command = remote_bridge_command(true);
+        let attach_command = remote_bridge_command(false);
         for host in ["work", "user@host", "user@[::1]", "host;echo"] {
             let command = ssh_command(host, true).unwrap();
             assert_eq!(command.as_std().get_program(), "ssh");
             assert_eq!(
                 command.as_std().get_args().collect::<Vec<_>>(),
-                ["-T", "--", host, "fut __stdio-bridge --start-if-missing"]
+                ["-T", "--", host, &start_command]
             );
             assert_eq!(
                 ssh_command(host, false)
@@ -440,7 +470,7 @@ mod tests {
                     .as_std()
                     .get_args()
                     .collect::<Vec<_>>(),
-                ["-T", "--", host, "fut __stdio-bridge"]
+                ["-T", "--", host, &attach_command]
             );
             let background = background_ssh_command(host).unwrap();
             assert_eq!(
@@ -453,7 +483,7 @@ mod tests {
                     "StrictHostKeyChecking=yes",
                     "--",
                     host,
-                    "fut __stdio-bridge",
+                    &attach_command,
                 ]
             );
         }
@@ -471,6 +501,59 @@ mod tests {
             assert!(ssh_command(invalid, true).is_err(), "{invalid:?}");
         }
         assert!(ssh_command("hôte", true).is_ok());
+    }
+
+    #[test]
+    fn remote_discovery_handles_restricted_path_and_preserves_bridge_flags() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        // Spaces and shell metacharacters must remain part of the executable path.
+        let home = root.path().join("remote home; $literal");
+        let local_bin = home.join(".local/bin");
+        let path_bin = root.path().join("path-bin");
+        std::fs::create_dir_all(&local_bin).unwrap();
+        std::fs::create_dir_all(&path_bin).unwrap();
+        for (bin, label) in [(&local_bin, "fallback"), (&path_bin, "path")] {
+            let executable = bin.join("fut");
+            std::fs::write(
+                &executable,
+                format!("#!/bin/sh\nprintf '%s\\n' {label} \"$@\"\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        for on_path in [false, true] {
+            for start_if_missing in [false, true] {
+                let path = if on_path {
+                    format!("{}:/usr/bin:/bin", path_bin.display())
+                } else {
+                    "/usr/bin:/bin".to_owned()
+                };
+                let output = std::process::Command::new("/bin/sh")
+                    .args(["-c", &remote_bridge_command(start_if_missing)])
+                    .env_clear()
+                    .env("HOME", &home)
+                    .env("PATH", path)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(output.stderr.is_empty());
+                let label = if on_path { "path" } else { "fallback" };
+                let flag = if start_if_missing {
+                    "--start-if-missing\n"
+                } else {
+                    ""
+                };
+                assert_eq!(
+                    String::from_utf8(output.stdout).unwrap(),
+                    format!("{label}\n__stdio-bridge\n{flag}")
+                );
+            }
+        }
     }
 
     #[test]

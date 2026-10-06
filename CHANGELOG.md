@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.32
+
+- Find remote Fut installations even when SSH's noninteractive PATH omits common install directories.
+
 ## 0.31
 
 - Upgrade standalone installations with `fut upgrade`, or check for updates with `fut upgrade --check`.
