@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Make agents sidebar rows configurable with an agents `row`, `agent.*` tokens, and the agent's workspace, tab, and pane extension tokens. Rows without one keep their built-in line, and an overflowing agents list now shows the overflow marker like workspaces.
+
 ## 0.34
 
 - Accept Ctrl-Space as a configurable prefix, binding, or hotkey.

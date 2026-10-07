@@ -1245,6 +1245,17 @@ impl Default for SidebarRowConfig {
     }
 }
 
+/// A configured agent row. Its lanes start empty; without one, agent rows keep
+/// their built-in single-line layout.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(super) struct AgentRowConfig {
+    pub left: Vec<SegmentConfig>,
+    pub body: Vec<SegmentConfig>,
+    pub right: Vec<SegmentConfig>,
+    pub detail: Vec<SegmentConfig>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SidebarSlotConfig {
     pub width: u16,
@@ -1296,6 +1307,7 @@ fn default_right_sidebar() -> SidebarSlotConfig {
         components: vec![SidebarComponentConfig::Agents {
             size: SidebarComponentSize::Fill,
             scope: AgentScope::Session,
+            row: None,
         }],
     }
 }
@@ -1415,6 +1427,8 @@ pub(super) enum SidebarComponentConfig {
         size: SidebarComponentSize,
         #[serde(default)]
         scope: AgentScope,
+        #[serde(default)]
+        row: Option<AgentRowConfig>,
     },
 }
 
@@ -2797,23 +2811,29 @@ fn validate(ui: &UiConfig, extensions: &[Extension]) -> Result<()> {
     )?;
     for (side, sidebar) in [("left", &ui.sidebar.left), ("right", &ui.sidebar.right)] {
         for (index, component) in sidebar.components.iter().enumerate() {
-            let SidebarComponentConfig::Workspaces {
-                header,
-                footer,
-                row,
-                ..
-            } = component
-            else {
-                continue;
+            let lanes = match component {
+                SidebarComponentConfig::Workspaces {
+                    header,
+                    footer,
+                    row,
+                    ..
+                } => vec![
+                    ("header", header, TokenScope::Sidebar),
+                    ("footer", footer, TokenScope::Sidebar),
+                    ("row.left", &row.left, TokenScope::Workspace),
+                    ("row.body", &row.body, TokenScope::Workspace),
+                    ("row.right", &row.right, TokenScope::Workspace),
+                    ("row.detail", &row.detail, TokenScope::Workspace),
+                ],
+                SidebarComponentConfig::Agents { row: None, .. } => continue,
+                SidebarComponentConfig::Agents { row: Some(row), .. } => vec![
+                    ("row.left", &row.left, TokenScope::Agent),
+                    ("row.body", &row.body, TokenScope::Agent),
+                    ("row.right", &row.right, TokenScope::Agent),
+                    ("row.detail", &row.detail, TokenScope::Agent),
+                ],
             };
-            for (name, segments, scope) in [
-                ("header", header, TokenScope::Sidebar),
-                ("footer", footer, TokenScope::Sidebar),
-                ("row.left", &row.left, TokenScope::Workspace),
-                ("row.body", &row.body, TokenScope::Workspace),
-                ("row.right", &row.right, TokenScope::Workspace),
-                ("row.detail", &row.detail, TokenScope::Workspace),
-            ] {
+            for (name, segments, scope) in lanes {
                 validate_segments(
                     &format!("ui.sidebar.{side}.components[{index}].{name}"),
                     segments,
@@ -2834,6 +2854,7 @@ enum TokenScope {
     Tab,
     Workspace,
     Sidebar,
+    Agent,
 }
 
 fn validate_segments(
@@ -2917,6 +2938,16 @@ fn token_allowed(scope: TokenScope, token: &str, extensions: &[Extension]) -> bo
                 | "sidebar.status"
                 | "sidebar.visibility"
         ),
+        TokenScope::Agent => matches!(
+            token,
+            "agent.source"
+                | "agent.status"
+                | "agent.activity"
+                | "agent.location"
+                | "agent.session"
+                | "agent.workspace"
+                | "agent.tab"
+        ),
     };
     builtin || extension_token_allowed(scope, token, extensions)
 }
@@ -2932,6 +2963,12 @@ fn extension_token_allowed(scope: TokenScope, token: &str, extensions: &[Extensi
             TokenScope::Workspace => {
                 declaration.scope() == extensions::PresentationScope::Workspace
             }
+            TokenScope::Agent => matches!(
+                declaration.scope(),
+                extensions::PresentationScope::Workspace
+                    | extensions::PresentationScope::Tab
+                    | extensions::PresentationScope::Pane
+            ),
         })
 }
 
@@ -3208,6 +3245,7 @@ recipe_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde
             [SidebarComponentConfig::Agents {
                 size: SidebarComponentSize::Fill,
                 scope: AgentScope::Session,
+                ..
             }]
         ));
 
@@ -3227,6 +3265,39 @@ recipe_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde
                 ..
             }]
         ));
+    }
+
+    #[test]
+    fn agent_rows_accept_only_agent_tokens_and_leave_unset_lanes_empty() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[ui.sidebar.right]
+components = [{ component = "agents", row = { detail = [{ token = "agent.status" }, { token = "agent.tab", prefix = " " }] } }]
+"#,
+        )
+        .unwrap();
+        let config = load_path(&path, true).unwrap();
+        let SidebarComponentConfig::Agents { row: Some(row), .. } =
+            &config.sidebar.right.components[0]
+        else {
+            panic!("expected an agents component with a row");
+        };
+        assert!(row.left.is_empty() && row.body.is_empty() && row.right.is_empty());
+        assert_eq!(row.detail.len(), 2);
+
+        for config in [
+            r#"[ui.sidebar.right]
+components = [{ component = "agents", row = { body = [{ token = "workspace.name" }] } }]"#,
+            r#"[ui.sidebar.left]
+components = [{ component = "workspaces", row = { body = [{ token = "agent.source" }] } }]"#,
+        ] {
+            fs::write(&path, config).unwrap();
+            let error = format!("{:#}", load_path(&path, true).unwrap_err());
+            assert!(error.contains("unknown or out-of-scope token"), "{error}");
+        }
     }
 
     #[test]

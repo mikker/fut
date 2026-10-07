@@ -99,6 +99,26 @@ Current, closing, and keyboard-selected styles compose over each workspace row.
 
 The daemon resolves Git tokens with bounded background `git` processes and refreshes each workspace at most every five seconds. Each Git command has a two-second timeout. Branch, insertion, and deletion values enter the authoritative resource snapshot together in at most one revision and only when changed, so every attached client sees the same status. They never block rendering and all three stay empty for non-Git roots, errors, timeouts, or a repository that disappears.
 
+## Agent-row tokens
+
+These may appear in the `row.left`, `body`, `right`, or `detail` fields of a `component = "agents"` entry.
+
+<div class="wide-table" markdown="1">
+
+| Token | Value |
+| --- | --- |
+| `agent.source` | Integration that reported the agent, such as `claude-code` |
+| `agent.status` | `idle`, `working`, `blocked`, or `completed`, styled `muted`, `activity`, `error`, or `added` |
+| `agent.activity` | Spinner while working, `!` when blocked, or `•` for an unread completion, in the status style; empty when idle |
+| `agent.location` | Workspace name, prefixed by the session when a `global` list spans several sessions |
+| `agent.session` | Session name |
+| `agent.workspace` | Workspace name |
+| `agent.tab` | Tab name |
+
+</div>
+
+Agent rows also resolve declared workspace-, tab-, and pane-scoped extension tokens for the agent's own workspace, tab, and pane, so an extension can publish per-agent details such as a model name to its pane. Current and keyboard-selected styles compose over each agent row.
+
 ## Sidebar header and footer tokens
 
 These may appear in the `header` and `footer` fields of a `component = "workspaces"` entry under either sidebar side:
