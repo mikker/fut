@@ -99,6 +99,26 @@ Current, closing, and keyboard-selected styles compose over each workspace row.
 
 The daemon resolves Git tokens with bounded background `git` processes and refreshes each workspace at most every five seconds. Each Git command has a two-second timeout. Branch, insertion, and deletion values enter the authoritative resource snapshot together in at most one revision and only when changed, so every attached client sees the same status. They never block rendering and all three stay empty for non-Git roots, errors, timeouts, or a repository that disappears.
 
+## Agent-row tokens
+
+These may appear in the `row.left`, `body`, `right`, or `detail` fields of a `component = "agents"` entry.
+
+<div class="wide-table" markdown="1">
+
+| Token | Value |
+| --- | --- |
+| `agent.source` | Integration that reported the agent, such as `claude-code` |
+| `agent.status` | `idle`, `working`, `attention`, `blocked`, or `completed`, styled `muted`, `activity`, `attention`, `error`, or `added` |
+| `agent.activity` | Spinner for working, `!` for blocked or BEL, or `•` for completion, in the status style; empty when idle |
+| `agent.location` | Workspace name, prefixed by the session only in a `global` list spanning several sessions and followed by the tab only when the workspace has several tabs |
+| `agent.session` | Session name |
+| `agent.workspace` | Workspace name |
+| `agent.tab` | Tab name |
+
+</div>
+
+Current and keyboard-selected styles compose over each agent row; the current agent's `body` is drawn as a pill when the icon preset has pill caps.
+
 ## Sidebar header and footer tokens
 
 These may appear in the `header` and `footer` fields of a `component = "workspaces"` entry under either sidebar side:

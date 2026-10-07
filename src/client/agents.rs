@@ -26,6 +26,8 @@ pub(super) struct AgentItem {
     pub session: String,
     pub workspace: String,
     pub tab: String,
+    /// The workspace, qualified by session or tab only where those disambiguate.
+    pub location: String,
     pub source: String,
     pub current: bool,
     pub indicator: Option<ActivityIndicator>,
@@ -118,6 +120,13 @@ pub(super) fn items(
     scope: AgentScope,
 ) -> Vec<AgentItem> {
     let focused_ancestry = focused_ancestry(snapshot, focused);
+    let qualify_session = matches!(scope, AgentScope::Global)
+        && snapshot
+            .sessions
+            .iter()
+            .filter(|session| !session.closing)
+            .count()
+            > 1;
     snapshot
         .pane_paths()
         .filter(|path| in_scope(*path, focused_ancestry, scope))
@@ -131,6 +140,7 @@ pub(super) fn items(
             session: sanitize(&path.session.name),
             workspace: sanitize(&path.workspace.name),
             tab: sanitize(&path.tab.name),
+            location: location(path, qualify_session),
             source: sanitize(
                 path.pane
                     .activity
@@ -154,6 +164,25 @@ pub(super) fn has_items(
     snapshot
         .pane_paths()
         .any(|path| in_scope(path, focused_ancestry, scope))
+}
+
+fn location(path: PanePathRef<'_>, qualify_session: bool) -> String {
+    let qualify_tab = path
+        .workspace
+        .tabs
+        .iter()
+        .filter(|tab| !tab.closing)
+        .count()
+        > 1;
+    [
+        qualify_session.then(|| sanitize(&path.session.name)),
+        Some(sanitize(&path.workspace.name)),
+        qualify_tab.then(|| sanitize(&path.tab.name)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("/")
 }
 
 fn focused_ancestry(snapshot: &ResourceSnapshot, focused: &SelectedTarget) -> FocusedAncestry {

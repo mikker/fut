@@ -402,7 +402,8 @@
       "properties": {
         "component": { "enum": ["agents"] },
         "size": { "$ref": "#/definitions/componentSize" },
-        "scope": { "enum": ["tab", "workspace", "session", "global"], "default": "session" }
+        "scope": { "enum": ["tab", "workspace", "session", "global"], "default": "session" },
+        "row": { "$ref": "#/definitions/workspaceRow" }
       },
       "required": ["component"]
     },

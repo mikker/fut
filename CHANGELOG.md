@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Draw agents sidebar rows on two lines, with the current agent as a pill and a compact location, configurable through an agents `row` and new `agent.*` tokens.
+
 ## 0.34
 
 - Accept Ctrl-Space as a configurable prefix, binding, or hotkey.
