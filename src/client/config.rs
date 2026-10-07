@@ -1924,9 +1924,29 @@ pub(crate) fn load_terminal_location(
     let Some(source) = read_config_source(path, location.explicit)? else {
         return Ok(crate::terminal::TerminalConfig::default());
     };
-    let config: TerminalSettings = toml::from_str(&source)
+    let mut config: TerminalSettings = toml::from_str(&source)
         .with_context(|| format!("parse terminal config from {}", path.display()))?;
+    let home = env::var_os("HOME").map(PathBuf::from);
+    validate_terminal(&mut config.terminal, home.as_deref())?;
     Ok(config.terminal)
+}
+
+/// The shell is executed directly, so it must name one unambiguous program.
+fn validate_terminal(
+    terminal: &mut crate::terminal::TerminalConfig,
+    home: Option<&Path>,
+) -> Result<()> {
+    let Some(shell) = &mut terminal.shell else {
+        return Ok(());
+    };
+    *shell = expand_home_path(shell, home, "terminal shell")?;
+    if !shell.is_absolute() {
+        bail!(
+            "terminal.shell must be an absolute path or begin with ~/, got {}",
+            shell.display()
+        );
+    }
+    Ok(())
 }
 
 /// Load the durable project catalog without making control commands depend on
@@ -2099,6 +2119,8 @@ fn materialize_config(
     source: Option<&Path>,
 ) -> Result<UiConfig> {
     config.ui.alerts = config.alerts;
+    let home = env::var_os("HOME").map(PathBuf::from);
+    validate_terminal(&mut config.terminal, home.as_deref())?;
     config.ui.terminal = config.terminal;
     let prefix = parse_key(&config.ui.prefix)
         .map(|(bytes, _)| bytes)
@@ -2108,7 +2130,6 @@ fn materialize_config(
         .ui
         .bindings
         .set_hotkeys(std::mem::take(&mut config.ui.hotkeys));
-    let home = env::var_os("HOME").map(PathBuf::from);
     for command in config.trusted_commands.values_mut() {
         command.program =
             expand_home_path(&command.program, home.as_deref(), "trusted command program")?;
@@ -3035,6 +3056,56 @@ mod tests {
             })
             .unwrap(),
             Default::default()
+        );
+    }
+
+    #[test]
+    fn terminal_shell_loads_for_client_and_daemon_and_expands_home() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("config.toml");
+        let location = ConfigLocation {
+            path: Some(path.clone()),
+            explicit: false,
+            source: "test",
+        };
+        assert_eq!(load_terminal_location(&location).unwrap().shell, None);
+
+        fs::write(&path, "[terminal]\nshell = \"/opt/homebrew/bin/fish\"\n").unwrap();
+        let expected = Some(PathBuf::from("/opt/homebrew/bin/fish"));
+        assert_eq!(load_terminal_location(&location).unwrap().shell, expected);
+        let staged = stage_location(&location).unwrap();
+        let ui =
+            materialize_config(staged.config, Vec::new(), Default::default(), Some(&path)).unwrap();
+        assert_eq!(ui.terminal.shell, expected);
+
+        let mut terminal = crate::terminal::TerminalConfig {
+            shell: Some("~/bin/zsh".into()),
+            ..Default::default()
+        };
+        validate_terminal(&mut terminal, Some(Path::new("/home/fut"))).unwrap();
+        assert_eq!(terminal.shell, Some(PathBuf::from("/home/fut/bin/zsh")));
+
+        for invalid in ["zsh", "bin/zsh", "~user/zsh"] {
+            let mut terminal = crate::terminal::TerminalConfig {
+                shell: Some(invalid.into()),
+                ..Default::default()
+            };
+            assert!(
+                validate_terminal(&mut terminal, Some(Path::new("/home/fut"))).is_err(),
+                "{invalid} should be rejected"
+            );
+        }
+        fs::write(&path, "[terminal]\nshell = \"zsh\"\n").unwrap();
+        assert!(load_terminal_location(&location).is_err());
+        assert!(
+            stage_location(&location)
+                .and_then(|staged| materialize_config(
+                    staged.config,
+                    Vec::new(),
+                    Default::default(),
+                    Some(&path)
+                ))
+                .is_err()
         );
     }
 
