@@ -248,7 +248,7 @@ width = 28
 display = "expanded"
 visibility = "automatic"
 components = [
-  { component = "agents", size = "fill", scope = "session", row = { left = [{ text = " " }], body = [{ token = "agent.source" }], right = [{ token = "agent.activity", prefix = " " }, { text = " " }], detail = [{ text = " " }, { token = "agent.status" }, { token = "agent.location", style = "muted", prefix = " · " }] } },
+  { component = "agents", size = "fill", scope = "session" },
 ]
 ```
 
@@ -327,7 +327,16 @@ Each `[trusted_commands.NAME]` table requires `title` and an executable `program
 
 ## Sidebars
 
-Agents is a read-only projection of terminals with an explicit agent integration. Its `scope` is `tab`, `workspace`, `session`, or `global`. Tab, workspace, and session filters use fresh live focus ancestry when available and otherwise fall back to the selected IDs; global needs no focus anchor. Rows under any closing session, workspace, tab, or pane are omitted; screen detection alone does not add a row. Each row shows the agent's source on its first line and its idle, working, blocked, or daemon-wide unread-completed status with a compact location on a second, using the same `left`/`body`/`right`/`detail` lanes and pill caps as workspace rows; an empty `detail` gives one-line rows. Enter navigates with the row's typed pane ID; `global` safely permits cross-session destinations. The separate Notifications dialog remains the unread-attention surface.
+Agents is a read-only projection of terminals with an explicit agent integration. Its `scope` is `tab`, `workspace`, `session`, or `global`. Tab, workspace, and session filters use fresh live focus ancestry when available and otherwise fall back to the selected IDs; global needs no focus anchor. Rows under any closing session, workspace, tab, or pane are omitted; screen detection alone does not add a row. Rows show idle, working, blocked, and daemon-wide unread-completed activity plus session/workspace/tab context. Enter navigates with the row's typed pane ID; `global` safely permits cross-session destinations. The separate Notifications dialog remains the unread-attention surface.
+
+Without a `row`, each agent keeps the built-in single line above. An agents `row` replaces it with the same `left`, `body`, `right`, and `detail` lanes as workspace rows, using [agent-row tokens](tokens.md#agent-row-tokens); lanes it leaves out are empty, and a non-empty `detail` makes each row two lines. The current agent's `body` is drawn as a pill when the icon preset has pill caps. This puts the source on one line and the status and workspace on a second:
+
+```toml
+[ui.sidebar.right]
+components = [
+  { component = "agents", scope = "global", row = { left = [{ text = " " }], body = [{ token = "agent.source" }], right = [{ token = "agent.activity" }, { text = " " }], detail = [{ text = "  " }, { token = "agent.status" }, { token = "agent.location", style = "muted", prefix = " · " }] } },
+]
+```
 
 Each sidebar width is independently 4 through 80 cells and includes its one-cell inner divider. Each tagged built-in entry uses `component = "workspaces"` or `component = "agents"` and has either `size = "fill"` or a positive fixed row count; each side may contain at most one `fill` and at most one Workspaces component. Left-drag either visible divider to resize only that side. A docked drag preserves at least 40 terminal columns after accounting for the other docked side; an open drawer's divider is also draggable, while a hidden drawer is not. Dragged widths belong only to that attached client: they are not written to configuration, and both configured widths return on reattach or configuration reload. The active workspace is marked with a bullet.
 

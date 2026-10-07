@@ -1245,45 +1245,15 @@ impl Default for SidebarRowConfig {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+/// A configured agent row. Its lanes start empty; without one, agent rows keep
+/// their built-in single-line layout.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct AgentRowConfig {
     pub left: Vec<SegmentConfig>,
     pub body: Vec<SegmentConfig>,
     pub right: Vec<SegmentConfig>,
     pub detail: Vec<SegmentConfig>,
-}
-
-impl Default for AgentRowConfig {
-    fn default() -> Self {
-        Self {
-            left: vec![SegmentConfig::text(" ")],
-            body: vec![SegmentConfig::token("agent.source")],
-            right: vec![
-                SegmentConfig::token_with(
-                    "agent.activity",
-                    None,
-                    " ",
-                    "",
-                    None,
-                    TokenVisual::Plain,
-                ),
-                SegmentConfig::text(" "),
-            ],
-            detail: vec![
-                SegmentConfig::text(" "),
-                SegmentConfig::token("agent.status"),
-                SegmentConfig::token_with(
-                    "agent.location",
-                    Some(SemanticStyle::Muted),
-                    " · ",
-                    "",
-                    None,
-                    TokenVisual::Plain,
-                ),
-            ],
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1337,7 +1307,7 @@ fn default_right_sidebar() -> SidebarSlotConfig {
         components: vec![SidebarComponentConfig::Agents {
             size: SidebarComponentSize::Fill,
             scope: AgentScope::Session,
-            row: AgentRowConfig::default(),
+            row: None,
         }],
     }
 }
@@ -1458,7 +1428,7 @@ pub(super) enum SidebarComponentConfig {
         #[serde(default)]
         scope: AgentScope,
         #[serde(default)]
-        row: AgentRowConfig,
+        row: Option<AgentRowConfig>,
     },
 }
 
@@ -2855,7 +2825,8 @@ fn validate(ui: &UiConfig, extensions: &[Extension]) -> Result<()> {
                     ("row.right", &row.right, TokenScope::Workspace),
                     ("row.detail", &row.detail, TokenScope::Workspace),
                 ],
-                SidebarComponentConfig::Agents { row, .. } => vec![
+                SidebarComponentConfig::Agents { row: None, .. } => continue,
+                SidebarComponentConfig::Agents { row: Some(row), .. } => vec![
                     ("row.left", &row.left, TokenScope::Agent),
                     ("row.body", &row.body, TokenScope::Agent),
                     ("row.right", &row.right, TokenScope::Agent),
@@ -2992,7 +2963,12 @@ fn extension_token_allowed(scope: TokenScope, token: &str, extensions: &[Extensi
             TokenScope::Workspace => {
                 declaration.scope() == extensions::PresentationScope::Workspace
             }
-            TokenScope::Agent => false,
+            TokenScope::Agent => matches!(
+                declaration.scope(),
+                extensions::PresentationScope::Workspace
+                    | extensions::PresentationScope::Tab
+                    | extensions::PresentationScope::Pane
+            ),
         })
 }
 
@@ -3292,7 +3268,7 @@ recipe_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde
     }
 
     #[test]
-    fn agent_rows_accept_only_agent_tokens_and_keep_unset_lanes_default() {
+    fn agent_rows_accept_only_agent_tokens_and_leave_unset_lanes_empty() {
         let temporary = tempfile::tempdir().unwrap();
         let path = temporary.path().join("config.toml");
         fs::write(
@@ -3304,10 +3280,12 @@ components = [{ component = "agents", row = { detail = [{ token = "agent.status"
         )
         .unwrap();
         let config = load_path(&path, true).unwrap();
-        let SidebarComponentConfig::Agents { row, .. } = &config.sidebar.right.components[0] else {
-            panic!("expected an agents component");
+        let SidebarComponentConfig::Agents { row: Some(row), .. } =
+            &config.sidebar.right.components[0]
+        else {
+            panic!("expected an agents component with a row");
         };
-        assert_eq!(row.body, AgentRowConfig::default().body);
+        assert!(row.left.is_empty() && row.body.is_empty() && row.right.is_empty());
         assert_eq!(row.detail.len(), 2);
 
         for config in [

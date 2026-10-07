@@ -364,7 +364,6 @@ mod tests {
                 session: "fut".into(),
                 workspace: "agents-popup".into(),
                 tab: "node".into(),
-                location: "agents-popup".into(),
                 source: "codex".into(),
                 current: false,
                 indicator: Some(ActivityIndicator::Working),
