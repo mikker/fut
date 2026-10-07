@@ -8,6 +8,8 @@ use ratatui::{
     style::{Modifier, Style},
 };
 
+use super::chrome::truncate;
+
 /// Centered floating box, biased toward the upper third of the host.
 pub(super) fn dialog_area(host: Rect, max_width: u16, max_height: u16) -> Rect {
     let width = host.width.min(max_width);
@@ -70,6 +72,47 @@ pub(super) fn render_frame(area: Rect, buffer: &mut Buffer) -> Rect {
         }
     }
     inner
+}
+
+/// Restyle a frame drawn by [`render_frame`] and set `title` into its top
+/// border, leaving the content area untouched.
+pub(super) fn style_frame(
+    area: Rect,
+    title: &str,
+    border: Style,
+    title_style: Style,
+    buffer: &mut Buffer,
+) {
+    if frame_inner(area) == area {
+        return;
+    }
+    let right = area.x + area.width - 1;
+    let bottom = area.y + area.height - 1;
+    for x in area.x..=right {
+        for y in [area.y, bottom] {
+            if let Some(cell) = buffer.cell_mut((x, y)) {
+                cell.set_style(border);
+            }
+        }
+    }
+    for y in area.y..=bottom {
+        for x in [area.x, right] {
+            if let Some(cell) = buffer.cell_mut((x, y)) {
+                cell.set_style(border);
+            }
+        }
+    }
+    let available = usize::from(area.width.saturating_sub(4));
+    if available > 2 {
+        let title = truncate(title, available - 2);
+        buffer.set_stringn(
+            area.x + 2,
+            area.y,
+            format!(" {title} "),
+            available,
+            title_style,
+        );
+    }
 }
 
 /// Dim the cells peeking out below and to the right of the box so the

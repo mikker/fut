@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Render faint text from terminal programs dimmed instead of at full brightness.
+- Draw the rename prompt as a bordered dialog with its title in the border, a highlighted input field and key hints, using the configured `ui.styles` colors.
 
 ## 0.34
 

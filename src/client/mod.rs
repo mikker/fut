@@ -4115,7 +4115,7 @@ async fn run_loop(
                             cheatsheet::render(&ui.bindings, layout.terminal, frame.buffer_mut());
                         }
                         if let Some(rename) = rename.as_ref() {
-                            rename.render(layout.terminal, frame.buffer_mut());
+                            rename.render(layout.terminal, &ui.styles, frame.buffer_mut());
                         }
                         if let Some(copy_mode) = copy_mode.as_ref() {
                             copy_mode.render(layout.terminal, frame.buffer_mut());
