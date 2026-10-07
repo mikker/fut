@@ -2630,7 +2630,7 @@ fn validate(ui: &UiConfig, extensions: &[Extension]) -> Result<()> {
         }
         if ui.bindings.parse_suffix(value).is_none() {
             bail!(
-                "ui.bindings.{key} must be one character, prefix, ctrl-a through ctrl-z, space, enter, tab, esc, up, or down"
+                "ui.bindings.{key} must be one character, prefix, ctrl-a through ctrl-z, ctrl-space, space, enter, tab, esc, up, or down"
             );
         }
     }
@@ -2655,7 +2655,7 @@ fn validate(ui: &UiConfig, extensions: &[Extension]) -> Result<()> {
         }
         let Some((hotkey, _)) = parse_key(key) else {
             bail!(
-                "ui.hotkeys key {key:?} must be one character, ctrl-a through ctrl-z, space, enter, tab, esc, up, or down"
+                "ui.hotkeys key {key:?} must be one character, ctrl-a through ctrl-z, ctrl-space, space, enter, tab, esc, up, or down"
             );
         };
         if hotkey == ui.bindings.prefix {
@@ -3518,6 +3518,97 @@ components = [
             prefix.feed(vec![1]),
             PrefixAction::Dispatch(ClientAction::FocusNextNotification)
         );
+    }
+
+    #[test]
+    fn ctrl_space_prefix_matches_input_and_passes_through_nul() {
+        use crate::client::input::{PrefixAction, PrefixState, encode_key};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("config.toml");
+        fs::write(&path, "[ui]\nprefix = 'ctrl-space'\n").unwrap();
+        let config = load_path(&path, true).unwrap();
+        assert_eq!(config.bindings.prefix(), b"\0");
+        assert_eq!(config.bindings.prefix_label(), "Ctrl-Space");
+        assert_eq!(
+            config.bindings.label(ClientAction::OpenCommandBar),
+            "Ctrl-Space :"
+        );
+        assert_eq!(
+            config.bindings.label(ClientAction::FocusNextNotification),
+            "Ctrl-Space Ctrl-Space"
+        );
+        let mut prefix = PrefixState::new(config.bindings);
+        assert_eq!(prefix.feed(vec![0]), PrefixAction::Wait);
+        assert_eq!(
+            prefix.feed(vec![0]),
+            PrefixAction::Dispatch(ClientAction::FocusNextNotification)
+        );
+
+        fs::write(
+            &path,
+            "[ui]\nprefix = 'ctrl-space'\n[ui.bindings]\nfocus_next_notification = '.'\n",
+        )
+        .unwrap();
+        let mut prefix = PrefixState::new(load_path(&path, true).unwrap().bindings);
+        for event in [
+            KeyEvent::new(KeyCode::Char('\0'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL),
+        ] {
+            let bytes = encode_key(event).unwrap();
+            assert_eq!(bytes, vec![0]);
+            assert_eq!(prefix.feed(bytes.clone()), PrefixAction::Wait);
+            assert_eq!(
+                prefix.feed(b":".to_vec()),
+                PrefixAction::Dispatch(ClientAction::OpenCommandBar)
+            );
+            assert_eq!(prefix.feed(bytes.clone()), PrefixAction::Wait);
+            assert_eq!(prefix.feed(bytes.clone()), PrefixAction::Send(vec![0]));
+            assert_eq!(prefix.feed(bytes), PrefixAction::Wait);
+            assert_eq!(
+                prefix.feed(b"?".to_vec()),
+                PrefixAction::Send(b"\0?".to_vec())
+            );
+            assert_eq!(
+                prefix.feed(b" ".to_vec()),
+                PrefixAction::Send(b" ".to_vec())
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_space_is_supported_for_suffixes_and_hotkeys() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("config.toml");
+        fs::write(&path, "[ui.bindings]\nopen_command_bar = 'ctrl-space'\n").unwrap();
+        let config = load_path(&path, true).unwrap();
+        assert_eq!(
+            config.bindings.action_for_suffix(b"\0"),
+            Some(ClientAction::OpenCommandBar)
+        );
+        assert_eq!(
+            config.bindings.label(ClientAction::OpenCommandBar),
+            "Ctrl-b Ctrl-Space"
+        );
+
+        fs::write(&path, "[ui.hotkeys]\n'ctrl-space' = 'open_command_bar'\n").unwrap();
+        let config = load_path(&path, true).unwrap();
+        assert_eq!(
+            config.bindings.action_for_hotkey(b"\0"),
+            Some(ClientAction::OpenCommandBar)
+        );
+        assert_eq!(
+            config.bindings.label(ClientAction::OpenCommandBar),
+            "Ctrl-Space"
+        );
+
+        fs::write(
+            &path,
+            "[ui]\nprefix = 'ctrl-space'\n[ui.hotkeys]\n'ctrl-space' = 'open_command_bar'\n",
+        )
+        .unwrap();
+        assert!(load_path(&path, true).is_err());
     }
 
     #[test]

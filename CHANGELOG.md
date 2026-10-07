@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Accept Ctrl-Space as a configurable prefix, binding, or hotkey.
+
 ## 0.33
 
 - Show activity reported by any program through the OSC 7501 program status protocol, including over SSH.

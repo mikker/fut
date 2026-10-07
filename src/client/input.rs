@@ -232,6 +232,33 @@ mod tests {
     }
 
     #[test]
+    fn encodes_control_space_as_nul_for_legacy_and_enhanced_input() {
+        for (code, modifiers) in [
+            (KeyCode::Char('\0'), KeyModifiers::NONE),
+            (KeyCode::Char(' '), KeyModifiers::CONTROL),
+            (KeyCode::Char('@'), KeyModifiers::CONTROL),
+        ] {
+            let mut event = key(code, modifiers);
+            assert_eq!(encode_key(event), Some(vec![0]));
+            event.kind = KeyEventKind::Repeat;
+            assert_eq!(encode_key(event), Some(vec![0]));
+            event.kind = KeyEventKind::Release;
+            assert_eq!(encode_key(event), None);
+        }
+        assert_eq!(
+            encode_key(key(KeyCode::Char(' '), KeyModifiers::NONE)),
+            Some(vec![b' '])
+        );
+        assert_eq!(
+            encode_key(key(
+                KeyCode::Char(' '),
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            )),
+            Some(vec![0x1b, 0])
+        );
+    }
+
+    #[test]
     fn ignores_key_release() {
         let mut event = key(KeyCode::Char('x'), KeyModifiers::NONE);
         event.kind = KeyEventKind::Release;

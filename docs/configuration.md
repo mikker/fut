@@ -304,11 +304,17 @@ default bindings; configure the corresponding `rename_*` or `close_*` keys to
 add shortcuts. `kill-pane` remains bound through `close_pane` by default.
 
 A prefix, suffix, or hotkey may be one printable character, `ctrl-a` through
-`ctrl-z`, `space`, `enter`, `tab`, `esc`, `up`, or `down`. Suffixes also accept
-`prefix`, meaning the configured prefix key again. A hotkey cannot be the
-configured prefix or share a key with another hotkey. Pause after the prefix to
-see the effective bindings, or press prefix then `:` to search the command
-palette.
+`ctrl-z`, `ctrl-space`, `space`, `enter`, `tab`, `esc`, `up`, or `down`. Suffixes
+also accept `prefix`, meaning the configured prefix key again. A hotkey cannot
+be the configured prefix or share a key with another hotkey. Pause after the
+prefix to see the effective bindings, or press prefix then `:` to search the
+command palette.
+
+For a Ctrl-Space prefix, set `prefix = "ctrl-space"` under `[ui]`. Fut displays
+it as `Ctrl-Space`. By default, pressing the prefix twice focuses the next
+notification. To send the literal prefix to the pane instead, rebind
+`focus_next_notification` under `[ui.bindings]` (for example, to `"."`). With
+Ctrl-Space, pressing the prefix twice then sends a NUL byte (`0x00`).
 
 An `[extension_commands."EXTENSION:COMMAND"]` table can set `args` to replace
 the arguments supplied after that extension command's manifest executable.

@@ -743,6 +743,7 @@ pub(super) fn default_suffix(action: ClientAction) -> Option<&'static [u8]> {
 
 pub(super) fn parse_key(value: &str) -> Option<(Vec<u8>, String)> {
     let bytes = match value {
+        "ctrl-space" => vec![0],
         "space" => b" ".to_vec(),
         "enter" => b"\r".to_vec(),
         "tab" => b"\t".to_vec(),
@@ -767,6 +768,7 @@ pub(super) fn parse_key(value: &str) -> Option<(Vec<u8>, String)> {
 
 pub(super) fn suffix_name(suffix: &[u8]) -> String {
     match suffix {
+        [0] => "Ctrl-Space".into(),
         b" " => "Space".into(),
         b"\r" => "Enter".into(),
         b"\t" => "Tab".into(),
@@ -841,6 +843,25 @@ mod tests {
 
     use super::*;
     use crate::client::config::BindingsConfig;
+
+    #[test]
+    fn parses_and_names_control_space_and_letters() {
+        assert_eq!(
+            parse_key("ctrl-space"),
+            Some((vec![0], "Ctrl-Space".into()))
+        );
+        assert_eq!(suffix_name(b"\0"), "Ctrl-Space");
+        for letter in b'a'..=b'z' {
+            let name = format!("ctrl-{}", char::from(letter));
+            assert_eq!(
+                parse_key(&name),
+                Some((vec![letter - b'a' + 1], suffix_name(&[letter - b'a' + 1])))
+            );
+        }
+        for invalid in ["ctrl-", "ctrl-aa", "ctrl-spaces", "ctrl-1", "\0"] {
+            assert_eq!(parse_key(invalid), None);
+        }
+    }
 
     #[test]
     fn every_command_is_in_the_action_catalog() {
