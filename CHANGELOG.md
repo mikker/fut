@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Stop panes from flickering and receiving spurious resizes when switching focus between split panes of different sizes.
+
 ## 0.34
 
 - Accept Ctrl-Space as a configurable prefix, binding, or hotkey.
