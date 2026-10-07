@@ -180,7 +180,7 @@ Proven changes, in application order:
   Ghostty has no active selection. Selection and wide-cell behavior retain
   their original path.
 - Specialize the protocol representation: plain cells are strings; styled
-  cells are tuples whose two colors and four flags occupy one packed `u64`.
+  cells are tuples whose two colors and five flags occupy one packed `u64`.
   Keep that packed style word as the in-memory representation too. Protocol
   v14 pins the exact JSON and MessagePack shapes.
 - Extract ordinary cells from Ghostty's raw codepoint, reserving the string

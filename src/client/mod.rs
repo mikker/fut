@@ -7651,6 +7651,7 @@ fn style(source: CellStyle, selected: bool) -> Style {
         (source.italic(), Modifier::ITALIC),
         (source.underline(), Modifier::UNDERLINED),
         (source.inverse() ^ selected, Modifier::REVERSED),
+        (source.faint(), Modifier::DIM),
     ] {
         if enabled {
             target = target.add_modifier(modifier);
@@ -9823,6 +9824,21 @@ mod tests {
     }
 
     #[test]
+    fn style_conversion_dims_only_faint_cells() {
+        let faint = style(
+            CellStyle::new(None, None, false, false, false, false, true),
+            false,
+        );
+        assert_eq!(faint.add_modifier, Modifier::DIM);
+
+        let bold = style(
+            CellStyle::new(None, None, true, false, false, false, false),
+            false,
+        );
+        assert!(!bold.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
     fn style_conversion_preserves_indexed_rgb_and_modifiers() {
         let converted = style(
             CellStyle::new(
@@ -9836,13 +9852,18 @@ mod tests {
                 true,
                 true,
                 true,
+                true,
             ),
             false,
         );
         assert_eq!(converted.fg, Some(Color::Indexed(1)));
         assert_eq!(converted.bg, Some(Color::Rgb(4, 5, 6)));
         assert!(converted.add_modifier.contains(
-            Modifier::BOLD | Modifier::ITALIC | Modifier::UNDERLINED | Modifier::REVERSED
+            Modifier::BOLD
+                | Modifier::ITALIC
+                | Modifier::UNDERLINED
+                | Modifier::REVERSED
+                | Modifier::DIM
         ));
 
         assert_eq!(
@@ -9860,9 +9881,12 @@ mod tests {
                 .contains(Modifier::REVERSED)
         );
         assert!(
-            !style(CellStyle::new(None, None, false, false, false, true), true,)
-                .add_modifier
-                .contains(Modifier::REVERSED)
+            !style(
+                CellStyle::new(None, None, false, false, false, true, false),
+                true,
+            )
+            .add_modifier
+            .contains(Modifier::REVERSED)
         );
     }
 
