@@ -1112,7 +1112,6 @@ enum AttachmentUpdate {
 
 struct Attachment {
     owner: ClientId,
-    size: TerminalSize,
     panes: Vec<ObservedTarget>,
     focused: LeasedTarget,
     layout: SplitTree,
@@ -1132,7 +1131,6 @@ struct Attachment {
 
 struct AttachmentInit {
     owner: ClientId,
-    size: TerminalSize,
     panes: Vec<ObservedTarget>,
     focused: LeasedTarget,
     layout: SplitTree,
@@ -1156,7 +1154,6 @@ impl Attachment {
         let (update_sender, updates) = mpsc::channel(ATTACHMENT_UPDATE_CAPACITY);
         let mut attachment = Self {
             owner: init.owner,
-            size: init.size,
             panes: init.panes,
             focused: init.focused,
             layout: init.layout,
@@ -1195,7 +1192,6 @@ impl Attachment {
     }
 
     async fn resize_focused(&mut self, size: TerminalSize) -> Result<TerminalSize, CommandError> {
-        self.size = size;
         let configuration = self
             .focused
             .lease
@@ -1223,10 +1219,6 @@ impl Attachment {
             .terminal
             .configure_attachment(configuration)
             .await
-    }
-
-    fn size(&self) -> TerminalSize {
-        self.size
     }
 
     fn focused_viewport_state(&self) -> FocusedViewportState {
@@ -2845,19 +2837,21 @@ async fn handle_connection(
                 .await?;
                 return Ok(());
             }
-            let attachment = match lease_view(&shared, selector, None, client, size).await {
-                Ok(attachment) => attachment,
-                Err(error) => {
-                    send_error(
-                        &mut connection,
-                        first.request_id,
-                        error.code,
-                        &error.message,
-                    )
-                    .await?;
-                    return Ok(());
-                }
-            };
+            let attachment =
+                match lease_view(&shared, selector, None, client, LeaseSize::Requested(size)).await
+                {
+                    Ok(attachment) => attachment,
+                    Err(error) => {
+                        send_error(
+                            &mut connection,
+                            first.request_id,
+                            error.code,
+                            &error.message,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
             if let Err(error) = attachment.all_running() {
                 send_error(
                     &mut connection,
@@ -3320,7 +3314,6 @@ async fn handle_connection(
                             selector,
                             expected.as_ref(),
                             client,
-                            attachment.size(),
                         )
                         .await
                         {
@@ -3402,7 +3395,6 @@ async fn handle_connection(
                                 selector,
                                 None,
                                 client,
-                                attachment.size(),
                             ).await {
                                 Ok(candidate) => candidate,
                                 Err(error) => {
@@ -3844,7 +3836,7 @@ async fn handle_connection(
                                 Some(TargetSelector::Terminal(terminal_id)),
                                 None,
                                 client,
-                                attachment.size(),
+                                LeaseSize::Current,
                             ).await
                                 && candidate.all_running().is_ok()
                             {
@@ -4973,12 +4965,24 @@ async fn watched_presence_change(
     }
 }
 
+/// Geometry for the focused terminal's new lease.
+#[derive(Clone, Copy)]
+enum LeaseSize {
+    /// The size the client requested when it connected.
+    Requested(TerminalSize),
+    /// The terminal's current size, kept until the client reports the size
+    /// of the pane it now shows. Another pane's size would resize the PTY
+    /// twice when the panes differ: the program gets two SIGWINCHes and the
+    /// client may show one frame rendered at the wrong size.
+    Current,
+}
+
 async fn lease_view(
     shared: &Shared,
     selector: Option<TargetSelector>,
     expected: Option<&SelectionExpectation>,
     client: ClientId,
-    size: TerminalSize,
+    size: LeaseSize,
 ) -> Result<Attachment, DaemonError> {
     let state = shared.lock().await;
     if !state.accepting {
@@ -5006,6 +5010,10 @@ async fn lease_view(
             format!("terminal already exited with status {exit_code:?}"),
         ));
     }
+    let size = match size {
+        LeaseSize::Requested(size) => size,
+        LeaseSize::Current => focused_runtime.handle.subscribe_snapshots().borrow().size,
+    };
     let acquisition = focused_runtime
         .lease
         .acquire(client, size, Arc::clone(&focused_runtime.handle))
@@ -5041,7 +5049,6 @@ async fn lease_view(
     let mut attachment = Attachment::new(
         AttachmentInit {
             owner: client,
-            size,
             panes,
             focused: focused_target,
             layout,
@@ -5343,9 +5350,9 @@ async fn switch_candidate(
     selector: TargetSelector,
     expected: Option<&SelectionExpectation>,
     client: ClientId,
-    size: TerminalSize,
 ) -> Result<Attachment, DaemonError> {
-    let attachment = lease_view(shared, Some(selector), expected, client, size).await?;
+    let attachment =
+        lease_view(shared, Some(selector), expected, client, LeaseSize::Current).await?;
     attachment.all_running()?;
     Ok(attachment)
 }
@@ -7588,7 +7595,6 @@ mod tests {
         let attachment = Attachment::new(
             AttachmentInit {
                 owner,
-                size,
                 panes: vec![ObservedTarget {
                     selected: selected.clone(),
                     terminal: Arc::clone(&terminal),
@@ -7849,7 +7855,7 @@ mod tests {
             Some(TargetSelector::Pane(path.pane_id)),
             None,
             ClientId::new(),
-            size,
+            LeaseSize::Requested(size),
         )
         .await
         .unwrap();
@@ -7858,7 +7864,7 @@ mod tests {
             Some(TargetSelector::Pane(second_pane)),
             None,
             ClientId::new(),
-            size,
+            LeaseSize::Requested(size),
         )
         .await
         .unwrap();
@@ -7874,6 +7880,81 @@ mod tests {
         drop(state);
         drop(first_client);
         drop(second_client);
+        first_terminal.close().await.unwrap();
+        second_terminal.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn switching_panes_keeps_the_target_terminal_size() {
+        let (mut state, path) = inconsistent_state();
+        let second_pane = PaneId::new();
+        let second_terminal_id = TerminalId::new();
+        state
+            .resources
+            .split_pane(
+                path.pane_id,
+                SplitDirection::Right,
+                second_pane,
+                second_terminal_id,
+            )
+            .unwrap();
+        let spawn = |id, size| {
+            Arc::new(
+                spawn_terminal(SpawnSpec {
+                    terminal: crate::terminal::TerminalConfig::default(),
+                    id,
+                    program: "/bin/sh".into(),
+                    argv: vec!["-c".into(), "while :; do sleep 1; done".into()],
+                    cwd: "/".into(),
+                    env: HashMap::new(),
+                    size,
+                })
+                .unwrap(),
+            )
+        };
+        let tall = TerminalSize {
+            columns: 80,
+            rows: 24,
+        };
+        let short = TerminalSize {
+            columns: 80,
+            rows: 12,
+        };
+        let first_terminal = spawn(path.terminal_id, tall);
+        let second_terminal = spawn(second_terminal_id, short);
+        for (terminal_id, handle) in [
+            (path.terminal_id, &first_terminal),
+            (second_terminal_id, &second_terminal),
+        ] {
+            state.runtimes.insert(
+                terminal_id,
+                RuntimeEntry {
+                    handle: Arc::clone(handle),
+                    lease: AttachmentLease::default(),
+                },
+            );
+        }
+        let shared = Arc::new(Mutex::new(state));
+        let client = ClientId::new();
+        let attachment = lease_view(
+            &shared,
+            Some(TargetSelector::Pane(path.pane_id)),
+            None,
+            client,
+            LeaseSize::Requested(tall),
+        )
+        .await
+        .unwrap();
+
+        let candidate =
+            switch_candidate(&shared, TargetSelector::Pane(second_pane), None, client).await;
+        drop(attachment);
+        let candidate = candidate.unwrap();
+
+        // Queued behind any resize the switch requested.
+        second_terminal.refresh_snapshot().await.unwrap();
+        assert_eq!(second_terminal.subscribe_snapshots().borrow().size, short);
+        drop(candidate);
         first_terminal.close().await.unwrap();
         second_terminal.close().await.unwrap();
     }
@@ -8738,10 +8819,10 @@ scope = "workspace"
             Some(TargetSelector::Pane(path.pane_id)),
             None,
             ClientId::new(),
-            TerminalSize {
+            LeaseSize::Requested(TerminalSize {
                 columns: 80,
                 rows: 24,
-            },
+            }),
         )
         .await
         .unwrap();

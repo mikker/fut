@@ -4,6 +4,7 @@
 
 - Render faint text from terminal programs dimmed instead of at full brightness.
 - Draw the rename prompt in the same bordered dialog frame as the command palette and other dialogs.
+- Stop panes from flickering and receiving spurious resizes when switching focus between split panes of different sizes.
 
 ## 0.34
 
