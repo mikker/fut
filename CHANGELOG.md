@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.34
+
 - Accept Ctrl-Space as a configurable prefix, binding, or hotkey.
 
 ## 0.33
