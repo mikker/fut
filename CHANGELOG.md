@@ -7,6 +7,7 @@
 - Stop panes from flickering and receiving spurious resizes when switching focus between split panes of different sizes.
 - Show the close-pane confirmation over the pane it would close and dim the rest of the window.
 - Choose the shell new panes launch with `terminal.shell`, instead of always using `$SHELL`.
+- Draw agents sidebar rows on two lines, with the current agent as a pill and a compact location, configurable through an agents `row` and new `agent.*` tokens.
 
 ## 0.34
 
