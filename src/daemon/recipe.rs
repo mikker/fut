@@ -106,14 +106,20 @@ pub(super) async fn prepare_initial(
     extensions: &[crate::extensions::Extension],
     resolved: &ResolvedLocation,
     command_override: Option<(PathBuf, Vec<String>)>,
+    default_shell: &Path,
 ) -> Result<Option<PreparedRecipe>, DaemonError> {
     let project = recipe_project(catalog, None, resolved).await?;
     let Some(loaded) = load_project_recipe(&project, extensions)? else {
         return Ok(None);
     };
-    prepare_recipe(loaded, &resolved.workspace_root, command_override)
-        .await
-        .map(Some)
+    prepare_recipe(
+        loaded,
+        &resolved.workspace_root,
+        command_override,
+        default_shell,
+    )
+    .await
+    .map(Some)
 }
 
 pub(super) async fn create_initial(
@@ -129,7 +135,7 @@ pub(super) async fn create_initial(
         None,
         recipe,
     )?;
-    let terminals = match spawn_recipe_terminals(&plan, &state.child_env, state.terminal_config) {
+    let terminals = match spawn_recipe_terminals(&plan, &state.child_env, &state.terminal_config) {
         Ok(terminals) => terminals,
         Err((error, terminals)) => {
             close_spawned_terminals(terminals).await;
@@ -276,7 +282,15 @@ pub(super) async fn open_location(
         .await;
     };
     let command_override = program.clone().map(|program| (program, argv.clone()));
-    let recipe = match prepare_recipe(loaded, &resolved.workspace_root, command_override).await {
+    let default_shell = shared.lock().await.default_shell.clone();
+    let recipe = match prepare_recipe(
+        loaded,
+        &resolved.workspace_root,
+        command_override,
+        &default_shell,
+    )
+    .await
+    {
         Ok(recipe) => recipe,
         Err(error) => {
             let mut state = shared.lock().await;
@@ -328,7 +342,7 @@ pub(super) async fn open_location(
     let plan = plan_recipe_session(resources, mutations, replacing, &resolved, name, &recipe)?;
     let selected_path = plan.selected;
     let disposition = plan.disposition;
-    let terminals = match spawn_recipe_terminals(&plan, &state.child_env, state.terminal_config) {
+    let terminals = match spawn_recipe_terminals(&plan, &state.child_env, &state.terminal_config) {
         Ok(terminals) => terminals,
         Err((error, terminals)) => {
             drop(state);
@@ -496,6 +510,7 @@ async fn prepare_recipe(
     loaded: LoadedRecipe,
     workspace_root: &Path,
     command_override: Option<(PathBuf, Vec<String>)>,
+    default_shell: &Path,
 ) -> Result<PreparedRecipe, DaemonError> {
     let LoadedRecipe {
         source,
@@ -565,7 +580,7 @@ async fn prepare_recipe(
                         .map(|(name, value)| (name.clone(), value.clone())),
                 );
                 let (mut program, mut argv) = match pane.command() {
-                    None => default_shell_command(),
+                    None => (default_shell.to_path_buf(), Vec::new()),
                     Some(command) if pane.exec() => {
                         (PathBuf::from(&command[0]), command[1..].to_vec())
                     }
@@ -598,15 +613,6 @@ async fn prepare_recipe(
         workspaces,
         trusted_project_config,
     })
-}
-
-fn default_shell_command() -> (PathBuf, Vec<String>) {
-    (
-        std::env::var_os("SHELL")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/bin/sh")),
-        Vec::new(),
-    )
 }
 
 fn returning_shell_command(command: &[String]) -> (PathBuf, Vec<String>) {
@@ -810,7 +816,7 @@ fn plan_recipe_session(
 fn spawn_recipe_terminals(
     plan: &RecipeCreationPlan,
     child_env: &HashMap<std::ffi::OsString, std::ffi::OsString>,
-    terminal_config: crate::terminal::TerminalConfig,
+    terminal_config: &crate::terminal::TerminalConfig,
 ) -> RecipeSpawnResult {
     let mut terminals = Vec::with_capacity(plan.terminals.len());
     for terminal in &plan.terminals {
@@ -822,7 +828,7 @@ fn spawn_recipe_terminals(
                 .map(|(key, value)| (key.into(), value.into())),
         );
         let spec = SpawnSpec {
-            terminal: terminal_config,
+            terminal: terminal_config.clone(),
             id: terminal.path.terminal_id,
             program: terminal.program.clone(),
             argv: terminal.argv.clone(),
@@ -994,7 +1000,7 @@ auto_start = true
         let loaded = crate::project_definition::load(&project, &extensions)
             .unwrap()
             .unwrap();
-        let recipe = prepare_recipe(loaded, temporary.path(), None)
+        let recipe = prepare_recipe(loaded, temporary.path(), None, Path::new("/bin/sh"))
             .await
             .unwrap();
         assert_eq!(
@@ -1081,7 +1087,7 @@ panes = [{ command = ["pi"] }]
         let loaded = crate::project_definition::load(&project, &[])
             .unwrap()
             .unwrap();
-        let recipe = prepare_recipe(loaded, temporary.path(), None)
+        let recipe = prepare_recipe(loaded, temporary.path(), None, Path::new("/bin/sh"))
             .await
             .unwrap();
         let resolved = ProjectResolver::default()
@@ -1150,7 +1156,7 @@ panes = [{ command = ["pi"] }]
             replacing: None,
         };
         let (error, spawned) =
-            match spawn_recipe_terminals(&plan, &HashMap::new(), Default::default()) {
+            match spawn_recipe_terminals(&plan, &HashMap::new(), &Default::default()) {
                 Ok(_) => panic!("missing recipe command unexpectedly spawned"),
                 Err(failure) => failure,
             };

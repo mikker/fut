@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Choose the shell new panes launch with `terminal.shell`, instead of always using `$SHELL`.
+
 ## 0.34
 
 - Accept Ctrl-Space as a configurable prefix, binding, or hotkey.

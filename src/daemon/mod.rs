@@ -91,9 +91,7 @@ impl DaemonConfig {
         cwd: PathBuf,
         config_location: global_config::ConfigLocation,
     ) -> Self {
-        let program = std::env::var_os("SHELL")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/bin/sh"));
+        let program = default_shell(None);
         let env = shell_environment(&socket_path, std::env::vars_os());
         Self {
             socket_path,
@@ -113,6 +111,15 @@ impl DaemonConfig {
             },
         }
     }
+}
+
+/// Resolve the program for new shell panes: the configured `terminal.shell`,
+/// then the daemon's inherited `$SHELL`, then `/bin/sh`.
+fn default_shell(configured: Option<&Path>) -> PathBuf {
+    configured
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("SHELL").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("/bin/sh"))
 }
 
 fn shell_environment(
@@ -147,6 +154,7 @@ struct SharedState {
     agent_events: broadcast::Sender<AgentLifecycleUpdate>,
     child_env: HashMap<OsString, OsString>,
     terminal_config: crate::terminal::TerminalConfig,
+    default_shell: PathBuf,
     config_location: global_config::ConfigLocation,
     extension_registry: Arc<crate::extensions::ExtensionRegistry>,
     extension_catalog: watch::Sender<crate::protocol::ExtensionCatalog>,
@@ -1776,6 +1784,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     let loaded_extensions = global_config::load_extensions_location(&config_location)?;
     let projects = global_config::load_projects_location(&config_location)?;
     let terminal_config = global_config::load_terminal_location(&config_location)?;
+    let default_shell = default_shell(terminal_config.shell.as_deref());
     let extension_registry = Arc::new(crate::extensions::ExtensionRegistry::new(
         1,
         loaded_extensions.extensions,
@@ -1802,12 +1811,23 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
         extension_registry.extensions(),
         &resolved,
         command_override,
+        &default_shell,
     )
     .await?;
     let socket = bind_socket(&config.socket_path).await?;
     let mut initial_spawn = config.spawn;
     initial_spawn.cwd = resolved.cwd.clone();
-    initial_spawn.terminal = terminal_config;
+    initial_spawn.terminal = terminal_config.clone();
+    if !config.recipe_command_override {
+        initial_spawn.program = default_shell.clone();
+    }
+    // Like tmux's default-shell, export the configured shell so programs that
+    // spawn "the user's shell" (and recipe commands returning to one) agree.
+    if let Some(shell) = &terminal_config.shell {
+        initial_spawn
+            .env
+            .insert("SHELL".into(), shell.as_os_str().to_owned());
+    }
     let child_env = initial_spawn.env.clone();
     let (resource_changes, _) = watch::channel(0);
     let (alert_changes, _) = watch::channel(0);
@@ -1827,6 +1847,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
         agent_events,
         child_env,
         terminal_config,
+        default_shell,
         config_location,
         extension_registry,
         extension_catalog,
@@ -5381,11 +5402,10 @@ async fn open_location_without_recipe(
     program: Option<PathBuf>,
     argv: Vec<String>,
 ) -> Result<(SelectedTarget, OpenDisposition), DaemonError> {
-    let program = program.unwrap_or_else(|| {
-        std::env::var_os("SHELL")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| "/bin/sh".into())
-    });
+    let program = match program {
+        Some(program) => program,
+        None => shared.lock().await.default_shell.clone(),
+    };
     let (terminal, selected, disposition, insertion_error) = {
         let mut state = shared.lock().await;
         if !state.accepting {
@@ -5503,7 +5523,7 @@ async fn open_location_without_recipe(
         };
         let terminal = Arc::new(
             spawn_terminal(SpawnSpec {
-                terminal: state.terminal_config,
+                terminal: state.terminal_config.clone(),
                 id: spawn_target.terminal_id,
                 program,
                 argv,
@@ -5659,11 +5679,10 @@ async fn create_workspace(
     };
     let cwd = resolve_creation_cwd(&source_root, cwd, inherited_cwd).await?;
     let root = cwd.clone();
-    let program = program.unwrap_or_else(|| {
-        std::env::var_os("SHELL")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| "/bin/sh".into())
-    });
+    let program = match program {
+        Some(program) => program,
+        None => shared.lock().await.default_shell.clone(),
+    };
 
     let (terminal, creation) = {
         let mut state = shared.lock().await;
@@ -5716,7 +5735,7 @@ async fn create_workspace(
 
         let terminal = Arc::new(
             spawn_terminal(SpawnSpec {
-                terminal: state.terminal_config,
+                terminal: state.terminal_config.clone(),
                 id: proposed.terminal_id,
                 program,
                 argv,
@@ -5797,11 +5816,10 @@ async fn create_tab(
         state.resources.workspace_root(workspace_id)?.to_path_buf()
     };
     let cwd = resolve_creation_cwd(&root, cwd, inherited_cwd).await?;
-    let program = program.unwrap_or_else(|| {
-        std::env::var_os("SHELL")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| "/bin/sh".into())
-    });
+    let program = match program {
+        Some(program) => program,
+        None => shared.lock().await.default_shell.clone(),
+    };
 
     let (terminal, creation) = {
         let mut state = shared.lock().await;
@@ -5838,7 +5856,7 @@ async fn create_tab(
 
         let terminal = Arc::new(
             spawn_terminal(SpawnSpec {
-                terminal: state.terminal_config,
+                terminal: state.terminal_config.clone(),
                 id: proposed.terminal_id,
                 program,
                 argv,
@@ -5959,11 +5977,10 @@ async fn create_pane(
         (workspace_id, session_id, root, inherited_cwd)
     };
     let cwd = resolve_creation_cwd(&root, cwd, inherited_cwd).await?;
-    let program = program.unwrap_or_else(|| {
-        std::env::var_os("SHELL")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| "/bin/sh".into())
-    });
+    let program = match program {
+        Some(program) => program,
+        None => shared.lock().await.default_shell.clone(),
+    };
 
     let (terminal, creation) = {
         let mut state = shared.lock().await;
@@ -6007,7 +6024,7 @@ async fn create_pane(
 
         let terminal = Arc::new(
             spawn_terminal(SpawnSpec {
-                terminal: state.terminal_config,
+                terminal: state.terminal_config.clone(),
                 id: terminal_id,
                 program,
                 argv,
@@ -7915,6 +7932,7 @@ mod tests {
                 agent_events: broadcast::channel(AGENT_EVENT_CAPACITY).0,
                 child_env: HashMap::new(),
                 terminal_config: crate::terminal::TerminalConfig::default(),
+                default_shell: PathBuf::from("/bin/sh"),
                 config_location: global_config::ConfigLocation {
                     path: None,
                     explicit: false,
@@ -8719,6 +8737,7 @@ scope = "workspace"
             agent_events: broadcast::channel(AGENT_EVENT_CAPACITY).0,
             child_env: HashMap::new(),
             terminal_config: crate::terminal::TerminalConfig::default(),
+            default_shell: PathBuf::from("/bin/sh"),
             config_location: global_config::ConfigLocation {
                 path: None,
                 explicit: false,

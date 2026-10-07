@@ -2414,7 +2414,7 @@ async fn run_loop(
                                 let submission = form.submit();
                                 let host: Rect = terminal.size()?.into();
                                 match spawn_temporary_command(
-                                    ui.terminal,
+                                    ui.terminal.clone(),
                                     &submission.command,
                                     view.focused().child_pid,
                                     host,
@@ -5378,7 +5378,7 @@ async fn dispatch_presentation_token_action(
                 return Ok(None);
             }
             match spawn_temporary_command(
-                ui.terminal,
+                ui.terminal.clone(),
                 &command,
                 focused.child_pid,
                 host,
@@ -5511,7 +5511,7 @@ async fn dispatch_client_action(
                 return Ok(None);
             }
             match spawn_temporary_command(
-                ui.terminal,
+                ui.terminal.clone(),
                 &command,
                 view.focused().child_pid,
                 host,

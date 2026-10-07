@@ -13400,6 +13400,57 @@ async fn public_client_paste_is_mode_aware_focused_literal_and_not_a_fut_prefix(
 }
 
 #[tokio::test]
+async fn configured_terminal_shell_overrides_inherited_shell_for_new_panes() {
+    // An inherited $SHELL that cannot exist proves the configured shell wins.
+    let harness = Harness::start_configured(
+        "printf 'CONFIGURED_SHELL_READY\\r\\n'; while IFS= read -r line; do :; done",
+        |root| {
+            let bin = root.join("shells");
+            fs::create_dir_all(&bin).unwrap();
+            let shell = bin.join("fake-shell");
+            fs::write(
+                &shell,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$SHELL\" > '{}'\nexec sleep 60\n",
+                    root.join("shell-ran").display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&shell, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::create_dir_all(root.join("home/.config/fut")).unwrap();
+            fs::write(
+                root.join("home/.config/fut/config.toml"),
+                format!("[terminal]\nshell = {:?}\n", shell.display().to_string()),
+            )
+            .unwrap();
+        },
+        Some(std::path::Path::new("/definitely/missing/fut-shell")),
+        false,
+    )
+    .await;
+    let workspace = harness.resources().await.sessions[0].workspaces[0].clone();
+    let tab = harness
+        .cli()
+        .args(["tab", "new", &workspace.id.to_string()])
+        .output()
+        .unwrap();
+    assert!(
+        tab.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tab.stderr)
+    );
+    let marker = harness.root.path().join("shell-ran");
+    wait_for(DEADLINE, || marker.exists()).await;
+    let expected = harness.root.path().join("shells/fake-shell");
+    wait_for(DEADLINE, || {
+        fs::read_to_string(&marker)
+            .is_ok_and(|content| content.trim_end() == expected.display().to_string())
+    })
+    .await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn command_bar_create_failure_releases_input_to_the_original_terminal() {
     let harness = Harness::start_with_shell(
         "printf 'CREATE_FAILURE_READY\\r\\n'; while IFS= read -r line; do [ \"$line\" = after ] && printf 'CREATE_FAILURE_RECOVERED\\r\\n'; done",
