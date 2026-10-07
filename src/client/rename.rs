@@ -3,6 +3,7 @@ use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Modifier, Style},
+    text::{Line, Span},
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -10,10 +11,15 @@ use uuid::Uuid;
 
 use crate::{protocol::RenameSelector, resources::ResourceSnapshot};
 
-use super::chrome::{sanitize, truncate};
+use super::{
+    chrome::sanitize,
+    config::{SemanticStyle, StylesConfig},
+    dialog::{dialog_area, fill_row, render_frame, style_frame},
+};
 
 const MAX_NAME_BYTES: usize = 512;
 const MAX_WIDTH: u16 = 52;
+const HEIGHT: u16 = 6;
 
 pub(super) struct RenameState {
     selector: RenameSelector,
@@ -160,56 +166,71 @@ impl RenameState {
         true
     }
 
-    pub fn render(&self, host: Rect, buffer: &mut Buffer) {
-        let area = rename_area(host);
-        if area.width == 0 || area.height == 0 {
+    pub fn render(&self, host: Rect, styles: &StylesConfig, buffer: &mut Buffer) {
+        let outer = dialog_area(host, MAX_WIDTH, HEIGHT);
+        let area = render_frame(outer, buffer);
+        if area.width < 3 || area.height < 4 {
             return;
         }
-        clear(area, buffer);
-        let width = usize::from(area.width);
-        let title = truncate(&format!(" Rename {}", self.kind), width);
-        buffer.set_stringn(area.x, area.y, title, width, title_style());
-        if area.height >= 2 {
-            let available = width.saturating_sub(4);
-            let name = trailing_view(&sanitize(&self.name), available);
-            buffer.set_stringn(
-                area.x,
-                area.y + 1,
-                format!(" > {name}"),
-                width,
-                Style::default(),
-            );
-            let cursor_x = area
-                .x
-                .saturating_add(3)
-                .saturating_add(
-                    u16::try_from(UnicodeWidthStr::width(name.as_str())).unwrap_or(u16::MAX),
-                )
-                .min(area.x.saturating_add(area.width - 1));
-            if let Some(cell) = buffer.cell_mut((cursor_x, area.y + 1)) {
-                cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
-            }
+        let accent = styles.apply(SemanticStyle::Current, Style::default()).fg;
+        let title_style = Style {
+            fg: accent,
+            ..Style::default()
         }
-        if area.height >= 3 {
-            let status = if self.request_id.is_some() {
-                " renaming…"
-            } else if let Some(error) = self.error.as_deref() {
-                error
-            } else if self.name.trim().is_empty()
+        .add_modifier(Modifier::BOLD);
+        style_frame(
+            outer,
+            &format!("Rename {}", self.kind),
+            styles.apply(SemanticStyle::Divider, Style::default()),
+            title_style,
+            buffer,
+        );
+
+        let content = Rect::new(area.x + 1, area.y, area.width - 2, area.height);
+        let field = Rect::new(content.x, content.y + 1, content.width, 1);
+        let field_style = styles.apply(SemanticStyle::Selected, Style::default());
+        fill_row(field, field_style, buffer);
+        let width = usize::from(field.width);
+        let name = trailing_view(&sanitize(&self.name), width.saturating_sub(2));
+        buffer.set_stringn(field.x, field.y, format!(" {name}"), width, field_style);
+        let cursor_x = field
+            .x
+            .saturating_add(1)
+            .saturating_add(
+                u16::try_from(UnicodeWidthStr::width(name.as_str())).unwrap_or(u16::MAX),
+            )
+            .min(field.x.saturating_add(field.width - 1));
+        if let Some(cell) = buffer.cell_mut((cursor_x, field.y)) {
+            cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
+        }
+
+        let muted = styles.apply(SemanticStyle::Muted, Style::default());
+        let footer = if self.request_id.is_some() {
+            Line::from(Span::styled("renaming…", muted))
+        } else if let Some(error) = self.error.as_deref() {
+            Line::from(Span::styled(
+                error.trim().to_owned(),
+                styles.apply(SemanticStyle::Error, Style::default()),
+            ))
+        } else {
+            let action = if self.name.trim().is_empty()
                 && !matches!(self.selector, RenameSelector::Session(_))
             {
-                " enter clear name · esc cancel"
+                "clear name"
             } else {
-                " enter rename · esc cancel"
+                "rename"
             };
-            buffer.set_stringn(
-                area.x,
-                area.y + area.height - 1,
-                truncate(status, width),
-                width,
-                muted_style(),
-            );
-        }
+            let key = styles
+                .apply(SemanticStyle::Normal, Style::default())
+                .add_modifier(Modifier::BOLD);
+            Line::from(vec![
+                Span::styled("⏎", key),
+                Span::styled(format!(" {action}   "), muted),
+                Span::styled("esc", key),
+                Span::styled(" cancel", muted),
+            ])
+        };
+        buffer.set_line(content.x + 1, content.y + 3, &footer, content.width - 1);
     }
 
     fn append(&mut self, character: char) {
@@ -265,36 +286,6 @@ fn trailing_view(value: &str, width: usize) -> String {
     format!("…{}", suffix.concat())
 }
 
-fn rename_area(host: Rect) -> Rect {
-    let width = host.width.min(MAX_WIDTH);
-    let height = host.height.min(3);
-    Rect::new(
-        host.x.saturating_add(host.width.saturating_sub(width) / 2),
-        host.y
-            .saturating_add(host.height.saturating_sub(height) / 2),
-        width,
-        height,
-    )
-}
-
-fn clear(area: Rect, buffer: &mut Buffer) {
-    for row in area.y..area.y.saturating_add(area.height) {
-        for column in area.x..area.x.saturating_add(area.width) {
-            if let Some(cell) = buffer.cell_mut((column, row)) {
-                cell.reset();
-            }
-        }
-    }
-}
-
-fn title_style() -> Style {
-    Style::default().add_modifier(Modifier::BOLD)
-}
-
-fn muted_style() -> Style {
-    Style::default().add_modifier(Modifier::DIM)
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -307,6 +298,46 @@ mod tests {
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn render_titles_the_border_and_themes_the_field_and_hints() {
+        let rename = RenameState::open(
+            RenameSelector::Workspace(WorkspaceId::new()),
+            "workspace",
+            "main".into(),
+        );
+        let styles = StylesConfig::default();
+        let host = Rect::new(0, 0, 60, 20);
+        let mut buffer = Buffer::empty(host);
+        rename.render(host, &styles, &mut buffer);
+
+        let row = |y: u16| -> String {
+            (4..56)
+                .map(|x| buffer[(x, y)].symbol().to_owned())
+                .collect()
+        };
+        assert!(row(4).starts_with("╭─ Rename workspace ─") && row(4).ends_with("─╮"));
+        assert_eq!(
+            buffer[(4, 4)].fg,
+            styles
+                .apply(SemanticStyle::Divider, Style::default())
+                .fg
+                .unwrap()
+        );
+        assert!(buffer[(7, 4)].modifier.contains(Modifier::BOLD));
+        assert_eq!(row(5).trim_matches(['│', ' ']), "");
+        assert!(row(6).starts_with("│  main"));
+        let field = styles.apply(SemanticStyle::Selected, Style::default());
+        assert_eq!(buffer[(6, 6)].bg, field.bg.unwrap());
+        assert_eq!(buffer[(53, 6)].bg, field.bg.unwrap());
+        assert!(
+            buffer[(11, 6)].modifier.contains(Modifier::REVERSED),
+            "cursor"
+        );
+        assert!(row(8).starts_with("│  ⏎ rename   esc cancel"));
+        assert!(buffer[(7, 8)].modifier.contains(Modifier::BOLD));
+        assert!(row(9).starts_with("╰─") && row(9).ends_with("─╯"));
     }
 
     #[test]

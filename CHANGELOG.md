@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Draw the rename prompt as a bordered dialog with its title in the border, a highlighted input field and key hints, using the configured `ui.styles` colors.
+
 ## 0.34
 
 - Accept Ctrl-Space as a configurable prefix, binding, or hotkey.
