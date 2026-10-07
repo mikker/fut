@@ -1501,7 +1501,7 @@ impl GhosttyTerminal {
                 // `has_styling` is false exactly when the cell's style is
                 // default. Build Fut's zero-cost default directly instead of
                 // asking Ghostty to materialize its larger default style.
-                let (foreground, mut background, bold, italic, underline, inverse) =
+                let (foreground, mut background, bold, italic, underline, inverse, faint) =
                     if basic.has_styling {
                         let ghostty_style = cell.style()?;
                         (
@@ -1511,9 +1511,10 @@ impl GhosttyTerminal {
                             ghostty_style.italic,
                             ghostty_style.underline != Underline::None,
                             ghostty_style.inverse,
+                            ghostty_style.faint,
                         )
                     } else {
-                        (None, None, false, false, false, false)
+                        (None, None, false, false, false, false, false)
                     };
                 background = match content_tag {
                     CellContentTag::BgColorPalette => {
@@ -1524,8 +1525,9 @@ impl GhosttyTerminal {
                     }
                     _ => background,
                 };
-                let style =
-                    CellStyle::new(foreground, background, bold, italic, underline, inverse);
+                let style = CellStyle::new(
+                    foreground, background, bold, italic, underline, inverse, faint,
+                );
                 if let Some(widths) = &mut widths {
                     widths.push(raw_cell.wide()?);
                 }
@@ -2457,6 +2459,14 @@ mod tests {
     }
 
     #[test]
+    fn preserves_faint_text() {
+        let snapshot = terminal(4, 1).feed(b"\x1b[2mX\x1b[22mY").unwrap();
+        let snapshot = snapshot.unwrap();
+        assert!(snapshot.cells[0].style.faint());
+        assert!(!snapshot.cells[1].style.faint());
+    }
+
+    #[test]
     fn preserves_indexed_and_truecolor_styles() {
         let snapshot = terminal(4, 1)
             .feed(b"\x1b[1;3;4;31;48;5;120mX\x1b[38;2;1;2;3;48;2;4;5;6mY")
@@ -2466,6 +2476,7 @@ mod tests {
         assert_eq!(indexed.foreground(), Some(CellColor::Indexed(1)));
         assert_eq!(indexed.background(), Some(CellColor::Indexed(120)));
         assert!(indexed.bold() && indexed.italic() && indexed.underline());
+        assert!(!indexed.faint());
 
         let truecolor = snapshot.cells[1].style;
         assert_eq!(

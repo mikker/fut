@@ -728,11 +728,12 @@ const FLAG_BOLD: u8 = 1 << 0;
 const FLAG_ITALIC: u8 = 1 << 1;
 const FLAG_UNDERLINE: u8 = 1 << 2;
 const FLAG_INVERSE: u8 = 1 << 3;
+const FLAG_FAINT: u8 = 1 << 4;
 const PACKED_COLOR_BITS: u32 = 26;
 const PACKED_COLOR_MASK: u64 = (1 << PACKED_COLOR_BITS) - 1;
 
 /// Compact in-memory and wire representation of terminal cell colors and
-/// modifiers. Both 26-bit colors and four flags fit losslessly in one word.
+/// modifiers. Both 26-bit colors and five flags fit losslessly in one word.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CellStyle(u64);
 
@@ -767,6 +768,7 @@ impl CellStyle {
         italic: bool,
         underline: bool,
         inverse: bool,
+        faint: bool,
     ) -> Self {
         let mut flags = 0;
         if bold {
@@ -780,6 +782,9 @@ impl CellStyle {
         }
         if inverse {
             flags |= FLAG_INVERSE;
+        }
+        if faint {
+            flags |= FLAG_FAINT;
         }
         Self(
             u64::from(pack_color(foreground))
@@ -816,6 +821,11 @@ impl CellStyle {
     #[must_use]
     pub fn inverse(self) -> bool {
         self.flags() & FLAG_INVERSE != 0
+    }
+
+    #[must_use]
+    pub fn faint(self) -> bool {
+        self.flags() & FLAG_FAINT != 0
     }
 
     fn flags(self) -> u8 {
@@ -869,6 +879,7 @@ impl<'de> Deserialize<'de> for CellStyle {
                     flags & FLAG_ITALIC != 0,
                     flags & FLAG_UNDERLINE != 0,
                     flags & FLAG_INVERSE != 0,
+                    flags & FLAG_FAINT != 0,
                 ))
             }
         }
@@ -890,7 +901,7 @@ pub struct Cell {
 /// containers. Plain unselected cells are encoded as just their string;
 /// styled cells are `[contents, packed_style]`, with a trailing `true` only
 /// for selected cells. Hyperlinked cells append `selected, hyperlink_index`.
-/// Both 26-bit colors and four flags fit in one `u64`.
+/// Both 26-bit colors and five flags fit in one `u64`.
 impl Serialize for Cell {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         if self.style.is_default() && !self.selected && self.hyperlink.is_none() {
@@ -1826,6 +1837,7 @@ mod tests {
                 true,
                 true,
                 true,
+                true,
             ),
             selected: true,
             hyperlink: None,
@@ -1837,10 +1849,10 @@ mod tests {
         // Style is a flat [fg, bg, flags] array: fg packs the indexed-color
         // tag (0x0100_0000) with the palette index, bg packs the RGB tag
         // (0x0200_0000) with the r/g/b bytes, and flags is a bitfield
-        // (bold|italic|underline|inverse = 0b1111).
+        // (bold|italic|underline|inverse|faint = 0b1_1111).
         let json = serde_json::to_string(&cell).unwrap();
         assert_eq!(serde_json::from_str::<Cell>(&json).unwrap(), cell);
-        assert_eq!(json, r#"["λ",70909444472438785,true]"#);
+        assert_eq!(json, r#"["λ",142967038510366721,true]"#);
         assert_eq!(serde_json::to_string(&Cell::default()).unwrap(), r#"" ""#);
     }
 }
