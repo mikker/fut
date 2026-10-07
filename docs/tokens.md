@@ -108,16 +108,16 @@ These may appear in the `row.left`, `body`, `right`, or `detail` fields of a `co
 | Token | Value |
 | --- | --- |
 | `agent.source` | Integration that reported the agent, such as `claude-code` |
-| `agent.status` | `idle`, `working`, `attention`, `blocked`, or `completed`, styled `muted`, `activity`, `attention`, `error`, or `added` |
-| `agent.activity` | Spinner for working, `!` for blocked or BEL, or `•` for completion, in the status style; empty when idle |
-| `agent.location` | Workspace name, prefixed by the session only in a `global` list spanning several sessions and followed by the tab only when the workspace has several tabs |
+| `agent.status` | `idle`, `working`, `blocked`, or `completed`, styled `muted`, `activity`, `error`, or `added` |
+| `agent.activity` | Spinner while working, `!` when blocked, or `•` for an unread completion, in the status style; empty when idle |
+| `agent.location` | Workspace name, prefixed by the session when a `global` list spans several sessions |
 | `agent.session` | Session name |
 | `agent.workspace` | Workspace name |
 | `agent.tab` | Tab name |
 
 </div>
 
-Current and keyboard-selected styles compose over each agent row; the current agent's `body` is drawn as a pill when the icon preset has pill caps.
+Agent rows also resolve declared workspace-, tab-, and pane-scoped extension tokens for the agent's own workspace, tab, and pane, so an extension can publish per-agent details such as a model name to its pane. Current and keyboard-selected styles compose over each agent row.
 
 ## Sidebar header and footer tokens
 

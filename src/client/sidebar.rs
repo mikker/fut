@@ -8,7 +8,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    domain::{PaneId, SessionId, TerminalId, WorkspaceId},
+    domain::{PaneId, SessionId, TabId, TerminalId, WorkspaceId},
     protocol::SelectedTarget,
     resources::{
         MaterializedTokenMap, MaterializedTokenValue, PanePathRef, PresentationTokenTarget,
@@ -21,7 +21,7 @@ use super::{
     agents::{self, AgentItem},
     chrome::{sanitize, truncate},
     config::{
-        AgentRowConfig, AgentScope, IconPreset, MINIMIZED_SIDEBAR_WIDTH, SegmentConfig,
+        AgentRowConfig, AgentScope, IconPreset, IconSet, MINIMIZED_SIDEBAR_WIDTH, SegmentConfig,
         SemanticStyle, SidebarComponentConfig, SidebarComponentSize, SidebarDisplay,
         SidebarSlotConfig, SidebarVisibility, UiConfig, WorkspaceComponentConfigRef,
     },
@@ -131,13 +131,6 @@ pub(super) fn slot_relevant(
                 agents::has_items(snapshot, focused, *scope)
             }
         })
-}
-
-fn agent_row_config(side: SidebarSide, ui: &UiConfig, index: usize) -> Option<&AgentRowConfig> {
-    match side.config(ui).components.get(index)? {
-        SidebarComponentConfig::Agents { row, .. } => Some(row),
-        SidebarComponentConfig::Workspaces { .. } => None,
-    }
 }
 
 fn workspace_config(ui: &UiConfig, side: SidebarSide) -> WorkspaceComponentConfigRef<'_> {
@@ -747,6 +740,16 @@ pub(super) struct AgentsComponent {
     items: Vec<AgentItem>,
     selected: Option<TerminalId>,
     scope: AgentScope,
+    row: Option<AgentRowConfig>,
+    /// Extension tokens of each item's ancestry, parallel to `items`; only
+    /// gathered when a configured row can show them.
+    tokens: Vec<Option<AgentTokens>>,
+}
+
+struct AgentTokens {
+    workspace_id: WorkspaceId,
+    tab_id: TabId,
+    values: MaterializedTokenMap,
 }
 
 impl Default for AgentsComponent {
@@ -755,6 +758,8 @@ impl Default for AgentsComponent {
             items: Vec::new(),
             selected: None,
             scope: AgentScope::Session,
+            row: None,
+            tokens: Vec::new(),
         }
     }
 }
@@ -765,9 +770,11 @@ impl AgentsComponent {
         focused: &SelectedTarget,
         notifications: &NotificationState,
         scope: AgentScope,
+        row: Option<AgentRowConfig>,
     ) -> Self {
         let mut component = Self {
             scope,
+            row,
             ..Self::default()
         };
         component.accept_resources(snapshot, focused, notifications);
@@ -782,6 +789,30 @@ impl AgentsComponent {
     ) {
         let selected = self.selected;
         self.items = agents::items(snapshot, focused, notifications, self.scope);
+        self.tokens = if self.row.is_some() {
+            let mut by_pane = snapshot
+                .pane_paths()
+                .map(|path| {
+                    let mut values = path.workspace.tokens.clone();
+                    values.extend(path.tab.tokens.clone());
+                    values.extend(path.pane.tokens.clone());
+                    (
+                        path.pane.id,
+                        AgentTokens {
+                            workspace_id: path.workspace.id,
+                            tab_id: path.tab.id,
+                            values,
+                        },
+                    )
+                })
+                .collect::<std::collections::HashMap<_, _>>();
+            self.items
+                .iter()
+                .map(|item| by_pane.remove(&item.pane_id))
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.selected = selected
             .filter(|terminal_id| {
                 self.items
@@ -840,12 +871,11 @@ impl AgentsComponent {
         &mut self,
         area: Rect,
         side: SidebarSide,
-        config: &AgentRowConfig,
         ui: &UiConfig,
         column: u16,
         row: u16,
     ) -> ComponentEffect {
-        let Some(index) = agent_item_at(area, side, self, config, ui, column, row) else {
+        let Some(index) = agent_item_at(area, side, self, ui, column, row) else {
             return ComponentEffect::Stay;
         };
         let item = &self.items[index];
@@ -861,21 +891,17 @@ impl AgentsComponent {
         &self,
         area: Rect,
         side: SidebarSide,
-        config: &AgentRowConfig,
         ui: &UiConfig,
         column: u16,
         row: u16,
     ) -> ComponentEffect {
-        agent_item_at(area, side, self, config, ui, column, row).map_or(
-            ComponentEffect::Stay,
-            |index| {
-                ComponentEffect::Navigate(
-                    self.items[index].pane_id,
-                    self.scope.navigation_scope(),
-                    SidebarComponentKind::Agents,
-                )
-            },
-        )
+        agent_item_at(area, side, self, ui, column, row).map_or(ComponentEffect::Stay, |index| {
+            ComponentEffect::Navigate(
+                self.items[index].pane_id,
+                self.scope.navigation_scope(),
+                SidebarComponentKind::Agents,
+            )
+        })
     }
 
     fn move_selection(&mut self, forward: bool) {
@@ -909,17 +935,31 @@ impl AgentsComponent {
         })
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the renderer keeps layout, focus, configuration, and target inputs explicit"
-    )]
+    fn item_height(&self, area: Rect, side: SidebarSide, ui: &UiConfig) -> u16 {
+        match &self.row {
+            Some(row) if !sidebar_is_minimized(area, side, ui) => lane_item_height(&row.detail),
+            _ => 1,
+        }
+    }
+
+    /// Prefix locations with the session only when the list spans several.
+    fn qualify_session(&self) -> bool {
+        matches!(self.scope, AgentScope::Global)
+            && self
+                .items
+                .iter()
+                .map(|item| item.session.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                > 1
+    }
+
     fn render(
         &self,
         area: Rect,
         side: SidebarSide,
         focused: bool,
         spinner_frame: usize,
-        row: &AgentRowConfig,
         ui: &UiConfig,
         buffer: &mut Buffer,
     ) {
@@ -943,29 +983,44 @@ impl AgentsComponent {
             usize::from(content.width),
             title_style,
         );
-        let item_height = agent_item_height(area, side, row, ui);
-        for (index, row_area) in agent_rows(content, self, item_height) {
-            let selected = self.selected == Some(self.items[index].terminal_id) && focused;
-            if minimized {
-                render_minimized_agent_row(
-                    &self.items[index],
+        let icons = ui.icons.resolve();
+        let qualify_session = self.qualify_session();
+        for geometry in agent_rows(content, self, self.item_height(area, side, ui)) {
+            let VisibleRow::Item(index) = geometry.row else {
+                render_overflow_row(geometry.area, &icons, ui, buffer);
+                continue;
+            };
+            let item = &self.items[index];
+            let selected = self.selected == Some(item.terminal_id) && focused;
+            match &self.row {
+                _ if minimized => render_minimized_agent_row(
+                    item,
                     index,
                     selected,
                     spinner_frame,
-                    row_area,
+                    geometry.area,
                     ui,
                     buffer,
-                );
-            } else {
-                render_agent_row(
-                    &self.items[index],
-                    selected,
-                    spinner_frame,
-                    row_area,
-                    row,
-                    ui,
+                ),
+                None => {
+                    render_agent_row(item, selected, spinner_frame, geometry.area, ui, buffer);
+                }
+                Some(row) => render_row_lines(
+                    agent_row_lines(
+                        item,
+                        self.tokens.get(index).and_then(Option::as_ref),
+                        selected,
+                        &AgentRowContext {
+                            row,
+                            qualify_session,
+                            spinner_frame,
+                            ui,
+                            icons: &icons,
+                        },
+                    ),
+                    geometry.area,
                     buffer,
-                );
+                ),
             }
         }
     }
@@ -1025,8 +1080,8 @@ impl SidebarState {
                 SidebarComponentConfig::Workspaces { .. } => SidebarComponent::Workspaces(
                     WorkspacesComponent::open(snapshot, focused, history, notifications),
                 ),
-                SidebarComponentConfig::Agents { scope, .. } => SidebarComponent::Agents(
-                    AgentsComponent::open(snapshot, focused, notifications, *scope),
+                SidebarComponentConfig::Agents { scope, row, .. } => SidebarComponent::Agents(
+                    AgentsComponent::open(snapshot, focused, notifications, *scope, row.clone()),
                 ),
             })
             .collect::<Vec<_>>();
@@ -1110,12 +1165,7 @@ impl SidebarState {
                 component.passive_click(component_geometry.area, self.side, ui, column, row)
             }
             Some(SidebarComponent::Agents(component)) => {
-                agent_row_config(self.side, ui, component_geometry.index).map_or(
-                    ComponentEffect::Stay,
-                    |config| {
-                        component.click(component_geometry.area, self.side, config, ui, column, row)
-                    },
-                )
+                component.click(component_geometry.area, self.side, ui, column, row)
             }
             None => ComponentEffect::Stay,
         };
@@ -1138,14 +1188,9 @@ impl SidebarState {
             Some(SidebarComponent::Workspaces(component)) => {
                 component.passive_click(component_geometry.area, self.side, ui, column, row)
             }
-            Some(SidebarComponent::Agents(component)) => agent_row_config(
-                self.side,
-                ui,
-                component_geometry.index,
-            )
-            .map_or(ComponentEffect::Stay, |config| {
-                component.passive_click(component_geometry.area, self.side, config, ui, column, row)
-            }),
+            Some(SidebarComponent::Agents(component)) => {
+                component.passive_click(component_geometry.area, self.side, ui, column, row)
+            }
             None => ComponentEffect::Stay,
         }
     }
@@ -1208,19 +1253,14 @@ impl SidebarState {
                     spinner_frame,
                     buffer,
                 ),
-                SidebarComponent::Agents(component) => {
-                    if let Some(row) = agent_row_config(self.side, ui, component_geometry.index) {
-                        component.render(
-                            component_geometry.area,
-                            self.side,
-                            component_geometry.index == self.focused_component,
-                            spinner_frame,
-                            row,
-                            ui,
-                            buffer,
-                        );
-                    }
-                }
+                SidebarComponent::Agents(component) => component.render(
+                    component_geometry.area,
+                    self.side,
+                    component_geometry.index == self.focused_component,
+                    spinner_frame,
+                    ui,
+                    buffer,
+                ),
             }
         }
         render_component_dividers(&geometry, self.side, ui, buffer);
@@ -1376,15 +1416,7 @@ fn render_component_dividers(
     }
 }
 
-fn agent_item_height(area: Rect, side: SidebarSide, row: &AgentRowConfig, ui: &UiConfig) -> u16 {
-    if sidebar_is_minimized(area, side, ui) || row.detail.is_empty() {
-        1
-    } else {
-        2
-    }
-}
-
-fn agent_rows(content: Rect, component: &AgentsComponent, item_height: u16) -> Vec<(usize, Rect)> {
+fn agent_rows(content: Rect, component: &AgentsComponent, item_height: u16) -> Vec<RowGeometry> {
     let rows = Rect::new(
         content.x,
         content.y.saturating_add(1),
@@ -1401,52 +1433,82 @@ fn agent_rows(content: Rect, component: &AgentsComponent, item_height: u16) -> V
         })
         .or_else(|| component.items.iter().position(|item| item.current))
         .unwrap_or(0);
-    let mut y = rows.y;
-    let mut geometry = Vec::new();
-    for visible in visible_rows_with_item_height(
-        component.items.len(),
-        anchor,
-        usize::from(rows.height),
-        usize::from(item_height),
-    ) {
-        match visible {
-            VisibleRow::Ellipsis => y = y.saturating_add(1),
-            VisibleRow::Item(index) => {
-                let height = item_height.min(rows.bottom().saturating_sub(y));
-                geometry.push((index, Rect::new(rows.x, y, rows.width, height)));
-                y = y.saturating_add(item_height);
-            }
-        }
-    }
-    geometry
+    row_geometries(rows, component.items.len(), anchor, item_height)
 }
 
 fn agent_item_at(
     area: Rect,
     side: SidebarSide,
     component: &AgentsComponent,
-    config: &AgentRowConfig,
     ui: &UiConfig,
     column: u16,
     row: u16,
 ) -> Option<usize> {
     let content = sidebar_content(area, side)?;
-    agent_rows(
-        content,
-        component,
-        agent_item_height(area, side, config, ui),
-    )
-    .into_iter()
-    .find_map(|(index, area)| rect_contains(area, column, row).then_some(index))
+    agent_rows(content, component, component.item_height(area, side, ui))
+        .into_iter()
+        .find_map(|geometry| match geometry.row {
+            VisibleRow::Item(index) => rect_contains(geometry.area, column, row).then_some(index),
+            VisibleRow::Ellipsis => None,
+        })
+}
+
+fn render_agent_row(
+    item: &AgentItem,
+    selected: bool,
+    spinner_frame: usize,
+    area: Rect,
+    ui: &UiConfig,
+    buffer: &mut Buffer,
+) {
+    let row_state = ItemState {
+        current: false,
+        selected,
+        closing: false,
+        attention: false,
+    };
+    let normal = ui.styles.apply(SemanticStyle::Normal, Style::default());
+    let detail_style = apply_item_state(&ui.styles, row_state, normal);
+    clear(area, detail_style, buffer);
+    let title_style = apply_item_state(
+        &ui.styles,
+        ItemState {
+            current: item.current,
+            ..row_state
+        },
+        normal,
+    );
+    let status_style = ui.styles.apply(item.status_style(), detail_style);
+    buffer.set_line(
+        area.x,
+        area.y,
+        &item.line(
+            spinner_frame,
+            &ui.spinner,
+            "/",
+            title_style,
+            detail_style,
+            status_style,
+        ),
+        area.width,
+    );
+}
+
+struct AgentRowContext<'a> {
+    row: &'a AgentRowConfig,
+    qualify_session: bool,
+    spinner_frame: usize,
+    ui: &'a UiConfig,
+    icons: &'a IconSet,
 }
 
 fn agent_row_lines(
     item: &AgentItem,
+    tokens: Option<&AgentTokens>,
     selected: bool,
-    spinner_frame: usize,
-    row: &AgentRowConfig,
-    ui: &UiConfig,
+    context: &AgentRowContext<'_>,
 ) -> SidebarRowLines {
+    let ui = context.ui;
     let state = ItemState {
         current: false,
         selected,
@@ -1460,51 +1522,58 @@ fn agent_row_lines(
             || TokenValue::plain(""),
             |indicator| {
                 TokenValue::styled(
-                    indicator.marker(spinner_frame, &ui.spinner),
+                    indicator.marker(context.spinner_frame, &ui.spinner),
                     item.status_style(),
                 )
             },
         ),
-        "agent.location" => TokenValue::plain(item.location.clone()),
+        "agent.location" if context.qualify_session => {
+            TokenValue::plain(format!("{}/{}", item.session, item.workspace))
+        }
+        "agent.location" | "agent.workspace" => TokenValue::plain(item.workspace.clone()),
         "agent.session" => TokenValue::plain(item.session.clone()),
-        "agent.workspace" => TokenValue::plain(item.workspace.clone()),
         "agent.tab" => TokenValue::plain(item.tab.clone()),
-        _ => TokenValue::plain(""),
+        _ => materialized_extension_token_value(
+            ui,
+            token,
+            tokens.and_then(|tokens| {
+                let target = if token.starts_with("pane.") {
+                    PresentationTokenTarget::Pane(item.pane_id)
+                } else if token.starts_with("tab.") {
+                    PresentationTokenTarget::Tab(tokens.tab_id)
+                } else {
+                    PresentationTokenTarget::Workspace(tokens.workspace_id)
+                };
+                tokens.values.get(token).map(|value| (value, target))
+            }),
+            context.spinner_frame,
+        ),
     };
     sidebar_row_lines(
         RowLanes {
-            left: &row.left,
-            body: &row.body,
-            right: &row.right,
-            detail: &row.detail,
+            left: &context.row.left,
+            body: &context.row.body,
+            right: &context.row.right,
+            detail: &context.row.detail,
         },
         state,
         item.current,
         ui,
+        context.icons,
         resolve,
     )
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "row rendering keeps item, state, layout, and configuration inputs explicit"
-)]
-fn render_agent_row(
-    item: &AgentItem,
-    selected: bool,
-    spinner_frame: usize,
-    area: Rect,
-    row: &AgentRowConfig,
-    ui: &UiConfig,
-    buffer: &mut Buffer,
-) {
-    if area.width == 0 {
-        return;
-    }
-    render_row_lines(
-        agent_row_lines(item, selected, spinner_frame, row, ui),
-        area,
-        buffer,
+fn render_overflow_row(area: Rect, icons: &IconSet, ui: &UiConfig, buffer: &mut Buffer) {
+    buffer.set_stringn(
+        area.x,
+        area.y,
+        format!(" {}", icons.overflow),
+        usize::from(area.width),
+        ui.styles.apply(
+            SemanticStyle::Muted,
+            ui.styles.apply(SemanticStyle::Normal, Style::default()),
+        ),
     );
 }
 
@@ -1558,9 +1627,40 @@ fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct WorkspaceRowGeometry {
+struct RowGeometry {
     row: VisibleRow,
     area: Rect,
+}
+
+/// Rows with a detail lane take two lines.
+fn lane_item_height(detail: &[SegmentConfig]) -> u16 {
+    if detail.is_empty() { 1 } else { 2 }
+}
+
+/// Lays out the visible rows around `anchor`, clipping the last one to `rows`.
+fn row_geometries(rows: Rect, count: usize, anchor: usize, item_height: u16) -> Vec<RowGeometry> {
+    let mut y = rows.y;
+    visible_rows_with_item_height(
+        count,
+        anchor,
+        usize::from(rows.height),
+        usize::from(item_height),
+    )
+    .into_iter()
+    .map(|row| {
+        let height = match row {
+            VisibleRow::Ellipsis => 1,
+            VisibleRow::Item(_) => item_height,
+        }
+        .min(rows.bottom().saturating_sub(y));
+        let geometry = RowGeometry {
+            row,
+            area: Rect::new(rows.x, y, rows.width, height),
+        };
+        y = y.saturating_add(height);
+        geometry
+    })
+    .collect()
 }
 
 struct WorkspaceGeometry {
@@ -1568,7 +1668,7 @@ struct WorkspaceGeometry {
     header: RenderedTokenLine,
     header_height: u16,
     rows: Rect,
-    row_geometries: Vec<WorkspaceRowGeometry>,
+    row_geometries: Vec<RowGeometry>,
     footer: Vec<RenderedTokenLine>,
 }
 
@@ -1627,37 +1727,12 @@ fn workspace_geometry(
         content.width,
         content.height.saturating_sub(header_height + footer_height),
     );
-    let item_height = if workspace_config(ui, position).row.detail.is_empty() {
-        1
-    } else {
-        2
-    };
+    let item_height = lane_item_height(&workspace_config(ui, position).row.detail);
     let anchor = selected
         .and_then(|id| model.items.iter().position(|item| item.id == id))
         .or_else(|| model.items.iter().position(|item| item.current))
         .unwrap_or(0);
-    let mut y = rows.y;
-    let row_geometries = visible_rows_with_item_height(
-        model.items.len(),
-        anchor,
-        usize::from(rows.height),
-        item_height,
-    )
-    .into_iter()
-    .map(|row| {
-        let height = match row {
-            VisibleRow::Ellipsis => 1,
-            VisibleRow::Item(_) => u16::try_from(item_height).unwrap_or(u16::MAX),
-        }
-        .min(rows.bottom().saturating_sub(y));
-        let geometry = WorkspaceRowGeometry {
-            row,
-            area: Rect::new(rows.x, y, rows.width, height),
-        };
-        y = y.saturating_add(height);
-        geometry
-    })
-    .collect();
+    let row_geometries = row_geometries(rows, model.items.len(), anchor, item_height);
     Some(WorkspaceGeometry {
         content,
         header,
@@ -1861,9 +1936,9 @@ pub(super) fn render_sidebar(
             ),
             SidebarComponentConfig::Agents { scope, row, .. } => {
                 let agents = snapshot.map_or_else(AgentsComponent::default, |snapshot| {
-                    AgentsComponent::open(snapshot, focused, notifications, *scope)
+                    AgentsComponent::open(snapshot, focused, notifications, *scope, row.clone())
                 });
-                agents.render(component.area, side, false, spinner_frame, row, ui, buffer);
+                agents.render(component.area, side, false, spinner_frame, ui, buffer);
             }
         }
     }
@@ -2103,16 +2178,7 @@ fn render_model(
         for row in &geometry.row_geometries {
             match row.row {
                 VisibleRow::Ellipsis => {
-                    buffer.set_stringn(
-                        row.area.x,
-                        row.area.y,
-                        format!(" {}", ui.icons.resolve().overflow),
-                        usize::from(row.area.width),
-                        ui.styles.apply(
-                            SemanticStyle::Muted,
-                            ui.styles.apply(SemanticStyle::Normal, Style::default()),
-                        ),
-                    );
+                    render_overflow_row(row.area, &ui.icons.resolve(), ui, buffer);
                 }
                 VisibleRow::Item(index) => {
                     let item = &model.items[index];
@@ -2456,6 +2522,7 @@ fn workspace_row_lines(
         state,
         item.current,
         ui,
+        &icons,
         resolve,
     )
 }
@@ -2467,15 +2534,14 @@ fn sidebar_row_lines(
     state: ItemState,
     current: bool,
     ui: &UiConfig,
+    icons: &IconSet,
     resolve: impl Fn(&str) -> TokenValue + Copy,
 ) -> SidebarRowLines {
-    let icons = ui.icons.resolve();
     let surface = ui.styles.apply(SemanticStyle::Normal, Style::default());
     let row_style = apply_item_state(&ui.styles, state, surface);
-    let left = render_token_segments(lanes.left, None, state, &ui.styles, &icons, resolve);
+    let left = render_token_segments(lanes.left, None, state, &ui.styles, icons, resolve);
     let title_state = ItemState { current, ..state };
-    let mut body =
-        render_token_segments(lanes.body, None, title_state, &ui.styles, &icons, resolve);
+    let mut body = render_token_segments(lanes.body, None, title_state, &ui.styles, icons, resolve);
     let pill_width =
         if !body.spans.is_empty() && !icons.pill_left.is_empty() && !icons.pill_right.is_empty() {
             UnicodeWidthStr::width(icons.pill_left.as_str())
@@ -2501,13 +2567,13 @@ fn sidebar_row_lines(
                 .insert(0, Span::styled(" ".repeat(pill_width), row_style));
         }
     }
-    let right = render_token_segments(lanes.right, None, state, &ui.styles, &icons, resolve);
+    let right = render_token_segments(lanes.right, None, state, &ui.styles, icons, resolve);
     let detail = (!lanes.detail.is_empty()).then(|| {
         let mut detail =
-            render_token_segments(lanes.detail, None, state, &ui.styles, &icons, resolve);
+            render_token_segments(lanes.detail, None, state, &ui.styles, icons, resolve);
         if pill_width > 0 {
-            // The title line reserves a cap column even when unfocused;
-            // detail connectors must begin beneath the same tree column.
+            // The title line reserves a cap column even for rows that aren't
+            // current, so the detail line starts beneath the same column.
             detail
                 .line
                 .spans
@@ -3507,7 +3573,7 @@ mod tests {
         assert!(!activity.style.add_modifier.contains(Modifier::REVERSED));
     }
 
-    fn agent_item(current: bool, indicator: Option<ActivityIndicator>) -> AgentItem {
+    fn agent_item(session: &str, current: bool, indicator: Option<ActivityIndicator>) -> AgentItem {
         AgentItem {
             machine: crate::client::federation::MachineId::Local,
             generation: crate::client::federation::Generation::default(),
@@ -3515,10 +3581,9 @@ mod tests {
             selectable: true,
             terminal_id: TerminalId::new(),
             pane_id: PaneId::new(),
-            session: "session".into(),
+            session: session.into(),
             workspace: "workspace".into(),
             tab: "tab".into(),
-            location: "workspace".into(),
             source: "codex".into(),
             current,
             indicator,
@@ -3531,82 +3596,202 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn current_agent_styles_only_its_source_and_keeps_status_color() {
-        let item = agent_item(true, Some(ActivityIndicator::Working));
-        let ui = UiConfig::default();
-        let area = Rect::new(0, 0, 40, 2);
-        let mut buffer = Buffer::empty(area);
-        render_agent_row(
-            &item,
-            false,
-            0,
-            area,
-            &AgentRowConfig::default(),
-            &ui,
-            &mut buffer,
-        );
+    fn agent_row(lanes: &str) -> AgentRowConfig {
+        toml::from_str(lanes).expect("agent row")
+    }
 
-        assert!(buffer_line(&buffer, 0).starts_with(" codex "));
-        assert_eq!(buffer_line(&buffer, 1).trim_end(), " working · workspace");
-        assert!((1..6).all(|column| buffer[(column, 0)].modifier.contains(Modifier::REVERSED)));
-        assert!((6..40).all(|column| !buffer[(column, 0)].modifier.contains(Modifier::REVERSED)));
-        let activity = ui
-            .styles
-            .apply(SemanticStyle::Activity, Style::default())
-            .fg
-            .expect("activity foreground");
-        assert_eq!(
-            buffer[(38, 0)].fg,
-            activity,
-            "the spinner keeps its status color"
-        );
-        assert_eq!(buffer[(1, 1)].fg, activity);
-        let muted = ui.styles.apply(SemanticStyle::Muted, Style::default());
-        assert_eq!(buffer[(11, 1)].fg, muted.fg.unwrap_or_default());
-        assert!(buffer[(11, 1)].modifier.contains(muted.add_modifier));
-        assert!(!buffer[(1, 1)].modifier.contains(Modifier::DIM));
+    fn two_line_agent_row() -> AgentRowConfig {
+        agent_row(
+            r#"
+left = [{ text = " " }]
+body = [{ token = "agent.source" }]
+right = [{ token = "agent.activity" }]
+detail = [{ text = " " }, { token = "agent.status" }, { token = "agent.location" }]
+"#,
+        )
+    }
+
+    fn configured_agents(
+        items: Vec<AgentItem>,
+        scope: AgentScope,
+        row: AgentRowConfig,
+    ) -> AgentsComponent {
+        AgentsComponent {
+            tokens: items.iter().map(|_| None).collect(),
+            items,
+            selected: None,
+            scope,
+            row: Some(row),
+        }
     }
 
     #[test]
-    fn current_agent_source_uses_pill_caps_and_detail_aligns_beneath_it() {
+    fn unconfigured_agent_rows_keep_the_built_in_line() {
+        let item = agent_item("session", true, None);
+        let ui = UiConfig::default();
+        let area = Rect::new(0, 0, 40, 1);
+        let mut buffer = Buffer::empty(area);
+        render_agent_row(&item, false, 0, area, &ui, &mut buffer);
+        assert_eq!(
+            buffer_line(&buffer, 0).trim_end(),
+            " • codex idle · session/workspace/tab"
+        );
+
+        let agents = AgentsComponent {
+            items: vec![item],
+            tokens: Vec::new(),
+            ..AgentsComponent::default()
+        };
+        let area = Rect::new(0, 0, 41, 3);
+        let mut sidebar = Buffer::empty(area);
+        agents.render(area, SidebarSide::Right, false, 0, &ui, &mut sidebar);
+        assert_eq!(
+            buffer_line(&sidebar, 1).trim_end(),
+            "│ • codex idle · session/workspace/tab"
+        );
+        assert_eq!(buffer_line(&sidebar, 2).trim(), "│");
+    }
+
+    #[test]
+    fn configured_agent_rows_draw_lanes_with_pill_and_detail() {
         let mut ui = UiConfig::default();
         ui.icons.preset = IconPreset::NerdFont;
         let icons = ui.icons.resolve();
-        let area = Rect::new(0, 0, 30, 2);
+        let agents = configured_agents(
+            vec![
+                agent_item("session", true, None),
+                agent_item("session", false, Some(ActivityIndicator::Blocked)),
+            ],
+            AgentScope::Session,
+            two_line_agent_row(),
+        );
+        let area = Rect::new(0, 0, 31, 6);
         let mut buffer = Buffer::empty(area);
-        render_agent_row(
-            &agent_item(true, None),
-            false,
-            0,
-            area,
-            &AgentRowConfig::default(),
-            &ui,
-            &mut buffer,
-        );
-        assert_eq!(buffer[(1, 0)].symbol(), icons.pill_left);
-        assert_eq!(
-            buffer_line(&buffer, 0)[..]
-                .chars()
-                .skip(2)
-                .take(5)
-                .collect::<String>(),
-            "codex"
-        );
-        assert_eq!(buffer[(7, 0)].symbol(), icons.pill_right);
-        assert_eq!(buffer_line(&buffer, 1).trim_end(), "  idle · workspace");
+        agents.render(area, SidebarSide::Right, false, 0, &ui, &mut buffer);
 
+        assert_eq!(buffer[(2, 1)].symbol(), icons.pill_left);
+        assert!(buffer_line(&buffer, 1).contains("codex"));
+        assert_eq!(buffer_line(&buffer, 2).trim_end(), "│  idleworkspace");
+        assert!(buffer_line(&buffer, 3).starts_with("│  codex"));
+        assert!(buffer_line(&buffer, 3).trim_end().ends_with('!'));
+        assert_eq!(buffer_line(&buffer, 4).trim_end(), "│  blockedworkspace");
+        assert_eq!(
+            agents.passive_click(area, SidebarSide::Right, &ui, 3, 4),
+            ComponentEffect::Navigate(
+                agents.items[1].pane_id,
+                NavigationScope::Session,
+                SidebarComponentKind::Agents,
+            ),
+            "either line of a two-line row selects its agent"
+        );
+    }
+
+    #[test]
+    fn agent_location_names_the_session_only_when_the_list_spans_several() {
+        let row = agent_row(r#"body = [{ token = "agent.location" }]"#);
+        let ui = UiConfig::default();
+        for (sessions, expected) in [(["a", "a"], "workspace"), (["a", "b"], "a/workspace")] {
+            let agents = configured_agents(
+                sessions
+                    .iter()
+                    .map(|session| agent_item(session, false, None))
+                    .collect(),
+                AgentScope::Global,
+                row.clone(),
+            );
+            let area = Rect::new(0, 0, 20, 3);
+            let mut buffer = Buffer::empty(area);
+            agents.render(area, SidebarSide::Right, false, 0, &ui, &mut buffer);
+            assert_eq!(buffer_line(&buffer, 1).trim_end(), format!("│{expected}"));
+        }
+    }
+
+    #[test]
+    fn configured_agent_rows_resolve_extension_tokens_of_their_ancestry() {
+        let row = agent_row(
+            r#"body = [{ token = "pane.extension.claude.model" }, { token = "workspace.extension.claude.branch" }]"#,
+        );
+        let mut agents = configured_agents(
+            vec![agent_item("session", false, None)],
+            AgentScope::Session,
+            row,
+        );
+        agents.tokens = vec![Some(AgentTokens {
+            workspace_id: WorkspaceId::new(),
+            tab_id: TabId::new(),
+            values: [
+                ("pane.extension.claude.model", "opus "),
+                ("workspace.extension.claude.branch", "main"),
+            ]
+            .into_iter()
+            .map(|(token, text)| {
+                (
+                    token.to_owned(),
+                    MaterializedTokenValue::new(text.into(), None),
+                )
+            })
+            .collect(),
+        })];
+        let area = Rect::new(0, 0, 20, 3);
         let mut buffer = Buffer::empty(area);
-        render_agent_row(
-            &agent_item(false, None),
+        agents.render(
+            area,
+            SidebarSide::Right,
             false,
             0,
-            area,
-            &AgentRowConfig::default(),
-            &ui,
+            &UiConfig::default(),
             &mut buffer,
         );
-        assert!(buffer_line(&buffer, 0).starts_with("  codex "));
+        assert_eq!(buffer_line(&buffer, 1).trim_end(), "│opus main");
+    }
+
+    #[test]
+    fn agent_overflow_is_marked_like_workspace_overflow() {
+        let agents = configured_agents(
+            (0..3).map(|_| agent_item("session", false, None)).collect(),
+            AgentScope::Session,
+            two_line_agent_row(),
+        );
+        let ui = UiConfig::default();
+        let area = Rect::new(0, 0, 20, 4);
+        let mut buffer = Buffer::empty(area);
+        agents.render(area, SidebarSide::Right, false, 0, &ui, &mut buffer);
+        assert_eq!(
+            buffer_line(&buffer, 3).trim_end(),
+            format!("│ {}", ui.icons.resolve().overflow)
+        );
+    }
+
+    #[test]
+    fn current_agent_styles_only_its_source_and_keeps_status_color() {
+        let item = AgentItem {
+            machine: crate::client::federation::MachineId::Local,
+            generation: crate::client::federation::Generation::default(),
+            machine_label: None,
+            selectable: true,
+            terminal_id: TerminalId::new(),
+            pane_id: PaneId::new(),
+            session: "session".into(),
+            workspace: "workspace".into(),
+            tab: "tab".into(),
+            source: "codex".into(),
+            current: true,
+            indicator: Some(ActivityIndicator::Working),
+        };
+        let ui = UiConfig::default();
+        let area = Rect::new(0, 0, 40, 1);
+        let mut buffer = Buffer::empty(area);
+        render_agent_row(&item, false, 0, area, &ui, &mut buffer);
+
+        assert!((2..9).all(|column| buffer[(column, 0)].modifier.contains(Modifier::REVERSED)));
+        assert!((9..40).all(|column| !buffer[(column, 0)].modifier.contains(Modifier::REVERSED)));
+        assert_eq!(
+            buffer[(9, 0)].fg,
+            ui.styles
+                .apply(SemanticStyle::Activity, Style::default())
+                .fg
+                .expect("activity foreground")
+        );
     }
 
     #[test]
@@ -3796,6 +3981,7 @@ mod tests {
             &focused,
             &NotificationState::default(),
             AgentScope::Session,
+            None,
         );
         assert_eq!(agents.items.len(), 2, "other sessions are excluded");
         assert!(agents.items.iter().all(|item| item.session == "project"));
@@ -3808,6 +3994,7 @@ mod tests {
             &focused,
             &NotificationState::default(),
             AgentScope::Session,
+            None,
         );
         assert!(agents.items.is_empty());
 
@@ -3820,6 +4007,7 @@ mod tests {
             &focused,
             &NotificationState::default(),
             AgentScope::Session,
+            None,
         );
         assert!(agents.items.is_empty());
     }
@@ -3838,6 +4026,7 @@ mod tests {
             &focused,
             &NotificationState::default(),
             AgentScope::Global,
+            None,
         );
 
         assert!(
@@ -3860,6 +4049,7 @@ mod tests {
             &focused,
             &NotificationState::default(),
             AgentScope::Global,
+            None,
         );
         assert!(
             agents.items.is_empty(),
@@ -3876,6 +4066,7 @@ mod tests {
             &focused,
             &NotificationState::default(),
             AgentScope::Global,
+            None,
         );
 
         assert_eq!(agents.items.len(), 1);
@@ -3926,45 +4117,22 @@ mod tests {
             (AgentScope::Session, 3),
             (AgentScope::Global, 4),
         ] {
-            let agents =
-                AgentsComponent::open(&snapshot, &focused, &NotificationState::default(), scope);
+            let agents = AgentsComponent::open(
+                &snapshot,
+                &focused,
+                &NotificationState::default(),
+                scope,
+                None,
+            );
             assert_eq!(agents.items.len(), expected, "{scope:?}");
         }
-
-        // Tabs qualify only multi-tab workspaces; sessions only a global list
-        // that spans several sessions.
-        let session = AgentsComponent::open(
-            &snapshot,
-            &focused,
-            &NotificationState::default(),
-            AgentScope::Session,
-        );
-        for item in &session.items {
-            let expected = if item.workspace == "current" {
-                format!("current/{}", item.tab)
-            } else {
-                item.workspace.clone()
-            };
-            assert_eq!(item.location, expected);
-        }
-        let global = AgentsComponent::open(
-            &snapshot,
-            &focused,
-            &NotificationState::default(),
-            AgentScope::Global,
-        );
-        assert!(
-            global
-                .items
-                .iter()
-                .all(|item| item.location.starts_with(&format!("{}/", item.session)))
-        );
 
         let mut global = AgentsComponent::open(
             &snapshot,
             &focused,
             &NotificationState::default(),
             AgentScope::Global,
+            None,
         );
         global.selected = global
             .items
@@ -4000,8 +4168,13 @@ mod tests {
             AgentScope::Session,
             AgentScope::Global,
         ] {
-            let agents =
-                AgentsComponent::open(&snapshot, &focused, &NotificationState::default(), scope);
+            let agents = AgentsComponent::open(
+                &snapshot,
+                &focused,
+                &NotificationState::default(),
+                scope,
+                None,
+            );
             assert_eq!(agents.items.len(), 1, "{scope:?}");
             assert_eq!(agents.items[0].source, "live");
         }
@@ -4015,6 +4188,7 @@ mod tests {
             &focused,
             &NotificationState::default(),
             AgentScope::Global,
+            None,
         );
         assert_eq!(
             global.items.len(),
@@ -4026,7 +4200,7 @@ mod tests {
         ui.sidebar.right.components = vec![SidebarComponentConfig::Agents {
             size: SidebarComponentSize::Fill,
             scope: AgentScope::Global,
-            row: AgentRowConfig::default(),
+            row: None,
         }];
         assert!(slot_relevant(&snapshot, &focused, SidebarSide::Right, &ui));
 
@@ -4051,27 +4225,30 @@ mod tests {
             &focused,
             &NotificationState::default(),
             AgentScope::Session,
+            None,
         );
         let area = Rect::new(10, 2, 28, 4);
-        let ui = UiConfig::default();
-        let row = AgentRowConfig::default();
         let mut buffer = Buffer::empty(area);
-        agents.render(area, SidebarSide::Right, false, 0, &row, &ui, &mut buffer);
+        agents.render(
+            area,
+            SidebarSide::Right,
+            false,
+            0,
+            &UiConfig::default(),
+            &mut buffer,
+        );
         assert_eq!(buffer[(10, 2)].symbol(), "│");
         assert_eq!(buffer[(11, 2)].symbol(), " ");
-        for line in [3, 4] {
-            assert_eq!(
-                agents.passive_click(area, SidebarSide::Right, &row, &ui, 11, line),
-                ComponentEffect::Navigate(
-                    pane_id,
-                    NavigationScope::Session,
-                    SidebarComponentKind::Agents,
-                ),
-                "both lines of the row hit the agent"
-            );
-        }
         assert_eq!(
-            agents.passive_click(area, SidebarSide::Right, &row, &ui, 10, 3),
+            agents.passive_click(area, SidebarSide::Right, &UiConfig::default(), 11, 3),
+            ComponentEffect::Navigate(
+                pane_id,
+                NavigationScope::Session,
+                SidebarComponentKind::Agents,
+            )
+        );
+        assert_eq!(
+            agents.passive_click(area, SidebarSide::Right, &UiConfig::default(), 10, 3),
             ComponentEffect::Stay,
             "the divider is not component content"
         );
@@ -4096,6 +4273,7 @@ mod tests {
             &focused,
             &NotificationState::default(),
             AgentScope::Session,
+            None,
         );
         let mut ui = UiConfig::default();
         ui.sidebar.left.display = SidebarDisplay::Minimized;
@@ -4106,29 +4284,14 @@ mod tests {
             (SidebarSide::Right, Rect::new(10, 0, 6, 4), 10, 11),
         ] {
             let mut buffer = Buffer::empty(area);
-            agents.render(
-                area,
-                side,
-                false,
-                0,
-                &AgentRowConfig::default(),
-                &ui,
-                &mut buffer,
-            );
+            agents.render(area, side, false, 0, &ui, &mut buffer);
             assert_eq!(buffer[(divider_x, 0)].symbol(), "│");
             assert_eq!(buffer[(content_x, 1)].symbol(), CURRENT_MARKER);
             assert_eq!(buffer[(content_x + 2, 1)].symbol(), "1");
             assert_eq!(buffer[(content_x + 2, 2)].symbol(), "2");
             assert_eq!(buffer[(content_x + 3, 2)].symbol(), "⠋");
             assert_eq!(
-                agents.passive_click(
-                    area,
-                    side,
-                    &AgentRowConfig::default(),
-                    &ui,
-                    content_x + 1,
-                    2
-                ),
+                agents.passive_click(area, side, &UiConfig::default(), content_x + 1, 2),
                 ComponentEffect::Navigate(
                     working_pane,
                     NavigationScope::Session,
@@ -4139,15 +4302,7 @@ mod tests {
 
         let drawer = Rect::new(10, 0, 30, 4);
         let mut buffer = Buffer::empty(drawer);
-        agents.render(
-            drawer,
-            SidebarSide::Right,
-            true,
-            0,
-            &AgentRowConfig::default(),
-            &ui,
-            &mut buffer,
-        );
+        agents.render(drawer, SidebarSide::Right, true, 0, &ui, &mut buffer);
         assert_eq!(buffer[(11, 0)].symbol(), " ");
         assert_eq!(buffer[(12, 0)].symbol(), "A");
         assert_eq!(buffer[(13, 0)].symbol(), "g");
@@ -4174,8 +4329,13 @@ mod tests {
             turn_id: None,
         });
         let notifications = NotificationState::default();
-        let agents =
-            AgentsComponent::open(&snapshot, &focused, &notifications, AgentScope::Session);
+        let agents = AgentsComponent::open(
+            &snapshot,
+            &focused,
+            &notifications,
+            AgentScope::Session,
+            None,
+        );
         assert_eq!(agents.items[0].indicator, None);
         assert_eq!(agents.items[1].indicator, Some(ActivityIndicator::Working));
         assert_eq!(agents.items[2].indicator, Some(ActivityIndicator::Blocked));
@@ -4191,8 +4351,13 @@ mod tests {
         snapshot.sessions[0].workspaces[3].tabs[0].panes[0]
             .activity
             .read_revision = 7;
-        let agents =
-            AgentsComponent::open(&snapshot, &focused, &notifications, AgentScope::Session);
+        let agents = AgentsComponent::open(
+            &snapshot,
+            &focused,
+            &notifications,
+            AgentScope::Session,
+            None,
+        );
         assert_eq!(agents.items[3].indicator, None);
     }
 
@@ -4207,6 +4372,7 @@ mod tests {
             &focused,
             &NotificationState::default(),
             AgentScope::Session,
+            None,
         );
         agents.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         let selected_terminal = agents.selected.unwrap();
@@ -4227,14 +4393,7 @@ mod tests {
 
         let area = Rect::new(0, 0, 28, 4);
         assert_eq!(
-            agents.passive_click(
-                area,
-                SidebarSide::Left,
-                &AgentRowConfig::default(),
-                &UiConfig::default(),
-                3,
-                2
-            ),
+            agents.passive_click(area, SidebarSide::Left, &UiConfig::default(), 3, 2),
             ComponentEffect::Navigate(
                 fresh_pane,
                 NavigationScope::Session,
@@ -4258,7 +4417,7 @@ mod tests {
             .push(SidebarComponentConfig::Agents {
                 size: SidebarComponentSize::Fixed(4),
                 scope: AgentScope::Session,
-                row: AgentRowConfig::default(),
+                row: None,
             });
         let mut sidebar = SidebarState::open(
             &snapshot,
@@ -4507,7 +4666,7 @@ mod tests {
             SidebarComponentConfig::Agents {
                 size: SidebarComponentSize::Fixed(3),
                 scope: AgentScope::Session,
-                row: AgentRowConfig::default(),
+                row: None,
             },
             SidebarComponentConfig::Workspaces {
                 size: SidebarComponentSize::Fill,
