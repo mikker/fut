@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Show the close-pane confirmation over the pane it would close and dim the rest of the window.
+
 ## 0.34
 
 - Accept Ctrl-Space as a configurable prefix, binding, or hotkey.
