@@ -6,6 +6,7 @@
 - Draw the rename prompt in the same bordered dialog frame as the command palette and other dialogs.
 - Stop panes from flickering and receiving spurious resizes when switching focus between split panes of different sizes.
 - Show the close-pane confirmation over the pane it would close and dim the rest of the window.
+- Choose the shell new panes launch with `terminal.shell`, instead of always using `$SHELL`.
 
 ## 0.34
 

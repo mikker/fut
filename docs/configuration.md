@@ -93,6 +93,27 @@ resize existing history buffers. Newly opened command popups use the client's
 current setting after `Ctrl-b Shift-R`. Alternate-screen applications manage
 their own history.
 
+## Default shell
+
+New shell panes, tabs, workspaces, and sessions run the program in `$SHELL`,
+falling back to `/bin/sh`. To use a different shell without changing your login
+shell or `$SHELL`, set `terminal.shell`:
+
+```toml
+[terminal]
+shell = "/opt/homebrew/bin/fish" # Absolute, or beginning with ~/.
+```
+
+Fut executes this program directly, without arguments. It must be an absolute
+path or begin with `~/`; bare program names are rejected rather than looked up
+on `PATH`. When it is set, Fut also exports it as `SHELL` to every terminal, so
+programs that start your shell—and project commands that return to a prompt
+when they exit—use the same one. Commands passed explicitly, such as
+`fut tab new -- htop`, are unaffected.
+
+The daemon reads this setting when it starts. Restart the daemon to apply a
+change; `Ctrl-b Shift-R` does not affect it.
+
 ## Example
 
 This example is intentionally customized; it is not a dump of the defaults.
@@ -108,6 +129,9 @@ extensions = [
 
 [alerts]
 signal_outer_terminal = false
+
+[terminal]
+shell = "/opt/homebrew/bin/fish"
 
 [ui]
 pane_layout = "splits" # "splits" or "accordion"

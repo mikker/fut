@@ -7,16 +7,19 @@ mod runtime;
 /// Scrollback storage budget per terminal, in bytes (allocated as history grows).
 pub const DEFAULT_SCROLLBACK_BYTES: usize = 100 * 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TerminalConfig {
     pub scrollback_bytes: usize,
+    /// Absolute program used for new shell panes; `None` falls back to `$SHELL`.
+    pub shell: Option<std::path::PathBuf>,
 }
 
 impl Default for TerminalConfig {
     fn default() -> Self {
         Self {
             scrollback_bytes: DEFAULT_SCROLLBACK_BYTES,
+            shell: None,
         }
     }
 }

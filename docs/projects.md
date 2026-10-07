@@ -185,7 +185,7 @@ in the same tab with direction `right` or `down`.
 
 Commands are direct argument arrays and are never evaluated by a shell. By
 default, Fut runs a configured command as a child process and starts the user's
-shell when it exits, so stopping the command leaves the pane open at a prompt.
+[default shell](configuration.md#default-shell) when it exits, so stopping the command leaves the pane open at a prompt.
 Set `exec = true` on a pane to make its configured command the pane's top-level
 process instead. Omit `command` to start the configured shell immediately.
 

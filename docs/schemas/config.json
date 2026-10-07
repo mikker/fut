@@ -199,6 +199,11 @@
           "minimum": 0,
           "default": 104857600,
           "description": "Maximum retained scrollback storage per terminal in bytes."
+        },
+        "shell": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Absolute path, or one beginning with ~/, of the shell new panes launch. Defaults to $SHELL, then /bin/sh. Read when the daemon starts."
         }
       }
     },
