@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.33
+
 - Show activity reported by any program through the OSC 7501 program status protocol, including over SSH.
 
 ## 0.32
