@@ -132,9 +132,12 @@ impl ToastState {
         }
     }
 
+    /// `prompt_host` narrows where a prompt is centered, so a prompt about one
+    /// pane appears over that pane; other toasts always use `host`.
     pub(super) fn render(
         &self,
         host: Rect,
+        prompt_host: Option<Rect>,
         tab_bar_position: TabBarPosition,
         styles: &StylesConfig,
         buffer: &mut Buffer,
@@ -149,7 +152,7 @@ impl ToastState {
         };
         let message = sanitize(message);
         let area = if centered {
-            prompt_area(host, &message)
+            prompt_area(prompt_host.unwrap_or(host), &message)
         } else {
             toast_area(host, tab_bar_position, &message)
         };
@@ -321,6 +324,7 @@ mod tests {
         state.error("a very long failure message");
         state.render(
             host,
+            None,
             TabBarPosition::Top,
             &StylesConfig::default(),
             &mut buffer,
@@ -333,6 +337,37 @@ mod tests {
                 .modifier
                 .contains(ratatui::style::Modifier::BOLD)
         );
+    }
+
+    #[test]
+    fn prompts_center_on_their_prompt_host_but_toasts_ignore_it() {
+        let host = Rect::new(0, 0, 80, 24);
+        let pane = Rect::new(41, 0, 39, 24);
+        let mut buffer = Buffer::empty(host);
+        let mut state = ToastState::default();
+        state.replace(Some(Toast::prompt("Close pane? (y/n)")));
+        state.render(
+            host,
+            Some(pane),
+            TabBarPosition::Top,
+            &StylesConfig::default(),
+            &mut buffer,
+        );
+        let area = prompt_area(pane, "Close pane? (y/n)");
+        assert!(area.x >= pane.x);
+        assert_eq!(buffer[(area.x, area.y)].symbol(), "╭");
+
+        let mut buffer = Buffer::empty(host);
+        state.error("failed");
+        state.render(
+            host,
+            Some(pane),
+            TabBarPosition::Top,
+            &StylesConfig::default(),
+            &mut buffer,
+        );
+        let area = toast_area(host, TabBarPosition::Top, "failed");
+        assert_eq!(buffer[(area.x, area.y)].symbol(), "╭");
     }
 
     #[test]

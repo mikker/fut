@@ -4005,6 +4005,7 @@ async fn run_loop(
                             }
                             toasts.render(
                                 area,
+                                None,
                                 ui.tab_bar.position,
                                 &ui.styles,
                                 frame.buffer_mut(),
@@ -4024,6 +4025,12 @@ async fn run_loop(
                             &ui.styles,
                             frame.buffer_mut(),
                         );
+                        let close_pane_area = close_target.confirming_pane().and_then(|pane_id| {
+                            view.pane_content_area(layout.terminal, ui.pane_layout, pane_id)
+                        });
+                        if let Some(target) = close_pane_area {
+                            dim_outside(layout.terminal, target, frame.buffer_mut());
+                        }
                         if let Some(tab_bar) = layout.tab_bar {
                             if let Some(ClientSurface::TabBar(state)) = surface.as_ref() {
                                 state.render(
@@ -4134,6 +4141,7 @@ async fn run_loop(
                         }
                         toasts.render(
                             area,
+                            close_pane_area,
                             ui.tab_bar.position,
                             &ui.styles,
                             frame.buffer_mut(),
@@ -6509,6 +6517,15 @@ impl CloseTargetState {
         matches!(self, Self::Confirming { .. })
     }
 
+    fn confirming_pane(&self) -> Option<crate::domain::PaneId> {
+        match self {
+            Self::Confirming {
+                selector: TargetSelector::Pane(pane_id),
+            } => Some(*pane_id),
+            _ => None,
+        }
+    }
+
     fn route_confirmation_input(&mut self, event: &Event) -> CloseConfirmationInput {
         if !self.is_confirming() {
             return CloseConfirmationInput::Pass;
@@ -7135,6 +7152,27 @@ impl ViewState {
         })
     }
 
+    /// The visible content area of the pane a close prompt refers to, so the
+    /// prompt can sit on that pane rather than the middle of the window.
+    fn pane_content_area(
+        &self,
+        area: Rect,
+        policy: PaneLayoutPolicy,
+        pane_id: crate::domain::PaneId,
+    ) -> Option<Rect> {
+        let terminal_id = self
+            .panes
+            .iter()
+            .find(|pane| pane.target.pane_id == pane_id)?
+            .target
+            .terminal_id;
+        self.pane_layouts(area, policy)
+            .0
+            .get(&terminal_id)
+            .map(|layout| layout.content)
+            .filter(|content| content.width > 0 && content.height > 0)
+    }
+
     fn terminal_cell(
         &self,
         area: Rect,
@@ -7439,6 +7477,23 @@ fn render_view(
         }
     }
     cursor
+}
+
+/// Dim everything in `area` except `keep`, so a close prompt clearly points at
+/// the one pane it would close.
+fn dim_outside(area: Rect, keep: Rect, buffer: &mut Buffer) {
+    for row in area.y..area.bottom() {
+        for column in area.x..area.right() {
+            let inside =
+                column >= keep.x && column < keep.right() && row >= keep.y && row < keep.bottom();
+            if inside {
+                continue;
+            }
+            if let Some(cell) = buffer.cell_mut((column, row)) {
+                cell.modifier.insert(Modifier::DIM);
+            }
+        }
+    }
 }
 
 /// A larger attached client cannot grow a shared PTY beyond the smallest
@@ -8199,6 +8254,57 @@ mod tests {
         };
         assert_eq!(selector, pane);
         assert!(state.complete(Some(request_id)));
+    }
+
+    #[test]
+    fn close_confirmation_exposes_only_a_pane_target() {
+        let pane_id = crate::domain::PaneId::new();
+        let mut state = CloseTargetState::default();
+        assert_eq!(state.confirming_pane(), None);
+        state.begin(TargetSelector::Pane(pane_id), true);
+        assert_eq!(state.confirming_pane(), Some(pane_id));
+        state.confirm();
+        assert_eq!(state.confirming_pane(), None);
+
+        let mut state = CloseTargetState::default();
+        state.begin(TargetSelector::Tab(TabId::new()), true);
+        assert_eq!(state.confirming_pane(), None);
+    }
+
+    #[test]
+    fn close_prompt_targets_the_pane_and_dims_everything_else() {
+        let panes = targets(2);
+        let state = ViewState::new(
+            Locality::Local,
+            selected_view(1, panes[0].clone(), panes.clone()),
+        )
+        .unwrap();
+        let area = Rect::new(0, 0, 40, 6);
+        let layouts = state.pane_layouts(area, PaneLayoutPolicy::Splits).0;
+        let target = layouts[&panes[1].terminal_id].content;
+        assert_eq!(
+            state.pane_content_area(area, PaneLayoutPolicy::Splits, panes[1].pane_id),
+            Some(target)
+        );
+        assert_eq!(
+            state.pane_content_area(area, PaneLayoutPolicy::Splits, PaneId::new()),
+            None
+        );
+
+        let mut buffer = Buffer::empty(area);
+        dim_outside(area, target, &mut buffer);
+        let other = layouts[&panes[0].terminal_id].content;
+        assert!(buffer[(other.x, other.y)].modifier.contains(Modifier::DIM));
+        assert!(
+            !buffer[(target.x, target.y)]
+                .modifier
+                .contains(Modifier::DIM)
+        );
+        assert!(
+            !buffer[(target.right() - 1, target.bottom() - 1)]
+                .modifier
+                .contains(Modifier::DIM)
+        );
     }
 
     #[test]
