@@ -239,6 +239,7 @@ fn rendered_placements(
                 .images
                 .iter()
                 .find(|image| image.id == placement.image_id)
+                .and_then(|image| view.kitty_image(pane.target.terminal_id, image))
             else {
                 continue;
             };
@@ -400,7 +401,7 @@ mod tests {
         let image = KittyImage {
             id: 7,
             generation: 1,
-            png: vec![1],
+            png: vec![1].into(),
         };
         let placement = KittyPlacement {
             image_id: 7,
@@ -482,7 +483,7 @@ mod tests {
         let image = KittyImage {
             id: 1,
             generation: 1,
-            png,
+            png: png.into(),
         };
         let geometry = PlacementGeometry {
             host_column: 4,

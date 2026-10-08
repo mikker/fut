@@ -1242,6 +1242,115 @@ done
 }
 
 #[tokio::test]
+async fn kitty_images_are_delivered_once_and_large_screens_are_accepted() {
+    let script = r#"
+printf 'READY\r\n'
+while IFS= read -r line; do
+  case "$line" in
+    image) printf '\033_Ga=T,f=100,q=2,c=2,r=2,i=7;iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==\033\\IMAGE\r\n' ;;
+    text) printf 'TEXT\r\n' ;;
+  esac
+done
+"#;
+    let mut harness = Harness::start(script).await;
+    let (mut client, terminal_id, _) = harness.interactive().await;
+    snapshot_containing(&mut client, terminal_id, "READY").await;
+
+    // Collect kitty_image deliveries until a screen containing `needle`.
+    async fn images_until(
+        client: &mut Connection,
+        terminal_id: TerminalId,
+        needle: &str,
+    ) -> (Vec<fut::domain::KittyImage>, ScreenSnapshot) {
+        let mut images = Vec::new();
+        loop {
+            match receive(client).await.expect("daemon disconnected") {
+                ServerMessage::KittyImage {
+                    terminal_id: id,
+                    image,
+                } if id == terminal_id => images.push(image),
+                ServerMessage::Snapshot {
+                    terminal_id: id,
+                    screen,
+                } if id == terminal_id && snapshot_text(&screen).contains(needle) => {
+                    return (images, screen);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    send(
+        &mut client,
+        ClientMessage::Input {
+            bytes: b"image\n".to_vec(),
+        },
+    )
+    .await;
+    let (images, screen) = images_until(&mut client, terminal_id, "IMAGE").await;
+    assert_eq!(
+        images.len(),
+        1,
+        "image pixels were not delivered exactly once"
+    );
+    assert!(images[0].png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    let referenced = &screen.graphics.images;
+    assert_eq!(referenced.len(), 1);
+    assert!(referenced[0].is_reference(), "screen embedded image pixels");
+    assert_eq!(
+        (referenced[0].id, referenced[0].generation),
+        (images[0].id, images[0].generation)
+    );
+
+    // Later screens keep referencing the image without resending it.
+    send(
+        &mut client,
+        ClientMessage::Input {
+            bytes: b"text\n".to_vec(),
+        },
+    )
+    .await;
+    let (images, screen) = images_until(&mut client, terminal_id, "TEXT").await;
+    assert!(images.is_empty(), "unchanged image pixels were resent");
+    assert_eq!(screen.graphics.images.len(), 1);
+
+    // A 5120x2160 display at a typical font size.
+    let large = TerminalSize {
+        columns: 508,
+        rows: 160,
+    };
+    send(
+        &mut client,
+        ClientMessage::Resize {
+            terminal_id,
+            size: large,
+        },
+    )
+    .await;
+    snapshot_with_size(&mut client, terminal_id, large).await;
+
+    send(
+        &mut client,
+        ClientMessage::Resize {
+            terminal_id,
+            size: TerminalSize {
+                columns: 1000,
+                rows: 200,
+            },
+        },
+    )
+    .await;
+    receive_matching(
+        &mut client,
+        |message| matches!(message, ServerMessage::Error { code, .. } if code == "invalid_size"),
+    )
+    .await;
+
+    harness.detach(&mut client).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn terminal_output_read_and_wait_are_bounded_event_driven_and_typed() {
     let script = r#"
 printf '\033[31mBOOT-雪\033[0m\r\n'

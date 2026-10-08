@@ -24,8 +24,9 @@ use crate::{
 /// Local clients and daemons require an exact protocol match. The protocol is
 /// the package version's minor component: Fut 0.12.x uses protocol 12.
 pub const PROTOCOL_VERSION: u16 = parse_protocol_version(env!("CARGO_PKG_VERSION_MINOR"));
-/// Enough for 50,000 individually styled MessagePack-encoded cells while
-/// remaining a firm pre-allocation bound for the length-delimited transport.
+/// Enough for a worst-case screen of [`crate::domain::MAX_VISIBLE_CELLS`]
+/// cells, or one Kitty image, while remaining a firm pre-allocation bound for
+/// the length-delimited transport.
 pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
 
 const fn parse_protocol_version(value: &str) -> u16 {
@@ -682,6 +683,13 @@ pub enum ServerMessage {
         terminal_id: TerminalId,
         delta: ScreenDelta,
     },
+    /// Pixels for a Kitty image that a following screen references. Sent at
+    /// most once per image generation while the client's screens keep
+    /// referencing it, so screens themselves carry only references.
+    KittyImage {
+        terminal_id: TerminalId,
+        image: crate::domain::KittyImage,
+    },
     CopyModeSnapshot {
         terminal_id: TerminalId,
         screen: ScreenSnapshot,
@@ -1334,8 +1342,8 @@ mod tests {
     #[test]
     fn maximum_blank_snapshot_round_trips_below_frame_limit() {
         let size = TerminalSize {
-            columns: 250,
-            rows: 200,
+            columns: 500,
+            rows: 300,
         };
         assert_eq!(size.cell_count().unwrap(), MAX_VISIBLE_CELLS);
         let snapshot = ScreenSnapshot::new(
@@ -1343,8 +1351,8 @@ mod tests {
             size,
             vec![Cell::default(); MAX_VISIBLE_CELLS],
             Cursor {
-                column: 249,
-                row: 199,
+                column: 499,
+                row: 299,
                 visible: true,
                 shape: Default::default(),
                 blinking: false,
@@ -1362,8 +1370,8 @@ mod tests {
     #[test]
     fn maximum_content_selected_styled_snapshot_and_copy_frames_fit() {
         let size = TerminalSize {
-            columns: 250,
-            rows: 200,
+            columns: 500,
+            rows: 300,
         };
         let maximum_content = format!("a{}\u{1ab0}", "\u{301}".repeat(14));
         assert_eq!(maximum_content.len(), MAX_CELL_CONTENT_BYTES);
@@ -1386,21 +1394,50 @@ mod tests {
                 true,
             ),
             selected: true,
-            hyperlink: None,
+            hyperlink: Some(511),
         };
-        let screen = ScreenSnapshot::new(
+        let mut screen = ScreenSnapshot::new(
             u64::MAX,
             size,
             vec![cell; MAX_VISIBLE_CELLS],
             Cursor {
-                column: 249,
-                row: 199,
+                column: 499,
+                row: 299,
                 visible: false,
                 shape: Default::default(),
                 blinking: false,
             },
         )
         .unwrap();
+        // The rest of the frame's budget: a full hyperlink table whose
+        // indices need MessagePack's three-byte encoding, and the maximum
+        // number of placements, each referencing its own image.
+        let uri = "h".repeat(crate::domain::MAX_SCREEN_HYPERLINK_BYTES / 512);
+        screen.hyperlinks = vec![uri.into(); 512];
+        screen.graphics = crate::domain::KittyGraphics {
+            images: (0..crate::domain::MAX_KITTY_PLACEMENTS)
+                .map(|index| crate::domain::KittyImage {
+                    id: u32::MAX - index as u32,
+                    generation: u64::MAX,
+                    png: std::sync::Arc::from([]),
+                })
+                .collect(),
+            placements: (0..crate::domain::MAX_KITTY_PLACEMENTS)
+                .map(|index| crate::domain::KittyPlacement {
+                    image_id: u32::MAX - index as u32,
+                    placement_id: u32::MAX,
+                    column: i32::MIN,
+                    row: i32::MIN,
+                    columns: u32::MAX,
+                    rows: u32::MAX,
+                    source_x: u32::MAX,
+                    source_y: u32::MAX,
+                    source_width: u32::MAX,
+                    source_height: u32::MAX,
+                    z: i32::MIN,
+                })
+                .collect(),
+        };
         assert_eq!(screen.cells[0].contents.len(), MAX_CELL_CONTENT_BYTES);
         let terminal_id = TerminalId::new();
         for message in [
@@ -1424,6 +1461,26 @@ mod tests {
                 payload.len()
             );
         }
+    }
+
+    #[test]
+    fn largest_kitty_image_frame_fits() {
+        let message = Envelope {
+            request_id: None,
+            message: ServerMessage::KittyImage {
+                terminal_id: TerminalId::new(),
+                image: crate::domain::KittyImage {
+                    id: u32::MAX,
+                    generation: u64::MAX,
+                    png: vec![0xff; crate::terminal::KITTY_SNAPSHOT_BYTES].into(),
+                },
+            },
+        };
+        let payload = encode_payload(&message).unwrap();
+        assert_eq!(
+            decode_payload::<Envelope<ServerMessage>>(&payload).unwrap(),
+            message
+        );
     }
 
     #[test]

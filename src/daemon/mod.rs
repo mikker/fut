@@ -2504,6 +2504,13 @@ enum Outbound {
         /// hold a matching base grid to splice a delta into.
         force_full: bool,
     },
+    /// An ordered message carrying a screen, such as a copy-mode reply.
+    /// Encoded by the writer so its Kitty images go through the same
+    /// per-connection image tracking as live snapshots.
+    Screen {
+        request_id: Option<uuid::Uuid>,
+        message: Box<ServerMessage>,
+    },
 }
 
 #[derive(Default)]
@@ -2517,6 +2524,10 @@ struct OutboundState {
 struct OutboundQueue {
     state: std::sync::Mutex<OutboundState>,
     ready: Notify,
+    /// Set for remote peers without `large-screens.v1`: their frozen screen
+    /// format embeds Kitty image pixels instead of referencing separate
+    /// `kitty_image` frames.
+    embed_images: std::sync::atomic::AtomicBool,
 }
 
 impl ClientConnection {
@@ -2541,6 +2552,15 @@ impl ClientConnection {
 
     async fn next(&mut self) -> Option<std::io::Result<bytes::BytesMut>> {
         self.reader.next().await
+    }
+
+    /// Largest grid this connection's client may request; remote peers
+    /// without `large-screens.v1` keep the generation-1 bound.
+    fn max_visible_cells(&self) -> usize {
+        self.remote.map_or(
+            crate::domain::MAX_VISIBLE_CELLS,
+            Capabilities::max_visible_cells,
+        )
     }
 
     fn enqueue(&self, item: Outbound) -> Result<()> {
@@ -2703,11 +2723,78 @@ fn diff_rows(previous: &ScreenSnapshot, next: &ScreenSnapshot) -> Option<Vec<Del
     Some(changed)
 }
 
+/// Kitty images a client holds, per terminal, when screens reference
+/// separately sent pixels. Mirrors the client's cache: after each message
+/// that states a screen's complete graphics, both sides keep exactly that
+/// screen's images (the client may keep more), so an image is resent only
+/// when the client could have dropped it.
+#[derive(Default)]
+struct SentImages(HashMap<TerminalId, HashSet<(u32, u64)>>);
+
+impl SentImages {
+    /// Forget everything sent for `terminal_id`, e.g. before a forced full
+    /// snapshot to a client that may have discarded its pane.
+    fn reset(&mut self, terminal_id: TerminalId) {
+        self.0.remove(&terminal_id);
+    }
+
+    /// Return `kitty_image` messages for images in `message` the client may
+    /// lack, and replace the pixels in `message` with references.
+    fn prepare(&mut self, message: &mut ServerMessage) -> Vec<ServerMessage> {
+        let (terminal_id, graphics) = match message {
+            ServerMessage::Snapshot {
+                terminal_id,
+                screen,
+            }
+            | ServerMessage::CopyModeSnapshot {
+                terminal_id,
+                screen,
+            }
+            | ServerMessage::CopyModeFinalized {
+                terminal_id,
+                screen,
+            }
+            | ServerMessage::CopyModeCancelled {
+                terminal_id,
+                screen,
+            } => (*terminal_id, &mut screen.graphics),
+            ServerMessage::SnapshotDelta {
+                terminal_id,
+                delta:
+                    ScreenDelta {
+                        graphics: Some(graphics),
+                        ..
+                    },
+            } => (*terminal_id, graphics),
+            _ => return Vec::new(),
+        };
+        let held = self.0.remove(&terminal_id).unwrap_or_default();
+        let mut images = Vec::new();
+        let mut now_held = HashSet::with_capacity(graphics.images.len());
+        for image in &graphics.images {
+            let key = (image.id, image.generation);
+            if !held.contains(&key) && !image.is_reference() {
+                images.push(ServerMessage::KittyImage {
+                    terminal_id,
+                    image: image.clone(),
+                });
+            }
+            now_held.insert(key);
+        }
+        graphics.strip_pixels();
+        if !now_held.is_empty() {
+            self.0.insert(terminal_id, now_held);
+        }
+        images
+    }
+}
+
 async fn write_outbound(
     mut sink: SplitSink<Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>, Bytes>,
     queue: Arc<OutboundQueue>,
 ) {
     let mut last_sent: HashMap<TerminalId, ScreenSnapshot> = HashMap::new();
+    let mut sent_images = SentImages::default();
     loop {
         let Some(item) = queue.pop() else {
             if queue.is_finished() {
@@ -2716,35 +2803,77 @@ async fn write_outbound(
             queue.ready.notified().await;
             continue;
         };
-        let payload = match item {
-            Outbound::Frame(bytes) => Ok(bytes),
+        let (request_id, mut message) = match item {
+            Outbound::Frame(bytes) => {
+                if !send_outbound(&mut sink, &queue, Ok(bytes)).await {
+                    return;
+                }
+                continue;
+            }
             Outbound::Snapshot {
                 terminal_id,
                 screen,
                 force_full,
             } => {
-                let message = snapshot_message(terminal_id, screen, force_full, &mut last_sent);
-                encode_payload(&Envelope {
-                    request_id: None,
-                    message,
-                })
-                .map(Bytes::from)
+                if force_full {
+                    sent_images.reset(terminal_id);
+                }
+                (
+                    None,
+                    snapshot_message(terminal_id, screen, force_full, &mut last_sent),
+                )
             }
+            Outbound::Screen {
+                request_id,
+                message,
+            } => (request_id, *message),
         };
-        let sent = match payload {
-            Ok(bytes) if queue.is_finished() => timeout(OUTBOUND_FLUSH_DEADLINE, sink.send(bytes))
-                .await
-                .map_err(anyhow::Error::from)
-                .and_then(|result| result.map_err(Into::into)),
-            Ok(bytes) => sink.send(bytes).await.map_err(Into::into),
-            Err(error) => Err(error.into()),
-        };
-        if let Err(error) = sent {
-            tracing::debug!(%error, "client connection writer stopped");
-            queue.fail();
+        if !queue
+            .embed_images
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            for image in sent_images.prepare(&mut message) {
+                let payload = encode_payload(&Envelope {
+                    request_id: None,
+                    message: image,
+                })
+                .map(Bytes::from);
+                if !send_outbound(&mut sink, &queue, payload).await {
+                    return;
+                }
+            }
+        }
+        let payload = encode_payload(&Envelope {
+            request_id,
+            message,
+        })
+        .map(Bytes::from);
+        if !send_outbound(&mut sink, &queue, payload).await {
             return;
         }
     }
+}
+
+/// Write one encoded frame; on failure, fail the queue and return `false`.
+async fn send_outbound(
+    sink: &mut SplitSink<Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>, Bytes>,
+    queue: &OutboundQueue,
+    payload: Result<Bytes, crate::protocol::FrameError>,
+) -> bool {
+    let sent = match payload {
+        Ok(bytes) if queue.is_finished() => timeout(OUTBOUND_FLUSH_DEADLINE, sink.send(bytes))
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result.map_err(Into::into)),
+        Ok(bytes) => sink.send(bytes).await.map_err(Into::into),
+        Err(error) => Err(error.into()),
+    };
+    if let Err(error) = sent {
+        tracing::debug!(%error, "client connection writer stopped");
+        queue.fail();
+        return false;
+    }
+    true
 }
 
 async fn handle_connection(
@@ -2807,7 +2936,13 @@ async fn handle_connection(
             let negotiated = remote::decode_handshake::<Envelope<ClientMessage>>(&frame)
                 .and_then(|_| hello.negotiate(Capabilities::ALL));
             match negotiated {
-                Ok(capabilities) => connection.remote = Some(capabilities),
+                Ok(capabilities) => {
+                    connection.remote = Some(capabilities);
+                    connection.outbound.embed_images.store(
+                        !capabilities.separate_images(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
                 Err(error) => {
                     send(
                         &mut connection,
@@ -2835,7 +2970,7 @@ async fn handle_connection(
     let presence = shared.lock().await.presence.clone();
     let (leased, interactive_size) = match mode {
         ClientMode::Interactive { size, selector } => {
-            if let Err(error) = size.validate() {
+            if let Err(error) = size.validate_within(connection.max_visible_cells()) {
                 send_error(
                     &mut connection,
                     first.request_id,
@@ -3222,7 +3357,7 @@ async fn handle_connection(
                         }
                     }
                     ClientMessage::Resize { terminal_id, size } => {
-                        if let Err(error) = size.validate() {
+                        if let Err(error) = size.validate_within(connection.max_visible_cells()) {
                             send_error(&mut connection, envelope.request_id, "invalid_size", &error.to_string()).await?;
                         } else if terminal_id == attachment.focused.selected.terminal_id {
                             match attachment.resize_focused(size).await {
@@ -7027,6 +7162,17 @@ async fn send(
             error: EndpointError::MethodNotNegotiated,
         };
     }
+    if matches!(
+        message,
+        ServerMessage::CopyModeSnapshot { .. }
+            | ServerMessage::CopyModeFinalized { .. }
+            | ServerMessage::CopyModeCancelled { .. }
+    ) {
+        return connection.enqueue(Outbound::Screen {
+            request_id,
+            message: Box::new(message),
+        });
+    }
     connection.enqueue(Outbound::Frame(Bytes::from(encode_payload(&Envelope {
         request_id,
         message,
@@ -7149,6 +7295,106 @@ mod tests {
         assert!(delta.cursor.blinking);
         assert!(delta.mouse_tracking);
         assert_eq!(delta.graphics.unwrap().placements.len(), 1);
+    }
+
+    fn screen_with_image(revision: u64, generation: u64) -> ScreenSnapshot {
+        use crate::domain::{Cell, Cursor, CursorShape};
+        let size = TerminalSize {
+            columns: 2,
+            rows: 1,
+        };
+        let cursor = Cursor {
+            column: 0,
+            row: 0,
+            visible: true,
+            shape: CursorShape::Block,
+            blinking: false,
+        };
+        let mut screen =
+            ScreenSnapshot::new(revision, size, vec![Cell::default(); 2], cursor).unwrap();
+        screen.graphics.images.push(crate::domain::KittyImage {
+            id: 7,
+            generation,
+            png: vec![1, 2, 3].into(),
+        });
+        screen
+    }
+
+    fn sent_image_generations(images: &[ServerMessage]) -> Vec<u64> {
+        images
+            .iter()
+            .map(|message| match message {
+                ServerMessage::KittyImage { image, .. } => {
+                    assert!(!image.is_reference());
+                    image.generation
+                }
+                other => panic!("expected kitty_image, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sent_images_deliver_pixels_once_and_screens_carry_references() {
+        let terminal_id = TerminalId::new();
+        let mut sent = SentImages::default();
+        let snapshot = |screen| ServerMessage::Snapshot {
+            terminal_id,
+            screen,
+        };
+
+        let mut first = snapshot(screen_with_image(1, 1));
+        assert_eq!(sent_image_generations(&sent.prepare(&mut first)), [1]);
+        let ServerMessage::Snapshot { screen, .. } = &first else {
+            unreachable!()
+        };
+        assert!(screen.graphics.images[0].is_reference());
+
+        // Unchanged pixels are never resent, including in copy-mode screens.
+        let mut repeat = snapshot(screen_with_image(2, 1));
+        assert!(sent.prepare(&mut repeat).is_empty());
+        let mut copy = ServerMessage::CopyModeSnapshot {
+            terminal_id,
+            screen: screen_with_image(3, 1),
+        };
+        assert!(sent.prepare(&mut copy).is_empty());
+
+        // A new generation is delivered; a delta without graphics changes
+        // nothing about what the client holds.
+        let mut delta = ServerMessage::SnapshotDelta {
+            terminal_id,
+            delta: ScreenDelta {
+                revision: 4,
+                base_revision: 3,
+                size: TerminalSize {
+                    columns: 2,
+                    rows: 1,
+                },
+                rows: Vec::new(),
+                hyperlinks: Vec::new(),
+                cursor: screen_with_image(4, 2).cursor,
+                scroll: Default::default(),
+                mouse_tracking: false,
+                graphics: Some(screen_with_image(4, 2).graphics),
+            },
+        };
+        assert_eq!(sent_image_generations(&sent.prepare(&mut delta)), [2]);
+        let ServerMessage::SnapshotDelta {
+            delta: sent_delta, ..
+        } = &delta
+        else {
+            unreachable!()
+        };
+        assert!(sent_delta.graphics.as_ref().unwrap().images[0].is_reference());
+
+        // The client prunes to the latest screen's images, so an earlier
+        // generation must be delivered again.
+        let mut previous = snapshot(screen_with_image(5, 1));
+        assert_eq!(sent_image_generations(&sent.prepare(&mut previous)), [1]);
+
+        // A forced full snapshot may target a client that discarded the pane.
+        sent.reset(terminal_id);
+        let mut forced = snapshot(screen_with_image(6, 1));
+        assert_eq!(sent_image_generations(&sent.prepare(&mut forced)), [1]);
     }
 
     #[tokio::test]
