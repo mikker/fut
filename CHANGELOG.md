@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Draw the rename prompt as a bordered dialog with its title in the border, a highlighted input field and key hints, using the configured `ui.styles` colors.
+- Draw the rename prompt in the same bordered dialog frame as the command palette and other dialogs.
 
 ## 0.34
 
