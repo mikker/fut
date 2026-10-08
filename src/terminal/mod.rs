@@ -4,6 +4,9 @@ mod ghostty;
 mod program_status;
 mod runtime;
 
+#[cfg(test)]
+pub(crate) use ghostty::KITTY_SNAPSHOT_BYTES;
+
 /// Scrollback storage budget per terminal, in bytes (allocated as history grows).
 pub const DEFAULT_SCROLLBACK_BYTES: usize = 100 * 1024 * 1024;
 

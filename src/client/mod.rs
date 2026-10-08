@@ -135,9 +135,9 @@ use ui_catalog::{UiCatalog, UiCatalogAction};
 
 use crate::{
     domain::{
-        CellColor, CellStyle, CursorShape, MouseButton, MouseButtons, MouseEvent, MouseEventKind,
-        MouseModifiers, MouseWheelDirection, ScreenDelta, ScreenSnapshot, ScrollPosition,
-        SessionId, SplitId, TerminalId, TerminalSize,
+        CellColor, CellStyle, CursorShape, KittyGraphics, KittyImage, MouseButton, MouseButtons,
+        MouseEvent, MouseEventKind, MouseModifiers, MouseWheelDirection, ScreenDelta,
+        ScreenSnapshot, ScrollPosition, SessionId, SplitId, TerminalId, TerminalSize,
     },
     protocol::{
         ClientMessage, ClientMode, Envelope, PROTOCOL_VERSION, SelectedTarget, SelectedView,
@@ -968,6 +968,9 @@ async fn stage_machine_view(
                 } => {
                     view.accept(terminal_id, screen);
                 }
+                ServerMessage::KittyImage { terminal_id, image } => {
+                    view.accept_kitty_image(terminal_id, image);
+                }
                 ServerMessage::Resources { snapshot, presence } => {
                     resources.accept_presence(presence);
                     resources.accept(snapshot);
@@ -1589,6 +1592,9 @@ async fn run_loop(
                             }
                             force_draw = true;
                         }
+                    }
+                    ServerMessage::KittyImage { terminal_id, image } => {
+                        view.accept_kitty_image(terminal_id, image);
                     }
                     ServerMessage::SnapshotDelta { terminal_id, delta } => {
                         match view.accept_delta(terminal_id, delta) {
@@ -6727,6 +6733,12 @@ struct ViewState {
     layout: SplitTree,
     zoomed: bool,
     resize_requests: HashMap<Uuid, TerminalId>,
+    /// Kitty image pixels delivered apart from the screens that reference
+    /// them, per terminal and keyed by (image ID, generation). Pruned in
+    /// step with the daemon's per-connection record (`SentImages`): after a
+    /// screen states its complete graphics, at least that screen's images
+    /// stay cached.
+    kitty_images: HashMap<TerminalId, HashMap<(u32, u64), KittyImage>>,
 }
 
 impl ViewState {
@@ -6740,6 +6752,7 @@ impl ViewState {
             layout: selected.layout.clone(),
             zoomed: false,
             resize_requests: HashMap::new(),
+            kitty_images: HashMap::new(),
         };
         view.replace(selected)?;
         Ok(view)
@@ -6882,10 +6895,69 @@ impl ViewState {
     }
 
     fn accept(&mut self, terminal_id: TerminalId, screen: ScreenSnapshot) -> bool {
+        self.retain_kitty_images(terminal_id, &screen.graphics);
         self.panes
             .iter_mut()
             .find(|pane| pane.target.terminal_id == terminal_id)
             .is_some_and(|pane| pane.accept(screen))
+    }
+
+    fn accept_kitty_image(&mut self, terminal_id: TerminalId, image: KittyImage) {
+        if image.is_reference() {
+            return;
+        }
+        self.kitty_images
+            .entry(terminal_id)
+            .or_default()
+            .insert((image.id, image.generation), image);
+    }
+
+    /// Drop cached pixels that neither `graphics`, a terminal's newly
+    /// received complete graphics, nor its current screen references, along
+    /// with caches for terminals no longer shown. Retaining both sides keeps
+    /// every image the daemon assumes this client holds, whether or not the
+    /// new screen is accepted.
+    fn retain_kitty_images(&mut self, terminal_id: TerminalId, graphics: &KittyGraphics) {
+        let panes = &self.panes;
+        self.kitty_images.retain(|cached_terminal, _| {
+            *cached_terminal == terminal_id
+                || panes
+                    .iter()
+                    .any(|pane| pane.target.terminal_id == *cached_terminal)
+        });
+        let Some(images) = self.kitty_images.get_mut(&terminal_id) else {
+            return;
+        };
+        let current = panes
+            .iter()
+            .find(|pane| pane.target.terminal_id == terminal_id)
+            .and_then(|pane| pane.pending.as_ref())
+            .map_or(&[][..], |screen| &screen.graphics.images[..]);
+        images.retain(|&(id, generation), _| {
+            graphics
+                .images
+                .iter()
+                .chain(current)
+                .any(|image| image.id == id && image.generation == generation)
+        });
+        if images.is_empty() {
+            self.kitty_images.remove(&terminal_id);
+        }
+    }
+
+    /// Pixels for `image` as referenced by `terminal_id`'s screen: the image
+    /// itself when its pixels are embedded, otherwise the cached delivery.
+    fn kitty_image<'a>(
+        &'a self,
+        terminal_id: TerminalId,
+        image: &'a KittyImage,
+    ) -> Option<&'a KittyImage> {
+        if !image.is_reference() {
+            return Some(image);
+        }
+        self.kitty_images
+            .get(&terminal_id)?
+            .get(&(image.id, image.generation))
     }
 
     fn mark_resize_requested(&mut self, terminal_id: TerminalId, request_id: Uuid) {
@@ -6948,6 +7020,9 @@ impl ViewState {
     /// returned at most once per run of unapplicable deltas, so a burst of
     /// mismatches can't spam the daemon with refresh requests.
     fn accept_delta(&mut self, terminal_id: TerminalId, delta: ScreenDelta) -> DeltaApplyResult {
+        if let Some(graphics) = &delta.graphics {
+            self.retain_kitty_images(terminal_id, graphics);
+        }
         let Some(pane) = self
             .panes
             .iter_mut()
@@ -8433,6 +8508,68 @@ mod tests {
         assert_eq!(cursor.shape, CursorShape::Underline);
         assert!(cursor.blinking);
         assert!(state.panes[0].pending.as_ref().unwrap().mouse_tracking);
+    }
+
+    #[test]
+    fn separately_delivered_kitty_images_resolve_until_no_screen_references_them() {
+        let target = targets(1).remove(0);
+        let terminal_id = target.terminal_id;
+        let mut state = ViewState::new(
+            Locality::Local,
+            selected_view(1, target.clone(), vec![target]),
+        )
+        .unwrap();
+        let image = |generation| KittyImage {
+            id: 7,
+            generation,
+            png: vec![1, 2, 3].into(),
+        };
+        let screen = |revision, generations: &[u64]| {
+            let mut screen = ScreenSnapshot::new(
+                revision,
+                TerminalSize {
+                    columns: 1,
+                    rows: 1,
+                },
+                vec![Cell::default()],
+                Cursor {
+                    column: 0,
+                    row: 0,
+                    visible: true,
+                    shape: CursorShape::Block,
+                    blinking: false,
+                },
+            )
+            .unwrap();
+            screen.graphics.images = generations
+                .iter()
+                .map(|generation| image(*generation).reference())
+                .collect();
+            screen
+        };
+        let resolves = |state: &ViewState, generation| {
+            state
+                .kitty_image(terminal_id, &image(generation).reference())
+                .is_some_and(|resolved| *resolved.png == [1, 2, 3])
+        };
+
+        // Embedded pixels resolve to themselves.
+        assert!(state.kitty_image(terminal_id, &image(1)).is_some());
+
+        state.accept_kitty_image(terminal_id, image(1));
+        assert!(state.accept(terminal_id, screen(1, &[1])));
+        assert!(resolves(&state, 1));
+
+        // A newer generation arrives before the screen that references it;
+        // the current screen's image survives until that screen replaces it.
+        state.accept_kitty_image(terminal_id, image(2));
+        assert!(state.accept(terminal_id, screen(2, &[2])));
+        assert!(resolves(&state, 2));
+        assert!(state.accept(terminal_id, screen(3, &[])));
+        assert!(resolves(&state, 2));
+        assert!(state.accept(terminal_id, screen(4, &[])));
+        assert!(!resolves(&state, 2));
+        assert!(state.kitty_images.is_empty());
     }
 
     #[test]

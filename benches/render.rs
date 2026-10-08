@@ -5,6 +5,10 @@
 //! - `encode`/`decode`: MessagePack wire cost of a full `ScreenSnapshot` per
 //!   frame
 //! - `clone`: the per-attached-client grid clone in the daemon fan-out
+//! - `scale`: the same per-frame costs at large-display grid sizes, up to
+//!   what a 5120x2160 display produces with small fonts. Sizes above
+//!   `MAX_VISIBLE_CELLS` are skipped so the file runs against older caps.
+//! - `graphics`: per-frame costs for a screen showing a Kitty image
 //!
 //! Run with `mise run perf:bench` (or `cargo bench --bench render`).
 //! Compare runs with `critcmp` or criterion's built-in baseline diffing:
@@ -12,9 +16,10 @@
 
 use std::fmt::Write;
 
+use base64::{Engine, engine::general_purpose::STANDARD};
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use fut::{
-    domain::{ScreenSnapshot, TerminalSize},
+    domain::{MAX_VISIBLE_CELLS, ScreenSnapshot, TerminalSize},
     protocol::{Envelope, ServerMessage, decode_payload, encode_payload},
     terminal::bench::VtBench,
 };
@@ -191,5 +196,186 @@ fn bench_wire(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_feed, bench_wire);
+/// Grid sizes a 5120x2160 display produces, from today's cell cap up to
+/// small fonts: (name, size).
+const SCALE_SIZES: [(&str, TerminalSize); 5] = [
+    ("200x50", LARGE),
+    (
+        "250x200",
+        TerminalSize {
+            columns: 250,
+            rows: 200,
+        },
+    ),
+    (
+        "508x160",
+        TerminalSize {
+            columns: 508,
+            rows: 160,
+        },
+    ),
+    (
+        "731x154",
+        TerminalSize {
+            columns: 731,
+            rows: 154,
+        },
+    ),
+    (
+        "833x180",
+        TerminalSize {
+            columns: 833,
+            rows: 180,
+        },
+    ),
+];
+
+fn snapshot_envelope(screen: ScreenSnapshot) -> Envelope<ServerMessage> {
+    Envelope {
+        request_id: None,
+        message: ServerMessage::Snapshot {
+            terminal_id: fut::domain::TerminalId::new(),
+            screen,
+        },
+    }
+}
+
+fn bench_scale(c: &mut Criterion) {
+    let mut group = c.benchmark_group("scale");
+    group.sample_size(20);
+    for (name, size) in SCALE_SIZES {
+        let cells = usize::from(size.columns) * usize::from(size.rows);
+        if cells > MAX_VISIBLE_CELLS {
+            eprintln!("scale/{name}: skipped, {cells} cells exceed cap {MAX_VISIBLE_CELLS}");
+            continue;
+        }
+        let frames: Vec<Vec<u8>> = (0..8).map(|phase| dense_frame(size, phase)).collect();
+        let mut vt = filled_terminal(size, &frames[0]);
+        let mut next = 0usize;
+        group.throughput(Throughput::Elements(cells as u64));
+        group.bench_function(format!("feed_dense_{name}"), |b| {
+            b.iter(|| {
+                next = (next + 1) % frames.len();
+                vt.feed(&frames[next]).expect("feed bench terminal")
+            })
+        });
+
+        let envelope = snapshot_envelope(dense_snapshot(size, 1));
+        let encoded = encode_payload(&envelope).expect("encode snapshot");
+        eprintln!("scale/{name}: dense frame {} bytes", encoded.len());
+        group.bench_function(format!("encode_dense_{name}"), |b| {
+            b.iter(|| encode_payload(&envelope).expect("encode snapshot"))
+        });
+        group.bench_function(format!("decode_dense_{name}"), |b| {
+            b.iter(|| decode_payload::<Envelope<ServerMessage>>(&encoded).expect("decode snapshot"))
+        });
+        group.bench_function(format!("clone_dense_{name}"), |b| {
+            b.iter(|| envelope.clone())
+        });
+    }
+    group.finish();
+}
+
+/// Deterministic noise so the PNG encoder cannot shrink the image much,
+/// approximating a photo or screenshot shown by an image previewer.
+fn noise_rgba(width: u32, height: u32) -> Vec<u8> {
+    let mut state = 0x2545_f491_u32;
+    (0..width * height * 4)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect()
+}
+
+/// Kitty graphics APC sequence transmitting and displaying one RGBA image
+/// across `columns`x`rows` cells, chunked as real clients send it.
+fn kitty_image(id: u32, width: u32, height: u32, columns: u16, rows: u16) -> Vec<u8> {
+    let payload = STANDARD.encode(noise_rgba(width, height));
+    let chunks: Vec<&[u8]> = payload.as_bytes().chunks(4096).collect();
+    let mut out = Vec::new();
+    for (index, chunk) in chunks.iter().enumerate() {
+        let more = u8::from(index + 1 < chunks.len());
+        if index == 0 {
+            write!(
+                out_string(&mut out),
+                "\x1b_Ga=T,f=32,s={width},v={height},q=2,c={columns},r={rows},i={id},m={more};"
+            )
+            .unwrap();
+        } else {
+            write!(out_string(&mut out), "\x1b_Gm={more};").unwrap();
+        }
+        out.extend_from_slice(chunk);
+        out.extend_from_slice(b"\x1b\\");
+    }
+    out
+}
+
+/// `write!` target appending UTF-8 to a byte buffer.
+fn out_string(out: &mut Vec<u8>) -> impl Write + '_ {
+    struct Bytes<'a>(&'a mut Vec<u8>);
+    impl Write for Bytes<'_> {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            self.0.extend_from_slice(s.as_bytes());
+            Ok(())
+        }
+    }
+    Bytes(out)
+}
+
+fn bench_graphics(c: &mut Criterion) {
+    let mut group = c.benchmark_group("graphics");
+    let mut vt = filled_terminal(LARGE, &styled_chunk(64 * 1024));
+    vt.feed(b"\x1b[H").expect("home cursor");
+    vt.feed(&kitty_image(1, 640, 480, 80, 30))
+        .expect("display image");
+    // A one-cell text update next to a still image: the common case for an
+    // image previewer or a TUI with an embedded picture.
+    let screen = vt
+        .feed(b"\x1b[40;100Hx")
+        .expect("feed bench terminal")
+        .expect("snapshot is published");
+    let previous = vt
+        .feed(b"\x1b[40;100Hy")
+        .expect("feed bench terminal")
+        .expect("snapshot is published");
+    // What the daemon writes for a full screen: image pixels travel once in
+    // their own `kitty_image` frame, so the screen carries references.
+    let mut wire_screen = screen.clone();
+    wire_screen.graphics.strip_pixels();
+    let envelope = snapshot_envelope(wire_screen);
+    let encoded = encode_payload(&envelope).expect("encode snapshot");
+    eprintln!("graphics/image_200x50: full frame {} bytes", encoded.len());
+
+    let mut toggle = false;
+    group.bench_function("feed_image_200x50", |b| {
+        b.iter(|| {
+            toggle = !toggle;
+            vt.feed(if toggle {
+                b"\x1b[40;100Hx"
+            } else {
+                b"\x1b[40;100Hy"
+            })
+            .expect("feed bench terminal")
+        })
+    });
+    group.bench_function("encode_image_200x50", |b| {
+        b.iter(|| encode_payload(&envelope).expect("encode snapshot"))
+    });
+    group.bench_function("decode_image_200x50", |b| {
+        b.iter(|| decode_payload::<Envelope<ServerMessage>>(&encoded).expect("decode snapshot"))
+    });
+    group.bench_function("clone_image_200x50", |b| b.iter(|| screen.clone()));
+    // The daemon checks whether graphics changed before every delta.
+    group.bench_function("graphics_eq_image_200x50", |b| {
+        b.iter(|| {
+            std::hint::black_box(&previous.graphics) == std::hint::black_box(&screen.graphics)
+        })
+    });
+    group.finish();
+}
+
+criterion_group!(benches, bench_feed, bench_wire, bench_scale, bench_graphics);
 criterion_main!(benches);

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Support terminals up to 150,000 cells, enough for 5K displays, and stop resending unchanged inline images with every full screen.
+
 ## 0.34
 
 - Accept Ctrl-Space as a configurable prefix, binding, or hotkey.

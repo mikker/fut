@@ -3,6 +3,8 @@
 //! These types deliberately contain no PTY, terminal-emulator, transport, or
 //! presentation-library types.
 
+use std::sync::Arc;
+
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
@@ -40,16 +42,27 @@ pub fn parse_id(value: &str) -> Result<Uuid, IdParseError> {
 ///
 /// This is deliberately independent of the transport frame limit: validating
 /// dimensions before constructing a grid prevents hostile `u16` dimensions
-/// from driving multi-gigabyte allocations.
-pub const MAX_VISIBLE_CELLS: usize = 50_000;
+/// from driving multi-gigabyte allocations. The bound is also sized so the
+/// worst-case screen still fits one frame: at most about 50 bytes per fully
+/// styled, selected, hyperlinked cell, plus [`MAX_SCREEN_HYPERLINK_BYTES`]
+/// and [`MAX_KITTY_PLACEMENTS`] worth of image references. Kitty image
+/// pixels travel in their own frames, so they do not share this budget.
+pub const MAX_VISIBLE_CELLS: usize = 150_000;
+/// Visible-cell bound for remote peers that did not negotiate
+/// `large-screens.v1`. Generation-1 screens embed Kitty image pixels and were
+/// frozen with this bound, so those peers must never see a larger grid.
+pub const LEGACY_MAX_VISIBLE_CELLS: usize = 50_000;
+/// Maximum Kitty placements carried in one screen. Bounds the image
+/// references and placements that share a screen's frame with its cells.
+pub const MAX_KITTY_PLACEMENTS: usize = 1024;
 /// Maximum UTF-8 bytes retained for one serialized terminal cell.
 ///
 /// Cell contents are also constrained to one control-free grapheme, and the
 /// wire format (MessagePack) stores strings as raw length-prefixed bytes
-/// with no escaping overhead. At 32 bytes, 50,000 fully styled and selected
-/// cells still fit below the protocol's eight-MiB limit, while ordinary
-/// emoji clusters remain exact. Pathological combining sequences are
-/// represented by a fixed marker.
+/// with no escaping overhead. At 32 bytes, [`MAX_VISIBLE_CELLS`] fully
+/// styled, selected, hyperlinked cells still fit below the protocol's
+/// eight-MiB limit, while ordinary emoji clusters remain exact. Pathological
+/// combining sequences are represented by a fixed marker.
 pub const MAX_CELL_CONTENT_BYTES: usize = 32;
 pub const OVERSIZED_CELL_CONTENT_MARKER: &str = "�";
 /// Maximum UTF-8 bytes retained for one explicit OSC 8 hyperlink URI.
@@ -677,16 +690,26 @@ impl TerminalSize {
         self.cell_count().map(|_| ())
     }
 
+    /// Validate against a tighter peer-specific bound such as
+    /// [`LEGACY_MAX_VISIBLE_CELLS`].
+    pub fn validate_within(self, maximum: usize) -> Result<(), TerminalSizeError> {
+        self.cell_count_within(maximum).map(|_| ())
+    }
+
     pub fn cell_count(self) -> Result<usize, TerminalSizeError> {
+        self.cell_count_within(MAX_VISIBLE_CELLS)
+    }
+
+    fn cell_count_within(self, maximum: usize) -> Result<usize, TerminalSizeError> {
         if self.columns == 0 || self.rows == 0 {
             return Err(TerminalSizeError::Empty);
         }
 
         let count = usize::from(self.columns) * usize::from(self.rows);
-        if count > MAX_VISIBLE_CELLS {
+        if count > maximum.min(MAX_VISIBLE_CELLS) {
             return Err(TerminalSizeError::TooLarge {
                 actual: count,
-                maximum: MAX_VISIBLE_CELLS,
+                maximum: maximum.min(MAX_VISIBLE_CELLS),
             });
         }
         Ok(count)
@@ -1053,14 +1076,53 @@ pub struct ScrollPosition {
 /// A decoded Kitty image, recompressed as PNG for transport to attached
 /// clients. Image generations are process-wide libghostty stamps and let a
 /// client avoid retransmitting unchanged pixels to its host terminal.
+///
+/// Pixels are shared, so cloning a screen never copies them. Connections
+/// that negotiated separate image frames receive screens whose images have
+/// an empty `png`: a reference to pixels delivered earlier in a
+/// `kitty_image` message.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct KittyImage {
     #[serde(rename = "i")]
     pub id: u32,
     #[serde(rename = "g")]
     pub generation: u64,
-    #[serde(rename = "d", with = "serde_bytes")]
-    pub png: Vec<u8>,
+    #[serde(rename = "d", with = "shared_bytes")]
+    pub png: Arc<[u8]>,
+}
+
+impl KittyImage {
+    /// The same image without its pixels, for screens whose images travel
+    /// in separate frames.
+    #[must_use]
+    pub fn reference(&self) -> Self {
+        Self {
+            id: self.id,
+            generation: self.generation,
+            png: Arc::from([]),
+        }
+    }
+
+    #[must_use]
+    pub fn is_reference(&self) -> bool {
+        self.png.is_empty()
+    }
+}
+
+/// MessagePack binary for shared byte buffers, matching `serde_bytes`.
+mod shared_bytes {
+    use std::sync::Arc;
+
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &Arc<[u8]>, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(bytes)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Arc<[u8]>, D::Error> {
+        let bytes: serde_bytes::ByteBuf = serde::Deserialize::deserialize(deserializer)?;
+        Ok(Arc::from(bytes.into_vec()))
+    }
 }
 
 /// One visible, non-placeholder Kitty placement in terminal-grid space.
@@ -1102,6 +1164,13 @@ impl KittyGraphics {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.placements.is_empty()
+    }
+
+    /// Replace every image with a pixel-free reference.
+    pub fn strip_pixels(&mut self) {
+        for image in &mut self.images {
+            *image = image.reference();
+        }
     }
 }
 
@@ -1669,7 +1738,7 @@ mod tests {
             images: vec![KittyImage {
                 id: 7,
                 generation: 4,
-                png: vec![1, 2, 3],
+                png: vec![1, 2, 3].into(),
             }],
             placements: vec![KittyPlacement {
                 image_id: 7,
@@ -1737,7 +1806,7 @@ mod tests {
             images: vec![KittyImage {
                 id: 1,
                 generation: 1,
-                png: vec![1],
+                png: vec![1].into(),
             }],
             placements: Vec::new(),
         };
@@ -1750,7 +1819,7 @@ mod tests {
             images: vec![KittyImage {
                 id: 2,
                 generation: 2,
-                png: vec![2],
+                png: vec![2].into(),
             }],
             placements: Vec::new(),
         };

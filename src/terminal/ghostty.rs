@@ -32,18 +32,21 @@ use super::{
 use crate::domain::{
     Cell, CellColor, CellStyle, ClientId, CopyModeAction, CopyModeError, CopyModeMovement, Cursor,
     CursorShape, KittyGraphics, KittyImage, KittyPlacement, MAX_COPY_BYTES, MAX_COPY_CELLS,
-    MAX_HYPERLINK_URI_BYTES, MAX_SCREEN_HYPERLINK_BYTES, MAX_SEARCH_CELL_CODEPOINTS,
-    MAX_SEARCH_CELLS, MAX_SEARCH_QUERY_BYTES, MAX_SEARCH_TEXT_BYTES, MAX_TERMINAL_OUTPUT_BYTES,
-    MAX_TERMINAL_OUTPUT_CELLS, MAX_TERMINAL_OUTPUT_ROWS, MouseButton, MouseEvent, MouseEventKind,
-    MouseModifiers, MouseWheelDirection, Rgb, ScreenSnapshot, SearchDirection, TerminalKeyAction,
-    TerminalKeyCode, TerminalKeyEvent, TerminalOutputSource, TerminalSize,
+    MAX_HYPERLINK_URI_BYTES, MAX_KITTY_PLACEMENTS, MAX_SCREEN_HYPERLINK_BYTES,
+    MAX_SEARCH_CELL_CODEPOINTS, MAX_SEARCH_CELLS, MAX_SEARCH_QUERY_BYTES, MAX_SEARCH_TEXT_BYTES,
+    MAX_TERMINAL_OUTPUT_BYTES, MAX_TERMINAL_OUTPUT_CELLS, MAX_TERMINAL_OUTPUT_ROWS, MouseButton,
+    MouseEvent, MouseEventKind, MouseModifiers, MouseWheelDirection, Rgb, ScreenSnapshot,
+    SearchDirection, TerminalKeyAction, TerminalKeyCode, TerminalKeyEvent, TerminalOutputSource,
+    TerminalSize,
 };
 
 const SYNCHRONIZED_OUTPUT_TIMEOUT: Duration = Duration::from_secs(1);
 const MOUSE_WHEEL_LINES: isize = 3;
 const KITTY_IMAGE_STORAGE_BYTES: u64 = 16 * 1024 * 1024;
 const KITTY_APC_BYTES: usize = 24 * 1024 * 1024;
-const KITTY_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
+/// PNG bytes retained for one screen's images; any single image sent in a
+/// `kitty_image` frame is therefore at most this large.
+pub(crate) const KITTY_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
 
 pub(crate) enum MouseInputOutcome {
     Handled,
@@ -162,7 +165,7 @@ pub(super) struct GhosttyTerminal {
     mouse_encoder: mouse::Encoder<'static>,
     mouse_event: mouse::Event<'static>,
     kitty_placements: PlacementIterator<'static>,
-    kitty_png_cache: HashMap<u64, Vec<u8>>,
+    kitty_png_cache: HashMap<u64, Arc<[u8]>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     bell_count: Arc<AtomicU64>,
     program_status_scanner: program_status::Scanner,
@@ -1604,6 +1607,11 @@ impl GhosttyTerminal {
             if !info.viewport_visible || info.grid_cols == 0 || info.grid_rows == 0 {
                 continue;
             }
+            // Placements share the screen's frame with its cells; beyond
+            // this bound the rest are not shown.
+            if placements.len() == MAX_KITTY_PLACEMENTS {
+                break;
+            }
             image_ids.push(image_id);
             placements.push(KittyPlacement {
                 image_id,
@@ -1633,12 +1641,13 @@ impl GhosttyTerminal {
             let png = if let Some(cached) = self.kitty_png_cache.get(&image_generation) {
                 cached.clone()
             } else {
-                let encoded = encode_kitty_png(
+                let encoded: Arc<[u8]> = encode_kitty_png(
                     image.width()?,
                     image.height()?,
                     image.format()?,
                     image.data()?,
-                )?;
+                )?
+                .into();
                 self.kitty_png_cache
                     .insert(image_generation, encoded.clone());
                 encoded
