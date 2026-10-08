@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Draw the rename prompt in the same bordered dialog frame as the command palette and other dialogs.
+
 ## 0.34
 
 - Accept Ctrl-Space as a configurable prefix, binding, or hotkey.

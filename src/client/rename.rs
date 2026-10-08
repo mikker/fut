@@ -10,10 +10,14 @@ use uuid::Uuid;
 
 use crate::{protocol::RenameSelector, resources::ResourceSnapshot};
 
-use super::chrome::{sanitize, truncate};
+use super::{
+    chrome::{sanitize, truncate},
+    dialog::{dialog_area, render_footer, render_frame, render_title},
+};
 
 const MAX_NAME_BYTES: usize = 512;
 const MAX_WIDTH: u16 = 52;
+const HEIGHT: u16 = 5;
 
 pub(super) struct RenameState {
     selector: RenameSelector,
@@ -161,14 +165,16 @@ impl RenameState {
     }
 
     pub fn render(&self, host: Rect, buffer: &mut Buffer) {
-        let area = rename_area(host);
+        let area = render_frame(dialog_area(host, MAX_WIDTH, HEIGHT), buffer);
         if area.width == 0 || area.height == 0 {
             return;
         }
-        clear(area, buffer);
         let width = usize::from(area.width);
-        let title = truncate(&format!(" Rename {}", self.kind), width);
-        buffer.set_stringn(area.x, area.y, title, width, title_style());
+        render_title(
+            area,
+            &truncate(&format!(" Rename {}", self.kind), width),
+            buffer,
+        );
         if area.height >= 2 {
             let available = width.saturating_sub(4);
             let name = trailing_view(&sanitize(&self.name), available);
@@ -202,13 +208,7 @@ impl RenameState {
             } else {
                 " enter rename · esc cancel"
             };
-            buffer.set_stringn(
-                area.x,
-                area.y + area.height - 1,
-                truncate(status, width),
-                width,
-                muted_style(),
-            );
+            render_footer(area, &truncate(status, width), buffer);
         }
     }
 
@@ -265,36 +265,6 @@ fn trailing_view(value: &str, width: usize) -> String {
     format!("…{}", suffix.concat())
 }
 
-fn rename_area(host: Rect) -> Rect {
-    let width = host.width.min(MAX_WIDTH);
-    let height = host.height.min(3);
-    Rect::new(
-        host.x.saturating_add(host.width.saturating_sub(width) / 2),
-        host.y
-            .saturating_add(host.height.saturating_sub(height) / 2),
-        width,
-        height,
-    )
-}
-
-fn clear(area: Rect, buffer: &mut Buffer) {
-    for row in area.y..area.y.saturating_add(area.height) {
-        for column in area.x..area.x.saturating_add(area.width) {
-            if let Some(cell) = buffer.cell_mut((column, row)) {
-                cell.reset();
-            }
-        }
-    }
-}
-
-fn title_style() -> Style {
-    Style::default().add_modifier(Modifier::BOLD)
-}
-
-fn muted_style() -> Style {
-    Style::default().add_modifier(Modifier::DIM)
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -307,6 +277,50 @@ mod tests {
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn render_draws_the_shared_dialog_frame() {
+        let rename = RenameState::open(
+            RenameSelector::Workspace(WorkspaceId::new()),
+            "workspace",
+            "main".into(),
+        );
+        let host = Rect::new(0, 0, 60, 20);
+        let mut buffer = Buffer::empty(host);
+        rename.render(host, &mut buffer);
+
+        let row = |y: u16| -> String {
+            (4..56)
+                .map(|x| buffer[(x, y)].symbol().to_owned())
+                .collect()
+        };
+        assert!(row(5).starts_with("╭─") && row(5).ends_with("─╮"));
+        assert!(row(6).starts_with("│ Rename workspace"));
+        assert!(buffer[(5, 6)].modifier.contains(Modifier::REVERSED));
+        assert!(row(7).starts_with("│ > main"));
+        assert!(row(8).starts_with("│ enter rename · esc cancel"));
+        assert!(row(9).starts_with("╰─") && row(9).ends_with("─╯"));
+    }
+
+    #[test]
+    fn render_keeps_the_title_and_input_on_a_short_host() {
+        let rename = RenameState::open(
+            RenameSelector::Workspace(WorkspaceId::new()),
+            "workspace",
+            "main".into(),
+        );
+        let host = Rect::new(0, 0, 60, 2);
+        let mut buffer = Buffer::empty(host);
+        rename.render(host, &mut buffer);
+
+        let row = |y: u16| -> String {
+            (4..56)
+                .map(|x| buffer[(x, y)].symbol().to_owned())
+                .collect()
+        };
+        assert!(row(0).starts_with(" Rename workspace"));
+        assert!(row(1).starts_with(" > main"));
     }
 
     #[test]
