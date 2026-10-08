@@ -292,10 +292,30 @@ is the worst case for construction cost:
 | 731x154 | 112,574 | 1.35 MB | 24.8 ms | 1.7 ms | 7.1 ms | 484 µs |
 | 833x180 | 149,940 | 1.80 MB | 32.1 ms | 2.3 ms | 9.8 ms | 669 µs |
 
-At these sizes, full-screen animation exceeds the 8 ms publication interval;
-ordinary text output does not approach it. Making capture proportional to the
-changed area (bottleneck 1 above) is the next step for such workloads before
-row-chunked screens would lift the cap further.
+Splitting `feed` shows the dense cost is mostly libghostty parsing the
+program's output, not Fut's screen construction:
+
+| 508x160 | dense animation | plain scrolling |
+| --- | ---: | ---: |
+| PTY bytes per frame | 2.96 MB | 64 KiB chunk |
+| parse only | 12.1 ms | — |
+| snapshot construction only | 2.3 ms | 1.4 ms |
+| feed (parse + snapshot) | ~18 ms | 1.6 ms |
+| full screen frame / client decode | 975 KB / 5.2 ms | 163 KB / 1.9 ms |
+
+At 833x180 the split is 22.4 ms parse and 4.2 ms construction (dense), and
+2.6 ms feed with a 3.3 ms decode (plain). Dense animation exceeds the 8 ms
+publication interval because of input volume, which any emulator must parse;
+pacing then lowers the frame rate while bounded queues apply backpressure, so
+lag does not accumulate. Capture proportional to the changed area would save
+only the 2–4 ms construction share.
+
+The larger cost at these sizes is scrolling: every row shifts, so deltas fall
+back to full screens. A flood at 508x160 can send 163 KB up to 125 times per
+second (about 20 MB/s, and roughly 25% of a core decoding on the client).
+Scroll-aware deltas that shift retained rows would remove most of that, and
+come before row-chunked screens lift the cap further. Client draw cost at
+these sizes is not yet measured.
 
 ### External multiplexer baseline (2026-08-10)
 

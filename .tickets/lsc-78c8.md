@@ -2,7 +2,7 @@
 id: lsc-78c8
 status: open
 deps: []
-links: []
+links: [lsc-9ea8]
 created: 2026-10-08T02:41:43Z
 type: feature
 priority: 3
@@ -17,4 +17,4 @@ Send full screens (and large deltas) as row-range chunks tied to one revision, c
 
 ## Acceptance Criteria
 
-Grids beyond 150,000 cells attach and render; no frame exceeds MAX_FRAME_LEN; older remote peers keep their bounds. Benchmarks first show screen construction cost (not frame size) is acceptable at that scale; see PERF.md full-grid rebuild notes.
+Grids beyond 150,000 cells attach and render; no frame exceeds MAX_FRAME_LEN; older remote peers keep their bounds. Do this after scroll-aware deltas: at 150,000 cells, full-screen sends during scrolling, not frame size or snapshot construction, dominate cost (PERF.md Round 7).
