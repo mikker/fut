@@ -96,7 +96,8 @@ is read to EOF and submitted with the same atomic paste-and-Enter behavior.
 report. A blocked report is a successful structured outcome. Standalone
 `agent wait` returns an already settled agent immediately or waits for a
 currently working one. Stable failures include `not_an_agent`, `agent_busy`,
-`agent_timeout`, `agent_events_lagged`, and `terminal_exited`.
+`agent_timeout`, `agent_events_lagged`, `terminal_exited`, and
+`input_backlog_full`, which means the program has stopped reading its input.
 
 Read bounded terminal output together with the agent's current state and
 `available` flag:

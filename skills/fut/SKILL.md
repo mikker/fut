@@ -179,7 +179,9 @@ fut --json agent wait "$terminal_id" --timeout 2m
 
 Standalone `agent wait` may return an already settled state immediately. It does
 not establish a fresh prompt barrier. Treat `not_an_agent`, `agent_busy`,
-`agent_timeout`, `agent_events_lagged`, and `terminal_exited` as typed failures.
+`agent_timeout`, `agent_events_lagged`, `terminal_exited`, and
+`input_backlog_full` (the program has stopped reading its input) as typed
+failures.
 
 ## Report lifecycle from an integration
 
