@@ -5409,12 +5409,9 @@ async fn open_location_without_recipe(
     program: Option<PathBuf>,
     argv: Vec<String>,
 ) -> Result<(SelectedTarget, OpenDisposition), DaemonError> {
-    let program = match program {
-        Some(program) => program,
-        None => shared.lock().await.default_shell.clone(),
-    };
     let (terminal, selected, disposition, insertion_error) = {
         let mut state = shared.lock().await;
+        let program = program.unwrap_or_else(|| state.default_shell.clone());
         if !state.accepting {
             return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
         }
@@ -5686,13 +5683,9 @@ async fn create_workspace(
     };
     let cwd = resolve_creation_cwd(&source_root, cwd, inherited_cwd).await?;
     let root = cwd.clone();
-    let program = match program {
-        Some(program) => program,
-        None => shared.lock().await.default_shell.clone(),
-    };
-
     let (terminal, creation) = {
         let mut state = shared.lock().await;
+        let program = program.unwrap_or_else(|| state.default_shell.clone());
         if !state.accepting {
             return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
         }
@@ -5823,13 +5816,9 @@ async fn create_tab(
         state.resources.workspace_root(workspace_id)?.to_path_buf()
     };
     let cwd = resolve_creation_cwd(&root, cwd, inherited_cwd).await?;
-    let program = match program {
-        Some(program) => program,
-        None => shared.lock().await.default_shell.clone(),
-    };
-
     let (terminal, creation) = {
         let mut state = shared.lock().await;
+        let program = program.unwrap_or_else(|| state.default_shell.clone());
         if !state.accepting {
             return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
         }
@@ -5984,13 +5973,9 @@ async fn create_pane(
         (workspace_id, session_id, root, inherited_cwd)
     };
     let cwd = resolve_creation_cwd(&root, cwd, inherited_cwd).await?;
-    let program = match program {
-        Some(program) => program,
-        None => shared.lock().await.default_shell.clone(),
-    };
-
     let (terminal, creation) = {
         let mut state = shared.lock().await;
+        let program = program.unwrap_or_else(|| state.default_shell.clone());
         if !state.accepting {
             return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
         }
