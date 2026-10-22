@@ -3570,6 +3570,28 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_shift_letters_reach_kitty_apps_with_shift() {
+        let (mut terminal, output) = recording_terminal(10, 4);
+        // pi requests disambiguate | report events | report alternate keys.
+        terminal.feed(b"\x1b[>7u").unwrap().unwrap();
+        take_output(&output);
+        terminal
+            .key_input(TerminalKeyEvent {
+                code: TerminalKeyCode::Character('C'),
+                modifiers: crate::domain::TerminalKeyModifiers {
+                    shift: true,
+                    control: true,
+                    ..Default::default()
+                },
+                action: TerminalKeyAction::Press,
+                text: Some("C".into()),
+            })
+            .unwrap();
+        // Matches what Ghostty itself sends for ctrl+shift+c.
+        assert_eq!(take_output(&output), b"\x1b[99:67;6u");
+    }
+
+    #[test]
     fn structured_keyboard_events_retain_the_complete_legacy_fallback() {
         let (mut terminal, output) = recording_terminal(10, 4);
         let event = |code, modifiers, action, text: Option<&str>| TerminalKeyEvent {

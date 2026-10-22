@@ -47,8 +47,12 @@ pub(crate) fn terminal_key_event(key: KeyEvent) -> Option<TerminalKeyEvent> {
     Some(TerminalKeyEvent {
         code,
         modifiers: TerminalKeyModifiers {
+            // With the kitty alternate-keys flag, crossterm swaps in the
+            // shifted codepoint and clears SHIFT. Caps Lock leaves the base
+            // codepoint alone, so an uppercase letter still means Shift.
             shift: key.modifiers.contains(KeyModifiers::SHIFT)
-                || matches!(key.code, KeyCode::BackTab),
+                || matches!(key.code, KeyCode::BackTab)
+                || matches!(key.code, KeyCode::Char(character) if character.is_uppercase()),
             control: key.modifiers.contains(KeyModifiers::CONTROL),
             alt: key.modifiers.contains(KeyModifiers::ALT),
             super_key: key
@@ -305,6 +309,34 @@ mod tests {
         assert_eq!(
             terminal_key_event(release).map(|event| event.action),
             Some(TerminalKeyAction::Release)
+        );
+    }
+
+    #[test]
+    fn restores_shift_that_crossterm_drops_from_shifted_letters() {
+        // Crossterm reports kitty `CSI 99:67;6u` (ctrl+shift+c) like this.
+        assert_eq!(
+            terminal_key_event(key(KeyCode::Char('C'), KeyModifiers::CONTROL)),
+            Some(TerminalKeyEvent {
+                code: TerminalKeyCode::Character('C'),
+                modifiers: TerminalKeyModifiers {
+                    shift: true,
+                    control: true,
+                    ..Default::default()
+                },
+                action: TerminalKeyAction::Press,
+                text: Some("C".into()),
+            })
+        );
+        let shift =
+            |code| terminal_key_event(key(code, KeyModifiers::NONE)).map(|e| e.modifiers.shift);
+        assert_eq!(shift(KeyCode::Char('A')), Some(true));
+        assert_eq!(shift(KeyCode::Char('a')), Some(false));
+        assert_eq!(shift(KeyCode::Char('!')), Some(false));
+        assert_eq!(
+            terminal_key_event(key(KeyCode::Char('c'), KeyModifiers::CONTROL))
+                .map(|e| e.modifiers.shift),
+            Some(false)
         );
     }
 
