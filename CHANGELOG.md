@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Keep Shift on Ctrl+Shift+letter shortcuts, so apps in a pane, such as pi, receive `ctrl+shift+c` as they do outside Fut.
+
 ## 0.39
 
 - Let compatible Fut clients and daemons from different releases keep working together without restarting terminals; daemons predating this handshake need one explicit restart.
