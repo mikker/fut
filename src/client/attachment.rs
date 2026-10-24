@@ -15,7 +15,10 @@ pub(super) enum Locality {
 
 #[derive(Clone, Debug)]
 pub(super) enum Attachment {
-    Local(PathBuf),
+    Local {
+        socket: PathBuf,
+        pane_titles: bool,
+    },
     Remote {
         capabilities: Capabilities,
         target: String,
@@ -51,7 +54,7 @@ impl Attachment {
 
     pub(super) fn command_generation(&self) -> Option<uuid::Uuid> {
         match self {
-            Self::Local(_) => None,
+            Self::Local { .. } => None,
             Self::Remote { commands, .. } => Some(commands.generation),
         }
     }
@@ -88,7 +91,7 @@ impl Attachment {
 
     pub(super) fn supports_terminal_colors(&self) -> bool {
         match self {
-            Self::Local(_) => true,
+            Self::Local { .. } => true,
             Self::Remote { capabilities, .. } => {
                 capabilities.contains(crate::protocol::remote::Capability::TerminalColors)
             }
@@ -97,16 +100,25 @@ impl Attachment {
 
     pub(super) fn supports_attachments(&self) -> bool {
         match self {
-            Self::Local(_) => true,
+            Self::Local { .. } => true,
             Self::Remote { capabilities, .. } => {
                 capabilities.contains(crate::protocol::remote::Capability::Attachments)
             }
         }
     }
 
+    pub(super) fn supports_pane_titles(&self) -> bool {
+        match self {
+            Self::Local { pane_titles, .. } => *pane_titles,
+            Self::Remote { capabilities, .. } => {
+                capabilities.contains(crate::protocol::remote::Capability::PaneTitles)
+            }
+        }
+    }
+
     pub(super) fn blocked_command(&self) -> Option<&'static str> {
         match self {
-            Self::Local(_) => None,
+            Self::Local { .. } => None,
             Self::Remote { capabilities, .. }
                 if capabilities
                     .contains(crate::protocol::remote::Capability::ConfiguredCommands) =>
@@ -121,14 +133,14 @@ impl Attachment {
 
     pub(super) fn locality(&self) -> Locality {
         match self {
-            Self::Local(_) => Locality::Local,
+            Self::Local { .. } => Locality::Local,
             Self::Remote { .. } => Locality::Remote,
         }
     }
 
     pub(super) fn local_socket(&self) -> anyhow::Result<&Path> {
         match self {
-            Self::Local(path) => Ok(path.as_path()),
+            Self::Local { socket, .. } => Ok(socket.as_path()),
             Self::Remote { .. } => {
                 anyhow::bail!("local commands unavailable during remote attachment")
             }
@@ -170,7 +182,7 @@ impl Attachment {
     ) -> anyhow::Result<Option<crate::extensions::ClientHookRuntime>> {
         match self {
             Self::Remote { .. } => Ok(None),
-            Self::Local(socket) => Ok(Some(crate::extensions::ClientHookRuntime::new(
+            Self::Local { socket, .. } => Ok(Some(crate::extensions::ClientHookRuntime::new(
                 ui.extensions.clone(),
                 std::env::current_exe()?,
                 socket.to_owned(),
@@ -190,11 +202,30 @@ mod tests {
         assert!(legacy.blocked_command().is_some());
         assert!(current.blocked_command().is_none());
         assert!(
-            Attachment::Local("/tmp/fut.sock".into())
-                .blocked_command()
-                .is_none()
+            Attachment::Local {
+                socket: "/tmp/fut.sock".into(),
+                pane_titles: false
+            }
+            .blocked_command()
+            .is_none()
         );
         assert_ne!(legacy.command_generation(), current.command_generation());
+    }
+
+    #[test]
+    fn pane_renaming_requires_explicit_selection_on_both_endpoints() {
+        let mut local = Attachment::Local {
+            socket: "/tmp/fut.sock".into(),
+            pane_titles: false,
+        };
+        assert!(!local.supports_pane_titles());
+        let Attachment::Local { pane_titles, .. } = &mut local else {
+            unreachable!()
+        };
+        *pane_titles = true;
+        assert!(local.supports_pane_titles());
+        assert!(!Attachment::remote(Capabilities::default(), "old-host").supports_pane_titles());
+        assert!(Attachment::remote(Capabilities::ALL, "new-host").supports_pane_titles());
     }
 
     #[tokio::test]
@@ -211,7 +242,13 @@ mod tests {
 
     #[test]
     fn image_paste_requires_remote_attachment_negotiation_but_is_available_locally() {
-        assert!(Attachment::Local(PathBuf::from("/tmp/fut.sock")).supports_attachments());
+        assert!(
+            Attachment::Local {
+                socket: PathBuf::from("/tmp/fut.sock"),
+                pane_titles: false
+            }
+            .supports_attachments()
+        );
         assert!(!Attachment::remote(Capabilities::default(), "old-host").supports_attachments());
         assert!(Attachment::remote(Capabilities::ALL, "new-host").supports_attachments());
     }

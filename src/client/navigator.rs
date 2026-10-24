@@ -1206,8 +1206,17 @@ fn flatten_optional(
                     tree_prefix: String::new(),
                     label: tab_label,
                     inline_pane: single_pane.map(|pane| pane.id),
-                    search_path: single_pane
-                        .map_or_else(|| tab_path.clone(), |_| format!("{tab_path} › pane")),
+                    search_path: single_pane.map_or_else(
+                        || tab_path.clone(),
+                        |pane| {
+                            let name = pane
+                                .name
+                                .as_deref()
+                                .filter(|name| !name.is_empty())
+                                .unwrap_or("pane");
+                            format!("{tab_path} › {name}")
+                        },
+                    ),
                     current: tab_current,
                     closing: tab_row_closing,
                     destination: (!tab_row_closing)
@@ -1221,6 +1230,12 @@ fn flatten_optional(
                 }
                 for (index, pane) in tab.panes.iter().enumerate() {
                     let pane_closing = tab_closing || pane.closing;
+                    let label = pane
+                        .name
+                        .as_ref()
+                        .filter(|name| !name.is_empty())
+                        .cloned()
+                        .unwrap_or_else(|| format!("pane {}", index + 1));
                     rows.push(NavigatorRow {
                         key: ResourceKey::Pane(pane.id),
                         session_id: session.id,
@@ -1230,9 +1245,9 @@ fn flatten_optional(
                         selectable: !pane_closing,
                         depth: workspace_depth.saturating_add(2),
                         tree_prefix: String::new(),
-                        label: format!("pane {}", index + 1),
+                        search_path: format!("{tab_path} › {label}"),
+                        label,
                         inline_pane: None,
-                        search_path: format!("{tab_path} › pane {}", index + 1),
                         current: Some(pane.id) == current_pane_id,
                         closing: pane_closing,
                         destination: (!pane_closing).then_some(pane.id),
@@ -1268,6 +1283,24 @@ mod tests {
             PaneSnapshot, Project, ProjectIdentity, SessionSnapshot, TabSnapshot, WorkspaceSnapshot,
         },
     };
+
+    #[test]
+    fn named_panes_are_identifiable_and_searchable_in_the_navigator() {
+        let (mut snapshot, current, _) = fixture();
+        snapshot.sessions[0].workspaces[0].tabs[0].panes[0].name = Some("Review issue #25".into());
+        let rows = flatten(&snapshot, &current);
+        assert!(
+            rows.iter().any(|row| row.label == "Review issue #25"
+                && row.search_path.contains("Review issue #25"))
+        );
+        snapshot.sessions[0].workspaces[0].tabs[0].panes.truncate(1);
+        let rows = flatten(&snapshot, &current);
+        assert!(
+            rows.iter().any(
+                |row| row.inline_pane.is_some() && row.search_path.contains("Review issue #25")
+            )
+        );
+    }
 
     #[test]
     fn federated_rows_are_qualified_and_stale_machines_cannot_be_selected() {
@@ -1503,6 +1536,7 @@ mod tests {
                                 PaneSnapshot {
                                     tokens: Default::default(),
                                     id: current_pane,
+                                    name: None,
                                     terminal_id: current_terminal,
                                     closing: false,
                                     activity: Default::default(),
@@ -1512,6 +1546,7 @@ mod tests {
                                 PaneSnapshot {
                                     tokens: Default::default(),
                                     id: other_pane,
+                                    name: None,
                                     terminal_id: TerminalId::new(),
                                     closing: true,
                                     activity: Default::default(),

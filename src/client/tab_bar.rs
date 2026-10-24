@@ -377,6 +377,7 @@ mod tests {
                 panes: vec![PaneSnapshot {
                     tokens: Default::default(),
                     id: first_pane,
+                    name: None,
                     terminal_id: first_terminal,
                     closing: false,
                     activity: Default::default(),
@@ -393,6 +394,7 @@ mod tests {
                 panes: vec![PaneSnapshot {
                     tokens: Default::default(),
                     id: second_pane,
+                    name: None,
                     terminal_id: second_terminal,
                     closing: false,
                     activity: Default::default(),

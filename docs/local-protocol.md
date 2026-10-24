@@ -40,9 +40,25 @@ engine or an unlimited promise to support every past release. Compatible app
 releases retain generation 1 and `local.v1`, so updating a client alone need not
 interrupt running terminals.
 
-Only `local.v1` is selectable today. The first optional local feature must extend
-the capability representation, selection validation and boundary allowlists; the
-handshake's optional list is not permission to emit unrecognized behavior.
+`local.v1` is required. Clients can also offer `pane-titles.v1`.
+When selected, pane snapshots include `name`, or `""` for an unnamed pane.
+`rename_target` accepts a `pane` selector. The contextual `rename_pane` command
+renames the calling terminal's pane. The existing contextual `rename` command
+still rejects `scope: pane`.
+
+Pane names are plain text shared by clients. Names use at most 512 UTF-8 bytes
+and cannot contain control characters. An empty name clears the title. Clients
+still wait for both the rename acknowledgement and the corresponding resource
+revision.
+
+Without this capability, the daemon omits pane names and rejects pane rename
+requests before dispatch. Clients that offer it as optional accept a welcome
+without it and disable pane renaming for that connection. Legacy exact-version
+connections cannot rename panes.
+
+New features must update the capability types, selection validation, and
+boundary allowlists. Listing an optional capability does not authorize new
+behavior.
 
 - Keep existing wire shapes and semantics unchanged, including fields in shared
   domain types. Rust defaults or ignored unknown fields alone do not establish

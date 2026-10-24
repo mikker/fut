@@ -12,6 +12,7 @@ use remote::{EndpointError, capability_list, validate_name, validate_names, vali
 pub const GENERATION: u16 = 1;
 pub const CODEC: &str = "msgpack-map-v1";
 pub const BASELINE: &str = "local.v1";
+pub const PANE_TITLES: &str = "pane-titles.v1";
 
 /// An older daemon cannot decode local_hello, so its negative response cannot
 /// echo the request ID. Never treat a malformed welcome as a legacy rejection.
@@ -60,11 +61,21 @@ pub struct LocalWelcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Capabilities(());
+pub struct Capabilities {
+    pane_titles: bool,
+}
 
 impl Capabilities {
+    pub fn pane_titles(self) -> bool {
+        self.pane_titles
+    }
+
     pub fn names(self) -> Vec<String> {
-        vec![BASELINE.into()]
+        let mut names = vec![BASELINE.into()];
+        if self.pane_titles {
+            names.push(PANE_TITLES.into());
+        }
+        names
     }
 
     /// Intentionally exhaustive: every new method needs an explicit capability
@@ -73,6 +84,14 @@ impl Capabilities {
         use ClientMessage::*;
         match message {
             Hello { .. } | LocalHello(_) | RemoteHello(_) => false,
+            RenameTarget {
+                selector: super::RenameSelector::Pane(_),
+                ..
+            }
+            | Contextual {
+                command: super::ContextualCommand::RenamePane { .. },
+                ..
+            } => self.pane_titles,
             CommandDefaults { .. }
             | CommandStart { .. }
             | CommandOperation { .. }
@@ -182,7 +201,7 @@ impl LocalHello {
             codec: CODEC.into(),
             client_version: client_version.into(),
             required: vec![BASELINE.into()],
-            optional: Vec::new(),
+            optional: vec![PANE_TITLES.into()],
             mode,
         }
     }
@@ -201,17 +220,26 @@ impl LocalHello {
             return Err(EndpointError::UnsupportedCodec);
         }
         if !self.required.iter().any(|name| name == BASELINE)
-            || self.required.iter().any(|name| name != BASELINE)
+            || self
+                .required
+                .iter()
+                .any(|name| name != BASELINE && name != PANE_TITLES)
         {
             return Err(EndpointError::MissingRequiredCapability);
         }
         // Size is an operational error, not a compatibility failure. The
         // daemon validates it before leasing and returns descriptive invalid_size.
-        Ok(Capabilities(()))
+        Ok(Capabilities {
+            pane_titles: self
+                .required
+                .iter()
+                .chain(&self.optional)
+                .any(|name| name == PANE_TITLES),
+        })
     }
 
     pub fn accept(&self, welcome: &LocalWelcome) -> Result<Capabilities, EndpointError> {
-        let capabilities = self.negotiate()?;
+        self.negotiate()?;
         validate_version(&welcome.server_version)?;
         validate_names(welcome.capabilities.iter())?;
         validate_name(&welcome.codec)?;
@@ -224,15 +252,27 @@ impl LocalHello {
         if welcome.codec != CODEC {
             return Err(EndpointError::UnsupportedCodec);
         }
-        if !welcome.capabilities.iter().any(|name| name == BASELINE) {
+        if self
+            .required
+            .iter()
+            .any(|name| !welcome.capabilities.contains(name))
+        {
             return Err(EndpointError::MissingRequiredCapability);
         }
-        if welcome.capabilities != capabilities.names()
-            || matches!(self.mode, ClientMode::Interactive { .. }) != welcome.selected.is_some()
+        if welcome.capabilities.iter().any(|name| {
+            (name != BASELINE && name != PANE_TITLES)
+                || !self
+                    .required
+                    .iter()
+                    .chain(&self.optional)
+                    .any(|offered| offered == name)
+        }) || matches!(self.mode, ClientMode::Interactive { .. }) != welcome.selected.is_some()
         {
             return Err(EndpointError::InvalidHandshake);
         }
-        Ok(capabilities)
+        Ok(Capabilities {
+            pane_titles: welcome.capabilities.iter().any(|name| name == PANE_TITLES),
+        })
     }
 }
 
@@ -316,7 +356,7 @@ mod tests {
     #[test]
     fn baseline_is_required_and_unknown_optional_is_ignored() {
         let mut hello = LocalHello::new(ClientMode::Control, "0.1.0");
-        hello.optional.push("future.v1".into());
+        hello.optional = vec!["future.v1".into()];
         assert_eq!(hello.negotiate().unwrap().names(), [BASELINE]);
         hello.required.push("future-required.v1".into());
         assert_eq!(
@@ -327,6 +367,47 @@ mod tests {
         hello.optional = vec![BASELINE.into()];
         assert_eq!(
             hello.negotiate(),
+            Err(EndpointError::MissingRequiredCapability)
+        );
+    }
+
+    #[test]
+    fn pane_titles_are_optional_and_gate_new_selectors_and_contextual_semantics() {
+        let mut hello = LocalHello::new(ClientMode::Control, "0.1.0");
+        let selected = hello.negotiate().unwrap();
+        assert!(selected.pane_titles);
+        let explicit = ClientMessage::RenameTarget {
+            selector: super::super::RenameSelector::Pane(crate::domain::PaneId::new()),
+            name: "Review".into(),
+        };
+        assert!(selected.allows_client(&explicit));
+        assert!(!hello.accept(&welcome()).unwrap().pane_titles);
+        hello.optional.clear();
+        let baseline = hello.negotiate().unwrap();
+        assert!(!baseline.allows_client(&explicit));
+        let contextual = ClientMessage::Contextual {
+            context: super::super::TerminalContext {
+                session_id: crate::domain::SessionId::new(),
+                workspace_id: crate::domain::WorkspaceId::new(),
+                tab_id: crate::domain::TabId::new(),
+                pane_id: crate::domain::PaneId::new(),
+                terminal_id: crate::domain::TerminalId::new(),
+            },
+            command: super::super::ContextualCommand::RenamePane {
+                name: "Task".into(),
+            },
+        };
+        assert!(selected.allows_client(&contextual));
+        assert!(!baseline.allows_client(&contextual));
+        let mut unoffered = welcome();
+        unoffered.capabilities.push(PANE_TITLES.into());
+        assert_eq!(
+            hello.accept(&unoffered),
+            Err(EndpointError::InvalidHandshake)
+        );
+        hello.required.push(PANE_TITLES.into());
+        assert_eq!(
+            hello.accept(&welcome()),
             Err(EndpointError::MissingRequiredCapability)
         );
     }

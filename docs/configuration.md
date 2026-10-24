@@ -181,6 +181,7 @@ open_command_bar = "space"
 # rename_session = "S"   # These rename and close actions have no default binding.
 # rename_workspace = "W"
 # rename_tab = "T"
+# rename_pane = ","
 # close_session = "q"
 # close_workspace = "Q"
 # close_tab = "X"
@@ -346,9 +347,10 @@ map the key to the action under `[ui.hotkeys]` instead. Direct hotkeys are
 additional: the action's prefixed binding continues to work.
 
 The command palette also includes `rename-session`, `rename-workspace`,
-`rename-tab`, `kill-session`, `kill-workspace`, and `kill-tab`. They have no
-default bindings; configure the corresponding `rename_*` or `close_*` keys to
-add shortcuts. `kill-pane` remains bound through `close_pane` by default.
+`rename-tab`, `rename-pane`, `kill-session`, `kill-workspace`, and `kill-tab`.
+These actions have no default bindings. Configure the corresponding `rename_*`
+or `close_*` keys to add shortcuts. `kill-pane` has a default binding through
+`close_pane`.
 
 A prefix, suffix, or hotkey may be one printable character, `ctrl-a` through
 `ctrl-z`, `ctrl-space`, `space`, `enter`, `tab`, `esc`, `up`, or `down`. Suffixes

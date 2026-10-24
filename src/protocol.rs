@@ -130,6 +130,8 @@ pub enum RenameSelector {
     Session(SessionSelector),
     Workspace(WorkspaceId),
     Tab(TabId),
+    /// This selector requires pane-titles.v1. Do not send it to peers without it.
+    Pane(PaneId),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -201,6 +203,11 @@ pub enum ContextualCommand {
     },
     Rename {
         scope: ContextScope,
+        name: String,
+    },
+    /// This command requires pane-titles.v1. The existing Rename command
+    /// must still reject scope: pane.
+    RenamePane {
         name: String,
     },
 }
@@ -704,6 +711,21 @@ pub enum ClientMessage {
     },
     Ping,
     Shutdown,
+}
+
+impl ClientMessage {
+    pub fn requires_pane_titles(&self) -> bool {
+        matches!(
+            self,
+            Self::RenameTarget {
+                selector: RenameSelector::Pane(_),
+                ..
+            } | Self::Contextual {
+                command: ContextualCommand::RenamePane { .. },
+                ..
+            }
+        )
+    }
 }
 
 /// An action requested by an extension token publisher. Extension command
@@ -2040,6 +2062,7 @@ mod tests {
                 "  exact name  ",
             ),
             (RenameSelector::Tab(TabId::new()), "雪/タブ"),
+            (RenameSelector::Pane(PaneId::new()), "Task λ"),
         ];
 
         for (selector, name) in cases {
@@ -2221,6 +2244,9 @@ mod tests {
             ContextualCommand::Rename {
                 scope: ContextScope::Tab,
                 name: "renamed".into(),
+            },
+            ContextualCommand::RenamePane {
+                name: "current task".into(),
             },
         ];
         for command in commands {

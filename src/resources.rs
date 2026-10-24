@@ -327,6 +327,9 @@ pub struct TabSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PaneSnapshot {
     pub id: PaneId,
+    /// Peers receive this name only after negotiating pane-titles.v1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub terminal_id: TerminalId,
     pub closing: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -426,8 +429,20 @@ impl ResourceSnapshot {
         found.ok_or(ResourceError::NotFound("terminal"))
     }
 
-    /// Preserve the frozen remote metadata.v2 payload for peers that did not
-    /// negotiate nested workspace metadata.
+    /// Omit pane names for peers without pane-titles.v1.
+    pub(crate) fn clear_pane_names(&mut self) {
+        for session in &mut self.sessions {
+            for workspace in &mut session.workspaces {
+                for tab in &mut workspace.tabs {
+                    for pane in &mut tab.panes {
+                        pane.name = None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Omit workspace parents for peers without nested-workspaces.v1.
     pub(crate) fn clear_workspace_parents(&mut self) {
         for session in &mut self.sessions {
             for workspace in &mut session.workspaces {
@@ -674,6 +689,8 @@ pub enum ResourceError {
     Duplicate(&'static str),
     #[error("name must not be blank")]
     EmptyName,
+    #[error("pane name must be at most 512 bytes and contain no control characters")]
+    InvalidPaneName,
     #[error("panes may only move between tabs in the same workspace")]
     DifferentWorkspace,
     #[error("invalid workspace parent: {0}")]
@@ -726,6 +743,7 @@ struct Tab {
 }
 #[derive(Clone, Debug)]
 struct Pane {
+    name: String,
     tab_id: TabId,
     terminal_id: TerminalId,
     creation_order: u64,
@@ -1823,6 +1841,27 @@ impl ResourceTree {
         ))
     }
 
+    pub fn rename_pane(
+        &mut self,
+        pane_id: PaneId,
+        new_name: String,
+    ) -> Result<Mutation, ResourceError> {
+        check_optional_name(&new_name)?;
+        if new_name.len() > 512 || new_name.chars().any(char::is_control) {
+            return Err(ResourceError::InvalidPaneName);
+        }
+        let pane = self
+            .panes
+            .get(&pane_id)
+            .ok_or(ResourceError::NotFound("pane"))?;
+        self.resolve_terminal_target(Some(TargetSelector::Pane(pane_id)))?;
+        if pane.name == new_name {
+            return Ok(self.unchanged());
+        }
+        self.panes.get_mut(&pane_id).unwrap().name = new_name;
+        Ok(self.finish(Vec::new(), Vec::new()))
+    }
+
     pub fn add_workspace(
         &mut self,
         session_id: SessionId,
@@ -2744,6 +2783,7 @@ impl ResourceTree {
         self.panes.insert(
             pane_id,
             Pane {
+                name: String::new(),
                 tab_id,
                 terminal_id,
                 creation_order,
@@ -2868,6 +2908,7 @@ impl ResourceTree {
         let p = &self.panes[&id];
         PaneSnapshot {
             id,
+            name: Some(p.name.clone()),
             terminal_id: p.terminal_id,
             closing: self.pane_is_closing(id),
             tokens: p.tokens.clone(),
@@ -6114,6 +6155,68 @@ mod tests {
         );
         assert_eq!(tree.snapshot(), before);
         tree.validate().unwrap();
+    }
+
+    #[test]
+    fn pane_names_preserve_identity_allow_duplicates_and_clear_without_changing_tabs() {
+        let mut tree = ResourceTree::default();
+        let path = initial("Session", "/project");
+        let pane_id = path.pane_id;
+        let tab_id = path.tab_id;
+        tree.create_session(path).unwrap();
+        let before = tree.snapshot();
+        let mutation = tree.rename_pane(pane_id, "Review λ".into()).unwrap();
+        assert_eq!(mutation.revision, before.revision + 1);
+        assert!(mutation.terminals_to_close.is_empty());
+        let mut expected = before.clone();
+        expected.revision += 1;
+        expected.sessions[0].workspaces[0].tabs[0].panes[0].name = Some("Review λ".into());
+        assert_eq!(tree.snapshot(), expected);
+        assert_eq!(
+            tree.rename_pane(pane_id, "Review λ".into())
+                .unwrap()
+                .revision,
+            expected.revision
+        );
+
+        let peer = PaneId::new();
+        tree.add_pane(tab_id, peer, TerminalId::new()).unwrap();
+        tree.rename_pane(peer, "Review λ".into()).unwrap();
+        tree.rename_pane(pane_id, String::new()).unwrap();
+        let tab = &tree.snapshot().sessions[0].workspaces[0].tabs[0];
+        assert_eq!(tab.name, before.sessions[0].workspaces[0].tabs[0].name);
+        assert_eq!(tab.panes[0].name.as_deref(), Some(""));
+        assert_eq!(tab.panes[1].name.as_deref(), Some("Review λ"));
+        tree.validate().unwrap();
+    }
+
+    #[test]
+    fn invalid_or_closing_pane_renames_are_atomic() {
+        let mut tree = ResourceTree::default();
+        let path = initial("Session", "/project");
+        let pane_id = path.pane_id;
+        tree.create_session(path).unwrap();
+        let before = tree.snapshot();
+        for name in [
+            " ".to_owned(),
+            "line\nbreak".into(),
+            "\x1b[31m".into(),
+            "λ".repeat(257),
+        ] {
+            assert!(tree.rename_pane(pane_id, name).is_err());
+            assert_eq!(tree.snapshot(), before);
+        }
+        assert_eq!(
+            tree.rename_pane(PaneId::new(), "task".into()),
+            Err(ResourceError::NotFound("pane"))
+        );
+        tree.close_pane(pane_id).unwrap();
+        let closing = tree.snapshot();
+        assert_eq!(
+            tree.rename_pane(pane_id, "task".into()),
+            Err(ResourceError::Closing("pane"))
+        );
+        assert_eq!(tree.snapshot(), closing);
     }
 
     #[test]

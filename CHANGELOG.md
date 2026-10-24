@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Rename panes from the command palette or with `fut pane rename`.
+
 ## 0.39
 
 - Let compatible Fut clients and daemons from different releases keep working together without restarting terminals; daemons predating this handshake need one explicit restart.

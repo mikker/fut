@@ -229,6 +229,21 @@ stored state.
 JSON includes `activity.records`, with app, title, message, kind, progress,
 and revision metadata, plus explicit `activity.source` provenance.
 
+An agent can name its Fut pane after its current task:
+
+```sh
+fut pane rename 'Review authentication changes'
+fut pane rename '' # Clear the task title when finished
+```
+
+Fut uses `FUT_TERMINAL_ID` to find the agent's pane, even after a move. The
+agent does not need to supply a pane ID. Programs outside Fut can call
+`fut pane rename PANE_ID NAME`.
+
+All attached clients see the same pane name. The command replaces any manually
+assigned name but does not change OSC 7501 status-record titles. See
+[Name panes](../usage/#name-panes) for UI controls and the required capability.
+
 Submit a prompt as one atomic paste-and-Enter operation. Targets are always
 explicit, and a currently working agent is rejected with `agent_busy`:
 

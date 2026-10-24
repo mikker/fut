@@ -103,6 +103,7 @@ pub(super) enum ClientAction {
     RenameSession,
     RenameWorkspace,
     RenameTab,
+    RenamePane,
     FocusNextTab,
     FocusPreviousTab,
     FocusNextWorkspace,
@@ -135,7 +136,7 @@ pub(super) struct DirectBinding {
     pub action: ClientAction,
 }
 
-pub(super) const ALL_ACTIONS: [ClientAction; 51] = [
+pub(super) const ALL_ACTIONS: [ClientAction; 52] = [
     ClientAction::OpenCommandBar,
     ClientAction::OpenMessages,
     ClientAction::OpenProject,
@@ -155,6 +156,7 @@ pub(super) const ALL_ACTIONS: [ClientAction; 51] = [
     ClientAction::RenameSession,
     ClientAction::RenameWorkspace,
     ClientAction::RenameTab,
+    ClientAction::RenamePane,
     ClientAction::FocusNextTab,
     ClientAction::FocusPreviousTab,
     ClientAction::FocusNextWorkspace,
@@ -189,7 +191,7 @@ pub(super) const ALL_ACTIONS: [ClientAction; 51] = [
     ClientAction::Detach,
 ];
 
-pub(super) const COMMANDS: [ActionDefinition; 50] = [
+pub(super) const COMMANDS: [ActionDefinition; 51] = [
     ActionDefinition {
         action: ClientAction::ReloadConfig,
         title: "Reload configuration",
@@ -269,6 +271,11 @@ pub(super) const COMMANDS: [ActionDefinition; 50] = [
         action: ClientAction::RenameTab,
         title: "Rename tab",
         keywords: "rename tab title name",
+    },
+    ActionDefinition {
+        action: ClientAction::RenamePane,
+        title: "Rename pane",
+        keywords: "rename pane terminal title name task",
     },
     ActionDefinition {
         action: ClientAction::FocusNextTab,
@@ -655,6 +662,7 @@ pub(super) const fn command_name(action: ClientAction) -> &'static str {
         ClientAction::RenameSession => "rename-session",
         ClientAction::RenameWorkspace => "rename-workspace",
         ClientAction::RenameTab => "rename-tab",
+        ClientAction::RenamePane => "rename-pane",
         ClientAction::FocusNextTab => "next-tab",
         ClientAction::FocusPreviousTab => "previous-tab",
         ClientAction::FocusNextWorkspace => "next-workspace",
@@ -712,6 +720,7 @@ pub(super) fn config_key(action: ClientAction) -> &'static str {
         ClientAction::RenameSession => "rename_session",
         ClientAction::RenameWorkspace => "rename_workspace",
         ClientAction::RenameTab => "rename_tab",
+        ClientAction::RenamePane => "rename_pane",
         ClientAction::FocusNextTab => "focus_next_tab",
         ClientAction::FocusPreviousTab => "focus_previous_tab",
         ClientAction::FocusNextWorkspace => "focus_next_workspace",
@@ -816,6 +825,7 @@ const fn requires_launcher(action: ClientAction) -> bool {
         | ClientAction::RenameSession
         | ClientAction::RenameWorkspace
         | ClientAction::RenameTab
+        | ClientAction::RenamePane
         | ClientAction::FocusNextTab
         | ClientAction::FocusPreviousTab
         | ClientAction::FocusNextWorkspace

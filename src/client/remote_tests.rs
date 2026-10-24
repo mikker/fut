@@ -76,9 +76,12 @@ fields = [{ name = 'value', label = 'Value' }]
             .is_err()
     );
     assert_eq!(
-        Attachment::Local(root.path().to_owned())
-            .local_socket()
-            .unwrap(),
+        Attachment::Local {
+            socket: root.path().to_owned(),
+            pane_titles: false
+        }
+        .local_socket()
+        .unwrap(),
         root.path()
     );
 
@@ -109,6 +112,7 @@ fields = [{ name = 'value', label = 'Value' }]
                     tokens: Default::default(),
                     layout: SplitTree::leaf(target.pane_id),
                     panes: vec![PaneSnapshot {
+                        name: None,
                         id: target.pane_id,
                         terminal_id: target.terminal_id,
                         closing: false,
@@ -385,7 +389,7 @@ async fn local_handshakes_accept_different_package_versions() {
             assert!(peer.next().await.is_none());
         });
         if interactive {
-            let (connection, _, catalog, _) = handshake_interactive(
+            let (connection, _, catalog, _, pane_titles) = handshake_interactive(
                 stream,
                 None,
                 TerminalSize {
@@ -399,6 +403,7 @@ async fn local_handshakes_accept_different_package_versions() {
             .await
             .unwrap();
             assert_eq!(catalog.generation, 7);
+            assert!(!pane_titles);
             drop(connection);
         } else {
             let (connection, catalog, version) =

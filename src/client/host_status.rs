@@ -473,6 +473,7 @@ mod tests {
 
     fn pane(records: Vec<StatusRecord>) -> PaneSnapshot {
         PaneSnapshot {
+            name: None,
             tokens: Default::default(),
             id: PaneId::new(),
             terminal_id: TerminalId::new(),
