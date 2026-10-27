@@ -4,6 +4,7 @@
 
 - Reorder workspaces with command-palette actions, configurable shortcuts, or `fut workspace move`.
 - Keep Shift on Ctrl+Shift+letter shortcuts, so apps in a pane, such as pi, receive `ctrl+shift+c` as they do outside Fut.
+- Name panes with `rename-pane` in the command palette or `fut pane rename`; titles show above panes and in navigator search. Workspace, tab, and pane names are limited to 512 bytes without control characters.
 
 ## 0.39
 

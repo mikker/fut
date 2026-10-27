@@ -16,6 +16,7 @@ const RAIL_WIDTH: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PaneLayout {
+    pub(super) title: Option<Rect>,
     pub(super) rail: Option<Rect>,
     pub(super) content: Rect,
 }
@@ -299,6 +300,7 @@ pub(super) fn pane_layouts(
         return BTreeMap::from([(
             terminal,
             PaneLayout {
+                title: None,
                 rail: None,
                 content: host,
             },
@@ -312,6 +314,7 @@ pub(super) fn pane_layouts(
         return BTreeMap::from([(
             focused,
             PaneLayout {
+                title: None,
                 rail: None,
                 content: host,
             },
@@ -349,6 +352,7 @@ pub(super) fn pane_layouts(
             (
                 terminal,
                 PaneLayout {
+                    title: None,
                     rail: Some(rail),
                     content,
                 },
@@ -475,6 +479,7 @@ mod tests {
         assert_eq!(
             pane_layouts(host, &ids, ids[0], false)[&ids[0]],
             PaneLayout {
+                title: None,
                 rail: None,
                 content: host
             }
@@ -557,6 +562,7 @@ mod tests {
             assert_eq!(
                 layouts[&ids[3]],
                 PaneLayout {
+                    title: None,
                     rail: None,
                     content: host
                 }
@@ -614,6 +620,7 @@ mod tests {
                 BTreeMap::from([(
                     focused,
                     PaneLayout {
+                        title: None,
                         rail: None,
                         content: host,
                     },

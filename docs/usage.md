@@ -54,6 +54,42 @@ or capability failures, and unsupported legacy changes may still fail.
 Fut refuses to start a nested interactive client inside one of its terminals.
 If nesting is intentional, run `FUT_ALLOW_NESTED=1 fut`.
 
+## Name panes
+
+Press `Ctrl-b :`, type `rename pane`, and press Enter to open the rename
+dialog. Enter a name and press Enter again to save. To clear a name, delete
+the text and press Enter. Fut shows the title above the pane in split and
+accordion layouts. The action has no default keybinding. Set `rename_pane`
+under `[ui.bindings]` to add one.
+
+Programs and agents can rename panes with the CLI:
+
+```sh
+fut pane rename "Fix authentication tests"  # Name the caller's pane
+fut pane rename "$FUT_PANE_ID" "Review tests"  # Name a pane by ID
+fut pane rename ""  # Clear the name
+```
+
+Without a pane ID, the CLI uses `FUT_TERMINAL_ID` to find the current pane.
+This works after moves. Programs outside Fut can pass a compact pane ID or
+UUID from `fut --json pane list TAB_ID`. They do not need to run inside a Fut
+terminal. `fut --json pane rename NAME` returns the pane ID and name. Pane-list
+JSON includes `name` when the daemon supports pane titles.
+
+Every attached client sees the same pane name. Names stay with the pane after
+moves and until the pane closes. Renaming a pane does not rename its tab or
+restart the terminal. UI and CLI changes overwrite the same name. Shell output
+does not change it.
+
+Names can contain Unicode and use at most 512 UTF-8 bytes, like workspace and
+tab names. Fut rejects control characters and names that contain only
+whitespace. An empty name removes the title row.
+
+The daemon must support `pane-titles.v1`. Older daemons cannot rename panes,
+but other commands still work. Update Fut on the daemon host to enable pane
+names. Remote UI renaming uses the same capability. Run CLI commands on the
+daemon's machine.
+
 ## Attach to a remote machine
 
 There are two distinct SSH workflows:
@@ -260,10 +296,11 @@ assign directly without a prefix under `[ui.hotkeys]`.
 
 Pause for 700 ms after `Ctrl-b` to see the complete, current binding list.
 Bindings can be changed in [Configuration](../configuration/).
-The command palette also provides unbound `rename-session`, `rename-workspace`,
-`rename-tab`, `kill-session`, `kill-workspace`, and `kill-tab` actions for the
-focused resource. Session actions target the session to which the client is
-attached; closing it ends that attachment along with its terminals.
+The command palette also includes `rename-session`, `rename-workspace`,
+`rename-tab`, `rename-pane`, `kill-session`, `kill-workspace`, and `kill-tab` for
+the focused resource. These actions have no default keybindings. Session
+actions target the attached session. Closing that session ends the attachment
+and closes its terminals.
 
 Use **Move workspace up** / **Move workspace down** in the command palette to
 reorder the active workspace, or `fut workspace move WORKSPACE_ID POSITION`

@@ -119,6 +119,17 @@ impl Attachment {
         }
     }
 
+    pub(super) fn supports_pane_titles(&self) -> bool {
+        match self {
+            Self::Local { capabilities, .. } => {
+                capabilities.is_some_and(crate::protocol::local::Capabilities::pane_titles)
+            }
+            Self::Remote { capabilities, .. } => {
+                capabilities.contains(crate::protocol::remote::Capability::PaneTitles)
+            }
+        }
+    }
+
     pub(super) fn blocked_command(&self) -> Option<&'static str> {
         match self {
             Self::Local { .. } => None,
@@ -238,6 +249,29 @@ mod tests {
             .is_none()
         );
         assert_ne!(legacy.command_generation(), current.command_generation());
+    }
+
+    #[test]
+    fn pane_renaming_requires_explicit_selection_on_both_endpoints() {
+        let baseline = Attachment::Local {
+            socket: "/tmp/fut.sock".into(),
+            capabilities: Some(Default::default()),
+        };
+        assert!(!baseline.supports_pane_titles());
+        let negotiated = Attachment::Local {
+            socket: "/tmp/fut.sock".into(),
+            capabilities: Some(
+                crate::protocol::local::LocalHello::new(
+                    crate::protocol::ClientMode::Control,
+                    "0.1.0",
+                )
+                .negotiate()
+                .unwrap(),
+            ),
+        };
+        assert!(negotiated.supports_pane_titles());
+        assert!(!Attachment::remote(Capabilities::default(), "old-host").supports_pane_titles());
+        assert!(Attachment::remote(Capabilities::ALL, "new-host").supports_pane_titles());
     }
 
     #[tokio::test]

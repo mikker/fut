@@ -317,6 +317,7 @@ mod tests {
                         closing: false,
                         layout: SplitTree::leaf(pane_id),
                         panes: vec![PaneSnapshot {
+                            name: None,
                             tokens: Default::default(),
                             id: pane_id,
                             terminal_id,

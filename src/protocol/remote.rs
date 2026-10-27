@@ -75,10 +75,11 @@ pub enum Capability {
     ChunkedScreens,
     ConfiguredCommands,
     WorkspaceOrder,
+    PaneTitles,
 }
 
 impl Capability {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::Metadata,
         Self::NestedWorkspaces,
         Self::Interactive,
@@ -94,6 +95,7 @@ impl Capability {
         Self::ChunkedScreens,
         Self::ConfiguredCommands,
         Self::WorkspaceOrder,
+        Self::PaneTitles,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -113,12 +115,13 @@ impl Capability {
             Self::ChunkedScreens => "chunked-screens.v1",
             Self::ConfiguredCommands => "configured-commands.v1",
             Self::WorkspaceOrder => "workspace-order.v1",
+            Self::PaneTitles => "pane-titles.v1",
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct Capabilities(u16);
+pub struct Capabilities(u32);
 
 impl Capabilities {
     pub const ALL: Self = Self((1 << Capability::ALL.len()) - 1);
@@ -174,6 +177,13 @@ impl Capabilities {
         use ClientMessage::*;
         let capability = match message {
             Detach => return true,
+            RenameTarget {
+                selector: super::RenameSelector::Pane(_),
+                ..
+            } => {
+                return self.contains(Capability::Interactive)
+                    && self.contains(Capability::PaneTitles);
+            }
             ListResources | WatchResources => Capability::Metadata,
             OpenProject { .. } => Capability::ProjectOpen,
             MoveWorkspace { .. } => Capability::WorkspaceOrder,
@@ -295,6 +305,7 @@ impl RemoteHello {
             Capability::ProjectOpen.name().into(),
             Capability::ConfiguredCommands.name().into(),
             Capability::WorkspaceOrder.name().into(),
+            Capability::PaneTitles.name().into(),
         ];
         if matches!(mode, ClientMode::Interactive { .. }) {
             optional.push(Capability::TerminalColors.name().into());
@@ -518,6 +529,38 @@ mod tests {
         };
         assert_eq!(hello.accept(&welcome).unwrap(), caps);
         assert_eq!(GENERATION, 2);
+    }
+
+    #[test]
+    fn pane_titles_require_interactive_support_and_never_grant_private_operations() {
+        let message = ClientMessage::RenameTarget {
+            selector: super::super::RenameSelector::Pane(crate::domain::PaneId::new()),
+            name: "Review".into(),
+        };
+        let mut offer = RemoteHello::new(ClientMode::Control, "0.1.0");
+        let control = offer.negotiate(Capabilities::ALL).unwrap();
+        assert!(control.contains(Capability::PaneTitles));
+        assert!(!control.allows_client(&message));
+        offer.mode = ClientMode::Interactive {
+            size: crate::domain::TerminalSize {
+                columns: 80,
+                rows: 24,
+            },
+            selector: None,
+        };
+        offer.required.push(Capability::Interactive.name().into());
+        let interactive = offer.negotiate(Capabilities::ALL).unwrap();
+        assert!(interactive.allows_client(&message));
+        assert!(!interactive.allows_client(&ClientMessage::Shutdown));
+        offer
+            .optional
+            .retain(|name| name != Capability::PaneTitles.name());
+        assert!(
+            !offer
+                .negotiate(Capabilities::ALL)
+                .unwrap()
+                .allows_client(&message)
+        );
     }
 
     #[test]

@@ -471,6 +471,14 @@ enum PaneCommand {
         #[arg(add = ArgValueCompleter::new(completion::pane_move_destination))]
         destination_tab_id: Option<TabId>,
     },
+    /// Rename a pane by ID, or use the caller's pane. An empty name clears it.
+    Rename {
+        /// New name, or a compact pane ID or UUID when followed by NAME.
+        #[arg(add = ArgValueCompleter::new(completion::pane_close))]
+        pane_or_name: String,
+        /// New name when PANE_ID is provided.
+        name: Option<String>,
+    },
     /// Close a pane by ID, or infer the caller's pane.
     Close {
         /// Compact pane ID or UUID.
@@ -3951,6 +3959,37 @@ async fn run_mutation(socket: &std::path::Path, json_output: bool, command: Comm
             )
         }
         Command::Pane {
+            command: PaneCommand::Rename { pane_or_name, name },
+        } => {
+            let (target, name) = rename_arguments::<PaneId>(pane_or_name, name, "pane")?;
+            let (pane_id, message) = match target {
+                Some(pane_id) => (
+                    pane_id,
+                    ClientMessage::RenameTarget {
+                        selector: RenameSelector::Pane(pane_id),
+                        name: name.clone(),
+                    },
+                ),
+                None => {
+                    let context = live_context(socket).await?;
+                    (
+                        context.pane_id,
+                        ClientMessage::Contextual {
+                            context,
+                            command: ContextualCommand::RenamePane { name: name.clone() },
+                        },
+                    )
+                }
+            };
+            (
+                message,
+                AcknowledgedCommand::RenameTarget,
+                "pane.rename",
+                json!({"pane_id": pane_id, "name": name}),
+                "renamed=true",
+            )
+        }
+        Command::Pane {
             command: PaneCommand::Close { pane_id },
         } => {
             let (pane_id, message) = match pane_id {
@@ -4284,7 +4323,11 @@ async fn negotiated_control_handshake_for(
         ServerMessage::LocalWelcome(welcome) => {
             let capabilities = hello.accept(&welcome)?;
             if command.is_some_and(|command| !capabilities.allows_client(command)) {
-                return Err(CliError::new("unsupported_operation", "daemon does not support workspace reordering; update Fut and restart its daemon").into());
+                return Err(CliError::new(
+                    "unsupported_operation",
+                    "daemon does not support this command; update Fut and restart its daemon",
+                )
+                .into());
             }
             Ok(ControlHandshake::Connected(framed))
         }
@@ -4819,7 +4862,7 @@ fn discover_target(snapshot: &ResourceSnapshot, id: Uuid) -> Result<serde_json::
                 }
                 for pane in &tab.panes {
                     let summary_record = pane.activity.summary_record();
-                    let pane_json = json!({
+                    let mut pane_json = json!({
                         "id": pane.id,
                         "closing": pane.closing,
                         "activity": pane.activity,
@@ -4827,6 +4870,9 @@ fn discover_target(snapshot: &ResourceSnapshot, id: Uuid) -> Result<serde_json::
                         "record": summary_record,
                         "state": pane.activity.summary_state(),
                     });
+                    if let Some(name) = &pane.name {
+                        pane_json["name"] = json!(name);
+                    }
                     let terminal_json = json!({ "id": pane.terminal_id });
                     if pane.id.uuid() == id {
                         matches.push(json!({
@@ -4895,10 +4941,15 @@ fn render_tabs(revision: u64, tabs: &[TabSnapshot]) -> String {
         ));
         for pane in &tab.panes {
             lines.push(format!(
-                "  pane {} terminal={}{}",
+                "  pane {} terminal={}{}{}",
                 pane.id,
                 pane.terminal_id,
-                if pane.closing { " closing" } else { "" }
+                if pane.closing { " closing" } else { "" },
+                pane.name
+                    .as_deref()
+                    .filter(|name| !name.is_empty())
+                    .map(|name| format!(" name={name:?}"))
+                    .unwrap_or_default()
             ));
         }
     }
@@ -5277,6 +5328,7 @@ mod tests {
                         tokens: Default::default(),
                         layout: SplitTree::leaf(pane_id),
                         panes: vec![PaneSnapshot {
+                            name: None,
                             id: pane_id,
                             terminal_id,
                             closing: false,
@@ -5745,6 +5797,65 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("update Fut and restart"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pane_rename_is_not_sent_when_the_daemon_omits_its_capability() {
+        let temporary = tempfile::tempdir().unwrap();
+        let socket = temporary.path().join("fut.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut framed = Framed::new(stream, codec());
+            let request: Envelope<ClientMessage> =
+                decode_payload(&framed.next().await.unwrap().unwrap()).unwrap();
+            let ClientMessage::LocalHello(hello) = request.message else {
+                panic!("expected hello")
+            };
+            assert!(
+                hello
+                    .optional
+                    .iter()
+                    .any(|name| name == crate::protocol::local::PANE_TITLES)
+            );
+            framed
+                .send(Bytes::from(
+                    encode_payload(&Envelope {
+                        request_id: request.request_id,
+                        message: ServerMessage::LocalWelcome(
+                            crate::protocol::local::LocalWelcome {
+                                generation: crate::protocol::local::GENERATION,
+                                codec: crate::protocol::local::CODEC.into(),
+                                server_version: "0.39.0".into(),
+                                capabilities: vec![crate::protocol::local::BASELINE.into()],
+                                selected: None,
+                                extension_catalog: empty_extension_catalog(),
+                            },
+                        ),
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            assert!(
+                framed.next().await.is_none(),
+                "pane rename was sent without negotiation"
+            );
+        });
+        let error = control(
+            &socket,
+            ClientMessage::RenameTarget {
+                selector: RenameSelector::Pane(PaneId::new()),
+                name: "Task".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("update Fut and restart"),
+            "{error}"
+        );
         server.await.unwrap();
     }
 
@@ -6244,6 +6355,15 @@ mod tests {
                     },
                 },
             ),
+            (
+                "pane",
+                Command::Pane {
+                    command: PaneCommand::Rename {
+                        pane_or_name: PaneId::new().to_string(),
+                        name: None,
+                    },
+                },
+            ),
         ];
 
         for (kind, command) in cases {
@@ -6312,6 +6432,7 @@ mod tests {
         let mut layout = SplitTree::leaf(first);
         assert!(layout.split(first, SplitDirection::Down, second));
         let pane = |id| PaneSnapshot {
+            name: None,
             tokens: Default::default(),
             id,
             terminal_id: TerminalId::new(),

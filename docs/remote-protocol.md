@@ -87,6 +87,7 @@ are common to every negotiated connection.
 | `workspace-order.v1` | `move_workspace { workspace_id, position }`; correlated `workspace_moved { resource_revision }` | Workspace reordering is unavailable; update/restart guidance is shown |
 | `metadata.v2` | `list_resources`, `watch_resources`; resource snapshots/changes, program-status records and client presence | Required for the navigator and attachment |
 | `nested-workspaces.v1` | Optional `parent_workspace_id` fields in workspace snapshots | Workspaces remain flat and generation-2 metadata payloads are unchanged |
+| `pane-titles.v1` | Pane snapshots include `name`, or `""` for unnamed panes. With `interactive.v1`, `rename_target` accepts a `pane` selector and replies with `target_renamed`, including the resource revision | The daemon omits pane names and rejects pane renaming |
 | `interactive.v1` | Input/key/paste/mouse, viewport reset/refresh, copy mode, terminal/split resize, target selection, workspace/tab/pane creation and split, rename/close, agent acknowledgement; their replies, full/delta screens and terminal exit | Required for attachment |
 | `large-screens.v1` | Interactive screens up to 150,000 visible cells; Kitty images arrive once per generation in `kitty_image` messages, and screen images carry an empty `d` as a reference to those pixels | Screens embed image pixels and stay within 50,000 visible cells; larger hello or resize sizes are rejected |
 | `chunked-screens.v1` | Requires `large-screens.v1`. Interactive screens up to 1,048,576 visible cells (65,535 columns or rows at most). A full screen, copy-mode screen, or delta whose rows hold more than 150,000 cells is sent as `screen_begin` (`begin`: `n`, the row count that follows, and `f`, the message it stands for with its `c` cells or `d` rows empty), one or more `screen_rows` (`revision`, `rows` as delta rows: a full screen's rows in order from 0, a delta's in ascending order), and `screen_end` (`revision`, and the request ID of a correlated copy-mode screen). The frames of one revision are contiguous; the receiver presents the screen only at `screen_end`, discards a partial screen when a newer one begins, and asks for a fresh screen after a malformed sequence | Screens stay within 150,000 visible cells; larger hello or resize sizes are rejected, and a larger terminal shared with another client is shown as its top-left corner until this peer's resize shrinks it |
@@ -106,6 +107,10 @@ programs and argv in these methods are endpoint-local. Remote resource roots,
 PIDs, extension paths and tokens never authorize local filesystem or process
 operations. Configuration reload and client hooks remain local-only.
 Clipboard and rendering run locally; terminal links allow only HTTP/HTTPS.
+All clients see the same pane name. Names use at most 512 UTF-8 bytes and cannot
+contain control characters. An empty name clears the title. The daemon applies
+the existing interactive scope checks to pane renames. This capability does not
+permit remote contextual or automation commands.
 Pane links and ordinary terminal/navigation/layout operations remain usable.
 An extension's Fut package requirement applies to the hosting daemon, not the
 local renderer; remote catalog validation retains structural/fingerprint checks

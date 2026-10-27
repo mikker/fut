@@ -380,7 +380,7 @@ impl From<ResourceError> for DaemonError {
             ResourceError::InvalidWorkspaceParent(_) => "invalid_workspace_parent",
             ResourceError::InvalidWorkspacePosition(_) => "invalid_position",
             ResourceError::TargetRequired | ResourceError::AmbiguousTarget => "target_required",
-            ResourceError::EmptyName => "invalid_name",
+            ResourceError::EmptyName | ResourceError::InvalidName => "invalid_name",
             ResourceError::InvalidStatusReport(_) => "invalid_agent_report",
             ResourceError::TooManyMaterializedTokens => "token_limit",
             _ => "resource_error",
@@ -1138,6 +1138,7 @@ impl SharedState {
             }
             RenameSelector::Workspace(id) => self.resources.rename_workspace(id, name)?,
             RenameSelector::Tab(id) => self.resources.rename_tab(id, name)?,
+            RenameSelector::Pane(id) => self.resources.rename_pane(id, name)?,
         };
         self.publish_mutation(&mutation);
         Ok(mutation.revision)
@@ -4433,7 +4434,8 @@ async fn reject_unnegotiated_method(
             .is_some_and(|caps| !caps.allows_client(&envelope.message))
         || (connection.remote.is_none()
             && connection.local.is_none()
-            && matches!(envelope.message, ClientMessage::MoveWorkspace { .. }))
+            && (matches!(envelope.message, ClientMessage::MoveWorkspace { .. })
+                || envelope.message.requires_pane_titles()))
     {
         send(
             connection,
@@ -5389,6 +5391,29 @@ async fn handle_contextual_command(
                 }
             }
         }
+        ContextualCommand::RenamePane { name } => {
+            let result = {
+                let mut state = shared.lock().await;
+                state
+                    .validate_terminal_context(context)
+                    .and_then(|_| state.rename_target(RenameSelector::Pane(context.pane_id), name))
+            };
+            match result {
+                Ok(_) => {
+                    send(
+                        connection,
+                        request_id,
+                        ServerMessage::CommandCompleted {
+                            command: AcknowledgedCommand::RenameTarget,
+                        },
+                    )
+                    .await?
+                }
+                Err(error) => {
+                    send_error(connection, request_id, error.code, &error.message).await?
+                }
+            }
+        }
         ContextualCommand::Rename { scope, name } => {
             let result = {
                 let mut state = shared.lock().await;
@@ -5646,6 +5671,9 @@ fn interactive_rename_allowed(
             .is_ok_and(|owner| owner == session_id),
         RenameSelector::Tab(target) => resources
             .workspace_id_for_tab(*target)
+            .is_ok_and(|owner| owner == workspace_id),
+        RenameSelector::Pane(target) => resources
+            .workspace_id_for_pane(*target)
             .is_ok_and(|owner| owner == workspace_id),
     }
 }
@@ -7821,6 +7849,17 @@ async fn send(
             _ => {}
         }
     }
+    let pane_titles = connection.local.is_some_and(|caps| caps.pane_titles())
+        || connection
+            .remote
+            .is_some_and(|caps| caps.contains(Capability::PaneTitles));
+    if !pane_titles {
+        match &mut message {
+            ServerMessage::Resources { snapshot, .. }
+            | ServerMessage::ResourcesChanged { snapshot } => snapshot.clear_pane_names(),
+            _ => {}
+        }
+    }
     if connection
         .remote
         .is_some_and(|caps| !caps.allows_server(&message))
@@ -9368,6 +9407,7 @@ mod tests {
         };
         let peer_workspace = peer.workspace_id;
         let peer_tab = peer.tab_id;
+        let peer_pane = peer.pane_id;
         state
             .resources
             .add_workspace(path.session_id, peer)
@@ -9402,6 +9442,18 @@ mod tests {
             path.session_id,
             path.workspace_id,
             &RenameSelector::Tab(peer_tab),
+        ));
+        assert!(interactive_rename_allowed(
+            &state.resources,
+            path.session_id,
+            path.workspace_id,
+            &RenameSelector::Pane(path.pane_id),
+        ));
+        assert!(!interactive_rename_allowed(
+            &state.resources,
+            path.session_id,
+            path.workspace_id,
+            &RenameSelector::Pane(peer_pane),
         ));
         assert!(!interactive_rename_allowed(
             &state.resources,

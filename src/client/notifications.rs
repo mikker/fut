@@ -715,6 +715,7 @@ mod tests {
 
     fn completed_pane(closing: bool) -> PaneSnapshot {
         PaneSnapshot {
+            name: None,
             tokens: Default::default(),
             id: PaneId::new(),
             terminal_id: TerminalId::new(),
@@ -788,6 +789,7 @@ mod tests {
             id: PaneId::new(),
             terminal_id,
             closing: false,
+            name: None,
             activity: program_status(StatusState::Done, 9, 4, 0, 10),
             cwd: None,
             worktree: None,
@@ -807,6 +809,7 @@ mod tests {
             id: PaneId::new(),
             terminal_id,
             closing: false,
+            name: None,
             activity: program_status(StatusState::Done, 11, 5, 4, 20),
             cwd: None,
             worktree: None,

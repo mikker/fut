@@ -112,6 +112,7 @@ fields = [{ name = 'value', label = 'Value' }]
                     tokens: Default::default(),
                     layout: SplitTree::leaf(target.pane_id),
                     panes: vec![PaneSnapshot {
+                        name: None,
                         id: target.pane_id,
                         terminal_id: target.terminal_id,
                         closing: false,
@@ -406,6 +407,7 @@ async fn local_handshakes_accept_different_package_versions() {
                 !capabilities.unwrap().workspace_order(),
                 "old daemons must not enable workspace moves"
             );
+            assert!(!capabilities.unwrap().pane_titles());
             drop(connection);
         } else {
             let (connection, catalog, version) =

@@ -561,6 +561,7 @@ mod tests {
 
     fn fixture() -> ResourceSnapshot {
         let pane = |closing| PaneSnapshot {
+            name: None,
             tokens: Default::default(),
             id: PaneId::new(),
             terminal_id: TerminalId::new(),
@@ -1052,6 +1053,7 @@ mod tests {
     fn sibling_panes_have_distinct_hierarchical_descriptions() {
         let mut snapshot = fixture();
         let second = PaneSnapshot {
+            name: None,
             tokens: Default::default(),
             id: PaneId::new(),
             terminal_id: TerminalId::new(),

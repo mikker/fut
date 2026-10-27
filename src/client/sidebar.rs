@@ -2846,6 +2846,7 @@ mod tests {
                         closing: false,
                         layout: crate::splits::SplitTree::leaf(pane_id),
                         panes: vec![PaneSnapshot {
+                            name: None,
                             tokens: Default::default(),
                             id: pane_id,
                             terminal_id: TerminalId::new(),
@@ -3313,6 +3314,7 @@ mod tests {
         focused.workspace_id = snapshot.sessions[0].workspaces[0].id;
         let feature = &mut snapshot.sessions[0].workspaces[1];
         let remembered = PaneSnapshot {
+            name: None,
             tokens: Default::default(),
             id: PaneId::new(),
             terminal_id: TerminalId::new(),

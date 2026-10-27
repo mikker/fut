@@ -8683,7 +8683,19 @@ async fn location_aware_layout_commands_follow_live_terminal_ancestry_and_guard_
         .status
         .success()
     );
+    assert!(
+        run(&["pane", "rename", "Moved task"], anchor.terminal_id)
+            .status
+            .success()
+    );
     let moved_panes = success_json(run(&["--json", "pane", "list"], anchor.terminal_id));
+    assert!(
+        moved_panes["result"]["panes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|pane| pane["id"] == anchor.id.uuid().to_string() && pane["name"] == "Moved task")
+    );
     assert_eq!(
         moved_panes["result"]["tab_id"],
         second_tab_id.uuid().to_string()
@@ -15342,7 +15354,7 @@ async fn public_doctor_probes_a_running_daemon_without_mutating_resources() {
     );
     assert_eq!(
         protocol["details"]["capabilities"],
-        serde_json::json!(["local.v1", "workspace-order.v1"])
+        serde_json::json!(["local.v1", "workspace-order.v1", "pane-titles.v1"])
     );
     let after = harness.resources().await;
     assert_eq!(without_observations(after), without_observations(before));
@@ -16612,6 +16624,229 @@ async fn last_terminal_exit_detaches_instead_of_crossing_sessions() {
 }
 
 #[tokio::test]
+async fn public_pane_rename_supports_explicit_and_caller_targets_without_restarting_terminals() {
+    let harness =
+        Harness::start("printf 'PANE_NAME_READY\\r\\n'; while IFS= read -r line; do :; done").await;
+    let initial = harness.resources().await;
+    let pane = &initial.sessions[0].workspaces[0].tabs[0].panes[0];
+    let pane_id = pane.id;
+    let terminal_id = pane.terminal_id;
+    let tab_id = initial.sessions[0].workspaces[0].tabs[0].id;
+    let (mut attached, selected) = attach_once(&harness, TargetSelector::Pane(pane_id)).await;
+    snapshot_containing(&mut attached, terminal_id, "PANE_NAME_READY").await;
+    let output = harness
+        .cli()
+        .args(["--json", "pane", "rename", &pane_id.to_string(), "Review λ"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["command"], "pane.rename");
+    assert_eq!(result["result"]["pane_id"], pane_id.uuid().to_string());
+    let named = harness.resources().await;
+    assert_eq!(
+        named.sessions[0].workspaces[0].tabs[0].panes[0]
+            .name
+            .as_deref(),
+        Some("Review λ")
+    );
+    assert!(process_alive(selected.child_pid));
+    assert_eq!(
+        named.sessions[0].workspaces[0].tabs[0].layout,
+        initial.sessions[0].workspaces[0].tabs[0].layout
+    );
+
+    for name in ["Implement issue #25", ""] {
+        let output = harness
+            .cli()
+            .env("FUT_TERMINAL_ID", terminal_id.to_string())
+            .args(["pane", "rename", name])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            harness.resources().await.sessions[0].workspaces[0].tabs[0].panes[0]
+                .name
+                .as_deref(),
+            Some(name)
+        );
+    }
+    let before_invalid = harness.resources().await;
+    for name in [" ".to_owned(), "line\nbreak".into(), "x".repeat(513)] {
+        let output = harness
+            .cli()
+            .args(["pane", "rename", &pane_id.to_string(), &name])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert_eq!(
+            without_observations(harness.resources().await),
+            without_observations(before_invalid.clone())
+        );
+    }
+    let listed = harness
+        .cli()
+        .args(["--json", "pane", "list", &tab_id.to_string()])
+        .output()
+        .unwrap();
+    let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed["result"]["panes"][0]["name"], "");
+    harness.detach(&mut attached).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn command_palette_renames_and_clears_a_pane_title() {
+    let harness =
+        Harness::start("printf 'PANE_UI_READY\\r\\n'; while IFS= read -r line; do :; done").await;
+    let snapshot = harness.resources().await;
+    let pane_id = snapshot.sessions[0].workspaces[0].tabs[0].panes[0].id;
+    let mut command = Command::new("/usr/bin/script");
+    command
+        .env_clear()
+        .env("HOME", harness.root.path().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", harness.root.path().join("runtime"))
+        .env("FUT_RUNTIME_DIR", harness.root.path().join("runtime"))
+        .env("TERM", "xterm-256color")
+        .args(script_command_args())
+        .arg(format!(
+            "stty rows 24 cols 120; exec '{}' --socket '{}' pane attach {pane_id}",
+            env!("CARGO_BIN_EXE_fut"),
+            harness.socket.display()
+        ));
+    let mut client = PtyChild::spawn(command);
+    client.wait_for_screen("PANE_UI_READY").await;
+    client.send(b"\x02:rename pane\r");
+    client.wait_for_screen("Rename pane").await;
+    client.send("\x15Review λ\r".as_bytes());
+    resources_when(&harness, |snapshot| {
+        snapshot
+            .pane_paths()
+            .any(|path| path.pane.id == pane_id && path.pane.name.as_deref() == Some("Review λ"))
+    })
+    .await;
+    client.wait_for_screen_without("Rename pane").await;
+    client.wait_for_screen("Review λ").await;
+    client.send(b"\x02:rename pane\r");
+    client.wait_for_screen("Rename pane").await;
+    client.send(b"\x15\r");
+    resources_when(&harness, |snapshot| {
+        snapshot
+            .pane_paths()
+            .any(|path| path.pane.id == pane_id && path.pane.name.as_deref() == Some(""))
+    })
+    .await;
+    client.wait_for_screen_without("Review λ").await;
+    client.send(b"\x02d");
+    client.wait_success().await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn baseline_peers_never_receive_pane_names_or_gain_pane_rename_methods() {
+    let harness = Harness::start("while IFS= read -r line; do :; done").await;
+    let snapshot = harness.resources().await;
+    let pane_id = snapshot.sessions[0].workspaces[0].tabs[0].panes[0].id;
+    let mut connection = harness.connect().await.unwrap();
+    let mut offer = fut::protocol::local::LocalHello::new(ClientMode::Control, "baseline-test");
+    offer.optional.clear();
+    send(&mut connection, ClientMessage::LocalHello(offer.clone())).await;
+    let ServerMessage::LocalWelcome(welcome) = receive(&mut connection).await.unwrap() else {
+        panic!("expected local welcome")
+    };
+    assert!(!offer.accept(&welcome).unwrap().pane_titles());
+    send(&mut connection, ClientMessage::ListResources).await;
+    let ServerMessage::Resources { snapshot, .. } = receive(&mut connection).await.unwrap() else {
+        panic!("expected resources")
+    };
+    assert!(snapshot.pane_paths().all(|path| path.pane.name.is_none()));
+    let wire = serde_json::to_value(snapshot).unwrap();
+    assert!(
+        wire["sessions"][0]["workspaces"][0]["tabs"][0]["panes"][0]
+            .get("name")
+            .is_none()
+    );
+    send(
+        &mut connection,
+        ClientMessage::RenameTarget {
+            selector: RenameSelector::Pane(pane_id),
+            name: "forbidden".into(),
+        },
+    )
+    .await;
+    assert_eq!(
+        receive(&mut connection).await.unwrap(),
+        ServerMessage::EndpointError {
+            error: fut::protocol::remote::EndpointError::MethodNotNegotiated
+        }
+    );
+    send(&mut connection, ClientMessage::Ping).await;
+    assert!(matches!(
+        receive(&mut connection).await,
+        Some(ServerMessage::Pong { .. })
+    ));
+    let resources = harness.resources().await;
+    let path = resources
+        .live_terminal_path(resources.sessions[0].workspaces[0].tabs[0].panes[0].terminal_id)
+        .unwrap();
+    send(
+        &mut connection,
+        ClientMessage::Contextual {
+            context: fut::protocol::TerminalContext {
+                session_id: path.session_id,
+                workspace_id: path.workspace_id,
+                tab_id: path.tab_id,
+                pane_id: path.pane_id,
+                terminal_id: path.terminal_id,
+            },
+            command: fut::protocol::ContextualCommand::Rename {
+                scope: fut::protocol::ContextScope::Pane,
+                name: "old request".into(),
+            },
+        },
+    )
+    .await;
+    assert!(
+        matches!(receive(&mut connection).await, Some(ServerMessage::Error { code, .. }) if code == "invalid_context_command")
+    );
+
+    let mut remote = harness.connect().await.unwrap();
+    let mut offer = fut::protocol::remote::RemoteHello::new(ClientMode::Control, "baseline-test");
+    offer.optional.clear();
+    send(&mut remote, ClientMessage::RemoteHello(offer.clone())).await;
+    let ServerMessage::RemoteWelcome(welcome) = receive(&mut remote).await.unwrap() else {
+        panic!("expected remote welcome")
+    };
+    assert!(
+        !offer
+            .accept(&welcome)
+            .unwrap()
+            .contains(fut::protocol::remote::Capability::PaneTitles)
+    );
+    send(&mut remote, ClientMessage::ListResources).await;
+    let ServerMessage::Resources { snapshot, .. } = receive(&mut remote).await.unwrap() else {
+        panic!("expected resources")
+    };
+    assert!(snapshot.pane_paths().all(|path| path.pane.name.is_none()));
+    assert_eq!(
+        harness.resources().await.sessions[0].workspaces[0].tabs[0].panes[0]
+            .name
+            .as_deref(),
+        Some("")
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn public_rename_preserves_a_live_process_and_rejects_invalid_changes_atomically() {
     let harness = Harness::start(
         "printf 'RENAME_READY\\r\\n'; while IFS= read -r line; do [ \"$line\" = routed ] && printf 'RENAME_ROUTED\\r\\n'; done",
@@ -16793,7 +17028,7 @@ async fn public_rename_preserves_a_live_process_and_rejects_invalid_changes_atom
             "pane".into(),
             "rename".into(),
             pane_id.to_string(),
-            "no".into(),
+            " \t ".into(),
         ],
         vec![
             "terminal".into(),

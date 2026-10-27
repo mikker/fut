@@ -66,8 +66,7 @@ impl RenameState {
             }
             KeyCode::Enter => {
                 let cleared = self.name.trim().is_empty();
-                // Sessions require a name; tabs and workspaces submit an empty
-                // name to return to automatic naming.
+                // Sessions require a name; other resources may clear theirs.
                 if cleared && matches!(self.selector, RenameSelector::Session(_)) {
                     self.error = Some("name cannot be empty".into());
                     return RenameAction::Stay;
@@ -395,18 +394,20 @@ mod tests {
     }
 
     #[test]
-    fn empty_submissions_clear_tabs_and_workspaces_but_not_sessions() {
-        let mut workspace = RenameState::open(
-            RenameSelector::Workspace(WorkspaceId::new()),
-            "workspace",
-            "  ".into(),
-        );
-        let RenameAction::Submit { name, .. } =
-            workspace.key(key(KeyCode::Enter, KeyModifiers::NONE))
-        else {
-            panic!("blank workspace rename did not submit")
-        };
-        assert_eq!(name, "", "whitespace normalizes to a cleared name");
+    fn empty_submissions_clear_optional_names_but_not_sessions() {
+        for (selector, kind) in [
+            (RenameSelector::Workspace(WorkspaceId::new()), "workspace"),
+            (RenameSelector::Tab(crate::domain::TabId::new()), "tab"),
+            (RenameSelector::Pane(crate::domain::PaneId::new()), "pane"),
+        ] {
+            let mut rename = RenameState::open(selector, kind, "  ".into());
+            let RenameAction::Submit { name, .. } =
+                rename.key(key(KeyCode::Enter, KeyModifiers::NONE))
+            else {
+                panic!("blank {kind} rename did not submit")
+            };
+            assert_eq!(name, "", "whitespace normalizes to a cleared name");
+        }
 
         let mut session = RenameState::open(
             RenameSelector::Session(crate::resources::SessionSelector::Id(SessionId::new())),

@@ -64,7 +64,7 @@ use bytes::Bytes;
 pub(crate) use chrome::sanitize as sanitize_display_text;
 use chrome::{
     ClientLayout, MIN_DOCKED_TERMINAL_WIDTH, ResourceState, client_layout, render_tab_bar,
-    sanitize, sidebar_drawer,
+    sanitize, sidebar_drawer, truncate,
 };
 use command_bar::{CommandBarAction, CommandBarState};
 use command_form::{CommandFormAction, CommandFormState};
@@ -4604,6 +4604,7 @@ async fn dispatch_context_menu_action(
             let label = match selector {
                 crate::protocol::RenameSelector::Workspace(_) => "workspace",
                 crate::protocol::RenameSelector::Tab(_) => "tab",
+                crate::protocol::RenameSelector::Pane(_) => "pane",
                 crate::protocol::RenameSelector::Session(_) => "session",
             };
             *rename = Some(RenameState::open(selector, label, name));
@@ -6128,7 +6129,15 @@ async fn dispatch_client_action(
             )
             .await?;
         }
-        ClientAction::RenameSession | ClientAction::RenameWorkspace | ClientAction::RenameTab => {
+        ClientAction::RenameSession
+        | ClientAction::RenameWorkspace
+        | ClientAction::RenameTab
+        | ClientAction::RenamePane => {
+            if action == ClientAction::RenamePane && !attachment.supports_pane_titles() {
+                return Ok(Some(Toast::error(
+                    "pane naming unavailable · update Fut on the daemon host",
+                )));
+            }
             let Some(snapshot) = resources.snapshot() else {
                 return Ok(Some(Toast::error("resources are still loading")));
             };
@@ -6178,6 +6187,15 @@ async fn dispatch_client_action(
                             tab.name.clone(),
                         )
                     }),
+                ClientAction::RenamePane => {
+                    let pane_id = view.focused().pane_id;
+                    let name = snapshot
+                        .pane_paths()
+                        .find(|path| path.pane.id == pane_id)
+                        .and_then(|path| path.pane.name.clone())
+                        .unwrap_or_default();
+                    Some((crate::protocol::RenameSelector::Pane(pane_id), "pane", name))
+                }
                 _ => unreachable!("rename action guard"),
             };
             let Some((selector, kind, name)) = target else {
@@ -7096,6 +7114,7 @@ impl FocusState {
 
 struct PaneState {
     target: SelectedTarget,
+    name: String,
     newest_revision: Option<u64>,
     drawn_revision: Option<u64>,
     /// The materialized grid this pane renders: a full snapshot with
@@ -7122,6 +7141,7 @@ impl PaneState {
     fn new(target: SelectedTarget) -> Self {
         Self {
             target,
+            name: String::new(),
             newest_revision: None,
             drawn_revision: None,
             pending: None,
@@ -7626,7 +7646,7 @@ impl ViewState {
         std::collections::BTreeMap<TerminalId, PaneLayout>,
         Vec<SplitDivider>,
     ) {
-        match policy {
+        let (mut layouts, dividers) = match policy {
             PaneLayoutPolicy::Accordion => (
                 pane_layouts(area, &self.terminal_ids(), self.focused, self.zoomed),
                 Vec::new(),
@@ -7645,6 +7665,7 @@ impl ViewState {
                                 (
                                     pane.target.terminal_id,
                                     PaneLayout {
+                                        title: None,
                                         rail: None,
                                         content,
                                     },
@@ -7654,7 +7675,23 @@ impl ViewState {
                     .collect();
                 (panes, authored.dividers)
             }
+        };
+        for pane in &self.panes {
+            if !pane.name.is_empty()
+                && let Some(layout) = layouts.get_mut(&pane.target.terminal_id)
+                && layout.content.height > 1
+            {
+                layout.title = Some(Rect::new(
+                    layout.content.x,
+                    layout.content.y,
+                    layout.content.width,
+                    1,
+                ));
+                layout.content.y += 1;
+                layout.content.height -= 1;
+            }
         }
+        (layouts, dividers)
     }
 
     fn resize_split(&mut self, tab_id: crate::domain::TabId, split_id: SplitId, ratio: SplitRatio) {
@@ -7672,12 +7709,20 @@ impl ViewState {
     ) -> Option<(SelectedTarget, u16, u16)> {
         let layouts = self.pane_layouts(area, policy).0;
         self.panes.iter().find_map(|pane| {
-            let content = layouts.get(&pane.target.terminal_id)?.content;
+            let layout = layouts.get(&pane.target.terminal_id)?;
+            let content = layout.content;
+            let top = layout.title.map_or(content.y, |title| title.y);
             (column >= content.x
                 && column < content.x.saturating_add(content.width)
-                && row >= content.y
+                && row >= top
                 && row < content.y.saturating_add(content.height))
-            .then(|| (pane.target.clone(), column - content.x, row - content.y))
+            .then(|| {
+                (
+                    pane.target.clone(),
+                    column - content.x,
+                    row.saturating_sub(content.y),
+                )
+            })
         })
     }
 
@@ -7797,6 +7842,17 @@ async fn resize_view(
     resources: &ResourceState,
     ui: &UiConfig,
 ) -> anyhow::Result<()> {
+    if let Some(snapshot) = resources.snapshot()
+        && view.resources_are_current(snapshot)
+    {
+        for pane in &mut view.panes {
+            pane.name = snapshot
+                .pane_paths()
+                .find(|path| path.pane.id == pane.target.pane_id)
+                .and_then(|path| path.pane.name.clone())
+                .unwrap_or_default();
+        }
+    }
     let terminal =
         client_layout(area, ui, resources.sidebar_relevance(view.focused(), ui)).terminal;
     for (terminal_id, size) in view.resize_requests(terminal, ui.pane_layout) {
@@ -7949,9 +8005,31 @@ fn render_view(
     }
     let mut cursor = None;
     for pane in &view.panes {
-        let Some(PaneLayout { rail, content }) = layouts.get(&pane.target.terminal_id) else {
+        let Some(PaneLayout {
+            title,
+            rail,
+            content,
+        }) = layouts.get(&pane.target.terminal_id)
+        else {
             continue;
         };
+        if let Some(title) = title {
+            let style = styles.apply(
+                if pane.target.terminal_id == view.focused {
+                    config::SemanticStyle::Current
+                } else {
+                    config::SemanticStyle::Muted
+                },
+                styles.apply(config::SemanticStyle::Normal, Style::default()),
+            );
+            buffer.set_stringn(
+                title.x,
+                title.y,
+                truncate(&sanitize(&pane.name), usize::from(title.width)),
+                usize::from(title.width),
+                style,
+            );
+        }
         if let Some(rail) = rail {
             let focused = pane.target.terminal_id == view.focused;
             let style = if focused {
@@ -8553,6 +8631,7 @@ mod tests {
                             tokens: Default::default(),
                             layout: SplitTree::leaf(focused_pane_id),
                             panes: vec![crate::resources::PaneSnapshot {
+                                name: None,
                                 id: focused_pane_id,
                                 terminal_id: focused_terminal_id,
                                 closing: false,
@@ -8577,6 +8656,7 @@ mod tests {
                             tokens: Default::default(),
                             layout: SplitTree::leaf(target_pane_id),
                             panes: vec![crate::resources::PaneSnapshot {
+                                name: None,
                                 id: target_pane_id,
                                 terminal_id: target_terminal_id,
                                 closing: false,
@@ -10455,6 +10535,89 @@ mod tests {
             .replace(selected_view(3, panes[0].clone(), vec![panes[0].clone()]))
             .unwrap();
         assert_eq!(state.toggle_zoom(), None);
+    }
+
+    #[test]
+    fn pane_titles_reserve_a_row_without_shifting_terminal_input_coordinates() {
+        let panes = targets(2);
+        let first = panes[0].terminal_id;
+        let mut state =
+            ViewState::new(Locality::Local, selected_view(1, panes[0].clone(), panes)).unwrap();
+        state.panes[0].name = "Review λ".into();
+        state.panes[1].name = "Build".into();
+        let area = Rect::new(3, 5, 90, 8);
+        for policy in [PaneLayoutPolicy::Splits, PaneLayoutPolicy::Accordion] {
+            let layouts = state.pane_layouts(area, policy).0;
+            let layout = layouts[&first];
+            let title = layout.title.unwrap();
+            assert_eq!(title.height, 1);
+            assert_eq!(layout.content.y, title.y + 1);
+            assert_eq!(layout.content.height, 7);
+            assert_eq!(
+                state.terminal_cell(
+                    area,
+                    policy,
+                    first,
+                    layout.content.x,
+                    layout.content.y,
+                    false
+                ),
+                Some((0, 0))
+            );
+            assert_eq!(
+                state.terminal_cell(area, policy, first, title.x, title.y, false),
+                None
+            );
+            assert_eq!(
+                state
+                    .pane_at(area, policy, title.x, title.y)
+                    .unwrap()
+                    .0
+                    .terminal_id,
+                first
+            );
+            let mut buffer = Buffer::empty(area);
+            render_view(
+                &state,
+                area,
+                policy,
+                &UiConfig::default().styles,
+                &mut buffer,
+            );
+            let text: String = (title.x..title.right())
+                .map(|x| buffer[(x, title.y)].symbol())
+                .collect();
+            assert!(text.starts_with("Review λ"));
+            assert_eq!(state.resize_requests(area, policy)[0].1.rows, 7);
+            state.panes[0].last_size = None;
+        }
+        state.panes[0].name.clear();
+        assert!(
+            state.pane_layouts(area, PaneLayoutPolicy::Splits).0[&first]
+                .title
+                .is_none()
+        );
+        assert_eq!(
+            state.resize_requests(area, PaneLayoutPolicy::Splits)[0]
+                .1
+                .rows,
+            8
+        );
+        state.panes[0].name = "A very long task 雪".repeat(100);
+        let tiny = Rect::new(0, 0, 2, 1);
+        assert!(
+            state.pane_layouts(tiny, PaneLayoutPolicy::Splits).0[&first]
+                .title
+                .is_none()
+        );
+        let short = Rect::new(0, 0, 4, 2);
+        render_view(
+            &state,
+            short,
+            PaneLayoutPolicy::Splits,
+            &UiConfig::default().styles,
+            &mut Buffer::empty(short),
+        );
     }
 
     #[test]

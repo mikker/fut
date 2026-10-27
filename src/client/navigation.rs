@@ -307,6 +307,7 @@ mod tests {
 
     fn pane() -> crate::resources::PaneSnapshot {
         PaneSnapshot {
+            name: None,
             tokens: Default::default(),
             id: PaneId::new(),
             terminal_id: TerminalId::new(),

@@ -183,6 +183,7 @@ open_command_bar = "space"
 # move_workspace_up = "<"    # Unbound by default; move among workspace siblings.
 # move_workspace_down = ">"
 # rename_tab = "T"
+# rename_pane = ","
 # close_session = "q"
 # close_workspace = "Q"
 # close_tab = "X"
@@ -348,9 +349,10 @@ map the key to the action under `[ui.hotkeys]` instead. Direct hotkeys are
 additional: the action's prefixed binding continues to work.
 
 The command palette also includes `rename-session`, `rename-workspace`,
-`rename-tab`, `kill-session`, `kill-workspace`, and `kill-tab`. They have no
-default bindings; configure the corresponding `rename_*` or `close_*` keys to
-add shortcuts. `kill-pane` remains bound through `close_pane` by default.
+`rename-tab`, `rename-pane`, `kill-session`, `kill-workspace`, and `kill-tab`.
+These actions have no default bindings. Configure the corresponding `rename_*`
+or `close_*` keys to add shortcuts. `kill-pane` has a default binding through
+`close_pane`.
 
 `move-workspace-up` and `move-workspace-down` in the command palette reorder
 the active workspace without switching focus. They are unbound by default to

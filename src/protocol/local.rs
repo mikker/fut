@@ -13,6 +13,7 @@ pub const GENERATION: u16 = 1;
 pub const CODEC: &str = "msgpack-map-v1";
 pub const BASELINE: &str = "local.v1";
 pub const WORKSPACE_ORDER: &str = "workspace-order.v1";
+pub const PANE_TITLES: &str = "pane-titles.v1";
 
 /// An older daemon cannot decode local_hello, so its negative response cannot
 /// echo the request ID. Never treat a malformed welcome as a legacy rejection.
@@ -60,9 +61,12 @@ pub struct LocalWelcome {
     pub extension_catalog: ExtensionCatalog,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// The selected local contract. The default is the baseline alone, which is
+/// all a legacy welcome can imply.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Capabilities {
     workspace_order: bool,
+    pane_titles: bool,
 }
 
 impl Capabilities {
@@ -70,10 +74,17 @@ impl Capabilities {
         self.workspace_order
     }
 
+    pub fn pane_titles(self) -> bool {
+        self.pane_titles
+    }
+
     pub fn names(self) -> Vec<String> {
         let mut names = vec![BASELINE.into()];
         if self.workspace_order {
             names.push(WORKSPACE_ORDER.into());
+        }
+        if self.pane_titles {
+            names.push(PANE_TITLES.into());
         }
         names
     }
@@ -85,6 +96,14 @@ impl Capabilities {
         match message {
             Hello { .. } | LocalHello(_) | RemoteHello(_) => false,
             MoveWorkspace { .. } => self.workspace_order,
+            RenameTarget {
+                selector: super::RenameSelector::Pane(_),
+                ..
+            }
+            | Contextual {
+                command: super::ContextualCommand::RenamePane { .. },
+                ..
+            } => self.pane_titles,
             CommandDefaults { .. }
             | CommandStart { .. }
             | CommandOperation { .. }
@@ -195,7 +214,7 @@ impl LocalHello {
             codec: CODEC.into(),
             client_version: client_version.into(),
             required: vec![BASELINE.into()],
-            optional: vec![WORKSPACE_ORDER.into()],
+            optional: vec![WORKSPACE_ORDER.into(), PANE_TITLES.into()],
             mode,
         }
     }
@@ -217,7 +236,7 @@ impl LocalHello {
             || self
                 .required
                 .iter()
-                .any(|name| name != BASELINE && name != WORKSPACE_ORDER)
+                .any(|name| name != BASELINE && name != WORKSPACE_ORDER && name != PANE_TITLES)
         {
             return Err(EndpointError::MissingRequiredCapability);
         }
@@ -229,6 +248,11 @@ impl LocalHello {
                 .iter()
                 .chain(&self.optional)
                 .any(|name| name == WORKSPACE_ORDER),
+            pane_titles: self
+                .required
+                .iter()
+                .chain(&self.optional)
+                .any(|name| name == PANE_TITLES),
         })
     }
 
@@ -246,11 +270,15 @@ impl LocalHello {
         if welcome.codec != CODEC {
             return Err(EndpointError::UnsupportedCodec);
         }
-        if !welcome.capabilities.iter().any(|name| name == BASELINE) {
+        if self
+            .required
+            .iter()
+            .any(|name| !welcome.capabilities.contains(name))
+        {
             return Err(EndpointError::MissingRequiredCapability);
         }
         if welcome.capabilities.iter().any(|name| {
-            (name != BASELINE && name != WORKSPACE_ORDER)
+            (name != BASELINE && name != WORKSPACE_ORDER && name != PANE_TITLES)
                 || !self
                     .required
                     .iter()
@@ -269,6 +297,7 @@ impl LocalHello {
                 .capabilities
                 .iter()
                 .any(|name| name == WORKSPACE_ORDER),
+            pane_titles: welcome.capabilities.iter().any(|name| name == PANE_TITLES),
         })
     }
 }
@@ -365,6 +394,47 @@ mod tests {
         hello.optional = vec![BASELINE.into()];
         assert_eq!(
             hello.negotiate(),
+            Err(EndpointError::MissingRequiredCapability)
+        );
+    }
+
+    #[test]
+    fn pane_titles_are_optional_and_gate_new_selectors_and_contextual_semantics() {
+        let mut hello = LocalHello::new(ClientMode::Control, "0.1.0");
+        let selected = hello.negotiate().unwrap();
+        assert!(selected.pane_titles);
+        let explicit = ClientMessage::RenameTarget {
+            selector: super::super::RenameSelector::Pane(crate::domain::PaneId::new()),
+            name: "Review".into(),
+        };
+        assert!(selected.allows_client(&explicit));
+        assert!(!hello.accept(&welcome()).unwrap().pane_titles);
+        hello.optional.clear();
+        let baseline = hello.negotiate().unwrap();
+        assert!(!baseline.allows_client(&explicit));
+        let contextual = ClientMessage::Contextual {
+            context: super::super::TerminalContext {
+                session_id: crate::domain::SessionId::new(),
+                workspace_id: crate::domain::WorkspaceId::new(),
+                tab_id: crate::domain::TabId::new(),
+                pane_id: crate::domain::PaneId::new(),
+                terminal_id: crate::domain::TerminalId::new(),
+            },
+            command: super::super::ContextualCommand::RenamePane {
+                name: "Task".into(),
+            },
+        };
+        assert!(selected.allows_client(&contextual));
+        assert!(!baseline.allows_client(&contextual));
+        let mut unoffered = welcome();
+        unoffered.capabilities.push(PANE_TITLES.into());
+        assert_eq!(
+            hello.accept(&unoffered),
+            Err(EndpointError::InvalidHandshake)
+        );
+        hello.required.push(PANE_TITLES.into());
+        assert_eq!(
+            hello.accept(&welcome()),
             Err(EndpointError::MissingRequiredCapability)
         );
     }

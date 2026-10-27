@@ -8,7 +8,7 @@ big-endian lengths and bounded MessagePack named maps, `msgpack-map-v1`.
 The first envelope contains `local_hello`:
 
 ```json
-{"message":{"type":"local_hello","generation":1,"codec":"msgpack-map-v1","client_version":"0.38.0","required":["local.v1"],"optional":[],"mode":"control"}}
+{"message":{"type":"local_hello","generation":1,"codec":"msgpack-map-v1","client_version":"0.38.0","required":["local.v1"],"optional":["pane-titles.v1"],"mode":"control"}}
 ```
 
 Interactive mode retains the existing `ClientMode` representation with terminal
@@ -50,6 +50,26 @@ Successful changes use the existing resource snapshot/change path. Both sending
 and dispatch require selection; older selections retain the complete baseline
 and clients report update/restart guidance for this operation instead of sending
 it. Remote selection is independent and never grants local-only methods.
+
+`pane-titles.v1` is optional in the same way. When selected, pane snapshots include `name`, or `""` for an unnamed pane.
+`rename_target` accepts a `pane` selector. The contextual `rename_pane` command
+renames the calling terminal's pane. The existing contextual `rename` command
+still rejects `scope: pane`.
+
+Pane names are plain text shared by clients. Like workspace and tab names, they
+use at most 512 UTF-8 bytes and cannot contain control characters. An empty
+name clears the title. Clients
+still wait for both the rename acknowledgement and the corresponding resource
+revision.
+
+Without this capability, the daemon omits pane names and rejects pane rename
+requests before dispatch. Clients that offer it as optional accept a welcome
+without it and disable pane renaming for that connection. Legacy exact-version
+connections cannot rename panes.
+
+New features must update the capability types, selection validation, and
+boundary allowlists. Listing an optional capability does not authorize new
+behavior.
 
 - Keep existing wire shapes and semantics unchanged, including fields in shared
   domain types. Rust defaults or ignored unknown fields alone do not establish

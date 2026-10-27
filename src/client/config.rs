@@ -3761,6 +3761,7 @@ components = [
             ClientAction::RenameSession,
             ClientAction::RenameWorkspace,
             ClientAction::RenameTab,
+            ClientAction::RenamePane,
             ClientAction::CloseSession,
             ClientAction::CloseWorkspace,
             ClientAction::CloseTab,
@@ -3772,7 +3773,7 @@ components = [
         let path = temporary.path().join("config.toml");
         fs::write(
             &path,
-            "[ui.bindings]\nrename_session = 'S'\nrename_workspace = 'W'\nrename_tab = 'T'\nclose_session = 'q'\nclose_workspace = 'Q'\nclose_tab = 'X'\n",
+            "[ui.bindings]\nrename_session = 'S'\nrename_workspace = 'W'\nrename_tab = 'T'\nrename_pane = ','\nclose_session = 'q'\nclose_workspace = 'Q'\nclose_tab = 'X'\n",
         )
         .unwrap();
         let config = load_path(&path, true).unwrap();
@@ -3788,6 +3789,10 @@ components = [
         assert_eq!(
             config.bindings.action_for_suffix(b"T"),
             Some(ClientAction::RenameTab)
+        );
+        assert_eq!(
+            config.bindings.action_for_suffix(b","),
+            Some(ClientAction::RenamePane)
         );
         assert_eq!(
             config.bindings.action_for_suffix(b"q"),
