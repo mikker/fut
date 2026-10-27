@@ -40,9 +40,16 @@ engine or an unlimited promise to support every past release. Compatible app
 releases retain generation 1 and `local.v1`, so updating a client alone need not
 interrupt running terminals.
 
-Only `local.v1` is selectable today. The first optional local feature must extend
-the capability representation, selection validation and boundary allowlists; the
-handshake's optional list is not permission to emit unrecognized behavior.
+`workspace-order.v1` is optional alongside `local.v1`. It permits
+`move_workspace { workspace_id, position }` and the correlated
+`workspace_moved { resource_revision }` reply. Positions are one-based among
+siblings in the owning session (all workspaces in a flat session). Parentage
+and focus do not change. Unknown or closing targets and out-of-range positions
+fail atomically; moving to the current position does not advance the revision.
+Successful changes use the existing resource snapshot/change path. Both sending
+and dispatch require selection; older selections retain the complete baseline
+and clients report update/restart guidance for this operation instead of sending
+it. Remote selection is independent and never grants local-only methods.
 
 - Keep existing wire shapes and semantics unchanged, including fields in shared
   domain types. Rust defaults or ignored unknown fields alone do not establish

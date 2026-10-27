@@ -12,6 +12,7 @@ use remote::{EndpointError, capability_list, validate_name, validate_names, vali
 pub const GENERATION: u16 = 1;
 pub const CODEC: &str = "msgpack-map-v1";
 pub const BASELINE: &str = "local.v1";
+pub const WORKSPACE_ORDER: &str = "workspace-order.v1";
 
 /// An older daemon cannot decode local_hello, so its negative response cannot
 /// echo the request ID. Never treat a malformed welcome as a legacy rejection.
@@ -60,11 +61,21 @@ pub struct LocalWelcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Capabilities(());
+pub struct Capabilities {
+    workspace_order: bool,
+}
 
 impl Capabilities {
+    pub fn workspace_order(self) -> bool {
+        self.workspace_order
+    }
+
     pub fn names(self) -> Vec<String> {
-        vec![BASELINE.into()]
+        let mut names = vec![BASELINE.into()];
+        if self.workspace_order {
+            names.push(WORKSPACE_ORDER.into());
+        }
+        names
     }
 
     /// Intentionally exhaustive: every new method needs an explicit capability
@@ -73,6 +84,7 @@ impl Capabilities {
         use ClientMessage::*;
         match message {
             Hello { .. } | LocalHello(_) | RemoteHello(_) => false,
+            MoveWorkspace { .. } => self.workspace_order,
             CommandDefaults { .. }
             | CommandStart { .. }
             | CommandOperation { .. }
@@ -130,6 +142,7 @@ impl Capabilities {
         use ServerMessage::*;
         match message {
             Welcome { .. } | RemoteWelcome(_) | IncompatibleProtocol { .. } => false,
+            WorkspaceMoved { .. } => self.workspace_order,
             LocalWelcome(_)
             | EndpointError { .. }
             | CommandReply { .. }
@@ -182,7 +195,7 @@ impl LocalHello {
             codec: CODEC.into(),
             client_version: client_version.into(),
             required: vec![BASELINE.into()],
-            optional: Vec::new(),
+            optional: vec![WORKSPACE_ORDER.into()],
             mode,
         }
     }
@@ -201,17 +214,26 @@ impl LocalHello {
             return Err(EndpointError::UnsupportedCodec);
         }
         if !self.required.iter().any(|name| name == BASELINE)
-            || self.required.iter().any(|name| name != BASELINE)
+            || self
+                .required
+                .iter()
+                .any(|name| name != BASELINE && name != WORKSPACE_ORDER)
         {
             return Err(EndpointError::MissingRequiredCapability);
         }
         // Size is an operational error, not a compatibility failure. The
         // daemon validates it before leasing and returns descriptive invalid_size.
-        Ok(Capabilities(()))
+        Ok(Capabilities {
+            workspace_order: self
+                .required
+                .iter()
+                .chain(&self.optional)
+                .any(|name| name == WORKSPACE_ORDER),
+        })
     }
 
     pub fn accept(&self, welcome: &LocalWelcome) -> Result<Capabilities, EndpointError> {
-        let capabilities = self.negotiate()?;
+        self.negotiate()?;
         validate_version(&welcome.server_version)?;
         validate_names(welcome.capabilities.iter())?;
         validate_name(&welcome.codec)?;
@@ -227,12 +249,27 @@ impl LocalHello {
         if !welcome.capabilities.iter().any(|name| name == BASELINE) {
             return Err(EndpointError::MissingRequiredCapability);
         }
-        if welcome.capabilities != capabilities.names()
+        if welcome.capabilities.iter().any(|name| {
+            (name != BASELINE && name != WORKSPACE_ORDER)
+                || !self
+                    .required
+                    .iter()
+                    .chain(&self.optional)
+                    .any(|offered| offered == name)
+        }) || self
+            .required
+            .iter()
+            .any(|name| !welcome.capabilities.contains(name))
             || matches!(self.mode, ClientMode::Interactive { .. }) != welcome.selected.is_some()
         {
             return Err(EndpointError::InvalidHandshake);
         }
-        Ok(capabilities)
+        Ok(Capabilities {
+            workspace_order: welcome
+                .capabilities
+                .iter()
+                .any(|name| name == WORKSPACE_ORDER),
+        })
     }
 }
 
@@ -316,6 +353,7 @@ mod tests {
     #[test]
     fn baseline_is_required_and_unknown_optional_is_ignored() {
         let mut hello = LocalHello::new(ClientMode::Control, "0.1.0");
+        hello.optional.clear();
         hello.optional.push("future.v1".into());
         assert_eq!(hello.negotiate().unwrap().names(), [BASELINE]);
         hello.required.push("future-required.v1".into());
@@ -465,5 +503,46 @@ mod tests {
         assert!(local.allows_client(&ClientMessage::Shutdown));
         assert!(local.allows_server(&ServerMessage::LocalWelcome(welcome())));
         assert!(!local.allows_client(&ClientMessage::RemoteHello(hello)));
+    }
+
+    #[test]
+    fn workspace_order_is_optional_and_gates_both_wire_directions() {
+        let hello = LocalHello::new(ClientMode::Control, "0.1.0");
+        let request = ClientMessage::MoveWorkspace {
+            workspace_id: crate::domain::WorkspaceId::new(),
+            position: 1,
+        };
+        let reply = ServerMessage::WorkspaceMoved {
+            resource_revision: 42,
+        };
+        let request: ClientMessage =
+            remote::decode_handshake(&encode_payload(&request).unwrap()).unwrap();
+        let reply: ServerMessage =
+            remote::decode_handshake(&encode_payload(&reply).unwrap()).unwrap();
+        let old = hello.accept(&welcome()).unwrap();
+        assert!(!old.allows_client(&request));
+        assert!(!old.allows_server(&reply));
+        let mut selected = welcome();
+        selected.capabilities.push(WORKSPACE_ORDER.into());
+        let new = hello.accept(&selected).unwrap();
+        assert!(new.allows_client(&request));
+        assert!(new.allows_server(&reply));
+        let mut old_offer = hello.clone();
+        old_offer.optional.clear();
+        assert!(!old_offer.negotiate().unwrap().allows_client(&request));
+        assert_eq!(
+            old_offer.accept(&selected),
+            Err(EndpointError::InvalidHandshake)
+        );
+
+        let mut remote_offer = remote::RemoteHello::new(ClientMode::Control, "0.1.0");
+        let allowed = remote_offer.negotiate(remote::Capabilities::ALL).unwrap();
+        assert!(allowed.allows_client(&request));
+        assert!(allowed.allows_server(&reply));
+        assert!(!allowed.allows_client(&ClientMessage::Shutdown));
+        remote_offer.optional.retain(|name| name != WORKSPACE_ORDER);
+        let denied = remote_offer.negotiate(remote::Capabilities::ALL).unwrap();
+        assert!(!denied.allows_client(&request));
+        assert!(!denied.allows_server(&reply));
     }
 }

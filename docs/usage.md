@@ -265,6 +265,21 @@ The command palette also provides unbound `rename-session`, `rename-workspace`,
 focused resource. Session actions target the session to which the client is
 attached; closing it ends that attachment along with its terminals.
 
+Use **Move workspace up** / **Move workspace down** in the command palette to
+reorder the active workspace, or `fut workspace move WORKSPACE_ID POSITION`
+(`--json` is supported). Positions start at **1**, like the panel's workspace
+numbers. In a flat session this is the position in the session; nested
+workspaces move among siblings with the same parent, with positions counted
+within that sibling group. Moving a parent carries its displayed subtree;
+moving never changes parentage. Moving beyond the first/last sibling with an
+action is a no-op. The CLI rejects positions outside `1..=sibling_count`,
+unknown workspaces, and closing workspaces without changing the order.
+All clients see the updated order immediately; their focused workspace stays
+the same. These actions are unbound by default; bind `move_workspace_up` and
+`move_workspace_down` in [Configuration](../configuration/).
+Reordering requires `workspace-order.v1`; if unavailable, update Fut on the
+daemon's machine and restart its daemon. Mouse drag-to-reorder is not supported.
+
 Press `Ctrl-b Shift-S` to open a project without leaving the client. Fut fuzzy
 filters only the explicit `[projects]` catalog and never scans for repositories.
 Typing also adds an **Open path** row for the exact value, resolved relative to

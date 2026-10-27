@@ -15342,7 +15342,7 @@ async fn public_doctor_probes_a_running_daemon_without_mutating_resources() {
     );
     assert_eq!(
         protocol["details"]["capabilities"],
-        serde_json::json!(["local.v1"])
+        serde_json::json!(["local.v1", "workspace-order.v1"])
     );
     let after = harness.resources().await;
     assert_eq!(without_observations(after), without_observations(before));
@@ -15823,6 +15823,182 @@ async fn missing_destination_and_post_switch_disconnects_preserve_exact_leases()
     assert_eq!(selected.focused, c);
     harness.detach(&mut after_eof).await;
     drop(after_eof);
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn workspace_moves_negotiate_broadcast_and_round_trip_through_cli() {
+    use fut::protocol::{
+        local::LocalHello,
+        remote::{EndpointError, RemoteHello},
+    };
+    let harness = Harness::start("while IFS= read -r line; do :; done").await;
+    let initial = harness.resources().await;
+    let session_id = initial.sessions[0].id;
+    let first = initial.sessions[0].workspaces[0].id;
+    let (mut creator, _) = attach_once(&harness, TargetSelector::Workspace(first)).await;
+    send(
+        &mut creator,
+        ClientMessage::CreateWorkspace {
+            session_id,
+            name: Some("second".into()),
+            cwd: None,
+            program: Some("/bin/sh".into()),
+            argv: vec!["-c".into(), "while IFS= read -r line; do :; done".into()],
+        },
+    )
+    .await;
+    let second = time::timeout(DEADLINE, async {
+        loop {
+            match receive(&mut creator).await.unwrap() {
+                ServerMessage::WorkspaceCreated { selected } => break selected.workspace_id,
+                ServerMessage::Error { code, message } => {
+                    panic!("create failed: {code}: {message}")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    harness.detach(&mut creator).await;
+
+    // Both local and remote offers without the optional capability are denied
+    // before dispatch, without mutating the resource order.
+    for endpoint in ["legacy", "local", "remote"] {
+        let mut connection = harness.connect().await.unwrap();
+        let offer = if endpoint == "legacy" {
+            ClientMessage::Hello {
+                version: PROTOCOL_VERSION,
+                client_version: env!("CARGO_PKG_VERSION").into(),
+                mode: ClientMode::Control,
+            }
+        } else if endpoint == "remote" {
+            let mut offer = RemoteHello::new(ClientMode::Control, "0.1.0");
+            offer.optional.retain(|name| name != "workspace-order.v1");
+            ClientMessage::RemoteHello(offer)
+        } else {
+            let mut offer = LocalHello::new(ClientMode::Control, "0.1.0");
+            offer.optional.clear();
+            ClientMessage::LocalHello(offer)
+        };
+        send(&mut connection, offer).await;
+        assert!(matches!(
+            receive(&mut connection).await,
+            Some(
+                ServerMessage::Welcome { .. }
+                    | ServerMessage::LocalWelcome(_)
+                    | ServerMessage::RemoteWelcome(_)
+            )
+        ));
+        send(
+            &mut connection,
+            ClientMessage::MoveWorkspace {
+                workspace_id: second,
+                position: 1,
+            },
+        )
+        .await;
+        assert_eq!(
+            receive(&mut connection).await,
+            Some(ServerMessage::EndpointError {
+                error: EndpointError::MethodNotNegotiated
+            })
+        );
+    }
+    assert_eq!(
+        harness.resources().await.sessions[0].workspaces[0].id,
+        first
+    );
+
+    let mut watchers = Vec::new();
+    for _ in 0..2 {
+        let mut watcher = harness.connect().await.unwrap();
+        local_hello(&mut watcher, ClientMode::Control)
+            .await
+            .unwrap();
+        send(&mut watcher, ClientMessage::WatchResources).await;
+        assert!(matches!(
+            receive(&mut watcher).await,
+            Some(ServerMessage::Resources { .. })
+        ));
+        watchers.push(watcher);
+    }
+    let output = harness
+        .cli()
+        .args(["workspace", "move", &second.to_string(), "1", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["command"], "workspace.move");
+    assert_eq!(result["result"]["position"], 1);
+    for watcher in &mut watchers {
+        time::timeout(DEADLINE, async {
+            loop {
+                if let Some(ServerMessage::ResourcesChanged { snapshot }) = receive(watcher).await
+                    && snapshot.sessions[0]
+                        .workspaces
+                        .iter()
+                        .map(|w| w.id)
+                        .collect::<Vec<_>>()
+                        == [second, first]
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("workspace order was not broadcast");
+    }
+    let output = harness.cli().args(["list", "--json"]).output().unwrap();
+    assert!(output.status.success());
+    let listed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        listed["result"]["sessions"][0]["workspaces"][0]["id"],
+        second.uuid().to_string()
+    );
+    for position in ["0", "3"] {
+        let output = harness
+            .cli()
+            .args(["workspace", "move", &first.to_string(), position, "--json"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error"]["code"], "invalid_position");
+    }
+    // Remote peers can reorder, but still cannot acquire local privileges.
+    let mut remote = harness.connect().await.unwrap();
+    send(
+        &mut remote,
+        ClientMessage::RemoteHello(RemoteHello::new(ClientMode::Control, "0.1.0")),
+    )
+    .await;
+    assert!(matches!(
+        receive(&mut remote).await,
+        Some(ServerMessage::RemoteWelcome(_))
+    ));
+    send(
+        &mut remote,
+        ClientMessage::MoveWorkspace {
+            workspace_id: first,
+            position: 1,
+        },
+    )
+    .await;
+    assert!(matches!(
+        receive(&mut remote).await,
+        Some(ServerMessage::WorkspaceMoved { .. })
+    ));
+    assert_eq!(
+        harness.resources().await.sessions[0].workspaces[0].id,
+        first
+    );
     harness.shutdown().await;
 }
 
@@ -17955,6 +18131,11 @@ async fn process_completion_covers_live_resource_operations_and_refresh() {
         ),
         (
             vec!["workspace", "close", ""],
+            workspace.id.to_string(),
+            workspace_help.clone(),
+        ),
+        (
+            vec!["workspace", "move", ""],
             workspace.id.to_string(),
             workspace_help.clone(),
         ),

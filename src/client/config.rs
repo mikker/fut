@@ -3728,6 +3728,33 @@ components = [
     }
 
     #[test]
+    fn workspace_move_actions_are_unbound_and_configurable() {
+        let defaults = UiConfig::default();
+        for action in [
+            ClientAction::MoveWorkspaceUp,
+            ClientAction::MoveWorkspaceDown,
+        ] {
+            assert_eq!(defaults.bindings.label(action), "Unbound");
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("config.toml");
+        fs::write(
+            &path,
+            "[ui.bindings]\nmove_workspace_up = '<'\nmove_workspace_down = '>'\n",
+        )
+        .unwrap();
+        let config = load_path(&path, true).unwrap();
+        assert_eq!(
+            config.bindings.action_for_suffix(b"<"),
+            Some(ClientAction::MoveWorkspaceUp)
+        );
+        assert_eq!(
+            config.bindings.action_for_suffix(b">"),
+            Some(ClientAction::MoveWorkspaceDown)
+        );
+    }
+
+    #[test]
     fn rename_and_upper_level_close_actions_are_unbound_but_configurable() {
         let defaults = UiConfig::default();
         for action in [

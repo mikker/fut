@@ -341,6 +341,13 @@ enum SessionCommand {
 
 #[derive(Subcommand)]
 enum WorkspaceCommand {
+    /// Move a workspace to a one-based sibling position in its session.
+    Move {
+        #[arg(add = ArgValueCompleter::new(completion::workspace_close))]
+        workspace_id: WorkspaceId,
+        /// Sibling position (1 is first); all workspaces in a flat session.
+        position: usize,
+    },
     /// Attach to a workspace on the existing daemon.
     Attach {
         /// Compact workspace ID or UUID; the workspace must contain exactly one open terminal.
@@ -1436,6 +1443,21 @@ async fn execute(cli: Cli) -> Result<()> {
                 &config_location,
             )
             .await
+        }
+        Some(Command::Workspace {
+            command:
+                WorkspaceCommand::Move {
+                    workspace_id,
+                    position,
+                },
+        }) => {
+            let resource_revision = move_workspace(&socket, workspace_id, position).await?;
+            output(
+                cli.json,
+                "workspace.move",
+                json!({ "workspace_id": workspace_id.uuid(), "position": position, "resource_revision": resource_revision }),
+                "workspace moved",
+            )
         }
         Some(Command::Workspace {
             command: WorkspaceCommand::Attach { workspace_id },
@@ -4140,15 +4162,41 @@ async fn wait_until_protocol_stops(socket: &std::path::Path) -> bool {
     !protocol_ready(socket).await
 }
 
+async fn move_workspace(socket: &Path, workspace_id: WorkspaceId, position: usize) -> Result<u64> {
+    match control(
+        socket,
+        ClientMessage::MoveWorkspace {
+            workspace_id,
+            position,
+        },
+    )
+    .await?
+    {
+        ServerMessage::WorkspaceMoved { resource_revision } => Ok(resource_revision),
+        other => unexpected(other),
+    }
+}
+
 async fn control(socket: &std::path::Path, command: ClientMessage) -> Result<ServerMessage> {
-    request(connected_control(socket).await?, command).await
+    request(
+        connected_control_for(socket, Some(&command)).await?,
+        command,
+    )
+    .await
 }
 
 /// Negotiate the stable local contract, independently of package versions.
 async fn connected_control(
     socket: &std::path::Path,
 ) -> Result<Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>> {
-    match negotiated_control_handshake(socket).await? {
+    connected_control_for(socket, None).await
+}
+
+async fn connected_control_for(
+    socket: &std::path::Path,
+    command: Option<&ClientMessage>,
+) -> Result<Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>> {
+    match negotiated_control_handshake_for(socket, command).await? {
         ControlHandshake::Connected(framed) => Ok(framed),
         ControlHandshake::Incompatible { server, .. } => bail!(
             "daemon at {} uses protocol {server}, but this Fut client requires protocol \
@@ -4203,6 +4251,13 @@ enum ControlHandshake {
 }
 
 async fn negotiated_control_handshake(socket: &std::path::Path) -> Result<ControlHandshake> {
+    negotiated_control_handshake_for(socket, None).await
+}
+
+async fn negotiated_control_handshake_for(
+    socket: &std::path::Path,
+    command: Option<&ClientMessage>,
+) -> Result<ControlHandshake> {
     use crate::protocol::local::LocalHello;
 
     let stream = UnixStream::connect(socket)
@@ -4227,7 +4282,10 @@ async fn negotiated_control_handshake(socket: &std::path::Path) -> Result<Contro
     }
     match correlated_message(envelope, request_id)? {
         ServerMessage::LocalWelcome(welcome) => {
-            hello.accept(&welcome)?;
+            let capabilities = hello.accept(&welcome)?;
+            if command.is_some_and(|command| !capabilities.allows_client(command)) {
+                return Err(CliError::new("unsupported_operation", "daemon does not support workspace reordering; update Fut and restart its daemon").into());
+            }
             Ok(ControlHandshake::Connected(framed))
         }
         ServerMessage::IncompatibleProtocol { server, .. } => {
@@ -5646,6 +5704,48 @@ mod tests {
         let temporary = tempfile::NamedTempFile::new().unwrap();
         let error = owned_socket_identity(temporary.path()).unwrap_err();
         assert!(error.to_string().contains("non-socket"));
+    }
+
+    #[tokio::test]
+    async fn workspace_move_reports_old_daemon_without_sending_new_method() {
+        let temporary = tempfile::tempdir().unwrap();
+        let socket = temporary.path().join("fut.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut framed = Framed::new(stream, codec());
+            let request: Envelope<ClientMessage> =
+                decode_payload(&framed.next().await.unwrap().unwrap()).unwrap();
+            let ClientMessage::LocalHello(hello) = request.message else {
+                panic!("expected local hello")
+            };
+            assert!(hello.optional.contains(&"workspace-order.v1".into()));
+            framed
+                .send(Bytes::from(
+                    encode_payload(&Envelope {
+                        request_id: request.request_id,
+                        message: ServerMessage::LocalWelcome(
+                            crate::protocol::local::LocalWelcome {
+                                generation: 1,
+                                codec: crate::protocol::local::CODEC.into(),
+                                server_version: "0.1.0".into(),
+                                capabilities: vec![crate::protocol::local::BASELINE.into()],
+                                selected: None,
+                                extension_catalog: empty_extension_catalog(),
+                            },
+                        ),
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            assert!(framed.next().await.is_none());
+        });
+        let error = move_workspace(&socket, WorkspaceId::new(), 1)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("update Fut and restart"));
+        server.await.unwrap();
     }
 
     #[tokio::test]

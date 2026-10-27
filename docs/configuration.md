@@ -180,6 +180,8 @@ open_command_bar = "space"
 # create_tab = "c"
 # rename_session = "S"   # These rename and close actions have no default binding.
 # rename_workspace = "W"
+# move_workspace_up = "<"    # Unbound by default; move among workspace siblings.
+# move_workspace_down = ">"
 # rename_tab = "T"
 # close_session = "q"
 # close_workspace = "Q"
@@ -349,6 +351,20 @@ The command palette also includes `rename-session`, `rename-workspace`,
 `rename-tab`, `kill-session`, `kill-workspace`, and `kill-tab`. They have no
 default bindings; configure the corresponding `rename_*` or `close_*` keys to
 add shortcuts. `kill-pane` remains bound through `close_pane` by default.
+
+`move-workspace-up` and `move-workspace-down` in the command palette reorder
+the active workspace without switching focus. They are unbound by default to
+avoid taking existing shortcuts. For example:
+
+```toml
+[ui.bindings]
+move_workspace_up = "<"
+move_workspace_down = ">"
+```
+
+These suffixes follow your prefix (by default `Ctrl-b`). The same action names
+can be used in `[ui.hotkeys]` for immediate shortcuts. Nested workspaces move
+among siblings and keep their descendants grouped beneath them.
 
 A prefix, suffix, or hotkey may be one printable character, `ctrl-a` through
 `ctrl-z`, `ctrl-space`, `space`, `enter`, `tab`, `esc`, `up`, or `down`. Suffixes

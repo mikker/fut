@@ -76,7 +76,7 @@ fields = [{ name = 'value', label = 'Value' }]
             .is_err()
     );
     assert_eq!(
-        Attachment::Local(root.path().to_owned())
+        Attachment::Local(root.path().to_owned(), false)
             .local_socket()
             .unwrap(),
         root.path()
@@ -385,7 +385,7 @@ async fn local_handshakes_accept_different_package_versions() {
             assert!(peer.next().await.is_none());
         });
         if interactive {
-            let (connection, _, catalog, _) = handshake_interactive(
+            let (connection, _, catalog, _, workspace_order) = handshake_interactive(
                 stream,
                 None,
                 TerminalSize {
@@ -399,6 +399,10 @@ async fn local_handshakes_accept_different_package_versions() {
             .await
             .unwrap();
             assert_eq!(catalog.generation, 7);
+            assert!(
+                !workspace_order,
+                "old daemons must not enable workspace moves"
+            );
             drop(connection);
         } else {
             let (connection, catalog, version) =

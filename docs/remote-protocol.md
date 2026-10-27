@@ -84,6 +84,7 @@ are common to every negotiated connection.
 | Capability | Generation-2 methods and messages | When omitted |
 | --- | --- | --- |
 | `project-open.v1` | `open_project` with a catalog name; `location_opened` | Named project opening is unavailable |
+| `workspace-order.v1` | `move_workspace { workspace_id, position }`; correlated `workspace_moved { resource_revision }` | Workspace reordering is unavailable; update/restart guidance is shown |
 | `metadata.v2` | `list_resources`, `watch_resources`; resource snapshots/changes, program-status records and client presence | Required for the navigator and attachment |
 | `nested-workspaces.v1` | Optional `parent_workspace_id` fields in workspace snapshots | Workspaces remain flat and generation-2 metadata payloads are unchanged |
 | `interactive.v1` | Input/key/paste/mouse, viewport reset/refresh, copy mode, terminal/split resize, target selection, workspace/tab/pane creation and split, rename/close, agent acknowledgement; their replies, full/delta screens and terminal exit | Required for attachment |
@@ -109,6 +110,13 @@ Pane links and ordinary terminal/navigation/layout operations remain usable.
 An extension's Fut package requirement applies to the hosting daemon, not the
 local renderer; remote catalog validation retains structural/fingerprint checks
 without imposing the local package version on remote declarations.
+Workspace reordering is a session edit like renaming: it is permitted remotely
+only with `workspace-order.v1`, in either control or interactive mode. Interactive
+targets must belong to the attached session. Positions are one-based among
+siblings; parentage is preserved and subtree display remains grouped. Unknown,
+closing and out-of-range targets fail atomically. Existing metadata subscribers
+receive the new order through normal resource changes, even without this optional
+capability. No new fields or events are added to the frozen metadata payload.
 No capability in generation 2 permits daemon shutdown, configuration mutation,
 agent reporting, token publication, or private control/automation methods.
 
