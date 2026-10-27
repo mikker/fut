@@ -15,7 +15,11 @@ pub(super) enum Locality {
 
 #[derive(Clone, Debug)]
 pub(super) enum Attachment {
-    Local(PathBuf, bool),
+    Local {
+        socket: PathBuf,
+        /// Legacy exact-version attachments have no negotiated capabilities.
+        capabilities: Option<crate::protocol::local::Capabilities>,
+    },
     Remote {
         capabilities: Capabilities,
         target: String,
@@ -51,7 +55,7 @@ impl Attachment {
 
     pub(super) fn command_generation(&self) -> Option<uuid::Uuid> {
         match self {
-            Self::Local(..) => None,
+            Self::Local { .. } => None,
             Self::Remote { commands, .. } => Some(commands.generation),
         }
     }
@@ -86,9 +90,20 @@ impl Attachment {
         tasks.push(task.abort_handle());
     }
 
+    pub(super) fn supports_workspace_order(&self) -> bool {
+        match self {
+            Self::Local { capabilities, .. } => {
+                capabilities.is_some_and(crate::protocol::local::Capabilities::workspace_order)
+            }
+            Self::Remote { capabilities, .. } => {
+                capabilities.contains(crate::protocol::remote::Capability::WorkspaceOrder)
+            }
+        }
+    }
+
     pub(super) fn supports_terminal_colors(&self) -> bool {
         match self {
-            Self::Local(..) => true,
+            Self::Local { .. } => true,
             Self::Remote { capabilities, .. } => {
                 capabilities.contains(crate::protocol::remote::Capability::TerminalColors)
             }
@@ -97,7 +112,7 @@ impl Attachment {
 
     pub(super) fn supports_attachments(&self) -> bool {
         match self {
-            Self::Local(..) => true,
+            Self::Local { .. } => true,
             Self::Remote { capabilities, .. } => {
                 capabilities.contains(crate::protocol::remote::Capability::Attachments)
             }
@@ -106,7 +121,7 @@ impl Attachment {
 
     pub(super) fn blocked_command(&self) -> Option<&'static str> {
         match self {
-            Self::Local(..) => None,
+            Self::Local { .. } => None,
             Self::Remote { capabilities, .. }
                 if capabilities
                     .contains(crate::protocol::remote::Capability::ConfiguredCommands) =>
@@ -121,14 +136,14 @@ impl Attachment {
 
     pub(super) fn locality(&self) -> Locality {
         match self {
-            Self::Local(..) => Locality::Local,
+            Self::Local { .. } => Locality::Local,
             Self::Remote { .. } => Locality::Remote,
         }
     }
 
     pub(super) fn local_socket(&self) -> anyhow::Result<&Path> {
         match self {
-            Self::Local(path, _) => Ok(path.as_path()),
+            Self::Local { socket, .. } => Ok(socket.as_path()),
             Self::Remote { .. } => {
                 anyhow::bail!("local commands unavailable during remote attachment")
             }
@@ -170,7 +185,7 @@ impl Attachment {
     ) -> anyhow::Result<Option<crate::extensions::ClientHookRuntime>> {
         match self {
             Self::Remote { .. } => Ok(None),
-            Self::Local(socket, _) => Ok(Some(crate::extensions::ClientHookRuntime::new(
+            Self::Local { socket, .. } => Ok(Some(crate::extensions::ClientHookRuntime::new(
                 ui.extensions.clone(),
                 std::env::current_exe()?,
                 socket.to_owned(),
@@ -184,15 +199,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn workspace_order_requires_negotiation_on_each_attachment() {
+        use crate::protocol::{ClientMode, local::LocalHello};
+
+        let mut hello = LocalHello::new(ClientMode::Control, "0.1.0");
+        let current = hello.negotiate().unwrap();
+        hello.optional.clear();
+        let baseline = hello.negotiate().unwrap();
+        for (capabilities, expected) in [
+            (None, false),
+            (Some(baseline), false),
+            (Some(current), true),
+        ] {
+            let attachment = Attachment::Local {
+                socket: "/tmp/fut.sock".into(),
+                capabilities,
+            };
+            assert_eq!(attachment.supports_workspace_order(), expected);
+        }
+        assert!(
+            !Attachment::remote(Capabilities::default(), "old-host").supports_workspace_order()
+        );
+        assert!(Attachment::remote(Capabilities::ALL, "new-host").supports_workspace_order());
+    }
+
+    #[test]
     fn commands_require_negotiated_support_and_have_distinct_attachment_generations() {
         let legacy = Attachment::remote(Capabilities::default(), "legacy");
         let current = Attachment::remote(Capabilities::ALL, "current");
         assert!(legacy.blocked_command().is_some());
         assert!(current.blocked_command().is_none());
         assert!(
-            Attachment::Local("/tmp/fut.sock".into(), false)
-                .blocked_command()
-                .is_none()
+            Attachment::Local {
+                socket: "/tmp/fut.sock".into(),
+                capabilities: None
+            }
+            .blocked_command()
+            .is_none()
         );
         assert_ne!(legacy.command_generation(), current.command_generation());
     }
@@ -211,7 +254,13 @@ mod tests {
 
     #[test]
     fn image_paste_requires_remote_attachment_negotiation_but_is_available_locally() {
-        assert!(Attachment::Local(PathBuf::from("/tmp/fut.sock"), false).supports_attachments());
+        assert!(
+            Attachment::Local {
+                socket: PathBuf::from("/tmp/fut.sock"),
+                capabilities: None
+            }
+            .supports_attachments()
+        );
         assert!(!Attachment::remote(Capabilities::default(), "old-host").supports_attachments());
         assert!(Attachment::remote(Capabilities::ALL, "new-host").supports_attachments());
     }

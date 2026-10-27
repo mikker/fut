@@ -466,7 +466,7 @@ pub async fn attach_navigator(
     let staged = stage_ui_config(config_location)?;
     let (columns, rows) = crossterm::terminal::size().context("read terminal size")?;
     let size = TerminalSize { columns, rows };
-    let (mut framed, selected, catalog, alerts, workspace_order) = connect_interactive(
+    let (mut framed, selected, catalog, alerts, capabilities) = connect_interactive(
         socket_path,
         Some(selector),
         size,
@@ -482,7 +482,10 @@ pub async fn attach_navigator(
         alerts,
         ui,
         catalog.generation,
-        Attachment::Local(socket_path.to_owned(), workspace_order),
+        Attachment::Local {
+            socket: socket_path.to_owned(),
+            capabilities,
+        },
         Some(&federation),
         config_location,
         guard.enhanced_keyboard,
@@ -708,7 +711,7 @@ pub(crate) async fn attach_with_ui(
     let (columns, rows) = crossterm::terminal::size().context("read terminal size")?;
     let alert_client_id = alert_client_id(socket_path)?;
     let federation = federation::Service::start(socket_path.to_owned(), alert_client_id)?;
-    let (mut framed, selected, catalog, alerts, workspace_order) = connect_interactive(
+    let (mut framed, selected, catalog, alerts, capabilities) = connect_interactive(
         socket_path,
         selector,
         TerminalSize { columns, rows },
@@ -728,7 +731,10 @@ pub(crate) async fn attach_with_ui(
         alerts,
         ui,
         catalog.generation,
-        Attachment::Local(socket_path.to_owned(), workspace_order),
+        Attachment::Local {
+            socket: socket_path.to_owned(),
+            capabilities,
+        },
         Some(&federation),
         config_location,
         guard.enhanced_keyboard,
@@ -810,7 +816,7 @@ async fn connect_interactive(
     SelectedView,
     crate::protocol::ExtensionCatalog,
     crate::alerts::ClientAlertSnapshot,
-    bool,
+    Option<crate::protocol::local::Capabilities>,
 )> {
     let stream = UnixStream::connect(socket_path)
         .await
@@ -838,7 +844,7 @@ async fn handshake_interactive(
     SelectedView,
     crate::protocol::ExtensionCatalog,
     crate::alerts::ClientAlertSnapshot,
-    bool,
+    Option<crate::protocol::local::Capabilities>,
 )> {
     let mut framed = Framed::new(stream, codec());
     let hello = crate::protocol::local::LocalHello::new(
@@ -869,18 +875,18 @@ async fn handshake_interactive(
     .context("daemon handshake timed out")??
     {
         ServerMessage::LocalWelcome(welcome) if protocol_version.is_none() => {
-            let workspace_order = hello.accept(&welcome)?.workspace_order();
+            let capabilities = hello.accept(&welcome)?;
             let selected = welcome
                 .selected
                 .context("daemon did not select a terminal")?;
-            (selected, welcome.extension_catalog, workspace_order)
+            (selected, welcome.extension_catalog, Some(capabilities))
         }
         ServerMessage::Welcome {
             version,
             selected: Some(selected),
             extension_catalog,
             ..
-        } if Some(version) == protocol_version => (selected, extension_catalog, false),
+        } if Some(version) == protocol_version => (selected, extension_catalog, None),
         ServerMessage::Welcome { selected: None, .. } => bail!("daemon did not select a terminal"),
         ServerMessage::Welcome { version, .. } => {
             bail!("daemon welcomed client with unsupported protocol version {version}")
@@ -950,7 +956,7 @@ async fn prepare_machine_attachment(
     match spec {
         federation::EndpointSpec::Local => {
             let alert_client_id = alert_client_id(local_socket)?;
-            let (framed, selected, catalog, alerts, workspace_order) =
+            let (framed, selected, catalog, alerts, capabilities) =
                 connect_interactive(local_socket, Some(selector), size, alert_client_id, None)
                     .await?;
             let ui = staged.materialize(&catalog)?;
@@ -960,7 +966,10 @@ async fn prepare_machine_attachment(
                 alerts,
                 ui,
                 catalog_generation: catalog.generation,
-                attachment: Attachment::Local(local_socket.to_owned(), workspace_order),
+                attachment: Attachment::Local {
+                    socket: local_socket.to_owned(),
+                    capabilities,
+                },
                 bridge: None,
             })
         }
@@ -1558,7 +1567,7 @@ async fn run_loop(
                                     .as_ref()
                                     .expect("command exists")
                                     .write_failure_log(&match &attachment {
-                                        Attachment::Local(socket, _) => socket.clone(),
+                                        Attachment::Local { socket, .. } => socket.clone(),
                                         Attachment::Remote { .. } => crate::daemon::path::socket_path(None)?,
                                     })
                                     .await,
@@ -2607,7 +2616,7 @@ async fn run_loop(
                                         Attachment::Remote { target, .. } => spawn_remote_popup(
                                             &submission.command, terminal_id, host, target, Some(&submission.values),
                                         ).await,
-                                        Attachment::Local(..) => Err(anyhow::anyhow!("remote command attachment is no longer available")),
+                                        Attachment::Local { .. } => Err(anyhow::anyhow!("remote command attachment is no longer available")),
                                     }
                                 } else {
                                     spawn_temporary_command(
@@ -6073,13 +6082,7 @@ async fn dispatch_client_action(
             }
         }
         ClientAction::MoveWorkspaceUp | ClientAction::MoveWorkspaceDown => {
-            let supported = match attachment {
-                Attachment::Local(_, workspace_order) => *workspace_order,
-                Attachment::Remote { capabilities, .. } => {
-                    capabilities.contains(crate::protocol::remote::Capability::WorkspaceOrder)
-                }
-            };
-            if !supported {
+            if !attachment.supports_workspace_order() {
                 return Ok(Some(Toast::info(
                     "daemon does not support workspace reordering; update Fut and restart its daemon",
                 )));
