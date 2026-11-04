@@ -74,11 +74,12 @@ pub enum Capability {
     ScrollDeltas,
     ChunkedScreens,
     ConfiguredCommands,
+    WorkspaceOrder,
     PaneTitles,
 }
 
 impl Capability {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::Metadata,
         Self::NestedWorkspaces,
         Self::Interactive,
@@ -93,6 +94,7 @@ impl Capability {
         Self::ScrollDeltas,
         Self::ChunkedScreens,
         Self::ConfiguredCommands,
+        Self::WorkspaceOrder,
         Self::PaneTitles,
     ];
 
@@ -112,13 +114,14 @@ impl Capability {
             Self::ScrollDeltas => "scroll-deltas.v1",
             Self::ChunkedScreens => "chunked-screens.v1",
             Self::ConfiguredCommands => "configured-commands.v1",
+            Self::WorkspaceOrder => "workspace-order.v1",
             Self::PaneTitles => "pane-titles.v1",
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct Capabilities(u16);
+pub struct Capabilities(u32);
 
 impl Capabilities {
     pub const ALL: Self = Self((1 << Capability::ALL.len()) - 1);
@@ -183,6 +186,7 @@ impl Capabilities {
             }
             ListResources | WatchResources => Capability::Metadata,
             OpenProject { .. } => Capability::ProjectOpen,
+            MoveWorkspace { .. } => Capability::WorkspaceOrder,
             Ping => Capability::Health,
             GetExtensionCatalog => Capability::ExtensionCatalog,
             CommandDefaults { .. } | CommandStart { .. } | CommandOperation { .. } => {
@@ -227,6 +231,7 @@ impl Capabilities {
                 Capability::Metadata
             }
             LocationOpened { .. } => Capability::ProjectOpen,
+            WorkspaceMoved { .. } => Capability::WorkspaceOrder,
             Pong { .. } => Capability::Health,
             CommandReply { .. } => Capability::ConfiguredCommands,
             KittyImage { .. } => Capability::LargeScreens,
@@ -299,6 +304,7 @@ impl RemoteHello {
             Capability::NestedWorkspaces.name().into(),
             Capability::ProjectOpen.name().into(),
             Capability::ConfiguredCommands.name().into(),
+            Capability::WorkspaceOrder.name().into(),
             Capability::PaneTitles.name().into(),
         ];
         if matches!(mode, ClientMode::Interactive { .. }) {

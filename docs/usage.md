@@ -81,9 +81,9 @@ moves and until the pane closes. Renaming a pane does not rename its tab or
 restart the terminal. UI and CLI changes overwrite the same name. Shell output
 does not change it.
 
-Names can contain Unicode and use at most 512 UTF-8 bytes. Fut rejects control
-characters. An empty name removes the title row. The CLI rejects names that
-contain only whitespace.
+Names can contain Unicode and use at most 512 UTF-8 bytes, like workspace and
+tab names. Fut rejects control characters and names that contain only
+whitespace. An empty name removes the title row.
 
 The daemon must support `pane-titles.v1`. Older daemons cannot rename panes,
 but other commands still work. Update Fut on the daemon host to enable pane
@@ -301,6 +301,21 @@ The command palette also includes `rename-session`, `rename-workspace`,
 the focused resource. These actions have no default keybindings. Session
 actions target the attached session. Closing that session ends the attachment
 and closes its terminals.
+
+Use **Move workspace up** / **Move workspace down** in the command palette to
+reorder the active workspace, or `fut workspace move WORKSPACE_ID POSITION`
+(`--json` is supported). Positions start at **1**, like the panel's workspace
+numbers. In a flat session this is the position in the session; nested
+workspaces move among siblings with the same parent, with positions counted
+within that sibling group. Moving a parent carries its displayed subtree;
+moving never changes parentage. Moving beyond the first/last sibling with an
+action is a no-op. The CLI rejects positions outside `1..=sibling_count`,
+unknown workspaces, and closing workspaces without changing the order.
+All clients see the updated order immediately; their focused workspace stays
+the same. These actions are unbound by default; bind `move_workspace_up` and
+`move_workspace_down` in [Configuration](../configuration/).
+Reordering requires `workspace-order.v1`; if unavailable, update Fut on the
+daemon's machine and restart its daemon. Mouse drag-to-reorder is not supported.
 
 Press `Ctrl-b Shift-S` to open a project without leaving the client. Fut fuzzy
 filters only the explicit `[projects]` catalog and never scans for repositories.

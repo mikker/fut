@@ -33,7 +33,9 @@ shell interpolation. Open and attach to a catalog entry with `fut project fut`
 open it in the background.
 When `projects_dir` is set, a project name not in the explicit catalog falls
 back to a directory with that name below it, so `fut project website` opens
-`~/dev/website` in this example. Explicit catalog entries take precedence.
+`~/dev/website` in this example. Nested names such as `fut project work/api`
+open `~/dev/work/api`; each slash-separated segment follows the project name
+rules above. Explicit catalog entries take precedence.
 An optional path may select a linked checkout, for example
 `fut open ../fut-feature --project fut`; Fut verifies that the path has the same
 Git project identity as the configured root before opening it as a peer

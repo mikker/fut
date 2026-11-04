@@ -467,7 +467,7 @@ pub async fn attach_navigator(
     let staged = stage_ui_config(config_location)?;
     let (columns, rows) = crossterm::terminal::size().context("read terminal size")?;
     let size = TerminalSize { columns, rows };
-    let (mut framed, selected, catalog, alerts, pane_titles) = connect_interactive(
+    let (mut framed, selected, catalog, alerts, capabilities) = connect_interactive(
         socket_path,
         Some(selector),
         size,
@@ -485,7 +485,7 @@ pub async fn attach_navigator(
         catalog.generation,
         Attachment::Local {
             socket: socket_path.to_owned(),
-            pane_titles,
+            capabilities,
         },
         Some(&federation),
         config_location,
@@ -712,7 +712,7 @@ pub(crate) async fn attach_with_ui(
     let (columns, rows) = crossterm::terminal::size().context("read terminal size")?;
     let alert_client_id = alert_client_id(socket_path)?;
     let federation = federation::Service::start(socket_path.to_owned(), alert_client_id)?;
-    let (mut framed, selected, catalog, alerts, pane_titles) = connect_interactive(
+    let (mut framed, selected, catalog, alerts, capabilities) = connect_interactive(
         socket_path,
         selector,
         TerminalSize { columns, rows },
@@ -734,7 +734,7 @@ pub(crate) async fn attach_with_ui(
         catalog.generation,
         Attachment::Local {
             socket: socket_path.to_owned(),
-            pane_titles,
+            capabilities,
         },
         Some(&federation),
         config_location,
@@ -817,7 +817,7 @@ async fn connect_interactive(
     SelectedView,
     crate::protocol::ExtensionCatalog,
     crate::alerts::ClientAlertSnapshot,
-    bool,
+    Option<crate::protocol::local::Capabilities>,
 )> {
     let stream = UnixStream::connect(socket_path)
         .await
@@ -845,7 +845,7 @@ async fn handshake_interactive(
     SelectedView,
     crate::protocol::ExtensionCatalog,
     crate::alerts::ClientAlertSnapshot,
-    bool,
+    Option<crate::protocol::local::Capabilities>,
 )> {
     let mut framed = Framed::new(stream, codec());
     let hello = crate::protocol::local::LocalHello::new(
@@ -880,18 +880,14 @@ async fn handshake_interactive(
             let selected = welcome
                 .selected
                 .context("daemon did not select a terminal")?;
-            (
-                selected,
-                welcome.extension_catalog,
-                capabilities.pane_titles(),
-            )
+            (selected, welcome.extension_catalog, Some(capabilities))
         }
         ServerMessage::Welcome {
             version,
             selected: Some(selected),
             extension_catalog,
             ..
-        } if Some(version) == protocol_version => (selected, extension_catalog, false),
+        } if Some(version) == protocol_version => (selected, extension_catalog, None),
         ServerMessage::Welcome { selected: None, .. } => bail!("daemon did not select a terminal"),
         ServerMessage::Welcome { version, .. } => {
             bail!("daemon welcomed client with unsupported protocol version {version}")
@@ -961,7 +957,7 @@ async fn prepare_machine_attachment(
     match spec {
         federation::EndpointSpec::Local => {
             let alert_client_id = alert_client_id(local_socket)?;
-            let (framed, selected, catalog, alerts, pane_titles) =
+            let (framed, selected, catalog, alerts, capabilities) =
                 connect_interactive(local_socket, Some(selector), size, alert_client_id, None)
                     .await?;
             let ui = staged.materialize(&catalog)?;
@@ -973,7 +969,7 @@ async fn prepare_machine_attachment(
                 catalog_generation: catalog.generation,
                 attachment: Attachment::Local {
                     socket: local_socket.to_owned(),
-                    pane_titles,
+                    capabilities,
                 },
                 bridge: None,
             })
@@ -2255,6 +2251,9 @@ async fn run_loop(
                     ServerMessage::PaneMoved { .. } => {
                         // Pane movement is currently a control-plane operation.
                         bail!("unexpected pane movement response")
+                    }
+                    ServerMessage::WorkspaceMoved { .. } => {
+                        // Resource broadcasts, not replies, supply the authoritative order.
                     }
                     ServerMessage::ProjectConfigReloaded { .. } => {
                         let Some(reload) = project_config_reload.take() else {
@@ -6095,6 +6094,53 @@ async fn dispatch_client_action(
                 .await?;
             }
         }
+        ClientAction::MoveWorkspaceUp | ClientAction::MoveWorkspaceDown => {
+            if !attachment.supports_workspace_order() {
+                return Ok(Some(Toast::info(
+                    "daemon does not support workspace reordering; update Fut and restart its daemon",
+                )));
+            }
+            let Some(snapshot) = resources.snapshot() else {
+                return Ok(Some(Toast::error("workspaces are still loading")));
+            };
+            if !view.resources_are_current(snapshot) {
+                return Ok(Some(Toast::error("resources are syncing")));
+            }
+            let Some(session) = snapshot
+                .sessions
+                .iter()
+                .find(|s| s.id == view.focused().session_id)
+            else {
+                return Ok(Some(Toast::error("focused session is unavailable")));
+            };
+            let workspace_id = view.focused().workspace_id;
+            let Some(workspace) = session.workspaces.iter().find(|w| w.id == workspace_id) else {
+                return Ok(Some(Toast::error("focused workspace is unavailable")));
+            };
+            let siblings: Vec<_> = session
+                .workspaces
+                .iter()
+                .filter(|w| w.parent_workspace_id == workspace.parent_workspace_id)
+                .collect();
+            let index = siblings.iter().position(|w| w.id == workspace_id).unwrap();
+            let position = if action == ClientAction::MoveWorkspaceUp {
+                index.checked_sub(1)
+            } else {
+                (index + 1 < siblings.len()).then_some(index + 1)
+            };
+            let Some(position) = position else {
+                return Ok(None);
+            };
+            send_request(
+                framed,
+                None,
+                ClientMessage::MoveWorkspace {
+                    workspace_id,
+                    position: position + 1,
+                },
+            )
+            .await?;
+        }
         ClientAction::RenameSession
         | ClientAction::RenameWorkspace
         | ClientAction::RenameTab
@@ -6154,19 +6200,13 @@ async fn dispatch_client_action(
                         )
                     }),
                 ClientAction::RenamePane => {
-                    let pane = snapshot
+                    let pane_id = view.focused().pane_id;
+                    let name = snapshot
                         .pane_paths()
-                        .find(|path| path.pane.id == view.focused().pane_id);
-                    let Some(name) = pane.and_then(|path| path.pane.name.as_ref()) else {
-                        return Ok(Some(Toast::error(
-                            "pane naming unavailable · update Fut on the daemon host",
-                        )));
-                    };
-                    Some((
-                        crate::protocol::RenameSelector::Pane(view.focused().pane_id),
-                        "pane",
-                        name.clone(),
-                    ))
+                        .find(|path| path.pane.id == pane_id)
+                        .and_then(|path| path.pane.name.clone())
+                        .unwrap_or_default();
+                    Some((crate::protocol::RenameSelector::Pane(pane_id), "pane", name))
                 }
                 _ => unreachable!("rename action guard"),
             };

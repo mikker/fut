@@ -341,6 +341,13 @@ enum SessionCommand {
 
 #[derive(Subcommand)]
 enum WorkspaceCommand {
+    /// Move a workspace to a one-based sibling position in its session.
+    Move {
+        #[arg(add = ArgValueCompleter::new(completion::workspace_close))]
+        workspace_id: WorkspaceId,
+        /// Sibling position (1 is first); all workspaces in a flat session.
+        position: usize,
+    },
     /// Attach to a workspace on the existing daemon.
     Attach {
         /// Compact workspace ID or UUID; the workspace must contain exactly one open terminal.
@@ -1444,6 +1451,21 @@ async fn execute(cli: Cli) -> Result<()> {
                 &config_location,
             )
             .await
+        }
+        Some(Command::Workspace {
+            command:
+                WorkspaceCommand::Move {
+                    workspace_id,
+                    position,
+                },
+        }) => {
+            let resource_revision = move_workspace(&socket, workspace_id, position).await?;
+            output(
+                cli.json,
+                "workspace.move",
+                json!({ "workspace_id": workspace_id.uuid(), "position": position, "resource_revision": resource_revision }),
+                "workspace moved",
+            )
         }
         Some(Command::Workspace {
             command: WorkspaceCommand::Attach { workspace_id },
@@ -4179,23 +4201,41 @@ async fn wait_until_protocol_stops(socket: &std::path::Path) -> bool {
     !protocol_ready(socket).await
 }
 
+async fn move_workspace(socket: &Path, workspace_id: WorkspaceId, position: usize) -> Result<u64> {
+    match control(
+        socket,
+        ClientMessage::MoveWorkspace {
+            workspace_id,
+            position,
+        },
+    )
+    .await?
+    {
+        ServerMessage::WorkspaceMoved { resource_revision } => Ok(resource_revision),
+        other => unexpected(other),
+    }
+}
+
 async fn control(socket: &std::path::Path, command: ClientMessage) -> Result<ServerMessage> {
-    let framed = connected_control_for(socket, command.requires_pane_titles()).await?;
-    request(framed, command).await
+    request(
+        connected_control_for(socket, Some(&command)).await?,
+        command,
+    )
+    .await
 }
 
 /// Negotiate the stable local contract, independently of package versions.
 async fn connected_control(
     socket: &std::path::Path,
 ) -> Result<Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>> {
-    connected_control_for(socket, false).await
+    connected_control_for(socket, None).await
 }
 
 async fn connected_control_for(
     socket: &std::path::Path,
-    pane_titles: bool,
+    command: Option<&ClientMessage>,
 ) -> Result<Framed<UnixStream, tokio_util::codec::LengthDelimitedCodec>> {
-    match negotiated_control_handshake(socket, pane_titles).await? {
+    match negotiated_control_handshake_for(socket, command).await? {
         ControlHandshake::Connected(framed) => Ok(framed),
         ControlHandshake::Incompatible { server, .. } => bail!(
             "daemon at {} uses protocol {server}, but this Fut client requires protocol \
@@ -4209,7 +4249,7 @@ async fn connected_control_for(
 async fn shutdown_control(socket: &std::path::Path) -> Result<()> {
     // Only an explicit shutdown may fall back to the legacy handshake. Normal
     // operations never guess a peer's schema or retry a rejected negotiation.
-    let handshake = match negotiated_control_handshake(socket, false).await {
+    let handshake = match negotiated_control_handshake(socket).await {
         Err(error)
             if error.downcast_ref::<crate::protocol::remote::EndpointError>()
                 == Some(&crate::protocol::remote::EndpointError::InvalidHandshake) =>
@@ -4249,9 +4289,13 @@ enum ControlHandshake {
     },
 }
 
-async fn negotiated_control_handshake(
+async fn negotiated_control_handshake(socket: &std::path::Path) -> Result<ControlHandshake> {
+    negotiated_control_handshake_for(socket, None).await
+}
+
+async fn negotiated_control_handshake_for(
     socket: &std::path::Path,
-    pane_titles: bool,
+    command: Option<&ClientMessage>,
 ) -> Result<ControlHandshake> {
     use crate::protocol::local::LocalHello;
 
@@ -4260,15 +4304,7 @@ async fn negotiated_control_handshake(
         .with_context(|| format!("connect to {}", socket.display()))?;
     let peer = peer_credentials(&stream).ok();
     let mut framed = Framed::new(stream, codec());
-    let mut hello = LocalHello::new(ClientMode::Control, env!("CARGO_PKG_VERSION"));
-    if pane_titles {
-        hello
-            .optional
-            .retain(|name| name != crate::protocol::local::PANE_TITLES);
-        hello
-            .required
-            .push(crate::protocol::local::PANE_TITLES.into());
-    }
+    let hello = LocalHello::new(ClientMode::Control, env!("CARGO_PKG_VERSION"));
     let request_id = send(&mut framed, ClientMessage::LocalHello(hello.clone())).await?;
     let frame = tokio::time::timeout(Duration::from_secs(2), framed.next())
         .await
@@ -4285,7 +4321,14 @@ async fn negotiated_control_handshake(
     }
     match correlated_message(envelope, request_id)? {
         ServerMessage::LocalWelcome(welcome) => {
-            hello.accept(&welcome)?;
+            let capabilities = hello.accept(&welcome)?;
+            if command.is_some_and(|command| !capabilities.allows_client(command)) {
+                return Err(CliError::new(
+                    "unsupported_operation",
+                    "daemon does not support this command; update Fut and restart its daemon",
+                )
+                .into());
+            }
             Ok(ControlHandshake::Connected(framed))
         }
         ServerMessage::IncompatibleProtocol { server, .. } => {
@@ -5716,6 +5759,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_move_reports_old_daemon_without_sending_new_method() {
+        let temporary = tempfile::tempdir().unwrap();
+        let socket = temporary.path().join("fut.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut framed = Framed::new(stream, codec());
+            let request: Envelope<ClientMessage> =
+                decode_payload(&framed.next().await.unwrap().unwrap()).unwrap();
+            let ClientMessage::LocalHello(hello) = request.message else {
+                panic!("expected local hello")
+            };
+            assert!(hello.optional.contains(&"workspace-order.v1".into()));
+            framed
+                .send(Bytes::from(
+                    encode_payload(&Envelope {
+                        request_id: request.request_id,
+                        message: ServerMessage::LocalWelcome(
+                            crate::protocol::local::LocalWelcome {
+                                generation: 1,
+                                codec: crate::protocol::local::CODEC.into(),
+                                server_version: "0.1.0".into(),
+                                capabilities: vec![crate::protocol::local::BASELINE.into()],
+                                selected: None,
+                                extension_catalog: empty_extension_catalog(),
+                            },
+                        ),
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            assert!(framed.next().await.is_none());
+        });
+        let error = move_workspace(&socket, WorkspaceId::new(), 1)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("update Fut and restart"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn pane_rename_is_not_sent_when_the_daemon_omits_its_capability() {
         let temporary = tempfile::tempdir().unwrap();
         let socket = temporary.path().join("fut.sock");
@@ -5730,7 +5815,7 @@ mod tests {
             };
             assert!(
                 hello
-                    .required
+                    .optional
                     .iter()
                     .any(|name| name == crate::protocol::local::PANE_TITLES)
             );
@@ -5767,9 +5852,9 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(
-            error.downcast_ref::<crate::protocol::remote::EndpointError>(),
-            Some(&crate::protocol::remote::EndpointError::MissingRequiredCapability)
+        assert!(
+            error.to_string().contains("update Fut and restart"),
+            "{error}"
         );
         server.await.unwrap();
     }
@@ -6730,14 +6815,16 @@ mod tests {
         .unwrap();
         let config_location = client::config::resolve_location(Some(&config)).unwrap();
 
-        let (cwd, name, recipe_project) =
-            resolve_project_open(None, Some("10er"), temporary.path(), &config_location)
-                .await
-                .unwrap();
+        for project_name in ["10er", "work/api", "work/team/api"] {
+            let (cwd, name, recipe_project) =
+                resolve_project_open(None, Some(project_name), temporary.path(), &config_location)
+                    .await
+                    .unwrap();
 
-        assert_eq!(cwd, projects.join("10er"));
-        assert_eq!(name.as_deref(), Some("10er"));
-        assert_eq!(recipe_project.path(), projects.join("10er"));
+            assert_eq!(cwd, projects.join(project_name));
+            assert_eq!(name.as_deref(), Some(project_name));
+            assert_eq!(recipe_project.path(), projects.join(project_name));
+        }
     }
 
     #[tokio::test]

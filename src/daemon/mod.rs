@@ -378,8 +378,9 @@ impl From<ResourceError> for DaemonError {
             ResourceError::Closing(_) => "target_closing",
             ResourceError::DifferentWorkspace => "different_workspace",
             ResourceError::InvalidWorkspaceParent(_) => "invalid_workspace_parent",
+            ResourceError::InvalidWorkspacePosition(_) => "invalid_position",
             ResourceError::TargetRequired | ResourceError::AmbiguousTarget => "target_required",
-            ResourceError::EmptyName | ResourceError::InvalidPaneName => "invalid_name",
+            ResourceError::EmptyName | ResourceError::InvalidName => "invalid_name",
             ResourceError::InvalidStatusReport(_) => "invalid_agent_report",
             ResourceError::TooManyMaterializedTokens => "token_limit",
             _ => "resource_error",
@@ -1107,6 +1108,19 @@ impl SharedState {
             source_tab_closed,
             selected: selected_target(fresh, &runtime.handle),
         })
+    }
+
+    fn move_workspace(
+        &mut self,
+        workspace_id: WorkspaceId,
+        position: usize,
+    ) -> Result<u64, DaemonError> {
+        if !self.accepting {
+            return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
+        }
+        let mutation = self.resources.move_workspace(workspace_id, position)?;
+        self.publish_mutation(&mutation);
+        Ok(mutation.revision)
     }
 
     fn rename_target(
@@ -4161,6 +4175,21 @@ async fn handle_connection(
                         }
                     }
                     ClientMessage::Ping => send(&mut connection, envelope.request_id, ServerMessage::Pong { daemon_pid: std::process::id() }).await?,
+                    ClientMessage::MoveWorkspace { workspace_id, position } => {
+                        let result = {
+                            let mut state = shared.lock().await;
+                            match state.resources.session_id_for_workspace(workspace_id) {
+                                Ok(id) if id == attachment.focused.selected.session_id => state.move_workspace(workspace_id, position),
+                                Ok(_) => Err(DaemonError::new("outside_scope", "workspace is outside the active session")),
+                                Err(error) => Err(error.into()),
+                            }
+                        };
+                        match result {
+                            Ok(resource_revision) => send(&mut connection, envelope.request_id,
+                                ServerMessage::WorkspaceMoved { resource_revision }).await?,
+                            Err(error) => send_error(&mut connection, envelope.request_id, error.code, &error.message).await?,
+                        }
+                    }
                     ClientMessage::RenameTarget { selector, name } => {
                         let result = {
                             let mut state = shared.lock().await;
@@ -4392,7 +4421,7 @@ async fn handle_connection(
 
 /// Reject before dispatch, preserving the remote private-method restrictions
 /// and the local baseline allowlist in interactive, control and command loops.
-/// Legacy exact-version local peers bypass capability negotiation.
+/// Legacy exact-version local peers retain the baseline, not optional methods.
 async fn reject_unnegotiated_method(
     connection: &mut ClientConnection,
     envelope: &Envelope<ClientMessage>,
@@ -4403,9 +4432,10 @@ async fn reject_unnegotiated_method(
         || connection
             .local
             .is_some_and(|caps| !caps.allows_client(&envelope.message))
-        || (connection.local.is_none()
-            && connection.remote.is_none()
-            && envelope.message.requires_pane_titles())
+        || (connection.remote.is_none()
+            && connection.local.is_none()
+            && (matches!(envelope.message, ClientMessage::MoveWorkspace { .. })
+                || envelope.message.requires_pane_titles()))
     {
         send(
             connection,
@@ -4763,6 +4793,14 @@ async fn control_loop(
                     send_error(connection, envelope.request_id, error.code, &error.message).await?
                 }
             },
+            ClientMessage::MoveWorkspace { workspace_id, position } => {
+                let result = shared.lock().await.move_workspace(workspace_id, position);
+                match result {
+                    Ok(resource_revision) => send(connection, envelope.request_id,
+                        ServerMessage::WorkspaceMoved { resource_revision }).await?,
+                    Err(error) => send_error(connection, envelope.request_id, error.code, &error.message).await?,
+                }
+            }
             ClientMessage::MovePane {
                 pane_id,
                 destination_tab_id,
@@ -5635,8 +5673,8 @@ fn interactive_rename_allowed(
             .workspace_id_for_tab(*target)
             .is_ok_and(|owner| owner == workspace_id),
         RenameSelector::Pane(target) => resources
-            .resolve_terminal_target(Some(TargetSelector::Pane(*target)))
-            .is_ok_and(|path| path.workspace_id == workspace_id),
+            .workspace_id_for_pane(*target)
+            .is_ok_and(|owner| owner == workspace_id),
     }
 }
 

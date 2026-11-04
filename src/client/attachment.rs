@@ -17,7 +17,8 @@ pub(super) enum Locality {
 pub(super) enum Attachment {
     Local {
         socket: PathBuf,
-        pane_titles: bool,
+        /// Legacy exact-version attachments have no negotiated capabilities.
+        capabilities: Option<crate::protocol::local::Capabilities>,
     },
     Remote {
         capabilities: Capabilities,
@@ -89,6 +90,17 @@ impl Attachment {
         tasks.push(task.abort_handle());
     }
 
+    pub(super) fn supports_workspace_order(&self) -> bool {
+        match self {
+            Self::Local { capabilities, .. } => {
+                capabilities.is_some_and(crate::protocol::local::Capabilities::workspace_order)
+            }
+            Self::Remote { capabilities, .. } => {
+                capabilities.contains(crate::protocol::remote::Capability::WorkspaceOrder)
+            }
+        }
+    }
+
     pub(super) fn supports_terminal_colors(&self) -> bool {
         match self {
             Self::Local { .. } => true,
@@ -109,7 +121,9 @@ impl Attachment {
 
     pub(super) fn supports_pane_titles(&self) -> bool {
         match self {
-            Self::Local { pane_titles, .. } => *pane_titles,
+            Self::Local { capabilities, .. } => {
+                capabilities.is_some_and(crate::protocol::local::Capabilities::pane_titles)
+            }
             Self::Remote { capabilities, .. } => {
                 capabilities.contains(crate::protocol::remote::Capability::PaneTitles)
             }
@@ -196,6 +210,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn workspace_order_requires_negotiation_on_each_attachment() {
+        use crate::protocol::{ClientMode, local::LocalHello};
+
+        let mut hello = LocalHello::new(ClientMode::Control, "0.1.0");
+        let current = hello.negotiate().unwrap();
+        hello.optional.clear();
+        let baseline = hello.negotiate().unwrap();
+        for (capabilities, expected) in [
+            (None, false),
+            (Some(baseline), false),
+            (Some(current), true),
+        ] {
+            let attachment = Attachment::Local {
+                socket: "/tmp/fut.sock".into(),
+                capabilities,
+            };
+            assert_eq!(attachment.supports_workspace_order(), expected);
+        }
+        assert!(
+            !Attachment::remote(Capabilities::default(), "old-host").supports_workspace_order()
+        );
+        assert!(Attachment::remote(Capabilities::ALL, "new-host").supports_workspace_order());
+    }
+
+    #[test]
     fn commands_require_negotiated_support_and_have_distinct_attachment_generations() {
         let legacy = Attachment::remote(Capabilities::default(), "legacy");
         let current = Attachment::remote(Capabilities::ALL, "current");
@@ -204,7 +243,7 @@ mod tests {
         assert!(
             Attachment::Local {
                 socket: "/tmp/fut.sock".into(),
-                pane_titles: false
+                capabilities: None
             }
             .blocked_command()
             .is_none()
@@ -214,16 +253,23 @@ mod tests {
 
     #[test]
     fn pane_renaming_requires_explicit_selection_on_both_endpoints() {
-        let mut local = Attachment::Local {
+        let baseline = Attachment::Local {
             socket: "/tmp/fut.sock".into(),
-            pane_titles: false,
+            capabilities: Some(Default::default()),
         };
-        assert!(!local.supports_pane_titles());
-        let Attachment::Local { pane_titles, .. } = &mut local else {
-            unreachable!()
+        assert!(!baseline.supports_pane_titles());
+        let negotiated = Attachment::Local {
+            socket: "/tmp/fut.sock".into(),
+            capabilities: Some(
+                crate::protocol::local::LocalHello::new(
+                    crate::protocol::ClientMode::Control,
+                    "0.1.0",
+                )
+                .negotiate()
+                .unwrap(),
+            ),
         };
-        *pane_titles = true;
-        assert!(local.supports_pane_titles());
+        assert!(negotiated.supports_pane_titles());
         assert!(!Attachment::remote(Capabilities::default(), "old-host").supports_pane_titles());
         assert!(Attachment::remote(Capabilities::ALL, "new-host").supports_pane_titles());
     }
@@ -245,7 +291,7 @@ mod tests {
         assert!(
             Attachment::Local {
                 socket: PathBuf::from("/tmp/fut.sock"),
-                pane_titles: false
+                capabilities: None
             }
             .supports_attachments()
         );

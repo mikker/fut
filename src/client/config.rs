@@ -1693,7 +1693,9 @@ impl ProjectCatalog {
             return Some(project.clone());
         }
         let directory = self.directory.as_ref()?;
-        valid_project_name(name).then(|| ProjectConfig::repository(directory.join(name)))
+        name.split('/')
+            .all(valid_project_name)
+            .then(|| ProjectConfig::repository(directory.join(name)))
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, &ProjectConfig)> {
@@ -3391,7 +3393,23 @@ unknown_future_option = true
             catalog.resolve("10er").unwrap().path(),
             temporary.path().join("dev/10er")
         );
-        assert!(catalog.resolve("../outside").is_none());
+        for name in ["work/api", "work/team/api"] {
+            assert_eq!(
+                catalog.resolve(name).unwrap().path(),
+                temporary.path().join("dev").join(name)
+            );
+        }
+        for name in [
+            "",
+            "../outside",
+            "work/../outside",
+            "/work/api",
+            "work//api",
+            "work/",
+            "./work",
+        ] {
+            assert!(catalog.resolve(name).is_none(), "accepted {name:?}");
+        }
     }
 
     #[test]
@@ -3772,6 +3790,33 @@ components = [
         let mut prefix = PrefixState::new(config.bindings);
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Wait);
         assert_eq!(prefix.feed(vec![2]), PrefixAction::Send(vec![2]));
+    }
+
+    #[test]
+    fn workspace_move_actions_are_unbound_and_configurable() {
+        let defaults = UiConfig::default();
+        for action in [
+            ClientAction::MoveWorkspaceUp,
+            ClientAction::MoveWorkspaceDown,
+        ] {
+            assert_eq!(defaults.bindings.label(action), "Unbound");
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("config.toml");
+        fs::write(
+            &path,
+            "[ui.bindings]\nmove_workspace_up = '<'\nmove_workspace_down = '>'\n",
+        )
+        .unwrap();
+        let config = load_path(&path, true).unwrap();
+        assert_eq!(
+            config.bindings.action_for_suffix(b"<"),
+            Some(ClientAction::MoveWorkspaceUp)
+        );
+        assert_eq!(
+            config.bindings.action_for_suffix(b">"),
+            Some(ClientAction::MoveWorkspaceDown)
+        );
     }
 
     #[test]

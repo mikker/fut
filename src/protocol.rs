@@ -638,6 +638,11 @@ pub enum ClientMessage {
         pane_id: PaneId,
         destination_tab_id: TabId,
     },
+    /// Move within the session's one-based sibling workspace order.
+    MoveWorkspace {
+        workspace_id: WorkspaceId,
+        position: usize,
+    },
     Contextual {
         context: TerminalContext,
         command: ContextualCommand,
@@ -775,6 +780,9 @@ pub enum ServerMessage {
         selected: SelectedTarget,
     },
     TargetRenamed {
+        resource_revision: u64,
+    },
+    WorkspaceMoved {
         resource_revision: u64,
     },
     TokenPublished {

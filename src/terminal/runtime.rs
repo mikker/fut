@@ -609,7 +609,7 @@ impl OutputProducer {
         // snapshot can therefore include this message even while it is still
         // waiting for the runtime to free a queue slot.
         self.produced
-            .fetch_update(Ordering::Release, Ordering::Relaxed, |produced| {
+            .try_update(Ordering::Release, Ordering::Relaxed, |produced| {
                 produced.checked_add(1)
             })
             .expect("PTY output sequence overflow");

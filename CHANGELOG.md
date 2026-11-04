@@ -2,9 +2,18 @@
 
 ## Unreleased
 
-- Rename panes from the command palette or with `fut pane rename`.
 - Also write mouse selections to the Linux primary selection, so middle-click paste works in other terminals.
 - Send every copy to the containing terminal as an OSC 52 clipboard write, keeping the desktop clipboard working where clipboard tools write to a session other terminals do not read; disable with `clipboard.osc52 = false`.
+
+## 0.41
+
+- Open nested projects under `projects_dir` by name, such as `fut project work/api`.
+
+## 0.40
+
+- Name panes with `rename-pane` in the command palette or `fut pane rename`; titles show above panes and in navigator search. Workspace, tab, and pane names are limited to 512 bytes without control characters.
+- Reorder workspaces with `move-workspace-up` and `move-workspace-down` in the command palette, configurable shortcuts, or `fut workspace move`.
+- Keep Shift on Ctrl+Shift+letter shortcuts, so apps in a pane, such as pi, receive `ctrl+shift+c` as they do outside Fut.
 
 ## 0.39
 

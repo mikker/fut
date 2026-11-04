@@ -172,12 +172,23 @@ pub fn shared_live_location<'a>(root: &'a Path, tabs: &'a [TabSnapshot]) -> Opti
 
 /// Workspaces and tabs may be unnamed (empty), in which case they present an
 /// automatic name; any other name must carry visible characters.
+/// Longest optional name (workspace, tab, or pane) in UTF-8 bytes.
+pub const MAX_OPTIONAL_NAME_BYTES: usize = 512;
+
+/// Optional names may be empty to return to automatic naming. Otherwise they
+/// must not be blank, must fit in [`MAX_OPTIONAL_NAME_BYTES`], and must not
+/// contain control characters, so every client can show them verbatim.
 fn check_optional_name(name: &str) -> Result<(), ResourceError> {
-    if name.is_empty() || !name.trim().is_empty() {
-        Ok(())
-    } else {
-        Err(ResourceError::EmptyName)
+    if name.is_empty() {
+        return Ok(());
     }
+    if name.trim().is_empty() {
+        return Err(ResourceError::EmptyName);
+    }
+    if name.len() > MAX_OPTIONAL_NAME_BYTES || name.chars().any(char::is_control) {
+        return Err(ResourceError::InvalidName);
+    }
+    Ok(())
 }
 
 fn disambiguate(suggested: &str, exists: impl Fn(&str) -> bool) -> String {
@@ -454,7 +465,7 @@ impl ResourceSnapshot {
 
 impl SessionSnapshot {
     /// Workspaces in display order: each parent's complete subtree precedes
-    /// the next sibling, while siblings retain creation order.
+    /// the next sibling, while siblings retain the daemon's workspace order.
     #[must_use]
     pub fn workspaces_depth_first(&self) -> Vec<&WorkspaceSnapshot> {
         fn append<'a>(
@@ -689,8 +700,8 @@ pub enum ResourceError {
     Duplicate(&'static str),
     #[error("name must not be blank")]
     EmptyName,
-    #[error("pane name must be at most 512 bytes and contain no control characters")]
-    InvalidPaneName,
+    #[error("name must be at most 512 bytes and contain no control characters")]
+    InvalidName,
     #[error("panes may only move between tabs in the same workspace")]
     DifferentWorkspace,
     #[error("invalid workspace parent: {0}")]
@@ -705,6 +716,8 @@ pub enum ResourceError {
     InvalidStatusReport(&'static str),
     #[error("invalid split ratio")]
     InvalidSplitRatio,
+    #[error("workspace position must be between 1 and {0}")]
+    InvalidWorkspacePosition(usize),
     #[error("maximum of {MAX_MATERIALIZED_TOKEN_VALUES} materialized token values reached")]
     TooManyMaterializedTokens,
     #[error("resource tree invariant violated: {0}")]
@@ -1018,6 +1031,14 @@ impl ResourceTree {
             .get(&workspace_id)
             .map(|workspace| workspace.session_id)
             .ok_or(ResourceError::NotFound("workspace"))
+    }
+
+    pub fn workspace_id_for_pane(&self, pane_id: PaneId) -> Result<WorkspaceId, ResourceError> {
+        let pane = self
+            .panes
+            .get(&pane_id)
+            .ok_or(ResourceError::NotFound("pane"))?;
+        self.workspace_id_for_tab(pane.tab_id)
     }
 
     pub fn workspace_id_for_tab(&self, tab_id: TabId) -> Result<WorkspaceId, ResourceError> {
@@ -1746,6 +1767,52 @@ impl ResourceTree {
         ))
     }
 
+    /// Move to a one-based sibling position in the owning session. For flat
+    /// sessions this is the session position. Parent links never change.
+    pub fn move_workspace(
+        &mut self,
+        workspace_id: WorkspaceId,
+        position: usize,
+    ) -> Result<Mutation, ResourceError> {
+        let workspace = self
+            .workspaces
+            .get(&workspace_id)
+            .ok_or(ResourceError::NotFound("workspace"))?;
+        if self.workspace_is_closing(workspace_id) {
+            return Err(ResourceError::Closing("workspace"));
+        }
+        let siblings: Vec<_> = self.sessions[&workspace.session_id]
+            .workspaces
+            .iter()
+            .copied()
+            .filter(|id| self.workspaces[id].parent_workspace_id == workspace.parent_workspace_id)
+            .collect();
+        if position == 0 || position > siblings.len() {
+            return Err(ResourceError::InvalidWorkspacePosition(siblings.len()));
+        }
+        let previous = siblings.iter().position(|id| *id == workspace_id).unwrap();
+        if previous == position - 1 {
+            return Ok(self.unchanged());
+        }
+        // Rewrite only sibling slots in the single authoritative sequence.
+        // Descendants retain their order and follow their parent in the panel.
+        let mut reordered = siblings.clone();
+        reordered.remove(previous);
+        reordered.insert(position - 1, workspace_id);
+        let order = &mut self
+            .sessions
+            .get_mut(&workspace.session_id)
+            .unwrap()
+            .workspaces;
+        let mut reordered = reordered.into_iter();
+        for id in order {
+            if siblings.contains(id) {
+                *id = reordered.next().unwrap();
+            }
+        }
+        Ok(self.finish(vec![], vec![]))
+    }
+
     pub fn rename_workspace(
         &mut self,
         workspace_id: WorkspaceId,
@@ -1847,9 +1914,6 @@ impl ResourceTree {
         new_name: String,
     ) -> Result<Mutation, ResourceError> {
         check_optional_name(&new_name)?;
-        if new_name.len() > 512 || new_name.chars().any(char::is_control) {
-            return Err(ResourceError::InvalidPaneName);
-        }
         let pane = self
             .panes
             .get(&pane_id)
@@ -3133,6 +3197,69 @@ mod tests {
             pane_id: PaneId::new(),
             terminal_id: TerminalId::new(),
         }
+    }
+
+    #[test]
+    fn moving_workspaces_is_atomic_session_local_and_preserves_nesting() {
+        let mut tree = ResourceTree::default();
+        let first = initial("project", "/project");
+        let session = first.session_id;
+        let a = first.workspace_id;
+        tree.create_session(first).unwrap();
+        let second = workspace("second", None);
+        let b = second.workspace_id;
+        tree.add_workspace(session, second).unwrap();
+        let child = workspace("child", Some(a));
+        let c = child.workspace_id;
+        tree.add_workspace(session, child).unwrap();
+        let other = initial("other", "/other");
+        tree.create_session(other).unwrap();
+        let before = tree.snapshot();
+        for position in [0, 3, usize::MAX] {
+            assert_eq!(
+                tree.move_workspace(a, position),
+                Err(ResourceError::InvalidWorkspacePosition(2))
+            );
+            assert_eq!(tree.snapshot(), before);
+        }
+        assert_eq!(
+            tree.move_workspace(WorkspaceId::new(), 1),
+            Err(ResourceError::NotFound("workspace"))
+        );
+        assert_eq!(tree.move_workspace(a, 1).unwrap().revision, before.revision);
+        assert_eq!(
+            tree.move_workspace(a, 2).unwrap().revision,
+            before.revision + 1
+        );
+        let after = tree.snapshot();
+        assert_eq!(after.sessions[1], before.sessions[1]);
+        assert_eq!(
+            after.sessions[0]
+                .workspaces_depth_first()
+                .iter()
+                .map(|w| w.id)
+                .collect::<Vec<_>>(),
+            [b, a, c]
+        );
+        assert_eq!(
+            after.sessions[0]
+                .workspaces
+                .iter()
+                .find(|w| w.id == c)
+                .unwrap()
+                .parent_workspace_id,
+            Some(a)
+        );
+        tree.move_workspace(a, 1).unwrap();
+        assert_eq!(tree.snapshot().sessions, before.sessions);
+        tree.close_workspace(a).unwrap();
+        let closing = tree.snapshot();
+        assert_eq!(
+            tree.move_workspace(a, 2),
+            Err(ResourceError::Closing("workspace"))
+        );
+        assert_eq!(tree.snapshot(), closing);
+        tree.validate().unwrap();
     }
 
     #[test]
@@ -6195,6 +6322,7 @@ mod tests {
         let mut tree = ResourceTree::default();
         let path = initial("Session", "/project");
         let pane_id = path.pane_id;
+        let tab_id = path.tab_id;
         tree.create_session(path).unwrap();
         let before = tree.snapshot();
         for name in [
@@ -6203,7 +6331,8 @@ mod tests {
             "\x1b[31m".into(),
             "λ".repeat(257),
         ] {
-            assert!(tree.rename_pane(pane_id, name).is_err());
+            assert!(tree.rename_pane(pane_id, name.clone()).is_err());
+            assert!(tree.rename_tab(tab_id, name).is_err());
             assert_eq!(tree.snapshot(), before);
         }
         assert_eq!(
