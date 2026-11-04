@@ -1,0 +1,28 @@
+{
+  "name": "fut",
+  "workdir": "/workspaces/fut",
+  "dirs": [
+    "."
+  ],
+  "ports": [],
+  "tailscale": {
+    "enabled": true
+  },
+  "firewall": {
+    "enabled": true,
+    "allow": [
+      "index.crates.io",
+      "static.crates.io",
+      "deps.files.ghostty.org",
+      "github.com",
+      "codeload.github.com",
+      "codeberg.org"
+    ]
+  },
+  "resources": {
+    "cpus": 4,
+    "memory": "8GiB",
+    "disk": "40GiB"
+  },
+  "agent_credentials": true
+}
