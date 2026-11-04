@@ -18,10 +18,10 @@ use crate::{
     },
     extensions::Extension,
     resources::ExtensionConfigTable,
-    splits::SplitDirection,
+    splits::{SplitDirection, SplitRatio},
 };
 
-const MAX_RECIPE_BYTES: u64 = 64 * 1024;
+pub(crate) const MAX_RECIPE_BYTES: u64 = 64 * 1024;
 const MAX_TRUST_STORE_BYTES: u64 = 1024 * 1024;
 const MAX_TRUSTED_RECIPES: usize = 4_096;
 const TRUST_STORE_VERSION: u8 = 1;
@@ -54,6 +54,10 @@ pub(crate) struct RecipeWorkspace {
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
+    cwd: Option<PathBuf>,
+    #[serde(default)]
+    parent: Option<String>,
+    #[serde(default)]
     title: Option<String>,
     tabs: Vec<RecipeTab>,
 }
@@ -78,6 +82,8 @@ pub(crate) struct RecipePane {
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
     command: Option<Vec<String>>,
     #[serde(default)]
     exec: bool,
@@ -94,6 +100,8 @@ pub(crate) struct RecipePane {
 pub(crate) struct RecipeSplit {
     target: String,
     direction: SplitDirection,
+    #[serde(default)]
+    ratio: Option<SplitRatio>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -182,6 +190,8 @@ impl WorkspaceRecipe {
         if self.workspaces.is_empty() {
             self.workspaces.push(RecipeWorkspace {
                 id: None,
+                cwd: None,
+                parent: None,
                 title: None,
                 tabs: vec![RecipeTab {
                     id: None,
@@ -190,6 +200,7 @@ impl WorkspaceRecipe {
                     environment: BTreeMap::new(),
                     panes: vec![RecipePane {
                         id: None,
+                        title: None,
                         command: None,
                         exec: false,
                         cwd: None,
@@ -219,6 +230,13 @@ impl WorkspaceRecipe {
 }
 
 impl RecipeWorkspace {
+    pub(crate) fn cwd(&self) -> Option<&Path> {
+        self.cwd.as_deref()
+    }
+    pub(crate) fn parent(&self) -> Option<&str> {
+        self.parent.as_deref()
+    }
+
     pub(crate) fn id(&self) -> Option<&str> {
         self.id.as_deref()
     }
@@ -255,6 +273,10 @@ impl RecipeTab {
 }
 
 impl RecipePane {
+    pub(crate) fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
     pub(crate) fn id(&self) -> Option<&str> {
         self.id.as_deref()
     }
@@ -281,6 +303,10 @@ impl RecipePane {
 }
 
 impl RecipeSplit {
+    pub(crate) fn ratio(&self) -> Option<SplitRatio> {
+        self.ratio
+    }
+
     pub(crate) fn target(&self) -> &str {
         &self.target
     }
@@ -688,7 +714,7 @@ fn storable_path(path: &Path) -> Result<&str> {
     })
 }
 
-fn validate(recipe: &WorkspaceRecipe, extensions: &[Extension]) -> Result<()> {
+pub(crate) fn validate(recipe: &WorkspaceRecipe, extensions: &[Extension]) -> Result<()> {
     if recipe.workspaces.is_empty() || recipe.workspaces.len() > MAX_WORKSPACES {
         bail!("recipe must contain between 1 and {MAX_WORKSPACES} workspaces");
     }
@@ -701,6 +727,24 @@ fn validate(recipe: &WorkspaceRecipe, extensions: &[Extension]) -> Result<()> {
     let mut focus_targets = HashSet::new();
     for (workspace_index, workspace) in recipe.workspaces.iter().enumerate() {
         let workspace_path = format!("workspaces[{workspace_index}]");
+        validate_cwd(workspace.cwd.as_deref(), &format!("{workspace_path}.cwd"))?;
+        let mut parent = workspace.parent.as_deref();
+        let mut visited = HashSet::new();
+        if let Some(id) = workspace.id.as_deref() {
+            visited.insert(id);
+        }
+        while let Some(id) = parent {
+            if !visited.insert(id) {
+                bail!("cycle in recipe workspace parents");
+            }
+            parent = recipe
+                .workspaces
+                .iter()
+                .find(|w| w.id.as_deref() == Some(id))
+                .with_context(|| format!("unknown workspace parent {id:?}"))?
+                .parent
+                .as_deref();
+        }
         if let Some(id) = &workspace.id {
             validate_id(id, &format!("{workspace_path}.id"))?;
             if !workspace_ids.insert(id) {
@@ -762,6 +806,7 @@ fn validate(recipe: &WorkspaceRecipe, extensions: &[Extension]) -> Result<()> {
                 {
                     focus_targets.insert(format!("{workspace_id}.{tab_id}.{pane_id}"));
                 }
+                validate_title(pane.title.as_deref(), &format!("{pane_path}.title"))?;
                 validate_command(pane.command.as_deref(), &format!("{pane_path}.command"))?;
                 validate_cwd(pane.cwd.as_deref(), &format!("{pane_path}.cwd"))?;
                 validate_environment(&pane.environment, &format!("{pane_path}.environment"))?;

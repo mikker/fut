@@ -140,6 +140,23 @@ pub async fn ensure_daemon(
     cwd: &Path,
     config_location: &crate::client::config::ConfigLocation,
 ) -> Result<()> {
+    ensure_daemon_mode(socket, cwd, config_location, false).await
+}
+
+pub(crate) async fn ensure_daemon_for_restore(
+    socket: &Path,
+    cwd: &Path,
+    config_location: &crate::client::config::ConfigLocation,
+) -> Result<()> {
+    ensure_daemon_mode(socket, cwd, config_location, true).await
+}
+
+async fn ensure_daemon_mode(
+    socket: &Path,
+    cwd: &Path,
+    config_location: &crate::client::config::ConfigLocation,
+    restore_only: bool,
+) -> Result<()> {
     let probe = probe_protocol(socket).await;
     let should_start = probe == ProtocolProbe::Unavailable;
     if probe.check_ready(socket)? {
@@ -160,9 +177,11 @@ pub async fn ensure_daemon(
         {
             command.arg("--config-dir").arg(path);
         }
+        command.arg("daemon").arg("run");
+        if restore_only {
+            command.arg("--restore-only");
+        }
         command
-            .arg("daemon")
-            .arg("run")
             .arg("--cwd")
             .arg(cwd)
             .arg("--log-file")

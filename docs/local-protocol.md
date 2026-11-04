@@ -67,6 +67,25 @@ requests before dispatch. Clients that offer it as optional accept a welcome
 without it and disable pane renaming for that connection. Legacy exact-version
 connections cannot rename panes.
 
+Clients may also offer `layout-restoration.v1`. It permits `save_layout`,
+`list_layouts`, and `restore_layout` (`project: null` for all saved projects),
+with `layout_saved`, `saved_layouts`, and `layout_restored` replies. The local-only
+`layout` administrative request additionally permits enable/disable, review,
+approval, and export. All replies retain request correlation; operational
+failures use `error` with code `layout_error`. Restore skips live project
+identities, uses host-owned checkpoints/approvals, and never accepts replacement
+commands. A selector-free interactive hello may select the most recently
+restored pane only when this capability was selected. Without it, restored
+default-focus behavior and all new operations are unavailable; the frozen
+baseline selection remains unchanged.
+
+A newer host-local CLI can save a negotiated older daemon through a read-only
+adapter using only `list_resources`, `ping`, and a second `list_resources`.
+It compares structural metadata and observes native process arguments on the
+same host; it does not attach, mutate resources, or restart the daemon. This
+adapter is not a protocol fallback for unnegotiated legacy connections, and
+cannot enable remote host-local process inspection.
+
 New features must update the capability types, selection validation, and
 boundary allowlists. Listing an optional capability does not authorize new
 behavior.

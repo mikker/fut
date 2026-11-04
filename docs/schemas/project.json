@@ -61,6 +61,16 @@
       },
       "description": "Program followed by its arguments, executed directly without a shell."
     },
+    "splitRatio": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "numerator": { "type": "integer", "minimum": 1, "maximum": 65534 },
+        "denominator": { "type": "integer", "minimum": 2, "maximum": 65535 }
+      },
+      "required": ["numerator", "denominator"],
+      "description": "Fraction allocated to the first branch; numerator must be less than denominator. Defaults to one half."
+    },
     "split": {
       "type": "object",
       "additionalProperties": false,
@@ -71,6 +81,9 @@
         },
         "direction": {
           "enum": ["right", "down"]
+        },
+        "ratio": {
+          "$ref": "#/definitions/splitRatio"
         }
       },
       "required": ["target", "direction"]
@@ -79,6 +92,7 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "title": { "type": "string", "pattern": "\\S", "maxLength": 512 },
         "id": {
           "$ref": "#/definitions/id"
         },
@@ -101,6 +115,7 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "title": { "type": "string", "pattern": "\\S", "maxLength": 512 },
         "id": {
           "$ref": "#/definitions/id"
         },
@@ -160,6 +175,14 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "cwd": {
+          "$ref": "#/definitions/cwd",
+          "description": "Workspace root, relative to the recipe source root or absolute. Does not change project ownership."
+        },
+        "parent": {
+          "$ref": "#/definitions/id",
+          "description": "ID of another workspace in this recipe; cycles are not allowed."
+        },
         "id": {
           "$ref": "#/definitions/id"
         },

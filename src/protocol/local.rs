@@ -14,6 +14,7 @@ pub const CODEC: &str = "msgpack-map-v1";
 pub const BASELINE: &str = "local.v1";
 pub const WORKSPACE_ORDER: &str = "workspace-order.v1";
 pub const PANE_TITLES: &str = "pane-titles.v1";
+pub const LAYOUT_RESTORATION: &str = "layout-restoration.v1";
 
 /// An older daemon cannot decode local_hello, so its negative response cannot
 /// echo the request ID. Never treat a malformed welcome as a legacy rejection.
@@ -67,11 +68,16 @@ pub struct LocalWelcome {
 pub struct Capabilities {
     workspace_order: bool,
     pane_titles: bool,
+    layout_restoration: bool,
 }
 
 impl Capabilities {
     pub fn workspace_order(self) -> bool {
         self.workspace_order
+    }
+
+    pub fn layout_restoration(self) -> bool {
+        self.layout_restoration
     }
 
     pub fn pane_titles(self) -> bool {
@@ -86,6 +92,9 @@ impl Capabilities {
         if self.pane_titles {
             names.push(PANE_TITLES.into());
         }
+        if self.layout_restoration {
+            names.push(LAYOUT_RESTORATION.into());
+        }
         names
     }
 
@@ -96,6 +105,9 @@ impl Capabilities {
         match message {
             Hello { .. } | LocalHello(_) | RemoteHello(_) => false,
             MoveWorkspace { .. } => self.workspace_order,
+            SaveLayout | ListLayouts | RestoreLayout { .. } | Layout { .. } => {
+                self.layout_restoration
+            }
             RenameTarget {
                 selector: super::RenameSelector::Pane(_),
                 ..
@@ -162,6 +174,9 @@ impl Capabilities {
         match message {
             Welcome { .. } | RemoteWelcome(_) | IncompatibleProtocol { .. } => false,
             WorkspaceMoved { .. } => self.workspace_order,
+            LayoutSaved { .. } | SavedLayouts { .. } | LayoutRestored { .. } => {
+                self.layout_restoration
+            }
             LocalWelcome(_)
             | EndpointError { .. }
             | CommandReply { .. }
@@ -214,7 +229,11 @@ impl LocalHello {
             codec: CODEC.into(),
             client_version: client_version.into(),
             required: vec![BASELINE.into()],
-            optional: vec![WORKSPACE_ORDER.into(), PANE_TITLES.into()],
+            optional: vec![
+                WORKSPACE_ORDER.into(),
+                PANE_TITLES.into(),
+                LAYOUT_RESTORATION.into(),
+            ],
             mode,
         }
     }
@@ -233,10 +252,12 @@ impl LocalHello {
             return Err(EndpointError::UnsupportedCodec);
         }
         if !self.required.iter().any(|name| name == BASELINE)
-            || self
-                .required
-                .iter()
-                .any(|name| name != BASELINE && name != WORKSPACE_ORDER && name != PANE_TITLES)
+            || self.required.iter().any(|name| {
+                name != BASELINE
+                    && name != WORKSPACE_ORDER
+                    && name != PANE_TITLES
+                    && name != LAYOUT_RESTORATION
+            })
         {
             return Err(EndpointError::MissingRequiredCapability);
         }
@@ -248,6 +269,11 @@ impl LocalHello {
                 .iter()
                 .chain(&self.optional)
                 .any(|name| name == WORKSPACE_ORDER),
+            layout_restoration: self
+                .required
+                .iter()
+                .chain(&self.optional)
+                .any(|name| name == LAYOUT_RESTORATION),
             pane_titles: self
                 .required
                 .iter()
@@ -278,7 +304,10 @@ impl LocalHello {
             return Err(EndpointError::MissingRequiredCapability);
         }
         if welcome.capabilities.iter().any(|name| {
-            (name != BASELINE && name != WORKSPACE_ORDER && name != PANE_TITLES)
+            (name != BASELINE
+                && name != WORKSPACE_ORDER
+                && name != PANE_TITLES
+                && name != LAYOUT_RESTORATION)
                 || !self
                     .required
                     .iter()
@@ -297,6 +326,10 @@ impl LocalHello {
                 .capabilities
                 .iter()
                 .any(|name| name == WORKSPACE_ORDER),
+            layout_restoration: welcome
+                .capabilities
+                .iter()
+                .any(|name| name == LAYOUT_RESTORATION),
             pane_titles: welcome.capabilities.iter().any(|name| name == PANE_TITLES),
         })
     }
@@ -573,6 +606,51 @@ mod tests {
         assert!(local.allows_client(&ClientMessage::Shutdown));
         assert!(local.allows_server(&ServerMessage::LocalWelcome(welcome())));
         assert!(!local.allows_client(&ClientMessage::RemoteHello(hello)));
+    }
+
+    #[test]
+    fn workspace_order_and_layout_restoration_are_selected_independently() {
+        for (workspace_order, layout_restoration) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let mut hello = LocalHello::new(ClientMode::Control, "0.1.0");
+            hello.optional.clear();
+            if workspace_order {
+                hello.optional.push(WORKSPACE_ORDER.into());
+            }
+            if layout_restoration {
+                hello.optional.push(LAYOUT_RESTORATION.into());
+            }
+            let selected = hello.negotiate().unwrap();
+            assert_eq!(selected.workspace_order(), workspace_order);
+            assert_eq!(selected.layout_restoration(), layout_restoration);
+            assert_eq!(
+                selected.allows_client(&ClientMessage::MoveWorkspace {
+                    workspace_id: crate::domain::WorkspaceId::new(),
+                    position: 1,
+                }),
+                workspace_order
+            );
+            assert_eq!(
+                selected.allows_server(&ServerMessage::WorkspaceMoved {
+                    resource_revision: 42,
+                }),
+                workspace_order
+            );
+            assert_eq!(
+                selected.allows_client(&ClientMessage::SaveLayout),
+                layout_restoration
+            );
+            assert_eq!(
+                selected.allows_server(&ServerMessage::SavedLayouts {
+                    projects: Vec::new(),
+                }),
+                layout_restoration
+            );
+            let mut reply = welcome();
+            reply.capabilities = selected.names();
+            assert_eq!(hello.accept(&reply).unwrap(), selected);
+        }
     }
 
     #[test]

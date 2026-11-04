@@ -3,6 +3,9 @@
 #[path = "ssh_bridge/mod.rs"]
 mod ssh_bridge_tests;
 
+#[path = "layout_restore/mod.rs"]
+mod layout_restore_tests;
+
 // The byte-transparent stdio bridge test still calls the legacy helper by its
 // original name. Keep that explicit wire contract without migrating its module.
 use legacy_hello as hello;
@@ -15362,7 +15365,12 @@ async fn public_doctor_probes_a_running_daemon_without_mutating_resources() {
     );
     assert_eq!(
         protocol["details"]["capabilities"],
-        serde_json::json!(["local.v1", "workspace-order.v1", "pane-titles.v1"])
+        serde_json::json!([
+            "local.v1",
+            "workspace-order.v1",
+            "pane-titles.v1",
+            "layout-restoration.v1"
+        ])
     );
     let after = harness.resources().await;
     assert_eq!(without_observations(after), without_observations(before));

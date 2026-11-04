@@ -506,7 +506,18 @@ pub async fn attach_remote(
     attach_only: bool,
     project: Option<&str>,
 ) -> anyhow::Result<()> {
-    attach_remote_inner(host, config_location, attach_only, project)
+    attach_remote_inner(host, config_location, attach_only, project, None)
+        .await
+        .map_err(remote::report_error)
+}
+
+pub(crate) async fn attach_remote_restored(
+    host: &str,
+    config_location: &config::ConfigLocation,
+    attach_only: bool,
+    terminal: Option<TerminalId>,
+) -> anyhow::Result<()> {
+    attach_remote_inner(host, config_location, attach_only, None, terminal)
         .await
         .map_err(remote::report_error)
 }
@@ -516,10 +527,13 @@ async fn attach_remote_inner(
     config_location: &config::ConfigLocation,
     attach_only: bool,
     project: Option<&str>,
+    restored_terminal: Option<TerminalId>,
 ) -> anyhow::Result<()> {
     let staged = &stage_ui_config(config_location)?;
     let start_if_missing = staged.remote_autostart() && !attach_only;
-    let selector = if let Some(project) = project {
+    let selector = if let Some(terminal) = restored_terminal {
+        Some(TargetSelector::Terminal(terminal))
+    } else if let Some(project) = project {
         Some(
             over_ssh(host, start_if_missing, |stream| async move {
                 prepare_remote(remote::open_project(
@@ -606,6 +620,38 @@ async fn attach_remote_inner(
 
 const REMOTE_HANDSHAKE_FAILED: &str = "remote attachment failed (SSH or daemon handshake)";
 
+pub(crate) async fn layout_request(
+    host: &str,
+    config_location: &config::ConfigLocation,
+    attach_only: bool,
+    message: ClientMessage,
+) -> anyhow::Result<ServerMessage> {
+    let restore = matches!(message, ClientMessage::RestoreLayout { .. });
+    if !matches!(
+        message,
+        ClientMessage::SaveLayout
+            | ClientMessage::ListLayouts
+            | ClientMessage::RestoreLayout { .. }
+    ) {
+        bail!("only host-owned save, list, and restore operations are available remotely");
+    }
+    let start = restore && !attach_only && stage_ui_config(config_location)?.remote_autostart();
+    over_ssh_mode(host, start, restore, |stream| prepare_remote(async move {
+        let mut connection = remote::negotiate(stream, ClientMode::Control, env!("CARGO_PKG_VERSION"), Duration::from_secs(60)).await?;
+        if !connection.capabilities.contains(crate::protocol::remote::Capability::LayoutRestoration) {
+            bail!("remote daemon does not support layout restoration; install the updated Fut on the host and restart its daemon only after saving your work");
+        }
+        let id = Uuid::new_v4();
+        send_request(&mut connection.framed, Some(id), message).await?;
+        let frame = time::timeout(Duration::from_secs(120), connection.framed.next()).await.context("remote layout operation timed out")?.context("remote daemon disconnected")??;
+        let envelope: Envelope<ServerMessage> = decode_payload(&frame)?;
+        if envelope.request_id != Some(id) || !connection.capabilities.allows_server(&envelope.message) {
+            return Err(crate::protocol::remote::EndpointError::InvalidHandshake.into());
+        }
+        Ok(envelope.message)
+    })).await.map_err(remote::report_error)
+}
+
 /// Confirms that `host` already runs a compatible Fut daemon, reporting its
 /// version. This never touches the terminal, and failure or cancellation still
 /// terminates and reaps SSH. Nothing is started, stopped, or saved here.
@@ -672,7 +718,23 @@ async fn over_ssh<T, F>(
 where
     F: Future<Output = anyhow::Result<T>>,
 {
-    let (stream, bridge) = crate::ssh_bridge::SshBridge::connect(host, start_if_missing)?;
+    over_ssh_mode(host, start_if_missing, false, work).await
+}
+
+async fn over_ssh_mode<T, F>(
+    host: &str,
+    start_if_missing: bool,
+    restore: bool,
+    work: impl FnOnce(UnixStream) -> F,
+) -> anyhow::Result<T>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    let (stream, bridge) = if restore {
+        crate::ssh_bridge::SshBridge::connect_restore(host, start_if_missing)?
+    } else {
+        crate::ssh_bridge::SshBridge::connect(host, start_if_missing)?
+    };
     let result = work(stream).await;
     let cleanup = bridge.shutdown().await;
     result.and_then(|value| cleanup.map(|()| value))
@@ -2045,6 +2107,21 @@ async fn run_loop(
                                 force_draw = true;
                             }
                         }
+                    }
+                    ServerMessage::LayoutSaved { reply } => {
+                        toasts.info(format!("saved {} project(s); approve restart commands with `fut layout review` on the host", reply.projects.len()));
+                        force_draw = true;
+                    }
+                    ServerMessage::SavedLayouts { .. } => {}
+                    ServerMessage::LayoutRestored { report } => {
+                        toasts.info(report.message());
+                        let mut navigator = NavigatorState::open();
+                        if let Some(snapshot) = resources.snapshot() {
+                            navigator.accept_resources_with_notifications(snapshot, view.focused(), &workspace_history, resources.notifications());
+                        }
+                        navigator.accept_presence(resources.presence());
+                        surface = Some(ClientSurface::Navigator(navigator));
+                        force_draw = true;
                     }
                     ServerMessage::Resources { snapshot, presence } => {
                         let presence_changed = resources.accept_presence(presence);
@@ -5717,6 +5794,27 @@ async fn dispatch_client_action(
         return Ok(Some(Toast::info(message)));
     }
     match action {
+        ClientAction::SaveLayout | ClientAction::RestoreLayouts => {
+            if !attachment.supports_layout_restoration() {
+                return Ok(Some(Toast::error(
+                    "remote daemon does not support layout restoration; update it and restart safely",
+                )));
+            }
+            send(
+                framed,
+                if action == ClientAction::SaveLayout {
+                    ClientMessage::SaveLayout
+                } else {
+                    ClientMessage::RestoreLayout { project: None }
+                },
+            )
+            .await?;
+            return Ok(Some(Toast::info(if action == ClientAction::SaveLayout {
+                "saving all projects…"
+            } else {
+                "restoring saved projects…"
+            })));
+        }
         ClientAction::PasteImage => {
             if !attachment.supports_attachments() {
                 return Ok(Some(Toast::info(

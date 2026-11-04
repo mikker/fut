@@ -11,6 +11,7 @@ pub mod doctor;
 pub mod domain;
 pub(crate) mod extension_store;
 pub(crate) mod extensions;
+pub mod layout;
 pub(crate) mod machines;
 pub mod project;
 pub(crate) mod project_definition;

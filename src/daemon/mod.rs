@@ -2,11 +2,13 @@
 
 mod command;
 mod git;
+mod layout;
 mod lease;
 pub mod path;
 mod presence;
 pub(crate) mod process;
 mod recipe;
+pub(crate) use layout::compatible_projects;
 
 pub mod autostart;
 
@@ -85,6 +87,7 @@ pub struct DaemonConfig {
     pub spawn: SpawnSpec,
     pub config_location: global_config::ConfigLocation,
     pub recipe_command_override: bool,
+    pub restore_only: bool,
 }
 
 impl DaemonConfig {
@@ -99,6 +102,7 @@ impl DaemonConfig {
             socket_path,
             config_location,
             recipe_command_override: false,
+            restore_only: false,
             spawn: SpawnSpec {
                 terminal: crate::terminal::TerminalConfig::default(),
                 id: TerminalId::new(),
@@ -142,6 +146,7 @@ struct RuntimeEntry {
 }
 
 struct SharedState {
+    layout: Option<layout::LayoutRuntime>,
     attachment_store: Arc<crate::attachments::Store>,
     resources: ResourceTree,
     runtimes: HashMap<TerminalId, RuntimeEntry>,
@@ -805,7 +810,11 @@ impl SharedState {
         path: InitialPath,
         terminal: Arc<TerminalHandle>,
     ) -> Result<(), DaemonError> {
+        let project = path.project.clone();
         let mutation = self.resources.create_session(path)?;
+        if let Some(layout) = &mut self.layout {
+            layout.remember_project(&project);
+        }
         self.alerts.register_terminal(terminal.id());
         self.expected_finalizations.remove(&terminal.id());
         self.exited_terminals.retain(|(id, _)| *id != terminal.id());
@@ -1987,14 +1996,30 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     let command_override = config
         .recipe_command_override
         .then(|| (config.spawn.program.clone(), config.spawn.argv.clone()));
-    let prepared_recipe = recipe::prepare_initial(
-        &projects,
-        extension_registry.extensions(),
-        &resolved,
-        command_override,
-        &default_shell,
-    )
-    .await?;
+    let layout_runtime = match layout::LayoutRuntime::load(&config.socket_path) {
+        Ok(layout) => Some(layout),
+        Err(error) => {
+            tracing::warn!(%error, "saved-layout state unavailable; automatic restoration disabled");
+            None
+        }
+    };
+    let auto_restore = !config.restore_only
+        && layout_runtime
+            .as_ref()
+            .is_some_and(layout::LayoutRuntime::has_startup_layout);
+    let defer_initial = auto_restore || config.restore_only;
+    let prepared_recipe = if defer_initial {
+        None
+    } else {
+        recipe::prepare_initial(
+            &projects,
+            extension_registry.extensions(),
+            &resolved,
+            command_override,
+            &default_shell,
+        )
+        .await?
+    };
     let socket = bind_socket(&config.socket_path).await?;
     let mut initial_spawn = config.spawn;
     initial_spawn.cwd = resolved.cwd.clone();
@@ -2015,6 +2040,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     let (extension_catalog, _) = watch::channel(initial_extension_catalog);
     let (agent_events, _) = broadcast::channel(AGENT_EVENT_CAPACITY);
     let mut state = SharedState {
+        layout: layout_runtime,
         attachment_store: Default::default(),
         resources: ResourceTree::default(),
         runtimes: HashMap::new(),
@@ -2034,7 +2060,9 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
         hook_queue,
         accepting: true,
     };
-    let initial_terminals = if let Some(recipe) = prepared_recipe {
+    let initial_terminals = if defer_initial {
+        Vec::new()
+    } else if let Some(recipe) = prepared_recipe {
         recipe::create_initial(&mut state, &resolved, &recipe).await?
     } else {
         let initial = initial_path(
@@ -2067,10 +2095,19 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
         hook_shutdown_rx,
     ));
     let (exited_tx, mut exited_rx) = mpsc::unbounded_channel();
+    if auto_restore {
+        match layout::restore(&shared, &exited_tx, None).await {
+            Ok(report) => tracing::info!(message = %report.message(), "startup layout restoration"),
+            Err(error) => {
+                tracing::error!(%error, "startup layout restoration failed; checkpoint retained")
+            }
+        }
+    }
     for terminal in initial_terminals {
         watch_terminal(terminal, Arc::clone(&shared), exited_tx.clone());
     }
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let layout_checkpoints = layout::watch(Arc::clone(&shared), shutdown_tx.subscribe());
     let process_names = watch_process_names(Arc::clone(&shared), shutdown_tx.subscribe());
     let git_metadata = git::watch(
         Arc::clone(&shared),
@@ -2120,6 +2157,17 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     shutdown_tx.send_replace(true);
     let _ = process_names.await;
     let _ = git_metadata.await;
+    let _ = layout_checkpoints.await;
+    if shared
+        .lock()
+        .await
+        .layout
+        .as_ref()
+        .is_some_and(|l| l.enabled)
+        && let Err(error) = layout::save(&shared).await
+    {
+        tracing::warn!(%error, "final layout checkpoint failed; previous checkpoint retained");
+    }
     let handles = shared.lock().await.begin_shutdown();
     let mut first_close_error = None;
     for terminal in handles {
@@ -3309,6 +3357,21 @@ async fn handle_connection(
                 .await?;
                 return Ok(());
             }
+            let layout_selected = connection.local.is_some_and(|c| c.layout_restoration())
+                || connection
+                    .remote
+                    .is_some_and(|c| c.contains(Capability::LayoutRestoration));
+            let selector = if selector.is_none() && layout_selected {
+                let state = shared.lock().await;
+                state
+                    .layout
+                    .as_ref()
+                    .and_then(|l| l.last_focus)
+                    .filter(|id| state.runtimes.contains_key(id))
+                    .map(TargetSelector::Terminal)
+            } else {
+                selector
+            };
             let attachment =
                 match lease_view(&shared, selector, None, client, LeaseSize::Requested(size)).await
                 {
@@ -3399,6 +3462,7 @@ async fn handle_connection(
                 if reject_unnegotiated_method(&mut connection, &envelope).await? {
                     continue;
                 }
+                if dispatch_layout(&mut connection, &shared, &exited, &envelope).await? { continue; }
                 if let Some(operation) = fire_and_forget_operation(&envelope.message)
                     && reject_fire_and_forget_request_id(
                         &mut connection,
@@ -3412,6 +3476,7 @@ async fn handle_connection(
                     continue;
                 }
                 match envelope.message {
+                    ClientMessage::SaveLayout | ClientMessage::ListLayouts | ClientMessage::RestoreLayout { .. } | ClientMessage::Layout { .. } => unreachable!("layout method already dispatched"),
                     message @ (ClientMessage::AttachmentBegin { .. }
                     | ClientMessage::AttachmentChunk { .. }
                     | ClientMessage::AttachmentCommit { .. }
@@ -4435,7 +4500,8 @@ async fn reject_unnegotiated_method(
         || (connection.remote.is_none()
             && connection.local.is_none()
             && (matches!(envelope.message, ClientMessage::MoveWorkspace { .. })
-                || envelope.message.requires_pane_titles()))
+                || envelope.message.requires_pane_titles()
+                || envelope.message.requires_layout_restoration()))
     {
         send(
             connection,
@@ -4448,6 +4514,48 @@ async fn reject_unnegotiated_method(
         return Ok(true);
     }
     Ok(false)
+}
+
+async fn dispatch_layout(
+    connection: &mut ClientConnection,
+    shared: &Shared,
+    exited: &mpsc::UnboundedSender<TerminalId>,
+    envelope: &Envelope<ClientMessage>,
+) -> Result<bool> {
+    let response = match &envelope.message {
+        ClientMessage::SaveLayout => layout::save(shared)
+            .await
+            .map(|reply| ServerMessage::LayoutSaved { reply }),
+        ClientMessage::ListLayouts => {
+            layout::list(shared)
+                .await
+                .map(|reply| ServerMessage::SavedLayouts {
+                    projects: reply.projects,
+                })
+        }
+        ClientMessage::RestoreLayout { project } => {
+            layout::restore(shared, exited, project.as_deref())
+                .await
+                .map(|report| ServerMessage::LayoutRestored { report })
+        }
+        ClientMessage::Layout { action } => layout::action(shared, action.clone())
+            .await
+            .map(|reply| ServerMessage::LayoutSaved { reply }),
+        _ => return Ok(false),
+    };
+    match response {
+        Ok(message) => send(connection, envelope.request_id, message).await?,
+        Err(error) => {
+            send_error(
+                connection,
+                envelope.request_id,
+                "layout_error",
+                &format!("{error:#}"),
+            )
+            .await?
+        }
+    }
+    Ok(true)
 }
 
 async fn control_loop(
@@ -4502,12 +4610,14 @@ async fn control_loop(
         if reject_unnegotiated_method(connection, &envelope).await? {
             continue;
         }
+        if dispatch_layout(connection, &shared, &exited, &envelope).await? { continue; }
         if let Some(operation) = fire_and_forget_operation(&envelope.message)
             && reject_fire_and_forget_request_id(connection, envelope.request_id, operation).await?
         {
             continue;
         }
         match envelope.message {
+            ClientMessage::SaveLayout | ClientMessage::ListLayouts | ClientMessage::RestoreLayout { .. } | ClientMessage::Layout { .. } => unreachable!("layout method already dispatched"),
             ClientMessage::CommandDefaults { command, target } => {
                 command::defaults(connection, &shared, envelope.request_id, command, target).await?;
             }
@@ -5557,12 +5667,16 @@ async fn lease_view(
     client: ClientId,
     size: LeaseSize,
 ) -> Result<Attachment, DaemonError> {
-    let state = shared.lock().await;
+    let mut state = shared.lock().await;
     if !state.accepting {
         return Err(DaemonError::new("shutting_down", "daemon is shutting down"));
     }
     let focused = state.resources.resolve_terminal_target(selector)?;
     validate_selection_expectation(focused, expected)?;
+    if let Some(layout) = &mut state.layout {
+        layout.focus.insert(focused.session_id, focused.terminal_id);
+        layout.last_focus = Some(focused.terminal_id);
+    }
     let paths = state
         .resources
         .open_terminal_paths_for_tab(focused.tab_id)?;
@@ -10766,6 +10880,7 @@ mod tests {
         let extension_catalog = watch::channel(extension_registry.catalog().unwrap()).0;
         (
             SharedState {
+                layout: None,
                 attachment_store: Default::default(),
                 resources,
                 runtimes: HashMap::new(),
@@ -11570,6 +11685,7 @@ scope = "workspace"
         );
         let extension_catalog = watch::channel(extension_registry.catalog().unwrap()).0;
         let mut state = SharedState {
+            layout: None,
             attachment_store: Default::default(),
             resources: ResourceTree::default(),
             runtimes: HashMap::new(),

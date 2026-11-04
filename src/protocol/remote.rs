@@ -76,10 +76,11 @@ pub enum Capability {
     ConfiguredCommands,
     WorkspaceOrder,
     PaneTitles,
+    LayoutRestoration,
 }
 
 impl Capability {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::Metadata,
         Self::NestedWorkspaces,
         Self::Interactive,
@@ -96,6 +97,7 @@ impl Capability {
         Self::ConfiguredCommands,
         Self::WorkspaceOrder,
         Self::PaneTitles,
+        Self::LayoutRestoration,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -116,6 +118,7 @@ impl Capability {
             Self::ConfiguredCommands => "configured-commands.v1",
             Self::WorkspaceOrder => "workspace-order.v1",
             Self::PaneTitles => "pane-titles.v1",
+            Self::LayoutRestoration => "layout-restoration.v1",
         }
     }
 }
@@ -184,6 +187,7 @@ impl Capabilities {
                 return self.contains(Capability::Interactive)
                     && self.contains(Capability::PaneTitles);
             }
+            SaveLayout | ListLayouts | RestoreLayout { .. } => Capability::LayoutRestoration,
             ListResources | WatchResources => Capability::Metadata,
             OpenProject { .. } => Capability::ProjectOpen,
             MoveWorkspace { .. } => Capability::WorkspaceOrder,
@@ -229,6 +233,9 @@ impl Capabilities {
             Detached | Error { .. } | EndpointError { .. } => return true,
             Resources { .. } | ResourcesChanged { .. } | PresenceChanged { .. } => {
                 Capability::Metadata
+            }
+            LayoutSaved { .. } | SavedLayouts { .. } | LayoutRestored { .. } => {
+                Capability::LayoutRestoration
             }
             LocationOpened { .. } => Capability::ProjectOpen,
             WorkspaceMoved { .. } => Capability::WorkspaceOrder,
@@ -306,6 +313,7 @@ impl RemoteHello {
             Capability::ConfiguredCommands.name().into(),
             Capability::WorkspaceOrder.name().into(),
             Capability::PaneTitles.name().into(),
+            Capability::LayoutRestoration.name().into(),
         ];
         if matches!(mode, ClientMode::Interactive { .. }) {
             optional.push(Capability::TerminalColors.name().into());
@@ -1082,6 +1090,18 @@ mod tests {
             rmp_serde::from_slice::<ServerMessage>(&encoded).unwrap(),
             done
         );
+    }
+
+    #[test]
+    fn all_capability_bits_are_present_and_independent() {
+        for capability in Capability::ALL {
+            assert!(Capabilities::ALL.contains(capability));
+            let selected = Capabilities::from_names(&[capability.name().into()]);
+            assert_eq!(selected.names(), [capability.name()]);
+            for other in Capability::ALL {
+                assert_eq!(selected.contains(other), capability == other);
+            }
+        }
     }
 
     #[test]

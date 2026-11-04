@@ -22,6 +22,12 @@ if [ -n "$SSH_FAILURE" ]; then
     printf '%s\n' "$SSH_FAILURE" >&2
     exit 255
 fi
+if [ -n "$REMOTE_HOST_ROOT" ]; then
+    export HOME="$REMOTE_HOST_ROOT/home"
+    export XDG_STATE_HOME="$REMOTE_HOST_ROOT/state"
+    export XDG_DATA_HOME="$REMOTE_HOST_ROOT/data"
+    export FUT_RUNTIME_DIR="$REMOTE_HOST_ROOT/runtime"
+fi
 cd "$HOME" || exit 1
 socket="$REMOTE_SOCKET"
 for argument in "$@"; do
@@ -32,6 +38,8 @@ for argument in "$@"; do
     remote_command="$argument"
 done
 case "$remote_command" in
+    *' --start-if-missing --restore-only')
+        exec "$FUT_BIN" --no-config --socket "$socket" __stdio-bridge --start-if-missing --restore-only ;;
     *' --start-if-missing')
         exec "$FUT_BIN" --no-config --socket "$socket" __stdio-bridge --start-if-missing ;;
     *) exec "$FUT_BIN" --socket "$socket" __stdio-bridge ;;
@@ -41,6 +49,110 @@ esac
     .unwrap();
     fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
     bin
+}
+
+#[tokio::test]
+async fn remote_layout_restore_saves_lists_and_restores_on_the_host_not_the_client() {
+    use crate::layout_restore_tests::{action, approve, restart_empty, stop};
+    let mut harness = Harness::start("exec /bin/sleep 600").await;
+    let root = tempfile::tempdir().unwrap();
+    let bin = fake_ssh(root.path());
+    let socket = harness.socket.clone();
+    let host_root = harness.root.path().to_owned();
+    let run = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fut"));
+        remote_env(&mut command, root.path(), &bin, &socket);
+        command.env("REMOTE_HOST_ROOT", &host_root);
+        command
+            .args([
+                "--no-config",
+                "--json",
+                "--machine",
+                "layout-host",
+                "layout",
+            ])
+            .args(args);
+        tokio::process::Command::from(command)
+    };
+    let saved = run(&["save"]).output().await.unwrap();
+    assert!(
+        saved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&saved.stderr)
+    );
+    let saved: Value = serde_json::from_slice(&saved.stdout).unwrap();
+    assert!(
+        PathBuf::from(saved["result"]["path"].as_str().unwrap())
+            .starts_with(harness.root.path().join("state"))
+    );
+    let listed = run(&["list"]).output().await.unwrap();
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed["result"][0]["panes"], 1);
+    approve(&harness).await;
+    action(&harness, fut::layout::LayoutAction::Enable).await;
+    stop(&mut harness).await;
+    restart_empty(&mut harness).await;
+    let restored = run(&["restore", "--all", "--background"])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        restored.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    let restored: Value = serde_json::from_slice(&restored.stdout).unwrap();
+    assert_eq!(restored["result"]["restored"], serde_json::json!(["cwd"]));
+    assert_eq!(harness.resources().await.sessions.len(), 1);
+    assert!(!root.path().join("must-not-be-created").exists());
+    assert!(
+        fs::read_to_string(root.path().join("ssh-args"))
+            .unwrap()
+            .contains("--start-if-missing --restore-only")
+    );
+    assert_ssh_reaped(root.path()).await;
+    stop(&mut harness).await;
+    let attach_only = run(&["restore", "--all", "--background", "--attach-only"])
+        .output()
+        .await
+        .unwrap();
+    assert!(!attach_only.status.success());
+    assert!(!harness.socket.exists());
+    assert_ssh_reaped(root.path()).await;
+    let restarted = run(&["restore", "--all", "--background"])
+        .output()
+        .await
+        .unwrap();
+    let restarted_resources = if restarted.status.success() {
+        harness.resources().await.sessions
+    } else {
+        Vec::new()
+    };
+    let shutdown = harness.cli().args(["daemon", "shutdown"]).output().unwrap();
+    assert!(
+        shutdown.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shutdown.stderr)
+    );
+    wait_for(DEADLINE, || !harness.socket.exists()).await;
+    assert!(
+        restarted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restarted.stderr)
+    );
+    let restarted: Value = serde_json::from_slice(&restarted.stdout).unwrap();
+    assert_eq!(restarted["result"]["restored"], serde_json::json!(["cwd"]));
+    assert_eq!(restarted_resources.len(), 1);
+    assert_eq!(
+        restarted_resources[0].workspaces[0].root,
+        host_root.join("cwd")
+    );
+    assert_ssh_reaped(root.path()).await;
 }
 
 fn assert_ssh_arguments(root: &std::path::Path, host: &str, count: usize, start_if_missing: bool) {

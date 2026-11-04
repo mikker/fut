@@ -384,6 +384,26 @@ pub struct TokenPublication {
 }
 
 impl ResourceSnapshot {
+    pub(crate) fn layout_structure(mut self) -> Self {
+        self.revision = 0;
+        for session in &mut self.sessions {
+            session.tokens.clear();
+            for workspace in &mut session.workspaces {
+                workspace.tokens.clear();
+                for tab in &mut workspace.tabs {
+                    tab.tokens.clear();
+                    for pane in &mut tab.panes {
+                        pane.tokens.clear();
+                        pane.activity = Default::default();
+                        pane.cwd = None;
+                        pane.worktree = None;
+                    }
+                }
+            }
+        }
+        self
+    }
+
     /// Traverse every pane together with its session, workspace, and tab.
     pub fn pane_paths(&self) -> impl Iterator<Item = PanePathRef<'_>> {
         self.sessions.iter().flat_map(|session| {
@@ -1924,6 +1944,65 @@ impl ResourceTree {
         }
         self.panes.get_mut(&pane_id).unwrap().name = new_name;
         Ok(self.finish(Vec::new(), Vec::new()))
+    }
+
+    pub(crate) fn persistence_snapshot(&self) -> ResourceSnapshot {
+        let mut snapshot = self.snapshot();
+        for session in &mut snapshot.sessions {
+            for workspace in &mut session.workspaces {
+                workspace.name = self.workspaces[&workspace.id].name.clone();
+                for tab in &mut workspace.tabs {
+                    tab.name = self.tabs[&tab.id].name.clone();
+                }
+            }
+        }
+        snapshot.layout_structure()
+    }
+
+    pub(crate) fn restore_tab_layout(
+        &mut self,
+        tab_id: TabId,
+        layout: SplitTree,
+    ) -> Result<(), ResourceError> {
+        let tab = self
+            .tabs
+            .get(&tab_id)
+            .ok_or(ResourceError::NotFound("tab"))?;
+        let expected: BTreeSet<_> = tab
+            .layout
+            .as_ref()
+            .expect("live tab has layout")
+            .leaf_ids()
+            .into_iter()
+            .collect();
+        let actual: BTreeSet<_> = layout.leaf_ids().into_iter().collect();
+        if !layout.validate() || actual != expected {
+            return Err(ResourceError::Invariant(
+                "restored layout must contain exactly the tab's panes".into(),
+            ));
+        }
+        self.tabs.get_mut(&tab_id).unwrap().layout = Some(layout);
+        self.finish(Vec::new(), Vec::new());
+        Ok(())
+    }
+
+    pub(crate) fn restore_workspace_parent(
+        &mut self,
+        workspace_id: WorkspaceId,
+        parent: Option<WorkspaceId>,
+    ) -> Result<(), ResourceError> {
+        let session_id = self
+            .workspaces
+            .get(&workspace_id)
+            .ok_or(ResourceError::NotFound("workspace"))?
+            .session_id;
+        self.validate_workspace_parent(session_id, workspace_id, parent)?;
+        self.workspaces
+            .get_mut(&workspace_id)
+            .unwrap()
+            .parent_workspace_id = parent;
+        self.finish(Vec::new(), Vec::new());
+        Ok(())
     }
 
     pub fn add_workspace(

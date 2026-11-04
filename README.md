@@ -35,6 +35,7 @@ Run `fut` inside a project.
 Learn more:
 
 - [Using Fut](https://fut.sh/usage/)
+- [Save and restore layouts](https://fut.sh/layouts/)
 - [Configure projects](https://fut.sh/configuration/)
 - [Install extensions](https://fut.sh/extensions/)
 - [Build extensions](https://fut.sh/extension-authoring/)

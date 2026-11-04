@@ -119,6 +119,17 @@ impl Attachment {
         }
     }
 
+    pub(super) fn supports_layout_restoration(&self) -> bool {
+        match self {
+            Self::Local { capabilities, .. } => {
+                capabilities.is_some_and(|c| c.layout_restoration())
+            }
+            Self::Remote { capabilities, .. } => {
+                capabilities.contains(crate::protocol::remote::Capability::LayoutRestoration)
+            }
+        }
+    }
+
     pub(super) fn supports_pane_titles(&self) -> bool {
         match self {
             Self::Local { capabilities, .. } => {
@@ -258,6 +269,14 @@ mod tests {
             capabilities: Some(Default::default()),
         };
         assert!(!baseline.supports_pane_titles());
+        assert!(!baseline.supports_layout_restoration());
+        assert!(
+            !Attachment::Local {
+                socket: "/tmp/fut.sock".into(),
+                capabilities: None,
+            }
+            .supports_layout_restoration()
+        );
         let negotiated = Attachment::Local {
             socket: "/tmp/fut.sock".into(),
             capabilities: Some(
@@ -270,6 +289,11 @@ mod tests {
             ),
         };
         assert!(negotiated.supports_pane_titles());
+        assert!(negotiated.supports_layout_restoration());
+        assert!(
+            !Attachment::remote(Capabilities::default(), "old-host").supports_layout_restoration()
+        );
+        assert!(Attachment::remote(Capabilities::ALL, "new-host").supports_layout_restoration());
         assert!(!Attachment::remote(Capabilities::default(), "old-host").supports_pane_titles());
         assert!(Attachment::remote(Capabilities::ALL, "new-host").supports_pane_titles());
     }

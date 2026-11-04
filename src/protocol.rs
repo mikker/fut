@@ -465,6 +465,14 @@ pub enum RemoteCommandReply {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
+    SaveLayout,
+    ListLayouts,
+    RestoreLayout {
+        project: Option<String>,
+    },
+    Layout {
+        action: crate::layout::LayoutAction,
+    },
     CommandDefaults {
         command: RemoteCommandSpec,
         target: TerminalId,
@@ -719,6 +727,13 @@ pub enum ClientMessage {
 }
 
 impl ClientMessage {
+    pub fn requires_layout_restoration(&self) -> bool {
+        matches!(
+            self,
+            Self::SaveLayout | Self::ListLayouts | Self::RestoreLayout { .. } | Self::Layout { .. }
+        )
+    }
+
     pub fn requires_pane_titles(&self) -> bool {
         matches!(
             self,
@@ -746,6 +761,15 @@ pub enum PresentationTokenPublishAction {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    LayoutSaved {
+        reply: crate::layout::LayoutReply,
+    },
+    SavedLayouts {
+        projects: Vec<crate::layout::LayoutSummary>,
+    },
+    LayoutRestored {
+        report: crate::layout::RestoreReport,
+    },
     CommandReply {
         reply: RemoteCommandReply,
     },

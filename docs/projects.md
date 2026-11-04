@@ -178,12 +178,17 @@ valid focus targets, split targets that name earlier panes, installed extension
 configuration, and the total pane limit.
 
 Workspace, tab, and pane IDs are optional recipe-local references. Add an ID
-only when the item must be referenced by `focus = "WORKSPACE.TAB.PANE"` or a
-pane's `split.target`. IDs use ASCII letters, numbers, `-`, or `_` and never
+when the item must be referenced by `focus = "WORKSPACE.TAB.PANE"`, a pane's
+`split.target`, or a workspace's `parent`. Stable IDs also let saved layouts
+match current per-pane settings after recipe edits. IDs use ASCII letters, numbers, `-`, or `_` and never
 affect presentation. Set `title` on a workspace or tab when it needs a fixed
-display name; without one it follows Fut's normal automatic naming. The first
+display name; pane `title` sets its explicit pane name. Without titles, normal
+automatic naming applies. The first
 pane in a tab has no `split`. Every later pane must split an earlier, named pane
-in the same tab with direction `right` or `down`.
+in the same tab with direction `right` or `down`. Optional
+`ratio = { numerator = 2, denominator = 3 }` gives the first branch two thirds
+of the available cells instead of the default one half. Both values are
+positive 16-bit integers and the numerator must be smaller.
 
 Commands are direct argument arrays and are never evaluated by a shell. By
 default, Fut runs a configured command as a child process and starts the user's
@@ -191,8 +196,12 @@ default, Fut runs a configured command as a child process and starts the user's
 Set `exec = true` on a pane to make its configured command the pane's top-level
 process instead. Omit `command` to start the configured shell immediately.
 
-Relative `cwd` values are resolved from the workspace checkout root; pane `cwd`
-overrides tab `cwd`, and a tab `cwd` applies to panes that omit one. Environment
+Workspace `cwd` selects its root, relative to the recipe's original source root
+or as an absolute path. It does not change the owning project, including when
+it points at an unrelated repository. Workspace `parent` references another
+workspace's ID to preserve nesting; cycles are rejected. Relative tab and pane
+`cwd` values are resolved from that workspace root; pane `cwd` overrides tab
+`cwd`, and a tab `cwd` applies to panes that omit one. Environment
 values layer from recipe to tab to pane, with the most specific value winning.
 `FUT_*` variables are reserved for Fut and cannot be set by a recipe.
 
@@ -219,6 +228,15 @@ the pane's top-level process. Recipe topology and working directories are fully
 validated before processes start. Fut starts every declared terminal before
 publishing the initial resources and closes any terminals already started if a
 later spawn fails.
+
+## Saved working setups
+
+Recipes bootstrap a new project. [Saved layouts](layouts.md) instead capture the
+current arrangement of every project on a host and restore fresh approved
+programs after a daemon restart, without rerunning recipe bootstrap commands
+or creation hooks. Use `fut layout export PROJECT --output FILE` to deliberately
+turn a saved layout into a separate reviewable recipe; existing files and
+recipe trust are never silently overwritten.
 
 ## Related
 
