@@ -541,9 +541,12 @@ impl Harness {
         shell: Option<&std::path::Path>,
         public_readiness: bool,
     ) -> Self {
+        // Match the canonical directories reported by terminal processes.
+        let temporary_directory =
+            fs::canonicalize(std::env::temp_dir()).expect("resolve temporary directory");
         let root = tempfile::Builder::new()
             .prefix("fut-e2e-")
-            .tempdir()
+            .tempdir_in(temporary_directory)
             .expect("create isolated e2e directory");
         let runtime = root.path().join("runtime");
         let home = root.path().join("home");
@@ -10698,7 +10701,14 @@ async fn nested_workspace_open_and_parent_removal_preserve_descendants() {
             command: fut::protocol::AcknowledgedCommand::CloseTarget,
         }
     );
-    let promoted = harness.resources().await;
+    // Closing is acknowledged before terminal-exit resource cleanup finishes.
+    let promoted = resources_when(&harness, |snapshot| {
+        snapshot.sessions[0]
+            .workspaces
+            .iter()
+            .all(|workspace| workspace.id != child.workspace_id)
+    })
+    .await;
     let grandchild_workspace = promoted.sessions[0]
         .workspaces
         .iter()
