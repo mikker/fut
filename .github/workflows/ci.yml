@@ -6,7 +6,6 @@ on:
   pull_request:
 
 permissions:
-  actions: read
   contents: read
 
 concurrency:
@@ -23,30 +22,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-      - name: Inspect preceding Linux failure (temporary)
-        if: runner.os == 'Linux'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh api --allow-escape-sequences repos/mikker/fut/actions/jobs/127475128056/logs > "$RUNNER_TEMP/preceding-ci.log" 2>&1 || true
-          python3 - "$RUNNER_TEMP/preceding-ci.log" <<'PY'
-          from pathlib import Path
-          import re
-          import sys
-          path = Path(sys.argv[1])
-          print(f"::error title=[DEBUG-fut-ci] Relay status::Read {path.stat().st_size} bytes")
-          log = path.read_text(errors="replace")
-          log = re.sub(r"https?://\S+", "[redacted URL]", log)
-          log = re.sub(r"\x1b\[[0-9;]*m", "", log)
-          log = re.sub(r"(?m)^\d{4}-\d{2}-\d{2}T\S+ ", "", log)
-          log = "".join(char for char in log if char.isprintable() or char in "\n\t")
-          message = log[-12000:]
-          for index, start in enumerate(range(0, len(message), 2400), 1):
-              part = message[start:start + 2400]
-              part = part.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-              print(f"::error title=[DEBUG-fut-ci] Prior failure {index}::{part}")
-          PY
-          exit 1
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
       - run: rustup component add rustfmt clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
