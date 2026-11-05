@@ -25,4 +25,20 @@ jobs:
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
       - run: rustup component add rustfmt clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: mise run check
+      - run: |
+          set -o pipefail
+          mise run check 2>&1 | tee "$RUNNER_TEMP/fut-check.log"
+      - name: Report temporary CI failure details
+        if: failure()
+        run: |
+          python3 - "$RUNNER_TEMP/fut-check.log" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+          path = Path(sys.argv[1])
+          if path.exists():
+              log = re.sub(r"\x1b\[[0-9;]*m", "", path.read_text(errors="replace"))
+              message = "\n".join(log.splitlines()[-150:])[-20000:]
+              message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print(f"::error title=[DEBUG-fut-ci] Failure details::{message}")
+          PY
