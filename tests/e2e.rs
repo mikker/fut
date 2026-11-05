@@ -541,9 +541,12 @@ impl Harness {
         shell: Option<&std::path::Path>,
         public_readiness: bool,
     ) -> Self {
+        // Match the canonical directories reported by terminal processes.
+        let temporary_directory =
+            fs::canonicalize(std::env::temp_dir()).expect("resolve temporary directory");
         let root = tempfile::Builder::new()
             .prefix("fut-e2e-")
-            .tempdir()
+            .tempdir_in(temporary_directory)
             .expect("create isolated e2e directory");
         let runtime = root.path().join("runtime");
         let home = root.path().join("home");
@@ -10698,7 +10701,14 @@ async fn nested_workspace_open_and_parent_removal_preserve_descendants() {
             command: fut::protocol::AcknowledgedCommand::CloseTarget,
         }
     );
-    let promoted = harness.resources().await;
+    // Closing is acknowledged before terminal-exit resource cleanup finishes.
+    let promoted = resources_when(&harness, |snapshot| {
+        snapshot.sessions[0]
+            .workspaces
+            .iter()
+            .all(|workspace| workspace.id != child.workspace_id)
+    })
+    .await;
     let grandchild_workspace = promoted.sessions[0]
         .workspaces
         .iter()
@@ -14385,14 +14395,6 @@ async fn keyboard_copy_search_uses_client_clipboard_and_surfaces_success_and_fai
     })
     .await;
     assert_eq!(fs::read_to_string(mouse_capture).unwrap(), "COPY_TARGET");
-    // A mouse selection also targets the primary selection so middle-click
-    // paste works in other terminals.
-    let mouse_primary = PathBuf::from(format!("{}.2", capture.display()));
-    wait_for(DEADLINE, || {
-        fs::read_to_string(&mouse_primary).is_ok_and(|text| text == "COPY_TARGET")
-    })
-    .await;
-    assert_eq!(fs::read_to_string(mouse_primary).unwrap(), "COPY_TARGET");
     success.wait_for("copied ").await;
     success.clear_output();
     for _ in 0..10 {
@@ -14416,7 +14418,7 @@ async fn keyboard_copy_search_uses_client_clipboard_and_surfaces_success_and_fai
             "COPY_TARGET λ雪"
         };
         success.send(format!("\x02[/{expected}\r \x1b[Fy").as_bytes());
-        let captured = PathBuf::from(format!("{}.{}", capture.display(), iteration + 2));
+        let captured = PathBuf::from(format!("{}.{}", capture.display(), iteration + 1));
         wait_for(DEADLINE, || {
             fs::read_to_string(&captured).is_ok_and(|text| text == expected)
         })
@@ -14442,7 +14444,7 @@ async fn keyboard_copy_search_uses_client_clipboard_and_surfaces_success_and_fai
     assert!(!input_log.exists(), "failed copy exited copy mode");
     failure.clear_output();
     failure.send(b"y");
-    let retried_capture = PathBuf::from(format!("{}.13", capture.display()));
+    let retried_capture = PathBuf::from(format!("{}.12", capture.display()));
     wait_for(DEADLINE, || {
         fs::read_to_string(&retried_capture).is_ok_and(|text| text == "COPY_TARGET λ雪")
     })

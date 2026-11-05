@@ -8,7 +8,6 @@
   "properties": {
     "terminal": { "$ref": "#/definitions/terminal" },
     "alerts": { "$ref": "#/definitions/alerts" },
-    "clipboard": { "$ref": "#/definitions/clipboard" },
     "ui": { "$ref": "#/definitions/ui" },
     "remote": {
       "type": "object",
@@ -249,17 +248,6 @@
           "enum": ["auto", "always", "never"],
           "default": "auto",
           "description": "Forward the status rollup to the containing terminal as OSC 7501. auto waits for the terminal to answer the support query."
-        }
-      }
-    },
-    "clipboard": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "osc52": {
-          "type": "boolean",
-          "default": true,
-          "description": "Send each copy to the containing terminal as OSC 52, in addition to the platform clipboard tool. Terminals that do not implement OSC 52 ignore it; some, such as kitty, ask for confirmation."
         }
       }
     },
