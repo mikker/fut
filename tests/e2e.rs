@@ -14382,6 +14382,18 @@ async fn keyboard_copy_search_uses_client_clipboard_and_surfaces_success_and_fai
     })
     .await;
     assert_eq!(fs::read_to_string(mouse_capture).unwrap(), "COPY_TARGET");
+    let mouse_copies = if cfg!(target_os = "linux") { 2 } else { 1 };
+    #[cfg(target_os = "linux")]
+    {
+        // Linux mouse selections also target the primary selection for
+        // middle-click paste. macOS only writes the regular clipboard.
+        let mouse_primary = PathBuf::from(format!("{}.2", capture.display()));
+        wait_for(DEADLINE, || {
+            fs::read_to_string(&mouse_primary).is_ok_and(|text| text == "COPY_TARGET")
+        })
+        .await;
+        assert_eq!(fs::read_to_string(mouse_primary).unwrap(), "COPY_TARGET");
+    }
     success.wait_for("copied ").await;
     success.clear_output();
     for _ in 0..10 {
@@ -14405,7 +14417,7 @@ async fn keyboard_copy_search_uses_client_clipboard_and_surfaces_success_and_fai
             "COPY_TARGET λ雪"
         };
         success.send(format!("\x02[/{expected}\r \x1b[Fy").as_bytes());
-        let captured = PathBuf::from(format!("{}.{}", capture.display(), iteration + 1));
+        let captured = PathBuf::from(format!("{}.{}", capture.display(), iteration + mouse_copies));
         wait_for(DEADLINE, || {
             fs::read_to_string(&captured).is_ok_and(|text| text == expected)
         })
@@ -14431,7 +14443,7 @@ async fn keyboard_copy_search_uses_client_clipboard_and_surfaces_success_and_fai
     assert!(!input_log.exists(), "failed copy exited copy mode");
     failure.clear_output();
     failure.send(b"y");
-    let retried_capture = PathBuf::from(format!("{}.12", capture.display()));
+    let retried_capture = PathBuf::from(format!("{}.{}", capture.display(), mouse_copies + 11));
     wait_for(DEADLINE, || {
         fs::read_to_string(&retried_capture).is_ok_and(|text| text == "COPY_TARGET λ雪")
     })
