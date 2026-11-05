@@ -2,6 +2,8 @@ use super::*;
 use crate::layout::{LayoutAction, LayoutReply, Store};
 use anyhow::ensure;
 
+mod review;
+
 #[derive(Subcommand)]
 pub(super) enum LayoutCommand {
     /// Save every currently open project on this daemon host.
@@ -22,7 +24,7 @@ pub(super) enum LayoutCommand {
     Enable,
     /// Disable automatic checkpoints and restoration, keeping saved layouts.
     Disable,
-    /// Show exact executable, arguments, directory, and approval fingerprint.
+    /// Review and approve saved restart commands in an interactive checklist.
     Review,
     /// Approve only the reviewed, unchanged command fingerprints on this host.
     Approve {
@@ -264,6 +266,18 @@ fn offline(store: &Store, command: &LayoutCommand) -> Result<ServerMessage> {
             projects: store.read()?.summaries(),
         });
     }
+    if matches!(command, LayoutCommand::Review) {
+        let saved = store.read()?;
+        return Ok(ServerMessage::LayoutSaved {
+            reply: LayoutReply {
+                enabled: saved.enabled,
+                path: store.path.clone(),
+                projects: saved.summaries(),
+                commands: saved.review(),
+                export: None,
+            },
+        });
+    }
     store.update(|saved| {
         match command {
             LayoutCommand::Enable => saved.enabled = true,
@@ -276,11 +290,7 @@ fn offline(store: &Store, command: &LayoutCommand) -> Result<ServerMessage> {
                 enabled: saved.enabled,
                 path: store.path.clone(),
                 projects: saved.summaries(),
-                commands: if matches!(command, LayoutCommand::Review) {
-                    saved.review()
-                } else {
-                    Vec::new()
-                },
+                commands: Vec::new(),
                 export: match command {
                     LayoutCommand::Export { project, .. } => Some(crate::layout::export_recipe(
                         &saved.select(Some(project))?[0],
@@ -293,6 +303,10 @@ fn offline(store: &Store, command: &LayoutCommand) -> Result<ServerMessage> {
 }
 
 fn render_reply(cli: &Cli, command: &LayoutCommand, reply: LayoutReply) -> Result<()> {
+    if matches!(command, LayoutCommand::Review) && !cli.json {
+        let socket = socket_path(cli.socket.as_deref())?;
+        return review::run(&Store::for_socket(&socket)?, &reply);
+    }
     if let Some(export) = &reply.export {
         let LayoutCommand::Export {
             output: destination,
@@ -331,26 +345,7 @@ fn render_reply(cli: &Cli, command: &LayoutCommand, reply: LayoutReply) -> Resul
         LayoutCommand::Disable => {
             "automatic checkpoints and startup restoration disabled; saved layouts kept".into()
         }
-        LayoutCommand::Review => reply
-            .commands
-            .iter()
-            .map(|review| {
-                format!(
-                    "{}  {}  {}\n  cwd: {}\n  executable: {}\n  argv: {}",
-                    if review.approved {
-                        "approved"
-                    } else {
-                        "PENDING"
-                    },
-                    review.fingerprint,
-                    review.project,
-                    review.cwd.display(),
-                    review.command.program.display(),
-                    serde_json::to_string(&review.command.args).unwrap()
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
+        LayoutCommand::Review => review::text(&reply.commands),
         LayoutCommand::Approve { .. } => {
             "reviewed command fingerprints approved on this host".into()
         }

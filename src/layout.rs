@@ -291,6 +291,22 @@ impl Checkpoint {
         Ok(())
     }
 
+    pub(crate) fn confirm_review(
+        &mut self,
+        reviewed: &[CommandReview],
+        selected: &BTreeSet<String>,
+    ) -> Result<()> {
+        ensure!(
+            self.review() == reviewed,
+            "saved commands or approvals changed; run `fut layout review` again"
+        );
+        let available: BTreeSet<_> = reviewed.iter().map(|c| c.fingerprint.clone()).collect();
+        ensure!(selected.is_subset(&available), "invalid review selection");
+        self.approved.retain(|s| !available.contains(s));
+        self.approved.extend(selected.iter().cloned());
+        Ok(())
+    }
+
     pub(crate) fn select(&self, project: Option<&str>) -> Result<Vec<SavedProject>> {
         match project {
             None => Ok(self.projects.clone()),
@@ -633,6 +649,94 @@ mod tests {
             .args
             .push("changed".into());
         assert!(!saved.review()[0].approved);
+    }
+
+    #[test]
+    fn confirmed_review_persists_multiple_approvals_and_revocations() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store {
+            path: temporary.path().join("layout.json"),
+        };
+        let mut saved = checkpoint();
+        let mut other = saved.projects[0].clone();
+        other.name = "other".into();
+        other.project.identity = ProjectIdentity::CanonicalDirectory("/tmp/other".into());
+        other.workspaces[0].tabs[0].panes[0].cwd = "/tmp/other".into();
+        saved.projects.push(other);
+        store.write(&saved).unwrap();
+        let reviewed = store.read().unwrap().review();
+        let selected = reviewed.iter().map(|c| c.fingerprint.clone()).collect();
+        store
+            .update(|s| s.confirm_review(&reviewed, &selected))
+            .unwrap();
+        assert!(store.read().unwrap().review().iter().all(|c| c.approved));
+        let reviewed = store.read().unwrap().review();
+        let selected = BTreeSet::from([reviewed[1].fingerprint.clone()]);
+        store
+            .update(|s| s.confirm_review(&reviewed, &selected))
+            .unwrap();
+        let reopened = store.read().unwrap().review();
+        assert!(!reopened[0].approved);
+        assert!(reopened[1].approved);
+    }
+
+    #[test]
+    fn review_confirmation_rejects_changed_removed_added_or_concurrently_approved_commands() {
+        for change in 0..6 {
+            let temporary = tempfile::tempdir().unwrap();
+            let store = Store {
+                path: temporary.path().join("layout.json"),
+            };
+            let mut saved = checkpoint();
+            let reviewed = saved.review();
+            let selected = BTreeSet::from([reviewed[0].fingerprint.clone()]);
+            match change {
+                0 => saved.projects[0].workspaces[0].tabs[0].panes[0].cwd = "/tmp/changed".into(),
+                1 => {
+                    saved.projects[0].workspaces[0].tabs[0].panes[0]
+                        .command
+                        .as_mut()
+                        .unwrap()
+                        .program = "/bin/other".into()
+                }
+                2 => saved.projects[0].workspaces[0].tabs[0].panes[0]
+                    .command
+                    .as_mut()
+                    .unwrap()
+                    .args
+                    .push("changed".into()),
+                3 => saved.projects.clear(),
+                4 => {
+                    let mut other = saved.projects[0].clone();
+                    other.name = "other".into();
+                    other.project.identity =
+                        ProjectIdentity::CanonicalDirectory("/tmp/other".into());
+                    saved.projects.push(other);
+                }
+                _ => saved.approve(&[reviewed[0].fingerprint.clone()]).unwrap(),
+            }
+            store.write(&saved).unwrap();
+            let before = std::fs::read(&store.path).unwrap();
+            assert!(
+                store
+                    .update(|s| s.confirm_review(&reviewed, &selected))
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(&store.path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn review_rejects_unreviewed_selection_without_mutating_approvals() {
+        let mut saved = checkpoint();
+        let reviewed = saved.review();
+        let before = saved.clone();
+        assert!(
+            saved
+                .confirm_review(&reviewed, &BTreeSet::from(["unknown".into()]))
+                .is_err()
+        );
+        assert_eq!(saved, before);
     }
 
     #[test]

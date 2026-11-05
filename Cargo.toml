@@ -18,7 +18,7 @@ libc = "0.2"
 libghostty-vt = { path = "vendor/libghostty-vt", default-features = false, features = ["kitty-graphics", "png"] }
 png = "0.18"
 portable-pty = "=0.9.0"
-ratatui = "0.30"
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"

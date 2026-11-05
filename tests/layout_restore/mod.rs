@@ -5,6 +5,9 @@ use fut::{
 };
 use serde_json::json;
 
+#[cfg(target_os = "linux")]
+mod incus;
+
 async fn save(harness: &Harness) -> LayoutReply {
     time::timeout(DEADLINE, async {
         loop {
@@ -62,6 +65,209 @@ pub(super) async fn restart_empty(harness: &mut Harness) {
     harness.daemon = command.spawn().unwrap();
     harness.wait_until_ready().await;
     assert!(harness.resources().await.sessions.is_empty());
+}
+
+fn review_client(harness: &Harness, json: bool) -> PtyChild {
+    let template = harness.cli();
+    let mut command = Command::new("/usr/bin/script");
+    command.env_clear().envs(
+        template
+            .get_envs()
+            .filter_map(|(key, value)| value.map(|value| (key, value))),
+    );
+    command.args(script_command_args()).arg(format!(
+        "stty rows 24 cols 100; exec '{}' --socket '{}' {} layout review",
+        env!("CARGO_BIN_EXE_fut"),
+        harness.socket.display(),
+        if json { "--json" } else { "" },
+    ));
+    PtyChild::spawn(command)
+}
+
+#[tokio::test]
+async fn layout_review_checklist_confirms_multiple_commands_and_reopens_persisted_status() {
+    let harness = Harness::start_with("exec /bin/sleep 600", recipe_setup).await;
+    wait_for_cwds(&harness).await;
+    save(&harness).await;
+    let review = action(&harness, LayoutAction::Review).await;
+    assert_eq!(review.commands.len(), 3);
+    action(
+        &harness,
+        LayoutAction::Approve {
+            fingerprints: vec![review.commands[0].fingerprint.clone()],
+        },
+    )
+    .await;
+    let before = fs::read(&review.path).unwrap();
+    let mut client = review_client(&harness, false);
+    client.wait_for_screen("[x] approved | keep approval").await;
+    client
+        .wait_for_screen("[ ] pending | restore as shell")
+        .await;
+    client.wait_for_screen("executable: \"/bin/sleep\"").await;
+    client.send(b" \x1b[B \x1b[B ");
+    client.wait_for_screen("revoke on confirm").await;
+    client.wait_for_screen("approve on confirm").await;
+    assert_eq!(fs::read(&review.path).unwrap(), before);
+    client.send(b"\r");
+    client.wait_for_screen("Confirm approval changes?").await;
+    assert_eq!(fs::read(&review.path).unwrap(), before);
+    client.send(b"y");
+    client.wait_success().await;
+    let updated = action(&harness, LayoutAction::Review).await;
+    assert!(!updated.commands[0].approved);
+    assert!(updated.commands[1..].iter().all(|c| c.approved));
+    let mut reopened = review_client(&harness, false);
+    reopened
+        .wait_for_screen("[ ] pending | restore as shell")
+        .await;
+    reopened
+        .wait_for_screen("[x] approved | keep approval")
+        .await;
+    reopened.send(b"\x03");
+    reopened.wait_success().await;
+    assert_eq!(
+        action(&harness, LayoutAction::Review).await.commands,
+        updated.commands
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn layout_review_cancellation_and_stale_confirmation_leave_approvals_unchanged() {
+    let mut harness = Harness::start_with("exec /bin/sleep 600", recipe_setup).await;
+    wait_for_cwds(&harness).await;
+    save(&harness).await;
+    approve(&harness).await;
+    let review = action(&harness, LayoutAction::Review).await;
+    stop(&mut harness).await;
+    for confirmation in [false, true] {
+        let before = fs::read(&review.path).unwrap();
+        let mut client = review_client(&harness, false);
+        client.wait_for_screen("[x] approved").await;
+        client.send(b" ");
+        client.wait_for_screen("revoke on confirm").await;
+        if confirmation {
+            client.send(b"\r");
+            client.wait_for_screen("Confirm approval changes?").await;
+        }
+        client.send(b"\x1b");
+        client.wait_success().await;
+        assert_eq!(fs::read(&review.path).unwrap(), before);
+    }
+    let mut client = review_client(&harness, false);
+    client.wait_for_screen("[x] approved").await;
+    client.send(b" ");
+    let mut changed: Value = serde_json::from_slice(&fs::read(&review.path).unwrap()).unwrap();
+    changed["projects"][0]["workspaces"][0]["tabs"][0]["panes"][0]["command"]["args"] =
+        json!(["999"]);
+    fs::write(&review.path, serde_json::to_vec_pretty(&changed).unwrap()).unwrap();
+    let before = fs::read(&review.path).unwrap();
+    client.send(b"\r");
+    client.wait_for_screen("Confirm approval changes?").await;
+    client.send(b"y");
+    client.wait_success().await;
+    assert!(
+        client
+            .text()
+            .contains("saved commands or approvals changed"),
+        "{}",
+        client.text()
+    );
+    assert_eq!(fs::read(&review.path).unwrap(), before);
+    let mut reopened = review_client(&harness, false);
+    reopened
+        .wait_for_screen("[ ] pending | restore as shell")
+        .await;
+    reopened.wait_for_screen("argv: [\"999\"]").await;
+    reopened.send(b"\x1b");
+    reopened.wait_success().await;
+    assert_eq!(fs::read(&review.path).unwrap(), before);
+}
+
+#[tokio::test]
+async fn layout_review_noninteractive_and_json_never_change_approvals_or_open_a_menu() {
+    let mut harness = Harness::start_with("exec /bin/sleep 600", recipe_setup).await;
+    wait_for_cwds(&harness).await;
+    save(&harness).await;
+    let review = action(&harness, LayoutAction::Review).await;
+    action(
+        &harness,
+        LayoutAction::Approve {
+            fingerprints: vec![review.commands[0].fingerprint.clone()],
+        },
+    )
+    .await;
+    for offline in [false, true] {
+        if offline {
+            stop(&mut harness).await;
+        }
+        let before = fs::read(&review.path).unwrap();
+        let plain = harness.cli().args(["layout", "review"]).output().unwrap();
+        assert!(
+            plain.status.success(),
+            "{}",
+            String::from_utf8_lossy(&plain.stderr)
+        );
+        let text = String::from_utf8(plain.stdout).unwrap();
+        assert!(text.contains("approved"));
+        assert!(text.contains("pending"));
+        assert!(text.contains("executable:"));
+        assert!(!text.contains('\x1b'));
+        let json = harness
+            .cli()
+            .args(["--json", "layout", "review"])
+            .output()
+            .unwrap();
+        assert!(json.status.success());
+        let value: Value = serde_json::from_slice(&json.stdout).unwrap();
+        assert_eq!(value["result"]["commands"].as_array().unwrap().len(), 3);
+        assert_eq!(value["result"]["commands"][0]["approved"], true);
+        assert_eq!(value["result"]["commands"][1]["approved"], false);
+        let mut tty_json = review_client(&harness, true);
+        tty_json.wait_success().await;
+        assert!(tty_json.text().contains("\"commands\""));
+        assert!(!tty_json.text().contains("?1049h"));
+        assert_eq!(fs::read(&review.path).unwrap(), before);
+    }
+}
+
+#[tokio::test]
+async fn layout_review_empty_explains_shell_fallback_and_available_capture_warnings() {
+    let mut harness = Harness::start_with("cd sub; /bin/sleep 600 | /bin/sleep 601", |root| {
+        fs::create_dir(root.join("cwd/sub")).unwrap();
+    })
+    .await;
+    wait_for_cwds(&harness).await;
+    let saved = save(&harness).await;
+    assert!(
+        action(&harness, LayoutAction::Review)
+            .await
+            .commands
+            .is_empty()
+    );
+    stop(&mut harness).await;
+    let before = fs::read(&saved.path).unwrap();
+    let plain = harness.cli().args(["layout", "review"]).output().unwrap();
+    assert!(plain.status.success());
+    let text = String::from_utf8(plain.stdout).unwrap();
+    assert!(text.contains("No restart commands were captured"));
+    assert!(text.contains("restore as shells"));
+    assert!(text.contains("Capture warning"));
+    assert!(text.contains("could not be identified reliably"));
+    let mut client = review_client(&harness, false);
+    client.wait_success().await;
+    assert!(client.text().contains("No restart commands were captured"));
+    assert!(!client.text().contains("?1049h"));
+    let json = harness
+        .cli()
+        .args(["--json", "layout", "review"])
+        .output()
+        .unwrap();
+    assert!(json.status.success());
+    let value: Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(value["result"]["commands"], json!([]));
+    assert_eq!(fs::read(&saved.path).unwrap(), before);
 }
 
 fn recipe_setup(root: &std::path::Path) {

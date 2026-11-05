@@ -21,8 +21,7 @@ resume identifiers and initial prompts are removed rather than replayed.
 ```sh
 fut layout save
 fut layout list
-fut layout review
-fut layout approve FINGERPRINT   # Copy a reviewed fingerprint from review
+fut layout review              # Select commands and confirm their approvals
 fut layout restore PROJECT
 # Or restore every saved project:
 fut layout restore --all
@@ -34,10 +33,28 @@ Restore accepts an unambiguous saved project name. A specific-project restore
 attaches to its remembered pane; `--all` opens the navigator. Add `--background`
 to restore without attaching. `--json` also avoids attachment.
 
-Review prints exact executable paths, argument arrays, directories, and approval
-fingerprints. Approval covers all three: changing a program, argument, or cwd
-requires another approval. `fut layout approve all` approves every currently
-listed command; use it only after reviewing the entire list.
+Review opens a checklist when stdin and stdout are terminals. Every captured
+command shows its saved **approved** or **pending** status. Previously approved
+commands start checked; new or changed commands start unchecked. Use arrow keys
+(or `j`/`k`) to navigate, Space to toggle, and PgUp/PgDn to scroll the selected
+command's exact executable, argument array, directory, and fingerprint.
+
+Press Enter to review the changes, then `y` to save together or `n` to return to
+the checklist. Unchecking an approved command revokes its approval on confirmation:
+it will restore as a shell. Esc or Ctrl-C cancels without changing saved approvals.
+Running programs are unaffected. If saved commands or approvals change during
+review, confirmation fails without applying any changes; review again.
+
+Approval covers the exact executable, arguments, and cwd: changing any of them
+requires another approval. Identical commands in the same directory share an
+approval, so their checkboxes toggle together. Reopening Review shows persisted
+approvals. If no commands were captured, Review explains the shell fallback and
+shows available capture warnings.
+
+`fut --json layout review` and redirected input or output never open a menu or
+change approvals. JSON retains the command list, fingerprints, and saved approval
+status; plain text lists the exact commands. Scripts can still use
+`fut layout approve FINGERPRINT...` to approve specific reviewed fingerprints.
 
 Unapproved or unidentifiable programs become shells. Fut never treats `ps`
 display text, arbitrary shell scripts, or pipelines as restart commands. Programs
@@ -54,6 +71,24 @@ and saving replaces that pane's previous intent.
 **Save all project layouts** and **Restore saved project layouts** are also
 available in the command palette. They operate on the attached host. Neither has a default keybinding;
 use `save_layout` and `restore_layouts` under `[ui.bindings]` to add bindings.
+
+## Incus and sandboxsh
+
+Container panes save the **host-side launcher**, not the guest process tree.
+Launch Pi explicitly so it is part of the captured command:
+
+```sh
+sandboxsh exec -- pi
+```
+
+Direct `incus exec ... -- pi` commands also work. Save and approve the captured
+command on the Fut host. Restore restarts Pi inside the same running sandbox;
+it does not create or start the container/VM. Launcher arguments are replayed
+unchanged, so omit agent resume flags and initial prompts for a fresh session.
+
+If you enter with `sandboxsh shell` and then type `pi`, only the sandbox shell
+is remembered. Restore reopens that shell, but does not replay its history or
+start Pi automatically.
 
 ## Optional automatic recovery
 
@@ -144,8 +179,7 @@ settings:
 
 ```sh
 /path/to/new/fut layout save
-/path/to/new/fut layout review
-/path/to/new/fut layout approve FINGERPRINT
+/path/to/new/fut layout review       # Select commands and confirm approvals
 /path/to/new/fut layout enable       # Optional automatic recovery
 ```
 

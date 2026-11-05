@@ -27,8 +27,7 @@ arrangement with fresh programs, use [saved layouts](layouts.md):
 
 ```sh
 fut layout save
-fut layout review
-fut layout approve FINGERPRINT
+fut layout review                # Select restart commands and confirm approvals
 fut layout enable                 # Optional automatic checkpoints and recovery
 fut layout restore --all          # Explicit restoration, without duplicating live projects
 ```
