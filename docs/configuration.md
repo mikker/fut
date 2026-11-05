@@ -79,6 +79,21 @@ terminal answers the support query; `always` skips the query, for passthrough
 setups that cannot answer; `never` turns forwarding off. See
 [forwarding status to the outer terminal](agents.md#forward-status-to-the-outer-terminal).
 
+Clipboard handling is configured at the top level:
+
+```toml
+[clipboard]
+osc52 = true # Optional; default true.
+```
+
+`osc52` sends every copy to the terminal Fut runs in as an OSC 52 clipboard
+write, in addition to the platform clipboard tool (`pbcopy`, `wl-copy`,
+`xclip`, `xsel`). The containing terminal sets the desktop clipboard itself,
+which keeps copies working through nested multiplexers and remote attachments
+where tools cannot reach the graphical session. Terminals that do not
+implement OSC 52 ignore the sequence; some, such as kitty, ask for
+confirmation before writing. Set `false` to rely on clipboard tools alone.
+
 ## Remote image-path uploads
 
 By default, a bracketed paste containing a single absolute path to an existing

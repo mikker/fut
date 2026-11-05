@@ -81,6 +81,7 @@ pub(super) struct CopyModeState {
     clipboard: Option<(Uuid, Uuid)>,
     copied_bytes: Option<usize>,
     mouse_position: Option<(u16, u16)>,
+    mouse_selection: bool,
 }
 
 impl CopyModeState {
@@ -100,6 +101,7 @@ impl CopyModeState {
             clipboard: None,
             copied_bytes: None,
             mouse_position: None,
+            mouse_selection: false,
         }
     }
 
@@ -114,11 +116,18 @@ impl CopyModeState {
             row: position.1,
         });
         state.mouse_position = Some(position);
+        state.mouse_selection = true;
         state
     }
 
     pub fn terminal_id(&self) -> TerminalId {
         self.terminal_id
+    }
+
+    /// Whether the selection came from a mouse drag, so the copy also targets
+    /// the primary selection used by middle-click paste.
+    pub fn is_mouse_selection(&self) -> bool {
+        self.mouse_selection
     }
 
     pub fn is_mouse_dragging(&self) -> bool {

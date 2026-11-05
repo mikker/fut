@@ -43,8 +43,8 @@ pub(super) struct CommandSurface {
 }
 
 enum CommandRuntime {
-    Local(TemporaryCommandSurface),
-    Remote(RemoteCommandSurface),
+    Local(Box<TemporaryCommandSurface>),
+    Remote(Box<RemoteCommandSurface>),
 }
 
 impl CommandSurface {
@@ -68,7 +68,7 @@ impl CommandSurface {
         )
         .await?;
         Ok(Self {
-            runtime: CommandRuntime::Local(surface),
+            runtime: CommandRuntime::Local(Box::new(surface)),
         })
     }
 
@@ -90,12 +90,12 @@ impl CommandSurface {
             .await
             .context("remote command start timed out")??;
         Ok(Self {
-            runtime: CommandRuntime::Remote(RemoteCommandSurface {
+            runtime: CommandRuntime::Remote(Box::new(RemoteCommandSurface {
                 title: command.title.clone(),
                 size: popup_size,
                 session,
                 _bridge: bridge,
-            }),
+            })),
         })
     }
 
