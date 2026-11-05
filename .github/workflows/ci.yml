@@ -38,7 +38,7 @@ jobs:
           path = Path(sys.argv[1])
           if path.exists():
               log = re.sub(r"\x1b\[[0-9;]*m", "", path.read_text(errors="replace"))
-              message = "\n".join(log.splitlines()[-150:])[-20000:]
+              message = "\n".join(log.splitlines()[-150:])[-3000:]
               message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
               print(f"::error title=[DEBUG-fut-ci] Failure details::{message}")
           PY
