@@ -1511,8 +1511,6 @@ pub(crate) struct UiConfig {
     #[serde(skip)]
     pub(super) alerts: AlertsConfig,
     #[serde(skip)]
-    pub(super) clipboard: ClipboardConfig,
-    #[serde(skip)]
     pub(super) terminal: crate::terminal::TerminalConfig,
     #[serde(skip)]
     remote: RemoteConfig,
@@ -1536,7 +1534,6 @@ impl Default for UiConfig {
             tab_bar: TabBarConfig::default(),
             sidebar: SidebarConfig::default(),
             alerts: AlertsConfig::default(),
-            clipboard: ClipboardConfig::default(),
             terminal: crate::terminal::TerminalConfig::default(),
             remote: RemoteConfig::default(),
             extensions: Vec::new(),
@@ -1550,18 +1547,6 @@ impl Default for UiConfig {
 pub(crate) struct AlertsConfig {
     pub(super) signal_outer_terminal: bool,
     pub(super) outer_terminal_status: OuterTerminalStatus,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub(crate) struct ClipboardConfig {
-    pub(super) osc52: bool,
-}
-
-impl Default for ClipboardConfig {
-    fn default() -> Self {
-        Self { osc52: true }
-    }
 }
 
 /// Whether the client forwards its program-status rollup to the terminal it
@@ -1622,7 +1607,6 @@ struct Config {
     ui: UiConfig,
     remote: RemoteConfig,
     alerts: AlertsConfig,
-    clipboard: ClipboardConfig,
     trusted_commands: BTreeMap<String, PaletteCommand>,
     extension_commands: BTreeMap<String, ExtensionCommandConfig>,
     extensions: Vec<PathBuf>,
@@ -1811,11 +1795,6 @@ pub(crate) struct StagedUiConfig {
 impl StagedUiConfig {
     pub(crate) fn remote_autostart(&self) -> bool {
         self.config.remote.autostart
-    }
-
-    #[cfg(test)]
-    pub(crate) fn clipboard_osc52(&self) -> bool {
-        self.config.clipboard.osc52
     }
 
     /// Missing remote catalog support disables extension declarations and their
@@ -2225,7 +2204,6 @@ fn materialize_config_for_locality(
     locality: Locality,
 ) -> Result<UiConfig> {
     config.ui.alerts = config.alerts;
-    config.ui.clipboard = config.clipboard;
     let home = env::var_os("HOME").map(PathBuf::from);
     validate_terminal(&mut config.terminal, home.as_deref())?;
     config.ui.terminal = config.terminal;
@@ -3180,31 +3158,6 @@ mod tests {
         }
         fs::write(&path, "[remote]\nupload_image_paths = 'false'\n").unwrap();
         assert!(stage_location(&location).is_err());
-    }
-
-    #[test]
-    fn clipboard_osc52_defaults_on_and_can_be_disabled_locally() {
-        let temporary = tempfile::tempdir().unwrap();
-        let path = temporary.path().join("config.toml");
-        let location = ConfigLocation {
-            path: Some(path.clone()),
-            explicit: false,
-            source: "test",
-        };
-        assert!(stage_location(&location).unwrap().clipboard_osc52());
-        fs::write(&path, "[clipboard]\nosc52 = false\n").unwrap();
-        assert!(!stage_location(&location).unwrap().clipboard_osc52());
-        fs::write(&path, "[clipboard]\nosc52 = true\n").unwrap();
-        assert!(stage_location(&location).unwrap().clipboard_osc52());
-        fs::write(&path, "[clipboard]\nosc52 = 'false'\n").unwrap();
-        assert!(stage_location(&location).is_err());
-        fs::write(&path, "[clipboard]\nunknown = false\n").unwrap();
-        assert!(stage_location(&location).is_err());
-        assert!(
-            stage_location(&ConfigLocation::disabled())
-                .unwrap()
-                .clipboard_osc52()
-        );
     }
 
     #[test]

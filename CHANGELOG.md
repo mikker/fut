@@ -3,8 +3,6 @@
 ## Unreleased
 
 - Save and restore complete local or remote project layouts with fresh approved programs, including optional automatic recovery after daemon restarts.
-- Also write mouse selections to the Linux primary selection, so middle-click paste works in other terminals.
-- Send every copy to the containing terminal as an OSC 52 clipboard write, keeping the desktop clipboard working where clipboard tools write to a session other terminals do not read; disable with `clipboard.osc52 = false`.
 
 ## 0.41
 

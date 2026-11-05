@@ -362,11 +362,7 @@ Clipboard writes use `pbcopy` on macOS. On Linux, Fut automatically uses
 `wl-clipboard`, `xclip`, or `xsel` if your desktop does not provide one. In an
 SSH or headless session without access to a graphical clipboard, Fut reports
 that the clipboard is unavailable. A failed copy keeps the selection active
-for another attempt. On Linux, mouse selections also update the primary
-selection, so middle-click paste works in other terminals. Every copy is also
-sent to the terminal Fut runs in as an OSC 52 clipboard write, so the
-desktop clipboard updates even when the tools write to a session the other
-terminals do not read; disable it with `clipboard.osc52 = false`.
+for another attempt.
 
 ### Paste a clipboard image
 
