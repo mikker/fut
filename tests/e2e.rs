@@ -14417,7 +14417,11 @@ async fn keyboard_copy_search_uses_client_clipboard_and_surfaces_success_and_fai
             "COPY_TARGET λ雪"
         };
         success.send(format!("\x02[/{expected}\r \x1b[Fy").as_bytes());
-        let captured = PathBuf::from(format!("{}.{}", capture.display(), iteration + mouse_copies));
+        let captured = PathBuf::from(format!(
+            "{}.{}",
+            capture.display(),
+            iteration + mouse_copies
+        ));
         wait_for(DEADLINE, || {
             fs::read_to_string(&captured).is_ok_and(|text| text == expected)
         })
