@@ -403,11 +403,13 @@ async fn local_handshakes_accept_different_package_versions() {
             .await
             .unwrap();
             assert_eq!(catalog.generation, 7);
+            let capabilities = capabilities.expect("negotiated local capabilities");
             assert!(
-                !capabilities.unwrap().workspace_order(),
+                !capabilities.workspace_order(),
                 "old daemons must not enable workspace moves"
             );
-            assert!(!capabilities.unwrap().pane_titles());
+            assert!(!capabilities.pane_titles());
+            assert!(!capabilities.layout_restoration());
             drop(connection);
         } else {
             let (connection, catalog, version) =

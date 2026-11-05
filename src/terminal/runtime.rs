@@ -2225,8 +2225,14 @@ mod tests {
         // over, so seeing it proves the trailing-edge flush (dirty +
         // shrunk select timeout) still publishes after bursts stop instead
         // of leaving the last few throttled bytes unpublished forever.
-        let handle = spawn_terminal(shell("seq 1 2000; printf DONE", HashMap::new())).unwrap();
+        let handle = spawn_terminal(shell(
+            "IFS= read -r _; seq 1 2000; printf DONE",
+            HashMap::new(),
+        ))
+        .unwrap();
         let mut snapshots = handle.subscribe_snapshots();
+        // A fast child must not finish the burst before the observer attaches.
+        handle.input(b"start\n".to_vec()).await.unwrap();
         wait_for_text(&mut snapshots, "DONE").await;
         handle.close().await.unwrap();
     }

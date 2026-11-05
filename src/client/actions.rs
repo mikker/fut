@@ -89,6 +89,8 @@ pub(super) enum ClientAction {
     OpenProject,
     ReloadConfig,
     ReloadProjectConfig,
+    SaveLayout,
+    RestoreLayouts,
     EnterCopyMode,
     PasteImage,
     OpenNavigator,
@@ -138,12 +140,14 @@ pub(super) struct DirectBinding {
     pub action: ClientAction,
 }
 
-pub(super) const ALL_ACTIONS: [ClientAction; 54] = [
+pub(super) const ALL_ACTIONS: [ClientAction; 56] = [
     ClientAction::OpenCommandBar,
     ClientAction::OpenMessages,
     ClientAction::OpenProject,
     ClientAction::ReloadConfig,
     ClientAction::ReloadProjectConfig,
+    ClientAction::SaveLayout,
+    ClientAction::RestoreLayouts,
     ClientAction::EnterCopyMode,
     ClientAction::PasteImage,
     ClientAction::OpenNavigator,
@@ -195,7 +199,7 @@ pub(super) const ALL_ACTIONS: [ClientAction; 54] = [
     ClientAction::Detach,
 ];
 
-pub(super) const COMMANDS: [ActionDefinition; 53] = [
+pub(super) const COMMANDS: [ActionDefinition; 55] = [
     ActionDefinition {
         action: ClientAction::ReloadConfig,
         title: "Reload configuration",
@@ -205,6 +209,16 @@ pub(super) const COMMANDS: [ActionDefinition; 53] = [
         action: ClientAction::ReloadProjectConfig,
         title: "Reload project extension configuration",
         keywords: "reload refresh project config configuration recipe project.toml",
+    },
+    ActionDefinition {
+        action: ClientAction::SaveLayout,
+        title: "Save all project layouts",
+        keywords: "save layout checkpoint all projects workspaces tabs panes",
+    },
+    ActionDefinition {
+        action: ClientAction::RestoreLayouts,
+        title: "Restore saved project layouts",
+        keywords: "restore layout checkpoint all projects workspaces tabs panes",
     },
     ActionDefinition {
         action: ClientAction::OpenProject,
@@ -662,6 +676,8 @@ pub(super) const fn command_name(action: ClientAction) -> &'static str {
         ClientAction::OpenProject => "open-project",
         ClientAction::ReloadConfig => "reload-config",
         ClientAction::ReloadProjectConfig => "reload-project-config",
+        ClientAction::SaveLayout => "save-layout",
+        ClientAction::RestoreLayouts => "restore-layouts",
         ClientAction::EnterCopyMode => "copy-mode",
         ClientAction::PasteImage => "paste-image",
         ClientAction::OpenNavigator => "choose-tree",
@@ -722,6 +738,8 @@ pub(super) fn config_key(action: ClientAction) -> &'static str {
         ClientAction::OpenProject => "open_project",
         ClientAction::ReloadConfig => "reload_config",
         ClientAction::ReloadProjectConfig => "reload_project_config",
+        ClientAction::SaveLayout => "save_layout",
+        ClientAction::RestoreLayouts => "restore_layouts",
         ClientAction::EnterCopyMode => "enter_copy_mode",
         ClientAction::PasteImage => "paste_image",
         ClientAction::OpenNavigator => "open_navigator",
@@ -829,6 +847,8 @@ const fn requires_launcher(action: ClientAction) -> bool {
         | ClientAction::OpenProject
         | ClientAction::ReloadConfig
         | ClientAction::ReloadProjectConfig
+        | ClientAction::SaveLayout
+        | ClientAction::RestoreLayouts
         | ClientAction::EnterCopyMode
         | ClientAction::PasteImage
         | ClientAction::OpenNavigator

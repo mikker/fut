@@ -83,6 +83,7 @@ are common to every negotiated connection.
 
 | Capability | Generation-2 methods and messages | When omitted |
 | --- | --- | --- |
+| `layout-restoration.v1` | Control or interactive `save_layout`, `list_layouts`, `restore_layout` using host-owned checkpoints and approvals; `layout_saved`, `saved_layouts`, `layout_restored` | Saved-layout operations and restored default-focus selection are unavailable |
 | `project-open.v1` | `open_project` with a catalog name; `location_opened` | Named project opening is unavailable |
 | `workspace-order.v1` | `move_workspace { workspace_id, position }`; correlated `workspace_moved { resource_revision }` | Workspace reordering is unavailable; update/restart guidance is shown |
 | `metadata.v2` | `list_resources`, `watch_resources`; resource snapshots/changes, program-status records and client presence | Required for the navigator and attachment |
@@ -124,6 +125,29 @@ receive the new order through normal resource changes, even without this optiona
 capability. No new fields or events are added to the frozen metadata payload.
 No capability in generation 2 permits daemon shutdown, configuration mutation,
 agent reporting, token publication, or private control/automation methods.
+
+### Saved layouts
+
+`restore_layout` accepts an optional saved project name (`null` means all), not
+commands, directories, recipe contents, or approvals. Resource IDs are fresh;
+live project identities are skipped without mutation. Correlated replies report
+restored/already-live projects, warnings, and an optional selected terminal.
+Save returns summaries and a host-local checkpoint path, never an exported
+recipe or command-approval list. Failures use operational `error` with code
+`layout_error`. A selector-free interactive hello may select a remembered
+restored pane only after this capability is selected.
+
+The private local `layout` administrative method remains denied even when
+`layout-restoration.v1` is selected. Enabling/disabling automatic recovery,
+reviewing/approving commands, export, and trust remain host-local operations.
+The older-daemon Save adapter is local-only and is never attempted remotely.
+
+An explicit restore uses a fixed `--restore-only` bridge/startup flag when
+remote autostart is allowed. A newly started daemon creates neither a default
+recipe nor an automatic restore-all before the requested restoration. Existing
+daemons are never replaced. `--attach-only` and disabled remote autostart
+prevent startup. Reconnects, health probes, and background supervision never
+issue or replay a restore request.
 
 ### Configured commands
 

@@ -25,6 +25,8 @@ use tokio_util::codec::Framed;
 use uuid::Uuid;
 
 mod completion;
+mod layout;
+use layout::LayoutCommand;
 
 // Bundled at build time so the printed skill always matches this binary's release.
 const AGENT_SKILL: &str = include_str!("../skills/fut/SKILL.md");
@@ -73,10 +75,16 @@ use crate::{
 pub struct Cli {
     /// Attach to a saved machine or an SSH host.
     ///
-    /// Supports bare attachment, `attach`, or `project NAME`. Starts a missing remote daemon,
+    /// Supports attachment, `project NAME`, and `layout save|list|restore`. Starts a missing remote daemon,
     /// but never stops or replaces one.
     /// Projects use the remote catalog. UI configuration is local.
-    #[arg(long = "machine", visible_alias = "remote", global = true, value_name = "NAME", conflicts_with_all = ["socket", "json"])]
+    #[arg(
+        long = "machine",
+        visible_alias = "remote",
+        global = true,
+        value_name = "NAME",
+        conflicts_with = "socket"
+    )]
     remote_machine: Option<String>,
     /// Attach to an existing remote daemon without starting one.
     #[arg(long, global = true, requires = "remote_machine")]
@@ -133,6 +141,11 @@ where
 
 #[derive(Subcommand)]
 enum Command {
+    /// Save or restore this daemon host's complete working setup.
+    Layout {
+        #[command(subcommand)]
+        command: LayoutCommand,
+    },
     /// Upgrade this installation to the latest stable GitHub release.
     Upgrade {
         /// Show the latest version without changing this installation.
@@ -145,6 +158,8 @@ enum Command {
     /// Forward the selected daemon socket over stdio for an SSH attachment.
     #[command(name = "__stdio-bridge", hide = true)]
     StdioBridge {
+        #[arg(long, hide = true, requires = "start_if_missing")]
+        restore_only: bool,
         /// Only standalone remote attachment may bootstrap a missing daemon.
         #[arg(long, hide = true)]
         start_if_missing: bool,
@@ -894,6 +909,9 @@ enum DaemonCommand {
         /// Initial child working directory; defaults to the current directory.
         #[arg(long, value_hint = ValueHint::DirPath)]
         cwd: Option<PathBuf>,
+        /// Start without an initial project while an explicit restore is prepared.
+        #[arg(long, hide = true)]
+        restore_only: bool,
         /// Write daemon diagnostics to the bounded runtime log.
         #[arg(long, hide = true)]
         log_file: bool,
@@ -1168,6 +1186,9 @@ async fn run_from(args: impl IntoIterator<Item = OsString>) -> ExitCode {
 
 fn validate_remote_cli(cli: &Cli) -> Result<()> {
     if cli.remote_machine.is_some() {
+        if cli.json && !matches!(cli.command, Some(Command::Layout { .. })) {
+            bail!("--json with --machine is available only for layout commands");
+        }
         match cli.command {
             None
             | Some(Command::Attach {
@@ -1176,6 +1197,9 @@ fn validate_remote_cli(cli: &Cli) -> Result<()> {
             | Some(Command::Project {
                 name: Some(_),
                 command: None,
+            })
+            | Some(Command::Layout {
+                command: LayoutCommand::Save | LayoutCommand::List | LayoutCommand::Restore { .. },
             }) => {}
             Some(Command::Attach {
                 ignore_protocol_mismatch: true,
@@ -1184,7 +1208,9 @@ fn validate_remote_cli(cli: &Cli) -> Result<()> {
                     "--machine does not support --ignore-protocol-mismatch; remote compatibility is negotiated separately"
                 );
             }
-            _ => bail!("--machine supports only bare attachment, `attach`, or `project NAME`"),
+            _ => bail!(
+                "--machine supports attachment, `project NAME`, and `layout save`, `layout list`, or `layout restore`; review and approve restart commands on the host"
+            ),
         }
     }
     Ok(())
@@ -1192,6 +1218,12 @@ fn validate_remote_cli(cli: &Cli) -> Result<()> {
 
 async fn execute(cli: Cli) -> Result<()> {
     let mut cli = cli;
+    if let Some(Command::Layout { command }) = &cli.command {
+        if cli.ui_playground {
+            bail!("--ui-playground cannot be combined with a command");
+        }
+        return layout::execute(&cli, command).await;
+    }
 
     if let Some(machine) = &cli.remote_machine {
         reject_nested_client(&cli)?;
@@ -1241,7 +1273,11 @@ async fn execute(cli: Cli) -> Result<()> {
         return crate::upgrade::run(*check, *yes).await;
     }
 
-    if let Some(Command::StdioBridge { start_if_missing }) = &cli.command {
+    if let Some(Command::StdioBridge {
+        start_if_missing,
+        restore_only,
+    }) = &cli.command
+    {
         let socket = socket_path(cli.socket.as_deref())?;
         let stream = match std::os::unix::net::UnixStream::connect(&socket) {
             Ok(stream) => stream,
@@ -1254,7 +1290,12 @@ async fn execute(cli: Cli) -> Result<()> {
             {
                 let location = cli.config_location()?;
                 let cwd = std::env::current_dir().context("read remote working directory")?;
-                ensure_daemon(&socket, &cwd, &location).await?;
+                if *restore_only {
+                    crate::daemon::autostart::ensure_daemon_for_restore(&socket, &cwd, &location)
+                        .await?;
+                } else {
+                    ensure_daemon(&socket, &cwd, &location).await?;
+                }
                 std::os::unix::net::UnixStream::connect(&socket)
                     .with_context(|| format!("connect bridge to {}", socket.display()))?
             }
@@ -1351,6 +1392,9 @@ async fn execute(cli: Cli) -> Result<()> {
     let socket = socket_path(cli.socket.as_deref())?;
     reject_nested_client(&cli)?;
     match cli.command {
+        Some(Command::Layout { .. }) => {
+            unreachable!("layout commands are handled before attachment")
+        }
         Some(Command::Upgrade { .. }) => {
             unreachable!("upgrade is handled before config loading")
         }
@@ -2365,11 +2409,13 @@ async fn execute(cli: Cli) -> Result<()> {
                 DaemonCommand::Run {
                     cwd,
                     log_file,
+                    restore_only,
                     command,
                 },
         }) => {
             let cwd = cwd.unwrap_or(std::env::current_dir()?);
             let mut config = DaemonConfig::shell(socket, cwd, config_location);
+            config.restore_only = restore_only;
             if let Some(program) = command.first() {
                 config.spawn.program = program.into();
                 config.spawn.argv = command[1..].to_vec();
@@ -3712,7 +3758,15 @@ fn reject_interactive_json(cli: &Cli) -> Result<()> {
 }
 
 fn attaches_client(command: &Option<Command>) -> bool {
-    command.is_none()
+    matches!(
+        command,
+        Some(Command::Layout {
+            command: LayoutCommand::Restore {
+                background: false,
+                ..
+            }
+        })
+    ) || command.is_none()
         || matches!(command, Some(Command::Attach { .. }))
         || matches!(command, Some(Command::Project { name: Some(_), .. }))
         || matches!(
@@ -5223,6 +5277,18 @@ mod tests {
             vec!["fut", "--machine", "clonk"],
             vec!["fut", "--machine", "clonk", "attach"],
             vec!["fut", "--machine", "clonk", "--attach-only"],
+            vec!["fut", "--json", "--machine", "clonk", "layout", "save"],
+            vec!["fut", "--machine", "clonk", "layout", "list"],
+            vec!["fut", "--machine", "clonk", "layout", "restore", "--all"],
+            vec![
+                "fut",
+                "--machine",
+                "clonk",
+                "layout",
+                "restore",
+                "project",
+                "--background",
+            ],
             vec![
                 "fut",
                 "project",
@@ -5245,6 +5311,10 @@ mod tests {
             vec!["daemon", "shutdown", "--force"],
             vec!["list"],
             vec!["doctor"],
+            vec!["layout", "enable"],
+            vec!["layout", "review"],
+            vec!["layout", "approve", "fingerprint"],
+            vec!["layout", "export", "project"],
             vec!["trust", "status"],
             vec!["trust", "/tmp"],
             vec!["untrust", "/tmp"],
@@ -6941,6 +7011,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "layout",
                 "upgrade",
                 "attach",
                 "open",

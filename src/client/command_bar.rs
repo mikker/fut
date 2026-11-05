@@ -489,6 +489,8 @@ mod tests {
                 ClientAction::FocusNextPane,
                 ClientAction::FocusPreviousPane,
                 ClientAction::FocusNextWorkspace,
+                ClientAction::SaveLayout,
+                ClientAction::RestoreLayouts,
             ]
         );
         bar.key(key(KeyCode::Char(' '), KeyModifiers::NONE));
@@ -531,6 +533,29 @@ mod tests {
             bar.key(key(KeyCode::Esc, KeyModifiers::NONE)),
             CommandBarAction::Close
         );
+    }
+
+    #[test]
+    fn saved_layout_actions_are_discoverable_without_default_bindings() {
+        for (query, action) in [
+            ("save layout", ClientAction::SaveLayout),
+            ("restore layout", ClientAction::RestoreLayouts),
+        ] {
+            let mut bar = CommandBarState::open();
+            bar.paste(query);
+            let position = bar
+                .filtered
+                .iter()
+                .position(|candidate| *candidate == action)
+                .unwrap();
+            for _ in 0..position {
+                bar.key(key(KeyCode::Down, KeyModifiers::NONE));
+            }
+            assert_eq!(
+                bar.key(key(KeyCode::Enter, KeyModifiers::NONE)),
+                CommandBarAction::Dispatch(action)
+            );
+        }
     }
 
     #[test]

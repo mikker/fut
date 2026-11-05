@@ -3,6 +3,9 @@
 #[path = "ssh_bridge/mod.rs"]
 mod ssh_bridge_tests;
 
+#[path = "layout_restore/mod.rs"]
+mod layout_restore_tests;
+
 // The byte-transparent stdio bridge test still calls the legacy helper by its
 // original name. Keep that explicit wire contract without migrating its module.
 use legacy_hello as hello;
@@ -538,9 +541,12 @@ impl Harness {
         shell: Option<&std::path::Path>,
         public_readiness: bool,
     ) -> Self {
+        // Match the canonical directories reported by terminal processes.
+        let temporary_directory =
+            fs::canonicalize(std::env::temp_dir()).expect("resolve temporary directory");
         let root = tempfile::Builder::new()
             .prefix("fut-e2e-")
-            .tempdir()
+            .tempdir_in(temporary_directory)
             .expect("create isolated e2e directory");
         let runtime = root.path().join("runtime");
         let home = root.path().join("home");
@@ -10695,7 +10701,14 @@ async fn nested_workspace_open_and_parent_removal_preserve_descendants() {
             command: fut::protocol::AcknowledgedCommand::CloseTarget,
         }
     );
-    let promoted = harness.resources().await;
+    // Closing is acknowledged before terminal-exit resource cleanup finishes.
+    let promoted = resources_when(&harness, |snapshot| {
+        snapshot.sessions[0]
+            .workspaces
+            .iter()
+            .all(|workspace| workspace.id != child.workspace_id)
+    })
+    .await;
     let grandchild_workspace = promoted.sessions[0]
         .workspaces
         .iter()
@@ -15354,7 +15367,12 @@ async fn public_doctor_probes_a_running_daemon_without_mutating_resources() {
     );
     assert_eq!(
         protocol["details"]["capabilities"],
-        serde_json::json!(["local.v1", "workspace-order.v1", "pane-titles.v1"])
+        serde_json::json!([
+            "local.v1",
+            "workspace-order.v1",
+            "pane-titles.v1",
+            "layout-restoration.v1"
+        ])
     );
     let after = harness.resources().await;
     assert_eq!(without_observations(after), without_observations(before));

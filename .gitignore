@@ -1,2 +1,5 @@
 /target/
 /.bundle/
+.pi/remote-pi
+fut-remote-layout.json
+fut-remote-project.toml

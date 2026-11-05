@@ -21,8 +21,21 @@ fut
 Bare `fut` starts the daemon when needed, opens the current directory, and
 attaches a client. The daemon keeps sessions and terminal processes alive after
 you detach. Detached terminals keep consuming and parsing their output, but Fut
-defers screen rendering until a client observes them again. Runtime state is not
-restored after the daemon exits or the machine restarts.
+defers screen rendering until a client observes them again. Running processes
+do not survive a daemon exit or machine restart. To recreate the
+arrangement with fresh programs, use [saved layouts](layouts.md):
+
+```sh
+fut layout save
+fut layout review                # Select restart commands and confirm approvals
+fut layout enable                 # Optional automatic checkpoints and recovery
+fut layout restore --all          # Explicit restoration, without duplicating live projects
+```
+
+Save covers every project on the daemon. The command palette also offers
+**Save all project layouts** and **Restore saved project layouts**. Use
+`fut --machine HOST layout restore --all` from the local interface to restore a
+remote host. Approvals and automatic-recovery settings remain host-local.
 
 `fut daemon shutdown` gracefully closes every session. If an upgrade leaves an
 older, protocol-incompatible daemon running, Fut first asks that daemon's own

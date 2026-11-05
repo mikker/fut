@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Review saved restart commands in a checklist showing existing approvals, then confirm approvals or revocations together.
+- Save and restore complete local or remote project layouts with fresh approved programs, including optional automatic recovery after daemon restarts.
+
 ## 0.41
 
 - Open nested projects under `projects_dir` by name, such as `fut project work/api`.

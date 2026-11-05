@@ -164,6 +164,24 @@ impl SshBridge {
         Self::connect_command(ssh_command(destination, start_if_missing)?, true)
     }
 
+    pub(crate) fn connect_restore(
+        destination: &str,
+        start_if_missing: bool,
+    ) -> Result<(UnixStream, Self)> {
+        if !start_if_missing {
+            return Self::connect(destination, false);
+        }
+        validate_destination(destination)?;
+        let mut command = Command::new("ssh");
+        command.args([
+            "-T",
+            "--",
+            destination,
+            &format!("{} --restore-only", remote_bridge_command(true)),
+        ]);
+        Self::connect_command(command, true)
+    }
+
     /// Background supervision must never prompt through the user's terminal.
     pub(crate) fn connect_background(destination: &str) -> Result<(UnixStream, Self)> {
         Self::connect_command(background_ssh_command(destination)?, false)

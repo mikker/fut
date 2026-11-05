@@ -16,7 +16,7 @@ use crate::{
         CheckoutDestination, InitialPath, Mutation, ResolvedTerminalPath, ResourceTree, TabPath,
         TrustedProjectConfig, WorkspacePath,
     },
-    splits::SplitDirection,
+    splits::{SplitDirection, SplitRatio, SplitTree},
     terminal::{SpawnSpec, TerminalHandle, TerminalLifecycle, spawn_terminal},
 };
 
@@ -27,6 +27,7 @@ use super::{
 
 #[derive(Clone, Debug)]
 pub(super) struct PreparedRecipe {
+    source_root: PathBuf,
     workspaces: Vec<PreparedRecipeWorkspace>,
     trusted_project_config: Option<TrustedProjectConfig>,
 }
@@ -34,6 +35,8 @@ pub(super) struct PreparedRecipe {
 #[derive(Clone, Debug)]
 struct PreparedRecipeWorkspace {
     title: String,
+    root: PathBuf,
+    parent: Option<usize>,
     tabs: Vec<PreparedRecipeTab>,
 }
 
@@ -45,6 +48,8 @@ struct PreparedRecipeTab {
 
 #[derive(Clone, Debug)]
 struct PreparedRecipePane {
+    position: crate::layout::RecipePosition,
+    title: String,
     placement: PreparedPanePlacement,
     focused: bool,
     program: PathBuf,
@@ -59,6 +64,7 @@ enum PreparedPanePlacement {
     Split {
         target: usize,
         direction: SplitDirection,
+        ratio: Option<SplitRatio>,
     },
 }
 
@@ -68,9 +74,11 @@ struct PlannedRecipeTerminal {
     argv: Vec<String>,
     cwd: PathBuf,
     environment: HashMap<String, String>,
+    position: Option<crate::layout::RecipePosition>,
 }
 
 struct RecipeCreationPlan {
+    source_root: PathBuf,
     resources: ResourceTree,
     mutations: Vec<Mutation>,
     terminals: Vec<PlannedRecipeTerminal>,
@@ -433,6 +441,31 @@ async fn recipe_project(
     }))
 }
 
+pub(super) async fn restore_configuration(
+    location: &global_config::ConfigLocation,
+    extensions: &[crate::extensions::Extension],
+    expected: &crate::resources::Project,
+    root: &Path,
+) -> Result<(Option<TrustedProjectConfig>, Option<LoadedRecipe>), DaemonError> {
+    let resolved = ProjectResolver::default().resolve(root).await?;
+    if &resolved.project != expected {
+        return Err(DaemonError::new(
+            "project_mismatch",
+            "saved project root now belongs to a different project",
+        ));
+    }
+    let catalog = load_project_catalog(location)?;
+    let project = recipe_project(&catalog, None, &resolved).await?;
+    let Some(loaded) = load_project_recipe(&project, extensions)? else {
+        return Ok((None, None));
+    };
+    let trusted = (!loaded.recipe.extension().is_empty()).then(|| TrustedProjectConfig {
+        source: loaded.source.clone(),
+        extension: loaded.recipe.extension().clone(),
+    });
+    Ok((trusted, Some(loaded)))
+}
+
 fn load_project_recipe(
     project: &global_config::ProjectConfig,
     extensions: &[crate::extensions::Extension],
@@ -532,10 +565,10 @@ async fn prepare_recipe(
     });
     let mut workspaces = Vec::with_capacity(recipe.workspaces().len());
     for (workspace_index, workspace) in recipe.workspaces().iter().enumerate() {
+        let root = resolve_spawn_cwd(workspace_root, workspace.cwd().map(Path::to_owned)).await?;
         let mut tabs = Vec::with_capacity(workspace.tabs().len());
         for (tab_index, tab) in workspace.tabs().iter().enumerate() {
-            let tab_cwd =
-                resolve_spawn_cwd(workspace_root, tab.cwd().map(Path::to_path_buf)).await?;
+            let tab_cwd = resolve_spawn_cwd(&root, tab.cwd().map(Path::to_path_buf)).await?;
             let mut panes = Vec::with_capacity(tab.panes().len());
             let mut pane_indices = HashMap::with_capacity(tab.panes().len());
             for (pane_index, pane) in tab.panes().iter().enumerate() {
@@ -555,13 +588,14 @@ async fn prepare_recipe(
                             .copied()
                             .expect("validated recipe split targets an earlier pane"),
                         direction: split.direction(),
+                        ratio: split.ratio(),
                     },
                 };
                 if let Some(id) = pane.id() {
                     pane_indices.insert(id, pane_index);
                 }
                 let cwd = match pane.cwd() {
-                    Some(cwd) => resolve_spawn_cwd(workspace_root, Some(cwd.to_owned())).await?,
+                    Some(cwd) => resolve_spawn_cwd(&root, Some(cwd.to_owned())).await?,
                     None => tab_cwd.clone(),
                 };
                 let mut environment = recipe
@@ -591,6 +625,16 @@ async fn prepare_recipe(
                     argv = override_argv.clone();
                 }
                 panes.push(PreparedRecipePane {
+                    position: crate::layout::RecipePosition {
+                        digest: digest.clone(),
+                        indexes: [workspace_index, tab_index, pane_index],
+                        ids: [
+                            workspace.id().map(str::to_owned),
+                            tab.id().map(str::to_owned),
+                            pane.id().map(str::to_owned),
+                        ],
+                    },
+                    title: pane.title().unwrap_or_default().to_owned(),
                     placement,
                     focused,
                     program,
@@ -606,16 +650,25 @@ async fn prepare_recipe(
         }
         workspaces.push(PreparedRecipeWorkspace {
             title: workspace.title().unwrap_or_default().to_owned(),
+            root,
+            parent: workspace.parent().map(|id| {
+                recipe
+                    .workspaces()
+                    .iter()
+                    .position(|w| w.id() == Some(id))
+                    .expect("validated workspace parent")
+            }),
             tabs,
         });
     }
     Ok(PreparedRecipe {
+        source_root: workspace_root.to_owned(),
         workspaces,
         trusted_project_config,
     })
 }
 
-fn returning_shell_command(command: &[String]) -> (PathBuf, Vec<String>) {
+pub(super) fn returning_shell_command(command: &[String]) -> (PathBuf, Vec<String>) {
     let mut argv = vec![
         "-c".into(),
         r#""$@"; exec "${SHELL:-/bin/sh}""#.into(),
@@ -709,7 +762,7 @@ fn plan_recipe_session(
         trusted_project_config: recipe.trusted_project_config.clone(),
         workspace_id,
         workspace_name: first_workspace.title.clone(),
-        root: resolved.workspace_root.clone(),
+        root: first_workspace.root.clone(),
         tab_id: first_path.tab_id,
         tab_name: first_tab.title.clone(),
         pane_id: first_path.pane_id,
@@ -718,6 +771,7 @@ fn plan_recipe_session(
     mutations.push(first_mutation);
 
     let mut terminals = Vec::new();
+    let mut workspace_paths = Vec::new();
     let mut selected = first_path;
     for (workspace_index, workspace) in recipe.workspaces.iter().enumerate() {
         let workspace_path = if workspace_index == 0 {
@@ -736,7 +790,7 @@ fn plan_recipe_session(
                     workspace_id: path.workspace_id,
                     parent_workspace_id: None,
                     workspace_name: workspace.title.clone(),
-                    root: resolved.workspace_root.clone(),
+                    root: workspace.root.clone(),
                     tab_id: path.tab_id,
                     tab_name: workspace.tabs[0].title.clone(),
                     pane_id: path.pane_id,
@@ -745,6 +799,7 @@ fn plan_recipe_session(
             )?);
             path
         };
+        workspace_paths.push(workspace_path.workspace_id);
         for (tab_index, tab) in workspace.tabs.iter().enumerate() {
             let tab_path = if tab_index == 0 {
                 workspace_path
@@ -771,7 +826,11 @@ fn plan_recipe_session(
             for pane in &tab.panes {
                 let path = match pane.placement {
                     PreparedPanePlacement::Initial => tab_path,
-                    PreparedPanePlacement::Split { target, direction } => {
+                    PreparedPanePlacement::Split {
+                        target,
+                        direction,
+                        ratio,
+                    } => {
                         let path = ResolvedTerminalPath {
                             session_id,
                             workspace_id: workspace_path.workspace_id,
@@ -785,9 +844,16 @@ fn plan_recipe_session(
                             path.pane_id,
                             path.terminal_id,
                         )?);
+                        if let Some(ratio) = ratio {
+                            let layout = resources.open_layout_for_tab(path.tab_id)?;
+                            let split = split_for_new_pane(&layout, path.pane_id)
+                                .expect("new split exists");
+                            mutations.push(resources.resize_split(path.tab_id, split, ratio)?);
+                        }
                         path
                     }
                 };
+                mutations.push(resources.rename_pane(path.pane_id, pane.title.clone())?);
                 if pane.focused {
                     selected = path;
                 }
@@ -798,12 +864,20 @@ fn plan_recipe_session(
                     argv: pane.argv.clone(),
                     cwd: pane.cwd.clone(),
                     environment: pane.environment.clone(),
+                    position: Some(pane.position.clone()),
                 });
             }
         }
     }
+    for (index, workspace) in recipe.workspaces.iter().enumerate() {
+        resources.restore_workspace_parent(
+            workspace_paths[index],
+            workspace.parent.map(|p| workspace_paths[p]),
+        )?;
+    }
     resources.validate()?;
     Ok(RecipeCreationPlan {
+        source_root: recipe.source_root.clone(),
         resources,
         mutations,
         terminals,
@@ -811,6 +885,24 @@ fn plan_recipe_session(
         disposition: OpenDisposition::SessionCreated,
         replacing,
     })
+}
+
+fn split_for_new_pane(tree: &SplitTree, pane: PaneId) -> Option<crate::domain::SplitId> {
+    match tree {
+        SplitTree::Leaf { .. } => None,
+        SplitTree::Branch {
+            split_id,
+            first,
+            second,
+            ..
+        } => {
+            if matches!(second.as_ref(), SplitTree::Leaf { pane_id } if *pane_id == pane) {
+                Some(*split_id)
+            } else {
+                split_for_new_pane(first, pane).or_else(|| split_for_new_pane(second, pane))
+            }
+        }
+    }
 }
 
 fn spawn_recipe_terminals(
@@ -900,6 +992,9 @@ fn install_recipe_plan(
         None
     };
 
+    let (project, _) = plan
+        .resources
+        .session_project_context(plan.selected.session_id)?;
     state.resources = plan.resources;
     if let Some((terminal_id, exit_code)) = replacement_exit {
         state.runtimes.remove(&terminal_id);
@@ -923,6 +1018,19 @@ fn install_recipe_plan(
                 lease: AttachmentLease::default(),
             },
         );
+    }
+    if let Some(layout) = &mut state.layout {
+        layout.remember_project(&project);
+        layout
+            .roots
+            .insert(plan.selected.session_id, plan.source_root.clone());
+        for terminal in &plan.terminals {
+            if let Some(position) = &terminal.position {
+                layout
+                    .provenance
+                    .insert(terminal.path.terminal_id, position.clone());
+            }
+        }
     }
     state.accepting = true;
     for mutation in &plan.mutations {
@@ -1008,6 +1116,7 @@ auto_start = true
             PreparedPanePlacement::Split {
                 target: 0,
                 direction: SplitDirection::Down,
+                ratio: None,
             }
         );
         assert!(recipe.workspaces[0].tabs[0].panes[1].focused);
@@ -1129,6 +1238,7 @@ panes = [{ command = ["pi"] }]
             terminal_id: TerminalId::new(),
         };
         let plan = RecipeCreationPlan {
+            source_root: temporary.path().to_owned(),
             resources: ResourceTree::default(),
             mutations: Vec::new(),
             terminals: vec![
@@ -1138,6 +1248,7 @@ panes = [{ command = ["pi"] }]
                     argv: vec!["-c".into(), "while :; do sleep 1; done".into()],
                     cwd: temporary.path().to_owned(),
                     environment: HashMap::new(),
+                    position: None,
                 },
                 PlannedRecipeTerminal {
                     path: ResolvedTerminalPath {
@@ -1149,6 +1260,7 @@ panes = [{ command = ["pi"] }]
                     argv: Vec::new(),
                     cwd: temporary.path().to_owned(),
                     environment: HashMap::new(),
+                    position: None,
                 },
             ],
             selected: path,
