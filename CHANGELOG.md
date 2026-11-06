@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.42
+
 - Find the existing Linux daemon over SSH when `XDG_RUNTIME_DIR` is missing, including Tailscale SSH sessions.
 
 ## 0.41
