@@ -49,20 +49,50 @@ pub fn socket_path(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(directory) = env::var_os("FUT_RUNTIME_DIR") {
         return Ok(runtime_at(&directory, "FUT_RUNTIME_DIR")?.join("fut.sock"));
     }
-    // The XDG Base Directory specification says empty or relative values are
-    // invalid and must be ignored.
-    if let Some(directory) = env::var_os("XDG_RUNTIME_DIR")
-        && !directory.is_empty()
-        && Path::new(&directory).is_absolute()
-    {
-        return Ok(PathBuf::from(directory).join("fut/fut.sock"));
-    }
-    let temporary = env::var_os("TMPDIR")
-        .filter(|path| !path.is_empty() && Path::new(path).is_absolute())
-        .unwrap_or_else(|| "/tmp".into());
     // SAFETY: geteuid has no preconditions and cannot fail.
     let uid = unsafe { libc::geteuid() };
-    Ok(PathBuf::from(temporary).join(format!("fut-{uid}/fut.sock")))
+    #[cfg(target_os = "linux")]
+    let user_runtime = Some(PathBuf::from(format!("/run/user/{uid}")));
+    #[cfg(not(target_os = "linux"))]
+    let user_runtime: Option<PathBuf> = None;
+
+    Ok(default_socket_path(
+        env::var_os("XDG_RUNTIME_DIR").as_deref(),
+        user_runtime.as_deref(),
+        env::var_os("TMPDIR").as_deref(),
+        uid,
+    ))
+}
+
+fn default_socket_path(
+    xdg_runtime: Option<&std::ffi::OsStr>,
+    user_runtime: Option<&Path>,
+    temporary: Option<&std::ffi::OsStr>,
+    uid: u32,
+) -> PathBuf {
+    // The XDG Base Directory specification says empty or relative values are
+    // invalid and must be ignored.
+    if let Some(directory) = xdg_runtime
+        && !directory.is_empty()
+        && Path::new(directory).is_absolute()
+    {
+        return PathBuf::from(directory).join("fut/fut.sock");
+    }
+    // Noninteractive SSH sessions may omit XDG_RUNTIME_DIR even though the
+    // user's login runtime directory exists. Resolve the same socket as a
+    // normal login, but never trust a symlink or another user's directory.
+    if let Some(directory) = user_runtime
+        && let Ok(metadata) = fs::symlink_metadata(directory)
+        && metadata.is_dir()
+        && metadata.uid() == uid
+        && metadata.permissions().mode() & 0o077 == 0
+    {
+        return directory.join("fut/fut.sock");
+    }
+    let temporary = temporary
+        .filter(|path| !path.is_empty() && Path::new(path).is_absolute())
+        .unwrap_or_else(|| std::ffi::OsStr::new("/tmp"));
+    PathBuf::from(temporary).join(format!("fut-{uid}/fut.sock"))
 }
 
 pub fn runtime_dir(socket: &Path) -> Result<&Path> {
@@ -109,6 +139,95 @@ pub fn prepare_runtime_dir(socket: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssh_without_valid_xdg_uses_existing_user_runtime() {
+        let runtime = tempfile::tempdir().unwrap();
+        fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = fs::metadata(runtime.path()).unwrap().uid();
+
+        for xdg in [None, Some("".as_ref()), Some("relative".as_ref())] {
+            assert_eq!(
+                default_socket_path(xdg, Some(runtime.path()), Some("/tmp".as_ref()), uid),
+                runtime.path().join("fut/fut.sock")
+            );
+        }
+        // Discovery must not create runtime state or require a running daemon.
+        assert!(!runtime.path().join("fut").exists());
+    }
+
+    #[test]
+    fn explicit_xdg_location_wins_over_user_runtime() {
+        let runtime = tempfile::tempdir().unwrap();
+        fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = fs::metadata(runtime.path()).unwrap().uid();
+        assert_eq!(
+            default_socket_path(
+                Some("/custom/runtime".as_ref()),
+                Some(runtime.path()),
+                None,
+                uid
+            ),
+            PathBuf::from("/custom/runtime/fut/fut.sock")
+        );
+    }
+
+    #[test]
+    fn absent_user_runtime_preserves_temporary_fallbacks() {
+        let runtime = tempfile::tempdir().unwrap();
+        let missing = runtime.path().join("missing");
+        for user_runtime in [None, Some(missing.as_path())] {
+            assert_eq!(
+                default_socket_path(None, user_runtime, Some("/custom/tmp".as_ref()), 1000),
+                PathBuf::from("/custom/tmp/fut-1000/fut.sock")
+            );
+            for temporary in [None, Some("".as_ref()), Some("relative".as_ref())] {
+                assert_eq!(
+                    default_socket_path(None, user_runtime, temporary, 1000),
+                    PathBuf::from("/tmp/fut-1000/fut.sock")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn discovered_user_runtime_must_be_private_and_owned_by_user() {
+        let runtime = tempfile::tempdir().unwrap();
+        let uid = fs::metadata(runtime.path()).unwrap().uid();
+        let fallback = PathBuf::from(format!("/tmp/fut-{uid}/fut.sock"));
+
+        fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            default_socket_path(None, Some(runtime.path()), None, uid),
+            fallback
+        );
+
+        fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let other_uid = uid.wrapping_add(1);
+        assert_eq!(
+            default_socket_path(None, Some(runtime.path()), None, other_uid),
+            PathBuf::from(format!("/tmp/fut-{other_uid}/fut.sock"))
+        );
+    }
+
+    #[test]
+    fn discovered_user_runtime_rejects_symlinks_and_files() {
+        use std::os::unix::fs::symlink;
+
+        let runtime = tempfile::tempdir().unwrap();
+        fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = fs::metadata(runtime.path()).unwrap().uid();
+        let link = runtime.path().join("link");
+        symlink(runtime.path(), &link).unwrap();
+        let file = runtime.path().join("file");
+        fs::write(&file, "").unwrap();
+        for path in [&link, &file] {
+            assert_eq!(
+                default_socket_path(None, Some(path), None, uid),
+                PathBuf::from(format!("/tmp/fut-{uid}/fut.sock"))
+            );
+        }
+    }
 
     #[test]
     fn explicit_socket_is_unchanged() {

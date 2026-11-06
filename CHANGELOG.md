@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Find the existing Linux daemon over SSH when `XDG_RUNTIME_DIR` is missing, including Tailscale SSH sessions.
+
 ## 0.41
 
 - Open nested projects under `projects_dir` by name, such as `fut project work/api`.

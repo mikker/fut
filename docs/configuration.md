@@ -22,8 +22,11 @@ Fut refuses to start or attach another interactive Fut client from inside one of
 ## Runtime location
 
 Fut keeps its private Unix socket, lock, and daemon log under
-`$XDG_RUNTIME_DIR/fut` when `XDG_RUNTIME_DIR` is an absolute path. Otherwise it
-uses `${TMPDIR:-/tmp}/fut-UID`. Set `FUT_RUNTIME_DIR` to an absolute directory
+`$XDG_RUNTIME_DIR/fut` when `XDG_RUNTIME_DIR` is an absolute path. On Linux,
+when that variable is missing or invalid, Fut uses `/run/user/UID/fut` if
+`/run/user/UID` exists as a private directory owned by the current user, so
+noninteractive SSH sessions find the same daemon as a normal login. Otherwise
+it uses `${TMPDIR:-/tmp}/fut-UID`. Set `FUT_RUNTIME_DIR` to an absolute directory
 to override that location, `FUT_SOCKET` to an absolute socket pathname, or pass
 `--socket` explicitly. Fut rejects empty or relative explicit overrides; empty
 or relative XDG and temporary-directory values are ignored according to their
