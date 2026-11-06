@@ -44,6 +44,23 @@ class ConfigTests(unittest.TestCase):
 
 
 class StateTests(unittest.TestCase):
+    def test_stop_preserves_direct_signals_and_shell_exit_codes(self):
+        for returncode, code, signal in ((-15, None, 15), (143, 143, None), (-9, None, 9)):
+            with self.subTest(returncode=returncode), tempfile.TemporaryDirectory() as directory:
+                runctl.write_state(directory, {"generation": 1, "phase": "running"})
+                with mock.patch.object(runctl, "publish_state_tokens") as publish:
+                    runctl.record_exit(
+                        directory, 1, ["sleep", "300"], directory,
+                        returncode, None, terminated=True,
+                    )
+                state = runctl.read_state(directory)
+                self.assertEqual(state["phase"], "exited")
+                self.assertTrue(state["stop_requested"])
+                self.assertEqual(state["exit"]["code"], code)
+                self.assertEqual(state["exit"]["signal"], signal)
+                self.assertIsNone(state["exit"]["error"])
+                publish.assert_called_once_with("cross", state)
+
     def test_new_action_fields_round_trip_and_old_state_remains_readable(self):
         with tempfile.TemporaryDirectory() as directory:
             state = {
