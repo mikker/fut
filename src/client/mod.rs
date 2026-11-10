@@ -21,6 +21,7 @@ mod federation_transport;
 mod fuzzy;
 mod graphics;
 mod handoff;
+mod host_clipboard;
 mod host_status;
 mod hotkey;
 mod image_path;
@@ -1806,9 +1807,16 @@ async fn run_loop(
                                 .then_some(request_id)
                         });
                         if let Some(request_id) = accepted {
+                            let primary = copy_mode
+                                .as_ref()
+                                .is_some_and(CopyModeState::is_mouse_selection);
+                            if ui.clipboard.osc52 {
+                                host_clipboard::write(&text, &mut io::stdout())?;
+                            }
                             spawn_clipboard_copy(
                                 request_id,
                                 text,
+                                primary,
                                 clipboard_results.clone(),
                             );
                             force_draw = true;
@@ -2582,9 +2590,13 @@ async fn run_loop(
                         let content = temporary_command_content(command.size().area(host));
                         match command.mouse(mouse, content).await {
                             Ok(Some(copy)) => {
+                                if ui.clipboard.osc52 {
+                                    host_clipboard::write(&copy.text, &mut io::stdout())?;
+                                }
                                 spawn_clipboard_copy(
                                     copy.request_id,
                                     copy.text,
+                                    true,
                                     clipboard_results.clone(),
                                 );
                             }
@@ -6511,9 +6523,14 @@ async fn pump_copy_mode(
     .await
 }
 
-fn spawn_clipboard_copy(request_id: Uuid, text: String, results: mpsc::Sender<ClipboardResult>) {
+fn spawn_clipboard_copy(
+    request_id: Uuid,
+    text: String,
+    primary: bool,
+    results: mpsc::Sender<ClipboardResult>,
+) {
     tokio::spawn(async move {
-        let result = copy_to_system_clipboard(text).await;
+        let result = copy_to_system_clipboard(text, primary).await;
         let _ = results
             .send(match result {
                 Ok(bytes) => ClipboardResult::Copied { request_id, bytes },
@@ -6532,33 +6549,59 @@ struct ClipboardCommand {
     args: &'static [&'static str],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClipboardSelection {
+    Clipboard,
+    Primary,
+}
+
 #[cfg(target_os = "macos")]
-fn clipboard_commands(wayland: bool, x11: bool) -> Vec<ClipboardCommand> {
+fn clipboard_commands(
+    wayland: bool,
+    x11: bool,
+    selection: ClipboardSelection,
+) -> Vec<ClipboardCommand> {
     let _ = (wayland, x11);
-    vec![ClipboardCommand {
-        program: "pbcopy",
-        args: &[],
-    }]
+    match selection {
+        ClipboardSelection::Clipboard => vec![ClipboardCommand {
+            program: "pbcopy",
+            args: &[],
+        }],
+        ClipboardSelection::Primary => Vec::new(),
+    }
 }
 
 #[cfg(target_os = "linux")]
-fn clipboard_commands(wayland: bool, x11: bool) -> Vec<ClipboardCommand> {
+fn clipboard_commands(
+    wayland: bool,
+    x11: bool,
+    selection: ClipboardSelection,
+) -> Vec<ClipboardCommand> {
     let mut commands = Vec::new();
     if wayland {
         commands.push(ClipboardCommand {
             program: "wl-copy",
-            args: &[],
+            args: match selection {
+                ClipboardSelection::Clipboard => &[],
+                ClipboardSelection::Primary => &["-p"],
+            },
         });
     }
     if x11 {
         commands.extend([
             ClipboardCommand {
                 program: "xclip",
-                args: &["-selection", "clipboard"],
+                args: match selection {
+                    ClipboardSelection::Clipboard => &["-selection", "clipboard"],
+                    ClipboardSelection::Primary => &["-selection", "primary"],
+                },
             },
             ClipboardCommand {
                 program: "xsel",
-                args: &["--clipboard", "--input"],
+                args: match selection {
+                    ClipboardSelection::Clipboard => &["--clipboard", "--input"],
+                    ClipboardSelection::Primary => &["--primary", "--input"],
+                },
             },
         ]);
     }
@@ -6566,15 +6609,30 @@ fn clipboard_commands(wayland: bool, x11: bool) -> Vec<ClipboardCommand> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn clipboard_commands(wayland: bool, x11: bool) -> Vec<ClipboardCommand> {
-    let _ = (wayland, x11);
+fn clipboard_commands(
+    wayland: bool,
+    x11: bool,
+    selection: ClipboardSelection,
+) -> Vec<ClipboardCommand> {
+    let _ = (wayland, x11, selection);
     Vec::new()
 }
 
-async fn copy_to_system_clipboard(text: String) -> anyhow::Result<usize> {
+async fn copy_to_system_clipboard(text: String, primary: bool) -> anyhow::Result<usize> {
+    let bytes = copy_selection(&text, ClipboardSelection::Clipboard).await?;
+    if primary {
+        // The primary selection is a best-effort companion to a successful
+        // clipboard copy; terminals conventionally expose mouse selections
+        // through it for middle-click paste.
+        let _ = copy_selection(&text, ClipboardSelection::Primary).await;
+    }
+    Ok(bytes)
+}
+
+async fn copy_selection(text: &str, selection: ClipboardSelection) -> anyhow::Result<usize> {
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
     let x11 = std::env::var_os("DISPLAY").is_some();
-    let commands = clipboard_commands(wayland, x11);
+    let commands = clipboard_commands(wayland, x11, selection);
     if commands.is_empty() {
         bail!("clipboard unavailable: no graphical session (SSH/headless session?)");
     }
@@ -6583,7 +6641,7 @@ async fn copy_to_system_clipboard(text: String) -> anyhow::Result<usize> {
         match copy_to_clipboard(
             Path::new(command.program),
             command.args,
-            &text,
+            text,
             CLIPBOARD_TIMEOUT,
         )
         .await
@@ -11050,17 +11108,26 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn clipboard_commands_follow_linux_session_type() {
-        assert_eq!(clipboard_commands(false, false), []);
+    fn clipboard_commands_follow_linux_session_type_and_selection() {
+        let clipboard = ClipboardSelection::Clipboard;
+        let primary = ClipboardSelection::Primary;
+        assert_eq!(clipboard_commands(false, false, clipboard), []);
         assert_eq!(
-            clipboard_commands(true, false),
+            clipboard_commands(true, false, clipboard),
             [ClipboardCommand {
                 program: "wl-copy",
                 args: &[],
             }]
         );
         assert_eq!(
-            clipboard_commands(false, true),
+            clipboard_commands(true, false, primary),
+            [ClipboardCommand {
+                program: "wl-copy",
+                args: &["-p"],
+            }]
+        );
+        assert_eq!(
+            clipboard_commands(false, true, clipboard),
             [
                 ClipboardCommand {
                     program: "xclip",
@@ -11072,6 +11139,20 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(clipboard_commands(true, true).len(), 3);
+        assert_eq!(
+            clipboard_commands(false, true, primary),
+            [
+                ClipboardCommand {
+                    program: "xclip",
+                    args: &["-selection", "primary"],
+                },
+                ClipboardCommand {
+                    program: "xsel",
+                    args: &["--primary", "--input"],
+                },
+            ]
+        );
+        assert_eq!(clipboard_commands(true, true, clipboard).len(), 3);
+        assert_eq!(clipboard_commands(true, true, primary).len(), 3);
     }
 }
