@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.43
+
 - Also write mouse selections to the Linux primary selection, so middle-click paste works in other terminals.
 - Send every copy to the containing terminal as OSC 52, so copying works over SSH and in headless sessions; disable with `clipboard.osc52 = false`.
 
