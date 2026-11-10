@@ -14334,10 +14334,15 @@ async fn keyboard_copy_search_uses_client_clipboard_and_surfaces_success_and_fai
     let capture = root.path().join("clipboard");
     let copy_count = root.path().join("clipboard-count");
 
-    let spawn_client = |fail: bool| {
+    let tools_only_config = root.path().join("tools-only.toml");
+    fs::write(&tools_only_config, "[clipboard]\nosc52 = false\n").unwrap();
+    let spawn_client = |fail: bool, osc52: bool| {
         let mut command = Command::new("/usr/bin/script");
+        command.env_clear();
+        if !osc52 {
+            command.env("FUT_CONFIG", &tools_only_config);
+        }
         command
-            .env_clear()
             .env("HOME", harness.root.path().join("home"))
             .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
             .env("CLIPBOARD_CAPTURE", &capture)
@@ -14360,7 +14365,7 @@ async fn keyboard_copy_search_uses_client_clipboard_and_surfaces_success_and_fai
         PtyChild::spawn(command)
     };
 
-    let mut success = spawn_client(false);
+    let mut success = spawn_client(false, true);
     success.wait_for("COPY_READY").await;
     success.send(&[sgr_mouse(0, 1, 2, false), sgr_mouse(0, 1, 2, true)].concat());
     time::sleep(Duration::from_millis(100)).await;
@@ -14432,7 +14437,7 @@ async fn keyboard_copy_search_uses_client_clipboard_and_surfaces_success_and_fai
         if iteration < 10 {
             success.send(b"\x02d");
             success.wait_success().await;
-            success = spawn_client(false);
+            success = spawn_client(false, true);
             success.wait_for("COPY_READY").await;
         }
     }
@@ -14440,7 +14445,8 @@ async fn keyboard_copy_search_uses_client_clipboard_and_surfaces_success_and_fai
     success.send(b"\x02d");
     success.wait_success().await;
 
-    let mut failure = spawn_client(true);
+    // Without OSC 52 the clipboard tool alone decides the outcome.
+    let mut failure = spawn_client(true, false);
     failure.wait_for("COPY_READY").await;
     failure.send(b"\x02[/COPY_TARGET\r \x1b[Fy");
     failure.wait_for("FAILED").await;
@@ -14462,6 +14468,29 @@ async fn keyboard_copy_search_uses_client_clipboard_and_surfaces_success_and_fai
     assert_eq!(fs::read_to_string(&input_log).unwrap(), "probe\n");
     failure.send(b"\x02d");
     failure.wait_success().await;
+
+    // A copy the outer terminal took via OSC 52 succeeds even when the tool
+    // fails, as it does in SSH and headless sessions.
+    fs::remove_file(root.path().join("clipboard-failed-once")).unwrap();
+    let mut terminal_only = spawn_client(true, true);
+    terminal_only.wait_for("COPY_READY").await;
+    terminal_only.clear_output();
+    terminal_only.send(b"\x02[/COPY_TARGET\r \x1b[Fy");
+    terminal_only.wait_for("copied ").await;
+    assert!(
+        terminal_only.text().contains(&format!(
+            "\x1b]52;c;{}\x1b\\",
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                "COPY_TARGET λ雪"
+            )
+        )),
+        "copy did not reach the outer terminal: {:?}",
+        terminal_only.text()
+    );
+    assert!(!terminal_only.text().contains("FAILED"));
+    terminal_only.send(b"\x02d");
+    terminal_only.wait_success().await;
 
     harness.shutdown().await;
 }

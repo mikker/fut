@@ -1810,15 +1810,13 @@ async fn run_loop(
                             let primary = copy_mode
                                 .as_ref()
                                 .is_some_and(CopyModeState::is_mouse_selection);
-                            if ui.clipboard.osc52 {
-                                host_clipboard::write(&text, &mut io::stdout())?;
-                            }
-                            spawn_clipboard_copy(
+                            start_clipboard_copy(
                                 request_id,
                                 text,
                                 primary,
+                                ui.clipboard.osc52,
                                 clipboard_results.clone(),
-                            );
+                            )?;
                             force_draw = true;
                         }
                     }
@@ -2590,15 +2588,13 @@ async fn run_loop(
                         let content = temporary_command_content(command.size().area(host));
                         match command.mouse(mouse, content).await {
                             Ok(Some(copy)) => {
-                                if ui.clipboard.osc52 {
-                                    host_clipboard::write(&copy.text, &mut io::stdout())?;
-                                }
-                                spawn_clipboard_copy(
+                                start_clipboard_copy(
                                     copy.request_id,
                                     copy.text,
                                     true,
+                                    ui.clipboard.osc52,
                                     clipboard_results.clone(),
-                                );
+                                )?;
                             }
                             Ok(None) => {}
                             Err(error) => {
@@ -6523,24 +6519,31 @@ async fn pump_copy_mode(
     .await
 }
 
-fn spawn_clipboard_copy(
+/// Delivers a copy to the outer terminal (OSC 52) and the platform clipboard
+/// tools. Either channel succeeding makes the copy succeed: OSC 52 is the only
+/// path that reaches the desktop from SSH or headless sessions.
+fn start_clipboard_copy(
     request_id: Uuid,
     text: String,
     primary: bool,
+    osc52: bool,
     results: mpsc::Sender<ClipboardResult>,
-) {
+) -> io::Result<()> {
+    // Written here rather than in the task so it cannot interleave with a frame.
+    let sent_to_terminal = osc52 && host_clipboard::write(&text, &mut io::stdout())?;
     tokio::spawn(async move {
-        let result = copy_to_system_clipboard(text, primary).await;
-        let _ = results
-            .send(match result {
-                Ok(bytes) => ClipboardResult::Copied { request_id, bytes },
-                Err(error) => ClipboardResult::Failed {
-                    request_id,
-                    message: error.to_string(),
-                },
-            })
-            .await;
+        let bytes = text.len();
+        let result = match copy_to_system_clipboard(text, primary).await {
+            Ok(_) => ClipboardResult::Copied { request_id, bytes },
+            Err(_) if sent_to_terminal => ClipboardResult::Copied { request_id, bytes },
+            Err(error) => ClipboardResult::Failed {
+                request_id,
+                message: error.to_string(),
+            },
+        };
+        let _ = results.send(result).await;
     });
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

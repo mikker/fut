@@ -255,7 +255,7 @@
         "osc52": {
           "type": "boolean",
           "default": true,
-          "description": "Send each copy to the containing terminal as OSC 52, in addition to the platform clipboard tool. Terminals that do not implement OSC 52 ignore it; some, such as kitty, ask for confirmation."
+          "description": "Send each copy to the containing terminal as OSC 52, in addition to the platform clipboard tool. A copy succeeds when either path takes it; terminals that do not implement OSC 52 ignore it."
         }
       }
     },
