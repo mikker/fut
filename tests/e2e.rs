@@ -10768,6 +10768,15 @@ async fn public_open_resolves_relative_paths_from_its_calling_process() {
             .await,
         ServerMessage::CommandCompleted { .. }
     ));
+    // Closing is acknowledged before terminal-exit cleanup finishes, and a
+    // session refuses to close while one of its panes is still closing.
+    resources_when(&harness, |snapshot| {
+        snapshot.sessions[0]
+            .workspaces
+            .iter()
+            .all(|workspace| workspace.id != workspace_id)
+    })
+    .await;
     let session_id = snapshot.sessions[0].id;
     harness.close_session(SessionSelector::Id(session_id)).await;
     harness.wait_until_exited().await;
