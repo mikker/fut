@@ -2172,6 +2172,15 @@ mod tests {
         }
     }
 
+    /// Snapshots are only captured while someone subscribes, so a fast child
+    /// can finish before the test does. Refresh after subscribing, as
+    /// attachments do, so the receiver starts from the current screen.
+    async fn observe(handle: &TerminalHandle) -> watch::Receiver<ScreenSnapshot> {
+        let snapshots = handle.subscribe_snapshots();
+        handle.refresh_snapshot().await.unwrap();
+        snapshots
+    }
+
     async fn wait_for_text(receiver: &mut watch::Receiver<ScreenSnapshot>, needle: &str) {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -2206,7 +2215,7 @@ mod tests {
             let mut spec = shell("seq 1 2000; printf DONE; sleep 60", HashMap::new());
             spec.terminal.scrollback_bytes = budget;
             let handle = spawn_terminal(spec).unwrap();
-            let mut snapshots = handle.subscribe_snapshots();
+            let mut snapshots = observe(&handle).await;
             wait_for_text(&mut snapshots, "DONE").await;
             let history = snapshots.borrow().scroll.max_offset_from_bottom;
             handle.close().await.unwrap();
@@ -2226,7 +2235,7 @@ mod tests {
         // shrunk select timeout) still publishes after bursts stop instead
         // of leaving the last few throttled bytes unpublished forever.
         let handle = spawn_terminal(shell("seq 1 2000; printf DONE", HashMap::new())).unwrap();
-        let mut snapshots = handle.subscribe_snapshots();
+        let mut snapshots = observe(&handle).await;
         wait_for_text(&mut snapshots, "DONE").await;
         handle.close().await.unwrap();
     }
@@ -2241,7 +2250,7 @@ mod tests {
             env,
         ))
         .unwrap();
-        let mut snapshots = handle.subscribe_snapshots();
+        let mut snapshots = observe(&handle).await;
         let mut lifecycle = handle.subscribe_lifecycle();
         handle.input(b"input\n".to_vec()).await.unwrap();
         wait_for_text(&mut snapshots, "works:xterm-256color:input").await;
@@ -2268,7 +2277,7 @@ mod tests {
             capture.display()
         );
         let handle = spawn_terminal(shell(&script, HashMap::new())).unwrap();
-        let mut snapshots = handle.subscribe_snapshots();
+        let mut snapshots = observe(&handle).await;
         wait_for_text(&mut snapshots, "PASTE_READY").await;
 
         handle
@@ -2946,7 +2955,7 @@ mod tests {
     #[tokio::test]
     async fn resizes_pty_and_snapshot() {
         let handle = spawn_terminal(shell("sleep 2", HashMap::new())).unwrap();
-        let mut snapshots = handle.subscribe_snapshots();
+        let mut snapshots = observe(&handle).await;
         handle
             .resize(TerminalSize {
                 columns: 17,
@@ -2977,7 +2986,7 @@ mod tests {
         let mut env = HashMap::new();
         env.insert("FUT_COLOR_CAPTURE".into(), capture.clone().into_os_string());
         let handle = spawn_terminal(shell(&script, env)).unwrap();
-        let mut snapshots = handle.subscribe_snapshots();
+        let mut snapshots = observe(&handle).await;
         wait_for_text(&mut snapshots, "READY").await;
         let size = snapshots.borrow().size;
         let light = crate::domain::TerminalColors {
@@ -3015,7 +3024,7 @@ mod tests {
     #[tokio::test]
     async fn stale_attachment_geometry_cannot_override_a_newer_resize() {
         let handle = spawn_terminal(shell("sleep 2", HashMap::new())).unwrap();
-        let mut snapshots = handle.subscribe_snapshots();
+        let mut snapshots = observe(&handle).await;
         let newest = TerminalSize {
             columns: 37,
             rows: 11,
@@ -3089,7 +3098,7 @@ mod tests {
             HashMap::new(),
         ))
         .unwrap();
-        let mut snapshots = handle.subscribe_snapshots();
+        let mut snapshots = observe(&handle).await;
         wait_for_text(&mut snapshots, "READY").await;
 
         // A wheel round-trip must not wait out the runtime's 20ms output
@@ -3157,7 +3166,7 @@ mod tests {
             HashMap::new(),
         ))
         .unwrap();
-        let mut snapshots = handle.subscribe_snapshots();
+        let mut snapshots = observe(&handle).await;
         wait_for_text(&mut snapshots, "OLD_FRAME").await;
         handle.input(b"start\n".to_vec()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -3245,7 +3254,7 @@ mod tests {
             env,
         ))
         .unwrap();
-        let mut snapshots = handle.subscribe_snapshots();
+        let mut snapshots = observe(&handle).await;
         wait_for_text(&mut snapshots, "READY").await;
 
         handle.close().await.unwrap();
@@ -3512,7 +3521,7 @@ mod tests {
         .await
         .unwrap();
 
-        let mut snapshots = handle.subscribe_snapshots();
+        let mut snapshots = observe(&handle).await;
         let initial_revision = snapshots.borrow().revision;
         handle.refresh_snapshot().await.unwrap();
         wait_for_text(&mut snapshots, "FUT_LATE_FINAL").await;
@@ -3696,7 +3705,7 @@ mod tests {
             HashMap::new(),
         ))
         .unwrap();
-        let mut snapshots = handle.subscribe_snapshots();
+        let mut snapshots = observe(&handle).await;
         wait_for_text(&mut snapshots, "EOF_SYNC_FRAME").await;
 
         tokio::time::timeout(Duration::from_secs(5), handle.close())
@@ -3738,7 +3747,7 @@ mod tests {
             HashMap::new(),
         ))
         .unwrap();
-        let mut snapshots = handle.subscribe_snapshots();
+        let mut snapshots = observe(&handle).await;
         wait_for_text(&mut snapshots, "READY").await;
         let wheel = b"\x1b[<65;10;10M".repeat(1024);
         for _ in 0..16 {
@@ -4057,7 +4066,7 @@ mod tests {
             HashMap::new(),
         ))
         .unwrap();
-        let mut snapshots = handle.subscribe_snapshots();
+        let mut snapshots = observe(&handle).await;
         wait_for_text(&mut snapshots, "READY").await;
         let mut events = handle.subscribe_events();
         handle
