@@ -89,6 +89,12 @@ impl EventSource for UnixInternalEventSource {
                 return Ok(None);
             }
 
+            // Readiness is edge-triggered: a TTY event skipped in this batch is
+            // not reported again until more input arrives. A wake therefore
+            // must not short-circuit the batch, or input already waiting
+            // behind a stale wake (e.g. from a dropped `EventStream`) stalls.
+            #[cfg(feature = "event-stream")]
+            let mut woken = false;
             for token in self.events.iter().map(|x| x.token()) {
                 match token {
                     TTY_TOKEN => {
@@ -135,14 +141,17 @@ impl EventSource for UnixInternalEventSource {
                         }
                     }
                     #[cfg(feature = "event-stream")]
-                    WAKE_TOKEN => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Interrupted,
-                            "Poll operation was woken up by `Waker::wake`",
-                        ));
-                    }
+                    WAKE_TOKEN => woken = true,
                     _ => unreachable!("Synchronize Evented handle registration & token handling"),
                 }
+            }
+
+            #[cfg(feature = "event-stream")]
+            if woken {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "Poll operation was woken up by `Waker::wake`",
+                ));
             }
 
             // Processing above can take some time, check if timeout expired

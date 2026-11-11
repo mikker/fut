@@ -6,6 +6,9 @@ without a second reader consuming keyboard input. Local changes:
 - Add `Event::TerminalResponse(Vec<u8>)` for OSC replies and CSI `?997` reports.
 - Parse OSC replies through BEL or ST, with a 4096-byte bound, and color-scheme
   reports through their final `n`. Test replies split at every byte boundary.
+- Finish a readiness batch before reporting a `Waker::wake`. Readiness is
+  edge-triggered, so returning on the wake dropped a TTY event in the same batch
+  and stalled input that arrived just after an `EventStream` was replaced.
 - Remove example targets (examples are not vendored) and fix an existing
   unnecessary-parentheses warning exposed by the path dependency.
 

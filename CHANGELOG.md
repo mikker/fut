@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fix keys typed right after choosing a session in the navigator sometimes waiting for the next keypress.
+
 ## 0.43
 
 - Also write mouse selections to the Linux primary selection, so middle-click paste works in other terminals.
