@@ -2212,7 +2212,9 @@ mod tests {
     #[tokio::test]
     async fn spawn_honors_scrollback_budget() {
         for budget in [0, super::super::DEFAULT_SCROLLBACK_BYTES] {
-            let mut spec = shell("seq 1 2000; printf DONE; sleep 60", HashMap::new());
+            // Debug Ghostty, used by the test profile, re-validates all
+            // scrollback per line; 2000 lines took seconds on loaded CI.
+            let mut spec = shell("seq 1 200; printf DONE; sleep 60", HashMap::new());
             spec.terminal.scrollback_bytes = budget;
             let handle = spawn_terminal(spec).unwrap();
             let mut snapshots = observe(&handle).await;
@@ -2222,7 +2224,7 @@ mod tests {
             if budget == 0 {
                 assert_eq!(history, 0);
             } else {
-                assert!(history > 1900);
+                assert!(history > 190, "history {history}");
             }
         }
     }
@@ -2234,7 +2236,11 @@ mod tests {
         // over, so seeing it proves the trailing-edge flush (dirty +
         // shrunk select timeout) still publishes after bursts stop instead
         // of leaving the last few throttled bytes unpublished forever.
-        let handle = spawn_terminal(shell("seq 1 2000; printf DONE", HashMap::new())).unwrap();
+        // Without scrollback, so debug Ghostty's per-line scrollback
+        // validation does not dominate the burst on loaded CI.
+        let mut spec = shell("seq 1 2000; printf DONE", HashMap::new());
+        spec.terminal.scrollback_bytes = 0;
+        let handle = spawn_terminal(spec).unwrap();
         let mut snapshots = observe(&handle).await;
         wait_for_text(&mut snapshots, "DONE").await;
         handle.close().await.unwrap();
