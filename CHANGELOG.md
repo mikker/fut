@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.44
+
 - Fix keys typed right after choosing a session in the navigator sometimes waiting for the next keypress.
 
 ## 0.43
